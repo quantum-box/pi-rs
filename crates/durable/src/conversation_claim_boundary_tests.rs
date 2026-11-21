@@ -7552,15 +7552,24 @@ impl DurableAsyncTool for WokenAnyFixture {
     }
 }
 
-fn start_woken_any_scheduler(path: &std::path::Path) -> (Scheduler, crate::task_driver::Driver) {
+fn build_woken_any(path: &std::path::Path) -> (Options, Registry, crate::extension::Registry) {
     use crate::async_task_tool::{
         DurableParkCancel, register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel,
         register_conversation_unsafe_durable_tool_with_at_most_once_woken_cancel,
     };
-    struct Cancel(std::path::PathBuf, bool);
+    struct Cancel(
+        std::path::PathBuf,
+        bool,
+        Option<crate::nested_identity::IdentityHandle>,
+    );
     #[async_trait]
     impl DurableParkCancel for Cancel {
-        async fn cancel(&self, _: Value, checkpoint: Value, _: ToolContext) -> Result<(), String> {
+        async fn cancel(
+            &self,
+            _: Value,
+            checkpoint: Value,
+            context: ToolContext,
+        ) -> Result<(), String> {
             if self.1 {
                 let blocker: AsyncTaskCall =
                     serde_json::from_value(checkpoint["blocker"].clone()).unwrap();
@@ -7575,6 +7584,18 @@ fn start_woken_any_scheduler(path: &std::path::Path) -> (Scheduler, crate::task_
                 );
                 std::fs::write(self.0.join("slow-cancel"), b"called").unwrap();
                 return Ok(());
+            }
+            if std::env::var_os("PI_TEST_WOKEN_OWNED_CASE").is_some() {
+                assert!(
+                    self.2
+                        .as_ref()
+                        .unwrap()
+                        .update(Some("changed".into()), || panic!(
+                            "identity changed during callback"
+                        ))
+                        .await
+                        .is_err()
+                );
             }
             let slow: AsyncTaskCall = serde_json::from_value(checkpoint["slow"].clone()).unwrap();
             let store = durable_store::Store::open(self.0.join("db")).unwrap();
@@ -7592,7 +7613,57 @@ fn start_woken_any_scheduler(path: &std::path::Path) -> (Scheduler, crate::task_
                     "unsafe child must cancel first"
                 );
             }
-            std::fs::write(self.0.join("parent-cancel"), b"called").unwrap();
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.0.join("parent-cancel"))
+                    .unwrap(),
+                "called"
+            )
+            .unwrap();
+            if std::env::var("PI_TEST_WOKEN_OWNED_CASE").ok().as_deref() == Some("23") {
+                let task = crate::task_store::TaskStore::new(&store)
+                    .load(context.operation_id)
+                    .unwrap()
+                    .unwrap()
+                    .task;
+                let attempt = task.woken_interrupted_attempt().unwrap();
+                let key = format!(
+                    "durable/unsafe-park-async/{}/{attempt}/intent/receipt",
+                    task.id()
+                )
+                .into_bytes();
+                let late = crate::async_task_tool::UnsafeDurableReceipt {
+                    task_id: task.id(),
+                    attempt_id: attempt,
+                    outcome: Outcome::Pending {
+                        reference: "late-owned-work".into(),
+                    },
+                };
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Missing,
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: serde_json::to_vec(&late).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+            }
+            if std::env::var("PI_TEST_WOKEN_OWNED_CUT").ok().as_deref() == Some("callback") {
+                let control = std::path::PathBuf::from(
+                    std::env::var_os("PI_TEST_WOKEN_OWNED_CONTROL").unwrap(),
+                );
+                std::fs::write(control.join("cut-ready"), b"callback").unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
             Ok(())
         }
     }
@@ -7620,6 +7691,26 @@ fn start_woken_any_scheduler(path: &std::path::Path) -> (Scheduler, crate::task_
             .unwrap();
     }
     let mut registry = Registry::default();
+    assert!(
+        registry.register("owned-independent", true, |_: &crate::task::Task| Ok(
+            crate::task_scheduler::Step::Succeed(json!("independent"))
+        ))
+    );
+    #[cfg(feature = "experimental-graph-revision")]
+    {
+        let hold_path = dir.join("hold-owned-child");
+        assert!(registry.register_with_abort(
+            "owned-abort-child",
+            true,
+            |_: &crate::task::Task| Ok(crate::task_scheduler::Step::Succeed(json!("unused"))),
+            move |_: &crate::task::Task| {
+                while hold_path.exists() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(crate::task_scheduler::Step::Succeed(json!("cancelled")))
+            },
+        ));
+    }
     let mut extra = Vec::new();
     let register_safe = |registry: &mut Registry, name: &'static str| {
         let tool = Arc::new(WokenAnyFixture {
@@ -7650,7 +7741,7 @@ fn start_woken_any_scheduler(path: &std::path::Path) -> (Scheduler, crate::task_
         let _identity =
             crate::nested_identity::register(&identity, Some("slow-backend".into())).unwrap();
         let slow = if selected {
-            crate::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel(&mut registry, slow, "slow", 1, vec![blocker.clone()], &extensions.snapshot(), &["policy".to_owned()], "slow-cancel-v1", Arc::new(Cancel(dir.clone(), true)), UnsafeDurableAuthorization::interruption_requires_reconciliation(), crate::async_task_tool::ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe()).unwrap()
+            crate::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel(&mut registry, slow, "slow", 1, vec![blocker.clone()], &extensions.snapshot(), &["policy".to_owned()], "slow-cancel-v1", Arc::new(Cancel(dir.clone(), true, None)), UnsafeDurableAuthorization::interruption_requires_reconciliation(), crate::async_task_tool::ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe()).unwrap()
         } else {
             register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
                 &mut registry,
@@ -7659,7 +7750,7 @@ fn start_woken_any_scheduler(path: &std::path::Path) -> (Scheduler, crate::task_
                 1,
                 vec![blocker.clone()],
                 "slow-cancel-v1",
-                Arc::new(Cancel(dir.clone(), true)),
+                Arc::new(Cancel(dir.clone(), true, None)),
                 UnsafeDurableAuthorization::interruption_requires_reconciliation(),
             )
             .unwrap()
@@ -7676,9 +7767,10 @@ fn start_woken_any_scheduler(path: &std::path::Path) -> (Scheduler, crate::task_
         dir: dir.clone(),
     });
     let identity: Arc<dyn Tool> = root.clone();
-    let _identity = crate::nested_identity::register(&identity, Some("backend-v1".into())).unwrap();
+    let identity_handle =
+        crate::nested_identity::register(&identity, Some("backend-v1".into())).unwrap();
     let root = if selected {
-        crate::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_woken_cancel(&mut registry, root, "root", 1, children.clone(), &extensions.snapshot(), &["policy".to_owned()], "cancel-v1", Arc::new(Cancel(dir, false)), UnsafeDurableAuthorization::interruption_requires_reconciliation(), crate::async_task_tool::ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe()).unwrap()
+        crate::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_woken_cancel(&mut registry, root, "root", 1, children.clone(), &extensions.snapshot(), &["policy".to_owned()], "cancel-v1", Arc::new(Cancel(dir, false, Some(identity_handle.clone()))), UnsafeDurableAuthorization::interruption_requires_reconciliation(), crate::async_task_tool::ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe()).unwrap()
     } else {
         register_conversation_unsafe_durable_tool_with_at_most_once_woken_cancel(
             &mut registry,
@@ -7687,7 +7779,7 @@ fn start_woken_any_scheduler(path: &std::path::Path) -> (Scheduler, crate::task_
             1,
             children.clone(),
             "cancel-v1",
-            Arc::new(Cancel(dir, false)),
+            Arc::new(Cancel(dir, false, Some(identity_handle))),
             UnsafeDurableAuthorization::interruption_requires_reconciliation(),
         )
         .unwrap()
@@ -7704,6 +7796,11 @@ fn start_woken_any_scheduler(path: &std::path::Path) -> (Scheduler, crate::task_
         max_turns: 4,
         uncertain_policy: UncertainPolicy::RequireReconciliation,
     };
+    (options, registry, extensions)
+}
+
+fn start_woken_any_scheduler(path: &std::path::Path) -> (Scheduler, crate::task_driver::Driver) {
+    let (options, registry, extensions) = build_woken_any(path);
     let scheduler = Scheduler::open_with_extensions(path, options, extensions).unwrap();
     let driver = scheduler.start_tasks(registry).unwrap();
     (scheduler, driver)
@@ -7859,8 +7956,301 @@ async fn live_woken_root_drains_any_loser_before_cancel() {
 
 #[tokio::test]
 async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_together() {
+    exercise_woken_owned_graph_receipt(false, 0).await;
+}
+
+#[cfg(not(feature = "experimental-graph-revision"))]
+#[tokio::test]
+async fn woken_owned_callback_is_not_dispatched_by_default() {
+    exercise_woken_owned_graph_receipt(false, 26).await;
+}
+
+#[tokio::test]
+async fn owned_cleanup_receipt_conflict_preserves_abort_and_marker() {
+    exercise_woken_owned_graph_receipt(true, 0).await;
+}
+
+#[tokio::test]
+async fn owned_graph_child_aba_requires_scoped_revision() {
+    exercise_woken_owned_graph_receipt(false, 1).await;
+}
+
+#[tokio::test]
+async fn owned_graph_terminal_resurrection_requires_scoped_revision() {
+    exercise_woken_owned_graph_receipt(false, 2).await;
+}
+
+#[tokio::test]
+async fn owned_graph_abort_clear_requires_scoped_revision() {
+    exercise_woken_owned_graph_receipt(false, 3).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_reservation_is_bound_and_child_attempt_is_rejected() {
+    exercise_woken_owned_graph_receipt(false, 4).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_reservation_survives_reopen() {
+    exercise_woken_owned_graph_receipt(false, 5).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_terminal_requires_authenticated_woken_marker() {
+    exercise_woken_owned_graph_receipt(false, 11).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_terminal_accepts_only_bound_woken_receipt() {
+    exercise_woken_owned_graph_receipt(false, 12).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_callback_marker_manifest_fences_and_reopens() {
+    exercise_woken_owned_graph_receipt(false, 24).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_publication_rejects_replaced_marker_retirement() {
+    exercise_woken_owned_graph_receipt(false, 25).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_publication_rejects_replaced_edge() {
+    exercise_woken_owned_graph_receipt(false, 16).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_terminal_rejects_late_tool_receipt() {
+    exercise_woken_owned_graph_receipt(false, 13).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_evidence_cannot_be_erased_into_ordinary_root() {
+    exercise_woken_owned_graph_receipt(false, 14).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_rejects_same_attempt_state_aba() {
+    exercise_woken_owned_graph_receipt(false, 15).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_driver_commits_reservation_evidence() {
+    exercise_woken_owned_graph_receipt(false, 6).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_rejects_unauthenticated_unsafe_conversation_child() {
+    exercise_woken_owned_graph_receipt(false, 7).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_graph_driver_reserves_direct_conversation_child() {
+    exercise_woken_owned_graph_receipt(false, 8).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn owned_child_binding_requires_both_pending_conversations() {
+    exercise_woken_owned_graph_receipt(false, 9).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn woken_owned_callback_fixture() {
+    if let Some(dir) = std::env::var_os("PI_TEST_WOKEN_OWNED_RESUME") {
+        let path = std::path::PathBuf::from(dir).join("db");
+        let (scheduler, driver) = start_woken_any_scheduler(&path);
+        let store = durable_store::Store::open(&path).unwrap();
+        let root = crate::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|record| {
+                matches!(record.task.owner(), crate::task::TaskOwner::Conversation(_))
+                    && record.task.woken_interrupted_attempt().is_some()
+            })
+            .unwrap()
+            .task
+            .id();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !driver.get(root).unwrap().unwrap().is_terminal() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path.parent().unwrap().join("parent-cancel"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let receipt = store
+            .get(&crate::task_scheduler::woken_conversation_receipt_key(root))
+            .unwrap();
+        let has_receipt = std::env::var("PI_TEST_WOKEN_OWNED_CUT").unwrap() == "receipt";
+        assert_eq!(receipt.is_some(), has_receipt);
+        let task = driver.get(root).unwrap().unwrap();
+        assert!(
+            matches!(task.state(), TaskState::Failed(reason) if reason.contains("reconciliation"))
+        );
+        if has_receipt {
+            let crate::task::TaskOwner::Conversation(owner) = task.owner() else {
+                panic!("missing owner")
+            };
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if scheduler.conversation(*owner).unwrap().messages.iter().any(|message| matches!(message, Message::Tool { content, .. } if content.contains("after cancel"))) { break; }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+        }
+        drop(store);
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+        scheduler.shutdown().await.unwrap();
+        return;
+    }
+    if let Ok(case) = std::env::var("PI_TEST_WOKEN_OWNED_CASE") {
+        exercise_woken_owned_graph_receipt(false, case.parse().unwrap()).await;
+    }
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn woken_owned_callback_driver_fixture_runs_once() {
+    use std::process::{Command, Stdio};
+    for case in [17, 18, 19, 20, 21, 22, 23] {
+        let mut worker = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::woken_owned_callback_fixture",
+                "--nocapture",
+            ])
+            .env("PI_TEST_WOKEN_OWNED_CASE", case.to_string())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(50), async {
+            loop {
+                if let Some(status) = worker.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if status.is_err() {
+            let _ = worker.kill();
+            let _ = worker.wait();
+        }
+        assert!(status.unwrap().success(), "fixture case {case} failed");
+    }
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn woken_owned_callback_kill_and_reopen() {
+    use std::process::{Command, Stdio};
+    for cut in ["callback", "receipt"] {
+        let control = tempfile::tempdir().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::woken_owned_callback_fixture",
+                "--nocapture",
+            ])
+            .env("PI_TEST_WOKEN_OWNED_CASE", "18")
+            .env("PI_TEST_WOKEN_OWNED_CONTROL", control.path())
+            .env("PI_TEST_WOKEN_OWNED_CUT", cut)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if cut == "receipt" {
+            command.env("PI_TEST_WOKEN_HOLD_AFTER_RECEIPT", control.path());
+        }
+        let mut worker = command.spawn().unwrap();
+        let ready = control.path().join(if cut == "callback" {
+            "cut-ready"
+        } else {
+            "woken-receipt"
+        });
+        let reached = tokio::time::timeout(Duration::from_secs(35), async {
+            while !ready.exists() {
+                assert!(
+                    worker.try_wait().unwrap().is_none(),
+                    "worker exited before {cut}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if reached.is_err() {
+            let _ = worker.kill();
+            let _ = worker.wait();
+        }
+        reached.unwrap();
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+        let dir = std::fs::read_to_string(control.path().join("fixture-path")).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::woken_owned_callback_fixture",
+                "--nocapture",
+            ])
+            .env("PI_TEST_WOKEN_OWNED_RESUME", &dir)
+            .env("PI_TEST_WOKEN_OWNED_CUT", cut)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .unwrap();
+        assert!(status.success(), "resume after {cut} failed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn selected_owned_child_binding_requires_both_pending_conversations() {
+    exercise_woken_owned_graph_receipt(false, 10).await;
+}
+
+async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
+    if let Some(control) = std::env::var_os("PI_TEST_WOKEN_OWNED_CONTROL") {
+        let control = std::path::PathBuf::from(control);
+        std::fs::write(
+            control.join("fixture-path.tmp"),
+            dir.path().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        std::fs::rename(
+            control.join("fixture-path.tmp"),
+            control.join("fixture-path"),
+        )
+        .unwrap();
+    }
+    if matches!(graph_aba, 10 | 18 | 20 | 23) {
+        std::fs::write(dir.path().join("selected-mode"), b"yes").unwrap();
+    }
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -7882,16 +8272,11 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
     child.kill().unwrap();
     child.wait().unwrap();
     let path = dir.path().join("db");
-    let options = Options {
-        model: Arc::new(ModelStub {
-            arguments: "{}".into(),
-        }),
-        tools: vec![],
-        restart_limit: 4,
-        max_turns: 4,
-        uncertain_policy: UncertainPolicy::RequireReconciliation,
-    };
+    let (options, registry, extensions) = build_woken_any(&path);
     let mut harness = crate::runtime::Harness::open_paused(&path, options).unwrap();
+    if matches!(graph_aba, 10 | 18 | 20 | 23) {
+        harness.set_extension_registry_for_test(extensions);
+    }
     let conversation = harness
         .create_conversation(Config {
             model: "test".into(),
@@ -7914,10 +8299,150 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
         child: conversation,
         mode: crate::ownership_edge::Mode::Foreground,
     };
+    #[cfg(feature = "experimental-graph-revision")]
+    let ordinary_checks = if graph_aba == 14 {
+        let checks = harness
+            .woken_owned_graph_checks_if_required(&root, store.put_version().unwrap())
+            .unwrap();
+        store.commit(&checks, &[]).unwrap();
+        Some(checks)
+    } else {
+        None
+    };
     let prepared = crate::ownership_edge::EdgeStore::new(&store)
         .prepare_create(&edge)
         .unwrap();
     store.commit(&prepared.checks, &prepared.mutations).unwrap();
+    let additional_conversation = if matches!(graph_aba, 19 | 20) {
+        let child = harness
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        let edge = crate::ownership_edge::Edge {
+            task: root.task.id(),
+            task_owner: root.task.owner().clone(),
+            child,
+            mode: crate::ownership_edge::Mode::Foreground,
+        };
+        let batch = crate::ownership_edge::EdgeStore::new(&store)
+            .prepare_create(&edge)
+            .unwrap();
+        store.commit(&batch.checks, &batch.mutations).unwrap();
+        Some(child)
+    } else {
+        None
+    };
+    #[cfg(feature = "experimental-graph-revision")]
+    if let Some(checks) = ordinary_checks {
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+    }
+    let unsafe_owned = if matches!(graph_aba, 7 | 8 | 21) {
+        let task = crate::task::Task::new(
+            uuid::Uuid::new_v4(),
+            crate::task::TaskOwner::Conversation(conversation),
+            crate::task::Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered(
+            if matches!(graph_aba, 7 | 21) {
+                "unverified-owned-child"
+            } else {
+                "owned-abort-child"
+            }
+            .into(),
+            graph_aba == 8,
+        );
+        crate::task_store::TaskStore::new(&store)
+            .save(&[crate::task_store::Save::Create(&task)])
+            .unwrap();
+        Some(task.id())
+    } else {
+        None
+    };
+    #[cfg(feature = "experimental-graph-revision")]
+    let bound_child = if graph_aba == 9 || graph_aba == 10 {
+        let child = uuid::Uuid::new_v4();
+        let crate::task::TaskOwner::Conversation(parent_conversation) = root.task.owner() else {
+            panic!("missing parent conversation")
+        };
+        let parent_key = format!("runtime/conversation/{parent_conversation}").into_bytes();
+        let parent_snapshot: Value =
+            serde_json::from_slice(&store.get(&parent_key).unwrap().unwrap().value).unwrap();
+        let conversation_key = format!("runtime/conversation/{conversation}").into_bytes();
+        let old = store.get(&conversation_key).unwrap().unwrap();
+        let mut cloned: Value = serde_json::from_slice(&old.value).unwrap();
+        cloned["phase"] = parent_snapshot["phase"].clone();
+        cloned["tool_attempt"] = parent_snapshot["tool_attempt"].clone();
+        cloned["extensions"] = parent_snapshot["extensions"].clone();
+        cloned["phase"]["TaskPending"]["task"] = json!(child);
+        cloned["phase"]["TaskPending"]["operation_id"] = json!(child);
+        cloned["tool_attempt"]["operation_id"] = json!(child);
+        let parent_binding_key =
+            format!("runtime/checkpointable-root-binding/v1/{}", root.task.id()).into_bytes();
+        let mut binding: Value =
+            serde_json::from_slice(&store.get(&parent_binding_key).unwrap().unwrap().value)
+                .unwrap();
+        binding["conversation"] = json!(conversation);
+        binding["task"] = json!(child);
+        binding["tool_attempt"]["operation_id"] = json!(child);
+        let binding_key = format!("runtime/checkpointable-root-binding/v1/{child}").into_bytes();
+        let mut task = serde_json::to_value(&root.task).unwrap();
+        task["id"] = json!(child);
+        task["owner"] = json!({"Conversation":conversation});
+        task["state"] = json!("Ready");
+        task.as_object_mut().unwrap().remove("attempt_id");
+        task.as_object_mut().unwrap().remove("retired_attempt_id");
+        task.as_object_mut()
+            .unwrap()
+            .remove("woken_interrupted_attempt");
+        let task_key = crate::task_store::key(child);
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: conversation_key.clone(),
+                    expected: durable_store::Expected::Version(old.version),
+                }],
+                &[
+                    durable_store::Mutation::Put {
+                        key: conversation_key,
+                        value: serde_json::to_vec(&cloned).unwrap(),
+                    },
+                    durable_store::Mutation::Put {
+                        key: binding_key,
+                        value: serde_json::to_vec(&binding).unwrap(),
+                    },
+                    durable_store::Mutation::Put {
+                        key: task_key,
+                        value: serde_json::to_vec(&task).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        Some(child)
+    } else {
+        None
+    };
+    if graph_aba == 8 {
+        let tasks = crate::task_store::TaskStore::new(&store);
+        for child in tasks.list().unwrap().into_iter().filter(|child| {
+            child.task.owner() == &crate::task::TaskOwner::Task(root.task.id())
+                && !child.task.is_terminal()
+        }) {
+            tasks.update(&child, |task| task.request_abort()).unwrap();
+            let child = tasks.load(child.task.id()).unwrap().unwrap();
+            tasks.update(&child, |task| task.cancel()).unwrap();
+        }
+    }
     let root = crate::task_store::TaskStore::new(&store)
         .load(root.task.id())
         .unwrap()
@@ -7959,10 +8484,343 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
             .unwrap(),
         root
     );
+    assert!(
+        harness
+            .authenticated_scoped_woken_abort_graph(&root, &Registry::default(), &[conversation])
+            .is_err()
+    );
+    assert!(!harness.conversation(conversation).unwrap().abort_requested);
+    assert_eq!(
+        crate::task_store::TaskStore::new(&store)
+            .load(root.task.id())
+            .unwrap()
+            .unwrap(),
+        root
+    );
+    let mut expected_conversations = vec![conversation];
+    expected_conversations.extend(additional_conversation);
     harness
-        .scoped_woken_abort_graph(&root, &proof, &[conversation])
+        .authenticated_scoped_woken_abort_graph(&root, &registry, &expected_conversations)
         .unwrap();
+    if let Some(id) = unsafe_owned.filter(|_| matches!(graph_aba, 7 | 21)) {
+        let tasks = crate::task_store::TaskStore::new(&store);
+        let task = tasks.load(id).unwrap().unwrap();
+        assert!(task.task.abort_requested());
+        tasks.update(&task, |task| task.cancel()).unwrap();
+    }
     assert!(harness.conversation(conversation).unwrap().abort_requested);
+    #[cfg(feature = "experimental-graph-revision")]
+    if let Some(child) = bound_child {
+        let tasks = crate::task_store::TaskStore::new(&store);
+        let ready = tasks.load(child).unwrap().unwrap();
+        let mut running = ready.clone();
+        running.task.start_attempt(uuid::Uuid::new_v4()).unwrap();
+        let (checks, marker) =
+            crate::runtime::prepare_woken_owned_child_reservation(&store, &ready, &running.task)
+                .unwrap()
+                .unwrap();
+        let mut batch = tasks
+            .prepare_save(&[crate::task_store::Save::Update(&running)])
+            .unwrap();
+        batch.checks.extend(checks);
+        batch.mutations.push(marker);
+        store.commit(&batch.checks, &batch.mutations).unwrap();
+        let running = tasks.load(child).unwrap().unwrap();
+        let marked_root = tasks.load(root.task.id()).unwrap().unwrap();
+        let identity_leases = crate::task_scheduler::owned_child_cleanup_identity_leases(
+            &registry,
+            &marked_root.task,
+            &running.task,
+        )
+        .unwrap();
+        assert_eq!(identity_leases.len(), 2);
+        let identity_lock = tokio::sync::OwnedRwLockReadGuard::rwlock(&identity_leases[0]).clone();
+        assert!(Arc::ptr_eq(
+            &identity_lock,
+            tokio::sync::OwnedRwLockReadGuard::rwlock(&identity_leases[1])
+        ));
+        assert!(identity_lock.try_write().is_err());
+        let selection_lease = crate::task_scheduler::owned_child_cleanup_selection_lease(
+            &registry,
+            &marked_root.task,
+            &running.task,
+            &harness,
+        )
+        .unwrap();
+        if graph_aba == 10 {
+            assert!(matches!(
+                harness.uninstall_extension("policy"),
+                Err(crate::runtime::Error::TaskPublicationBusy)
+            ));
+        }
+        let mut changed_identity = serde_json::to_value(&running.task).unwrap();
+        changed_identity["kind"] = json!("different-registration");
+        let changed_identity: crate::task::Task = serde_json::from_value(changed_identity).unwrap();
+        assert!(
+            crate::task_scheduler::owned_child_cleanup_identity_leases(
+                &registry,
+                &marked_root.task,
+                &changed_identity
+            )
+            .is_err()
+        );
+        assert!(
+            crate::task_scheduler::owned_child_cleanup_selection_lease(
+                &registry,
+                &marked_root.task,
+                &changed_identity,
+                &harness
+            )
+            .is_err()
+        );
+        let checks = harness
+            .checkpointable_owned_child_admission_checks(&running.task, &registry)
+            .unwrap();
+        store.commit(&checks, &[]).unwrap();
+        let binding_key = format!("runtime/checkpointable-root-binding/v1/{child}").into_bytes();
+        let binding = store.get(&binding_key).unwrap().unwrap();
+        let mut bad: Value = serde_json::from_slice(&binding.value).unwrap();
+        bad["arguments"] = json!({"forged":true});
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: binding_key.clone(),
+                    expected: durable_store::Expected::Version(binding.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key: binding_key.clone(),
+                    value: serde_json::to_vec(&bad).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            harness
+                .checkpointable_owned_child_admission_checks(&running.task, &registry)
+                .is_err()
+        );
+        drop(identity_leases);
+        drop(selection_lease);
+        assert!(identity_lock.try_write().is_ok());
+        let modified = store.get(&binding_key).unwrap().unwrap();
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: binding_key.clone(),
+                    expected: durable_store::Expected::Version(modified.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key: binding_key,
+                    value: binding.value,
+                }],
+            )
+            .unwrap();
+        let checks = harness
+            .checkpointable_owned_child_admission_checks(&running.task, &registry)
+            .unwrap();
+        let parent_key =
+            format!("runtime/checkpointable-root-binding/v1/{}", root.task.id()).into_bytes();
+        let parent = store.get(&parent_key).unwrap().unwrap();
+        let mut bad_parent: Value = serde_json::from_slice(&parent.value).unwrap();
+        bad_parent["arguments"] = json!({"forged":true});
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: parent_key.clone(),
+                    expected: durable_store::Expected::Version(parent.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key: parent_key.clone(),
+                    value: serde_json::to_vec(&bad_parent).unwrap(),
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            harness
+                .checkpointable_owned_child_admission_checks(&running.task, &registry)
+                .is_err()
+        );
+        if graph_aba == 10 {
+            let modified = store.get(&parent_key).unwrap().unwrap();
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: parent_key.clone(),
+                        expected: durable_store::Expected::Version(modified.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: parent_key,
+                        value: parent.value,
+                    }],
+                )
+                .unwrap();
+            let checks = harness
+                .checkpointable_owned_child_admission_checks(&running.task, &registry)
+                .unwrap();
+            let conversation_key = format!("runtime/conversation/{conversation}").into_bytes();
+            let current = store.get(&conversation_key).unwrap().unwrap();
+            let mut changed: Value = serde_json::from_slice(&current.value).unwrap();
+            changed["extensions"] = json!([]);
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: conversation_key.clone(),
+                        expected: durable_store::Expected::Version(current.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: conversation_key,
+                        value: serde_json::to_vec(&changed).unwrap(),
+                    }],
+                )
+                .unwrap();
+            assert!(matches!(
+                store.commit(&checks, &[]),
+                Err(durable_store::Error::Conflict { .. })
+            ));
+            assert!(
+                harness
+                    .checkpointable_owned_child_admission_checks(&running.task, &registry)
+                    .is_err()
+            );
+        }
+        return;
+    }
+    #[cfg(feature = "experimental-graph-revision")]
+    if graph_aba == 8 {
+        let child = unsafe_owned.unwrap();
+        std::fs::write(dir.path().join("hold-owned-child"), b"hold").unwrap();
+        drop(store);
+        drop(harness);
+        let mut worker = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::woken_any_child_drain_worker",
+            ])
+            .env("PI_TEST_WOKEN_ANY_DIR", dir.path())
+            .env("PI_TEST_WOKEN_ANY_RESUME", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let marker = format!(
+            "runtime/woken-owned-child-reservation/v1/{}/{child}",
+            root.task.id()
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let store = durable_store::Store::open(&path).unwrap();
+                if store.get(marker.as_bytes()).unwrap().is_some() {
+                    break;
+                }
+                assert!(worker.try_wait().unwrap().is_none());
+                drop(store);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let _ = worker.kill();
+            let _ = worker.wait();
+            let store = durable_store::Store::open(&path).unwrap();
+            panic!(
+                "child marker missing: {:?}",
+                crate::task_store::TaskStore::new(&store).list().unwrap()
+            );
+        });
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let entry = store.get(marker.as_bytes()).unwrap().unwrap();
+        let child_record = crate::task_store::TaskStore::new(&store)
+            .load(child)
+            .unwrap()
+            .unwrap();
+        let (owned_root, checks) =
+            crate::runtime::woken_owned_child_reservation_checks(&store, &child_record).unwrap();
+        assert_eq!(owned_root, root.task.id());
+        store.commit(&checks, &[]).unwrap();
+        let (options, registry, _) = build_woken_any(&path);
+        let reopened = crate::runtime::Harness::open_paused(&path, options).unwrap();
+        assert!(
+            reopened
+                .checkpointable_owned_child_admission_checks(&child_record.task, &registry)
+                .is_err(),
+            "reservation evidence alone cannot authorize an idle conversation"
+        );
+        drop(reopened);
+        let other = crate::task::Task::new(
+            uuid::Uuid::new_v4(),
+            crate::task::TaskOwner::Conversation(uuid::Uuid::new_v4()),
+            crate::task::Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("owned-independent".into(), true);
+        store
+            .commit(
+                &[],
+                &[durable_store::Mutation::Put {
+                    key: crate::task_store::key(other.id()),
+                    value: serde_json::to_vec(&other).unwrap(),
+                }],
+            )
+            .unwrap();
+        let (_, checks) =
+            crate::runtime::woken_owned_child_reservation_checks(&store, &child_record).unwrap();
+        store.commit(&checks, &[]).unwrap();
+        let graph = store
+            .get(&crate::runtime::woken_owned_graph_key(root.task.id()))
+            .unwrap()
+            .unwrap();
+        let graph: crate::runtime::WokenOwnedGraphEvidence =
+            serde_json::from_slice(&graph.value).unwrap();
+        let prior_version = graph.structure.unwrap().root_revision.unwrap();
+        let revision_key = durable_store::graph_revision::task_structure_revision(root.task.id());
+        let prior_commit = store
+            .commit_for_version(&revision_key, prior_version)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .commit_for_version(marker.as_bytes(), entry.version)
+                .unwrap(),
+            store
+                .next_commit_for_key(&revision_key, prior_commit)
+                .unwrap()
+        );
+        let edge_key = crate::ownership_edge::edge_key(conversation);
+        let edge = store.get(&edge_key).unwrap().unwrap();
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: edge_key.clone(),
+                    expected: durable_store::Expected::Version(edge.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key: edge_key,
+                    value: edge.value,
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        assert!(
+            crate::runtime::woken_owned_child_reservation_checks(&store, &child_record).is_err()
+        );
+        return;
+    }
     let recovered = crate::task_store::TaskStore::new(&store)
         .load(root.task.id())
         .unwrap()
@@ -7973,6 +8831,1013 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
         recovered.task.woken_interrupted_attempt(),
         root.task.attempt_id()
     );
+    let evidence_key = crate::runtime::woken_owned_graph_key(root.task.id());
+    let evidence_entry = store.get(&evidence_key).unwrap().unwrap();
+    let evidence: crate::runtime::WokenOwnedGraphEvidence =
+        serde_json::from_slice(&evidence_entry.value).unwrap();
+    assert_eq!(evidence.root, root.task.id());
+    assert_eq!(Some(evidence.interrupted_attempt), root.task.attempt_id());
+    assert_eq!(
+        evidence.edges.len(),
+        if additional_conversation.is_some() {
+            2
+        } else {
+            1
+        }
+    );
+    assert!(
+        evidence
+            .edges
+            .iter()
+            .any(|edge| edge.edge.child == conversation)
+    );
+    let graph_commit = store
+        .commit_for_version(&evidence_key, evidence_entry.version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .commit_for_version(&crate::task_store::key(root.task.id()), recovered.version)
+            .unwrap(),
+        Some(graph_commit)
+    );
+    let conversation_key = format!("runtime/conversation/{conversation}").into_bytes();
+    let conversation_entry = store.get(&conversation_key).unwrap().unwrap();
+    assert_eq!(
+        store
+            .commit_for_version(&conversation_key, conversation_entry.version)
+            .unwrap(),
+        Some(graph_commit)
+    );
+
+    if conflict {
+        let path = path.clone();
+        crate::runtime::before_owned_cleanup_final_commit(conversation, move || {
+            let store = durable_store::Store::open(path).unwrap();
+            let key = crate::runtime::owned_cleanup_key(conversation);
+            let marker = store.get(&key).unwrap().unwrap();
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Version(marker.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: marker.value,
+                    }],
+                )
+                .unwrap();
+        });
+    }
+    let cleanup = harness
+        .drive_owned_cleanup_fenced(conversation, &pi_rs_core::CancellationToken::new())
+        .await;
+    if conflict {
+        assert!(cleanup.is_err());
+        assert!(harness.conversation(conversation).unwrap().abort_requested);
+        assert!(
+            store
+                .get(&crate::runtime::owned_cleanup_key(conversation))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .list(format!("runtime/owned-cleanup-receipt/v1/{conversation}/").as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+        drop(store);
+        drop(harness);
+        let (options, _, _) = build_woken_any(&path);
+        let reopened = crate::runtime::Harness::open_paused(&path, options).unwrap();
+        assert!(reopened.conversation(conversation).unwrap().abort_requested);
+        assert!(
+            durable_store::Store::open(&path)
+                .unwrap()
+                .get(&crate::runtime::owned_cleanup_key(conversation))
+                .unwrap()
+                .is_some()
+        );
+        return;
+    }
+    cleanup.unwrap();
+    if let Some(additional) = additional_conversation {
+        harness
+            .drive_owned_cleanup_fenced(additional, &pi_rs_core::CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!harness.conversation(additional).unwrap().abort_requested);
+    }
+    assert!(!harness.conversation(conversation).unwrap().abort_requested);
+    assert!(
+        store
+            .get(&crate::runtime::owned_cleanup_key(conversation))
+            .unwrap()
+            .is_none()
+    );
+    let prefix = format!("runtime/owned-cleanup-receipt/v1/{conversation}/");
+    let receipts = store.list(prefix.as_bytes()).unwrap();
+    assert_eq!(receipts.len(), 1);
+    let (receipt_key, receipt_entry) = &receipts[0];
+    let receipt: crate::runtime::OwnedCleanupReceipt =
+        serde_json::from_slice(&receipt_entry.value).unwrap();
+    assert_eq!(receipt.conversation, conversation);
+    assert_eq!(receipt.edge.child, conversation);
+    assert_eq!(receipt.edge.task, root.task.id());
+    let finished = store.get(&conversation_key).unwrap().unwrap();
+    let receipt_commit = store
+        .commit_for_version(receipt_key, receipt_entry.version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .commit_for_version(&conversation_key, finished.version)
+            .unwrap(),
+        Some(receipt_commit)
+    );
+    let start_commit = store
+        .commit_for_version(
+            &crate::runtime::owned_cleanup_key(conversation),
+            receipt.marker_version,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(start_commit < receipt_commit);
+    #[cfg(feature = "experimental-graph-revision")]
+    if matches!(graph_aba, 7 | 21) {
+        assert!(
+            harness
+                .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
+                .is_err()
+        );
+        if graph_aba == 21 {
+            let id = root.task.id();
+            drop(store);
+            drop(harness);
+            let (scheduler, driver) = start_woken_any_scheduler(&path);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(!dir.path().join("parent-cancel").exists());
+            let held = driver.get(id).unwrap().unwrap();
+            assert!(held.abort_requested());
+            assert!(!matches!(held.state(), TaskState::Succeeded(_)));
+            assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+            scheduler.shutdown().await.unwrap();
+        }
+        return;
+    }
+    #[cfg(not(feature = "experimental-graph-revision"))]
+    if graph_aba == 26 {
+        let root_id = root.task.id();
+        drop(store);
+        drop(harness);
+        let (scheduler, driver) = start_woken_any_scheduler(&path);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!dir.path().join("parent-cancel").exists());
+        assert!(!matches!(
+            driver.get(root_id).unwrap().unwrap().state(),
+            TaskState::Succeeded(_)
+        ));
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+        scheduler.shutdown().await.unwrap();
+        return;
+    }
+    #[cfg(not(feature = "experimental-graph-revision"))]
+    assert!(
+        harness
+            .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
+            .is_err()
+    );
+    #[cfg(feature = "experimental-graph-revision")]
+    {
+        // Normal cleanup state changes and a different graph must not
+        // invalidate this graph's structural revision.
+        let tasks = crate::task_store::TaskStore::new(&store);
+        let child = tasks
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|item| {
+                item.task.owner() == &crate::task::TaskOwner::Task(root.task.id())
+                    && !item.task.is_terminal()
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                harness.replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap()),
+                Err(crate::runtime::Error::Invalid(reason)) if reason == "owned task cleanup incomplete"
+            ),
+            "a live direct task descendant must not be accepted as drained"
+        );
+        tasks.update(&child, |task| task.cancel()).unwrap();
+        let unrelated = harness
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        let unrelated_task = crate::task::Task::new(
+            uuid::Uuid::new_v4(),
+            crate::task::TaskOwner::Conversation(unrelated),
+            crate::task::Checkpoint {
+                phase: "initial".into(),
+                data: json!({}),
+            },
+            3,
+        )
+        .unwrap()
+        .registered("other".into(), true);
+        tasks
+            .save(&[crate::task_store::Save::Create(&unrelated_task)])
+            .unwrap();
+        if graph_aba == 22 {
+            // Simulate a store opened after its commit-history migration: older
+            // writes have no complete commit provenance, even if live rows exist.
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            raw.execute("UPDATE durable_commit_meta SET legacy_version = (SELECT version FROM durable_store_meta WHERE id=1) WHERE id=1", []).unwrap();
+            drop(raw);
+            assert!(
+                matches!(harness.replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap()),
+                Err(crate::runtime::Error::Invalid(reason)) if reason == "legacy owned graph requires reconciliation")
+            );
+            let id = root.task.id();
+            drop(store);
+            drop(harness);
+            let (scheduler, driver) = start_woken_any_scheduler(&path);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(!dir.path().join("parent-cancel").exists());
+            assert!(driver.get(id).unwrap().unwrap().abort_requested());
+            assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+            scheduler.shutdown().await.unwrap();
+            return;
+        }
+        let checks = harness
+            .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
+            .unwrap();
+        store.commit(&checks, &[]).unwrap();
+        if matches!(graph_aba, 17 | 18 | 19 | 20 | 23) {
+            let root_id = root.task.id();
+            drop(store);
+            drop(harness);
+            let (options, registry, extensions) = build_woken_any(&path);
+            let mut scheduler =
+                Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+            let selection_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let mut worker = scheduler.subagent_harness().worker();
+                let observed = selection_observed.clone();
+                let marker_path = path.clone();
+                crate::task_scheduler::on_conversation_start_result(root_id, move || {
+                    let store = durable_store::Store::open(marker_path).unwrap();
+                    assert!(matches!(
+                        crate::conversation_signal::clear_callback_start_check(
+                            &store,
+                            conversation
+                        ),
+                        Err(crate::conversation_signal::Error::CallbackStartBusy)
+                    ));
+                    if let Some(additional) = additional_conversation {
+                        assert!(matches!(
+                            crate::conversation_signal::clear_callback_start_check(
+                                &store, additional
+                            ),
+                            Err(crate::conversation_signal::Error::CallbackStartBusy)
+                        ));
+                    }
+                    assert!(matches!(
+                        worker.submit(conversation, None, "new work".into()),
+                        Err(crate::runtime::Error::TaskPublicationBusy)
+                    ));
+                    if let Some(additional) = additional_conversation {
+                        assert!(matches!(
+                            worker.submit(additional, None, "new work".into()),
+                            Err(crate::runtime::Error::TaskPublicationBusy)
+                        ));
+                    }
+                    if matches!(graph_aba, 18 | 20 | 23) {
+                        assert!(matches!(
+                            worker.uninstall_extension("policy"),
+                            Err(crate::runtime::Error::TaskPublicationBusy)
+                        ));
+                    }
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+            let driver = scheduler.start_tasks(registry).unwrap();
+            if graph_aba == 23 {
+                let store = durable_store::Store::open(&path).unwrap();
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    while !crate::async_task_tool::read_unsafe_durable_receipts(&store, root_id).unwrap().iter()
+                        .any(|receipt| matches!(&receipt.outcome, Outcome::Pending { reference } if reference == "late-owned-work")) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                assert!(
+                    store
+                        .get(&crate::task_scheduler::woken_conversation_receipt_key(
+                            root_id
+                        ))
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join("parent-cancel"))
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    1
+                );
+                let held = driver.get(root_id).unwrap().unwrap();
+                assert!(!matches!(held.state(), TaskState::Succeeded(_)));
+                drop(store);
+                assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+                scheduler.shutdown().await.unwrap();
+                return;
+            }
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if driver.get(root_id).unwrap().unwrap().is_terminal() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let final_task = driver.get(root_id).unwrap().unwrap();
+            assert!(
+                matches!(final_task.state(), TaskState::Failed(reason) if reason.contains("reconciliation")),
+                "{final_task:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("parent-cancel"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            let receipt_key = crate::task_scheduler::woken_conversation_receipt_key(root_id);
+            let store = durable_store::Store::open(&path).unwrap();
+            assert!(selection_observed.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                crate::conversation_signal::clear_callback_start_check(&store, conversation)
+                    .is_ok()
+            );
+            if let Some(additional) = additional_conversation {
+                assert!(
+                    crate::conversation_signal::clear_callback_start_check(&store, additional)
+                        .is_ok()
+                );
+            }
+            let receipt: crate::task_scheduler::WokenConversationCancelReceipt =
+                serde_json::from_slice(&store.get(&receipt_key).unwrap().unwrap().value).unwrap();
+            assert_eq!(receipt.result, "callback returned");
+            assert_eq!(
+                receipt.version,
+                if matches!(graph_aba, 18 | 20) { 2 } else { 1 }
+            );
+            if matches!(graph_aba, 18 | 20) {
+                assert!(selection_observed.load(std::sync::atomic::Ordering::SeqCst));
+                let crate::task::TaskOwner::Conversation(owner) = final_task.owner() else {
+                    panic!("missing conversation");
+                };
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if scheduler.conversation(*owner).unwrap().messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content.contains("after cancel"))) { break; }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.unwrap();
+            }
+            drop(store);
+            assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+            scheduler.shutdown().await.unwrap();
+            let (scheduler, driver) = start_woken_any_scheduler(&path);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert!(driver.get(root_id).unwrap().unwrap().is_terminal());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("parent-cancel"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+            scheduler.shutdown().await.unwrap();
+            return;
+        }
+        if graph_aba == 14 {
+            let evidence_key = crate::runtime::woken_owned_graph_key(root.task.id());
+            let edge_key = crate::ownership_edge::edge_key(conversation);
+            let evidence = store.get(&evidence_key).unwrap().unwrap();
+            let edge = store.get(&edge_key).unwrap().unwrap();
+            store
+                .commit(
+                    &[
+                        durable_store::Check {
+                            key: evidence_key.clone(),
+                            expected: durable_store::Expected::Version(evidence.version),
+                        },
+                        durable_store::Check {
+                            key: edge_key.clone(),
+                            expected: durable_store::Expected::Version(edge.version),
+                        },
+                    ],
+                    &[
+                        durable_store::Mutation::Delete { key: evidence_key },
+                        durable_store::Mutation::Delete { key: edge_key },
+                    ],
+                )
+                .unwrap();
+            assert!(matches!(
+                store.commit(&checks, &[]),
+                Err(durable_store::Error::Conflict { .. })
+            ));
+            assert!(
+                harness
+                    .woken_owned_graph_checks_if_required(&recovered, store.put_version().unwrap())
+                    .is_err()
+            );
+            return;
+        }
+        if graph_aba == 6 {
+            drop(store);
+            drop(harness);
+            let mut worker = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "conversation_claim_boundary_tests::woken_any_child_drain_worker",
+                ])
+                .env("PI_TEST_WOKEN_ANY_DIR", dir.path())
+                .env("PI_TEST_WOKEN_ANY_RESUME", "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let marker = format!("runtime/woken-owned-reservation/v1/{}", root.task.id());
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let store = durable_store::Store::open(&path).unwrap();
+                    if store.get(marker.as_bytes()).unwrap().is_some() {
+                        break;
+                    }
+                    assert!(worker.try_wait().unwrap().is_none());
+                    drop(store);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            worker.kill().unwrap();
+            worker.wait().unwrap();
+            let store = durable_store::Store::open(&path).unwrap();
+            let entry = store.get(marker.as_bytes()).unwrap().unwrap();
+            let reservation: Value = serde_json::from_slice(&entry.value).unwrap();
+            let revision = durable_store::graph_revision::task_structure_revision(root.task.id());
+            let revision_entry = store.get(&revision).unwrap().unwrap();
+            assert_eq!(
+                store
+                    .commit_for_version(marker.as_bytes(), entry.version)
+                    .unwrap(),
+                store
+                    .commit_for_version(&revision, revision_entry.version)
+                    .unwrap(),
+            );
+            assert_eq!(reservation["running"]["id"], json!(root.task.id()));
+            return;
+        }
+        let proof_root = if graph_aba == 4
+            || graph_aba == 5
+            || graph_aba == 11
+            || graph_aba == 12
+            || graph_aba == 13
+            || graph_aba == 15
+            || graph_aba == 16
+            || graph_aba == 24
+            || graph_aba == 25
+        {
+            let mut running = recovered.clone();
+            running.task.start_attempt(uuid::Uuid::new_v4()).unwrap();
+            let (reservation_checks, marker) =
+                crate::runtime::prepare_woken_owned_reservation(&store, &recovered, &running.task)
+                    .unwrap()
+                    .unwrap();
+            let mut batch = tasks
+                .prepare_save(&[crate::task_store::Save::Update(&running)])
+                .unwrap();
+            batch.checks.extend(reservation_checks);
+            batch.mutations.push(marker);
+            store.commit(&batch.checks, &batch.mutations).unwrap();
+            let running = tasks.load(root.task.id()).unwrap().unwrap();
+            let new_checks = harness
+                .replay_safe_woken_owned_cleanup_checks(&running, store.put_version().unwrap())
+                .unwrap();
+            store.commit(&new_checks, &[]).unwrap();
+            if graph_aba == 15 {
+                let key = crate::task_store::key(root.task.id());
+                let original = store.get(&key).unwrap().unwrap();
+                let mut changed: Value = serde_json::from_slice(&original.value).unwrap();
+                changed["state"] = json!("Ready");
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(original.version),
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key: key.clone(),
+                            value: serde_json::to_vec(&changed).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+                let changed_entry = store.get(&key).unwrap().unwrap();
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(changed_entry.version),
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: original.value,
+                        }],
+                    )
+                    .unwrap();
+                let current = tasks.load(root.task.id()).unwrap().unwrap();
+                assert!(matches!(
+                    store.commit(&new_checks, &[]),
+                    Err(durable_store::Error::Conflict { .. })
+                ));
+                assert!(
+                    harness
+                        .replay_safe_woken_owned_cleanup_checks(
+                            &current,
+                            store.put_version().unwrap()
+                        )
+                        .is_err()
+                );
+                return;
+            }
+            if graph_aba == 11 {
+                let mut forged = serde_json::to_value(&running.task).unwrap();
+                forged["state"] = json!({"Failed":"interrupted"});
+                forged["retired_attempt_id"] = json!(running.task.attempt_id().unwrap());
+                forged.as_object_mut().unwrap().remove("attempt_id");
+                let key = crate::task_store::key(root.task.id());
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(running.version),
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: serde_json::to_vec(&forged).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+                let failed = tasks.load(root.task.id()).unwrap().unwrap();
+                assert!(
+                    harness
+                        .replay_safe_woken_owned_cleanup_checks(
+                            &failed,
+                            store.put_version().unwrap()
+                        )
+                        .is_err()
+                );
+                return;
+            }
+            if matches!(graph_aba, 12 | 13 | 16 | 24 | 25) {
+                let boundary = store.put_version().unwrap();
+                let (claim, claim_checks) =
+                    crate::task_scheduler::prepare_woken_conversation_cancel_claim(
+                        &store,
+                        &running.task,
+                        uuid::Uuid::new_v4(),
+                        crate::async_task_tool::ConversationCancelPolicy::AtMostOnce,
+                        boundary,
+                    )
+                    .unwrap();
+                let claim_key = crate::task_scheduler::woken_conversation_claim_key(root.task.id());
+                let mut checks = claim_checks;
+                checks.push(durable_store::Check {
+                    key: claim_key.clone(),
+                    expected: durable_store::Expected::Missing,
+                });
+                store
+                    .commit(
+                        &checks,
+                        &[durable_store::Mutation::Put {
+                            key: claim_key,
+                            value: serde_json::to_vec(&claim).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+                if graph_aba == 24 {
+                    let marker = b"owned-callback-marker";
+                    let (ids, batch) = crate::task_scheduler::prepare_woken_owned_callback_start(
+                        &store, &claim, marker,
+                    )
+                    .unwrap();
+                    assert_eq!(ids, vec![conversation]);
+                    store.commit(&batch.checks, &batch.mutations).unwrap();
+                    assert!(matches!(
+                        crate::conversation_signal::clear_callback_start_check(
+                            &store,
+                            conversation
+                        ),
+                        Err(crate::conversation_signal::Error::CallbackStartBusy)
+                    ));
+                    assert!(
+                        crate::task_scheduler::prepare_woken_owned_callback_finish(
+                            &store,
+                            &claim,
+                            b"different"
+                        )
+                        .is_err()
+                    );
+                    let reopened = durable_store::Store::open(&path).unwrap();
+                    let finish = crate::task_scheduler::prepare_woken_owned_callback_finish(
+                        &reopened, &claim, marker,
+                    )
+                    .unwrap();
+                    let key =
+                        crate::task_scheduler::woken_owned_callback_markers_key(root.task.id());
+                    let entry = store.get(&key).unwrap().unwrap();
+                    store
+                        .commit(
+                            &[durable_store::Check {
+                                key: key.clone(),
+                                expected: durable_store::Expected::Version(entry.version),
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key,
+                                value: entry.value,
+                            }],
+                        )
+                        .unwrap();
+                    assert!(matches!(
+                        reopened.commit(&finish.checks, &finish.mutations),
+                        Err(durable_store::Error::Conflict { .. })
+                    ));
+                    let finish = crate::task_scheduler::prepare_woken_owned_callback_finish(
+                        &reopened, &claim, marker,
+                    )
+                    .unwrap();
+                    reopened.commit(&finish.checks, &finish.mutations).unwrap();
+                    assert!(
+                        crate::conversation_signal::clear_callback_start_check(
+                            &reopened,
+                            conversation
+                        )
+                        .is_ok()
+                    );
+                    return;
+                }
+                let snapshot_key =
+                    format!("runtime/conversation/{}", claim.conversation).into_bytes();
+                let snapshot_version = store.get(&snapshot_key).unwrap().unwrap().version;
+                let after = json!({"task_content_v1":{"isError":true,"output":[{"type":"text","text":"aborted"}],"diagnostics":[{"severity":"error","code":"aborted","message":"Tool was aborted"}]}});
+                crate::async_task_tool::validate_aborted_after_result(&after).unwrap();
+                let receipt = crate::task_scheduler::WokenConversationCancelReceipt {
+                    version: 2,
+                    claim: claim.clone(),
+                    result: "callback returned".into(),
+                    after_result: Some(after),
+                    snapshot_version: Some(snapshot_version),
+                };
+                let receipt_key =
+                    crate::task_scheduler::woken_conversation_receipt_key(root.task.id());
+                let marker = b"owned-result-fixture";
+                let (_, start) = crate::task_scheduler::prepare_woken_owned_callback_start(
+                    &store, &claim, marker,
+                )
+                .unwrap();
+                store.commit(&start.checks, &start.mutations).unwrap();
+                let mut finish = crate::task_scheduler::prepare_woken_owned_callback_finish(
+                    &store, &claim, marker,
+                )
+                .unwrap();
+                finish.checks.push(durable_store::Check {
+                    key: receipt_key.clone(),
+                    expected: durable_store::Expected::Missing,
+                });
+                finish.mutations.push(durable_store::Mutation::Put {
+                    key: receipt_key.clone(),
+                    value: serde_json::to_vec(&receipt).unwrap(),
+                });
+                store.commit(&finish.checks, &finish.mutations).unwrap();
+                let receipt_version = store.get(&receipt_key).unwrap().unwrap().version;
+                let mut failed = running.clone();
+                failed
+                    .task
+                    .fail("interrupted woken execution; reconciliation required".into())
+                    .unwrap();
+                let terminal = crate::task_scheduler::WokenConversationCancelTerminalMarker {
+                    version: 1,
+                    claim_id: claim.claim_id,
+                    cleanup_attempt: claim.cleanup_attempt,
+                    woken_attempt: claim.woken_attempt,
+                    running_task_version: running.version,
+                    terminal_task: failed.task.clone(),
+                    receipt_version,
+                };
+                let terminal_key =
+                    crate::task_scheduler::woken_conversation_terminal_key(root.task.id());
+                let mut batch = tasks
+                    .prepare_save(&[crate::task_store::Save::Update(&failed)])
+                    .unwrap();
+                batch.checks.push(durable_store::Check {
+                    key: terminal_key.clone(),
+                    expected: durable_store::Expected::Missing,
+                });
+                batch.mutations.push(durable_store::Mutation::Put {
+                    key: terminal_key,
+                    value: serde_json::to_vec(&terminal).unwrap(),
+                });
+                store.commit(&batch.checks, &batch.mutations).unwrap();
+                let failed = tasks.load(root.task.id()).unwrap().unwrap();
+                let checks = harness
+                    .replay_safe_woken_owned_cleanup_checks(&failed, store.put_version().unwrap())
+                    .unwrap();
+                store.commit(&checks, &[]).unwrap();
+                let (uncertain, publication_checks, _leases) =
+                    crate::task_scheduler::authenticated_woken_terminal_descendants(
+                        &store,
+                        &failed,
+                        &tasks.list().unwrap(),
+                        store.put_version().unwrap(),
+                        &registry,
+                        &harness,
+                    )
+                    .unwrap();
+                assert!(uncertain.is_none());
+                store.commit(&publication_checks, &[]).unwrap();
+                if graph_aba == 25 {
+                    let key =
+                        crate::task_scheduler::woken_owned_marker_retirement_key(root.task.id());
+                    let retirement = store.get(&key).unwrap().unwrap();
+                    store
+                        .commit(
+                            &[durable_store::Check {
+                                key: key.clone(),
+                                expected: durable_store::Expected::Version(retirement.version),
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key,
+                                value: retirement.value,
+                            }],
+                        )
+                        .unwrap();
+                    assert!(matches!(
+                        store.commit(&publication_checks, &[]),
+                        Err(durable_store::Error::Conflict { .. })
+                    ));
+                    assert!(
+                        crate::task_scheduler::authenticated_woken_terminal_descendants(
+                            &store,
+                            &failed,
+                            &tasks.list().unwrap(),
+                            store.put_version().unwrap(),
+                            &registry,
+                            &harness,
+                        )
+                        .is_err()
+                    );
+                    return;
+                }
+                if graph_aba == 16 {
+                    let key = crate::ownership_edge::edge_key(conversation);
+                    let edge = store.get(&key).unwrap().unwrap();
+                    store
+                        .commit(
+                            &[durable_store::Check {
+                                key: key.clone(),
+                                expected: durable_store::Expected::Version(edge.version),
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key,
+                                value: edge.value,
+                            }],
+                        )
+                        .unwrap();
+                    assert!(matches!(
+                        store.commit(&publication_checks, &[]),
+                        Err(durable_store::Error::Conflict { .. })
+                    ));
+                    assert!(
+                        crate::task_scheduler::authenticated_woken_terminal_descendants(
+                            &store,
+                            &failed,
+                            &tasks.list().unwrap(),
+                            store.put_version().unwrap(),
+                            &registry,
+                            &harness,
+                        )
+                        .is_err()
+                    );
+                    return;
+                }
+                if graph_aba == 13 {
+                    let late = format!(
+                        "durable/unsafe-park-async/{}/{}/intent/receipt",
+                        root.task.id(),
+                        claim.woken_attempt
+                    )
+                    .into_bytes();
+                    store
+                        .commit(
+                            &[durable_store::Check {
+                                key: late.clone(),
+                                expected: durable_store::Expected::Missing,
+                            }],
+                            &[durable_store::Mutation::Put {
+                                key: late,
+                                value: b"late".to_vec(),
+                            }],
+                        )
+                        .unwrap();
+                    assert!(matches!(
+                        store.commit(&checks, &[]),
+                        Err(durable_store::Error::Conflict { .. })
+                    ));
+                    assert!(matches!(
+                        store.commit(&publication_checks, &[]),
+                        Err(durable_store::Error::Conflict { .. })
+                    ));
+                    assert!(
+                        harness
+                            .replay_safe_woken_owned_cleanup_checks(
+                                &failed,
+                                store.put_version().unwrap()
+                            )
+                            .is_err()
+                    );
+                    return;
+                }
+                let receipt_entry = store.get(&receipt_key).unwrap().unwrap();
+                let mut forged = receipt.clone();
+                forged.claim.cleanup_attempt = uuid::Uuid::new_v4();
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: receipt_key.clone(),
+                            expected: durable_store::Expected::Version(receipt_entry.version),
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key: receipt_key,
+                            value: serde_json::to_vec(&forged).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    store.commit(&checks, &[]),
+                    Err(durable_store::Error::Conflict { .. })
+                ));
+                assert!(
+                    harness
+                        .replay_safe_woken_owned_cleanup_checks(
+                            &failed,
+                            store.put_version().unwrap()
+                        )
+                        .is_err()
+                );
+                return;
+            }
+            if graph_aba == 4 {
+                let key = crate::task_store::key(child.task.id());
+                let original = store.get(&key).unwrap().unwrap();
+                let mut changed: Value = serde_json::from_slice(&original.value).unwrap();
+                changed["attempt_id"] = json!(uuid::Uuid::new_v4());
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(original.version),
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: serde_json::to_vec(&changed).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+            }
+            running
+        } else {
+            recovered.clone()
+        };
+        if graph_aba == 4 || graph_aba == 5 {
+            // The child mutation above must invalidate both proof generations.
+        } else if graph_aba >= 2 {
+            let key = crate::task_store::key(child.task.id());
+            let original = store.get(&key).unwrap().unwrap();
+            let mut changed: Value = serde_json::from_slice(&original.value).unwrap();
+            if graph_aba == 2 {
+                changed["state"] = json!("Running");
+            } else {
+                assert_eq!(changed["abort_requested"], json!(true));
+                changed["abort_requested"] = json!(false);
+            }
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Version(original.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: key.clone(),
+                        value: serde_json::to_vec(&changed).unwrap(),
+                    }],
+                )
+                .unwrap();
+            let effect = format!("test/owned-aba-effect/{graph_aba}").into_bytes();
+            store
+                .commit(
+                    &[],
+                    &[durable_store::Mutation::Put {
+                        key: effect.clone(),
+                        value: b"executed".to_vec(),
+                    }],
+                )
+                .unwrap();
+            let changed_entry = store.get(&key).unwrap().unwrap();
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Version(changed_entry.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: original.value,
+                    }],
+                )
+                .unwrap();
+            assert_eq!(store.get(&effect).unwrap().unwrap().value, b"executed");
+        } else if graph_aba == 1 {
+            let child = crate::task::Task::new(
+                uuid::Uuid::new_v4(),
+                crate::task::TaskOwner::Conversation(conversation),
+                crate::task::Checkpoint {
+                    phase: "initial".into(),
+                    data: json!({}),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("legacy-child".into(), true);
+            let key = crate::task_store::key(child.id());
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: key.clone(),
+                        value: serde_json::to_vec(&child).unwrap(),
+                    }],
+                )
+                .unwrap();
+            let entry = store.get(&key).unwrap().unwrap();
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Version(entry.version),
+                    }],
+                    &[durable_store::Mutation::Delete { key }],
+                )
+                .unwrap();
+        } else {
+            // Even a byte-identical replacement changes edge authority.
+            let edge_key = crate::ownership_edge::edge_key(conversation);
+            let edge = store.get(&edge_key).unwrap().unwrap();
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: edge_key.clone(),
+                        expected: durable_store::Expected::Version(edge.version),
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: edge_key,
+                        value: edge.value,
+                    }],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+        let proof = harness
+            .replay_safe_woken_owned_cleanup_checks(&proof_root, store.put_version().unwrap());
+        assert_eq!(proof.is_ok(), graph_aba == 5);
+    }
+    #[cfg(not(feature = "experimental-graph-revision"))]
+    let _ = graph_aba;
     drop(store);
     drop(harness);
     let options = Options {
@@ -7985,13 +9850,28 @@ async fn interrupted_woken_graph_abort_commits_wake_and_owned_conversation_toget
         uncertain_policy: UncertainPolicy::RequireReconciliation,
     };
     let reopened = crate::runtime::Harness::open_paused(&path, options).unwrap();
-    assert!(reopened.conversation(conversation).unwrap().abort_requested);
+    assert!(!reopened.conversation(conversation).unwrap().abort_requested);
     let store = durable_store::Store::open(&path).unwrap();
     let saved = crate::task_store::TaskStore::new(&store)
         .load(root.task.id())
         .unwrap()
         .unwrap();
-    assert_eq!(saved.task, recovered.task);
+    if graph_aba == 4 || graph_aba == 5 {
+        assert_eq!(saved.task.state(), &TaskState::Running);
+        assert_eq!(
+            saved.task.woken_interrupted_attempt(),
+            recovered.task.woken_interrupted_attempt()
+        );
+    } else {
+        assert_eq!(saved.task, recovered.task);
+    }
+    #[cfg(feature = "experimental-graph-revision")]
+    if graph_aba == 5 {
+        let proof = reopened
+            .replay_safe_woken_owned_cleanup_checks(&saved, store.put_version().unwrap())
+            .unwrap();
+        store.commit(&proof, &[]).unwrap();
+    }
 }
 
 #[tokio::test]
@@ -8787,6 +10667,90 @@ async fn nested_woken_real_callback_records_receipt_once() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn nested_woken_with_owned_conversation_remains_fail_closed() {
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let mut initial = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "conversation_claim_boundary_tests::nested_woken_evidence_worker",
+        ])
+        .env("PI_TEST_NESTED_WOKEN_DIR", dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !dir.path().join("nested-woken").exists() {
+            assert!(initial.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    initial.kill().unwrap();
+    initial.wait().unwrap();
+    let path = dir.path().join("db");
+    let options = Options {
+        model: Arc::new(ModelStub {
+            arguments: "{}".into(),
+        }),
+        tools: vec![],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut harness = crate::runtime::Harness::open_paused(&path, options).unwrap();
+    let owned = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let records = crate::task_store::TaskStore::new(&store).list().unwrap();
+    let root = records
+        .iter()
+        .find(|record| matches!(record.task.owner(), crate::task::TaskOwner::Conversation(_)))
+        .unwrap();
+    let child = records
+        .iter()
+        .find(|record| record.task.owner() == &crate::task::TaskOwner::Task(root.task.id()))
+        .unwrap();
+    let edge = crate::ownership_edge::Edge {
+        task: child.task.id(),
+        task_owner: child.task.owner().clone(),
+        child: owned,
+        mode: crate::ownership_edge::Mode::Foreground,
+    };
+    let prepared = crate::ownership_edge::EdgeStore::new(&store)
+        .prepare_create(&edge)
+        .unwrap();
+    store.commit(&prepared.checks, &prepared.mutations).unwrap();
+    drop(store);
+    drop(harness);
+    let mut resumed = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "conversation_claim_boundary_tests::nested_woken_evidence_worker",
+        ])
+        .env("PI_TEST_NESTED_WOKEN_DIR", dir.path())
+        .env("PI_TEST_NESTED_WOKEN_RESUME", "1")
+        .env("PI_TEST_WOKEN_REAL", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(resumed.try_wait().unwrap().is_none());
+    assert!(!dir.path().join("nested-cancelled").exists());
+    resumed.kill().unwrap();
+    resumed.wait().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn nested_woken_live_receipt_settles_without_restart() {
     exercise_nested_woken_live_receipt(false).await;
 }
@@ -9278,4 +11242,223 @@ async fn nested_woken_identity_busy_defers_callback() {
         std::fs::read_to_string(dir.path().join("nested-cancelled")).unwrap(),
         "called\n"
     );
+}
+
+#[tokio::test]
+async fn interrupted_woken_owned_conversation_is_marked_by_driver_before_refusal() {
+    exercise_woken_owned_coordinator(false).await;
+}
+
+#[tokio::test]
+async fn invalid_woken_owned_proof_does_not_stop_independent_work() {
+    exercise_woken_owned_coordinator(true).await;
+}
+
+async fn exercise_woken_owned_coordinator(invalid_proof: bool) {
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let mut process = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "conversation_claim_boundary_tests::woken_any_child_drain_worker",
+        ])
+        .env("PI_TEST_WOKEN_ANY_DIR", dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !dir.path().join("any-woken").exists() {
+            assert!(process.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    process.kill().unwrap();
+    process.wait().unwrap();
+    let path = dir.path().join("db");
+    let (options, _, _) = build_woken_any(&path);
+    let mut harness = crate::runtime::Harness::open_paused(&path, options).unwrap();
+    let conversation = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let independent_conversation = harness
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let root = crate::task_store::TaskStore::new(&store)
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|r| {
+            matches!(r.task.owner(), crate::task::TaskOwner::Conversation(_))
+                && r.task.state() == &TaskState::Running
+        })
+        .unwrap();
+    let edge = crate::ownership_edge::Edge {
+        task: root.task.id(),
+        task_owner: root.task.owner().clone(),
+        child: conversation,
+        mode: crate::ownership_edge::Mode::Foreground,
+    };
+    let prepared = crate::ownership_edge::EdgeStore::new(&store)
+        .prepare_create(&edge)
+        .unwrap();
+    store.commit(&prepared.checks, &prepared.mutations).unwrap();
+    if invalid_proof {
+        let current = crate::task_store::TaskStore::new(&store)
+            .load(root.task.id())
+            .unwrap()
+            .unwrap();
+        let (_, checks) = crate::async_task_tool::unsafe_park_proof::woken_cancel_candidate_checks(
+            &store,
+            &current.task,
+            store.put_version().unwrap(),
+        )
+        .unwrap();
+        let key = checks
+            .iter()
+            .find(|check| matches!(check.expected, durable_store::Expected::Version(_)))
+            .unwrap()
+            .key
+            .clone();
+        let entry = store.get(&key).unwrap().unwrap();
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: key.clone(),
+                    expected: durable_store::Expected::Version(entry.version),
+                }],
+                &[durable_store::Mutation::Put {
+                    key,
+                    value: entry.value,
+                }],
+            )
+            .unwrap();
+    }
+    let mut independent_abort = crate::task::Task::new(
+        uuid::Uuid::from_u128(u128::MAX),
+        crate::task::TaskOwner::Conversation(independent_conversation),
+        crate::task::Checkpoint {
+            phase: "initial".into(),
+            data: json!({}),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("owned-independent".into(), true);
+    independent_abort.request_abort().unwrap();
+    crate::task_store::TaskStore::new(&store)
+        .save(&[crate::task_store::Save::Create(&independent_abort)])
+        .unwrap();
+    drop(store);
+    drop(harness);
+    let conflict_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = conflict_observed.clone();
+    let writer_path = path.clone();
+    let parent = root.task.id();
+    if !invalid_proof {
+        crate::task_scheduler::before_woken_recovery_commit_for_test(parent, move || {
+            use std::sync::atomic::Ordering;
+            let store = durable_store::Store::open(writer_path).unwrap();
+            let mut child = crate::task::Task::new(
+                uuid::Uuid::new_v4(),
+                crate::task::TaskOwner::Task(parent),
+                crate::task::Checkpoint {
+                    phase: "initial".into(),
+                    data: json!({}),
+                },
+                3,
+            )
+            .unwrap()
+            .registered("owned-independent".into(), true);
+            child.cancel().unwrap();
+            let key = crate::task_store::key(child.id());
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key,
+                        value: serde_json::to_vec(&child).unwrap(),
+                    }],
+                )
+                .unwrap();
+            observed.store(true, Ordering::SeqCst);
+        });
+    }
+    let (scheduler, driver) = start_woken_any_scheduler(&path);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !scheduler
+            .conversation(conversation)
+            .unwrap()
+            .abort_requested
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let recovered = driver.get(root.task.id()).unwrap().unwrap();
+    if invalid_proof {
+        assert!(
+            matches!(recovered.state(), TaskState::CompletingFailed(reason) | TaskState::Failed(reason) if reason.contains("reconciliation"))
+        );
+    } else {
+        assert!(conflict_observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(recovered.abort_requested());
+        assert_eq!(
+            recovered.woken_interrupted_attempt(),
+            root.task.attempt_id()
+        );
+    }
+    assert!(!dir.path().join("parent-cancel").exists());
+    let independent = crate::task::Task::new(
+        uuid::Uuid::new_v4(),
+        crate::task::TaskOwner::Conversation(independent_conversation),
+        crate::task::Checkpoint {
+            phase: "initial".into(),
+            data: json!({}),
+        },
+        3,
+    )
+    .unwrap()
+    .registered("owned-independent".into(), true);
+    driver.submit(&independent).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !driver.get(independent.id()).unwrap().unwrap().is_terminal() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        driver.get(independent.id()).unwrap().unwrap().state(),
+        &TaskState::Succeeded(json!("independent"))
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !driver
+            .get(independent_abort.id())
+            .unwrap()
+            .unwrap()
+            .is_terminal()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+    let _ = scheduler.shutdown().await;
 }

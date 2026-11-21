@@ -44,7 +44,18 @@ and park proof to claim, first poll and receipt; a late Tool result blocks
 receipt settlement and remains reconciliation evidence. The callback is polled
 at most once. A successful callback does not determine the interrupted Tool's
 outcome: the task fails for reconciliation and `abort_and_wait` can report
-pending cleanup. Woken roots and children with unsupported or uncertain owned work fail closed. Nested claims bind the exact foreground ancestry; callback markers are retired atomically across it. A stopped callback is never replayed, and a retained child receipt does not resolve the interrupted Tool outcome.
+pending cleanup. Woken roots and nested children with unsupported or uncertain
+owned work fail closed. Nested claims bind the exact foreground ancestry;
+callback markers retire atomically across it. A stopped callback is never
+replayed, and its receipt does not resolve the interrupted Tool outcome.
+With the non-default `experimental-graph-revision` feature, a woken root may
+also cancel after its recorded foreground owned-conversation graph has drained,
+when every task reached through a conversation edge is replay-safe and terminal.
+Legacy stores, missing or changed graph evidence, and unsafe owned-conversation
+tasks remain reconciliation-required. All recorded owned conversations are
+fenced through first poll and their durable markers retire with the receipt or
+unknown outcome. Without this feature, owned-conversation cancellation remains
+disabled.
 A separate `register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_woken_cancel`
 registration runs the replay-safe selected after hook with fenced memo and
 retains its rich result with the callback receipt and snapshot version. An
@@ -149,10 +160,13 @@ to run. Indeterminate commits also remain unresolved rather than being treated
 as uncommitted.
 
 Interrupted-woken cancellation drains foreground task descendants before the
-parent callback. Foreground owned conversations are not yet supported by this
-path: recovery and callback authorization fail closed when one is present.
-Atomic graph marking, conversation-edge authentication and child-conversation
-terminal evidence are not yet connected to production recovery.
+parent callback. When a foreground owned conversation is present, driver
+recovery atomically preserves the wake and marks the foreground graph for abort.
+Without `experimental-graph-revision` the parent callback remains disabled for
+this case. With the feature, callback admission and result publication require
+the authenticated drained graph described above. Invalid wake, binding, legacy,
+or unsafe owned-child evidence remains blocked for reconciliation; it does not
+authorize an external callback.
 
 The sections below describe the earlier stages; references to dispatch being
 disabled apply to those stages and to the original registration.

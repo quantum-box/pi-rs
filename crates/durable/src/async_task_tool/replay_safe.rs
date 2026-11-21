@@ -1882,6 +1882,7 @@ impl Handler for Executor {
                         &_identity_lease,
                         expected,
                         cancel.conversation_cancel_policy(),
+                        &[],
                     )?;
                     std::fs::write(std::path::Path::new(&dir).join("woken-start.tmp"), &marker)
                         .map_err(|e| e.to_string())?;
@@ -2051,6 +2052,17 @@ impl Handler for Executor {
                         cancel.conversation_cancel_policy(),
                     )?;
                     let nested = matches!(task.owner(), crate::task::TaskOwner::Task(_));
+                    #[cfg(feature = "experimental-graph-revision")]
+                    let (owned_ids, owned_leases) = if nested {
+                        (vec![], vec![])
+                    } else {
+                        admission.woken_owned_start_leases()?
+                    };
+                    #[cfg(not(feature = "experimental-graph-revision"))]
+                    let (owned_ids, owned_leases): (
+                        Vec<uuid::Uuid>,
+                        Vec<durable_store::controls::CallbackStartLease>,
+                    ) = (vec![], vec![]);
                     let start = if nested {
                         let (conversation, start) =
                             admission.nested_conversation_callback_start_lease()?;
@@ -2067,7 +2079,10 @@ impl Handler for Executor {
                         &_identity_lease,
                         expected,
                         cancel.conversation_cancel_policy(),
+                        &owned_ids,
                     )?;
+                    #[cfg(test)]
+                    crate::task_scheduler::report_conversation_start_result(task.id());
                     let cancellation = pi_rs_core::CancellationToken::new();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         runtime.block_on(durable_store::controls::with_callback_context(
@@ -2087,15 +2102,17 @@ impl Handler for Executor {
                                     scope,
                                 );
                                 let mut future = std::pin::pin!(future);
-                                let mut leases = Some((start, selection_start));
+                                let mut starts = owned_leases;
+                                starts.push(start);
+                                let mut leases = Some((starts, selection_start));
                                 tokio::time::timeout(
                                     std::time::Duration::from_secs(30),
                                     std::future::poll_fn(|cx| match leases.take() {
-                                        Some((lease, Some(selection))) => {
-                                            selection.poll_first(lease, future.as_mut(), cx)
+                                        Some((leases, Some(selection))) => {
+                                            selection.poll_first_many(leases, future.as_mut(), cx)
                                         }
-                                        Some((lease, None)) => {
-                                            lease.poll_first(future.as_mut(), cx)
+                                        Some((leases, None)) => {
+                                            durable_store::controls::CallbackStartLease::poll_first_many(leases, future.as_mut(), cx)
                                         }
                                         None => future.as_mut().poll(cx),
                                     }),

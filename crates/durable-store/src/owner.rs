@@ -83,7 +83,7 @@ pub struct OwnedStore {
 
 // Dropped after `store`: explicitly unlock the shared open file description so
 // a child temporarily between fork and exec cannot retain an abandoned lock.
-struct OwnerLock {
+pub(crate) struct OwnerLock {
     file: File,
     owner_pid: u32,
 }
@@ -111,49 +111,54 @@ thread_local! {
     static AFTER_OWNER_LOCK: std::cell::RefCell<Option<OwnerLockHook>> = std::cell::RefCell::new(None);
 }
 
+#[cfg(unix)]
+pub(crate) fn acquire_owner_lock(path: &Path) -> Result<(PathBuf, OwnerLock), OwnerError> {
+    let name = path
+        .file_name()
+        .ok_or(OwnerError::InvalidPath("database needs a file name"))?;
+    use std::os::unix::ffi::OsStrExt;
+    if name.as_bytes().ends_with(b".scheduler.lock") {
+        return Err(OwnerError::InvalidPath(
+            "database name uses the reserved lockfile suffix",
+        ));
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let db = fs::canonicalize(parent)?.join(name);
+    validate_file(&db, true)?;
+    let mut lock_name = name.to_os_string();
+    lock_name.push(".scheduler.lock");
+    let lock_path = db.parent().unwrap().join(lock_name);
+    validate_file(&lock_path, true)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    // Check both the path and the open handle before locking. Filesystem
+    // replacement races are outside the supported deployment contract.
+    validate_file(&lock_path, false)?;
+    validate_metadata(&lock.metadata()?)?;
+    match lock.try_lock() {
+        Ok(()) => (),
+        Err(std::fs::TryLockError::WouldBlock) => return Err(OwnerError::Busy),
+        Err(std::fs::TryLockError::Error(e)) => return Err(OwnerError::Io(e)),
+    }
+    let lock = OwnerLock {
+        file: lock,
+        owner_pid: std::process::id(),
+    };
+    Ok((db, lock))
+}
+
 impl OwnedStore {
     /// Try to acquire ownership without waiting, then open the SQLite store.
     #[cfg(unix)]
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OwnerError> {
-        let path = path.as_ref();
-        let name = path
-            .file_name()
-            .ok_or(OwnerError::InvalidPath("database needs a file name"))?;
-        use std::os::unix::ffi::OsStrExt;
-        if name.as_bytes().ends_with(b".scheduler.lock") {
-            return Err(OwnerError::InvalidPath(
-                "database name uses the reserved lockfile suffix",
-            ));
-        }
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let db = fs::canonicalize(parent)?.join(name);
-        validate_file(&db, true)?;
-        let mut lock_name = name.to_os_string();
-        lock_name.push(".scheduler.lock");
-        let lock_path = db.parent().unwrap().join(lock_name);
-        validate_file(&lock_path, true)?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        // Check both the path and the open handle before locking. Filesystem
-        // replacement races are outside the supported deployment contract.
-        validate_file(&lock_path, false)?;
-        validate_metadata(&lock.metadata()?)?;
-        match lock.try_lock() {
-            Ok(()) => (),
-            Err(std::fs::TryLockError::WouldBlock) => return Err(OwnerError::Busy),
-            Err(std::fs::TryLockError::Error(e)) => return Err(OwnerError::Io(e)),
-        }
-        let lock = OwnerLock {
-            file: lock,
-            owner_pid: std::process::id(),
-        };
+        let (db, lock) = acquire_owner_lock(path.as_ref())?;
         #[cfg(test)]
         AFTER_OWNER_LOCK.with(|slot| {
             if let Some(hook) = slot.borrow_mut().take() {
@@ -161,7 +166,7 @@ impl OwnedStore {
             }
         });
         validate_file(&db, true)?;
-        let store = Store::open(&db)?;
+        let store = Store::open_owned(&db)?;
         validate_file(&db, false)?;
         Ok(Self {
             store,

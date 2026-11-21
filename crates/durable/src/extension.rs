@@ -1134,7 +1134,19 @@ impl SelectionStartGates {
         &self,
         selection: &StableExtensionSelection,
     ) -> Result<SelectionStartLease, ()> {
-        let mut names: Vec<_> = selection.names().collect();
+        self.try_start_many(std::iter::once(selection))
+    }
+
+    /// Hold the union once: two nested conversations may select the same
+    /// extension and its start gate is deliberately non-reentrant.
+    pub(crate) fn try_start_many<'a>(
+        &self,
+        selections: impl IntoIterator<Item = &'a StableExtensionSelection>,
+    ) -> Result<SelectionStartLease, ()> {
+        let mut names: Vec<_> = selections
+            .into_iter()
+            .flat_map(|selection| selection.names())
+            .collect();
         names.sort_unstable();
         names.dedup();
         let mut gates = Vec::with_capacity(names.len());
@@ -1153,12 +1165,22 @@ impl SelectionStartGates {
 
 impl SelectionStartLease {
     pub(crate) fn poll_first<F: std::future::Future + ?Sized>(
-        mut self,
+        self,
         conversation: durable_store::controls::CallbackStartLease,
         future: std::pin::Pin<&mut F>,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<F::Output> {
-        self.leases.push(conversation);
+        self.poll_first_many(vec![conversation], future, context)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn poll_first_many<F: std::future::Future + ?Sized>(
+        mut self,
+        conversations: Vec<durable_store::controls::CallbackStartLease>,
+        future: std::pin::Pin<&mut F>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        self.leases.extend(conversations);
         durable_store::controls::CallbackStartLease::poll_first_many(
             std::mem::take(&mut self.leases),
             future,
@@ -1178,6 +1200,17 @@ mod selection_start_gate_tests {
                 ExtensionIdentity::new(1, "identity".into(), vec!["hook".into()]).unwrap(),
             )],
         }
+    }
+
+    #[test]
+    fn overlapping_selections_share_one_start_lease() {
+        let gates = SelectionStartGates::default();
+        let first = selection();
+        let second = selection();
+        let lease = gates.try_start_many([&first, &second]).unwrap();
+        assert!(gates.try_mutation("policy").is_err());
+        drop(lease);
+        assert!(gates.try_mutation("policy").is_ok());
     }
 
     #[test]

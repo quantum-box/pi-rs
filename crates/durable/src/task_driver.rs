@@ -1670,7 +1670,8 @@ impl Shared {
                             let id = match intent.intent() {
                                 task_scheduler::MaintenanceIntent::Nested(id)
                                 | task_scheduler::MaintenanceIntent::Failed(id)
-                                | task_scheduler::MaintenanceIntent::FailFast(id) => id,
+                                | task_scheduler::MaintenanceIntent::FailFast(id)
+                                | task_scheduler::MaintenanceIntent::Woken(id) => id,
                             };
                             let hook = maintenance_reserved_hooks().lock().unwrap().remove(&id);
                             if let Some(hook) = hook {

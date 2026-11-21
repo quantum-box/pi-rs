@@ -7,6 +7,8 @@
 //! the database before deciding whether to retry a non-idempotent operation.
 
 pub mod controls;
+#[cfg(feature = "experimental-graph-revision")]
+pub mod graph_revision;
 pub mod owner;
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -111,6 +113,8 @@ pub enum Error {
     LockPoisoned,
     VersionExhausted,
     InvalidSnapshot,
+    IncompatibleGraphProtocol,
+    MigrationOwnerUnavailable(String),
     DocumentFrameTooLarge,
 }
 impl fmt::Display for Error {
@@ -121,6 +125,14 @@ impl fmt::Display for Error {
             Self::WriteLockBusy(e) => write!(f, "writer lock unavailable before transaction: {e}"),
             Self::LockPoisoned => write!(f, "store lock poisoned"),
             Self::VersionExhausted => write!(f, "store version exhausted"),
+            Self::MigrationOwnerUnavailable(reason) => write!(
+                f,
+                "graph protocol migration requires exclusive ownership: {reason}"
+            ),
+            Self::IncompatibleGraphProtocol => write!(
+                f,
+                "durable graph protocol is incompatible with this runtime"
+            ),
             Self::InvalidSnapshot => write!(
                 f,
                 "snapshot is newer than document history or lacks tracking evidence"
@@ -169,12 +181,881 @@ mod task_record {
         }
         Some(task.state.is_terminal_state())
     }
+
+    #[cfg(feature = "experimental-graph-revision")]
+    pub(super) fn is_owned_reservation(
+        before: &[u8],
+        after: &[u8],
+        id: Uuid,
+        interrupted: Uuid,
+    ) -> bool {
+        let Ok(mut old) = serde_json::from_slice::<Task>(before) else {
+            return false;
+        };
+        let Ok(new) = serde_json::from_slice::<Task>(after) else {
+            return false;
+        };
+        if old.id != id
+            || old.state != TaskState::Ready
+            || !old.abort_requested
+            || old.woken_interrupted_attempt != Some(interrupted)
+            || old.restarts > 0 && old.restarts >= old.restart_limit
+            || new.attempt_id.is_none_or(|id| id.is_nil())
+        {
+            return false;
+        }
+        old.state = TaskState::Running;
+        old.attempt_id = new.attempt_id;
+        old.retired_attempt_id = None;
+        old == new
+    }
+
+    #[cfg(feature = "experimental-graph-revision")]
+    pub(super) fn is_owned_child_reservation(before: &[u8], after: &[u8], id: Uuid) -> bool {
+        let Ok(mut old) = serde_json::from_slice::<Task>(before) else {
+            return false;
+        };
+        let Ok(new) = serde_json::from_slice::<Task>(after) else {
+            return false;
+        };
+        if old.id != id
+            || old.state != TaskState::Ready
+            || !old.abort_requested
+            || old.restarts > 0 && old.restarts >= old.restart_limit
+            || new.attempt_id.is_none_or(|id| id.is_nil())
+        {
+            return false;
+        }
+        old.state = TaskState::Running;
+        old.attempt_id = new.attempt_id;
+        old.retired_attempt_id = None;
+        old == new
+    }
+
+    #[cfg(feature = "experimental-graph-revision")]
+    pub(super) fn is_owned_graph_root(value: &[u8], id: Uuid, interrupted: Uuid) -> bool {
+        let Ok(task) = serde_json::from_slice::<Task>(value) else {
+            return false;
+        };
+        !interrupted.is_nil()
+            && task.id == id
+            && task.state == TaskState::Ready
+            && task.abort_requested
+            && task.woken_interrupted_attempt == Some(interrupted)
+    }
+}
+
+// A single direct owned-conversation child; this validates only the reservation,
+// never selection, callback dispatch, or receipt authorization.
+#[cfg(feature = "experimental-graph-revision")]
+fn marked_owned_child_matches(marked: &serde_json::Value, current: &serde_json::Value) -> bool {
+    [
+        "id",
+        "owner",
+        "kind",
+        "definition_version",
+        "input",
+        "checkpoint",
+        "replay_safe",
+        "background",
+        "task_tool",
+        "retain_task_children_on_success",
+        "interrupted_dispatch_attempt",
+        "woken_interrupted_attempt",
+    ]
+    .iter()
+    .all(|field| marked.get(*field) == current.get(*field))
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+fn validate_owned_child_reservation(
+    tx: &rusqlite::Transaction<'_>,
+    mutations: &[Mutation],
+) -> Result<(), Error> {
+    const PREFIX: &[u8] = b"runtime/woken-owned-child-reservation/v1/";
+    let Some((key, bytes)) = mutations.iter().find_map(|m| match m {
+        Mutation::Put { key, value } if key.starts_with(PREFIX) => Some((key, value)),
+        _ => None,
+    }) else {
+        return Err(Error::InvalidSnapshot);
+    };
+    let fail = || Error::Conflict { key: key.clone() };
+    if mutations.len() != 2 {
+        return Err(fail());
+    }
+    let suffix = std::str::from_utf8(&key[PREFIX.len()..]).map_err(|_| fail())?;
+    let Some((root_text, child_text)) = suffix.split_once('/') else {
+        return Err(fail());
+    };
+    let root = uuid::Uuid::parse_str(root_text).map_err(|_| fail())?;
+    let child = uuid::Uuid::parse_str(child_text).map_err(|_| fail())?;
+    if suffix != format!("{root}/{child}") || root == child {
+        return Err(fail());
+    }
+    let marker: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| fail())?;
+    if marker.as_object().is_none_or(|object| object.len() != 6)
+        || marker["version"] != 1
+        || marker["root"] != root.to_string()
+        || marker["child"] != child.to_string()
+    {
+        return Err(fail());
+    }
+    let child_key = [b"durable/task/".as_slice(), child.as_bytes()].concat();
+    let after = mutations
+        .iter()
+        .find_map(|m| match m {
+            Mutation::Put { key, value } if key == &child_key => Some(value),
+            _ => None,
+        })
+        .ok_or_else(fail)?;
+    let (before, child_version): (Vec<u8>, u64) = tx
+        .query_row(
+            "SELECT value,version FROM durable_store_entries WHERE key=?1",
+            [&child_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(fail)?;
+    let current: serde_json::Value = serde_json::from_slice(&before).map_err(|_| fail())?;
+    if current["background"] == true
+        || marker["ready_version"].as_u64() != Some(child_version)
+        || marker["running"]
+            != serde_json::from_slice::<serde_json::Value>(after).map_err(|_| fail())?
+        || !task_record::is_owned_child_reservation(&before, after, child)
+    {
+        return Err(fail());
+    }
+    let conversation = current["owner"]["Conversation"]
+        .as_str()
+        .and_then(|v| uuid::Uuid::parse_str(v).ok())
+        .ok_or_else(fail)?;
+    let graph_key = format!("runtime/woken-owned-graph/v1/{root}").into_bytes();
+    let (graph_bytes, graph_version): (Vec<u8>, u64) = tx
+        .query_row(
+            "SELECT value,version FROM durable_store_entries WHERE key=?1",
+            [&graph_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(fail)?;
+    let graph: serde_json::Value = serde_json::from_slice(&graph_bytes).map_err(|_| fail())?;
+    if graph["version"] != 1
+        || graph["root"] != root.to_string()
+        || marker["graph_version"].as_u64() != Some(graph_version)
+    {
+        return Err(fail());
+    }
+    let root_key = [b"durable/task/".as_slice(), root.as_bytes()].concat();
+    let (root_bytes, root_version): (Vec<u8>, u64) = tx
+        .query_row(
+            "SELECT value,version FROM durable_store_entries WHERE key=?1",
+            [&root_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(fail)?;
+    let root_task: serde_json::Value = serde_json::from_slice(&root_bytes).map_err(|_| fail())?;
+    let interrupted = graph["interrupted_attempt"]
+        .as_str()
+        .and_then(|v| uuid::Uuid::parse_str(v).ok())
+        .ok_or_else(fail)?;
+    let same_commit: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_commit_versions a JOIN durable_commit_versions b ON a.sequence=b.sequence WHERE a.key=?1 AND a.version=?2 AND b.key=?3 AND b.version=?4)", rusqlite::params![&root_key,root_version,&graph_key,graph_version], |r| r.get(0))?;
+    if !same_commit || !task_record::is_owned_graph_root(&root_bytes, root, interrupted) {
+        return Err(fail());
+    }
+    let marked = graph["tasks"]
+        .as_array()
+        .and_then(|tasks| {
+            let mut matches = tasks.iter().filter(|task| task["id"] == child.to_string());
+            let task = matches.next()?;
+            matches.next().is_none().then_some(task)
+        })
+        .ok_or_else(fail)?;
+    if !marked_owned_child_matches(marked, &current) {
+        return Err(fail());
+    }
+    let new_attempt = &marker["running"]["attempt_id"];
+    for previous in [
+        &current["attempt_id"],
+        &current["retired_attempt_id"],
+        &marked["attempt_id"],
+        &marked["retired_attempt_id"],
+        &marked["interrupted_dispatch_attempt"],
+        &marked["woken_interrupted_attempt"],
+    ] {
+        if !previous.is_null() && previous == new_attempt {
+            return Err(fail());
+        }
+    }
+    let edge = graph["edges"]
+        .as_array()
+        .and_then(|edges| {
+            let mut matches = edges
+                .iter()
+                .filter(|edge| edge["edge"]["child"] == conversation.to_string());
+            let edge = matches.next()?;
+            matches.next().is_none().then_some(edge)
+        })
+        .ok_or_else(fail)?;
+    if edge["edge"]["task"] != root.to_string()
+        || edge["edge"]["mode"] != "Foreground"
+        || edge["edge"]["task_owner"] != root_task["owner"]
+    {
+        return Err(fail());
+    }
+    let edge_key = [
+        b"durable/conversation-owner/".as_slice(),
+        conversation.as_bytes(),
+    ]
+    .concat();
+    let (edge_bytes, edge_version): (Vec<u8>, u64) = tx
+        .query_row(
+            "SELECT value,version FROM durable_store_entries WHERE key=?1",
+            [&edge_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(fail)?;
+    if edge["edge_version"].as_u64() != Some(edge_version)
+        || edge["edge"]
+            != serde_json::from_slice::<serde_json::Value>(&edge_bytes).map_err(|_| fail())?
+    {
+        return Err(fail());
+    }
+    let marker_exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE key=?1)",
+        [key],
+        |r| r.get(0),
+    )?;
+    if marker_exists {
+        return Err(fail());
+    }
+    let boundary = graph["structure"]["boundary"].as_u64().ok_or_else(fail)?;
+    let (current_version, legacy): (u64,u64) = tx.query_row("SELECT s.version,c.legacy_version FROM durable_store_meta s JOIN durable_commit_meta c ON s.id=c.id WHERE s.id=1", [], |r| Ok((r.get(0)?,r.get(1)?)))?;
+    if boundary < legacy || boundary > current_version {
+        return Err(fail());
+    }
+    for (revision_key, field) in [
+        (
+            graph_revision::task_structure_revision(root),
+            "root_revision",
+        ),
+        (
+            graph_revision::global_structure_revision(),
+            "global_revision",
+        ),
+    ] {
+        let expected = &graph["structure"][field];
+        let version: Option<u64> = tx
+            .query_row(
+                "SELECT version FROM durable_store_entries WHERE key=?1",
+                [&revision_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if expected.as_u64() != version || (!expected.is_null() && expected.as_u64().is_none()) {
+            return Err(fail());
+        }
+        if version.is_none() {
+            let changed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM durable_commit_versions WHERE key=?1 AND version>?2)",
+                rusqlite::params![&revision_key, boundary],
+                |r| r.get(0),
+            )?;
+            if changed {
+                return Err(fail());
+            }
+        }
+    }
+    Ok(())
+}
+
+// Protocol v4 validates the entire reservation write set under the SQLite
+// write lock and prevents older writers from bypassing this validation.
+#[cfg(feature = "experimental-graph-revision")]
+fn validate_owned_reservation(
+    tx: &rusqlite::Transaction<'_>,
+    mutations: &[Mutation],
+) -> Result<(), Error> {
+    const PREFIX: &[u8] = b"runtime/woken-owned-reservation/v1/";
+    const CHILD_PREFIX: &[u8] = b"runtime/woken-owned-child-reservation/";
+    if let Some(key) = mutations.iter().find_map(|mutation| match mutation {
+        Mutation::Put { key, .. } | Mutation::Delete { key } if key.starts_with(CHILD_PREFIX) => {
+            Some(key)
+        }
+        _ => None,
+    }) {
+        let _ = key;
+        return validate_owned_child_reservation(tx, mutations);
+    }
+    let markers: Vec<_> = mutations
+        .iter()
+        .filter_map(|m| match m {
+            Mutation::Put { key, value } if key.starts_with(PREFIX) => Some((key, value)),
+            Mutation::Delete { key } if key.starts_with(PREFIX) => Some((key, key)),
+            _ => None,
+        })
+        .collect();
+    if markers.is_empty() {
+        return Ok(());
+    }
+    let fail = || Error::Conflict {
+        key: markers[0].0.clone(),
+    };
+    if markers.len() != 1 || mutations.len() != 2 {
+        return Err(fail());
+    }
+    let (marker_key, marker_bytes) = markers[0];
+    let id = std::str::from_utf8(&marker_key[PREFIX.len()..])
+        .ok()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .ok_or_else(fail)?;
+    if marker_key != format!("runtime/woken-owned-reservation/v1/{id}").as_bytes() {
+        return Err(fail());
+    }
+    let marker: serde_json::Value = serde_json::from_slice(marker_bytes).map_err(|_| fail())?;
+    if marker.as_object().is_none_or(|v| v.len() != 4) || marker["version"] != 1 {
+        return Err(fail());
+    }
+    let task_key = [b"durable/task/".as_slice(), id.as_bytes()].concat();
+    let after = mutations
+        .iter()
+        .find_map(|m| match m {
+            Mutation::Put { key, value } if key == &task_key => Some(value),
+            _ => None,
+        })
+        .ok_or_else(fail)?;
+    let (before, ready_version): (Vec<u8>, u64) = tx
+        .query_row(
+            "SELECT value,version FROM durable_store_entries WHERE key=?1",
+            [&task_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(fail)?;
+    let graph_key = format!("runtime/woken-owned-graph/v1/{id}").into_bytes();
+    let (graph_bytes, graph_version): (Vec<u8>, u64) = tx
+        .query_row(
+            "SELECT value,version FROM durable_store_entries WHERE key=?1",
+            [&graph_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(fail)?;
+    let graph: serde_json::Value = serde_json::from_slice(&graph_bytes).map_err(|_| fail())?;
+    let same_commit: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM durable_commit_versions a JOIN durable_commit_versions b ON a.sequence=b.sequence WHERE a.key=?1 AND a.version=?2 AND b.key=?3 AND b.version=?4)", rusqlite::params![&task_key, ready_version, &graph_key, graph_version], |r| r.get(0))?;
+    let interrupted = graph["interrupted_attempt"]
+        .as_str()
+        .and_then(|v| uuid::Uuid::parse_str(v).ok())
+        .ok_or_else(fail)?;
+    if !same_commit
+        || graph["version"] != 1
+        || graph["root"] != id.to_string()
+        || marker["graph_version"].as_u64() != Some(graph_version)
+        || marker["ready_version"].as_u64() != Some(ready_version)
+        || marker["running"]
+            != serde_json::from_slice::<serde_json::Value>(after).map_err(|_| fail())?
+        || !task_record::is_owned_reservation(&before, after, id, interrupted)
+    {
+        return Err(fail());
+    }
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE key=?1)",
+        [marker_key],
+        |r| r.get(0),
+    )?;
+    if exists {
+        return Err(fail());
+    }
+    let boundary = graph["structure"]["boundary"].as_u64().ok_or_else(fail)?;
+    let current: u64 = tx.query_row(
+        "SELECT version FROM durable_store_meta WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    let legacy: u64 = tx.query_row(
+        "SELECT legacy_version FROM durable_commit_meta WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    if boundary < legacy || boundary > current {
+        return Err(fail());
+    }
+    for (key, field) in [
+        (graph_revision::task_structure_revision(id), "root_revision"),
+        (
+            graph_revision::global_structure_revision(),
+            "global_revision",
+        ),
+    ] {
+        let expected = &graph["structure"][field];
+        let version: Option<u64> = tx
+            .query_row(
+                "SELECT version FROM durable_store_entries WHERE key=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if expected.as_u64() != version || (!expected.is_null() && expected.as_u64().is_none()) {
+            return Err(fail());
+        }
+        if version.is_none() {
+            let changed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM durable_commit_versions WHERE key=?1 AND version>?2)",
+                rusqlite::params![&key, boundary],
+                |r| r.get(0),
+            )?;
+            if changed {
+                return Err(fail());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "experimental-graph-revision"))]
+mod owned_reservation_validation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn child_checkpoint_cannot_be_substituted() {
+        let marked = json!({"id":"child","checkpoint":{"phase":"parked","data":{"nonce":1}}});
+        let mut changed = marked.clone();
+        changed["checkpoint"]["data"]["nonce"] = json!(2);
+        assert!(marked_owned_child_matches(&marked, &marked));
+        assert!(!marked_owned_child_matches(&marked, &changed));
+    }
+
+    #[test]
+    fn direct_owned_child_reservation_checks_graph_and_entire_write_set() {
+        let store = Store::memory().unwrap();
+        let root = uuid::Uuid::from_u128(10);
+        let child = uuid::Uuid::from_u128(11);
+        let outer = uuid::Uuid::from_u128(12);
+        let conversation = uuid::Uuid::from_u128(13);
+        let interrupted = uuid::Uuid::from_u128(14);
+        let root_key = [b"durable/task/".as_slice(), root.as_bytes()].concat();
+        let child_key = [b"durable/task/".as_slice(), child.as_bytes()].concat();
+        let edge_key = [
+            b"durable/conversation-owner/".as_slice(),
+            conversation.as_bytes(),
+        ]
+        .concat();
+        let graph_key = format!("runtime/woken-owned-graph/v1/{root}").into_bytes();
+        let marker_key =
+            format!("runtime/woken-owned-child-reservation/v1/{root}/{child}").into_bytes();
+        let mut root_task = json!({"id":root,"owner":{"Conversation":outer},"checkpoint":{"phase":"wait","data":null},"state":"Running","restarts":0,"restart_limit":4,"abort_requested":true,"woken_interrupted_attempt":interrupted});
+        let mut child_task = json!({"id":child,"owner":{"Conversation":conversation},"checkpoint":{"phase":"parked","data":null},"state":"Ready","restarts":0,"restart_limit":4,"abort_requested":true,"kind":"unsafe-child","replay_safe":false,"retired_attempt_id":uuid::Uuid::from_u128(15)});
+        let edge = json!({"task":root,"task_owner":{"Conversation":outer},"child":conversation,"mode":"Foreground"});
+        store
+            .commit(
+                &[],
+                &[
+                    Mutation::Put {
+                        key: root_key.clone(),
+                        value: serde_json::to_vec(&root_task).unwrap(),
+                    },
+                    Mutation::Put {
+                        key: child_key.clone(),
+                        value: serde_json::to_vec(&child_task).unwrap(),
+                    },
+                    Mutation::Put {
+                        key: edge_key.clone(),
+                        value: serde_json::to_vec(&edge).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        let root_before = store.get(&root_key).unwrap().unwrap();
+        let mut child_before = store.get(&child_key).unwrap().unwrap();
+        let edge_version = store.get(&edge_key).unwrap().unwrap().version;
+        let root_revision = store
+            .get(&graph_revision::task_structure_revision(root))
+            .unwrap()
+            .map(|entry| entry.version);
+        let global_revision = store
+            .get(&graph_revision::global_structure_revision())
+            .unwrap()
+            .map(|entry| entry.version);
+        let boundary = store.put_version().unwrap();
+        let graph = json!({"version":1,"root":root,"interrupted_attempt":interrupted,"tasks":[root_task,child_task],"edges":[{"edge":edge,"edge_version":edge_version}],"structure":{"boundary":boundary,"root_revision":root_revision,"global_revision":global_revision}});
+        root_task["state"] = json!("Ready");
+        store
+            .commit(
+                &[Check {
+                    key: root_key.clone(),
+                    expected: Expected::Version(root_before.version),
+                }],
+                &[
+                    Mutation::Put {
+                        key: root_key,
+                        value: serde_json::to_vec(&root_task).unwrap(),
+                    },
+                    Mutation::Put {
+                        key: graph_key.clone(),
+                        value: serde_json::to_vec(&graph).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        let graph_version = store.get(&graph_key).unwrap().unwrap().version;
+        let mut changed_checkpoint = child_task.clone();
+        changed_checkpoint["checkpoint"]["data"] = json!({"substituted":true});
+        store
+            .commit(
+                &[Check {
+                    key: child_key.clone(),
+                    expected: Expected::Version(child_before.version),
+                }],
+                &[Mutation::Put {
+                    key: child_key.clone(),
+                    value: serde_json::to_vec(&changed_checkpoint).unwrap(),
+                }],
+            )
+            .unwrap();
+        let changed_entry = store.get(&child_key).unwrap().unwrap();
+        let mut bad_running = changed_checkpoint;
+        bad_running["state"] = json!("Running");
+        bad_running["attempt_id"] = json!(uuid::Uuid::from_u128(16));
+        bad_running
+            .as_object_mut()
+            .unwrap()
+            .remove("retired_attempt_id");
+        let bad_marker = json!({"version":1,"root":root,"child":child,"graph_version":graph_version,"ready_version":changed_entry.version,"running":bad_running});
+        assert!(matches!(
+            store.commit(
+                &[],
+                &[
+                    Mutation::Put {
+                        key: child_key.clone(),
+                        value: serde_json::to_vec(&bad_running).unwrap()
+                    },
+                    Mutation::Put {
+                        key: marker_key.clone(),
+                        value: serde_json::to_vec(&bad_marker).unwrap()
+                    },
+                ]
+            ),
+            Err(Error::Conflict { .. })
+        ));
+        assert!(store.get(&marker_key).unwrap().is_none());
+        store
+            .commit(
+                &[Check {
+                    key: child_key.clone(),
+                    expected: Expected::Version(changed_entry.version),
+                }],
+                &[Mutation::Put {
+                    key: child_key.clone(),
+                    value: serde_json::to_vec(&child_task).unwrap(),
+                }],
+            )
+            .unwrap();
+        child_before = store.get(&child_key).unwrap().unwrap();
+        child_task["state"] = json!("Running");
+        child_task["attempt_id"] = json!(uuid::Uuid::from_u128(16));
+        child_task
+            .as_object_mut()
+            .unwrap()
+            .remove("retired_attempt_id");
+        let marker = json!({"version":1,"root":root,"child":child,"graph_version":graph_version,"ready_version":child_before.version,"running":child_task});
+        let mut writes = vec![
+            Mutation::Put {
+                key: child_key.clone(),
+                value: serde_json::to_vec(&child_task).unwrap(),
+            },
+            Mutation::Put {
+                key: marker_key,
+                value: serde_json::to_vec(&marker).unwrap(),
+            },
+        ];
+        let mut connection = store.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(validate_owned_child_reservation(&tx, &writes).is_ok());
+        let mut reused = child_task.clone();
+        reused["attempt_id"] = json!(uuid::Uuid::from_u128(15));
+        let mut reused_marker = marker.clone();
+        reused_marker["running"] = reused.clone();
+        let reused_key = match &writes[1] {
+            Mutation::Put { key, .. } => key.clone(),
+            _ => unreachable!(),
+        };
+        writes[0] = Mutation::Put {
+            key: child_key.clone(),
+            value: serde_json::to_vec(&reused).unwrap(),
+        };
+        writes[1] = Mutation::Put {
+            key: reused_key.clone(),
+            value: serde_json::to_vec(&reused_marker).unwrap(),
+        };
+        assert!(validate_owned_child_reservation(&tx, &writes).is_err());
+        writes[1] = Mutation::Put {
+            key: reused_key,
+            value: serde_json::to_vec(&marker).unwrap(),
+        };
+        let mut altered = child_task.clone();
+        altered["abort_requested"] = json!(false);
+        writes[0] = Mutation::Put {
+            key: child_key.clone(),
+            value: serde_json::to_vec(&altered).unwrap(),
+        };
+        assert!(validate_owned_child_reservation(&tx, &writes).is_err());
+        let mut forged_marker = marker.clone();
+        forged_marker["running"] = altered;
+        let marker_key = match &writes[1] {
+            Mutation::Put { key, .. } => key.clone(),
+            _ => unreachable!(),
+        };
+        writes[1] = Mutation::Put {
+            key: marker_key.clone(),
+            value: serde_json::to_vec(&forged_marker).unwrap(),
+        };
+        assert!(validate_owned_child_reservation(&tx, &writes).is_err());
+        writes[1] = Mutation::Put {
+            key: marker_key,
+            value: serde_json::to_vec(&marker).unwrap(),
+        };
+        writes[0] = Mutation::Put {
+            key: child_key,
+            value: serde_json::to_vec(&child_task).unwrap(),
+        };
+        writes.push(Mutation::Delete {
+            key: edge_key.clone(),
+        });
+        assert!(validate_owned_child_reservation(&tx, &writes).is_err());
+        writes.pop();
+        drop(tx);
+        drop(connection);
+        let mut forged = writes.clone();
+        let forged_key = match &forged[0] {
+            Mutation::Put { key, .. } => key.clone(),
+            _ => unreachable!(),
+        };
+        let forged_marker_key = match &forged[1] {
+            Mutation::Put { key, .. } => key.clone(),
+            _ => unreachable!(),
+        };
+        forged[0] = Mutation::Put {
+            key: forged_key.clone(),
+            value: serde_json::to_vec(&forged_marker["running"]).unwrap(),
+        };
+        forged[1] = Mutation::Put {
+            key: forged_marker_key.clone(),
+            value: serde_json::to_vec(&forged_marker).unwrap(),
+        };
+        assert!(matches!(
+            store.commit(&[], &forged),
+            Err(Error::Conflict { .. })
+        ));
+        assert!(store.get(&forged_marker_key).unwrap().is_none());
+        assert_eq!(
+            store.get(&forged_key).unwrap().unwrap().version,
+            child_before.version
+        );
+        let edge_entry = store.get(&edge_key).unwrap().unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: edge_key.clone(),
+                    expected: Expected::Version(edge_entry.version),
+                }],
+                &[Mutation::Put {
+                    key: edge_key,
+                    value: edge_entry.value,
+                }],
+            )
+            .unwrap();
+        let mut connection = store.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(validate_owned_child_reservation(&tx, &writes).is_err());
+    }
+
+    #[test]
+    fn reservation_rejects_wrong_task_and_mixed_graph_mutation() {
+        let store = Store::memory().unwrap();
+        assert!(matches!(
+            store.commit(
+                &[],
+                &[Mutation::Put {
+                    key: b"runtime/woken-owned-child-reservation/v1/forged".to_vec(),
+                    value: b"forged".to_vec(),
+                }]
+            ),
+            Err(Error::Conflict { .. })
+        ));
+        let id = uuid::Uuid::from_u128(1);
+        let interrupted = uuid::Uuid::from_u128(2);
+        let task_key = [b"durable/task/".as_slice(), id.as_bytes()].concat();
+        let graph_key = format!("runtime/woken-owned-graph/v1/{id}").into_bytes();
+        let marker_key = format!("runtime/woken-owned-reservation/v1/{id}").into_bytes();
+        let mut task = json!({"id": id, "owner": {"Conversation": uuid::Uuid::from_u128(3)}, "checkpoint": {"phase":"wait", "data":null}, "state":"Running", "restarts":0, "restart_limit":4, "abort_requested":true, "woken_interrupted_attempt":interrupted});
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: task_key.clone(),
+                    value: serde_json::to_vec(&task).unwrap(),
+                }],
+            )
+            .unwrap();
+        let task_entry = store.get(&task_key).unwrap().unwrap();
+        let root_revision = store
+            .get(&graph_revision::task_structure_revision(id))
+            .unwrap()
+            .map(|e| e.version);
+        let global_revision = store
+            .get(&graph_revision::global_structure_revision())
+            .unwrap()
+            .map(|e| e.version);
+        let boundary = store.put_version().unwrap();
+        let graph = json!({"version":1, "root":id, "interrupted_attempt":interrupted, "structure":{"boundary":boundary,"root_revision":root_revision,"global_revision":global_revision}});
+        task["state"] = json!("Ready");
+        store
+            .commit(
+                &[Check {
+                    key: task_key.clone(),
+                    expected: Expected::Version(task_entry.version),
+                }],
+                &[
+                    Mutation::Put {
+                        key: task_key.clone(),
+                        value: serde_json::to_vec(&task).unwrap(),
+                    },
+                    Mutation::Put {
+                        key: graph_key.clone(),
+                        value: serde_json::to_vec(&graph).unwrap(),
+                    },
+                ],
+            )
+            .unwrap();
+        let ready_version = store.get(&task_key).unwrap().unwrap().version;
+        let graph_version = store.get(&graph_key).unwrap().unwrap().version;
+        task["state"] = json!("Running");
+        task["attempt_id"] = json!(uuid::Uuid::from_u128(4));
+        let marker = json!({"version":1,"graph_version":graph_version,"ready_version":ready_version,"running":task});
+        let mut writes = vec![
+            Mutation::Put {
+                key: task_key.clone(),
+                value: serde_json::to_vec(&task).unwrap(),
+            },
+            Mutation::Put {
+                key: marker_key,
+                value: serde_json::to_vec(&marker).unwrap(),
+            },
+        ];
+        let mut connection = store.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(validate_owned_reservation(&tx, &writes).is_ok());
+        let mut bad = task.clone();
+        bad["abort_requested"] = json!(false);
+        writes[0] = Mutation::Put {
+            key: task_key.clone(),
+            value: serde_json::to_vec(&bad).unwrap(),
+        };
+        assert!(validate_owned_reservation(&tx, &writes).is_err());
+        let mut forged_marker = marker.clone();
+        forged_marker["running"] = bad;
+        let marker_key = match &writes[1] {
+            Mutation::Put { key, .. } => key.clone(),
+            _ => unreachable!(),
+        };
+        writes[1] = Mutation::Put {
+            key: marker_key.clone(),
+            value: serde_json::to_vec(&forged_marker).unwrap(),
+        };
+        assert!(validate_owned_reservation(&tx, &writes).is_err());
+        writes[0] = Mutation::Put {
+            key: task_key.clone(),
+            value: serde_json::to_vec(&task).unwrap(),
+        };
+        writes[1] = Mutation::Put {
+            key: marker_key,
+            value: serde_json::to_vec(&marker).unwrap(),
+        };
+        writes.push(Mutation::Delete {
+            key: b"durable/task/other".to_vec(),
+        });
+        assert!(validate_owned_reservation(&tx, &writes).is_err());
+        writes.pop();
+        drop(tx);
+        drop(connection);
+        let mut mixed = writes.clone();
+        mixed.push(Mutation::Delete {
+            key: b"durable/task/other".to_vec(),
+        });
+        assert!(matches!(
+            store.commit(&[], &mixed),
+            Err(Error::Conflict { .. })
+        ));
+        assert_eq!(
+            store.get(&task_key).unwrap().unwrap().version,
+            ready_version
+        );
+        let mut forged = writes.clone();
+        forged[0] = Mutation::Put {
+            key: task_key.clone(),
+            value: serde_json::to_vec(&forged_marker["running"]).unwrap(),
+        };
+        let marker_key = match &forged[1] {
+            Mutation::Put { key, .. } => key.clone(),
+            _ => unreachable!(),
+        };
+        forged[1] = Mutation::Put {
+            key: marker_key.clone(),
+            value: serde_json::to_vec(&forged_marker).unwrap(),
+        };
+        assert!(matches!(
+            store.commit(&[], &forged),
+            Err(Error::Conflict { .. })
+        ));
+        assert!(store.get(&marker_key).unwrap().is_none());
+        assert_eq!(
+            store.get(&task_key).unwrap().unwrap().version,
+            ready_version
+        );
+        let child = uuid::Uuid::from_u128(5);
+        let child_key = [b"durable/task/".as_slice(), child.as_bytes()].concat();
+        let child_value = json!({"id":child,"owner":{"Task":id},"checkpoint":{"phase":"initial","data":null},"state":"Ready","restarts":0,"restart_limit":4});
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key: child_key.clone(),
+                    value: serde_json::to_vec(&child_value).unwrap(),
+                }],
+            )
+            .unwrap();
+        let child_entry = store.get(&child_key).unwrap().unwrap();
+        store
+            .commit(
+                &[Check {
+                    key: child_key.clone(),
+                    expected: Expected::Version(child_entry.version),
+                }],
+                &[Mutation::Delete { key: child_key }],
+            )
+            .unwrap();
+        let mut connection = store.connection.lock().unwrap();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(validate_owned_reservation(&tx, &writes).is_err());
+    }
 }
 
 /// A single connection, safe to share between threads. Different instances
 /// opening the same database coordinate through SQLite's write lock.
 pub struct Store {
     connection: Mutex<Connection>,
+    #[cfg(feature = "experimental-graph-revision")]
+    graph_protocol_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     commits: tokio::sync::watch::Sender<u64>,
 }
 
@@ -196,13 +1077,110 @@ impl CommitUpdates {
 }
 impl Store {
     pub fn memory() -> Result<Self, Error> {
-        Self::initialize(Connection::open_in_memory()?, false)
+        Self::initialize(Connection::open_in_memory()?, false, true)
     }
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        Self::initialize(Connection::open(path)?, true)
+        let path = path.as_ref();
+        #[cfg(all(feature = "experimental-graph-revision", unix))]
+        {
+            let version = if path.exists() {
+                let conn =
+                    Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                let protected: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='durable_graph_protocol')", [], |row| row.get(0))?;
+                if protected {
+                    conn.query_row(
+                        "SELECT version FROM durable_graph_protocol WHERE id=1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if version.is_none() || matches!(version, Some(1 | 2 | 3)) {
+                let (db, _lock) = owner::acquire_owner_lock(path)
+                    .map_err(|error| Error::MigrationOwnerUnavailable(error.to_string()))?;
+                return Self::initialize(Connection::open(db)?, true, true);
+            }
+        }
+        Self::initialize(Connection::open(path)?, true, false)
     }
-    fn initialize(conn: Connection, disk: bool) -> Result<Self, Error> {
+    pub(crate) fn open_owned(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::initialize(Connection::open(path)?, true, true)
+    }
+    fn initialize(
+        conn: Connection,
+        disk: bool,
+        _migration_authorized: bool,
+    ) -> Result<Self, Error> {
+        #[cfg(feature = "experimental-graph-revision")]
+        let graph_protocol_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(feature = "experimental-graph-revision")]
+        {
+            let active = graph_protocol_active.clone();
+            conn.create_scalar_function(
+                "pi_graph_protocol_v4",
+                0,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                move |_| Ok(i64::from(active.load(std::sync::atomic::Ordering::Acquire))),
+            )?;
+        }
         conn.busy_timeout(Duration::from_secs(5))?;
+        let protected: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='durable_graph_protocol')", [], |row| row.get(0))?;
+        #[cfg(not(feature = "experimental-graph-revision"))]
+        if protected {
+            return Err(Error::IncompatibleGraphProtocol);
+        }
+        #[cfg(feature = "experimental-graph-revision")]
+        if disk && !protected && !_migration_authorized {
+            return Err(Error::IncompatibleGraphProtocol);
+        }
+        #[cfg(feature = "experimental-graph-revision")]
+        let mut migrate_old = false;
+        #[cfg(feature = "experimental-graph-revision")]
+        let mut old_version = None;
+        #[cfg(feature = "experimental-graph-revision")]
+        if protected {
+            let version: Option<i64> = conn
+                .query_row(
+                    "SELECT version FROM durable_graph_protocol WHERE id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if !matches!(version, Some(1 | 2 | 3 | 4))
+                || (matches!(version, Some(1 | 2 | 3)) && disk && !_migration_authorized)
+            {
+                return Err(Error::IncompatibleGraphProtocol);
+            }
+            migrate_old = matches!(version, Some(1 | 2 | 3));
+            old_version = version;
+            let guard_name = match version {
+                Some(1) => "pi_graph_protocol() != 1",
+                Some(2) => "pi_graph_protocol_v2() != 1",
+                Some(3) => "pi_graph_protocol_v3() != 1",
+                Some(4) => "pi_graph_protocol_v4() != 1",
+                _ => unreachable!(),
+            };
+            for (name, action) in [
+                ("durable_graph_protocol_insert", "INSERT"),
+                ("durable_graph_protocol_update", "UPDATE"),
+                ("durable_graph_protocol_delete", "DELETE"),
+            ] {
+                let sql: Option<String> = conn.query_row("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1 AND tbl_name='durable_store_entries'", [name], |row| row.get(0)).optional()?;
+                let expected = format!("BEFORE {action} ON durable_store_entries");
+                if !sql.as_deref().is_some_and(|sql| {
+                    sql.contains(&expected)
+                        && sql.contains(guard_name)
+                        && sql.contains("RAISE(ABORT, 'graph protocol required')")
+                }) {
+                    return Err(Error::IncompatibleGraphProtocol);
+                }
+            }
+        }
         if disk {
             let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
             if !mode.eq_ignore_ascii_case("wal") {
@@ -255,6 +1233,32 @@ impl Store {
             CREATE TABLE IF NOT EXISTS durable_document_commit_sequences (revision INTEGER PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE);
             INSERT OR IGNORE INTO durable_document_commit_meta SELECT 1, (SELECT revision FROM durable_document_history_meta WHERE id=1), (SELECT sequence FROM durable_commit_meta WHERE id=1);
             COMMIT;")?;
+        #[cfg(feature = "experimental-graph-revision")]
+        if !protected || migrate_old {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let marker_prefix = b"runtime/woken-owned-reservation/v1/";
+            let child_marker_prefix = b"runtime/woken-owned-child-reservation/";
+            let old_marker: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM durable_store_entries WHERE (?5 AND substr(key,1,?1)=?2) OR substr(key,1,?3)=?4)",
+                rusqlite::params![marker_prefix.len() as i64, marker_prefix, child_marker_prefix.len() as i64, child_marker_prefix, old_version != Some(3)],
+                |row| row.get(0),
+            )?;
+            if old_marker {
+                conn.execute_batch("ROLLBACK;")?;
+                return Err(Error::IncompatibleGraphProtocol);
+            }
+            conn.execute_batch("
+            DROP TRIGGER IF EXISTS durable_graph_protocol_insert;
+            DROP TRIGGER IF EXISTS durable_graph_protocol_update;
+            DROP TRIGGER IF EXISTS durable_graph_protocol_delete;
+            DROP TABLE IF EXISTS durable_graph_protocol;
+            CREATE TABLE durable_graph_protocol (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL CHECK(version=4));
+            INSERT INTO durable_graph_protocol(id,version) VALUES(1,4);
+            CREATE TRIGGER durable_graph_protocol_insert BEFORE INSERT ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v4() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TRIGGER durable_graph_protocol_update BEFORE UPDATE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v4() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            CREATE TRIGGER durable_graph_protocol_delete BEFORE DELETE ON durable_store_entries BEGIN SELECT CASE WHEN pi_graph_protocol_v4() != 1 THEN RAISE(ABORT, 'graph protocol required') END; END;
+            COMMIT;")?;
+        }
         let sequence = conn.query_row(
             "SELECT sequence FROM durable_commit_meta WHERE id=1",
             [],
@@ -263,6 +1267,8 @@ impl Store {
         let (commits, _) = tokio::sync::watch::channel(sequence);
         Ok(Self {
             connection: Mutex::new(conn),
+            #[cfg(feature = "experimental-graph-revision")]
+            graph_protocol_active,
             commits,
         })
     }
@@ -1345,6 +2351,18 @@ impl Store {
         prefix_fence: Option<(&[&[u8]], u64)>,
     ) -> Result<(), Error> {
         let mut conn = self.connection.lock().map_err(|_| Error::LockPoisoned)?;
+        #[cfg(feature = "experimental-graph-revision")]
+        let _protocol = {
+            struct Reset<'a>(&'a std::sync::atomic::AtomicBool);
+            impl Drop for Reset<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            self.graph_protocol_active
+                .store(true, std::sync::atomic::Ordering::Release);
+            Reset(&self.graph_protocol_active)
+        };
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| match &error {
@@ -1358,6 +2376,8 @@ impl Store {
                 }
                 _ => Error::Storage(error),
             })?;
+        #[cfg(feature = "experimental-graph-revision")]
+        validate_owned_reservation(&tx, mutations)?;
         if let Some((prefixes, boundary)) = prefix_fence {
             let current: u64 = tx.query_row(
                 "SELECT version FROM durable_store_meta WHERE id=1",
@@ -1666,6 +2686,14 @@ impl Store {
                 }
             }
         }
+        #[cfg(feature = "experimental-graph-revision")]
+        {
+            let revisions = graph_revision::affected(&tx, &effective)?;
+            effective.extend(revisions.into_iter().map(|key| Mutation::Put {
+                key,
+                value: vec![1],
+            }));
+        }
         let mutations = effective.as_slice();
         for acquisition in acquisitions {
             tx.execute(
@@ -1963,6 +2991,29 @@ mod document_history_tests {
             reopened.next_commit_for_key(b"root", u64::MAX),
             Err(Error::InvalidSnapshot)
         ));
+    }
+
+    #[cfg(not(feature = "experimental-graph-revision"))]
+    #[test]
+    fn disabled_runtime_rejects_protected_database_before_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("protected.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE durable_graph_protocol(id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO durable_graph_protocol VALUES(1,1);").unwrap();
+        drop(conn);
+        assert!(matches!(
+            Store::open(&path),
+            Err(Error::IncompatibleGraphProtocol)
+        ));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='durable_store_entries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "incompatible open must not migrate the database");
     }
 
     #[test]

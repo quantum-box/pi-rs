@@ -8,6 +8,7 @@ description = "Experimental durable agent runtime for pi-rs"
 
 [features]
 default = []
+experimental-graph-revision = ["durable-store/experimental-graph-revision"]
 # Explicitly enabled only by synchronization tests.
 test-hooks = []
 coding-tools = ["dep:pi-rs-workbench"]
