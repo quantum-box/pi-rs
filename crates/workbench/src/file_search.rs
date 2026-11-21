@@ -21,7 +21,7 @@ impl Grep {
     pub fn with_numeric_limit(mut self, limit: f64) -> Self {
         self.output.numeric_limit = Some(limit.floor().max(1.0));
         self.context = self.context.min(9_007_199_254_740_991);
-        self.searcher = Self::build_searcher(self.context);
+        self.searcher = Self::searcher_builder(self.context).build();
         self
     }
     pub fn new(args: &Value, limit: usize) -> Result<Self> {
@@ -54,7 +54,7 @@ impl Grep {
             .unwrap_or_else(|| args["context"].as_f64().unwrap_or(0.0).max(0.0) as u64);
         Ok(Self {
             matcher,
-            searcher: Self::build_searcher(0),
+            searcher: Self::searcher_builder(0).build(),
             output: Output {
                 limit,
                 ..Output::default()
@@ -62,15 +62,16 @@ impl Grep {
             context,
         })
     }
-    fn build_searcher(context: u64) -> Searcher {
+    fn searcher_builder(context: u64) -> SearcherBuilder {
         let context = usize::try_from(context).unwrap_or(usize::MAX);
-        SearcherBuilder::new()
+        let mut builder = SearcherBuilder::new();
+        builder
             .line_number(true)
             .binary_detection(BinaryDetection::quit(0))
             .heap_limit(Some(64 * 1024 * 1024))
             .before_context(context)
-            .after_context(context)
-            .build()
+            .after_context(context);
+        builder
     }
 
     /// Ripgrep converts NUL bytes to line breaks for explicit file arguments.
@@ -192,11 +193,8 @@ impl Grep {
         display: &str,
         limit: f64,
     ) -> io::Result<()> {
-        let mut builder = SearcherBuilder::new();
-        builder
-            .line_number(true)
-            .heap_limit(Some(64 * 1024 * 1024))
-            .binary_detection(self.searcher.binary_detection().clone());
+        let mut builder = Self::searcher_builder(0);
+        builder.binary_detection(self.searcher.binary_detection().clone());
         file.file.seek(SeekFrom::Start(0))?;
         let cancellation = file.cancellation;
         let mut index = PiMatchIndex {
@@ -1194,21 +1192,24 @@ mod tests {
     #[test]
     fn pi_grep_streams_before_context_larger_than_the_search_heap_limit() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        let line = format!("{}\n", "x".repeat(128 * 1024));
-        for _ in 0..520 {
+        let line = format!("{}\n", "x".repeat(1024));
+        for _ in 0..128 {
             file.write_all(line.as_bytes()).unwrap();
         }
         file.write_all(b"match one\nmatch two\nafter\n").unwrap();
 
-        let mut grep = Grep::new(&json!({"pattern":"match","context":520}), 100)
+        let mut grep = Grep::new(&json!({"pattern":"match","context":128}), 100)
             .unwrap()
             .with_numeric_limit(1.0);
+        grep.searcher = Grep::searcher_builder(128)
+            .heap_limit(Some(64 * 1024))
+            .build();
         assert!(
             !grep
                 .search(file.path(), "text", &CancellationToken::new())
                 .unwrap()
         );
-        assert_eq!(grep.output.total_lines, 523);
+        assert_eq!(grep.output.total_lines, 131);
         assert_eq!(grep.output.matches, 1);
         assert!(grep.output.match_limit_exceeded);
         let output = grep.finish().tool_content();
