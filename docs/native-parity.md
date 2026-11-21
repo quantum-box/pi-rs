@@ -428,6 +428,9 @@ message. In a session, routing and cache hints include `x-affinity` and
 `prompt_cache_key`. Parallel continuations need a tool ID or index when the
 stream does not uniquely identify the target call. Live Mistral account
 inference has not been verified.
+ Streams that omit both the
+tool index and call ID are rejected when multiple invocations fit the same
+fragments.
 
 ### Kimi Code API key checkpoint
 

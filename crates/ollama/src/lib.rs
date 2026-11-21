@@ -1377,7 +1377,9 @@ impl Ollama {
                         let index = if let Some(index) = delta.index {
                             index
                         } else if mistral {
-                            mistral::stream_call_index(delta.id.as_deref(), delta.function.as_ref().and_then(|function| function.name.as_deref()), position, had_calls, &calls)?
+                            mistral::stream_call_index(
+                                delta.id.as_deref(), delta.function.as_ref(), position, had_calls, &calls,
+                            )?
                         } else {
                             Err(Error::Model("missing tool call index".into()))?;
                             unreachable!();

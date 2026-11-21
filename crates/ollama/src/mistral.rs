@@ -205,7 +205,7 @@ impl CallIds {
 
 pub(super) fn stream_call_index(
     id: Option<&str>,
-    name: Option<&str>,
+    function: Option<&super::WireFunction>,
     position: usize,
     had_calls: bool,
     calls: &std::collections::BTreeMap<usize, super::CallDelta>,
@@ -221,12 +221,18 @@ pub(super) fn stream_call_index(
             if let Some((index, active)) = calls.first_key_value()
                 && calls.len() == 1
                 && position == 0
-                && name.is_none_or(|name| {
+                && function.is_none_or(|function| {
+                    let name = function.name.as_deref().unwrap_or_default();
+                    let has_arguments = function
+                        .arguments
+                        .as_ref()
+                        .is_some_and(|value| !value.as_str().is_some_and(str::is_empty));
                     name.is_empty()
                         || (name == active.name
-                            && serde_json::from_str::<Value>(&active.arguments)
-                                .is_err_and(|error| error.is_eof())
-                            && !active.arguments.is_empty())
+                            && (!has_arguments
+                                || (!active.arguments.is_empty()
+                                    && serde_json::from_str::<Value>(&active.arguments)
+                                        .is_err_and(|error| error.is_eof()))))
                 })
             {
                 return Ok(*index);
@@ -387,6 +393,18 @@ mod tests {
                 )
             })
             .collect();
+        let read_delta = super::super::WireFunction {
+            name: Some("read".into()),
+            arguments: Some(json!("}")),
+        };
+        let other_delta = super::super::WireFunction {
+            name: Some("other".into()),
+            arguments: Some(json!("{}")),
+        };
+        let named_id = super::super::WireFunction {
+            name: Some("read".into()),
+            arguments: None,
+        };
         let anonymous = [(
             0,
             crate::CallDelta {
@@ -402,10 +420,10 @@ mod tests {
             0
         );
         assert_eq!(
-            stream_call_index(Some("late"), Some("read"), 0, true, &anonymous).unwrap(),
+            stream_call_index(Some("late"), Some(&read_delta), 0, true, &anonymous).unwrap(),
             0
         );
-        assert!(stream_call_index(Some("late"), Some("other"), 0, true, &anonymous).is_err());
+        assert!(stream_call_index(Some("late"), Some(&other_delta), 0, true, &anonymous).is_err());
         let complete = [(
             0,
             crate::CallDelta {
@@ -416,7 +434,11 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        assert!(stream_call_index(Some("late"), Some("read"), 0, true, &complete).is_err());
+        assert!(stream_call_index(Some("late"), Some(&read_delta), 0, true, &complete).is_err());
+        assert_eq!(
+            stream_call_index(Some("late"), Some(&named_id), 0, true, &complete).unwrap(),
+            0
+        );
         assert!(stream_call_index(None, None, 0, true, &calls).is_err());
         assert_eq!(
             stream_call_index(Some("fixture-1"), None, 0, true, &calls).unwrap(),
