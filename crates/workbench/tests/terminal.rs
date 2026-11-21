@@ -418,6 +418,22 @@ fn settings_picker_can_be_operated_with_the_mouse() {
     let settings: serde_json::Value =
         serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
     assert_eq!(settings["compaction"]["enabled"], false);
+    master.write_all(b"Warnings\r").unwrap();
+    output_until(&mut master, |text| {
+        settings_row_shows(text, "Anthropic extra usage", "true")
+    });
+    master.write_all(b" ").unwrap();
+    output_until(&mut master, |text| {
+        settings_row_shows(text, "Anthropic extra usage", "false")
+    });
+    master.write_all(b"\x1b").unwrap();
+    output_until(&mut master, |text| {
+        settings_row_shows(text, "Warnings", "configure")
+    });
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(settings["warnings"]["anthropicExtraUsage"], false);
+    assert_eq!(settings["compaction"]["enabled"], false);
 }
 
 #[test]

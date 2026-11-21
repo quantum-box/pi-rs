@@ -463,6 +463,10 @@ impl Settings {
         usize::from(self.value["outputPad"].as_f64() != Some(0.0))
     }
 
+    pub fn warn_anthropic_extra_usage(&self) -> bool {
+        self.value["warnings"]["anthropicExtraUsage"] != false
+    }
+
     pub fn set_user_member(&mut self, key: &str, member: &str, value: Value) -> Result<()> {
         self.set_user_member_at(&agent_dir().join("settings.json"), key, member, value)
     }

@@ -2392,7 +2392,11 @@ input is queued. Tests cover schema diagnostics and dialog error layout.
 The terminal lists shared settings in Pi's order and uses Pi's labels and
 boolean values for those rows. Native controls and JSON editors remain
 available after the shared settings. The transport, changelog, installation
-telemetry and warnings controls are still open.
+telemetry controls are still open. The Warnings submenu includes the default-on
+Anthropic extra-usage warning. The terminal shows it once when the active model
+uses Anthropic subscription OAuth or a configured subscription token on the
+official endpoint. The warning check uses configured credentials without
+executing credential commands or refreshing tokens.
 Unlike upstream's permissive settings loading, pi-rs validates implemented
 settings. When several values in a file are invalid, the diagnostic lists the
 settings file and affected JSON paths, including nested package fields and

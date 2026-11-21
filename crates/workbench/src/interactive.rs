@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::{Cli, TuiMode, process::Worker, radius_auth, sessions};
+use super::{Cli, Provider, TuiMode, process::Worker, radius_auth, sessions};
 
 // Shell output is displayed separately from the model-facing context framing.
 fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
@@ -1065,6 +1065,8 @@ struct View {
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
     thinking_settings: Option<ThinkingSettings>,
+    warning_settings_parent: Option<Picker>,
+    anthropic_subscription_warning_shown: bool,
     pending_thinking: Option<PendingThinking>,
     session_name: Option<String>,
     resources: super::resources::Resources,
@@ -1439,6 +1441,36 @@ impl View {
                 }
             }
             self.regular.committed = self.regular.committed.saturating_sub(removed);
+        }
+    }
+    fn maybe_warn_about_anthropic_subscription(&mut self, args: &Cli) {
+        if self.anthropic_subscription_warning_shown
+            || !args.settings.warn_anthropic_extra_usage()
+            || args.provider != Provider::Anthropic
+            || args
+                .model_profiles
+                .model_adapter(&args.provider, &args.model)
+                != super::providers::Adapter::Anthropic
+        {
+            return;
+        }
+        let endpoint = args.model_endpoint_for(&args.provider, Some(&args.model));
+        if endpoint != Provider::Anthropic.default_endpoint() {
+            return;
+        }
+        let credential = args.model_credential_for(&args.provider, endpoint);
+        let uses_subscription = match credential {
+            Some(super::model_auth::Credential::AnthropicOAuth) => true,
+            Some(credential) => credential
+                .literal()
+                .is_some_and(|token| token.starts_with("sk-ant-oat")),
+            None => false,
+        };
+        if uses_subscription {
+            self.anthropic_subscription_warning_shown = true;
+            self.append_entry(Entry::Warning(
+                "Anthropic subscription auth is active. Requests may use paid extra usage. Manage extra usage at https://claude.ai/settings/usage. Disable this warning in /settings.".into(),
+            ));
         }
     }
     fn show_custom_message(&mut self, id: u64, message: &pi_rs::CustomMessage) {
@@ -4973,6 +5005,9 @@ pub(super) async fn run(
                     && worker.as_ref().is_some_and(|worker| worker.busy),
             )?;
         }
+        if dirty {
+            view.maybe_warn_about_anthropic_subscription(&args);
+        }
         if !args.trust_pending
             && view.picker.is_none()
             && view.pending_transition.is_none()
@@ -5526,6 +5561,17 @@ pub(super) async fn run(
                             view.picker = Some(picker);
                         }
                         Input::Cancel => {
+                            if picker.title == "Warnings"
+                                && let Some(mut parent) = view.warning_settings_parent.take()
+                            {
+                                parent.refresh_settings(settings_items(
+                                    &args,
+                                    &view,
+                                    worker.as_ref(),
+                                ));
+                                view.picker = Some(parent);
+                                continue;
+                            }
                             if let Some(mut state) = view.thinking_settings.take() {
                                 if let Some(model_picker) = state.model_picker.take() {
                                     state.levels = None;
@@ -5651,6 +5697,14 @@ pub(super) async fn run(
                         Input::Select(selection) => {
                             view.tree_confirmation = None;
                             let settings = picker.title == "Settings";
+                            if settings
+                                && matches!(&selection, Selection::EditSetting(name) if name == "warnings")
+                            {
+                                view.warning_settings_parent = Some(picker);
+                                view.picker =
+                                    Some(Picker::new("Warnings", warning_settings_items(&args)));
+                                continue;
+                            }
                             if settings
                                 && matches!(&selection, Selection::EditSetting(name) if name == "theme")
                             {
@@ -5881,12 +5935,13 @@ pub(super) async fn run(
                             }
                             let result =
                                 select(selection, &mut args, &mut view, &mut theme, &mut worker);
-                            if settings {
-                                picker.refresh_settings(settings_items(
-                                    &args,
-                                    &view,
-                                    worker.as_ref(),
-                                ));
+                            if settings || picker.title == "Warnings" {
+                                let items = if settings {
+                                    settings_items(&args, &view, worker.as_ref())
+                                } else {
+                                    warning_settings_items(&args)
+                                };
+                                picker.refresh_settings(items);
                                 if let Err(error) = result {
                                     picker.show_feedback(Err(error.to_string()));
                                 }
@@ -7249,6 +7304,14 @@ fn start_thinking_levels(
     Ok(receiver)
 }
 
+fn warning_settings_items(args: &Cli) -> Vec<Item> {
+    let enabled = args.settings.warn_anthropic_extra_usage();
+    vec![Item {
+        label: format!("Anthropic extra usage · {enabled}"),
+        selection: Selection::Setting("warnings.anthropicExtraUsage".into(), json!(!enabled)),
+    }]
+}
+
 fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item> {
     let cache_mode = args.settings.string("cacheWarming").unwrap_or("streaming");
     let next_cache_mode = match cache_mode {
@@ -7535,6 +7598,10 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
                 "treeFilterMode".into(),
                 json!(tree_filter.next().name()),
             ),
+        },
+        Item {
+            label: "Warnings · configure".into(),
+            selection: Selection::EditSetting("warnings".into()),
         },
         Item {
             label: format!("Default thinking level per model · {thinking_summary}"),
@@ -7918,6 +7985,9 @@ fn select(
             } else if let Some(member) = key.strip_prefix("markdown.") {
                 args.settings
                     .set_user_member("markdown", member, value.clone())?;
+            } else if let Some(member) = key.strip_prefix("warnings.") {
+                args.settings
+                    .set_user_member("warnings", member, value.clone())?;
             } else if key == "theme" {
                 let next = load_resolved_theme(
                     value
@@ -8859,6 +8929,44 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subscription_warning_respects_settings_and_only_appears_once() {
+        use clap::Parser;
+
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.provider = super::Provider::Anthropic;
+        args.model = "claude-sonnet-4-6".into();
+        args.endpoint = args.provider.default_endpoint().into();
+        args.settings = super::super::config::Settings::default();
+        args.model_keys = super::super::model_auth::Keys::parse(&serde_json::json!({
+            "anthropic": {"type": "api_key", "key": "sk-ant-api-fixture"}
+        }));
+        let mut view = super::View::default();
+        view.maybe_warn_about_anthropic_subscription(&args);
+        assert!(view.lines.is_empty());
+
+        args.model_keys = super::super::model_auth::Keys::parse(&serde_json::json!({
+            "anthropic": {"type": "oauth", "access": "sk-ant-oat-fixture", "refresh": "fixture", "expires": 123}
+        }));
+        view.maybe_warn_about_anthropic_subscription(&args);
+        view.maybe_warn_about_anthropic_subscription(&args);
+        assert!(matches!(&view.lines[..], [super::Entry::Warning(text)]
+            if text.contains("paid extra usage") && !text.contains("sk-ant-oat")));
+
+        let workspace = tempfile::tempdir().unwrap();
+        let settings_dir = workspace.path().join(".pi");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        std::fs::write(
+            settings_dir.join("settings.json"),
+            r#"{"warnings":{"anthropicExtraUsage":false}}"#,
+        )
+        .unwrap();
+        args.settings = super::super::config::Settings::load(workspace.path(), true).unwrap();
+        let mut view = super::View::default();
+        view.maybe_warn_about_anthropic_subscription(&args);
+        assert!(view.lines.is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn signal_listener_survives_interrupt_during_editor() {
