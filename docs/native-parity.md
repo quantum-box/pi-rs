@@ -4776,7 +4776,9 @@ the account and gateway identifiers in `CLOUDFLARE_ACCOUNT_ID` and
 credential. `CLOUDFLARE_API_KEY` supplies the gateway token. The model's API
 selects the Chat Completions, Messages, or Responses path. All three send
 `cf-aig-authorization` for gateway authentication, and saved keys remain
-scoped to their account and gateway.
+scoped to their account and gateway. A concrete provider `baseUrl` can
+supply missing route identifiers for an imported key when the configured
+route agrees with any saved or environment identifiers.
 
 The published Pi AI package and local fixtures cover each route and
 authentication header. Live gateway authentication was unverified because

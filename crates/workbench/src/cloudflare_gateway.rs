@@ -85,6 +85,20 @@ impl Route {
         })
     }
 
+    pub fn with_route_identifiers(
+        account: Option<&str>,
+        gateway: Option<&str>,
+        fallback: Option<Self>,
+    ) -> Option<Self> {
+        match (account, gateway) {
+            (Some(account), Some(gateway)) => Self::new(account, gateway),
+            (account, gateway) => fallback.filter(|route| {
+                account.is_none_or(|account| route.account == account)
+                    && gateway.is_none_or(|gateway| route.gateway == gateway)
+            }),
+        }
+    }
+
     pub fn matches_environment(
         &self,
         env: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -179,11 +193,28 @@ mod tests {
         .unwrap();
         assert!(profiles.has_provider_endpoint(&provider, &endpoint));
         let keys = Keys::parse(&json!({"cloudflare-ai-gateway":{
-            "type":"api_key","key":"fixture","env":{"CLOUDFLARE_GATEWAY_ID":"other-gateway"},
+            "type":"api_key","key":"fixture","env":{"CLOUDFLARE_GATEWAY_ID":"saved-gateway"},
         }}));
         assert!(
             keys.custom_credential(&provider, &endpoint, &profiles)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn configured_gateway_fills_missing_route_identifiers() {
+        let route = Route::new("account123", "configured").unwrap();
+        assert_eq!(
+            Route::with_route_identifiers(None, None, Some(route.clone())),
+            Some(route.clone())
+        );
+        assert_eq!(
+            Route::with_route_identifiers(Some("account123"), None, Some(route.clone())),
+            Some(route.clone())
+        );
+        assert_eq!(
+            Route::with_route_identifiers(Some("other"), None, Some(route)),
+            None
         );
     }
 
