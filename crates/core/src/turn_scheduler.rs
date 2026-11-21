@@ -1890,6 +1890,19 @@ impl Agent<'_> {
         let args = match turn_model_arguments(invocation, validated.as_ref()) {
             Ok(arguments) => arguments,
             Err(error) => {
+                if tool.tool.pi_argument_diagnostics() {
+                    let parse_error = if validated.is_some() {
+                        crate::parse_tool_arguments(&call.arguments).err()
+                    } else {
+                        Some(error.clone())
+                    };
+                    if let Some(parse_error) = parse_error {
+                        return Ok(TurnNormalized::ArgumentRejected(format!(
+                            "Invalid arguments for tool \"{}\": {parse_error}",
+                            call.name
+                        )));
+                    }
+                }
                 return Ok(TurnNormalized::Skipped(format!(
                     "Invalid arguments for tool \"{}\": {error}",
                     call.name

@@ -90,6 +90,18 @@ impl Model for Script {
                 name: name.into(),
                 arguments: args.to_string(),
             })
+            .chain(
+                [
+                    ("read-bad-syntax", r#"{"path":?"#),
+                    ("read-not-object", "[1]"),
+                ]
+                .into_iter()
+                .map(|(id, raw)| ToolCall {
+                    id: id.into(),
+                    name: "read".into(),
+                    arguments: raw.into(),
+                }),
+            )
             .collect()
         } else {
             vec![]
@@ -154,6 +166,14 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
         );
     }
     for (call_id, diagnostic) in [
+        (
+            "read-bad-syntax",
+            "Invalid arguments for tool \"read\": Unexpected token '?', \"{\"path\":?\" is not valid JSON\n\nReceived arguments:\n{\"path\":?",
+        ),
+        (
+            "read-not-object",
+            "Invalid arguments for tool \"read\": Tool arguments must be a JSON object\n\nReceived arguments:\n[1]",
+        ),
         (
             "ls-invalid",
             "Validation failed for tool \"ls\":\n  - limit: expected number, got string\n\nReceived arguments:\n{\n  \"limit\": \" true \"\n}",
