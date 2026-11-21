@@ -1830,11 +1830,23 @@ fn observe_snapshot(
 ) {
     if let pi_rs::Notification::Committed(record) = &event
         && let pi_rs::Event::ToolFinished { operation_id, .. } = &record.event
-        && let Some(structured_content) = pi_rs::tool_result_event_metadata(*operation_id)
     {
-        output(
-            json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":structured_content}),
-        );
+        let structured_content = pi_rs::tool_result_event_metadata(*operation_id);
+        let duration_ms =
+            super::rpc_events::tool_duration_ms(pi_rs::record_event_metadata(record.id).as_ref());
+        if structured_content.is_some() || duration_ms.is_some() {
+            let mut metadata = json!({
+                "type": "internal_tool_result_metadata",
+                "operationId": operation_id
+            });
+            if let Some(content) = structured_content {
+                metadata["structuredContent"] = content;
+            }
+            if let Some(duration_ms) = duration_ms {
+                metadata["durationMs"] = json!(duration_ms);
+            }
+            output(metadata);
+        }
     }
     let name = match &event {
         pi_rs::Notification::Committed(record) => match &record.event {

@@ -834,6 +834,11 @@ impl Projection {
                 value["toolName"] = json!(name);
                 value["timestamp"] = json!(timestamp);
                 value["isError"] = json!(outcome.map_or(*is_error, super::rpc_events::tool_failed));
+                if let Some(duration_ms) = super::rpc_events::tool_duration_ms(
+                    metadata.and_then(|source| source.get(record.id)),
+                ) {
+                    value["durationMs"] = json!(duration_ms);
+                }
                 value
             }
         }
@@ -1154,6 +1159,20 @@ mod tests {
         assert_eq!(value["nativeData"]["duration"], 3);
         assert_eq!(value["structuredContent"], json!({"answer":42}));
         assert_eq!(value["details"]["source"], "fixture");
+        assert!(value.get("durationMs").is_none());
+
+        let metadata = BTreeMap::from([
+            (record.id, json!({"durationMs":0})),
+            (record.id + 1, json!({"durationMs":500})),
+        ]);
+        let value = Projection::default().message(
+            std::slice::from_ref(&record),
+            &record,
+            &message,
+            false,
+            Some(MetadataSource::Snapshot(&metadata)),
+        );
+        assert_eq!(value["durationMs"], 0);
     }
 
     #[test]
