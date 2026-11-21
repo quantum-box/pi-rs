@@ -3513,7 +3513,9 @@ new-file numbers for insertions, and four context lines on either side of a
 change. Omitted ranges appear as ellipses. The terminal prefers the numbered
 diff, preserves each line’s original gutter (including empty line numbers),
 and uses the existing word highlighting for single-line changes. Added, removed
-and context rows use the corresponding Pi theme roles.
+and context rows use the corresponding Pi theme roles. Numbered rows wrap at
+word and CJK grapheme boundaries, with the diff coloring and inverse highlights
+carried into subsequent rows. Long words split at grapheme boundaries.
 Previously stored unified patches still render through the existing path.
 
 The CLI comparison checks exact numbered and unified diffs for two separate
