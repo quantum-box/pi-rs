@@ -418,15 +418,7 @@ impl Deferred {
                     Some(settings) => settings.clone(),
                     None => super::config::Settings::load(&std::env::current_dir()?, false)?,
                 };
-                Some(
-                    super::codex_auth::access(
-                        auth_path,
-                        &settings,
-                        std::time::Duration::ZERO,
-                        false,
-                    )
-                    .await?,
-                )
+                Some(super::codex_auth::access(auth_path, &settings, None, false).await?)
             }
             Some(Credential::Copilot) => {
                 let settings = match &self.http_settings {
