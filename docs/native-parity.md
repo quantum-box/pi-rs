@@ -2508,6 +2508,8 @@ rendering. The previous SIGINT disposition is restored after continuation.
 An external SIGTSTP uses the same restore and resume path while the TUI owns
 the terminal, matching Pi v1.6.0. The previous SIGTSTP disposition is restored
 when another program takes over the terminal.
+Suspension can interrupt the terminal's wait during `/reload`. Package
+preparation resumes with the foreground job.
 Windows and WSL use Pi's Ctrl+Q follow-up, Alt+P reverse-model and Alt+V paste
 bindings. Unix suspension remains available on WSL.
 Windows uses Ctrl+Z for undo; WSL uses Alt+Z so Ctrl+Z remains suspend.
