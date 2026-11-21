@@ -634,7 +634,7 @@ pub(super) async fn discover(
     Ok(discovery)
 }
 
-async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExtension> {
+pub(super) async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExtension> {
     connect_for_discovery(args, name, server, None).await
 }
 
@@ -904,14 +904,33 @@ async fn list_json(args: &Cli) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InspectionScope {
+    Global,
+    Project,
+    Override,
+}
+
+impl InspectionScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Project => "project",
+            Self::Override => "global · project override",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct Inspection {
-    name: String,
+    pub name: String,
     status: &'static str,
     exposure: String,
-    scope: &'static str,
+    scope: InspectionScope,
     description: String,
     tools: Vec<String>,
+    pub config: Option<ServerConfig>,
+    oauth: Option<ManagerAction>,
 }
 
 fn inspection_entries(
@@ -922,7 +941,8 @@ fn inspection_entries(
     servers
         .iter()
         .map(|(name, config)| {
-            let status = if report_server_config(config).is_none() {
+            let parsed = report_server_config(config);
+            let status = if parsed.is_none() {
                 "invalid"
             } else if config["enabled"] == false {
                 "disabled"
@@ -930,11 +950,11 @@ fn inspection_entries(
                 "disconnected"
             };
             let scope = if project.contains(name) {
-                "project"
+                InspectionScope::Project
             } else if overrides.contains(name) {
-                "global · project override"
+                InspectionScope::Override
             } else {
-                "global"
+                InspectionScope::Global
             };
             Inspection {
                 name: name.clone(),
@@ -945,6 +965,8 @@ fn inspection_entries(
                     config["description"].as_str().unwrap_or_default(),
                 ),
                 tools: Vec::new(),
+                config: parsed,
+                oauth: None,
             }
         })
         .collect()
@@ -960,12 +982,289 @@ fn inspection_description(description: &str) -> String {
         .collect()
 }
 
-pub(super) async fn inspect_servers(
-    configured: &[Inspection],
-    connected: &[Arc<McpExtension>],
+#[derive(Clone, Copy)]
+pub(super) enum ManagerAction {
+    Reconnect,
+    SetEnabled { enabled: bool, project: bool },
+    SetExposure(&'static str),
+    SignIn,
+    SignOut,
+}
+
+pub(super) struct ManagerRequest {
+    pub name: String,
+    pub config: ServerConfig,
+    pub action: ManagerAction,
+    scope: InspectionScope,
+}
+
+pub(super) fn check_manager_connection(
+    args: &Cli,
+    name: &str,
+    expected: &ServerConfig,
+) -> Result<()> {
+    let current = configurations(args)?
+        .remove(name)
+        .map(serde_json::from_value::<ServerConfig>)
+        .transpose()?;
+    if current.as_ref() != Some(expected)
+        || args
+            .disable_extension
+            .contains(&format!("mcp-{}", name.replace('-', "_")))
+        || expected.enabled == Some(false)
+    {
+        return Err(Error::Config(
+            "MCP configuration changed. Reload before connecting.".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) async fn manager_login(
+    args: &Cli,
+    pending: &PendingSignIn,
     ui: &dyn ExtensionUi,
     cancel: &CancellationToken,
 ) -> Result<()> {
+    use pi_rs_workbench::mcp_auth::{CliLoginClient, login_cli_with_precommit};
+    check_manager_connection(args, &pending.name, &pending.config)?;
+    let url = pending
+        .config
+        .url
+        .as_deref()
+        .ok_or_else(|| Error::Config("MCP OAuth requires HTTP".into()))?;
+    let (announce, announcement) = tokio::sync::oneshot::channel();
+    let announce = std::sync::Mutex::new(Some(announce));
+    let (redirect, manual_redirect) = tokio::sync::oneshot::channel();
+    let client = CliLoginClient::Interactive {
+        settings: pending.config.oauth_client(),
+        challenge: pending.challenge.as_deref(),
+        manual_redirect,
+    };
+    let paths = std::iter::once(path(args, false))
+        .chain(args.trusted.then(|| path(args, true)))
+        .collect();
+    let validate_args = args.clone();
+    let validate = pending.clone();
+    let options = super::http_proxy::configured_mcp(&args.settings)?;
+    let login_cancel = cancel.child_token();
+    let login = login_cli_with_precommit(
+        &pending.name,
+        url,
+        client,
+        &[],
+        Some(&options),
+        tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+        &login_cancel,
+        |url| {
+            if let Some(send) = announce.lock().expect("MCP authorization URL").take() {
+                let _ = send.send(url.to_owned());
+            }
+        },
+        paths,
+        move || check_manager_connection(&validate_args, &validate.name, &validate.config),
+    );
+    let present = present_mcp_login(&pending.name, announcement, redirect, ui, &login_cancel);
+    tokio::pin!(login, present);
+    tokio::select! {
+        biased;
+        result = &mut login => result,
+        delivered = &mut present => {
+            if let Err(error) = delivered {
+                login_cancel.cancel();
+                let result = login.await;
+                if matches!(result, Err(Error::Cancelled)) {
+                    return Err(error);
+                }
+                return result;
+            }
+            login.await
+        }
+    }
+}
+
+async fn present_mcp_login(
+    name: &str,
+    announcement: tokio::sync::oneshot::Receiver<String>,
+    redirect: tokio::sync::oneshot::Sender<reqwest_mcp::Url>,
+    ui: &dyn ExtensionUi,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let authorization = announcement.await.map_err(|_| Error::Cancelled)?;
+    let parsed = reqwest_mcp::Url::parse(&authorization)
+        .map_err(|_| Error::Config("Invalid MCP authorization URL".into()))?;
+    let parameter = |expected| {
+        parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == expected).then(|| value.into_owned()))
+    };
+    let state = parameter("state")
+        .ok_or_else(|| Error::Config("MCP authorization state is missing".into()))?;
+    let callback = parameter("redirect_uri")
+        .and_then(|url| reqwest_mcp::Url::parse(&url).ok())
+        .ok_or_else(|| Error::Config("MCP authorization callback is missing".into()))?;
+    let mut notes = vec!["Open this authorization URL in your browser.".to_owned()];
+    notes.extend(
+        authorization
+            .as_bytes()
+            .chunks(64)
+            .map(|part| String::from_utf8_lossy(part).into_owned()),
+    );
+    let displayed = ui
+        .request(
+            UiRequest::Custom {
+                title: format!("Sign in to MCP {name}"),
+                lines: notes
+                    .into_iter()
+                    .map(|text| {
+                        vec![UiComponentSpan {
+                            text,
+                            ..Default::default()
+                        }]
+                    })
+                    .collect(),
+                actions: vec![UiComponentAction {
+                    key: "enter".into(),
+                    value: "paste".into(),
+                    label: Some("Paste redirect URL".into()),
+                }],
+                timeout: None,
+            },
+            cancel.clone(),
+        )
+        .await;
+    if displayed != Ok(UiResponse::Text("paste".into())) {
+        return Err(Error::Cancelled);
+    }
+    let mut title = "Paste the browser redirect URL";
+    loop {
+        let answer = ui
+            .request(
+                UiRequest::Input {
+                    title: title.into(),
+                    initial_value: None,
+                    placeholder: None,
+                    timeout: None,
+                },
+                cancel.clone(),
+            )
+            .await;
+        let Ok(UiResponse::Text(value)) = answer else {
+            return Err(Error::Cancelled);
+        };
+        if let Some(url) =
+            pi_rs_workbench::oauth_callback::manual_redirect(&value, &callback, &state)
+        {
+            let _ = redirect.send(url);
+            return Ok(());
+        }
+        title = "Invalid redirect URL. Paste the full browser redirect URL";
+    }
+}
+
+pub(super) async fn edit_manager_config(
+    args: &Cli,
+    request: &ManagerRequest,
+    cancel: &CancellationToken,
+) -> Result<Inspection> {
+    let mut expected = request.config.clone();
+    let (key, value, in_project) = match request.action {
+        ManagerAction::SetEnabled { enabled, project } => {
+            expected.enabled = Some(enabled);
+            ("enabled", json!(enabled), project)
+        }
+        ManagerAction::SetExposure(exposure)
+            if request.config.enabled != Some(false)
+                && ["codemode", "deferred", "direct"].contains(&exposure) =>
+        {
+            expected.exposure = Some(exposure.into());
+            ("exposure", json!(exposure), false)
+        }
+        _ => return Err(Error::Config("Invalid MCP configuration edit".into())),
+    };
+    if args
+        .disable_extension
+        .contains(&format!("mcp-{}", request.name.replace('-', "_")))
+        || (in_project && (!args.trusted || request.scope != InspectionScope::Global))
+    {
+        return Err(Error::Config(
+            "MCP server is unavailable in this scope".into(),
+        ));
+    }
+    let user_path = config::agent_dir().join("mcp.json");
+    let project_path = args.trusted.then(|| args.workspace.join(".pi/mcp.json"));
+    let scope = if in_project {
+        InspectionScope::Override
+    } else {
+        request.scope
+    };
+    let path = if scope == InspectionScope::Global {
+        &user_path
+    } else {
+        project_path
+            .as_ref()
+            .ok_or_else(|| Error::Config("Project is no longer trusted".into()))?
+    };
+    let other_scope = if scope == InspectionScope::Global {
+        project_path.clone()
+    } else {
+        Some(user_path.clone())
+    };
+    let _locks = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(Error::Cancelled),
+        locks = pi_rs_workbench::mcp_config_edit_lock(path.to_owned(), other_scope) => locks?,
+    };
+    let inspect = || {
+        let (servers, project, overrides, _, _) =
+            configurations_with_project_scope(args, ConfigurationRead::Runtime)?;
+        inspection_entries(&servers, &project, &overrides)
+            .into_iter()
+            .find(|entry| entry.name == request.name)
+            .ok_or_else(|| Error::Config("MCP server is no longer configured".into()))
+    };
+    let current = inspect()?;
+    if current.config.as_ref() != Some(&request.config) || current.scope != request.scope {
+        return Err(Error::Config(
+            "MCP configuration changed. Reload before editing.".into(),
+        ));
+    }
+    let mut document = config::read_object(path)?;
+    let entries = document
+        .as_object_mut()
+        .expect("configuration object")
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| Error::Config("mcpServers must be an object".into()))?;
+    let entry = entries
+        .entry(&request.name)
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| Error::Config("MCP server must be an object".into()))?;
+    entry.insert(key.into(), value);
+    if cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    config::write_json(path, &document)?;
+    let updated = inspect()?;
+    if updated.scope != scope || updated.config.as_ref() != Some(&expected) {
+        return Err(Error::Config(
+            "MCP configuration changed while saving. Reload to apply it.".into(),
+        ));
+    }
+    Ok(updated)
+}
+
+pub(super) async fn inspect_servers(
+    configured: &[Inspection],
+    connected: &[Arc<McpExtension>],
+    pending: &BTreeMap<String, PendingSignIn>,
+    selected: Option<(&str, &str)>,
+    project_trusted: bool,
+    ui: &dyn ExtensionUi,
+    cancel: &CancellationToken,
+) -> Result<Option<ManagerRequest>> {
     let mut entries = configured.to_vec();
     for entry in &mut entries {
         if let Some(server) = connected
@@ -973,6 +1272,9 @@ pub(super) async fn inspect_servers(
             .find(|server| server.server_name == entry.name)
         {
             entry.status = "connected";
+            if server.uses_oauth() {
+                entry.oauth = Some(ManagerAction::SignOut);
+            }
             entry.description = inspection_description(&server.description);
             entry.tools = server
                 .remote_tool_names()
@@ -984,10 +1286,16 @@ pub(super) async fn inspect_servers(
                     )
                 })
                 .collect();
+        } else if pending.get(&entry.name).is_some_and(|pending| {
+            pending.config.enabled != Some(false) && entry.config.as_ref() == Some(&pending.config)
+        }) {
+            entry.status = "needs sign-in";
+            entry.oauth = Some(ManagerAction::SignIn);
         }
     }
     // Put disconnected and invalid entries first, as the Pi manager does.
-    entries.sort_by_key(|entry| !matches!(entry.status, "disconnected" | "invalid"));
+    entries
+        .sort_by_key(|entry| !matches!(entry.status, "disconnected" | "invalid" | "needs sign-in"));
     let options = entries
         .iter()
         .map(|entry| {
@@ -995,7 +1303,10 @@ pub(super) async fn inspect_servers(
             let tool_label = if count == 1 { "tool" } else { "tools" };
             format!(
                 "{} · {} · {count} {tool_label} · {} · {}",
-                entry.name, entry.status, entry.exposure, entry.scope,
+                entry.name,
+                entry.status,
+                entry.exposure,
+                entry.scope.label(),
             )
         })
         .collect::<Vec<_>>();
@@ -1003,62 +1314,191 @@ pub(super) async fn inspect_servers(
         let _ = show_inspection(
             "MCP servers".into(),
             vec!["No MCP servers configured.".into()],
+            None,
             false,
             ui,
             cancel,
         )
         .await?;
-        return Ok(());
+        return Ok(None);
     }
     let mut page = 0;
-    while let Some(index) =
-        select_inspection("MCP servers", &options, &mut page, ui, cancel).await?
-    {
+    let mut resume =
+        selected.and_then(|(name, _)| entries.iter().position(|entry| entry.name == name));
+    loop {
+        let index = match resume.take() {
+            Some(index) => index,
+            None => {
+                match select_inspection("MCP servers", &options, &mut page, ui, cancel).await? {
+                    Some(index) => index,
+                    None => return Ok(None),
+                }
+            }
+        };
         let entry = &entries[index];
+        let enabled = entry
+            .config
+            .as_ref()
+            .map(|config| config.enabled != Some(false));
         let mut lines = vec![
             format!("Status · {}", entry.status),
-            format!("Scope · {}", entry.scope),
+            format!("Scope · {}", entry.scope.label()),
             format!("Exposure · {}", entry.exposure),
             format!("Tools · {}", entry.tools.len()),
         ];
         if !entry.description.is_empty() {
             lines.push(entry.description.clone());
         }
-        while show_inspection(
-            format!("MCP server · {}", entry.name),
-            lines.clone(),
-            !entry.tools.is_empty(),
-            ui,
-            cancel,
-        )
-        .await?
+        if let Some((name, message)) = selected
+            && entry.name == name
         {
-            let title = format!("MCP tools · {}", entry.name);
-            let mut tool_page = 0;
-            let _ = select_inspection(&title, &entry.tools, &mut tool_page, ui, cancel).await?;
+            lines.push(message.into());
+        }
+        loop {
+            let action = show_inspection(
+                format!("MCP server · {}", entry.name),
+                lines.clone(),
+                Some(entry),
+                project_trusted && entry.scope == InspectionScope::Global,
+                ui,
+                cancel,
+            )
+            .await?;
+            match (action.as_str(), entry.config.as_ref()) {
+                ("tools", _) => {
+                    let title = format!("MCP tools · {}", entry.name);
+                    let mut tool_page = 0;
+                    let _ =
+                        select_inspection(&title, &entry.tools, &mut tool_page, ui, cancel).await?;
+                }
+                ("oauth", Some(config)) => {
+                    if let Some(action) = entry.oauth {
+                        return Ok(Some(ManagerRequest {
+                            name: entry.name.clone(),
+                            config: config.clone(),
+                            scope: entry.scope,
+                            action,
+                        }));
+                    }
+                }
+                ("exposure", Some(config)) if enabled == Some(true) => {
+                    if let Some(exposure) = choose_exposure(entry, ui, cancel).await? {
+                        return Ok(Some(ManagerRequest {
+                            name: entry.name.clone(),
+                            config: config.clone(),
+                            scope: entry.scope,
+                            action: ManagerAction::SetExposure(exposure),
+                        }));
+                    }
+                }
+                ("reconnect" | "toggle" | "toggle-project", Some(config)) => {
+                    let action = if action == "reconnect" {
+                        ManagerAction::Reconnect
+                    } else {
+                        ManagerAction::SetEnabled {
+                            enabled: enabled == Some(false),
+                            project: action == "toggle-project",
+                        }
+                    };
+                    return Ok(Some(ManagerRequest {
+                        name: entry.name.clone(),
+                        config: config.clone(),
+                        scope: entry.scope,
+                        action,
+                    }));
+                }
+                _ => break,
+            }
         }
     }
-    Ok(())
+}
+
+async fn choose_exposure(
+    entry: &Inspection,
+    ui: &dyn ExtensionUi,
+    cancel: &CancellationToken,
+) -> Result<Option<&'static str>> {
+    let mut choices = [
+        ("codemode", "Called from Codemode scripts"),
+        ("deferred", "Declared after tool_search discovers it"),
+        ("direct", "Declared to the model"),
+    ];
+    if let Some(index) = choices.iter().position(|(name, _)| *name == entry.exposure) {
+        choices.rotate_left(index);
+    }
+    let labels = choices.map(|(name, description)| {
+        let current = if name == entry.exposure { " ✓" } else { "" };
+        format!("{name}{current} · {description}")
+    });
+    let title = format!("Exposure of {}", entry.name);
+    let Some(index) = select_inspection(&title, &labels, &mut 0, ui, cancel).await? else {
+        return Ok(None);
+    };
+    let chosen = choices[index].0;
+    Ok((chosen != entry.exposure).then_some(chosen))
 }
 
 async fn show_inspection(
     title: String,
     lines: Vec<String>,
-    tools: bool,
+    entry: Option<&Inspection>,
+    project_toggle: bool,
     ui: &dyn ExtensionUi,
     cancel: &CancellationToken,
-) -> Result<bool> {
+) -> Result<String> {
     let mut actions = vec![UiComponentAction {
         key: "enter".into(),
         value: "back".into(),
         label: Some("Back".into()),
     }];
-    if tools {
+    if entry.is_some_and(|entry| !entry.tools.is_empty()) {
         actions.push(UiComponentAction {
             key: "t".into(),
             value: "tools".into(),
             label: Some("Tools".into()),
         });
+    }
+    let enabled = entry
+        .and_then(|entry| entry.config.as_ref())
+        .map(|config| config.enabled != Some(false));
+    if let Some(action) = entry.and_then(|entry| entry.oauth) {
+        let (key, label) = if matches!(action, ManagerAction::SignIn) {
+            ("i", "Sign in")
+        } else {
+            ("o", "Sign out")
+        };
+        actions.push(UiComponentAction {
+            key: key.into(),
+            value: "oauth".into(),
+            label: Some(label.into()),
+        });
+    }
+    if enabled == Some(true) {
+        actions.push(UiComponentAction {
+            key: "r".into(),
+            value: "reconnect".into(),
+            label: Some("Reconnect".into()),
+        });
+        actions.push(UiComponentAction {
+            key: "x".into(),
+            value: "exposure".into(),
+            label: Some("Exposure".into()),
+        });
+    }
+    if let Some(enabled) = enabled {
+        let label = if enabled { "Disable" } else { "Enable" };
+        actions.push(UiComponentAction {
+            key: "e".into(),
+            value: "toggle".into(),
+            label: Some(label.into()),
+        });
+        if project_toggle {
+            actions.push(UiComponentAction {
+                key: "p".into(),
+                value: "toggle-project".into(),
+                label: Some(format!("{label} in this project")),
+            });
+        }
     }
     let request = UiRequest::Custom {
         title,
@@ -1078,7 +1518,10 @@ async fn show_inspection(
         .request(request, cancel.clone())
         .await
         .map_err(|error| Error::Config(format!("MCP inspector UI failed: {error}")))?;
-    Ok(matches!(response, UiResponse::Text(action) if action == "tools"))
+    Ok(match response {
+        UiResponse::Text(action) => action,
+        _ => String::new(),
+    })
 }
 
 async fn select_inspection(
@@ -1301,7 +1744,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                 value["env"] = Value::Object(env);
             }
             let path = path(args, local);
-            config::update_object(&path, |document| {
+            update_cli_config(args, &path, local, |document| {
                 let entries = document
                     .entry("mcpServers")
                     .or_insert_with(|| json!({}))
@@ -1309,7 +1752,8 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                     .ok_or_else(|| Error::Config("mcpServers must be an object".into()))?;
                 entries.insert(name.clone(), value);
                 Ok(())
-            })?;
+            })
+            .await?;
             output(json!({"type":"mcp_saved","name":name,"path":path}));
         }
         McpCommand::Login {
@@ -1509,7 +1953,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
         }
         McpCommand::Remove { name, local } => {
             let path = path(args, local);
-            config::update_object(&path, |document| {
+            update_cli_config(args, &path, local, |document| {
                 document
                     .get_mut("mcpServers")
                     .and_then(Value::as_object_mut)
@@ -1518,12 +1962,32 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
                         Error::Config("MCP server not found in this configuration".into())
                     })?;
                 Ok(())
-            })?;
+            })
+            .await?;
             output(json!({"type":"mcp_removed","name":name,"path":path}));
         }
     }
     Ok(())
 }
+async fn update_cli_config(
+    args: &Cli,
+    path: &std::path::Path,
+    local: bool,
+    update: impl FnOnce(&mut serde_json::Map<String, Value>) -> Result<()>,
+) -> Result<()> {
+    // Project writers also hold a shared user lock so a global edit can
+    // validate the project even when the project directory does not yet exist.
+    let global = local.then(|| config::agent_dir().join("mcp.json"));
+    let _locks = tokio::select! {
+        biased;
+        _ = args.command_cancel.cancelled() => return Err(Error::Cancelled),
+        locks = pi_rs_workbench::mcp_config_edit_lock(path.to_owned(), global) => locks?,
+    };
+    let mut document = config::read_object(path)?;
+    update(document.as_object_mut().expect("configuration object"))?;
+    config::write_json(path, &document)
+}
+
 fn path(args: &Cli, local: bool) -> PathBuf {
     if local {
         args.workspace.join(".pi/mcp.json")
