@@ -1,4 +1,10 @@
 //! Render native unified edit results with line numbers and word-level changes.
+use std::ops::Range;
+use std::sync::LazyLock;
+
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
 use super::{
     render::{Line, Span, wrap},
     theme::Theme,
@@ -114,7 +120,7 @@ pub fn render(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
         .unwrap_or(1)
         .to_string()
         .len();
-    render_rows(&rows, digits, theme, width)
+    render_rows(&rows, digits, theme, width, wrap)
 }
 
 pub fn render_numbered(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
@@ -156,10 +162,16 @@ pub fn render_numbered(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
             }
         })
         .collect();
-    render_rows(&rows, 1, theme, width)
+    render_rows(&rows, 1, theme, width, wrap_numbered_row)
 }
 
-fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<Line> {
+fn render_rows(
+    rows: &[Row],
+    digits: usize,
+    theme: &Theme,
+    width: usize,
+    wrap_row: fn(&[Span], usize) -> Vec<Line>,
+) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut index = 0;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
@@ -208,11 +220,11 @@ fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<
                     }
                 }
             }
-            lines.extend(wrap(&removed_spans, width));
-            lines.extend(wrap(&added_spans, width));
+            lines.extend(wrap_row(&removed_spans, width));
+            lines.extend(wrap_row(&added_spans, width));
             index += 2;
         } else {
-            lines.extend(wrap(
+            lines.extend(wrap_row(
                 &[Span::themed(
                     format!("{}{}", row.prefix(digits), row.text),
                     theme,
@@ -226,9 +238,156 @@ fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<
     lines
 }
 
+fn wrap_numbered_row(spans: &[Span], width: usize) -> Vec<Line> {
+    let text: String = spans.iter().map(|span| span.text.as_str()).collect();
+    // Preserve the existing source mapping for search-only controls and
+    // the existing behavior for raw rows that contain an embedded break.
+    if width < 2
+        || text.contains(['\n', '\r', '\t'])
+        || spans.iter().any(|span| span.searchable() != span.text)
+        || text.width() <= width
+    {
+        return wrap(spans, width);
+    }
+    let Some(ranges) = wrapped_ranges(&text, width) else {
+        return wrap(spans, width);
+    };
+    let mut span_start = 0;
+    let mut remaining = spans.iter().peekable();
+    ranges
+        .into_iter()
+        .map(|range| {
+            let mut line = Line::default();
+            while let Some(span) = remaining.peek() {
+                let span_end = span_start + span.text.len();
+                let start = range.start.max(span_start);
+                let end = range.end.min(span_end);
+                if start < end {
+                    let mut piece = (*span).clone();
+                    piece.text = span.text[start - span_start..end - span_start].into();
+                    line.spans.push(piece);
+                }
+                if span_end > range.end {
+                    break;
+                }
+                remaining.next();
+                span_start = span_end;
+            }
+            line
+        })
+        .collect()
+}
+
+// Pi's Text component wraps on spaces and CJK graphemes. Advance by
+// complete words first, then split a word wider than the available row.
+fn wrapped_ranges(text: &str, width: usize) -> Option<Vec<Range<usize>>> {
+    static CJK: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"[\p{scx:Han}\p{scx:Hiragana}\p{scx:Katakana}\p{scx:Hangul}\p{scx:Bopomofo}]",
+        )
+        .expect("valid CJK script classes")
+    });
+    let trim = |start: usize, end: usize| {
+        start..start + text[start..end].trim_end_matches(word_diff::ws).len()
+    };
+    let mut glyphs = text.grapheme_indices(true).peekable();
+    let mut ranges = Vec::new();
+    let mut row_start = 0;
+    let mut used = 0;
+    while let Some((start, first)) = glyphs.next() {
+        let mut token_width = first.width();
+        if !CJK.is_match(first) {
+            let space = first == " ";
+            while let Some(&(_, next)) = glyphs.peek() {
+                if (next == " ") != space || CJK.is_match(next) {
+                    break;
+                }
+                token_width += next.width();
+                glyphs.next();
+            }
+        }
+        let end = glyphs.peek().map_or(text.len(), |&(index, _)| index);
+        let whitespace = text[start..end].chars().all(word_diff::ws);
+        if used + token_width > width && used > 0 {
+            ranges.push(trim(row_start, start));
+            row_start = start;
+            used = 0;
+            if whitespace {
+                row_start = end;
+                continue;
+            }
+        }
+        if token_width > width && !whitespace {
+            for (offset, glyph) in text[start..end].grapheme_indices(true) {
+                let size = glyph.width();
+                if size > width {
+                    return None;
+                }
+                if used > 0 && used + size > width {
+                    ranges.push(row_start..start + offset);
+                    row_start = start + offset;
+                    used = 0;
+                }
+                used += size;
+            }
+        } else {
+            used += token_width;
+        }
+    }
+    if row_start < text.len() || ranges.is_empty() {
+        ranges.push(trim(row_start, text.len()));
+    }
+    Some(ranges)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn numbered_diff_wraps_words_and_keeps_highlighting_across_rows() {
+        let theme = Theme::system();
+        let text = |line: &Line| {
+            line.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        };
+        for (source, width, expected) in [
+            ("-1 red blue", 8, vec!["-1 red", "blue"]),
+            ("+1 red chartreuse", 8, vec!["+1 red", "chartreu", "se"]),
+            ("-9     alpha  beta", 8, vec!["-9", "alpha", "beta"]),
+            ("+1 abc 日本語 test", 9, vec!["+1 abc 日", "本語 test"]),
+            ("+1 🧑‍💻 after", 8, vec!["+1 🧑‍💻", "after"]),
+        ] {
+            let rows = render_numbered(source, &theme, width);
+            assert_eq!(rows.iter().map(text).collect::<Vec<_>>(), expected);
+        }
+        let rows = render_numbered(
+            "-1 first oldword suffix\n+1 first newword suffix",
+            &theme,
+            10,
+        );
+        assert_eq!(
+            rows.iter().map(text).collect::<Vec<_>>(),
+            [
+                "-1 first", "oldword", "suffix", "+1 first", "newword", "suffix"
+            ]
+        );
+        assert!(
+            rows[1]
+                .spans
+                .iter()
+                .all(|span| span.inverse && span.color == theme.color("toolDiffRemoved"))
+        );
+        assert!(
+            rows[4]
+                .spans
+                .iter()
+                .all(|span| span.inverse && span.color == theme.color("toolDiffAdded"))
+        );
+        assert!(rows[5].spans.iter().all(|span| !span.inverse));
+    }
+
     #[test]
     fn grouped_changes_match_pi_whitespace_highlighting() {
         let lines = render_numbered("-1 A x B y\n+1 A  c B  d", &Theme::system(), 80);
