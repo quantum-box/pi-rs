@@ -194,6 +194,11 @@ impl PiMessages {
         self.headers.clone()
     }
 
+    pub(super) async fn prepare_header_override(&self, headers: &HeaderMap) -> Option<HeaderMap> {
+        pi_rs::prepare_provider_headers(headers, &self.token.iter().cloned().collect::<Vec<_>>())
+            .await
+    }
+
     /// Freeze credentials and the catalog-selected route for one request.
     pub(super) async fn prepare_context(&self, model: &str) -> Result<Self> {
         if self.radius.is_none() {

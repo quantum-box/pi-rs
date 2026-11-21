@@ -155,6 +155,15 @@ impl Google {
         self.headers.clone()
     }
 
+    #[doc(hidden)]
+    pub async fn prepare_header_override(&self, headers: &HeaderMap) -> Option<HeaderMap> {
+        if pi_rs_core::provider_header_session_id().is_none() {
+            return None;
+        }
+        let secrets = [self.api_key.to_str().unwrap_or_default().to_owned()];
+        pi_rs_core::prepare_provider_headers(headers, &secrets).await
+    }
+
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -1023,6 +1032,19 @@ fn wire_request(
 
 #[async_trait::async_trait]
 impl Model for Google {
+    async fn prepare_context<'a>(
+        &'a self,
+        _: &ModelRequest,
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        Ok(self
+            .prepare_header_override(&self.headers)
+            .await
+            .map(|headers| {
+                std::sync::Arc::new(self.clone().with_headers(headers))
+                    as std::sync::Arc<dyn Model + 'a>
+            }))
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,

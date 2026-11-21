@@ -1432,6 +1432,19 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Opt in to editing configured provider headers before transport authentication.
+    fn handles_before_provider_headers(&self) -> bool {
+        false
+    }
+
+    async fn before_provider_headers(
+        &self,
+        _headers: &mut crate::BeforeProviderHeaders,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        Ok(())
+    }
+
     /// Opt in to observing HTTP metadata before consuming a provider response body.
     fn handles_after_provider_response(&self) -> bool {
         false

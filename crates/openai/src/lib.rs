@@ -399,6 +399,17 @@ impl OpenAiResponses {
         self.headers.clone()
     }
 
+    #[doc(hidden)]
+    pub async fn prepare_header_override(
+        &self,
+        headers: &reqwest::header::HeaderMap,
+    ) -> Option<reqwest::header::HeaderMap> {
+        if pi_rs_core::provider_header_session_id().is_none() {
+            return None;
+        }
+        pi_rs_core::prepare_provider_headers(headers, &vec![self.token.clone()]).await
+    }
+
     pub fn with_headers(mut self, headers: reqwest::header::HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -774,6 +785,19 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
+    async fn prepare_context<'a>(
+        &'a self,
+        _: &ModelRequest,
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        Ok(self
+            .prepare_header_override(&self.headers)
+            .await
+            .map(|headers| {
+                std::sync::Arc::new(self.clone().with_headers(headers))
+                    as std::sync::Arc<dyn Model + 'a>
+            }))
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,
@@ -3378,10 +3402,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_response_hook_runs_before_openai_reads_an_error_body() {
+    async fn provider_headers_are_frozen_before_openai_sends_and_observes_an_error_response() {
         use pi_rs_core::{
-            Agent, CancellationToken, Extension, ExtensionResult, ExtensionState, Limits,
-            MemoryStore, ProviderResponseEvent, Registry, Session,
+            Agent, BeforeProviderHeaders, CancellationToken, Extension, ExtensionResult,
+            ExtensionState, Limits, MemoryStore, ProviderResponseEvent, Registry, Session,
         };
 
         struct Observer(tokio::sync::Notify);
@@ -3389,6 +3413,20 @@ mod tests {
         impl Extension for Observer {
             fn id(&self) -> &str {
                 "http-observer"
+            }
+            fn handles_before_provider_headers(&self) -> bool {
+                true
+            }
+            async fn before_provider_headers(
+                &self,
+                headers: &mut BeforeProviderHeaders,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                assert_eq!(headers["x-route"].as_deref(), Some("original"));
+                assert!(!headers.contains_key("authorization"));
+                headers.insert("x-route".into(), Some("adapter-test".into()));
+                headers.insert("x-delete".into(), None);
+                Ok(())
             }
             fn handles_after_provider_response(&self) -> bool {
                 true
@@ -3406,11 +3444,21 @@ mod tests {
         }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut configured = reqwest::header::HeaderMap::new();
+        configured.insert(
+            "x-route",
+            reqwest::header::HeaderValue::from_static("original"),
+        );
+        configured.insert(
+            "x-delete",
+            reqwest::header::HeaderValue::from_static("remove-me"),
+        );
         let model = OpenAiResponses::new_api(
             &format!("http://{}/responses", listener.local_addr().unwrap()),
             "fixture".into(),
         )
-        .unwrap();
+        .unwrap()
+        .with_headers(configured);
         let callback = std::sync::Arc::new(Observer(tokio::sync::Notify::new()));
         let mut registry = Registry::default();
         registry.register(callback.clone()).unwrap();
@@ -3427,6 +3475,10 @@ mod tests {
                 }
             };
             let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let normalized = headers.to_ascii_lowercase();
+            assert!(normalized.contains("x-route: adapter-test\r\n"));
+            assert!(normalized.contains("authorization: bearer fixture\r\n"));
+            assert!(!normalized.contains("x-delete:"));
             let length: usize = headers
                 .lines()
                 .filter_map(|line| line.split_once(':'))

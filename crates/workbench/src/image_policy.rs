@@ -84,6 +84,43 @@ impl FinalStrictPolicy {
     }
 }
 
+pub(super) fn session_affinity_headers(
+    names: &[&str],
+    external_id: &str,
+    configured: &HeaderMap,
+) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    if !external_id.is_empty() && names.iter().any(|name| !configured.contains_key(*name)) {
+        // Fetch's Headers converts JS strings to ByteString (Latin-1),
+        // then strips HTTP whitespace at the edges before validation.
+        // Reject unrepresentable or invalid bytes rather than dispatching
+        // a request with a different or missing affinity identity.
+        let bytes = external_id
+            .chars()
+            .map(|ch| u8::try_from(u32::from(ch)))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| pi_rs::Error::Config("Invalid session affinity ID".into()))?;
+        let whitespace = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
+        let start = bytes
+            .iter()
+            .position(|byte| !whitespace(byte))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|byte| !whitespace(byte))
+            .map_or(start, |index| index + 1);
+        let trimmed = &bytes[start..end];
+        let value = HeaderValue::from_bytes(trimmed)
+            .map_err(|_| pi_rs::Error::Config("Invalid session affinity ID".into()))?;
+        for &name in names {
+            if !configured.contains_key(name) {
+                headers.insert(name, value.clone());
+            }
+        }
+    }
+    Ok(headers)
+}
+
 #[async_trait::async_trait]
 impl Model for WorkbenchModel {
     async fn stream_detailed_with_tool_declarations(
@@ -178,8 +215,18 @@ impl Model for WorkbenchModel {
             .as_ref()
             .map(|policy| policy.support(&request.model))
             .transpose()?;
-        let Some((client, identity)) = self.client.prepare_for_context(&request.model).await?
-        else {
+        let external_id = pi_rs::provider_header_session_id();
+        let prepared = if let Some(external_id) = &external_id {
+            self.client
+                .prepare_for_context_with_header_hook(
+                    &request.model,
+                    Some((self.session_affinity, external_id.as_str())),
+                )
+                .await?
+        } else {
+            self.client.prepare_for_context(&request.model).await?
+        };
+        let Some((client, identity)) = prepared else {
             return Ok(None);
         };
         let changed_support = match (&self.strict_policy, support) {
@@ -218,7 +265,11 @@ impl Model for WorkbenchModel {
                 client,
                 block_images: self.block_images,
                 supports_images: self.supports_images,
-                session_affinity: self.session_affinity,
+                session_affinity: if external_id.is_some() {
+                    &[]
+                } else {
+                    self.session_affinity
+                },
                 price: self.price.clone(),
             },
             identity,
@@ -616,45 +667,12 @@ impl WorkbenchModel {
         }
     }
     async fn affinity_headers(&self, external_id: &str) -> Result<(Client, HeaderMap)> {
-        let mut headers = HeaderMap::new();
         let (client, configured) = if !self.session_affinity.is_empty() && !external_id.is_empty() {
             self.client.resolve_affinity_headers().await?
         } else {
             (self.client.clone(), HeaderMap::new())
         };
-        if !external_id.is_empty()
-            && self
-                .session_affinity
-                .iter()
-                .any(|name| !configured.contains_key(*name))
-        {
-            // Fetch's Headers converts JS strings to ByteString (Latin-1),
-            // then strips HTTP whitespace at the edges before validation.
-            // Reject unrepresentable or invalid bytes rather than dispatching
-            // a request with a different or missing affinity identity.
-            let bytes = external_id
-                .chars()
-                .map(|ch| u8::try_from(u32::from(ch)))
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|_| pi_rs::Error::Config("Invalid session affinity ID".into()))?;
-            let whitespace = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
-            let start = bytes
-                .iter()
-                .position(|byte| !whitespace(byte))
-                .unwrap_or(bytes.len());
-            let end = bytes
-                .iter()
-                .rposition(|byte| !whitespace(byte))
-                .map_or(start, |index| index + 1);
-            let trimmed = &bytes[start..end];
-            let value = HeaderValue::from_bytes(trimmed)
-                .map_err(|_| pi_rs::Error::Config("Invalid session affinity ID".into()))?;
-            for &name in self.session_affinity {
-                if !configured.contains_key(name) {
-                    headers.insert(name, value.clone());
-                }
-            }
-        }
+        let headers = session_affinity_headers(self.session_affinity, external_id, &configured)?;
         Ok((client, headers))
     }
 
