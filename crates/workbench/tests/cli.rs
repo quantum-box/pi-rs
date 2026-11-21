@@ -4054,6 +4054,69 @@ fn rpc_replacement_compaction_edit_case(live_retry: bool) {
     );
 }
 
+#[tokio::test]
+async fn rpc_manual_compaction_preflight_has_only_compaction_events() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let root = tempfile::tempdir().unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--offline",
+            "--no-approve",
+            "--no-extensions",
+            "--no-mcp",
+            "--no-session",
+            "--mode",
+            "rpc",
+            "--provider",
+            "ollama",
+            "--model",
+            "fixture",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let events = tokio::time::timeout(Duration::from_secs(20), async {
+        input
+            .write_all(b"{\"id\":\"compact\",\"type\":\"compact\"}\n")
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(line) = output.next_line().await.unwrap() {
+            let event: Value = serde_json::from_str(&line).unwrap();
+            match event["type"].as_str().unwrap() {
+                "compaction_start" | "compaction_end" | "agent_start" | "agent_end"
+                | "agent_settled" | "error" | "response" => events.push(event),
+                _ => {}
+            }
+            if events.last().is_some_and(|event| event["id"] == "compact") {
+                break;
+            }
+        }
+        drop(input);
+        assert!(child.wait().await.unwrap().success());
+        events
+    })
+    .await
+    .expect("manual compaction did not settle");
+    assert_eq!(
+        events,
+        [
+            json!({"type":"compaction_start","reason":"manual"}),
+            json!({"type":"compaction_end","reason":"manual","aborted":false,"willRetry":false,
+            "errorMessage":"Compaction failed: Nothing to compact (session too small)"}),
+            json!({"id":"compact","type":"response","command":"compact","success":false,
+            "error":"Nothing to compact (session too small)"}),
+        ]
+    );
+}
+
 #[test]
 fn rpc_replacement_worker_keeps_retry_disabled() {
     rpc_replacement_retry_case(true);
