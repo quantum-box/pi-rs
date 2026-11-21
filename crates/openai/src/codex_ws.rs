@@ -276,7 +276,11 @@ fn disconnected() -> Error {
 }
 
 async fn send(socket: &mut Socket, mut body: Value, timeout: Option<Duration>) -> Result<()> {
-    body["type"] = json!("response.create");
+    let fields = body
+        .as_object_mut()
+        .expect("Responses payload is an object");
+    fields.remove("stream");
+    fields.insert("type".into(), json!("response.create"));
     let send = socket.send(Message::Text(body.to_string().into()));
     match timeout {
         Some(timeout) => tokio::time::timeout(timeout, send)
@@ -471,6 +475,7 @@ mod tests {
                 let text = socket.next().await.unwrap().unwrap().into_text().unwrap();
                 let body: Value = serde_json::from_str(text.as_str()).unwrap();
                 assert_eq!(body["type"], "response.create");
+                assert!(body.get("stream").is_none());
                 assert_eq!(body["store"], false);
                 assert_eq!(body["input"].as_array().unwrap().len(), 1);
                 if turn == 0 {
