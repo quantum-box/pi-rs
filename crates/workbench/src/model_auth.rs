@@ -11,6 +11,15 @@ use super::{Provider, config};
 pub(super) const PI_OAUTH_MINIMUM_VALIDITY: std::time::Duration =
     std::time::Duration::from_secs(300);
 
+pub(super) async fn with_oauth_refresh_deadline<T>(
+    provider: &str,
+    refresh: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(std::time::Duration::from_secs(15), refresh)
+        .await
+        .map_err(|_| Error::Config(format!("OAuth token refresh timed out for {provider}")))?
+}
+
 #[derive(Clone)]
 pub(super) enum Credential {
     Literal(String),

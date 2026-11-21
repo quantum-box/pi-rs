@@ -332,7 +332,10 @@ async fn access_at(
             .map_err(|_| error("cannot start refresh runtime"))?;
         let barrier = super::process::refresh_barrier()?;
         let guard = super::process::guard_refresh_auth(barrier, guard);
-        let value = runtime.block_on(service.refresh(&value.refresh))?;
+        let value = runtime.block_on(super::model_auth::with_oauth_refresh_deadline(
+            "xai",
+            service.refresh(&value.refresh),
+        ))?;
         super::config::update_object_locked(&path, Some(&guard), |data| {
             let current = data
                 .get_mut("xai")

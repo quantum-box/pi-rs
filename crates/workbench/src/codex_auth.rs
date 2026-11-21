@@ -478,8 +478,10 @@ async fn access_at(
             .map_err(|_| error("cannot start refresh runtime"))?;
         let barrier = super::process::refresh_barrier()?;
         let guard = super::process::guard_refresh_auth(barrier, guard);
-        let replacement =
-            runtime.block_on(refresh_token(&client, token_endpoint, &stored.refresh))?;
+        let replacement = runtime.block_on(super::model_auth::with_oauth_refresh_deadline(
+            PROVIDER,
+            refresh_token(&client, token_endpoint, &stored.refresh),
+        ))?;
         let Credential {
             access,
             refresh,

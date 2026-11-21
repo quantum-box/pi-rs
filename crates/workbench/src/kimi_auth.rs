@@ -7,7 +7,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
-const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Credential {
     pub access: String,
@@ -191,9 +190,11 @@ impl Service {
             .map_err(|_| error("device authorization expired"))?
     }
     async fn refresh(&self, refresh: &str) -> Result<Credential> {
-        tokio::time::timeout(REFRESH_TIMEOUT, self.refresh_with_retries(refresh))
-            .await
-            .map_err(|_| error("token refresh timed out"))?
+        super::model_auth::with_oauth_refresh_deadline(
+            "kimi-coding",
+            self.refresh_with_retries(refresh),
+        )
+        .await
     }
 
     async fn refresh_with_retries(&self, refresh: &str) -> Result<Credential> {

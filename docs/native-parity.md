@@ -5074,6 +5074,14 @@ checked with a five-minute floor, even when a shorter minimum was requested.
 The rotated credential is saved before that check. The default
 check output contains only status and metadata.
 
+The Pi-managed OAuth exchange has a 15-second deadline for Anthropic, Codex,
+Copilot, Kimi Code, Radius, xAI, and imported Pi ChatGPT credentials. The
+deadline covers exchange and provider retries after the credential lock is
+acquired. Radius retains its recovery marker when the outcome of an admitted
+exchange is unknown. Native ChatGPT enrollment and Meta key minting retain
+their own request timeouts. Fixtures cover renewal and cancellation. Live
+credential renewal for this change was unverified.
+
 pi-rs does not automatically remove stale `auth.json.lock` directories.
 After a worker admits a protected OAuth refresh, pi-rs retains its worker
 refresh barrier until the auth lock is released, including on errors. A worker

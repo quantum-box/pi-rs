@@ -318,7 +318,16 @@ where
             .enable_all()
             .build()
             .map_err(|_| Error::Config("could not start ChatGPT refresh runtime".into()))?;
-        match runtime.block_on(exchange(previous.clone())) {
+        let exchange = exchange(previous.clone());
+        let result = if from_pi {
+            runtime.block_on(super::model_auth::with_oauth_refresh_deadline(
+                "openai-chatgpt",
+                exchange,
+            ))
+        } else {
+            runtime.block_on(exchange)
+        };
+        match result {
             Ok(refreshed) => {
                 if from_pi {
                     save_pi_refresh(&auth, &guard, &refreshed)?;
