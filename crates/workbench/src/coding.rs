@@ -1626,11 +1626,7 @@ fn edit_success(display_path: &str, original: &str, output: &str, count: usize) 
         .to_string()
         .len();
     let display = crate::text_edit::numbered_diff(&diff, digits);
-    let patch = diff
-        .unified_diff()
-        .context_radius(4)
-        .header(display_path, display_path)
-        .to_string();
+    let patch = crate::text_edit::unified_patch(display_path, &diff);
     Outcome::SucceededWithDetails {
         output: format!("Successfully replaced {count} block(s) in {display_path}."),
         details: json!({"diff":bounded(display),"patch":bounded(patch),"firstChangedLine":first_changed_line}),
