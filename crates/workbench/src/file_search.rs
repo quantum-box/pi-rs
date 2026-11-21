@@ -86,22 +86,46 @@ impl Grep {
         display: &str,
         cancellation: &CancellationToken,
     ) -> Result<bool> {
-        let file = SearchInput {
+        let mut file = SearchInput {
             file: std::fs::File::open(path)?,
             cancellation,
         };
-        if self.output.numeric_limit.is_some() {
-            let result = self.searcher.search_reader(
-                &self.matcher,
-                file,
-                PiMatchSink {
+        if let Some(limit) = self.output.numeric_limit {
+            let result = if self.context == 0 {
+                Self::search_pi(
+                    &mut self.searcher,
+                    &self.matcher,
+                    &mut file,
                     display,
-                    output: &mut self.output,
-                    context: self.context,
-                    trailing_end: None,
-                    cancellation,
-                },
-            );
+                    0,
+                    &mut self.output,
+                )
+            } else {
+                // A failed search can already have emitted rows. Commit the
+                // tentative result only if the contextual search completed.
+                let mut output = self.output.clone();
+                match Self::search_pi(
+                    &mut self.searcher,
+                    &self.matcher,
+                    &mut file,
+                    display,
+                    self.context,
+                    &mut output,
+                ) {
+                    Ok(()) => {
+                        self.output = output;
+                        Ok(())
+                    }
+                    Err(error)
+                        if error
+                            .to_string()
+                            .starts_with("configured allocation limit (") =>
+                    {
+                        self.search_pi_large_context(&mut file, display, limit)
+                    }
+                    Err(error) => Err(error),
+                }
+            };
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
@@ -137,6 +161,80 @@ impl Grep {
         }
         Ok(!self.output.limit_reached())
     }
+    fn search_pi(
+        searcher: &mut Searcher,
+        matcher: &RegexMatcher,
+        file: &mut SearchInput<'_>,
+        display: &str,
+        context: u64,
+        output: &mut Output,
+    ) -> io::Result<()> {
+        let cancellation = file.cancellation;
+        searcher.search_reader(
+            matcher,
+            file,
+            PiMatchSink {
+                display,
+                output,
+                context,
+                trailing_end: None,
+                cancellation,
+            },
+        )
+    }
+
+    // The searcher cannot keep arbitrarily many preceding bytes in memory.
+    // Index match numbers on disk, then emit the merged windows by streaming
+    // that same open file without asking the searcher to buffer context.
+    fn search_pi_large_context(
+        &mut self,
+        file: &mut SearchInput<'_>,
+        display: &str,
+        limit: f64,
+    ) -> io::Result<()> {
+        let mut builder = SearcherBuilder::new();
+        builder
+            .line_number(true)
+            .heap_limit(Some(64 * 1024 * 1024))
+            .binary_detection(self.searcher.binary_detection().clone());
+        file.file.seek(SeekFrom::Start(0))?;
+        let cancellation = file.cancellation;
+        let mut index = PiMatchIndex {
+            matches: None,
+            selected: self.output.matches,
+            limit,
+            exceeded: false,
+            cancellation,
+        };
+        builder
+            .build()
+            .search_reader(&self.matcher, &mut *file, &mut index)?;
+        if let Some(mut matches) = index.matches {
+            matches.rewind()?;
+            let mut numbers =
+                BufReader::new(matches.starts.into_inner().map_err(|e| e.into_error())?);
+            let center = read_u64(&mut numbers)?;
+            file.file.seek(SeekFrom::Start(0))?;
+            builder.passthru(true).build().search_reader(
+                &self.matcher,
+                file,
+                PiWindowSink {
+                    display,
+                    output: &mut self.output,
+                    numbers,
+                    remaining: matches.count - 1,
+                    center: Some(center),
+                    trailing_end: 0,
+                    context: self.context,
+                    cancellation,
+                },
+            )?;
+        }
+        self.output.matches = index.selected;
+        self.output.match_limit_exceeded |= index.exceeded;
+        Ok(())
+    }
+
     pub fn finish(self) -> Outcome {
         let output = self.output;
         if output.matches == 0 {
@@ -213,7 +311,7 @@ impl Read for SearchInput<'_> {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Output {
     lines: Vec<String>,
     total_bytes: u64,
@@ -365,6 +463,93 @@ impl Sink for PiMatchSink<'_> {
             context.line_number().expect("line numbers enabled"),
             context.bytes(),
             false,
+        )
+    }
+}
+
+struct PiMatchIndex<'a> {
+    matches: Option<MatchSpool>,
+    selected: usize,
+    limit: f64,
+    exceeded: bool,
+    cancellation: &'a CancellationToken,
+}
+
+impl Sink for PiMatchIndex<'_> {
+    type Error = io::Error;
+
+    fn matched(&mut self, _: &Searcher, found: &SinkMatch<'_>) -> io::Result<bool> {
+        if self.cancellation.is_cancelled() {
+            return Err(io::Error::other("Operation aborted"));
+        }
+        if self.selected as f64 >= self.limit {
+            self.exceeded = true;
+            return Ok(false);
+        }
+        if self.matches.is_none() {
+            self.matches = Some(MatchSpool::new()?);
+        }
+        self.matches
+            .as_mut()
+            .expect("spool initialized")
+            .push(found.line_number().expect("line numbers enabled"))?;
+        self.selected += 1;
+        Ok(true)
+    }
+}
+
+struct PiWindowSink<'a> {
+    display: &'a str,
+    output: &'a mut Output,
+    numbers: BufReader<std::fs::File>,
+    remaining: u64,
+    center: Option<u64>,
+    trailing_end: u64,
+    context: u64,
+    cancellation: &'a CancellationToken,
+}
+
+impl PiWindowSink<'_> {
+    fn line(&mut self, number: u64, bytes: &[u8]) -> io::Result<bool> {
+        if self.cancellation.is_cancelled() {
+            return Err(io::Error::other("Operation aborted"));
+        }
+        let matched = self.center == Some(number);
+        if number <= self.trailing_end
+            || self
+                .center
+                .is_some_and(|center| number >= center.saturating_sub(self.context))
+        {
+            self.output
+                .line(self.display, &ContextLine::from_rg(number, bytes), matched);
+        }
+        if matched {
+            self.trailing_end = number.saturating_add(self.context);
+            self.center = if self.remaining == 0 {
+                None
+            } else {
+                self.remaining -= 1;
+                Some(read_u64(&mut self.numbers)?)
+            };
+        }
+        Ok(self.center.is_some() || number < self.trailing_end)
+    }
+}
+
+impl Sink for PiWindowSink<'_> {
+    type Error = io::Error;
+
+    fn matched(&mut self, _: &Searcher, found: &SinkMatch<'_>) -> io::Result<bool> {
+        self.line(
+            found.line_number().expect("line numbers enabled"),
+            found.bytes(),
+        )
+    }
+
+    fn context(&mut self, _: &Searcher, context: &SinkContext<'_>) -> io::Result<bool> {
+        self.line(
+            context.line_number().expect("line numbers enabled"),
+            context.bytes(),
         )
     }
 }
@@ -1004,6 +1189,31 @@ mod tests {
         let line = ContextLine::from_rg(1, format!("{}😀\n", "x".repeat(499)).as_bytes());
         assert!(line.truncated);
         assert_eq!(line.text, format!("{}... [truncated]", "x".repeat(499)));
+    }
+
+    #[test]
+    fn pi_grep_streams_before_context_larger_than_the_search_heap_limit() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let line = format!("{}\n", "x".repeat(128 * 1024));
+        for _ in 0..520 {
+            file.write_all(line.as_bytes()).unwrap();
+        }
+        file.write_all(b"match one\nmatch two\nafter\n").unwrap();
+
+        let mut grep = Grep::new(&json!({"pattern":"match","context":520}), 100)
+            .unwrap()
+            .with_numeric_limit(1.0);
+        assert!(
+            !grep
+                .search(file.path(), "text", &CancellationToken::new())
+                .unwrap()
+        );
+        assert_eq!(grep.output.total_lines, 523);
+        assert_eq!(grep.output.matches, 1);
+        assert!(grep.output.match_limit_exceeded);
+        let output = grep.finish().tool_content();
+        assert!(output.starts_with(&format!("text-1- {}... [truncated]", "x".repeat(500))));
+        assert!(output.contains("[1 matches limit reached. Use limit=2 for more"));
     }
 
     #[test]

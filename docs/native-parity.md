@@ -1999,7 +1999,9 @@ same saved notes reached both requests.
 `grep` streams files with the native ripgrep libraries, supports surrounding
 context lines, bounds long displayed lines at 500 UTF-16 units, and reports
 match and byte limits. The unrestricted local tool uses ripgrep's context
-events as in Pi 1.6.0. Search memory retains the native 64 MiB cap.
+events as in Pi 1.6.0. When the context exceeds the native searcher's 64 MiB
+buffer, it indexes matches on disk and streams the selected context from the
+same open file.
 
 Unrestricted local `find` and `ls` accept Pi's numeric limit schema and interpret
 JSON numbers as JavaScript doubles. `ls` compares the number directly, including
