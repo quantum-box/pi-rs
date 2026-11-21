@@ -24,6 +24,7 @@ mod cache_warming;
 mod chatgpt_auth;
 mod cli_compat;
 mod clipboard;
+mod cloudflare_gateway;
 mod codex_auth;
 mod config;
 mod copilot_auth;
@@ -485,6 +486,13 @@ impl Cli {
                             .map(model_auth::Credential::VertexAdc)
                         });
                 }
+                if provider.id() == "cloudflare-ai-gateway" {
+                    return cloudflare_gateway::Route::is_endpoint(endpoint)
+                        .then(|| std::env::var("CLOUDFLARE_API_KEY").ok())
+                        .flatten()
+                        .filter(|key| !key.trim().is_empty())
+                        .map(model_auth::Credential::Literal);
+                }
                 if provider.id() == "openai-codex" {
                     return None;
                 }
@@ -616,6 +624,12 @@ impl Cli {
 
     fn replace_model_keys(&mut self, keys: model_auth::Keys) -> Result<()> {
         self.model_keys = keys;
+        if self.model_profiles.cloudflare_gateway_route()
+            != self.model_keys.cloudflare_gateway_route().as_ref()
+        {
+            self.reload_model_profiles()?;
+            return Ok(());
+        }
         if self.model_profiles.cloudflare_saved_account()
             != self.model_keys.cloudflare_chat_account()
         {
@@ -2697,7 +2711,13 @@ fn trace_tool_progress(
     trace: bool,
     json_stream: bool,
 ) -> Option<Value> {
-    (trace && !json_stream).then(|| serde_json::to_value(event).expect("tool progress"))
+    if json_stream {
+        return None;
+    }
+    if let Some(id) = pi_rs::tool_attempt_operation_id() {
+        return Some(json!({"type":"internal_tool_attempt","operationId":id}));
+    }
+    trace.then(|| serde_json::to_value(event).expect("tool progress"))
 }
 
 fn observe(event: Notification<'_>, trace: bool) {

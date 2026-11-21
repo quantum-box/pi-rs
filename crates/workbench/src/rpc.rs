@@ -3030,6 +3030,7 @@ fn forward_event(
                         | "tool_call_delta"
                         | "summary_request_start"
                         | "internal_tool_result_metadata"
+                        | "internal_tool_attempt"
                 )
             ) {
                 return Ok(());

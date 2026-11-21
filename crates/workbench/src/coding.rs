@@ -1626,11 +1626,7 @@ fn edit_success(display_path: &str, original: &str, output: &str, count: usize) 
         .to_string()
         .len();
     let display = crate::text_edit::numbered_diff(&diff, digits);
-    let patch = diff
-        .unified_diff()
-        .context_radius(4)
-        .header(display_path, display_path)
-        .to_string();
+    let patch = crate::text_edit::unified_patch(display_path, &diff);
     Outcome::SucceededWithDetails {
         output: format!("Successfully replaced {count} block(s) in {display_path}."),
         details: json!({"diff":bounded(display),"patch":bounded(patch),"firstChangedLine":first_changed_line}),
@@ -5130,7 +5126,7 @@ mod tests {
         {
             Outcome::SucceededWithDetails { details, .. } => {
                 assert!(details.get("matchLimitReached").is_none());
-                assert_eq!(details["truncation"]["totalLines"], count * 3 - 1);
+                assert_eq!(details["truncation"]["totalLines"], count);
             }
             other => panic!("expected truncated result with details, got {other:?}"),
         }
@@ -5245,9 +5241,9 @@ mod tests {
             ),
             (
                 json!(2.5),
-                3,
-                "2.5 matches limit reached. Use limit=5",
-                json!(2.5),
+                2,
+                "2 matches limit reached. Use limit=4",
+                json!(2.0),
             ),
             (
                 json!("0b10"),
