@@ -1400,6 +1400,9 @@ redraw the active view. Invalid edits retain the last valid colors and show one
 diagnostic per changed file contents. A PTY check covers live updates and
 terminal restoration. System appearance discovery queries terminal foreground and background colors
 using OSC 10 and 11 and updates light/dark theme selection as replies arrive.
+Like Pi, the system theme and automatic light/dark pairs subscribe to
+terminal appearance notifications. Fixed themes still request the initial
+terminal colors, and switching back to an automatic theme refreshes them.
 System theme accent and syntax roles use Pi's fallback ANSI palette slots.
 Neutral fallback roles use terminal-default foreground with Pi's dim
 attribute. The terminal palette is queried with OSC 4 and applied after all 16 colors
@@ -1413,9 +1416,11 @@ keeps stale responses out of a later query but means a terminal that never sends
 DA1 cannot refresh colors during that session. After an external editor or
 suspend hands terminal ownership away, further color queries are disabled for
 the session: another owner may consume the old DA1 or leave an unrelated one.
-If a later appearance report changes, stale colors are cleared and the reported
-light/dark mode is used with the ANSI fallback. A repeated report does not discard
-colors: a terminal's colors can intentionally differ from the OS appearance.
+If a later appearance report changes, or automatic mode is enabled after
+running with a fixed theme, the next applicable report clears stale colors and
+uses the reported light/dark mode with the ANSI fallback. A repeated report in
+continuous automatic mode retains the colors: a terminal's colors can
+intentionally differ from the OS appearance.
 The first appearance report received during the initial color query is treated as
 the startup status report, not a color change; the protocol
 does not distinguish this report from a simultaneous notification.
@@ -2159,9 +2164,15 @@ Prompt-template and skill expansion retain draft images. Ctrl+C clears an idle
 draft, including its attachments. User keybindings can override the action.
 
 Tests cover pixel validation, alpha preservation, draft delivery and image-only
-input validation. The live clipboard check exercised the empty/unavailable
-clipboard error and clean terminal exit. A populated OS image clipboard has not
-yet been exercised in this environment.
+input validation. Native drafts hold the prepared image in memory. Pi v1.5.0
+writes the pasted image to a temporary file and inserts its path in the editor.
+
+On macOS, Ctrl+V read a populated system pasteboard and sent an image-only
+prompt to a loopback model in regular and fullscreen mode. The model received
+the original 320×480 PNG dimensions, both modes exited cleanly, and the pasteboard
+contents were restored after each run. PTY captures verified the cropped Kitty
+placements and the cropped PNG dimensions from the iTerm2 protocol in both
+modes. Visual clipping in a running terminal emulator still needs acceptance.
 
 ### Edit matching checkpoint
 

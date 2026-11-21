@@ -186,6 +186,65 @@ fn typing_redraws_in_a_synchronized_frame() {
 }
 
 #[test]
+fn terminal_appearance_notifications_follow_the_saved_theme_selection() {
+    let root = tempfile::tempdir().unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("TERM", "xterm-256color")
+            .args(["--offline", "--no-trust", "--no-mcp", "--use-theme", "dark"])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| {
+        assert!(!text.contains("\x1b[?2031h"));
+        assert!(!text.contains("\x1b[?996n"));
+        text.contains("\x1b]11;?\x07") && text.contains("Enter to send")
+    });
+    master.write_all(b"\x1b[?1;2c/theme light/dark\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("\x1b[?2031h\x1b[?996n") && text.contains("\x1b]11;?\x07")
+    });
+    master.write_all(b"/theme light\r").unwrap();
+    output_until(&mut master, |text| text.contains("\x1b[?2031l"));
+    master.write_all(b"/theme system\r").unwrap();
+    output_until(&mut master, |text| text.contains("\x1b[?2031h\x1b[?996n"));
+    master.write_all(b"/quit\r").unwrap();
+    output_until(&mut master, |text| text.contains("\x1b[?2031l"));
+}
+
+#[test]
 fn initial_appearance_report_keeps_late_color_replies() {
     let root = tempfile::tempdir().unwrap();
     let mut master_fd = -1;
