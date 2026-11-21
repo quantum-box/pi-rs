@@ -12657,6 +12657,62 @@ impl Harness {
             }
         }
     }
+    /// Distinguish an ordinary woken root from one whose owned-graph evidence
+    /// was removed. Returned checks are provisional and must be committed with
+    /// the caller's other admission, identity and receipt fences.
+    #[allow(dead_code)]
+    pub(crate) fn woken_owned_graph_checks_if_required(
+        &self,
+        root: &crate::task_store::StoredTask,
+        boundary: u64,
+    ) -> Result<Vec<Check>, Error> {
+        let store = self.owner.store();
+        let evidence_key = woken_owned_graph_key(root.task.id());
+        if store.get(&evidence_key)?.is_some() {
+            return self.replay_safe_woken_owned_cleanup_checks(root, boundary);
+        }
+        if store.first_commit_for_key(&evidence_key)?.is_some() {
+            return Err(Error::Invalid("owned graph evidence was removed".into()));
+        }
+        let records = crate::task_store::TaskStore::new(store)
+            .list()
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        let mut ids = std::collections::HashSet::from([root.task.id()]);
+        loop {
+            let before = ids.len();
+            for record in &records {
+                if !record.task.is_background()
+                    && let crate::task::TaskOwner::Task(parent) = record.task.owner()
+                    && ids.contains(parent)
+                {
+                    ids.insert(record.task.id());
+                }
+            }
+            if ids.len() == before {
+                break;
+            }
+        }
+        if crate::ownership_edge::reject_foreground_children(store, ids)
+            .map_err(|e| Error::Invalid(e.to_string()))?
+        {
+            return Err(Error::Invalid("owned graph evidence missing".into()));
+        }
+        Ok(vec![
+            Check {
+                key: evidence_key,
+                expected: Expected::MissingUnchangedSince(boundary),
+            },
+            Check {
+                key: crate::ownership_edge::PREFIX.to_vec(),
+                expected: Expected::PrefixUnchangedSince(boundary),
+            },
+            Check {
+                key: crate::task_store::PREFIX.to_vec(),
+                expected: Expected::PrefixUnchangedSince(boundary),
+            },
+        ])
+    }
+
     /// Provisional evidence for a drained owned graph containing only
     /// replay-safe work across conversation edges. The scoped structural
     /// revision is required to detect graph changes after the mark.

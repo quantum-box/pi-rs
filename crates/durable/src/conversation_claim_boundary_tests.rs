@@ -7939,6 +7939,12 @@ async fn owned_graph_terminal_rejects_late_tool_receipt() {
 
 #[cfg(feature = "experimental-graph-revision")]
 #[tokio::test]
+async fn owned_graph_evidence_cannot_be_erased_into_ordinary_root() {
+    exercise_woken_owned_graph_receipt(false, 14).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
 async fn owned_graph_driver_commits_reservation_evidence() {
     exercise_woken_owned_graph_receipt(false, 6).await;
 }
@@ -8021,10 +8027,27 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         child: conversation,
         mode: crate::ownership_edge::Mode::Foreground,
     };
+    #[cfg(feature = "experimental-graph-revision")]
+    let ordinary_checks = if graph_aba == 14 {
+        let checks = harness
+            .woken_owned_graph_checks_if_required(&root, store.put_version().unwrap())
+            .unwrap();
+        store.commit(&checks, &[]).unwrap();
+        Some(checks)
+    } else {
+        None
+    };
     let prepared = crate::ownership_edge::EdgeStore::new(&store)
         .prepare_create(&edge)
         .unwrap();
     store.commit(&prepared.checks, &prepared.mutations).unwrap();
+    #[cfg(feature = "experimental-graph-revision")]
+    if let Some(checks) = ordinary_checks {
+        assert!(matches!(
+            store.commit(&checks, &[]),
+            Err(durable_store::Error::Conflict { .. })
+        ));
+    }
     let unsafe_owned = if graph_aba == 7 || graph_aba == 8 {
         let task = crate::task::Task::new(
             uuid::Uuid::new_v4(),
@@ -8678,6 +8701,40 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
             .unwrap();
         store.commit(&checks, &[]).unwrap();
+        if graph_aba == 14 {
+            let evidence_key = crate::runtime::woken_owned_graph_key(root.task.id());
+            let edge_key = crate::ownership_edge::edge_key(conversation);
+            let evidence = store.get(&evidence_key).unwrap().unwrap();
+            let edge = store.get(&edge_key).unwrap().unwrap();
+            store
+                .commit(
+                    &[
+                        durable_store::Check {
+                            key: evidence_key.clone(),
+                            expected: durable_store::Expected::Version(evidence.version),
+                        },
+                        durable_store::Check {
+                            key: edge_key.clone(),
+                            expected: durable_store::Expected::Version(edge.version),
+                        },
+                    ],
+                    &[
+                        durable_store::Mutation::Delete { key: evidence_key },
+                        durable_store::Mutation::Delete { key: edge_key },
+                    ],
+                )
+                .unwrap();
+            assert!(matches!(
+                store.commit(&checks, &[]),
+                Err(durable_store::Error::Conflict { .. })
+            ));
+            assert!(
+                harness
+                    .woken_owned_graph_checks_if_required(&recovered, store.put_version().unwrap())
+                    .is_err()
+            );
+            return;
+        }
         if graph_aba == 6 {
             drop(store);
             drop(harness);
