@@ -35,6 +35,19 @@ struct VercelGatewayRouting {
     order: Option<Vec<String>>,
 }
 
+fn overlay_map(
+    base: Option<serde_json::Map<String, Value>>,
+    newer: Option<serde_json::Map<String, Value>>,
+) -> Option<serde_json::Map<String, Value>> {
+    match (base, newer) {
+        (Some(mut base), Some(newer)) => {
+            base.extend(newer);
+            Some(base)
+        }
+        (base, newer) => newer.or(base),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,7 +60,26 @@ mod tests {
         }))
         .unwrap();
         let model = serde_json::from_value(json!({
-            "vercelGatewayRouting":{"order":["bedrock"],"only":[],"ignored":true}
+            "openRouterRouting":{"order":["second"]},
+            "vercelGatewayRouting":{"order":["bedrock"],"ignored":true}
+        }))
+        .unwrap();
+        let mut body = json!({});
+        provider
+            .clone()
+            .overlay(model)
+            .request_options(&mut body, 32, false);
+        assert_eq!(
+            body["provider"],
+            json!({"only":["first"],"order":["second"],"zdr":true,"data_collection":"deny"})
+        );
+        assert_eq!(
+            body["providerOptions"],
+            json!({"gateway":{"order":["bedrock"],"only":["anthropic"]}})
+        );
+
+        let model = serde_json::from_value(json!({
+            "openRouterRouting":{}, "vercelGatewayRouting":{}
         }))
         .unwrap();
         let mut body = json!({});
@@ -61,19 +93,18 @@ mod tests {
         );
         assert_eq!(
             body["providerOptions"],
-            json!({"gateway":{"order":["bedrock"],"only":[]}})
+            json!({"gateway":{"order":["first"],"only":["anthropic"]}})
         );
 
-        let model = serde_json::from_value(json!({
-            "openRouterRouting":{}, "vercelGatewayRouting":{}
-        }))
-        .unwrap();
+        let model = serde_json::from_value(json!({"vercelGatewayRouting":{"only":[]}})).unwrap();
         let mut body = json!({});
         provider
             .overlay(model)
             .request_options(&mut body, 32, false);
-        assert_eq!(body["provider"], json!({}));
-        assert!(body.get("providerOptions").is_none());
+        assert_eq!(
+            body["providerOptions"],
+            json!({"gateway":{"order":["first"],"only":[]}})
+        );
     }
 
     #[test]
@@ -269,13 +300,14 @@ impl ChatCompatibility {
 
     /// Model-specific values override the provider defaults field by field.
     pub fn overlay(self, model: Self) -> Self {
-        let chat_template_args = match (self.chat_template_args, model.chat_template_args) {
-            (Some(mut base), Some(newer)) => {
-                base.extend(newer);
-                Some(base)
-            }
-            (base, newer) => newer.or(base),
-        };
+        let vercel_gateway_routing =
+            match (self.vercel_gateway_routing, model.vercel_gateway_routing) {
+                (Some(base), Some(newer)) => Some(VercelGatewayRouting {
+                    only: newer.only.or(base.only),
+                    order: newer.order.or(base.order),
+                }),
+                (base, newer) => newer.or(base),
+            };
         Self {
             supports_store: model.supports_store.or(self.supports_store),
             supports_developer_role: model
@@ -301,9 +333,9 @@ impl ChatCompatibility {
             reasoning_field: model.reasoning_field.or(self.reasoning_field),
             max_tokens_field: model.max_tokens_field.or(self.max_tokens_field),
             thinking_format: model.thinking_format.or(self.thinking_format),
-            chat_template_args,
-            open_router_routing: model.open_router_routing.or(self.open_router_routing),
-            vercel_gateway_routing: model.vercel_gateway_routing.or(self.vercel_gateway_routing),
+            chat_template_args: overlay_map(self.chat_template_args, model.chat_template_args),
+            open_router_routing: overlay_map(self.open_router_routing, model.open_router_routing),
+            vercel_gateway_routing,
             zai_tool_stream: model.zai_tool_stream.or(self.zai_tool_stream),
             vllm_priority: model.vllm_priority.or(self.vllm_priority),
             supports_thinking_token_budget: model

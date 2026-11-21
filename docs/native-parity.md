@@ -4347,8 +4347,8 @@ worker reload.
 For Chat Completions routes, `compat.openRouterRouting` becomes the
 request's `provider` object. This includes data-collection and zero-retention
 preferences. `compat.vercelGatewayRouting` sends the configured `only` and
-`order` lists in `providerOptions.gateway`. Model-specific routing replaces
-the corresponding provider default. Local fixtures verify the request fields.
+`order` lists in `providerOptions.gateway`. Model settings override the
+provider defaults for each routing field they specify. Local fixtures verify the request fields.
 Live gateway routing was unverified.
 
 ### Session sharing destinations
