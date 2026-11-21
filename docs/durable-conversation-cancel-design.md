@@ -47,11 +47,12 @@ outcome: the task fails for reconciliation and `abort_and_wait` can report
 pending cleanup. Woken roots and children with unsupported or uncertain owned work fail closed. Nested claims bind the exact foreground ancestry; callback markers are retired atomically across it. A stopped callback is never replayed, and a retained child receipt does not resolve the interrupted Tool outcome.
 A separate `register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_woken_cancel`
 registration runs the replay-safe selected after hook with fenced memo and
-retains its rich result with the callback receipt and snapshot version. An
-atomic terminal marker binds it to the failed task. Publication rechecks the
-selected identity, snapshot, ownership, original wake and absence of late
-results; it appends the after output while retaining a Blocked conversation and
-the uncertain Tool outcome. A changed snapshot, selection or late result needs
+retains its rich result with the callback receipt and snapshot version. For a root, an atomic terminal marker binds it to the failed task. Root
+publication rechecks the selected identity, snapshot, ownership, original wake
+and absence of late results; it appends the after output while retaining a Blocked
+conversation and the uncertain Tool outcome. A nested child retains the rich
+after result in its receipt, but does not currently expose that result to its
+parent; the parent receives an uncertain outcome. A changed snapshot, selection or late result needs
 reconciliation. The current hook input uses the generic aborted diagnostic
 rather than upstream’s tool-specific interrupted diagnostic. After process loss recovery fails
 the original task for reconciliation and atomically retires only matching task
