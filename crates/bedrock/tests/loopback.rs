@@ -1308,6 +1308,10 @@ async fn provider_response_is_observed_before_bedrock_reads_its_first_frame() {
             &mut |_| {},
         )
         .await;
-    server.await.unwrap();
-    assert_eq!(answer.unwrap(), "hello");
+    let server = server.await;
+    assert_eq!(
+        answer.unwrap_or_else(|error| panic!("agent: {error}; server: {server:?}")),
+        "hello",
+    );
+    server.unwrap();
 }

@@ -1,8 +1,5 @@
 //! Snapshot the final Smithy response without touching its event-stream body.
-use std::{
-    fmt,
-    sync::{Arc, Mutex},
-};
+use std::{fmt, future::Future, sync::Mutex};
 
 use aws_smithy_runtime_api::{
     box_error::BoxError,
@@ -19,14 +16,29 @@ use aws_smithy_runtime_api::{
 };
 use aws_smithy_types::config_bag::ConfigBag;
 use http::HeaderMap;
+use tokio::sync::mpsc;
 
-#[derive(Clone, Default)]
-pub(crate) struct Capture(Arc<Mutex<Attempt>>);
+pub(crate) struct Capture {
+    request_headers: Mutex<HeaderMap>,
+    sender: mpsc::UnboundedSender<Observation>,
+}
 
-#[derive(Default)]
-struct Attempt {
+pub(crate) struct Observation {
     request_headers: HeaderMap,
-    response: Option<http::Response<()>>,
+    response: http::Response<()>,
+}
+
+impl Capture {
+    pub(crate) fn channel() -> (Self, mpsc::UnboundedReceiver<Observation>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (
+            Self {
+                request_headers: Mutex::default(),
+                sender,
+            },
+            receiver,
+        )
+    }
 }
 
 impl fmt::Debug for Capture {
@@ -50,10 +62,10 @@ impl Intercept for Capture {
             copy_metadata(http::StatusCode::OK.into(), context.request().headers())
                 .map(|response| response.into_parts().0.headers)
                 .unwrap_or_default();
-        *self.0.lock().expect("Bedrock response capture") = Attempt {
-            request_headers,
-            response: None,
-        };
+        *self
+            .request_headers
+            .lock()
+            .expect("Bedrock request headers") = request_headers;
         Ok(())
     }
 
@@ -64,19 +76,52 @@ impl Intercept for Capture {
         _: &mut ConfigBag,
     ) -> Result<(), BoxError> {
         let response = context.response();
-        self.0.lock().expect("Bedrock response capture").response =
-            copy_metadata(response.status(), response.headers());
+        if response.status().is_success()
+            && let Some(response) = copy_metadata(response.status(), response.headers())
+        {
+            let request_headers = std::mem::take(
+                &mut *self
+                    .request_headers
+                    .lock()
+                    .expect("Bedrock request headers"),
+            );
+            let _ = self.sender.send(Observation {
+                request_headers,
+                response,
+            });
+        }
         Ok(())
     }
 }
 
-impl Capture {
-    pub(crate) async fn notify(self, configured_secrets: &[String]) {
-        let Attempt {
+pub(crate) async fn observe_while_sending<F: Future>(
+    send: F,
+    mut observations: mpsc::UnboundedReceiver<Observation>,
+    configured_secrets: &[String],
+) -> F::Output {
+    tokio::pin!(send);
+    // The SDK can wait on the event stream while resolving the operation.
+    // Service the HTTP metadata as soon as Smithy supplies it.
+    let output = loop {
+        tokio::select! {
+            biased;
+            Some(metadata) = observations.recv() => metadata.notify(configured_secrets).await,
+            output = &mut send => break output,
+        }
+    };
+    // The SDK may have produced metadata and completed in the same poll.
+    while let Ok(metadata) = observations.try_recv() {
+        metadata.notify(configured_secrets).await;
+    }
+    output
+}
+
+impl Observation {
+    async fn notify(self, configured_secrets: &[String]) {
+        let Self {
             request_headers,
             response,
-        } = std::mem::take(&mut *self.0.lock().expect("Bedrock response capture"));
-        let Some(response) = response else { return };
+        } = self;
         let mut secrets = configured_secrets.to_vec();
         secrets.extend(
             request_headers
@@ -146,7 +191,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_preserves_sensitivity_from_both_smithy_http_versions() {
+    fn provider_response_snapshot_preserves_sensitivity_from_both_smithy_http_versions() {
         let make_legacy = || {
             let mut map = http02::HeaderMap::new();
             map.append("x-header", http02::HeaderValue::from_static("public"));
