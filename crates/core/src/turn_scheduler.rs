@@ -11,6 +11,7 @@ pub(super) enum TurnPreparation {
         guard: tokio_util::sync::DropGuard,
     },
     Skipped(String),
+    ArgumentRejected(String),
 }
 
 enum TurnNormalized {
@@ -19,6 +20,152 @@ enum TurnNormalized {
         args: serde_json::Value,
     },
     Skipped(String),
+    ArgumentRejected(String),
+}
+
+const MAX_PI_ARGUMENT_ISSUES: usize = 32;
+const MAX_PI_ARGUMENT_PREVIEW_BYTES: usize = 64 * 1024;
+
+fn pi_argument_diagnostic(
+    name: &str,
+    validator: &jsonschema::Validator,
+    input: &serde_json::Value,
+    prepared: &serde_json::Value,
+) -> String {
+    use jsonschema::error::{TypeKind, ValidationErrorKind as Kind};
+    use std::fmt::Write as _;
+
+    let mut output = format!("Validation failed for tool \"{name}\":");
+    let mut errors: Vec<_> = validator
+        .iter_errors(prepared)
+        .take(MAX_PI_ARGUMENT_ISSUES + 1)
+        .collect();
+    let mut omitted = errors.len() > MAX_PI_ARGUMENT_ISSUES;
+    errors.truncate(MAX_PI_ARGUMENT_ISSUES);
+    let mut remaining = MAX_PI_ARGUMENT_ISSUES;
+    errors.sort_by_key(|error| match error.kind {
+        Kind::Required { .. } => 0,
+        Kind::AdditionalProperties { .. } => 2,
+        _ => 1,
+    });
+    'errors: for error in errors {
+        let pointer = error.instance_path.to_string();
+        let path = pointer.strip_prefix('/').map(|pointer| {
+            pointer
+                .split('/')
+                .map(|part| part.replace("~1", "/").replace("~0", "~"))
+                .collect::<Vec<_>>()
+                .join(".")
+        });
+        let child_path = |key: &str| match &path {
+            Some(path) => format!("{path}.{key}"),
+            None => key.to_owned(),
+        };
+        let diagnostic = match &error.kind {
+            Kind::Required { property } => {
+                if let Some(property) = property.as_str()
+                    && !append_pi_argument_issue(
+                        &mut output,
+                        &mut remaining,
+                        &child_path(property),
+                        "missing",
+                    )
+                {
+                    omitted = true;
+                    break;
+                }
+                continue;
+            }
+            Kind::AdditionalProperties { unexpected } => {
+                for property in unexpected {
+                    if !append_pi_argument_issue(
+                        &mut output,
+                        &mut remaining,
+                        &child_path(property),
+                        "unknown field",
+                    ) {
+                        omitted = true;
+                        break 'errors;
+                    }
+                }
+                continue;
+            }
+            Kind::Type {
+                kind: TypeKind::Single(kind),
+            } => {
+                let actual = match error.instance.as_ref() {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "boolean",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                };
+                format!("expected {kind}, got {actual}")
+            }
+            Kind::Minimum { limit } => format!("expected >= {limit}"),
+            Kind::Maximum { limit } => format!("expected <= {limit}"),
+            Kind::ExclusiveMinimum { limit } => format!("expected > {limit}"),
+            Kind::ExclusiveMaximum { limit } => format!("expected < {limit}"),
+            Kind::MinLength { limit } => format!("expected at least {limit} characters"),
+            Kind::MinItems { limit } => format!("expected at least {limit} items"),
+            _ => error.masked().to_string(),
+        };
+        if !append_pi_argument_issue(
+            &mut output,
+            &mut remaining,
+            path.as_deref().unwrap_or("root"),
+            &diagnostic,
+        ) {
+            omitted = true;
+            break;
+        }
+    }
+    if omitted {
+        output.push_str("\n  [Additional validation issues omitted]");
+    }
+    let mut preview = ArgumentPreview::default();
+    let truncated = serde_json::to_writer_pretty(&mut preview, input).is_err();
+    let input = String::from_utf8_lossy(&preview.0);
+    let _ = write!(output, "\n\nReceived arguments:\n{input}");
+    if truncated {
+        output.push_str("\n[Received arguments truncated]");
+    }
+    output
+}
+
+fn append_pi_argument_issue(
+    output: &mut String,
+    remaining: &mut usize,
+    path: &str,
+    message: &str,
+) -> bool {
+    use std::fmt::Write as _;
+    if *remaining == 0
+        || output.len() + path.len() + message.len() + 6 > MAX_PI_ARGUMENT_PREVIEW_BYTES
+    {
+        return false;
+    }
+    let _ = write!(output, "\n  - {path}: {message}");
+    *remaining -= 1;
+    true
+}
+
+#[derive(Default)]
+struct ArgumentPreview(Vec<u8>);
+
+impl std::io::Write for ArgumentPreview {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let count = bytes
+            .len()
+            .min(MAX_PI_ARGUMENT_PREVIEW_BYTES - self.0.len());
+        self.0.extend_from_slice(&bytes[..count]);
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // A validated decision alone is not sufficient authorization: callers must
@@ -370,6 +517,51 @@ fn turn_poll_snapshot(
 mod strict_argument_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pi_argument_diagnostics_bound_issue_count_and_preview() {
+        let schema = jsonschema::validator_for(&json!({
+            "type":"object",
+            "properties":{"edits":{"type":"array","items":{
+                "type":"object","required":["oldText","newText"]
+            }}},
+            "additionalProperties":false
+        }))
+        .unwrap();
+        let many_edits = json!({"edits":vec![json!({}); 1000]});
+        let output = pi_argument_diagnostic("edit", &schema, &many_edits, &many_edits);
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.starts_with("  - "))
+                .count(),
+            MAX_PI_ARGUMENT_ISSUES
+        );
+        assert!(output.contains("[Additional validation issues omitted]"));
+        assert!(!output.contains("[Received arguments truncated]"));
+
+        let many_unknown_fields = serde_json::Value::Object(
+            (0..1000)
+                .map(|i| (format!("field{i:04}"), json!(null)))
+                .collect(),
+        );
+        let output =
+            pi_argument_diagnostic("edit", &schema, &many_unknown_fields, &many_unknown_fields);
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.ends_with(": unknown field"))
+                .count(),
+            MAX_PI_ARGUMENT_ISSUES
+        );
+        assert!(output.contains("[Additional validation issues omitted]"));
+
+        let large_input = json!({"subject":"界".repeat(MAX_PI_ARGUMENT_PREVIEW_BYTES)});
+        let output = pi_argument_diagnostic("edit", &schema, &large_input, &large_input);
+        assert!(output.contains("subject: unknown field"));
+        assert!(output.ends_with("[Received arguments truncated]"));
+        assert!(output.len() < MAX_PI_ARGUMENT_PREVIEW_BYTES + 256);
+    }
 
     struct FixtureTool {
         pollable: bool,
@@ -1715,11 +1907,24 @@ impl Agent<'_> {
             result = platform_time::timeout(tool_timeout, tool.tool.prepare_arguments(args)) => match result {
                 Ok(Ok(arguments)) if arguments.to_string().len() <= 16 * 1024 * 1024 => arguments,
                 Ok(Ok(_)) => return Ok(TurnNormalized::Skipped("prepared arguments exceed size limit".into())),
+                Ok(Err(error)) if tool.tool.pi_argument_diagnostics() => {
+                    return Ok(TurnNormalized::ArgumentRejected(error));
+                }
                 Ok(Err(error)) => return Ok(TurnNormalized::Skipped(format!("argument preparation failed: {error}"))),
                 Err(_) => return Ok(TurnNormalized::Skipped("argument preparation timed out".into())),
             },
         };
         if !tool.validator.is_valid(&args) {
+            if tool.tool.pi_argument_diagnostics()
+                && let Ok(input) = turn_model_arguments(invocation, None)
+            {
+                return Ok(TurnNormalized::ArgumentRejected(pi_argument_diagnostic(
+                    &tool.spec.name,
+                    &tool.validator,
+                    &input,
+                    &args,
+                )));
+            }
             return Ok(TurnNormalized::Skipped(
                 "arguments do not match the tool's JSON Schema".into(),
             ));
@@ -1739,6 +1944,9 @@ impl Agent<'_> {
         let (tool, mut args) = match normalized {
             TurnNormalized::Ready { tool, args } => (tool, args),
             TurnNormalized::Skipped(reason) => return Ok(TurnPreparation::Skipped(reason)),
+            TurnNormalized::ArgumentRejected(output) => {
+                return Ok(TurnPreparation::ArgumentRejected(output));
+            }
         };
         let call = &invocation.call;
         let cancellation = cancel.child_token();
@@ -1846,6 +2054,14 @@ impl Agent<'_> {
                 guard,
             } => (tool, args, context, state, guard),
             TurnPreparation::Skipped(reason) => return Outcome::Skipped(reason).into(),
+            TurnPreparation::ArgumentRejected(output) => {
+                return Outcome::TextResult {
+                    output,
+                    details: Some(serde_json::json!({})),
+                    is_error: true,
+                }
+                .into();
+            }
         };
         let timeout = if omit_default_tool_timeout && !tool.tool.use_default_timeout() {
             None
@@ -1952,6 +2168,7 @@ struct TurnCall {
     reply: Option<oneshot::Sender<Outcome>>,
     parallel: bool,
     polled: bool,
+    argument_rejected: bool,
     phase: TurnPhase,
 }
 enum TurnPhase {
@@ -2183,6 +2400,7 @@ impl Agent<'_> {
                     .get(&invocation.call.name)
                     .is_some_and(|tool| tool.tool.execution() == ToolExecution::ParallelRead),
                 polled: false,
+                argument_rejected: false,
                 phase: TurnPhase::Queued,
             });
             lanes.entry(None).or_default().calls.push_back(index);
@@ -2520,6 +2738,7 @@ impl Agent<'_> {
                     continue;
                 };
                 let mut reply = *reply;
+                let argument_rejected = calls[index].argument_rejected;
                 let registry = self.registry.clone();
                 let snapshot = states.clone();
                 let invocation = calls[index].invocation.clone();
@@ -2543,17 +2762,18 @@ impl Agent<'_> {
                             errors.push((extension.to_owned(), event, message.to_owned()));
                         }
                     };
-                    let replaced = Self::turn_transform(
-                        &registry,
-                        timeout,
-                        &invocation,
-                        &mut reply,
-                        &snapshot,
-                        &cancel,
-                        &mut collect,
-                        Some(hook_host),
-                    )
-                    .await;
+                    let replaced = !argument_rejected
+                        && Self::turn_transform(
+                            &registry,
+                            timeout,
+                            &invocation,
+                            &mut reply,
+                            &snapshot,
+                            &cancel,
+                            &mut collect,
+                            Some(hook_host),
+                        )
+                        .await;
                     TurnEvent::Transformed(index, reply, duration, errors, replaced)
                 }
                 .boxed();
@@ -2575,7 +2795,7 @@ impl Agent<'_> {
                         let index = calls.len();
                         positions.insert(invocation.operation_id, index);
                         snapshots.insert(invocation.operation_id, request.snapshot);
-                        calls.push(TurnCall { parallel: self.registry.tools.get(&invocation.call.name).is_some_and(|tool| tool.tool.execution() == ToolExecution::ParallelRead), polled: false, invocation, parent, lane, cancellation: request.cancellation, depth: request.depth, call_count: request.call_count, reply: Some(request.reply), phase: TurnPhase::Queued });
+                        calls.push(TurnCall { parallel: self.registry.tools.get(&invocation.call.name).is_some_and(|tool| tool.tool.execution() == ToolExecution::ParallelRead), polled: false, argument_rejected: false, invocation, parent, lane, cancellation: request.cancellation, depth: request.depth, call_count: request.call_count, reply: Some(request.reply), phase: TurnPhase::Queued });
                         lanes.entry(lane).or_default().calls.push_back(index);
                         group_indices.push(index);
                     }
@@ -2633,6 +2853,7 @@ impl Agent<'_> {
                                     continue;
                                 }
                                 let ran = matches!(&prepared, TurnPreparation::Ready { .. });
+                                calls[index].argument_rejected = matches!(&prepared, TurnPreparation::ArgumentRejected(_));
                                 if let TurnPreparation::Ready { tool, args, .. } = &prepared {
                                     let strict_decision = if calls[index].lane.is_none() {
                                         match turn_decision.as_ref() {
@@ -2651,7 +2872,7 @@ impl Agent<'_> {
                                         commit(session, Event::ToolStarted { operation_id: calls[index].invocation.operation_id, tool_execution: None }, observer)?;
                                     }
                                 }
-                                let cancellation = match &prepared { TurnPreparation::Ready { context, .. } => context.cancellation.clone(), TurnPreparation::Skipped(_) => calls[index].cancellation.child_token() };
+                                let cancellation = match &prepared { TurnPreparation::Ready { context, .. } => context.cancellation.clone(), TurnPreparation::Skipped(_) | TurnPreparation::ArgumentRejected(_) => calls[index].cancellation.child_token() };
                                 let (updates, mut progress_input) = mpsc::channel::<TurnProgress>(32);
                                 let (finish_progress, mut finish_signal) = oneshot::channel();
                                 let progress_output = progress_output.clone();
@@ -2716,7 +2937,8 @@ impl Agent<'_> {
                     }
                     TurnEvent::Transformed(index, reply, duration, errors, replaced) => {
                         for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); }
-                        let finished = self.finish_tool(session, &calls[index].invocation, reply, states, observer, Some(&snapshots), !replaced);
+                        let allow_event_metadata = !calls[index].argument_rejected && !replaced;
+                        let finished = self.finish_tool(session, &calls[index].invocation, reply, states, observer, Some(&snapshots), allow_event_metadata);
                         let outcome = session.operations().into_iter().find_map(|(invocation,state)| if invocation.operation_id == calls[index].invocation.operation_id { if let OperationState::Finished(outcome) = state { Some(outcome) } else { None } } else { None }).unwrap_or_else(|| Outcome::Unknown("tool produced no durable result".into()));
                         if matches!(&finished, Err(Error::PendingOperation(_)))
                             && let Outcome::Pending { reference } = &outcome

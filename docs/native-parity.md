@@ -2071,6 +2071,12 @@ Unrestricted local built-in tools coerce model arguments to their declared
 string, number and boolean types before schema validation. Optional null fields
 are treated as omissions, and edit batches also normalize replacement fields.
 Scoped tools and injected operations retain their argument handling.
+Schema rejections for these local built-ins report Pi-style field diagnostics
+and the received arguments. For oversized diagnostics, native reports up to
+32 issues and limits the argument preview to 64 KiB, with omission notices.
+Edit preparation also reports Pi's messages for
+empty edit arrays and empty replacement targets. These failures produce a tool
+error result before dispatch.
 
 `grep` streams files with the native ripgrep libraries, supports surrounding
 context lines, bounds long displayed lines at 500 characters, and reports match

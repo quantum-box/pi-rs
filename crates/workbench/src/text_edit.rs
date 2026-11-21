@@ -134,14 +134,19 @@ fn edits(arguments: &Value) -> Result<Vec<Edit>> {
     Ok(edits)
 }
 pub fn prepare_arguments(mut arguments: Value) -> Result<Value> {
-    let edits = edits(&arguments)?;
+    prepare_arguments_in_place(&mut arguments)?;
+    Ok(arguments)
+}
+
+pub(super) fn prepare_arguments_in_place(arguments: &mut Value) -> Result<()> {
+    let edits = edits(arguments)?;
     let object = arguments
         .as_object_mut()
         .ok_or_else(|| Error::Config("edit arguments must be an object".into()))?;
     object.remove("oldText");
     object.remove("newText");
     object.insert("edits".into(), serde_json::to_value(edits)?);
-    Ok(arguments)
+    Ok(())
 }
 fn replace(mut text: String, replacements: &[Replacement], offset: usize) -> String {
     for replacement in replacements.iter().rev() {
