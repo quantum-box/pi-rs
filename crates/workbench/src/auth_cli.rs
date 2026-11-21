@@ -159,7 +159,7 @@ async fn resolve(
             super::codex_auth::access(
                 &super::config::agent_dir().join("auth.json"),
                 &args.settings,
-                minimum,
+                (wanted == Some(AuthType::OAuth)).then_some(minimum),
                 no_refresh,
             )
             .await?

@@ -47,6 +47,25 @@ enum ThinkingMode {
     Budgeted,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum ThinkingDisplay {
+    #[default]
+    Summarized,
+    Omitted,
+}
+
+impl ThinkingDisplay {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Summarized => "summarized",
+            Self::Omitted => "omitted",
+        }
+    }
+}
+
+const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+const OAUTH_BETAS: &str = "claude-code-20250219,oauth-2025-04-20";
+
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Progress {
@@ -74,6 +93,8 @@ pub struct Anthropic {
     probe_context: bool,
     thinking_level: Option<String>,
     thinking_budgets: Option<Value>,
+    thinking_display: ThinkingDisplay,
+    interleaved_thinking: bool,
     configured_thinking: Option<CatalogEntry>,
     configured_thinking_is_fallback: bool,
     allow_empty_signature: bool,
@@ -99,6 +120,18 @@ impl Anthropic {
             ));
         }
         Self::connect(endpoint, AUTHORIZATION, &format!("Bearer {token}"))
+    }
+
+    /// Authenticate to Cloudflare AI Gateway without an origin API key.
+    pub fn with_cloudflare_gateway_token(endpoint: &str, token: &str) -> Result<Self> {
+        if token.trim().is_empty() {
+            return Err(Error::Config("missing Cloudflare AI Gateway token".into()));
+        }
+        Self::connect(
+            endpoint,
+            HeaderName::from_static("cf-aig-authorization"),
+            &format!("Bearer {token}"),
+        )
     }
 
     /// Connect using Anthropic subscription OAuth credentials.
@@ -168,6 +201,8 @@ impl Anthropic {
             probe_context: true,
             thinking_level: None,
             thinking_budgets: None,
+            thinking_display: ThinkingDisplay::default(),
+            interleaved_thinking: true,
             configured_thinking: None,
             configured_thinking_is_fallback: false,
             allow_empty_signature: false,
@@ -315,6 +350,18 @@ impl Anthropic {
         self
     }
 
+    /// Choose whether the model returns readable thinking or only its replay signature.
+    pub fn with_thinking_display(mut self, display: ThinkingDisplay) -> Self {
+        self.thinking_display = display;
+        self
+    }
+
+    /// Enable the interleaved beta for budgeted thinking when no beta header is specified.
+    pub fn with_interleaved_thinking(mut self, enabled: bool) -> Self {
+        self.interleaved_thinking = enabled;
+        self
+    }
+
     /// Use known thinking capabilities for a gateway that lacks a Models API.
     pub fn with_configured_thinking(mut self, level: &str, adaptive: bool, disable: bool) -> Self {
         self.thinking_level = Some(level.into());
@@ -375,7 +422,7 @@ impl Anthropic {
         url.path_segments_mut().ok()?.push(model);
         let details = tokio::time::timeout(Duration::from_secs(2), async {
             let response = send(
-                self.authenticate(self.client.get(url)),
+                self.authenticate(self.client.get(url), false),
                 &self.error_secrets(),
             )
             .await
@@ -434,25 +481,58 @@ impl Anthropic {
         secrets
     }
 
-    fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let request = request
+    fn authenticate(
+        &self,
+        mut request: reqwest::RequestBuilder,
+        interleaved: bool,
+    ) -> reqwest::RequestBuilder {
+        request = request
             .header("anthropic-version", API_VERSION)
             .header(self.auth.0.clone(), self.auth.1.clone());
-        let request = if self.oauth {
-            let request = request
+        if self.oauth {
+            request = request
                 .header("accept", "application/json")
                 .header("anthropic-dangerous-direct-browser-access", "true")
                 .header("user-agent", "claude-cli/2.1.280")
                 .header("x-app", "cli");
-            if self.headers.contains_key("anthropic-beta") {
-                request
-            } else {
-                request.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
-            }
-        } else {
-            request
-        };
+        }
+        if !self.headers.contains_key("anthropic-beta") {
+            request = match (self.oauth, interleaved) {
+                (true, true) => request.header(
+                    "anthropic-beta",
+                    format!("{OAUTH_BETAS},{INTERLEAVED_THINKING_BETA}"),
+                ),
+                (true, false) => request.header("anthropic-beta", OAUTH_BETAS),
+                (false, true) => request.header("anthropic-beta", INTERLEAVED_THINKING_BETA),
+                (false, false) => request,
+            };
+        }
         request.headers(self.headers.clone())
+    }
+
+    fn configure_request_thinking(
+        &self,
+        body: &mut Value,
+        details: Option<&CatalogEntry>,
+        max_output_tokens: u32,
+    ) -> Result<bool> {
+        if let Some(level) = self.thinking_level.as_deref() {
+            configure_thinking(
+                body,
+                details,
+                level,
+                max_output_tokens,
+                self.thinking_budgets.as_ref(),
+            )?;
+        }
+        let mode = body["thinking"]["type"].as_str();
+        let interleaved = mode == Some("enabled") && self.interleaved_thinking;
+        if matches!(mode, Some("enabled" | "adaptive"))
+            && self.thinking_display != ThinkingDisplay::Summarized
+        {
+            body["thinking"]["display"] = json!(self.thinking_display.as_str());
+        }
+        Ok(interleaved)
     }
 
     /// Return paginated models in server order and retain their metadata for this client.
@@ -474,7 +554,7 @@ impl Anthropic {
                 url.query_pairs_mut().append_pair("after_id", cursor);
             }
             let response = send(
-                self.authenticate(self.client.get(url)),
+                self.authenticate(self.client.get(url), false),
                 &self.error_secrets(),
             )
             .await?;
@@ -1549,6 +1629,28 @@ impl Model for Anthropic {
         } else {
             pi_rs_core::protected_model_fingerprint(&identity)
         }?;
+        let active_thinking = self
+            .thinking_level
+            .as_deref()
+            .is_some_and(|level| level != "off");
+        let interleaved = active_thinking
+            && self.interleaved_thinking
+            && !self.headers.contains_key("anthropic-beta")
+            && self
+                .configured_thinking
+                .as_ref()
+                .is_some_and(|details| matches!(details.thinking, Some(ThinkingMode::Budgeted)));
+        let omitted = active_thinking && self.thinking_display == ThinkingDisplay::Omitted;
+        let base = if interleaved || omitted {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "thinking-request-options-v1",
+                interleaved,
+                omitted,
+            ))?
+        } else {
+            base
+        };
         let base = if self.mid_conversation_system_models.is_empty() {
             base
         } else {
@@ -1772,21 +1874,17 @@ impl Anthropic {
         if self.oauth {
             prepare_oauth_request(&mut body, self.cache_retention);
         }
-        if let Some(level) = self.thinking_level.as_deref() {
-            configure_thinking(
-                &mut body,
-                details.as_ref(),
-                level,
-                max_output_tokens,
-                self.thinking_budgets.as_ref(),
-            )?;
-        }
+        let interleaved =
+            self.configure_request_thinking(&mut body, details.as_ref(), max_output_tokens)?;
         if let Some(progress) = &self.progress {
             progress(Progress::WaitingForModel);
         }
         let error_secrets = self.error_secrets();
         let mut request = self.client.post(self.endpoint.clone());
-        if copilot.is_some() || matches!(self.provider.as_ref(), "opencode" | "opencode-go") {
+        if self.auth.0 == "cf-aig-authorization"
+            || copilot.is_some()
+            || matches!(self.provider.as_ref(), "opencode" | "opencode-go")
+        {
             request = request.query(&[("beta", "true")]);
         }
         if let Some(headers) = copilot {
@@ -1796,7 +1894,7 @@ impl Anthropic {
                 }
             }
         }
-        let response = send_http(self.authenticate(request.json(&body))).await?;
+        let response = send_http(self.authenticate(request.json(&body), interleaved)).await?;
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
@@ -2744,9 +2842,15 @@ mod tests {
             let pos = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
             let headers = String::from_utf8_lossy(&request[..pos]).to_ascii_lowercase();
             assert!(headers.contains("authorization: bearer fixture-oauth"));
-            assert!(headers.contains("anthropic-beta: claude-code-20250219,oauth-2025-04-20"));
+            assert!(headers.lines().any(|line| {
+                line == "anthropic-beta: claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"
+            }));
             let body: Value = serde_json::from_slice(&request[pos + 4..]).unwrap();
             assert_eq!(body["tools"][0]["name"], "Read");
+            assert_eq!(
+                body["thinking"],
+                json!({"type":"enabled","budget_tokens":2048,"display":"omitted"})
+            );
             assert_eq!(
                 body["system"][0]["text"],
                 "You are Claude Code, Anthropic's official CLI for Claude."
@@ -2767,7 +2871,9 @@ mod tests {
         let model =
             Anthropic::with_oauth_token(&format!("http://{address}/v1/messages"), "fixture-oauth")
                 .unwrap()
-                .with_context_probe(false);
+                .with_context_probe(false)
+                .with_configured_thinking("low", false, true)
+                .with_thinking_display(ThinkingDisplay::Omitted);
         let request = ModelRequest {
             model: "m".into(),
             messages: vec![Message::User {
@@ -2778,7 +2884,7 @@ mod tests {
                 description: "read".into(),
                 parameters: json!({"type":"object"}),
             }],
-            max_output_tokens: 16,
+            max_output_tokens: 4096,
         };
         let mut stream = model.stream(request).await.unwrap();
         let mut observed = false;
@@ -3874,6 +3980,88 @@ mod tests {
             })
         );
         assert!(AnthropicInputTransformations::from_value(&json!([])).is_none());
+    }
+
+    #[test]
+    fn thinking_request_uses_interleaved_beta_for_budgeted_thinking_only() {
+        let base = Anthropic::new(DEFAULT_ENDPOINT, "fixture")
+            .unwrap()
+            .with_context_probe(false);
+        let budgeted = base.clone().with_configured_thinking("low", false, true);
+        let adaptive = base.clone().with_configured_thinking("low", true, true);
+        let disabled = budgeted.clone().with_thinking(Some("off"));
+        let explicit = budgeted.clone().with_headers(
+            [(
+                HeaderName::from_static("anthropic-beta"),
+                HeaderValue::from_static("custom-feature"),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        for (client, thinking, beta) in [
+            (base, Value::Null, None),
+            (disabled, json!({"type":"disabled"}), None),
+            (
+                budgeted.clone(),
+                json!({"type":"enabled","budget_tokens":2048,"display":"summarized"}),
+                Some(INTERLEAVED_THINKING_BETA),
+            ),
+            (
+                budgeted.clone().with_interleaved_thinking(false),
+                json!({"type":"enabled","budget_tokens":2048,"display":"summarized"}),
+                None,
+            ),
+            (
+                adaptive
+                    .clone()
+                    .with_thinking_display(ThinkingDisplay::Omitted),
+                json!({"type":"adaptive","display":"omitted"}),
+                None,
+            ),
+            (
+                explicit,
+                json!({"type":"enabled","budget_tokens":2048,"display":"summarized"}),
+                Some("custom-feature"),
+            ),
+        ] {
+            let mut body = json!({});
+            let interleaved = client
+                .configure_request_thinking(&mut body, client.configured_thinking.as_ref(), 4096)
+                .unwrap();
+            assert_eq!(body["thinking"], thinking);
+            let request = client
+                .authenticate(client.client.post(DEFAULT_ENDPOINT), interleaved)
+                .build()
+                .unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get("anthropic-beta")
+                    .and_then(|value| value.to_str().ok()),
+                beta,
+            );
+        }
+        assert_ne!(
+            budgeted.context_identity(),
+            budgeted
+                .clone()
+                .with_interleaved_thinking(false)
+                .context_identity(),
+        );
+        assert_eq!(
+            adaptive.context_identity(),
+            adaptive
+                .clone()
+                .with_interleaved_thinking(false)
+                .context_identity(),
+        );
+        assert_ne!(
+            adaptive.context_identity(),
+            adaptive
+                .clone()
+                .with_thinking_display(ThinkingDisplay::Omitted)
+                .context_identity(),
+        );
     }
 
     #[test]
