@@ -2561,7 +2561,7 @@ impl PendingMaintenance {
         if !Arc::ptr_eq(owner, &harness.owner) {
             return Err(Error::Ownership);
         }
-        let targets = match harness.scoped_abort_graph(None, Some(self.intent), None, None) {
+        let mut targets = match harness.scoped_abort_graph(None, Some(self.intent), None, None) {
             Ok(Some(targets)) => targets,
             Ok(None) => Vec::new(),
             Err(error)
@@ -2576,6 +2576,18 @@ impl PendingMaintenance {
                 )));
             }
         };
+        if let MaintenanceIntent::Woken(id) = self.intent {
+            let tasks = TaskStore::new(owner.store());
+            let Some(task) = tasks.load(id)? else { return Ok(false) };
+            if matches!(task.task.owner(), TaskOwner::Task(_)) {
+                let Some(root_id) = Scheduler::foreground_root(owner, &task.task) else { return Ok(false) };
+                let Some(root) = tasks.load(root_id)? else { return Ok(false) };
+                let TaskOwner::Conversation(conversation) = root.task.owner() else { return Ok(false) };
+                targets.push(*conversation);
+                targets.sort_unstable();
+                targets.dedup();
+            }
+        }
         match owner
             .conversation_controls()
             .try_fence_targets(&targets, || {
@@ -4752,7 +4764,7 @@ impl AdmissionHandle<'_> {
         // Until evidence traversal covers conversation ownership edges, refuse
         // to authorize cleanup through one, including after a live graph abort.
         #[cfg(feature = "experimental-graph-revision")]
-        if !nested {
+        {
             checks.extend(
                 provisional_woken_owned_checks(
                     self.validator.ok_or("missing harness")?,
@@ -4785,8 +4797,7 @@ impl AdmissionHandle<'_> {
             // The graph checks above authenticate this recorded snapshot; the
             // first-poll path separately holds every owned conversation gate.
             #[cfg(feature = "experimental-graph-revision")]
-            let authenticated_graph = !nested
-                && owner
+            let authenticated_graph = owner
                     .store()
                     .get(&crate::runtime::woken_owned_graph_key(current.task.id()))
                     .map_err(|e| e.to_string())?
@@ -5287,7 +5298,7 @@ impl AdmissionHandle<'_> {
             )
         };
         #[cfg(feature = "experimental-graph-revision")]
-        if !nested {
+        {
             checks.extend(
                 provisional_woken_owned_checks(
                     self.validator.ok_or("missing harness")?,
@@ -6120,7 +6131,7 @@ impl AdmissionHandle<'_> {
             )
         };
         #[cfg(feature = "experimental-graph-revision")]
-        if !nested {
+        {
             checks.extend(
                 provisional_woken_owned_checks(
                     self.validator.ok_or("missing harness")?,
@@ -14241,8 +14252,7 @@ impl Scheduler {
                                     ));
                                 }
                                 #[cfg(feature = "experimental-graph-revision")]
-                                if nested_ancestry.is_none()
-                                    && store
+                                if store
                                         .get(&crate::runtime::woken_owned_graph_key(claim.task))
                                         .map_err(task_store::Error::from)?
                                         .is_some()
@@ -16027,7 +16037,7 @@ impl Scheduler {
                     || record.task.state() != &TaskState::Running
                     || record.task.abort_requested()
                     || record.task.replay_safe()
-                    || !matches!(record.task.owner(), TaskOwner::Conversation(_))
+                    || !matches!(record.task.owner(), TaskOwner::Conversation(_) | TaskOwner::Task(_))
                     || record.task.checkpoint().phase != "replay-safe-async-wait"
                     || !self
                         .registered(&record.task)
@@ -19181,7 +19191,7 @@ pub(crate) fn resolve_maintenance(
             if !parent.task.abort_requested()
                 && parent.task.state() == &TaskState::Running
                 && !parent.task.replay_safe()
-                && matches!(parent.task.owner(), TaskOwner::Conversation(_))
+                && matches!(parent.task.owner(), TaskOwner::Conversation(_) | TaskOwner::Task(_))
                 && parent.task.checkpoint().phase == "replay-safe-async-wait" =>
         {
             Ok(Some((Some(id), None)))

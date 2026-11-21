@@ -11033,15 +11033,15 @@ async fn nested_woken_real_callback_records_receipt_once() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "experimental-graph-revision")))]
 #[tokio::test]
 async fn nested_woken_with_owned_conversation_remains_fail_closed() {
-    exercise_nested_woken_owned_rejection(false, false).await;
-    exercise_nested_woken_owned_rejection(true, false).await;
+    exercise_nested_woken_owned_rejection(false, false, 0).await;
+    exercise_nested_woken_owned_rejection(true, false, 0).await;
 }
 
 #[cfg(unix)]
-async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool) {
+async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool, automatic: u8) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
     if selected {
@@ -11125,6 +11125,9 @@ async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool) {
             return;
         }
     }
+    if automatic == 1 {
+        std::fs::write(dir.path().join("block-cancel"), b"hold").unwrap();
+    }
     let mut resumed = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -11137,6 +11140,79 @@ async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool) {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    if automatic != 0 {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !dir.path().join("nested-cancelled").exists() {
+                assert!(resumed.try_wait().unwrap().is_none());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        if automatic == 1 {
+            let store = durable_store::Store::open(&path).unwrap();
+            let task_marker = format!("durable/task-callback-start/{}", edge.task);
+            let crate::task::TaskOwner::Task(ancestor) = edge.task_owner else { unreachable!() };
+            let ancestor_marker = format!("durable/task-callback-start/{ancestor}");
+            let markers = [task_marker.into_bytes(), ancestor_marker.into_bytes(), crate::conversation_signal::callback_start_key(owned)];
+            let entries: Vec<_> = markers.iter().map(|key| store.get(key).unwrap().unwrap()).collect();
+            assert!(entries.iter().all(|entry| entry.value == entries[0].value));
+            drop(store);
+            resumed.kill().unwrap();
+            resumed.wait().unwrap();
+            std::fs::remove_file(dir.path().join("block-cancel")).unwrap();
+            let mut reopened = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "conversation_claim_boundary_tests::nested_woken_evidence_worker"])
+                .env("PI_TEST_NESTED_WOKEN_DIR", dir.path())
+                .env("PI_TEST_NESTED_WOKEN_RESUME", "1")
+                .env("PI_TEST_WOKEN_REAL", "1")
+                .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    assert!(reopened.try_wait().unwrap().is_none());
+                    let store = durable_store::Store::open(&path).unwrap();
+                    let task = crate::task_store::TaskStore::new(&store).load(edge.task).unwrap().unwrap();
+                    if task.task.is_terminal() { break; }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            assert_eq!(std::fs::read_to_string(dir.path().join("nested-cancelled")).unwrap(), "called\n");
+            let store = durable_store::Store::open(&path).unwrap();
+            for key in &markers { assert!(store.get(key).unwrap().is_none()); }
+            assert!(store.get(&crate::task_scheduler::woken_conversation_receipt_key(edge.task)).unwrap().is_none());
+            reopened.kill().unwrap();
+            reopened.wait().unwrap();
+            return;
+        }
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                assert!(resumed.try_wait().unwrap().is_none());
+                let store = durable_store::Store::open(&path).unwrap();
+                if store.get(&crate::task_scheduler::woken_conversation_receipt_key(edge.task)).unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        resumed.kill().unwrap();
+        resumed.wait().unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let receipt = store.get(&crate::task_scheduler::woken_conversation_receipt_key(edge.task)).unwrap().unwrap();
+        let saved: crate::task_scheduler::WokenConversationCancelReceipt = serde_json::from_slice(&receipt.value).unwrap();
+        assert_eq!(saved.result, "callback returned");
+        assert_eq!(saved.version, if selected { 2 } else { 1 });
+        drop(store);
+        let mut reopened = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "conversation_claim_boundary_tests::nested_woken_evidence_worker"])
+            .env("PI_TEST_NESTED_WOKEN_DIR", dir.path())
+            .env("PI_TEST_NESTED_WOKEN_RESUME", "1")
+            .env("PI_TEST_WOKEN_REAL", "1")
+            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(reopened.try_wait().unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(dir.path().join("nested-cancelled")).unwrap(), "called\n");
+        reopened.kill().unwrap();
+        reopened.wait().unwrap();
+        return;
+    }
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             assert!(resumed.try_wait().unwrap().is_none());
@@ -11203,9 +11279,23 @@ async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool) {
 
 #[cfg(all(unix, feature = "experimental-graph-revision"))]
 #[tokio::test]
+async fn nested_woken_owned_callback_kill_does_not_replay() {
+    exercise_nested_woken_owned_rejection(false, false, 1).await;
+    exercise_nested_woken_owned_rejection(true, false, 1).await;
+}
+
+#[cfg(all(unix, feature = "experimental-graph-revision"))]
+#[tokio::test]
+async fn nested_woken_owned_graph_automatic_callback() {
+    exercise_nested_woken_owned_rejection(false, false, 2).await;
+    exercise_nested_woken_owned_rejection(true, false, 2).await;
+}
+
+#[cfg(all(unix, feature = "experimental-graph-revision"))]
+#[tokio::test]
 async fn nested_woken_owned_graph_mark_requires_ancestor_fence() {
-    exercise_nested_woken_owned_rejection(false, true).await;
-    exercise_nested_woken_owned_rejection(true, true).await;
+    exercise_nested_woken_owned_rejection(false, true, 0).await;
+    exercise_nested_woken_owned_rejection(true, true, 0).await;
 }
 
 #[cfg(unix)]
