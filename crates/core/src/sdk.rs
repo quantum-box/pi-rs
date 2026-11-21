@@ -1358,6 +1358,7 @@ impl SessionBuilder {
         }
         // Session::open already recovers interrupted handoffs, but callers can
         // also supply a custom store whose temporary branch is still checked out.
+        crate::extension_boundary::repair_plan_on_open(&mut session)?;
         if self.historical_model_resolver.is_some() {
             session.recover_tree_trigger_handoff()?;
         }
@@ -1798,6 +1799,11 @@ impl AgentSession {
     pub fn registered_tool_info(&self) -> Vec<crate::RegisteredToolInfo> {
         self.registry.registered_tool_info()
     }
+    /// Snapshot configured custom-message renderers for the host presentation.
+    pub fn custom_message_renderers(&self) -> crate::CustomMessageRenderers {
+        self.registry.custom_message_renderers()
+    }
+
     /// Inspect configured extension commands, including collision-resolved
     /// invocation names and extension provenance. Prompt templates, skills and
     /// built-in host commands remain the host's responsibility. Per-request
@@ -2567,6 +2573,11 @@ impl AgentSession {
         let order = self.control.input_order.acquire().await?;
         let session = self.session.clone();
         let mut journal = session.lock().await;
+        if !defer_startup && journal.pending_extension_boundary_run().is_some() {
+            return Err(Error::Session(
+                "pending extension boundary recovery must be resumed before startup".into(),
+            ));
+        }
         if !defer_startup && crate::agent::resumable_compaction_run(&journal).is_some() {
             return Err(Error::Session(
                 "pending compaction recovery must be resumed before startup".into(),
@@ -3161,12 +3172,15 @@ impl AgentSession {
         .await
     }
     pub async fn resume(&mut self) -> Result<String> {
-        let recovery = {
+        let (recovery, boundary_run) = {
             let journal = self.journal_async().await;
-            crate::agent::resumable_compaction_run(&journal)
+            (
+                crate::agent::resumable_compaction_run(&journal),
+                journal.pending_extension_boundary_run(),
+            )
         };
         let (_, startup_error) = self
-            .start_with_fallback(None, false, recovery.is_some())
+            .start_with_fallback(None, false, recovery.is_some() || boundary_run.is_some())
             .await?;
         if let Some(error) = startup_error {
             return Err(error);
@@ -3199,7 +3213,7 @@ impl AgentSession {
                     .into(),
             ));
         }
-        let run_id = recovery.map(|(run_id, _, _)| run_id);
+        let run_id = recovery.map(|(run_id, _, _)| run_id).or(boundary_run);
         if run_id.is_none() {
             self.drain_idle_triggers().await?;
         }

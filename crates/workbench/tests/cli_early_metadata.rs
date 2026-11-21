@@ -64,6 +64,39 @@ fn rpc_rejects_file_arguments_before_startup() {
 }
 
 #[test]
+fn rpc_file_arguments_are_checked_before_root_help() {
+    for args in [
+        &["--help", "--mode", "rpc", "@missing.txt"][..],
+        &["--mode", "rpc", "-h", "--", "@"][..],
+        &["--mode", "text", "--mode", "rpc", "--help", "@missing.txt"][..],
+        &["--help", "--mode=rpc", "--list-models", "@missing.txt"][..],
+    ] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        assert_eq!(
+            output.stderr, b"Error: @file arguments are not supported in RPC mode\n",
+            "{args:?}"
+        );
+    }
+
+    let version = run(&["--version"]);
+    let output = run(&["--mode", "rpc", "@missing.txt", "--help", "--version"]);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, version.stdout);
+    assert_eq!(output.stderr, version.stderr);
+
+    for args in [
+        &["--mode", "rpc", "--mode", "text", "--help", "@missing.txt"][..],
+        &["--mode", "rpc", "--name", "@session-name", "--help"][..],
+    ] {
+        let output = run(args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Usage"));
+    }
+}
+
+#[test]
 fn export_runs_before_help_but_version_runs_before_export() {
     let export = run(&["--export", "missing-session.jsonl", "--help"]);
     assert!(!export.status.success(), "{export:?}");
@@ -83,6 +116,20 @@ fn export_with_help_preserves_explicit_output_even_when_it_names_a_subcommand() 
         .append_user_with_images("export marker".into(), Vec::new(), None)
         .unwrap();
     session.export_jsonl(&input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(home.path())
+        .env("PI_RS_HOME", home.path())
+        .args(["--mode", "rpc", "@missing.txt", "--help", "--export"])
+        .arg(&input)
+        .arg("rpc-report.html")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        std::fs::read_to_string(home.path().join("rpc-report.html"))
+            .unwrap()
+            .contains("export marker")
+    );
     for destination in ["report.html", "run"] {
         for order in 0..3 {
             let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
