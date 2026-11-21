@@ -4029,8 +4029,16 @@ The model accepts text and images, has a one-million-token context window
 and a 128,000-token model output limit, and adds xhigh and max to its standard
 effort levels.
 The catalog includes Pi's model-specific pricing, prompt-cache lifetimes,
-and image limits. Provider-side model fallback requests and fallback pricing
-remain open. Live Fable 5.2 inference was unverified.
+and image limits. The direct Anthropic catalog uses Pi v1.6.0's ordered
+server-side fallback targets for Fable 5 and Fable 5.2. Models can set or clear
+`compat.allowedFallbackModels` in `models.json`. Requests omit the fallback
+field for an empty list and retain the required fallback beta alongside custom
+betas when candidates are present. Native usage uses the fallback price only when the
+server identifies an allowed target on the same provider, while keeping the
+requested model for continuation. A fallback after recognized response content
+fails as in Pi. Loopback tests covered the beta header, target order, and
+fallback billing. Live Fable 5.2 inference and server-side fallback were
+unverified.
 
 Native Anthropic streams expose individual text and thinking block boundaries,
 and show redacted thinking as `[Reasoning redacted]` while retaining its opaque

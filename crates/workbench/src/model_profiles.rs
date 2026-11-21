@@ -2,8 +2,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 
-use pi_rs::ollama::ChatCompatibility;
+pub(super) use pi_rs::ChatPrice;
 use pi_rs::{Error, Result};
+use pi_rs::{anthropic::AnthropicFallbackModel, ollama::ChatCompatibility};
 use pi_rs_workbench::image_profile::ImageResizeProfile;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -204,6 +205,7 @@ struct ModelCompatibility {
     allow_empty_signature: Option<bool>,
     supports_strict_tools: Option<bool>,
     supports_mid_convo_effort: Option<bool>,
+    allowed_fallback_models: Option<Vec<AnthropicFallbackModel>>,
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
     session_affinity_format: Option<AffinityFormat>,
@@ -215,6 +217,12 @@ struct ModelCompatibility {
 }
 
 impl ModelCompatibility {
+    fn valid(&self) -> bool {
+        self.allowed_fallback_models
+            .as_deref()
+            .is_none_or(AnthropicFallbackModel::valid_list)
+    }
+
     fn overlay(self, newer: Self) -> Self {
         Self {
             chat: self.chat.overlay(newer.chat),
@@ -223,6 +231,9 @@ impl ModelCompatibility {
             supports_mid_convo_effort: newer
                 .supports_mid_convo_effort
                 .or(self.supports_mid_convo_effort),
+            allowed_fallback_models: newer
+                .allowed_fallback_models
+                .or(self.allowed_fallback_models),
             force_adaptive_thinking: newer
                 .force_adaptive_thinking
                 .or(self.force_adaptive_thinking),
@@ -244,132 +255,6 @@ impl ModelCompatibility {
                 .or(self.supports_cache_control_on_tools),
             cache_control_format: newer.cache_control_format.or(self.cache_control_format),
         }
-    }
-}
-
-/// Model prices in dollars per million tokens.
-#[derive(Clone, Default, Deserialize)]
-struct ChatRates {
-    input: Option<f64>,
-    output: Option<f64>,
-    #[serde(rename = "cacheRead")]
-    cache_read: Option<f64>,
-    #[serde(rename = "cacheWrite")]
-    cache_write: Option<f64>,
-}
-
-impl ChatRates {
-    fn overlay(self, newer: Self) -> Self {
-        Self {
-            input: newer.input.or(self.input),
-            output: newer.output.or(self.output),
-            cache_read: newer.cache_read.or(self.cache_read),
-            cache_write: newer.cache_write.or(self.cache_write),
-        }
-    }
-
-    fn valid(&self) -> bool {
-        [self.input, self.output, self.cache_read, self.cache_write]
-            .into_iter()
-            .flatten()
-            .all(|amount| amount.is_finite() && amount >= 0.0)
-    }
-
-    fn value(&self) -> Value {
-        serde_json::json!({
-            "input": self.input.unwrap_or_default(),
-            "output": self.output.unwrap_or_default(),
-            "cacheRead": self.cache_read.unwrap_or_default(),
-            "cacheWrite": self.cache_write.unwrap_or_default(),
-        })
-    }
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PriceTier {
-    input_tokens_above: u64,
-    #[serde(flatten)]
-    rates: ChatRates,
-}
-
-#[derive(Clone, Default, Deserialize)]
-pub(super) struct ChatPrice {
-    #[serde(flatten)]
-    rates: ChatRates,
-    tiers: Option<Vec<PriceTier>>,
-}
-
-impl ChatPrice {
-    fn overlay(self, newer: Self) -> Self {
-        Self {
-            rates: self.rates.overlay(newer.rates),
-            tiers: newer.tiers.or(self.tiers),
-        }
-    }
-
-    fn valid(&self) -> bool {
-        self.rates.valid()
-            && self
-                .tiers
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .all(|tier| tier.rates.valid())
-    }
-
-    pub fn value(&self) -> Value {
-        let mut value = self.rates.value();
-        if let Some(tiers) = &self.tiers {
-            value["tiers"] = Value::Array(
-                tiers
-                    .iter()
-                    .map(|tier| {
-                        let mut value = tier.rates.value();
-                        value["inputTokensAbove"] = serde_json::json!(tier.input_tokens_above);
-                        value
-                    })
-                    .collect(),
-            );
-        }
-        value
-    }
-
-    pub fn estimate(
-        &self,
-        usage: pi_rs::Usage,
-        metadata: &pi_rs::ModelMetadata,
-    ) -> Option<pi_rs::UsageCostBreakdown> {
-        let tier = self
-            .tiers
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .rev()
-            .filter(|tier| usage.input_tokens > tier.input_tokens_above)
-            .max_by_key(|tier| tier.input_tokens_above);
-        let rates = tier.map_or(&self.rates, |tier| &tier.rates);
-        let reads = metadata
-            .cached_input_tokens
-            .unwrap_or_default()
-            .min(usage.input_tokens);
-        let other_input = usage.input_tokens - reads;
-        let writes = metadata
-            .cache_creation_input_tokens
-            .unwrap_or_default()
-            .min(other_input);
-        let long = metadata
-            .cache_write_1h_tokens
-            .unwrap_or_default()
-            .min(writes);
-        let input_rate = rates.input.unwrap_or_default();
-        pi_rs::UsageCostBreakdown::new(
-            (input_rate / 1_000_000.0) * (other_input - writes) as f64,
-            (rates.output.unwrap_or_default() / 1_000_000.0) * usage.output_tokens as f64,
-            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64,
-            (rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
-                + (input_rate / 500_000.0) * long as f64,
-        )
     }
 }
 
@@ -534,6 +419,7 @@ impl ModelMetadata {
                 .is_some_and(|name| name.trim().is_empty())
             || self.context_window == Some(0)
             || self.max_tokens == Some(0)
+            || !self.compat.valid()
             || self.cost.as_ref().is_some_and(|cost| !cost.valid())
             || self.input_limits.is_some_and(|limits| !limits.valid())
             || self.prompt_cache.is_some_and(|cache| !cache.valid())
@@ -889,6 +775,12 @@ impl Profiles {
                     "models.json profile {} requires the {} API",
                     provider.id(),
                     provider.api()
+                )));
+            }
+            if !profile.compat.valid() {
+                return Err(Error::Config(format!(
+                    "invalid Anthropic fallback policy for {}",
+                    provider.id()
                 )));
             }
             let endpoint = profile.base_url.as_deref().map_or_else(
@@ -1262,6 +1154,22 @@ impl Profiles {
         })
     }
 
+    pub fn anthropic_fallback_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> BTreeMap<String, Vec<AnthropicFallbackModel>> {
+        self.anthropic_route_capabilities(provider, selected, explicit_endpoint, |metadata| {
+            self.cache_compatibility(provider, metadata)
+                .allowed_fallback_models
+                .unwrap_or_default()
+        })
+        .into_iter()
+        .filter(|(_, targets)| !targets.is_empty())
+        .collect()
+    }
+
     pub fn anthropic_managed_effort_models(
         &self,
         provider: &Provider,
@@ -1284,19 +1192,19 @@ impl Profiles {
         .collect()
     }
 
-    fn anthropic_route_capabilities(
+    fn anthropic_route_capabilities<T>(
         &self,
         provider: &Provider,
         selected: &str,
         explicit_endpoint: Option<&str>,
-        capability: impl Fn(Option<&ModelMetadata>) -> bool,
-    ) -> BTreeMap<String, bool> {
+        capability: impl Fn(Option<&ModelMetadata>) -> T,
+    ) -> BTreeMap<String, T> {
         let endpoint = explicit_endpoint
             .or_else(|| self.model_endpoint(provider, selected))
             .unwrap_or_else(|| self.endpoint(provider));
         // A partial model override does not establish a routable model.
         let ids = self.model_ids(provider);
-        let mut models: BTreeMap<String, bool> = ids
+        let mut models: BTreeMap<String, T> = ids
             .into_iter()
             .filter_map(|id| {
                 if self.model_adapter(provider, &id) != Adapter::Anthropic
@@ -1964,6 +1872,36 @@ mod tests {
                 "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
             );
         }
+    }
+
+    #[test]
+    fn anthropic_fallback_targets_match_pi_and_respect_model_overrides() {
+        let profiles = Profiles::default();
+        let provider = Provider::Anthropic;
+        let id = "claude-fable-5-2";
+        let targets = profiles.anthropic_fallback_models(&provider, id, None);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[id][0].provider, "anthropic");
+        assert_eq!(targets[id][0].model, "claude-opus-5");
+        assert_eq!(targets["claude-fable-5"][0].model, "claude-opus-4-8");
+        assert_eq!(targets["claude-fable-5"][1].model, "claude-opus-5");
+
+        let profiles = Profiles::parse(&json!({"providers":{"anthropic":{
+            "modelOverrides":{(id):{"compat":{"allowedFallbackModels":[]}}}
+        }}}))
+        .unwrap();
+        assert!(
+            !profiles
+                .anthropic_fallback_models(&provider, id, None)
+                .contains_key(id)
+        );
+
+        let invalid = Profiles::parse(&json!({"providers":{"anthropic":{
+            "modelOverrides":{(id):{"compat":{"allowedFallbackModels":[
+                {"provider":"anthropic","model":"other","cost":{"input":-1}}
+            ]}}}
+        }}}));
+        assert!(invalid.is_err());
     }
 
     #[test]

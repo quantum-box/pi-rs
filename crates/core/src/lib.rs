@@ -12,6 +12,7 @@ mod host_auth;
 mod journal;
 mod lifecycle;
 mod model_catalog;
+mod model_price;
 mod persistent_map;
 #[doc(hidden)]
 pub mod pi_import;
@@ -48,6 +49,7 @@ pub use lifecycle::{
     notify_in_session as notify_extension_lifecycle_in_session,
 };
 pub use model_catalog::*;
+pub use model_price::ChatPrice;
 pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};
 pub use provider_response::{ProviderResponseEvent, observe_provider_response};
 pub use resource::Resource;

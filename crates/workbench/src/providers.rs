@@ -1158,6 +1158,11 @@ impl Client {
                             args.explicit_endpoint_for(&args.provider),
                         ),
                     )
+                    .with_fallback_models(args.model_profiles.anthropic_fallback_models(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
+                    ))?
                     .with_thinking(thinking)
                     .with_thinking_budget_settings(
                         args.settings.value().get("thinkingBudgets").cloned(),
