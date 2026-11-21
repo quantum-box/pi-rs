@@ -1702,7 +1702,21 @@ impl BashOperations for LocalBashOperations {
         } = self
             .shell
             .launch(&context.cwd, false, true, &context.command, false)?;
-        check_local_shell_cwd(&cwd, "bash", &cancellation).await?;
+        // The backend owns the deadline so it can report a shell that has
+        // already exited. The same deadline bounds the directory check.
+        let deadline = async {
+            match timeout {
+                Some(value) => tokio::time::sleep(value).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(deadline);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            _ = &mut deadline => return Err(operation_timeout(timeout.expect("timeout"), None)),
+            result = check_local_shell_cwd(&cwd, "bash", &cancellation) => result?,
+        }
         command
             .current_dir(cwd)
             .env_clear()
@@ -1734,13 +1748,6 @@ impl BashOperations for LocalBashOperations {
         let mut shell_exit = None;
         let mut drain_deadline = None;
         let mut drain_max = None;
-        let deadline = async {
-            match timeout {
-                Some(value) => tokio::time::sleep(value).await,
-                None => std::future::pending().await,
-            }
-        };
-        tokio::pin!(deadline);
         'drain: while shell_exit.is_none() || stdout_open || stderr_open {
             tokio::select! {
                 biased;
@@ -4195,6 +4202,8 @@ fn append_shell_exit_status(
         use std::fmt::Write as _;
         let code = exit_code(status);
         let seconds = (elapsed.as_secs_f64() * 10.0).round() / 10.0;
+        // Pi uses this wording whenever inherited pipes remain open at the
+        // deadline, including when the descendant did not write to them.
         let _ = write!(
             message,
             ". The shell exited with code {code} after {seconds} seconds, but background processes it started kept writing output until the timeout."
