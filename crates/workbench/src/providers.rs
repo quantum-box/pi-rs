@@ -194,6 +194,11 @@ impl Provider {
                 }))
             }
             Adapter::ChatCompletions => {
+                if self.id() == "cloudflare-ai-gateway" && endpoint.is_empty() {
+                    return Err(Error::Config(
+                        "set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_GATEWAY_ID for cloudflare-ai-gateway".into(),
+                    ));
+                }
                 if self.id() == "cloudflare-workers-ai" && endpoint.is_empty() {
                     return Err(Error::Config(
                         "set CLOUDFLARE_ACCOUNT_ID for cloudflare-workers-ai".into(),
@@ -202,6 +207,8 @@ impl Provider {
                 if token.is_none()
                     && let Some(builtin) = super::builtin_chat::find(self.id())
                     && (builtin.endpoint() == endpoint
+                        || (self.id() == "cloudflare-ai-gateway"
+                            && super::cloudflare_gateway::Route::is_endpoint(endpoint))
                         || (self.id() == "cloudflare-workers-ai"
                             && super::model_profiles::cloudflare_workers_chat_account(endpoint)
                                 .is_some()))
@@ -218,7 +225,9 @@ impl Provider {
             }
             Adapter::Anthropic => {
                 let token = token.ok_or_else(missing_key)?;
-                let mut client = if self == &Self::Anthropic && token.contains("sk-ant-oat") {
+                let mut client = if self.id() == "cloudflare-ai-gateway" {
+                    Anthropic::with_cloudflare_gateway_token(endpoint, &token)?
+                } else if self == &Self::Anthropic && token.contains("sk-ant-oat") {
                     Anthropic::with_oauth_token(endpoint, &token)?
                 } else if bearer
                     || matches!(
@@ -1333,13 +1342,12 @@ impl Client {
                 let (supports_long, explicit_cache) = args
                     .model_profiles
                     .responses_cache_support(&args.provider, metadata.as_ref());
-                let supports_developer = args
+                let compat = args
                     .model_profiles
-                    .chat_compatibility(&args.provider, metadata.as_ref())
-                    .supports_developer_role();
+                    .chat_compatibility(&args.provider, metadata.as_ref());
                 let use_developer = metadata.as_ref().and_then(|model| model.reasoning)
                     == Some(true)
-                    && supports_developer != Some(false);
+                    && compat.supports_developer_role() != Some(false);
                 let client = if args
                     .model_profiles
                     .model_adapter(&args.provider, &args.model)
@@ -1367,6 +1375,9 @@ impl Client {
                     .with_strict_tool_support(
                         args.model_profiles
                             .responses_strict_tool_support(&args.provider, metadata.as_ref()),
+                    )
+                    .with_grammar_tool_support(
+                        compat.supports_openai_grammar_tools().unwrap_or(false),
                     )
                     .with_prompt_cache_key_enabled(
                         args.model_profiles
@@ -1761,6 +1772,67 @@ mod contention_tests {
             )
             .uses_final_strict_policy()
         );
+    }
+
+    #[tokio::test]
+    async fn responses_grammar_capability_follows_the_selected_model() {
+        use clap::Parser;
+
+        let endpoint = "http://localhost:9/responses";
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers":{"fixture":{
+                "api":"openai-responses","baseUrl":endpoint,
+                "compat":{"supportsOpenAIGrammarTools":true},
+                "models":[{"id":"grammar"},{"id":"function","compat":{"supportsOpenAIGrammarTools":false}}]
+            }}
+        })).unwrap();
+        args.provider = args.model_profiles.provider("fixture").unwrap();
+        let declaration = pi_rs::ToolDeclaration {
+            spec: pi_rs::ToolSpec {
+                name: "write".into(),
+                description: String::new(),
+                parameters: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+            },
+            constrained_sampling: Some(pi_rs::ToolConstraint::Grammar {
+                variants: pi_rs::ToolGrammarVariants {
+                    openai_regex: Some(".+".into()),
+                    ..Default::default()
+                },
+            }),
+        };
+        let context = pi_rs::ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "fixture".into(),
+            summary: false,
+        };
+        for (model, support) in [("grammar", true), ("function", false)] {
+            args.model = model.into();
+            let client = Client::OpenAi(
+                pi_rs::openai::OpenAiResponses::new_api(endpoint, "key".into()).unwrap(),
+            )
+            .with_model_options(&args, false)
+            .unwrap();
+            let request = ModelRequest {
+                model: model.into(),
+                messages: vec![],
+                tools: vec![declaration.spec.clone()],
+                max_output_tokens: 32,
+            };
+            let prepared = client
+                .prepare_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                matches!(
+                    prepared.effective_tools()[0].sampling,
+                    pi_rs::EffectiveToolSampling::OpenAiGrammar { .. }
+                ),
+                support
+            );
+        }
     }
 
     #[tokio::test]

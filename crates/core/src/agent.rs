@@ -3729,10 +3729,15 @@ impl Agent<'_> {
                                 .map_err(|_| Error::PendingOperation(invocation.operation_id))?;
                             if !validated.effective_tools().iter().any(|entry| {
                                 entry.spec.name == invocation.call.name
-                                    && matches!(
-                                        entry.sampling,
-                                        crate::EffectiveToolSampling::Unconstrained
-                                    )
+                                    && match entry.sampling {
+                                        crate::EffectiveToolSampling::Unconstrained => true,
+                                        crate::EffectiveToolSampling::OpenAiGrammar { .. } => {
+                                            validated.normalized_arguments(&invocation.call).is_ok()
+                                        }
+                                        crate::EffectiveToolSampling::StrictJsonSchema {
+                                            ..
+                                        } => false,
+                                    }
                             }) {
                                 return Err(Error::PendingOperation(invocation.operation_id));
                             }
