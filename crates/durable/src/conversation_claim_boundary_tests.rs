@@ -7557,7 +7557,11 @@ fn build_woken_any(path: &std::path::Path) -> (Options, Registry, crate::extensi
         DurableParkCancel, register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel,
         register_conversation_unsafe_durable_tool_with_at_most_once_woken_cancel,
     };
-    struct Cancel(std::path::PathBuf, bool);
+    struct Cancel(
+        std::path::PathBuf,
+        bool,
+        Option<crate::nested_identity::IdentityHandle>,
+    );
     #[async_trait]
     impl DurableParkCancel for Cancel {
         async fn cancel(&self, _: Value, checkpoint: Value, _: ToolContext) -> Result<(), String> {
@@ -7576,6 +7580,18 @@ fn build_woken_any(path: &std::path::Path) -> (Options, Registry, crate::extensi
                 std::fs::write(self.0.join("slow-cancel"), b"called").unwrap();
                 return Ok(());
             }
+            if std::env::var_os("PI_TEST_WOKEN_OWNED_DISPATCH").is_some() {
+                assert!(
+                    self.2
+                        .as_ref()
+                        .unwrap()
+                        .update(Some("changed".into()), || panic!(
+                            "identity changed during callback"
+                        ))
+                        .await
+                        .is_err()
+                );
+            }
             let slow: AsyncTaskCall = serde_json::from_value(checkpoint["slow"].clone()).unwrap();
             let store = durable_store::Store::open(self.0.join("db")).unwrap();
             let slow = crate::task_store::TaskStore::new(&store)
@@ -7592,7 +7608,25 @@ fn build_woken_any(path: &std::path::Path) -> (Options, Registry, crate::extensi
                     "unsafe child must cancel first"
                 );
             }
-            std::fs::write(self.0.join("parent-cancel"), b"called").unwrap();
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.0.join("parent-cancel"))
+                    .unwrap(),
+                "called"
+            )
+            .unwrap();
+            if std::env::var("PI_TEST_WOKEN_OWNED_CUT").ok().as_deref() == Some("callback") {
+                let control = std::path::PathBuf::from(
+                    std::env::var_os("PI_TEST_WOKEN_OWNED_CONTROL").unwrap(),
+                );
+                std::fs::write(control.join("cut-ready"), b"callback").unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
             Ok(())
         }
     }
@@ -7670,7 +7704,7 @@ fn build_woken_any(path: &std::path::Path) -> (Options, Registry, crate::extensi
         let _identity =
             crate::nested_identity::register(&identity, Some("slow-backend".into())).unwrap();
         let slow = if selected {
-            crate::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel(&mut registry, slow, "slow", 1, vec![blocker.clone()], &extensions.snapshot(), &["policy".to_owned()], "slow-cancel-v1", Arc::new(Cancel(dir.clone(), true)), UnsafeDurableAuthorization::interruption_requires_reconciliation(), crate::async_task_tool::ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe()).unwrap()
+            crate::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_park_cancel(&mut registry, slow, "slow", 1, vec![blocker.clone()], &extensions.snapshot(), &["policy".to_owned()], "slow-cancel-v1", Arc::new(Cancel(dir.clone(), true, None)), UnsafeDurableAuthorization::interruption_requires_reconciliation(), crate::async_task_tool::ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe()).unwrap()
         } else {
             register_conversation_unsafe_durable_tool_with_at_most_once_park_cancel(
                 &mut registry,
@@ -7679,7 +7713,7 @@ fn build_woken_any(path: &std::path::Path) -> (Options, Registry, crate::extensi
                 1,
                 vec![blocker.clone()],
                 "slow-cancel-v1",
-                Arc::new(Cancel(dir.clone(), true)),
+                Arc::new(Cancel(dir.clone(), true, None)),
                 UnsafeDurableAuthorization::interruption_requires_reconciliation(),
             )
             .unwrap()
@@ -7696,9 +7730,10 @@ fn build_woken_any(path: &std::path::Path) -> (Options, Registry, crate::extensi
         dir: dir.clone(),
     });
     let identity: Arc<dyn Tool> = root.clone();
-    let _identity = crate::nested_identity::register(&identity, Some("backend-v1".into())).unwrap();
+    let identity_handle =
+        crate::nested_identity::register(&identity, Some("backend-v1".into())).unwrap();
     let root = if selected {
-        crate::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_woken_cancel(&mut registry, root, "root", 1, children.clone(), &extensions.snapshot(), &["policy".to_owned()], "cancel-v1", Arc::new(Cancel(dir, false)), UnsafeDurableAuthorization::interruption_requires_reconciliation(), crate::async_task_tool::ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe()).unwrap()
+        crate::async_task_tool::register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_woken_cancel(&mut registry, root, "root", 1, children.clone(), &extensions.snapshot(), &["policy".to_owned()], "cancel-v1", Arc::new(Cancel(dir, false, Some(identity_handle.clone()))), UnsafeDurableAuthorization::interruption_requires_reconciliation(), crate::async_task_tool::ReplaySafeConversationHooksAuthorization::host_attests_hooks_replay_safe()).unwrap()
     } else {
         register_conversation_unsafe_durable_tool_with_at_most_once_woken_cancel(
             &mut registry,
@@ -7707,7 +7742,7 @@ fn build_woken_any(path: &std::path::Path) -> (Options, Registry, crate::extensi
             1,
             children.clone(),
             "cancel-v1",
-            Arc::new(Cancel(dir, false)),
+            Arc::new(Cancel(dir, false, Some(identity_handle))),
             UnsafeDurableAuthorization::interruption_requires_reconciliation(),
         )
         .unwrap()
@@ -7981,6 +8016,166 @@ async fn owned_child_binding_requires_both_pending_conversations() {
 
 #[cfg(feature = "experimental-graph-revision")]
 #[tokio::test]
+async fn woken_owned_callback_fixture() {
+    if let Some(dir) = std::env::var_os("PI_TEST_WOKEN_OWNED_RESUME") {
+        let path = std::path::PathBuf::from(dir).join("db");
+        let (scheduler, driver) = start_woken_any_scheduler(&path);
+        let store = durable_store::Store::open(&path).unwrap();
+        let root = crate::task_store::TaskStore::new(&store)
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|record| {
+                matches!(record.task.owner(), crate::task::TaskOwner::Conversation(_))
+                    && record.task.woken_interrupted_attempt().is_some()
+            })
+            .unwrap()
+            .task
+            .id();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !driver.get(root).unwrap().unwrap().is_terminal() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path.parent().unwrap().join("parent-cancel"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let receipt = store
+            .get(&crate::task_scheduler::woken_conversation_receipt_key(root))
+            .unwrap();
+        let has_receipt = std::env::var("PI_TEST_WOKEN_OWNED_CUT").unwrap() == "receipt";
+        assert_eq!(receipt.is_some(), has_receipt);
+        let task = driver.get(root).unwrap().unwrap();
+        assert!(
+            matches!(task.state(), TaskState::Failed(reason) if reason.contains("reconciliation"))
+        );
+        if has_receipt {
+            let crate::task::TaskOwner::Conversation(owner) = task.owner() else {
+                panic!("missing owner")
+            };
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if scheduler.conversation(*owner).unwrap().messages.iter().any(|message| matches!(message, Message::Tool { content, .. } if content.contains("after cancel"))) { break; }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+        }
+        drop(store);
+        assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+        scheduler.shutdown().await.unwrap();
+        return;
+    }
+    if let Ok(case) = std::env::var("PI_TEST_WOKEN_OWNED_CASE") {
+        exercise_woken_owned_graph_receipt(false, case.parse().unwrap()).await;
+    }
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn woken_owned_callback_driver_fixture_runs_once() {
+    use std::process::{Command, Stdio};
+    for case in [17, 18, 19, 20, 21, 22] {
+        let mut worker = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::woken_owned_callback_fixture",
+                "--nocapture",
+            ])
+            .env("PI_TEST_WOKEN_OWNED_CASE", case.to_string())
+            .env("PI_TEST_WOKEN_OWNED_DISPATCH", "1")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(50), async {
+            loop {
+                if let Some(status) = worker.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if status.is_err() {
+            let _ = worker.kill();
+            let _ = worker.wait();
+        }
+        assert!(status.unwrap().success(), "fixture case {case} failed");
+    }
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
+async fn woken_owned_callback_kill_and_reopen() {
+    use std::process::{Command, Stdio};
+    for cut in ["callback", "receipt"] {
+        let control = tempfile::tempdir().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::woken_owned_callback_fixture",
+                "--nocapture",
+            ])
+            .env("PI_TEST_WOKEN_OWNED_CASE", "18")
+            .env("PI_TEST_WOKEN_OWNED_DISPATCH", "1")
+            .env("PI_TEST_WOKEN_OWNED_CONTROL", control.path())
+            .env("PI_TEST_WOKEN_OWNED_CUT", cut)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if cut == "receipt" {
+            command.env("PI_TEST_WOKEN_HOLD_AFTER_RECEIPT", control.path());
+        }
+        let mut worker = command.spawn().unwrap();
+        let ready = control.path().join(if cut == "callback" {
+            "cut-ready"
+        } else {
+            "woken-receipt"
+        });
+        let reached = tokio::time::timeout(Duration::from_secs(35), async {
+            while !ready.exists() {
+                assert!(
+                    worker.try_wait().unwrap().is_none(),
+                    "worker exited before {cut}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if reached.is_err() {
+            let _ = worker.kill();
+            let _ = worker.wait();
+        }
+        reached.unwrap();
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+        let dir = std::fs::read_to_string(control.path().join("fixture-path")).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::woken_owned_callback_fixture",
+                "--nocapture",
+            ])
+            .env("PI_TEST_WOKEN_OWNED_RESUME", &dir)
+            .env("PI_TEST_WOKEN_OWNED_CUT", cut)
+            .env("PI_TEST_WOKEN_OWNED_DISPATCH", "1")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .unwrap();
+        assert!(status.success(), "resume after {cut} failed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
 async fn selected_owned_child_binding_requires_both_pending_conversations() {
     exercise_woken_owned_graph_receipt(false, 10).await;
 }
@@ -7988,7 +8183,20 @@ async fn selected_owned_child_binding_requires_both_pending_conversations() {
 async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
-    if graph_aba == 10 {
+    if let Some(control) = std::env::var_os("PI_TEST_WOKEN_OWNED_CONTROL") {
+        let control = std::path::PathBuf::from(control);
+        std::fs::write(
+            control.join("fixture-path.tmp"),
+            dir.path().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        std::fs::rename(
+            control.join("fixture-path.tmp"),
+            control.join("fixture-path"),
+        )
+        .unwrap();
+    }
+    if matches!(graph_aba, 10 | 18 | 20) {
         std::fs::write(dir.path().join("selected-mode"), b"yes").unwrap();
     }
     let mut child = Command::new(std::env::current_exe().unwrap())
@@ -8014,7 +8222,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     let path = dir.path().join("db");
     let (options, registry, extensions) = build_woken_any(&path);
     let mut harness = crate::runtime::Harness::open_paused(&path, options).unwrap();
-    if graph_aba == 10 {
+    if matches!(graph_aba, 10 | 18 | 20) {
         harness.set_extension_registry_for_test(extensions);
     }
     let conversation = harness
@@ -8053,6 +8261,28 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         .prepare_create(&edge)
         .unwrap();
     store.commit(&prepared.checks, &prepared.mutations).unwrap();
+    let additional_conversation = if matches!(graph_aba, 19 | 20) {
+        let child = harness
+            .create_conversation(Config {
+                model: "test".into(),
+                system_prompt: String::new(),
+                max_output_tokens: 100,
+            })
+            .unwrap();
+        let edge = crate::ownership_edge::Edge {
+            task: root.task.id(),
+            task_owner: root.task.owner().clone(),
+            child,
+            mode: crate::ownership_edge::Mode::Foreground,
+        };
+        let batch = crate::ownership_edge::EdgeStore::new(&store)
+            .prepare_create(&edge)
+            .unwrap();
+        store.commit(&batch.checks, &batch.mutations).unwrap();
+        Some(child)
+    } else {
+        None
+    };
     #[cfg(feature = "experimental-graph-revision")]
     if let Some(checks) = ordinary_checks {
         assert!(matches!(
@@ -8060,7 +8290,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             Err(durable_store::Error::Conflict { .. })
         ));
     }
-    let unsafe_owned = if graph_aba == 7 || graph_aba == 8 {
+    let unsafe_owned = if matches!(graph_aba, 7 | 8 | 21) {
         let task = crate::task::Task::new(
             uuid::Uuid::new_v4(),
             crate::task::TaskOwner::Conversation(conversation),
@@ -8072,7 +8302,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         )
         .unwrap()
         .registered(
-            if graph_aba == 7 {
+            if matches!(graph_aba, 7 | 21) {
                 "unverified-owned-child"
             } else {
                 "owned-abort-child"
@@ -8215,10 +8445,12 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             .unwrap(),
         root
     );
+    let mut expected_conversations = vec![conversation];
+    expected_conversations.extend(additional_conversation);
     harness
-        .authenticated_scoped_woken_abort_graph(&root, &registry, &[conversation])
+        .authenticated_scoped_woken_abort_graph(&root, &registry, &expected_conversations)
         .unwrap();
-    if let Some(id) = unsafe_owned.filter(|_| graph_aba == 7) {
+    if let Some(id) = unsafe_owned.filter(|_| matches!(graph_aba, 7 | 21)) {
         let tasks = crate::task_store::TaskStore::new(&store);
         let task = tasks.load(id).unwrap().unwrap();
         assert!(task.task.abort_requested());
@@ -8553,8 +8785,20 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         serde_json::from_slice(&evidence_entry.value).unwrap();
     assert_eq!(evidence.root, root.task.id());
     assert_eq!(Some(evidence.interrupted_attempt), root.task.attempt_id());
-    assert_eq!(evidence.edges.len(), 1);
-    assert_eq!(evidence.edges[0].edge.child, conversation);
+    assert_eq!(
+        evidence.edges.len(),
+        if additional_conversation.is_some() {
+            2
+        } else {
+            1
+        }
+    );
+    assert!(
+        evidence
+            .edges
+            .iter()
+            .any(|edge| edge.edge.child == conversation)
+    );
     let graph_commit = store
         .commit_for_version(&evidence_key, evidence_entry.version)
         .unwrap()
@@ -8627,6 +8871,13 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         return;
     }
     cleanup.unwrap();
+    if let Some(additional) = additional_conversation {
+        harness
+            .drive_owned_cleanup_fenced(additional, &pi_rs_core::CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!harness.conversation(additional).unwrap().abort_requested);
+    }
     assert!(!harness.conversation(conversation).unwrap().abort_requested);
     assert!(
         store
@@ -8663,12 +8914,32 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         .unwrap();
     assert!(start_commit < receipt_commit);
     #[cfg(feature = "experimental-graph-revision")]
-    if graph_aba == 7 {
+    if matches!(graph_aba, 7 | 21) {
         assert!(
             harness
                 .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
                 .is_err()
         );
+        if graph_aba == 21 {
+            let id = root.task.id();
+            drop(store);
+            drop(harness);
+            let (scheduler, driver) = start_woken_any_scheduler(&path);
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !driver.get(id).unwrap().unwrap().is_terminal() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!dir.path().join("parent-cancel").exists());
+            assert!(matches!(
+                driver.get(id).unwrap().unwrap().state(),
+                TaskState::Failed(_)
+            ));
+            assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+            scheduler.shutdown().await.unwrap();
+        }
         return;
     }
     #[cfg(not(feature = "experimental-graph-revision"))]
@@ -8720,10 +8991,113 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         tasks
             .save(&[crate::task_store::Save::Create(&unrelated_task)])
             .unwrap();
+        if graph_aba == 22 {
+            // Simulate a store opened after its commit-history migration: older
+            // writes have no complete commit provenance, even if live rows exist.
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            raw.execute("UPDATE durable_commit_meta SET legacy_version = (SELECT version FROM durable_store_meta WHERE id=1) WHERE id=1", []).unwrap();
+            drop(raw);
+            assert!(
+                matches!(harness.replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap()),
+                Err(crate::runtime::Error::Invalid(reason)) if reason == "legacy owned graph requires reconciliation")
+            );
+            let id = root.task.id();
+            drop(store);
+            drop(harness);
+            let (scheduler, driver) = start_woken_any_scheduler(&path);
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !driver.get(id).unwrap().unwrap().is_terminal() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!dir.path().join("parent-cancel").exists());
+            assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+            scheduler.shutdown().await.unwrap();
+            return;
+        }
         let checks = harness
             .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
             .unwrap();
         store.commit(&checks, &[]).unwrap();
+        if matches!(graph_aba, 17 | 18 | 19 | 20) {
+            let root_id = root.task.id();
+            drop(store);
+            drop(harness);
+            let (options, registry, extensions) = build_woken_any(&path);
+            let mut scheduler =
+                Scheduler::open_with_extensions(&path, options, extensions).unwrap();
+            let selection_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if matches!(graph_aba, 18 | 20) {
+                let worker = scheduler.subagent_harness().worker();
+                let observed = selection_observed.clone();
+                crate::task_scheduler::on_conversation_start_result(root_id, move || {
+                    assert!(matches!(
+                        worker.uninstall_extension("policy"),
+                        Err(crate::runtime::Error::TaskPublicationBusy)
+                    ));
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+            let driver = scheduler.start_tasks(registry).unwrap();
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if driver.get(root_id).unwrap().unwrap().is_terminal() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let final_task = driver.get(root_id).unwrap().unwrap();
+            assert!(
+                matches!(final_task.state(), TaskState::Failed(reason) if reason.contains("reconciliation")),
+                "{final_task:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("parent-cancel"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            let receipt_key = crate::task_scheduler::woken_conversation_receipt_key(root_id);
+            let store = durable_store::Store::open(&path).unwrap();
+            let receipt: crate::task_scheduler::WokenConversationCancelReceipt =
+                serde_json::from_slice(&store.get(&receipt_key).unwrap().unwrap().value).unwrap();
+            assert_eq!(receipt.result, "callback returned");
+            assert_eq!(receipt.version, if graph_aba == 18 { 2 } else { 1 });
+            if matches!(graph_aba, 18 | 20) {
+                assert!(selection_observed.load(std::sync::atomic::Ordering::SeqCst));
+                let crate::task::TaskOwner::Conversation(owner) = final_task.owner() else {
+                    panic!("missing conversation");
+                };
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if scheduler.conversation(*owner).unwrap().messages.iter().any(|m| matches!(m, Message::Tool { content, .. } if content.contains("after cancel"))) { break; }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.unwrap();
+            }
+            drop(store);
+            assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+            scheduler.shutdown().await.unwrap();
+            let (scheduler, driver) = start_woken_any_scheduler(&path);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert!(driver.get(root_id).unwrap().unwrap().is_terminal());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("parent-cancel"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
+            scheduler.shutdown().await.unwrap();
+            return;
+        }
         if graph_aba == 14 {
             let evidence_key = crate::runtime::woken_owned_graph_key(root.task.id());
             let edge_key = crate::ownership_edge::edge_key(conversation);
