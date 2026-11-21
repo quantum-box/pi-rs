@@ -5617,7 +5617,6 @@ impl AdmissionHandle<'_> {
                 mutations.extend(task_finish.mutations);
             }
         }
-        #[cfg(test)]
         let receipt_commit = memo.is_none();
         let memo_result = if let Some((memo_key, value)) = memo {
             let key =
