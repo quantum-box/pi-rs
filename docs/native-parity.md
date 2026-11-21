@@ -1152,6 +1152,18 @@ clamps them to at least one and uses Pi's numeric comparison and notices.
 
 ### Model-selection checkpoint
 
+Native hosts can build a `ModelCatalog` from explicitly authorized provider,
+endpoint, protocol and model definitions through `ModelClientFactory::catalog`.
+Optional metadata describes entries. A missing credential or invalid entry
+fails the catalog as a unit. SDK hosts that want Pi-style fallback can pass an
+authorized default to `ModelCatalog::session_builder_with_fallback`. It
+restores an exact authorized historical model first and reports a missing
+provider-qualified model through `AgentSession::model_fallback` when it
+commits the supplied default. The host chooses the default and may keep
+using the exact-only builder. Automatic provider discovery, credential
+refresh, and selection for provider-less legacy history remain host-owned.
+
+
 Native SDK hosts can construct OpenAI-compatible chat, OpenAI Responses,
 ChatGPT Responses, Anthropic Messages and Gemini clients from an explicitly supplied credential snapshot,
 provider identity and endpoint, then register them in a host-owned model catalog.
