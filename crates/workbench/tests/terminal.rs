@@ -81,6 +81,20 @@ impl Drop for BoundedProcess {
     }
 }
 
+fn settings_row_shows(text: &str, label: &str, value: &str) -> bool {
+    static COLORS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let colors = COLORS.get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap());
+    let text = colors.replace_all(text, "");
+    text.match_indices(label).any(|(index, _)| {
+        let tail = &text[index + label.len()..];
+        tail.starts_with(' ')
+            && tail
+                .trim_start_matches(' ')
+                .strip_prefix(value)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\x1b']))
+    })
+}
+
 fn output_until(master: &mut File, predicate: impl Fn(&str) -> bool) {
     output_until_with_timeout(master, Duration::from_secs(10), predicate);
 }
@@ -169,6 +183,65 @@ fn typing_redraws_in_a_synchronized_frame() {
             })
         });
     }
+}
+
+#[test]
+fn terminal_appearance_notifications_follow_the_saved_theme_selection() {
+    let root = tempfile::tempdir().unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .env("TERM", "xterm-256color")
+            .args(["--offline", "--no-trust", "--no-mcp", "--use-theme", "dark"])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| {
+        assert!(!text.contains("\x1b[?2031h"));
+        assert!(!text.contains("\x1b[?996n"));
+        text.contains("\x1b]11;?\x07") && text.contains("Enter to send")
+    });
+    master.write_all(b"\x1b[?1;2c/theme light/dark\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("\x1b[?2031h\x1b[?996n") && text.contains("\x1b]11;?\x07")
+    });
+    master.write_all(b"/theme light\r").unwrap();
+    output_until(&mut master, |text| text.contains("\x1b[?2031l"));
+    master.write_all(b"/theme system\r").unwrap();
+    output_until(&mut master, |text| text.contains("\x1b[?2031h\x1b[?996n"));
+    master.write_all(b"/quit\r").unwrap();
+    output_until(&mut master, |text| text.contains("\x1b[?2031l"));
 }
 
 #[test]
@@ -428,19 +501,19 @@ fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
         master.write_all(b"/settings\r").unwrap();
         output_until(&mut master, |text| text.contains("HTTP idle timeout"));
         master.write_all(query.as_bytes()).unwrap();
-        output_until(&mut master, |text| text.contains(&format!("{label} · on")));
+        output_until(&mut master, |text| settings_row_shows(text, label, "on"));
         master.write_all(b"\r").unwrap();
-        output_until(&mut master, |text| text.contains(&format!("{label} · off")));
+        output_until(&mut master, |text| settings_row_shows(text, label, "off"));
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
         assert_eq!(saved[key]["enabled"], false);
         master.write_all(b"\r").unwrap();
-        output_until(&mut master, |text| text.contains(&format!("{label} · on")));
+        output_until(&mut master, |text| settings_row_shows(text, label, "on"));
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
         assert_eq!(saved[key]["enabled"], true);
         master.write_all(b"\r").unwrap();
-        output_until(&mut master, |text| text.contains(&format!("{label} · off")));
+        output_until(&mut master, |text| settings_row_shows(text, label, "off"));
         master.write_all(b"\x1b").unwrap();
         output_until(&mut master, |text| text.contains("Enter to send"));
     }
@@ -557,7 +630,7 @@ fn delayed_color_reply_does_not_type_tail_or_open_editor() {
 }
 
 #[test]
-fn debug_command_writes_session_snapshot() {
+fn debug_command_and_global_shortcut_write_session_snapshots() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let mut master_fd = -1;
@@ -602,10 +675,22 @@ fn debug_command_writes_session_snapshot() {
     output_until(&mut master, |text| text.contains("Enter to send"));
     master.write_all(b"/debug\r").unwrap();
     output_until(&mut master, |text| text.contains("Debug log written"));
-    let output = std::fs::read_to_string(home.join("pi-debug.log")).unwrap();
+    let path = home.join("pi-debug.log");
+    let output = std::fs::read_to_string(&path).unwrap();
     assert!(output.contains("Terminal: 110x32"));
     assert!(output.contains("=== All rendered lines with visible widths ==="));
     assert!(output.contains("=== Agent messages (JSONL) ==="));
+    std::fs::remove_file(&path).unwrap();
+    master.write_all(b"/settings\r").unwrap();
+    output_until(&mut master, |text| text.contains("Settings"));
+    // Kitty CSI-u for Shift+Ctrl+D, delivered while the settings picker has focus.
+    master.write_all(b"\x1b[100;6u").unwrap();
+    output_until(&mut master, |_| {
+        std::fs::read_to_string(&path)
+            .is_ok_and(|snapshot| snapshot.contains("=== Agent messages (JSONL) ==="))
+    });
+    master.write_all(b"\x1b").unwrap();
+    output_until(&mut master, |text| text.contains("Enter to send"));
 }
 
 #[test]
@@ -929,14 +1014,14 @@ fn autocomplete_settings_cycle_starts_at_first_preset_for_custom_value() {
     output_until(&mut master, |text| text.contains("HTTP idle timeout"));
     master.write_all(b"Autocomplete max items\r").unwrap();
     output_until(&mut master, |text| {
-        text.contains("Autocomplete max items · 3")
+        settings_row_shows(text, "Autocomplete max items", "3")
     });
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
     assert_eq!(saved["autocompleteMaxVisible"], 3);
     master.write_all(b"\r\r").unwrap();
     output_until(&mut master, |text| {
-        text.contains("Autocomplete max items · 7")
+        settings_row_shows(text, "Autocomplete max items", "7")
     });
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
@@ -1088,9 +1173,13 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
             text.contains("HTTP idle timeout") && text.contains("30 sec")
         });
         master.write_all(b"\x1b[B\r").unwrap();
-        output_until(&mut master, |text| text.contains("Steering mode · all"));
+        output_until(&mut master, |text| {
+            settings_row_shows(text, "Steering mode", "all")
+        });
         master.write_all(b"\x1b[B\r").unwrap();
-        output_until(&mut master, |text| text.contains("Follow-up mode · all"));
+        output_until(&mut master, |text| {
+            settings_row_shows(text, "Follow-up mode", "all")
+        });
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok(session) = pi_rs::Session::snapshot(&session_path)
@@ -1112,11 +1201,11 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
             "regular"
         };
         output_until(&mut master, |text| {
-            text.contains(&format!("TUI mode · {changed}"))
+            settings_row_shows(text, "TUI mode", changed)
         });
         master.write_all(b"\r").unwrap();
         output_until(&mut master, |text| {
-            text.contains(&format!("TUI mode · {mode}"))
+            settings_row_shows(text, "TUI mode", mode)
         });
         master
             .write_all(b"\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f")
@@ -1834,7 +1923,7 @@ fn settings_switches_terminal_modes_and_restores_input() {
             ("\u{1b}[?1049l", "regular")
         };
         output_until(&mut master, |text| {
-            text.contains(control) && text.contains(&format!("TUI mode · {changed}"))
+            text.contains(control) && settings_row_shows(text, "TUI mode", changed)
         });
         master.write_all(b"\r").unwrap();
         let control = if initial == "regular" {
@@ -1843,7 +1932,7 @@ fn settings_switches_terminal_modes_and_restores_input() {
             "\u{1b}[?1049h"
         };
         output_until(&mut master, |text| {
-            text.contains(control) && text.contains(&format!("TUI mode · {initial}"))
+            text.contains(control) && settings_row_shows(text, "TUI mode", initial)
         });
         let settings: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
@@ -1885,7 +1974,7 @@ fn settings_switches_terminal_modes_and_restores_input() {
                     .map(str::to_owned)
                     .unwrap_or_else(|| expected.to_string());
                 output_until(&mut master, |text| {
-                    text.contains(&format!("{label} · {displayed}"))
+                    settings_row_shows(text, label, &displayed)
                 });
                 let settings: serde_json::Value = serde_json::from_slice(
                     &std::fs::read(root.path().join("home/settings.json")).unwrap(),
@@ -1975,7 +2064,7 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
     assert_eq!(read_theme(), "dark");
     master.write_all(b"\x03").unwrap();
     output_until(&mut master, |text| {
-        text.contains("Theme · dark") && text.contains("to change")
+        settings_row_shows(text, "Theme", "dark") && text.contains("to change")
     });
     assert_eq!(read_theme(), "dark");
     master.write_all(b"\r").unwrap();
@@ -1984,7 +2073,7 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
     });
     master.write_all(b"light\r").unwrap();
     output_until(&mut master, |text| {
-        text.contains("Theme · light") && text.contains("to change")
+        settings_row_shows(text, "Theme", "light") && text.contains("to change")
     });
     assert_eq!(read_theme(), "light");
     master.write_all(b"\r").unwrap();
@@ -2009,7 +2098,7 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
     output_until(&mut master, |text| text.contains("Dark theme · dark"));
     master.write_all(b"\x1b[B\x1b[B\r").unwrap();
     output_until(&mut master, |text| {
-        text.contains("Theme · system/dark") && text.contains("to change")
+        settings_row_shows(text, "Theme", "system/dark") && text.contains("to change")
     });
     assert_eq!(read_theme(), "system/dark");
 }

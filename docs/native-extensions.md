@@ -83,6 +83,16 @@ errors remain failures because their origin is unknown. The standard extension
 server advertises the capability and propagates typed errors from extensions it
 hosts, including executable extensions.
 
+## Observe extension UI prompts
+
+Opt in with `handles_lifecycle` and `handles_ui_prompt_lifecycle` to observe
+`ui_prompt_start` and `ui_prompt_end` while tools wait on a native interactive
+or SDK host. The payload has a prompt kind and optional opening title.
+Simultaneous prompts within one tool turn share the same pair of events.
+Cancellation ends the prompt even if the response is discarded. The UI
+does not wait for extension observers to finish. Notifications, status, and
+editor reads do not produce these events.
+
 ## Write another extension
 
 Add the extension crate to the host's Cargo dependencies, implement

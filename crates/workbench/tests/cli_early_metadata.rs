@@ -41,6 +41,29 @@ fn parse_errors_take_precedence_over_metadata_in_either_order() {
 }
 
 #[test]
+fn rpc_rejects_file_arguments_before_startup() {
+    for args in [
+        &["--mode", "rpc", "@missing.txt"][..],
+        &["--mode", "rpc", "--", "@"][..],
+        &[
+            "--mode",
+            "rpc",
+            "--provider",
+            "unknown-fixture",
+            "@missing.txt",
+        ][..],
+    ] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        assert_eq!(
+            output.stderr, b"Error: @file arguments are not supported in RPC mode\n",
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
 fn export_runs_before_help_but_version_runs_before_export() {
     let export = run(&["--export", "missing-session.jsonl", "--help"]);
     assert!(!export.status.success(), "{export:?}");

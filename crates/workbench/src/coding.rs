@@ -2278,7 +2278,10 @@ impl Tool for CodingTool {
                 Outcome::Failed(message)
             }
             Err(Error::Config(message))
-                if self.unrestricted && matches!(self.kind, Kind::Grep | Kind::List) =>
+                if self.unrestricted
+                    && (matches!(self.kind, Kind::Grep | Kind::List)
+                        || (matches!(self.kind, Kind::Find)
+                            && message.starts_with("[fd error]: "))) =>
             {
                 Outcome::Failed(message)
             }
@@ -3065,11 +3068,26 @@ impl CodingTool {
         } else {
             None
         };
-        let base = self.path(args["path"].as_str().unwrap_or("."))?;
+        let requested_path = args["path"].as_str().unwrap_or(".");
+        let base = if is_find && self.unrestricted {
+            let requested = crate::coding_paths::resolve(
+                &self.root,
+                &crate::coding_paths::normalize(requested_path)?,
+            );
+            requested
+                .canonicalize()
+                .ok()
+                .filter(|path| path.is_dir())
+                .ok_or_else(|| Error::Config(format!(
+                    "[fd error]: Search path {requested:?} is not a directory.\n[fd error]: No valid search paths given."
+                )))?
+        } else {
+            self.path(requested_path)?
+        };
         // Keep the requested name for a single-file grep, even when path()
         // resolves a symlink to enforce workspace boundaries.
         let grep_file_name = if !is_find && base.is_file() {
-            let input = crate::coding_paths::normalize(args["path"].as_str().unwrap_or("."))?;
+            let input = crate::coding_paths::normalize(requested_path)?;
             crate::coding_paths::resolve(&self.root, &input)
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -3103,7 +3121,13 @@ impl CodingTool {
                     .case_insensitive(!pattern.chars().any(char::is_uppercase))
                     .literal_separator(true)
                     .build()
-                    .map_err(|error| Error::Config(error.to_string()))?
+                    .map_err(|error| {
+                        Error::Config(if self.unrestricted {
+                            format!("[fd error]: {error}")
+                        } else {
+                            error.to_string()
+                        })
+                    })?
                     .compile_matcher(),
             )
         } else {
@@ -6665,6 +6689,57 @@ mod tests {
         assert_eq!(body.len(), MAX_OUTPUT_BYTES);
         assert_eq!(body.lines().collect::<Vec<_>>(), names[..256]);
         assert_eq!(notice, "[50.0KB limit reached]");
+    }
+
+    #[tokio::test]
+    async fn unrestricted_find_reports_fd_path_and_glob_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), "").unwrap();
+        let tool = CodingTool {
+            root: root.clone(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Find,
+        };
+        for (path, pattern, expected) in [
+            (
+                "missing",
+                "[abc",
+                format!(
+                    "[fd error]: Search path {:?} is not a directory.\n[fd error]: No valid search paths given.",
+                    root.join("missing")
+                ),
+            ),
+            (
+                "file.txt",
+                "*",
+                format!(
+                    "[fd error]: Search path {:?} is not a directory.\n[fd error]: No valid search paths given.",
+                    root.join("file.txt")
+                ),
+            ),
+            (
+                ".",
+                "[abc",
+                "[fd error]: error parsing glob '[abc': unclosed character class; missing ']'"
+                    .into(),
+            ),
+        ] {
+            let outcome = tool
+                .invoke(
+                    json!({"pattern": pattern, "path": path}),
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(&outcome, Outcome::Failed(message) if *message == expected),
+                "{outcome:?}"
+            );
+        }
     }
 
     #[test]
