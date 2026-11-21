@@ -151,8 +151,11 @@ pub(crate) fn recover_agent_before_settle(
                 let marker = record.id;
                 let plan: BoundaryPlan = serde_json::from_value(entry.clone())?;
                 persist_plan_suffix(session, marker, &plan, observer)?;
+                if session.ensure_settled().is_ok() {
+                    crate::agent::apply_settled_after_turn(session, observer)?;
+                }
                 return Ok(Some(
-                    if plan.should_continue
+                    if continuation_is_runnable(session, plan.should_continue, observer)
                         || (!matches!(plan.settled, BoundaryResult::Cancelled)
                             && has_activity_queue(session))
                     {
@@ -384,6 +387,25 @@ fn context(session: &Session) -> BoundaryContext {
     }
 }
 
+pub(crate) fn continuation_is_runnable(
+    session: &Session,
+    requested: bool,
+    observer: &mut Observer<'_>,
+) -> bool {
+    if !requested {
+        return false;
+    }
+    if context(session).can_continue {
+        return true;
+    }
+    report(
+        "<boundary>",
+        "continuation requires runnable model context",
+        observer,
+    );
+    false
+}
+
 fn append_draft(session: &mut Session, draft: &BoundaryDraft) -> Result<()> {
     match draft {
         BoundaryDraft::Custom { entry } => session.append_custom_entry(entry.clone()),
@@ -479,6 +501,14 @@ pub(crate) async fn dispatch_agent_before_settle(
         if cancel.is_cancelled() {
             break;
         }
+        if crate::runtime::time::Instant::now() >= deadline {
+            report(
+                extension.id(),
+                "boundary handler deadline expired",
+                observer,
+            );
+            break;
+        }
         let callback = std::panic::AssertUnwindSafe(async {
             extension
                 .agent_before_settle(&event, states.get(extension.id()))
@@ -517,14 +547,7 @@ pub(crate) async fn dispatch_agent_before_settle(
         return Ok(false);
     }
     let cancelled = cancel.is_cancelled();
-    let should_continue = !cancelled && event.should_continue && event.context.can_continue;
-    if event.should_continue && !cancelled && !event.context.can_continue {
-        report(
-            "<boundary>",
-            "continuation requires runnable model context",
-            observer,
-        );
-    }
+    let should_continue = !cancelled && event.should_continue;
     let plan = BoundaryPlan {
         entries: event.entries,
         should_continue,
@@ -986,6 +1009,109 @@ mod tests {
         );
         session.checkout(completed_plan).unwrap();
         assert_eq!(session.pending_extension_boundary_run(), None);
+    }
+
+    #[tokio::test]
+    async fn deferred_message_arriving_during_settlement_makes_continuation_runnable() {
+        struct LateMessage(tokio::sync::mpsc::Sender<crate::AgentInput>);
+
+        #[async_trait::async_trait]
+        impl Extension for LateMessage {
+            fn id(&self) -> &str {
+                "late-message"
+            }
+
+            fn handles_agent_before_settle(&self) -> bool {
+                true
+            }
+
+            async fn agent_before_settle(
+                &self,
+                event: &AgentBeforeSettle,
+                _: Option<&crate::ExtensionState>,
+            ) -> ExtensionResult<BoundaryDecision> {
+                if !matches!(event.context.context_messages.last(),
+                    Some(entry) if matches!(&entry.message,
+                        Message::Assistant { content, .. } if content == "first response"))
+                {
+                    return Ok(BoundaryDecision::default());
+                };
+                assert!(!event.context.can_continue);
+                let (reply, _) = tokio::sync::oneshot::channel();
+                self.0
+                    .send(crate::AgentInput::EnqueueCustom {
+                        message: crate::QueuedCustomMessage {
+                            id: uuid::Uuid::new_v4(),
+                            delivery: CustomMessageDelivery::AfterTurn,
+                            message: CustomMessage {
+                                custom_type: "late".into(),
+                                content: ContextContent::Text("continue here".into()),
+                                display: false,
+                                details: None,
+                            },
+                        },
+                        reply,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(BoundaryDecision {
+                    entries: None,
+                    should_continue: Some(true),
+                })
+            }
+        }
+
+        let (sender, mut queue) = tokio::sync::mpsc::channel(1);
+        let mut registry = Registry::default();
+        registry.register(Arc::new(LateMessage(sender))).unwrap();
+        let model = CaptureModel::default();
+        let agent = crate::Agent {
+            model: &model,
+            registry: &registry,
+            model_name: "fixture",
+            system_prompt: "help",
+            limits: Default::default(),
+        };
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let run = uuid::Uuid::new_v4();
+        let cancel = crate::CancellationToken::new();
+        assert_eq!(
+            agent
+                .run_correlated(
+                    &mut session,
+                    run,
+                    Some("review".into()),
+                    &mut queue,
+                    &cancel,
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "second response"
+        );
+        let queued = session.records().iter().find(|record| matches!(
+            &record.event, Event::CustomMessageQueued { input } if input.message.custom_type == "late"
+        )).unwrap().id;
+        let records = session.records()[..queued as usize].to_vec();
+        let metadata = records
+            .iter()
+            .filter_map(|record| {
+                session
+                    .record_metadata(record.id)
+                    .cloned()
+                    .map(|value| (record.id, value))
+            })
+            .collect();
+        let mut restored = Session::from_records_with_metadata(records, metadata).unwrap();
+        model.0.lock().unwrap().clear();
+        assert_eq!(
+            agent
+                .run_correlated(&mut restored, run, None, &mut queue, &cancel, &mut |_| {})
+                .await
+                .unwrap(),
+            "second response"
+        );
+        assert_eq!(model.0.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

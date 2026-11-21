@@ -780,8 +780,8 @@ impl Agent<'_> {
         observer: &mut Observer<'_>,
     ) -> Result<String> {
         use crate::extension_boundary::{
-            RecoveredBoundary, activity_marker, dispatch_agent_before_settle, has_activity_queue,
-            recover_agent_before_settle,
+            RecoveredBoundary, activity_marker, continuation_is_runnable,
+            dispatch_agent_before_settle, has_activity_queue, recover_agent_before_settle,
         };
 
         let recovered = if session.pending_extension_boundary_run() == Some(run_id) {
@@ -953,10 +953,8 @@ impl Agent<'_> {
                 queue_inputs(session, followups, observer)?;
                 apply_settled_after_turn(session, observer)?;
                 let queued = has_activity_queue(session);
-                let should_continue = if cancel.is_cancelled() {
+                let should_continue = if cancel.is_cancelled() || queued {
                     false
-                } else if queued {
-                    true
                 } else {
                     dispatch_agent_before_settle(
                         self.registry,
@@ -969,9 +967,12 @@ impl Agent<'_> {
                     .await?
                 };
                 queue_inputs(session, followups, observer)?;
+                apply_settled_after_turn(session, observer)?;
                 if cancel.is_cancelled() {
                     result = Err(Error::Cancelled);
-                } else if should_continue || has_activity_queue(session) {
+                } else if has_activity_queue(session)
+                    || continuation_is_runnable(session, should_continue, observer)
+                {
                     force_request = true;
                     start_new_activity = true;
                     in_process_continuation = true;
@@ -7384,7 +7385,10 @@ pub(crate) fn queue_custom_message(
     Ok(())
 }
 
-fn apply_settled_after_turn(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
+pub(crate) fn apply_settled_after_turn(
+    session: &mut Session,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
     for (queued_at, input) in session.queued_custom_messages() {
         let origin = session.records()[(queued_at - 1) as usize].run_id;
         if input.delivery == crate::CustomMessageDelivery::AfterTurn
