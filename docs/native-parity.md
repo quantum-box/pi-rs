@@ -1492,6 +1492,9 @@ In interactive mode, foreground, background and complete palettes are collected
 per query. A 100 ms timeout applies the partial snapshot; a later DA1 or the
 final color response applies the cumulative snapshot once, matching Pi's color
 aggregation while retaining the serialized DA1 safety policy described above.
+Explicit `/reload` requests fresh terminal colors for the active theme,
+including fixed themes. The same serialization and terminal handoff rules
+apply.
 Custom
 OKHSL and OKLCH colors accept Pi's case-insensitive syntax and hue units,
 validate component ranges, and gamut-map OKLCH colors.
