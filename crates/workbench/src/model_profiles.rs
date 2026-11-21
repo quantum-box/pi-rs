@@ -213,6 +213,7 @@ struct ModelCompatibility {
     supports_long_cache_retention: Option<bool>,
     supports_explicit_prompt_cache_mode: Option<bool>,
     supports_cache_control_on_tools: Option<bool>,
+    supports_eager_tool_input_streaming: Option<bool>,
     cache_control_format: Option<CacheControlFormat>,
 }
 
@@ -244,6 +245,9 @@ impl ModelCompatibility {
             supports_cache_control_on_tools: newer
                 .supports_cache_control_on_tools
                 .or(self.supports_cache_control_on_tools),
+            supports_eager_tool_input_streaming: newer
+                .supports_eager_tool_input_streaming
+                .or(self.supports_eager_tool_input_streaming),
             cache_control_format: newer.cache_control_format.or(self.cache_control_format),
         }
     }
@@ -1342,7 +1346,7 @@ impl Profiles {
         selected: &str,
         explicit_endpoint: Option<&str>,
     ) -> BTreeMap<String, bool> {
-        self.anthropic_route_capabilities(provider, selected, explicit_endpoint, |metadata| {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
             self.anthropic_strict_tool_support(provider, metadata)
         })
     }
@@ -1353,7 +1357,7 @@ impl Profiles {
         selected: &str,
         explicit_endpoint: Option<&str>,
     ) -> BTreeSet<String> {
-        self.anthropic_route_capabilities(provider, selected, explicit_endpoint, |metadata| {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
             self.chat_compatibility(provider, metadata)
                 .supports_mid_conversation_system_messages()
         })
@@ -1362,7 +1366,7 @@ impl Profiles {
         .collect()
     }
 
-    fn anthropic_route_capabilities(
+    fn anthropic_route_models(
         &self,
         provider: &Provider,
         selected: &str,
@@ -1397,6 +1401,24 @@ impl Profiles {
             capability(metadata.as_ref())
         });
         models
+    }
+
+    pub fn anthropic_eager_tool_input_policy(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> (bool, BTreeMap<String, bool>) {
+        let capability = |model: Option<&ModelMetadata>| {
+            self.cache_compatibility(provider, model)
+                .supports_eager_tool_input_streaming
+                .unwrap_or(true)
+        };
+        let default = capability(None);
+        let mut models =
+            self.anthropic_route_models(provider, selected, explicit_endpoint, capability);
+        models.retain(|_, supported| *supported != default);
+        (default, models)
     }
 
     pub fn messages_cache_support(
@@ -2233,6 +2255,23 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_tool_input_streaming_uses_the_selected_model_configuration() {
+        let profiles = Profiles::parse(&json!({"providers":{"fireworks":{"modelOverrides":{
+            "accounts/fireworks/models/deepseek-v4p1-flash":{"compat":{"supportsEagerToolInputStreaming":true}}
+        }}}})).unwrap();
+        let provider = profiles.provider("fireworks").unwrap();
+        let forced_eager = "accounts/fireworks/models/deepseek-v4p1-flash";
+        let (default, models) =
+            profiles.anthropic_eager_tool_input_policy(&provider, forced_eager, None);
+        assert!(default);
+        assert_eq!(models.get(forced_eager), None);
+        assert_eq!(
+            models.get("accounts/fireworks/models/gpt-oss-120b"),
+            Some(&false)
+        );
+    }
+
+    #[test]
     fn vercel_gateway_catalog_and_endpoint() {
         let profiles = Profiles::parse(&json!({})).unwrap();
         let provider = profiles.provider("vercel-ai-gateway").unwrap();
@@ -2296,7 +2335,23 @@ mod tests {
         assert_eq!(provider.adapter(), Adapter::OpenAiResponses);
         let endpoint = args.model_profiles.endpoint(&provider);
         assert_eq!(endpoint, "https://api.meta.ai/v1/responses");
-        assert_eq!(args.model_profiles.model_ids(&provider).len(), 6);
+        assert_eq!(args.model_profiles.model_ids(&provider).len(), 7);
+        let ember = args
+            .model_profiles
+            .model(&provider, "muse-ember-1.0")
+            .unwrap();
+        assert_eq!(ember.context_window, Some(1_048_576));
+        assert_eq!(ember.max_tokens, Some(524_288));
+        assert_eq!(ember.supports_images(), Some(true));
+        assert_eq!(ember.mapped_effort("max"), Some(Some("max")));
+        let mut metadata = json!({});
+        ember.apply_catalog_metadata(&mut metadata);
+        assert_eq!(metadata["cost"]["input"], 0.1);
+        assert_eq!(
+            metadata["cost"]["tiers"][0],
+            json!({"inputTokensAbove":200_000,"input":0.3,"output":1.5,
+                "cacheRead":0.012,"cacheWrite":0.0})
+        );
         let model = args
             .model_profiles
             .model(&provider, "muse-spark-1.3")
@@ -2457,6 +2512,17 @@ mod tests {
         );
         assert_eq!(profiles.model_ids(&provider).len(), 6);
         let model = profiles.model(&provider, "k3.1-pro").unwrap();
+        for (id, output) in [
+            ("k3", 1_048_576),
+            ("k3-256k", 262_144),
+            ("k3.1-pro", 1_048_576),
+            ("k3.1-pro-highspeed", 1_048_576),
+        ] {
+            assert_eq!(
+                profiles.model(&provider, id).unwrap().max_tokens,
+                Some(output)
+            );
+        }
         assert_eq!(
             model.levels(Adapter::ChatCompletions).unwrap(),
             ["low", "high", "max"]

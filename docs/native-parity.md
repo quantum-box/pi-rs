@@ -378,8 +378,9 @@ tool progress and completion-order notifications remain open.
 
 ### Meta Responses API-key checkpoint
 
-The `meta` provider includes Pi v1.5.0's six Muse models, including their
-thinking levels, image limits, token limits and prices. It uses the Responses
+The `meta` provider includes Pi 1.6.0's seven Muse models. Muse Ember supports
+images, reasoning through `max`, up to 524,288 output tokens and catalog
+pricing tiers above 200,000 input tokens. The provider uses the Responses
 adapter and `META_API_KEY` on the official endpoint. Saved and configured
 credentials retain precedence and remain bound to their endpoint. Existing
 Pi-compatible Meta subscription OAuth credentials can supply the inference key;
@@ -494,9 +495,11 @@ fragments.
 ### Kimi Code API key checkpoint
 
 The native `kimi-coding` provider uses Pi's coding endpoint, `KIMI_API_KEY`,
-and the six pinned Kimi chat models. Their image limits, prices, context windows,
-and per-model reasoning settings remain distinct; the high-speed coding model
-uses its DeepSeek-style thinking switch. Subscription OAuth supports device
+and the six Pi 1.6 Kimi chat models. K3, K3.1 Pro and K3.1 Pro HighSpeed
+advertise a 1,048,576-token output limit, and K3 256K advertises 262,144.
+Image limits, prices, context windows and reasoning settings remain
+model-specific. The high-speed coding model uses its DeepSeek-style thinking
+switch. Subscription OAuth supports device
 login, refresh, and Pi-compatible credential storage. Live Kimi acceptance
 remains open.
 
@@ -4137,8 +4140,10 @@ tool results, records measured usage including thought tokens, and preserves
 ordered signed response parts for the same model across tools and journal
 reopening. Gemini 2.5 and newer model families use their budget or level
 controls. Host-prefixed Gemini IDs use the same version checks for thinking,
-tool call IDs, and tool-result images as in current Pi. A response ending in
-`CONTINUATION` or `MAX_TOKENS` keeps its text, drops unfinished tool calls,
+tool call IDs, and tool-result images as in current Pi. The adapter folds
+nonempty system updates into `systemInstruction`. Consecutive tool results
+and their follow-up image turn on Gemini 2.5 stay together. A response ending
+in `CONTINUATION` or `MAX_TOKENS` keeps its text, drops unfinished tool calls,
 and ends with a length stop. The native adapter does not consume continuation
 tokens.
 
@@ -4428,9 +4433,10 @@ The pending representation is readable by pinned Pi v1.5.0 as a keyless
 API-key entry, so that version's locked OAuth resolver does not reuse the old
 refresh token. It does not protect tokens already copied into another process,
 non-cooperating writers, storage rollback, or a compromised auth lock. After
-a process crash leaves `auth.json.lock`, stop all Pi and pi-rs processes before
-removing that stale lock directory from the agent directory; then sign in to
-Radius again or explicitly log out. Never remove a lock held by a live process.
+a process crash leaves the auth lock, stop all Pi and pi-rs processes before
+removing the stale lock directory beside the resolved credential file. Then
+sign in to Radius again or explicitly log out. Never remove a lock held by a
+live process.
 If a caller cancels while a Radius refresh is queued at the refresh barrier,
 the exchange is discarded. Once admitted, it continues through credential
 persistence even if the caller is cancelled. Admission can precede the actual
@@ -5111,6 +5117,8 @@ checked with a five-minute floor, even when a shorter minimum was requested.
 The rotated credential is saved before that check. The default
 check output contains only status and metadata.
 
+As in Pi v1.6.0, a symbolic link to an auth file shares the target's lock.
+Credential updates keep the link and atomically replace the target file.
 pi-rs does not automatically remove stale `auth.json.lock` directories.
 After a worker admits a protected OAuth refresh, pi-rs retains its worker
 refresh barrier until the auth lock is released, including on errors. A worker
@@ -5207,6 +5215,13 @@ inherit the profile base URL or supply its own base URL. The CLI, terminal,
 RPC model selection and Codemode catalog use the model's effective API.
 A loopback session verified switching between Chat Completions and Messages,
 endpoint-bound keys and headers, and route-bound signed Messages replay.
+
+Anthropic Messages uses per-tool `eager_input_streaming` by default.
+Models with `compat.supportsEagerToolInputStreaming: false` use the legacy
+fine-grained streaming beta when tools are present. An explicit
+`anthropic-beta` header takes precedence over automatic beta selection.
+The native request fixtures and the published Pi runtime cover both forms.
+Live provider acceptance was unverified.
 
 ### Fireworks and OpenRouter Messages catalogs checkpoint
 
