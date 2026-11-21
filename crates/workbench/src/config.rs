@@ -682,21 +682,30 @@ pub fn validate_settings(value: &Value, path: &Path) -> Result<()> {
     });
     let mut normalized = value.clone();
     migrate_legacy_settings(&mut normalized);
-    if let Some(error) = SCHEMA.iter_errors(&normalized).next() {
-        return Err(Error::Config(format!(
-            "{}{}: {}",
-            path.display(),
-            error.instance_path,
-            error
-        )));
-    }
+    let mut errors: Vec<_> = SCHEMA
+        .iter_errors(&normalized)
+        .map(|error| (error.instance_path.to_string(), error.to_string()))
+        .collect();
     if let Some(timeout) = normalized.get("httpIdleTimeoutMs")
         && parse_http_idle_timeout(timeout).is_none()
+        && !errors
+            .iter()
+            .any(|(field, _)| field == "/httpIdleTimeoutMs")
     {
-        return Err(Error::Config(format!(
-            "{}/httpIdleTimeoutMs: invalid HTTP idle timeout",
-            path.display()
-        )));
+        errors.push((
+            "/httpIdleTimeoutMs".into(),
+            "invalid HTTP idle timeout".into(),
+        ));
+    }
+    if !errors.is_empty() {
+        errors.sort();
+        return Err(Error::Config(
+            errors
+                .into_iter()
+                .map(|(field, error)| format!("{}{field}: {error}", path.display()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
     }
     Ok(())
 }
@@ -1676,6 +1685,27 @@ mod tests {
         merge(&mut settings, json!({"defaultTools": []}));
         assert_eq!(settings["defaultTools"], json!(["write"]));
     }
+    #[test]
+    fn settings_validation_reports_all_invalid_fields_without_rewriting_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = r#"{"hideThinkingBlock":"yes","httpIdleTimeoutMs":"later","retry":{"enabled":"yes"},"extension":{"unknown":true}}"#;
+        std::fs::write(&path, original).unwrap();
+
+        let error = super::Settings::load_from_paths(dir.path(), false, &path)
+            .err()
+            .unwrap()
+            .to_string();
+        for field in ["/hideThinkingBlock", "/httpIdleTimeoutMs", "/retry/enabled"] {
+            assert!(
+                error.contains(&format!("{}{field}:", path.display())),
+                "{error}"
+            );
+        }
+        assert!(!error.contains("/extension"), "{error}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
     #[test]
     fn http_idle_timeout_has_pi_defaults_and_supports_disabling() {
         let mut settings = super::Settings::default();

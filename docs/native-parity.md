@@ -2194,6 +2194,9 @@ The local settings editor remains open when an outstanding model response
 finishes. Settings, theme and hotkey commands are handled before streaming
 input is queued. Tests cover schema diagnostics and dialog error layout.
 Remaining upstream settings and specialized selector behavior are still open.
+Unlike upstream's permissive settings loading, pi-rs validates implemented
+settings. When several values are invalid, the diagnostic reports each path
+at once, including invalid HTTP idle timeout strings, without changing the file.
 
 Like Pi, user and trusted-project `settings.json` files may start with a UTF-8
 BOM when loaded or updated. Malformed or unreadable user and trusted-project
