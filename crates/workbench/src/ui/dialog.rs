@@ -19,6 +19,8 @@ pub struct Dialog {
     selected: usize,
     scroll_max: Cell<usize>,
     error: Option<String>,
+    error_page: usize,
+    error_pages: Cell<usize>,
     external_error: Option<String>,
     masked: bool,
 }
@@ -57,6 +59,8 @@ impl Dialog {
             selected: 0,
             scroll_max: Cell::new(0),
             error: None,
+            error_page: 0,
+            error_pages: Cell::new(1),
             external_error: None,
             masked: false,
         }
@@ -84,6 +88,8 @@ impl Dialog {
     }
     pub fn set_error(&mut self, error: String) {
         self.error = Some(error);
+        self.error_page = 0;
+        self.error_pages.set(1);
     }
     pub fn external_editor_text(&self) -> &str {
         &self.editor.text
@@ -214,6 +220,20 @@ impl Dialog {
                 {
                     return Some(UiResponse::Text(self.editor.text.clone()));
                 }
+                if multiline && self.error_pages.get() > 1 && key.modifiers.is_empty() {
+                    let page = self.error_page.min(self.error_pages.get() - 1);
+                    match key.code {
+                        KeyCode::PageUp => {
+                            self.error_page = page.saturating_sub(1);
+                            return None;
+                        }
+                        KeyCode::PageDown => {
+                            self.error_page = (page + 1).min(self.error_pages.get() - 1);
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
                 let action = keys.action(key, self.editor.text.is_empty()).unwrap_or("");
                 if action == "tui.editor.cursorUp" {
                     self.editor.vertical(false);
@@ -258,7 +278,11 @@ impl Dialog {
             width,
         )
         .len()
-        .min(height.saturating_sub(2).clamp(1, 4))
+        .min(
+            height
+                .saturating_sub(2 + usize::from(self.external_error.is_some()))
+                .clamp(1, 4),
+        )
     }
     pub fn cursor(&self, width: usize, height: usize) -> Option<(usize, usize)> {
         if !matches!(
@@ -296,8 +320,21 @@ impl Dialog {
         ))
     }
     pub fn render(&self, theme: &Theme, width: usize, height: usize, keys: &Keys) -> Vec<Line> {
-        let mut lines = wrap(&[Span::themed(self.heading(), theme, "accent")], width);
-        lines.truncate(self.heading_height(width, height));
+        let heading = wrap(&[Span::themed(self.heading(), theme, "accent")], width);
+        let heading_height = self.heading_height(width, height);
+        let pages = if self.error.is_some() && matches!(self.request, UiRequest::Editor { .. }) {
+            heading.len().div_ceil(heading_height)
+        } else {
+            1
+        };
+        self.error_pages.set(pages);
+        let start = (self.error_page.min(pages - 1) * heading_height)
+            .min(heading.len().saturating_sub(heading_height));
+        let mut lines: Vec<_> = heading
+            .into_iter()
+            .skip(start)
+            .take(heading_height)
+            .collect();
         let available = height
             .saturating_sub(lines.len() + 1 + usize::from(self.external_error.is_some()))
             .max(1);
@@ -397,6 +434,12 @@ impl Dialog {
             _ => {}
         }
         let hint = match &self.request {
+            UiRequest::Editor { .. } if pages > 1 => Cow::Owned(format!(
+                "PgUp/PgDn ({}/{pages}) · Ctrl+S save · {} cancel · {} external editor",
+                self.error_page.min(pages - 1) + 1,
+                keys.hint("tui.select.cancel"),
+                keys.hint("app.editor.external")
+            )),
             UiRequest::Editor { .. } => Cow::Owned(format!(
                 "Ctrl+S save · {} external editor · {} cancel",
                 keys.hint("app.editor.external"),
@@ -645,6 +688,50 @@ mod tests {
         assert!(row >= 2 && row < lines.len());
         assert_eq!(column, 6);
         assert!(lines.len() <= 8);
+    }
+
+    #[test]
+    fn editor_pages_through_errors_without_changing_the_edit() {
+        let mut dialog = Dialog::new(
+            Uuid::new_v4(),
+            UiRequest::Editor {
+                title: "Edit setting".into(),
+                initial_value: Some("pending edit".into()),
+                timeout: None,
+            },
+        );
+        let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let keys = Keys::default();
+        let render = |dialog: &Dialog| {
+            dialog
+                .render(&theme, 60, 7, &keys)
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .into_iter()
+                        .map(|span| span.text)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        dialog.set_error("first\nsecond\nthird\nfourth\nfifth".into());
+        assert_eq!(render(&dialog)[0], "first");
+        let last = dialog.input(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &keys);
+        assert!(last.is_none());
+        let lines = render(&dialog);
+        assert!(lines.iter().any(|line| line == "fifth"));
+        assert!(lines.last().unwrap().contains("2/2"));
+        let (row, _) = dialog.cursor(60, 7).unwrap();
+        assert_eq!(lines[row], "pending edit");
+        dialog.input(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &keys);
+        assert_eq!(render(&dialog)[0], "first");
+        dialog.input(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &keys);
+        dialog.set_error("new error".into());
+        assert_eq!(render(&dialog)[0], "new error");
+        assert!(matches!(
+            dialog.input(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), &keys),
+            Some(UiResponse::Text(text)) if text == "pending edit"
+        ));
     }
 
     #[test]

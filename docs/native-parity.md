@@ -1938,17 +1938,18 @@ continues to skip binary files. Context still comes from the original file, as
 in Pi. Focused checks compare both linked and ordinary files, including context
 lines.
 
-Unrestricted `grep` applies path-containing glob overrides to the absolute
-search paths passed to ripgrep by Pi. Basename globs, negated globs, and
-explicit file arguments retain ripgrep's matching behavior. Directory results
-use Pi's slash-normalized relative paths and its basename fallback for paths
+Unrestricted `grep` anchors path-containing glob overrides at the selected
+search directory, including when that directory is a symlink. It removes
+leading `./` components, including after `!`, as current Pi does. Basename
+globs, negated globs, and explicit file arguments retain ripgrep's matching
+behavior. Directory results use Pi's slash-normalized relative paths and its basename fallback for paths
 starting with `..`; a single-file result retains the requested basename.
 The scoped native profile intentionally keeps its workspace-relative glob
 interpretation. On Unix, scoped `grep` preserves literal backslashes in file
 names so its results can be passed to `read`; unrestricted Pi-compatible grep
 normalizes them as Pi does. Both profiles normalize Windows path separators.
-Offline fixtures compare these cases with Pi's pinned ripgrep invocation and
-exercise `grep`-to-`read` for a Unix filename containing a backslash.
+Offline fixtures cover Pi's directory-rooted glob cases and exercise
+`grep`-to-`read` for a Unix filename containing a backslash.
 
 ### Published native package checkpoint
 
@@ -2204,6 +2205,12 @@ The local settings editor remains open when an outstanding model response
 finishes. Settings, theme and hotkey commands are handled before streaming
 input is queued. Tests cover schema diagnostics and dialog error layout.
 Remaining upstream settings and specialized selector behavior are still open.
+Unlike upstream's permissive settings loading, pi-rs validates implemented
+settings. When several values in a file are invalid, the diagnostic lists the
+settings file and affected JSON paths, including nested package fields and
+invalid HTTP idle timeout strings. It omits the rejected values and preserves
+the file. If the editor cannot fit the diagnostic, Page Up and Page Down show
+the other pages without discarding the edit.
 
 Like Pi, user and trusted-project `settings.json` files may start with a UTF-8
 BOM when loaded or updated. Malformed or unreadable user and trusted-project

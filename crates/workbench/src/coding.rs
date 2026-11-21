@@ -2127,7 +2127,22 @@ impl Tool for CodingTool {
             Kind::Grep => (
                 "grep",
                 "Search UTF-8 file contents. Respects ignore files and returns path, line number, and matching text.",
-                json!({"pattern":{"type":"string"},"path":path,"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer","minimum":0},"limit":if self.unrestricted { json!({"type":"number"}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
+                json!({
+                    "pattern": {"type": "string"},
+                    "path": path,
+                    "glob": {
+                        "type": "string",
+                        "description": if self.unrestricted {
+                            "Filter by glob relative to the search directory, e.g. 'src/**/*.ts'. A basename glob such as '*.ts' matches at any depth."
+                        } else {
+                            "Filter by glob relative to the workspace root."
+                        }
+                    },
+                    "ignoreCase": {"type": "boolean"},
+                    "literal": {"type": "boolean"},
+                    "context": {"type": "integer", "minimum": 0},
+                    "limit": if self.unrestricted { json!({"type":"number"}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }
+                }),
                 vec!["pattern"],
             ),
             Kind::Find => (
@@ -3130,19 +3145,30 @@ impl CodingTool {
                 // selected full paths afterwards.
                 .sort_by_file_path(std::path::Path::cmp);
         } else if let Some(glob) = args["glob"].as_str() {
-            // Pi invokes ripgrep with an absolute search path. Ripgrep builds
-            // command-line glob overrides against ".", so path-containing
-            // globs match that absolute path rather than a workspace-relative
-            // path. Basename globs and explicit file roots still work as usual.
-            // Scoped hosts retain their existing workspace-relative globs.
-            let glob_root = if self.unrestricted {
-                Path::new(".")
+            // Pi runs directory searches from the search directory and strips
+            // leading ./ components, including after a negation marker. File
+            // searches retain ripgrep's existing explicit-file behavior.
+            let glob_root = match (self.unrestricted, grep_file_name.is_some()) {
+                (false, _) => &self.root,
+                (true, true) => Path::new("."),
+                (true, false) => &base,
+            };
+            let glob = if self.unrestricted {
+                let (negation, pattern) = glob
+                    .strip_prefix('!')
+                    .map_or(("", glob), |pattern| ("!", pattern));
+                let pattern = pattern.trim_start_matches("./");
+                if negation.is_empty() {
+                    std::borrow::Cow::Borrowed(pattern)
+                } else {
+                    std::borrow::Cow::Owned(format!("{negation}{pattern}"))
+                }
             } else {
-                &self.root
+                std::borrow::Cow::Borrowed(glob)
             };
             let mut overrides = ignore::overrides::OverrideBuilder::new(glob_root);
             let overrides = overrides
-                .add(glob)
+                .add(&glob)
                 .and_then(|builder| builder.build())
                 .map_err(|error| Error::Config(error.to_string()))?;
             walker.overrides(overrides);
@@ -6937,7 +6963,7 @@ mod tests {
     }
 
     #[test]
-    fn grep_globs_match_pi_absolute_search_paths() {
+    fn grep_globs_follow_the_search_directory() {
         let root = tempfile::tempdir().unwrap();
         for file in [
             "project/src/main.rs",
@@ -6969,6 +6995,15 @@ mod tests {
                 vec!["src/main.rs:1: needle", "src/nested/sub.rs:1: needle"],
             ),
             ("!**/src/**", vec!["other/no.rs:1: needle"]),
+            (
+                "src/**",
+                vec!["src/main.rs:1: needle", "src/nested/sub.rs:1: needle"],
+            ),
+            (
+                "././src/**",
+                vec!["src/main.rs:1: needle", "src/nested/sub.rs:1: needle"],
+            ),
+            ("!./src/**", vec!["other/no.rs:1: needle"]),
             (
                 "*.rs",
                 vec![
@@ -7004,6 +7039,76 @@ mod tests {
                 .tool_content(),
                 "main.rs:1: needle"
             );
+        }
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        let output = scoped
+            .search(
+                &json!({"pattern":"needle","path":"project","glob":"project/src/**"}),
+                &pi_rs::CancellationToken::new(),
+            )
+            .unwrap()
+            .tool_content();
+        let mut actual: Vec<_> = output.lines().collect();
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            ["src/main.rs:1: needle", "src/nested/sub.rs:1: needle"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_globs_follow_symlinked_search_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        for name in ["migrations/main/a.js", "nested/migrations/main/b.js"] {
+            let path = repo.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "hello\n").unwrap();
+        }
+        std::os::unix::fs::symlink(&repo, root.path().join("repo-link")).unwrap();
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Grep,
+        };
+        for path in ["repo", "repo-link"] {
+            for (glob, expected) in [
+                (
+                    "migrations/main/*.js",
+                    vec!["migrations/main/a.js:1: hello"],
+                ),
+                (
+                    "./migrations/main/*.js",
+                    vec!["migrations/main/a.js:1: hello"],
+                ),
+                (
+                    "**/migrations/main/*.js",
+                    vec![
+                        "migrations/main/a.js:1: hello",
+                        "nested/migrations/main/b.js:1: hello",
+                    ],
+                ),
+                (
+                    "!./migrations/**",
+                    vec!["nested/migrations/main/b.js:1: hello"],
+                ),
+            ] {
+                let output = tool
+                    .search(
+                        &json!({"pattern":"hello", "path":path, "glob":glob}),
+                        &pi_rs::CancellationToken::new(),
+                    )
+                    .unwrap()
+                    .tool_content();
+                let mut actual: Vec<_> = output.lines().collect();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "path={path}, glob={glob}");
+            }
         }
     }
 
