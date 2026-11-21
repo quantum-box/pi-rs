@@ -231,10 +231,7 @@ impl Keys {
                     || anthropic)
                     && entry["type"] == "oauth";
                 let key = if chatgpt {
-                    serde_json::from_value::<pi_rs::openai::oauth::Credential>(
-                        entry["credential"].clone(),
-                    )
-                    .ok()?;
+                    super::chatgpt_auth::decode_entry(entry).ok()?;
                     Some(Credential::ChatGpt)
                 } else if codex {
                     super::codex_auth::valid_entry(entry).then_some(Credential::Codex)
@@ -346,7 +343,9 @@ impl Keys {
                 {
                     return None;
                 }
-                if codex && endpoint != Some(pi_rs::openai::CODEX_ENDPOINT) {
+                if (codex && endpoint != Some(pi_rs::openai::CODEX_ENDPOINT))
+                    || (chatgpt && endpoint != Some(pi_rs::openai::DEFAULT_ENDPOINT))
+                {
                     return None;
                 }
                 if anthropic && endpoint != Some(pi_rs::anthropic::DEFAULT_ENDPOINT) {
@@ -617,9 +616,7 @@ pub(super) fn remove(provider: &Provider) -> Result<bool> {
     Ok(removed)
 }
 
-pub(super) fn valid_key(key: &str) -> bool {
-    !key.is_empty() && key.len() <= 4096 && key.bytes().all(|byte| byte.is_ascii_graphic())
-}
+pub(super) use pi_rs_workbench::auth_factory::valid_api_key as valid_key;
 
 #[cfg(test)]
 mod tests {
@@ -856,6 +853,26 @@ mod tests {
         ));
         assert!(
             keys.credential(&provider, "http://127.0.0.1:1234/v1/responses")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn imported_pi_chatgpt_oauth_is_official_endpoint_only() {
+        let provider = Provider::named("openai-chatgpt").unwrap();
+        let mut entry = json!({"type":"oauth","access":"access","refresh":"refresh","expires":1000,
+            "clientId":"issued-client","scopes":["chatgpt.tokens.use.direct"]});
+        let keys = Keys::parse(&json!({"openai-chatgpt":entry}));
+        assert!(matches!(
+            keys.credential(&provider, pi_rs::openai::DEFAULT_ENDPOINT),
+            Some(Credential::ChatGpt)
+        ));
+        let loopback = "http://127.0.0.1:1234/v1/responses";
+        entry["endpoint"] = json!(loopback);
+        let keys = Keys::parse(&json!({"openai-chatgpt":entry}));
+        assert!(keys.credential(&provider, loopback).is_none());
+        assert!(
+            keys.credential(&provider, pi_rs::openai::DEFAULT_ENDPOINT)
                 .is_none()
         );
     }

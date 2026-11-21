@@ -399,6 +399,8 @@ struct Description {
     #[serde(default)]
     tool_execution_update_hook: bool,
     #[serde(default)]
+    ui_prompt_lifecycle_hook: bool,
+    #[serde(default)]
     model_selection_hook: bool,
     #[serde(default)]
     session_lifecycle_hook: bool,
@@ -997,6 +999,9 @@ impl Extension for ExecutableExtension {
     }
     fn handles_tool_execution_updates(&self) -> bool {
         self.description.tool_execution_update_hook
+    }
+    fn handles_ui_prompt_lifecycle(&self) -> bool {
+        self.description.ui_prompt_lifecycle_hook
     }
     fn handles_model_selection(&self) -> bool {
         self.description.model_selection_hook
@@ -3605,6 +3610,7 @@ async fn dispatch_inner(
             user_bash_stream_host_calls: true,
             tool_execution_lifecycle_hook: extension.handles_tool_execution_lifecycle(),
             tool_execution_update_hook: extension.handles_tool_execution_updates(),
+            ui_prompt_lifecycle_hook: extension.handles_ui_prompt_lifecycle(),
             model_selection_hook: extension.handles_model_selection(),
             session_lifecycle_hook: extension.handles_session_lifecycle(),
             session_transition_reasons: true,
@@ -4594,6 +4600,58 @@ mod tests {
             serde_json::from_value::<DuplexFrame>(encoded).unwrap(),
             DuplexFrame::Progress { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn ui_prompt_lifecycle_capability_and_payload_round_trip() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "ui-prompt-lifecycle"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_ui_prompt_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle(
+                &self,
+                event: &LifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                assert!(matches!(
+                    event,
+                    LifecycleEvent::UiPromptEnd {
+                        reason: pi_rs_core::UiPromptReason::UiPrompt,
+                        kind: pi_rs_core::UiPromptKind::Custom,
+                        title: None,
+                    }
+                ));
+                Ok(())
+            }
+        }
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let mut description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["ui_prompt_lifecycle_hook"], true);
+        description
+            .as_object_mut()
+            .unwrap()
+            .remove("ui_prompt_lifecycle_hook");
+        assert!(
+            !serde_json::from_value::<Description>(description)
+                .unwrap()
+                .ui_prompt_lifecycle_hook
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "type":"lifecycle","state":null,
+            "event":{"type":"ui_prompt_end","reason":"ui_prompt","kind":"custom"},
+        }))
+        .unwrap();
+        dispatch(extension, request).await.unwrap();
     }
 
     #[tokio::test]
