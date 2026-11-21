@@ -4298,19 +4298,28 @@ mod tests {
         let body = events.to_owned();
         let content_type = content_type.map(str::to_owned);
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            loop {
-                let mut chunk = [0; 4096];
-                let n = socket.read(&mut chunk).await.unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&chunk[..n]);
-                if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+            let mut socket = loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
                 }
-            }
-            let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-            assert!(headers.contains("authorization: bearer fixture"));
+                let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                assert!(headers.contains("authorization: bearer fixture"));
+                // A Codex client with auto transport can try an upgrade before SSE.
+                if headers.starts_with("get ") && headers.contains("upgrade: websocket") {
+                    socket.write_all(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
+                assert!(headers.starts_with("post "));
+                break socket;
+            };
             let header =
                 content_type.map_or_else(String::new, |value| format!("Content-Type: {value}\r\n"));
             let response = format!(
