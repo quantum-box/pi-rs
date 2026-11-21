@@ -184,37 +184,25 @@ impl Bedrock {
     /// Freeze inspectable AWS authentication before editing configured headers.
     #[doc(hidden)]
     pub async fn prepare_header_context(&self, defaults: &http::HeaderMap) -> Result<Self> {
-        use aws_credential_types::provider::ProvideCredentials;
-
-        let prepared = self.prepare_bedrock().await?;
-        let resolved_auth = prepared.is_some();
-        let resolved = prepared.unwrap_or_else(|| self.clone());
-        let mut secrets: Vec<_> = resolved.bearer.iter().cloned().collect();
+        let prepared = self.prepare_bedrock_with_auth(true).await?;
+        let (resolved, secrets, opaque_auth) = match prepared {
+            Some((resolved, secrets)) => (resolved, secrets, false),
+            None => (
+                self.clone(),
+                self.bearer.iter().cloned().collect(),
+                self.bearer.is_none(),
+            ),
+        };
         let mut headers = resolved.context_headers();
-
-        if resolved.bearer.is_none() {
-            let provider = resolved_auth
-                .then(|| {
-                    resolved
-                        .client
-                        .get()
-                        .and_then(|client| client.config().credentials_provider())
-                })
-                .flatten();
-            if let Some(provider) = provider
-                && let Ok(credentials) = provider.provide_credentials().await
-            {
-                secrets.push(credentials.access_key_id().to_owned());
-                secrets.push(credentials.secret_access_key().to_owned());
-                secrets.extend(credentials.session_token().map(str::to_owned));
-            } else {
-                // A caller-supplied signer can hold credentials this adapter cannot inspect.
-                for value in headers.values_mut() {
-                    value.set_sensitive(true);
-                }
+        if opaque_auth {
+            // A caller-supplied signer can hold credentials this adapter cannot inspect.
+            for value in headers.values_mut() {
+                value.set_sensitive(true);
             }
         }
-        headers.extend(defaults.clone());
+        for (name, value) in defaults {
+            headers.entry(name.clone()).or_insert_with(|| value.clone());
+        }
         let Some(headers) = pi_rs_core::prepare_provider_headers(&headers, &secrets).await else {
             return Ok(resolved);
         };
@@ -311,6 +299,16 @@ impl Bedrock {
     }
     /// Freeze an inspectable SDK configuration and its effective authentication for one request.
     pub async fn prepare_bedrock(&self) -> Result<Option<Self>> {
+        Ok(self
+            .prepare_bedrock_with_auth(false)
+            .await?
+            .map(|(model, _)| model))
+    }
+
+    async fn prepare_bedrock_with_auth(
+        &self,
+        collect_header_secrets: bool,
+    ) -> Result<Option<(Self, Vec<String>)>> {
         use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
         if self.unsupported.is_some() || self.http_client.is_some() {
             return Ok(None);
@@ -392,6 +390,19 @@ impl Bedrock {
                 .build();
             identity
         };
+        let secrets = if collect_header_secrets {
+            [
+                Some(auth_identity.1.clone()),
+                Some(auth_identity.2.clone()),
+                auth_identity.3.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|value| !value.is_empty())
+            .collect()
+        } else {
+            Vec::new()
+        };
         let identity = pi_rs_core::protected_model_fingerprint(&(
             "bedrock-converse-v1",
             &region,
@@ -438,7 +449,7 @@ impl Bedrock {
         prepared.bearer = bearer;
         prepared.known_config = None;
         prepared.prepared_identity = identity;
-        Ok(Some(prepared))
+        Ok(Some((prepared, secrets)))
     }
 
     /// Configure Pi's reasoning level and an optional model-specific effort mapping.
