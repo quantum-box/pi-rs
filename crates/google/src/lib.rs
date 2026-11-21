@@ -196,6 +196,16 @@ impl Google {
         self
     }
 
+    /// Add request defaults while preserving explicitly configured headers.
+    pub fn with_default_headers(mut self, headers: &HeaderMap) -> Self {
+        for (name, value) in headers {
+            self.headers
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
+        }
+        self
+    }
+
     pub fn with_context_probe(mut self, enabled: bool) -> Self {
         self.probe_context = enabled && !self.vertex;
         self
@@ -1225,7 +1235,9 @@ impl Model for Google {
         let mut body =
             wire_request_for_api(&request, thinking, &self.replay_scope, &edited_scope, api)?;
         if let Some((schemas, validated)) = &self.bound_tools
-            && let Some(tools) = body["tools"][0]["functionDeclarations"].as_array_mut()
+            && let Some(tools) = body
+                .pointer_mut("/tools/0/functionDeclarations")
+                .and_then(Value::as_array_mut)
         {
             for (tool, schema) in tools.iter_mut().zip(schemas) {
                 tool["parametersJsonSchema"] = schema.clone();

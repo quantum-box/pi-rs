@@ -176,7 +176,9 @@ without storing its value in that configuration file.
 Local package sources expand `~` using a nonempty `HOME` or the platform
 home-directory fallback, including `~\` on Windows. On Unix an explicitly
 empty `HOME` remains empty. Relative home values resolve from the source
-settings scope, matching Pi.
+settings scope, matching Pi. On Windows, local package sources and resource
+filters accept Git Bash/MSYS, Cygwin, and WSL drive spellings such as `/c/...`,
+`/cygdrive/c/...`, and `/mnt/c/...`.
 
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
@@ -406,10 +408,18 @@ Ring model, its official endpoint, and `ANT_LING_API_KEY`. Ring sends its
 mapped high or xhigh effort in the provider's nested `reasoning` field.
 Live acceptance with an Ant Ling account remains open.
 
-### OpenCode Zen classifiers
+### OpenCode Zen and Go
 
 OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
 using its official System One endpoint and `OPENCODE_API_KEY`.
+
+OpenCode Zen and Go expose their 79 and 30 pinned chat models, respectively,
+using `OPENCODE_API_KEY`. The model selects the Messages, Gemini, Chat
+Completions or Responses route. Session requests include `x-opencode-session`
+unless configuration supplies the header explicitly. Endpointless saved keys
+apply to the official routes for the corresponding provider. Gemini prepared
+requests also accept an empty tool list. Live inference
+with a Zen or Go account has not been verified.
 
 ### Vercel AI Gateway checkpoint
 
@@ -3532,7 +3542,9 @@ new-file numbers for insertions, and four context lines on either side of a
 change. Omitted ranges appear as ellipses. The terminal prefers the numbered
 diff, preserves each line’s original gutter (including empty line numbers),
 and uses the existing word highlighting for single-line changes. Added, removed
-and context rows use the corresponding Pi theme roles.
+and context rows use the corresponding Pi theme roles. Numbered rows wrap at
+word and CJK grapheme boundaries, with the diff coloring and inverse highlights
+carried into subsequent rows. Long words split at grapheme boundaries.
 Previously stored unified patches still render through the existing path.
 
 The CLI comparison checks exact numbered and unified diffs for two separate
@@ -5381,7 +5393,10 @@ atomic paste markers.
 
 Tree fold and jump keys now follow visible branch segments rather than folding
 or stepping through every record. Filtered-out intermediate records attach to
-nearest visible ancestors for navigation; changing the search clears folds.
+nearest visible ancestors for navigation. Search matches every whitespace-separated
+term regardless of order or case. Editing or clearing the search unfolds branches
+and retains the selected entry or its nearest visible ancestor, including when
+the search temporarily finds no entries.
 Focused selector tests cover linear chains, branches, hidden records, search,
 and fold/unfold behavior. Other tree layout and navigation differences remain.
 
