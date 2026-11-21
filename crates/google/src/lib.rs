@@ -1098,7 +1098,7 @@ impl Model for Google {
         }
         pi_rs_core::protected_model_fingerprint(&(
             headers,
-            "google-v2-const-enum",
+            "google-v3-tool-errors",
             self.endpoint.as_str(),
             self.provider.as_ref(),
             self.replay_scope.as_ref(),
@@ -1622,7 +1622,7 @@ mod tests {
         let headers: Vec<(&str, &[u8])> = vec![];
         let old = pi_rs_core::protected_model_fingerprint(&(
             headers,
-            "google-v1",
+            "google-v2-const-enum",
             google.endpoint.as_str(),
             google.provider.as_ref(),
             google.replay_scope.as_ref(),
