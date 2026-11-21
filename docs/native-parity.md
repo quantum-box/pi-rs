@@ -765,8 +765,11 @@ can theme. Missing or failed sections fall back independently. Pi returns
 live TUI components with local state and invalidation callbacks. Native
 hosts own framing, image handling, component state and redraws. Executable
 extension tool definitions can supply both sections through stateless
-process requests. Workbench terminal integration and executable
-cross-tool resolver registration remain pending.
+process requests. Workbench applies them to journaled calls and committed
+results, including restored transcript entries. Expansion and viewport
+changes rerender the active presentation with the host theme. Streaming
+argument and partial result rendering and executable cross-tool resolver
+registration remain pending.
 
 ### Native custom message renderers
 

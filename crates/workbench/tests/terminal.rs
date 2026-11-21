@@ -698,6 +698,123 @@ fn debug_command_and_global_shortcut_write_session_snapshots() {
 }
 
 #[test]
+fn extension_tool_renderer_displays_resumed_result_and_updates_on_expand() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let session = root.path().join("session.jsonl");
+    let source = root.path().join("pi-session.jsonl");
+    std::fs::write(
+        &source,
+        r#"{"type":"session","version":3}
+{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"call","name":"lookup","arguments":{"path":"example"}}]}}
+{"type":"message","id":"r","parentId":"a","message":{"role":"toolResult","toolCallId":"call","toolName":"lookup","content":[{"type":"text","text":"original result"}],"isError":false}}
+"#,
+    )
+    .unwrap();
+
+    let seed = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args(["--offline", "--no-mcp", "--no-trust", "--session"])
+        .arg(&session)
+        .arg("import")
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    let extension = root.path().join("renderer.py");
+    std::fs::write(
+        &extension,
+        r#"#!/usr/bin/env python3
+import json, sys
+request = json.load(sys.stdin)
+result = None
+if request["type"] == "describe":
+    result = {"id":"renderer", "commands":[], "dependencies":[], "tools":[{
+        "spec":{"name":"lookup","description":"Lookup","parameters":{"type":"object"}},
+        "execution":"sequential", "renderers":{"shell":"default","call":True,"result":True}
+    }]}
+elif request["type"] == "render_tool_section":
+    context = request["context"]
+    if request["section"] == "call":
+        text = "rendered call " + context["args"]["path"]
+    else:
+        original = context["result"]["content"][0]["text"]
+        text = ("expanded " if context["expanded"] else "collapsed ") + original
+    result = {"lines":[[{"text":text,"color":"accent"}]]}
+print(json.dumps({"version":1,"response":{"Ok":result}}))
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let (mut master_fd, mut slave_fd) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .args([
+                "--offline",
+                "--no-mcp",
+                "--no-trust",
+                "--model",
+                "fixture",
+                "--tui-mode",
+                "fullscreen",
+                "--session",
+            ])
+            .arg(&session)
+            .arg("--extension")
+            .arg(&extension)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until_with_timeout(&mut master, Duration::from_secs(15), |text| {
+        text.contains("rendered call example") && text.contains("collapsed original result")
+    });
+    master.write_all(b"\x0f").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("expanded original result")
+    });
+}
+
+#[test]
 fn delayed_thinking_callback_preserves_the_next_selection() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();

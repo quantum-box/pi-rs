@@ -295,6 +295,8 @@ pub enum Entry {
         finished: bool,
         parts: Vec<ToolPart>,
         numbered_diff: bool,
+        render_records: Option<crate::backend::ToolRenderRecords>,
+        rendered: Option<std::sync::Arc<pi_rs::RenderedTool>>,
     },
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -402,18 +404,8 @@ impl Entry {
                 rendered: Some(rendered),
                 ..
             } => {
-                let pad = rendered.padding.min(width.saturating_sub(1) / 2);
-                let inner = width.saturating_sub(2 * pad).max(1);
                 let mut lines = vec![Line::default()];
-                let padding = " ".repeat(pad);
-                let background = rendered.background.as_deref().map(|role| theme.color(role));
-                for mut row in component_lines(&rendered.lines, theme, inner) {
-                    if pad != 0 && !row.spans.is_empty() {
-                        row.spans.insert(0, Span::new(&padding, Color::Reset));
-                    }
-                    row.background = background;
-                    lines.push(row);
-                }
+                lines.extend(extension_rows(rendered, theme, width));
                 return lines;
             }
             Self::CustomMessage {
@@ -548,6 +540,7 @@ impl Entry {
                 finished,
                 parts,
                 numbered_diff,
+                rendered,
                 ..
             } => {
                 // Shell output may contain terminal escape sequences, including
@@ -563,6 +556,11 @@ impl Entry {
                 } else {
                     "toolPendingBg"
                 };
+                let self_framed = rendered
+                    .as_ref()
+                    .is_some_and(|rendered| rendered.shell == pi_rs::ToolRenderShell::SelfFramed);
+                let inner = if self_framed { width.max(1) } else { inner };
+                let padding = if self_framed { 0 } else { padding };
                 let arguments = serde_json::from_str::<serde_json::Value>(arguments).ok();
                 let detail = arguments
                     .as_ref()
@@ -576,55 +574,87 @@ impl Entry {
                     .unwrap_or("");
                 let mut title = Span::themed(format!("{name} {detail}"), theme, "toolTitle");
                 title.bold = true;
-                let mut lines = wrap(&[title], inner);
-                let output_lines: Vec<_> = output.lines().collect();
-                let limit = if expand_tools { output_lines.len() } else { 10 };
-                let render_text = |text: &str, lines: &mut Vec<Line>| {
-                    if *numbered_diff {
-                        lines.extend(super::diff::render_numbered(text, theme, inner));
-                    } else if name == "edit" {
-                        lines.extend(super::diff::render(text, theme, inner));
-                    } else {
-                        for text in text.split('\n') {
-                            lines.extend(wrap(&[Span::themed(text, theme, "toolOutput")], inner));
-                        }
-                    }
-                };
-                if expand_tools
-                    && !parts.is_empty()
-                    && let Some(limit) = options.image_width
+                let mut lines = match rendered
+                    .as_ref()
+                    .and_then(|rendered| rendered.call.as_ref())
                 {
-                    for part in parts {
-                        match part {
-                            ToolPart::Text(text) => render_text(text, &mut lines),
-                            ToolPart::Image(image) => {
-                                lines.extend(image.lines(width, limit, padding))
+                    Some(call) => extension_rows(call, theme, inner),
+                    None => wrap(&[title], inner),
+                };
+                if let Some(result) = rendered
+                    .as_ref()
+                    .and_then(|rendered| rendered.result.as_ref())
+                {
+                    lines.extend(extension_rows(result, theme, inner));
+                    if let Some(limit) = options.image_width {
+                        for part in parts {
+                            if let ToolPart::Image(image) = part {
+                                lines.extend(image.lines(width, limit, padding));
                             }
                         }
                     }
                 } else {
-                    let visible = output_lines
-                        .iter()
-                        .take(limit)
-                        .copied()
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if !visible.is_empty() {
-                        render_text(&visible, &mut lines);
+                    let output_lines: Vec<_> = output.lines().collect();
+                    let limit = if expand_tools { output_lines.len() } else { 10 };
+                    let render_text = |text: &str, lines: &mut Vec<Line>| {
+                        if *numbered_diff {
+                            lines.extend(super::diff::render_numbered(text, theme, inner));
+                        } else if name == "edit" {
+                            lines.extend(super::diff::render(text, theme, inner));
+                        } else {
+                            for text in text.split('\n') {
+                                lines.extend(wrap(
+                                    &[Span::themed(text, theme, "toolOutput")],
+                                    inner,
+                                ));
+                            }
+                        }
+                    };
+                    if expand_tools
+                        && !parts.is_empty()
+                        && let Some(limit) = options.image_width
+                    {
+                        for part in parts {
+                            match part {
+                                ToolPart::Text(text) => render_text(text, &mut lines),
+                                ToolPart::Image(image) => {
+                                    lines.extend(image.lines(width, limit, padding))
+                                }
+                            }
+                        }
+                    } else {
+                        let visible = output_lines
+                            .iter()
+                            .take(limit)
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !visible.is_empty() {
+                            render_text(&visible, &mut lines);
+                        }
+                    }
+                    if output_lines.len() > limit {
+                        lines.push(Line::themed(
+                            &format!(
+                                "… {} more lines (ctrl+o to expand)",
+                                output_lines.len() - limit
+                            ),
+                            theme,
+                            "dim",
+                        ));
                     }
                 }
-                if output_lines.len() > limit {
-                    lines.push(Line::themed(
-                        &format!(
-                            "… {} more lines (ctrl+o to expand)",
-                            output_lines.len() - limit
-                        ),
-                        theme,
-                        "dim",
-                    ));
-                }
-                for line in &mut lines {
-                    line.background = Some(theme.color(role));
+                if self_framed {
+                    if lines.is_empty() {
+                        return lines;
+                    }
+                    lines.insert(0, Line::default());
+                    lines.push(Line::default());
+                    return lines;
+                } else {
+                    for line in &mut lines {
+                        line.background.get_or_insert_with(|| theme.color(role));
+                    }
                 }
                 lines.push(Line::default());
                 lines
@@ -640,6 +670,25 @@ impl Entry {
         lines
     }
 }
+fn extension_rows(
+    rendered: &pi_rs::RenderedExtensionRows,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line> {
+    let pad = rendered.padding.min(width.saturating_sub(1) / 2);
+    let inner = width.saturating_sub(2 * pad).max(1);
+    let padding = " ".repeat(pad);
+    let background = rendered.background.as_deref().map(|role| theme.color(role));
+    let mut rows = component_lines(&rendered.lines, theme, inner);
+    for row in &mut rows {
+        if pad != 0 && !row.spans.is_empty() {
+            row.spans.insert(0, Span::new(&padding, Color::Reset));
+        }
+        row.background = background;
+    }
+    rows
+}
+
 pub(super) fn component_lines(
     lines: &[Vec<pi_rs::UiComponentSpan>],
     theme: &Theme,
@@ -4664,6 +4713,62 @@ mod tests {
     }
 
     #[test]
+    fn tool_renderer_keeps_per_section_fallback_and_uses_host_theme() {
+        let theme = Theme::system();
+        let styled = || pi_rs::RenderedExtensionRows {
+            lines: vec![vec![pi_rs::UiComponentSpan {
+                text: "custom\u{7}".into(),
+                color: Some("accent".into()),
+                bold: true,
+                ..Default::default()
+            }]],
+            ..Default::default()
+        };
+        let entry = |rendered| Entry::Tool {
+            id: "example".into(),
+            name: "search".into(),
+            arguments: r#"{"pattern":"test"}"#.into(),
+            output: "fallback result".into(),
+            failed: true,
+            finished: true,
+            numbered_diff: false,
+            render_records: None,
+            rendered: Some(std::sync::Arc::new(rendered)),
+            parts: Vec::new(),
+        };
+        let default_shell = entry(pi_rs::RenderedTool {
+            call: Some(styled()),
+            ..Default::default()
+        });
+        let lines = default_shell.render(&theme, 40, false, false, TranscriptOptions::default());
+        assert_eq!(lines[0].spans[0].text, "custom");
+        assert_eq!(lines[0].spans[0].color, theme.color("accent"));
+        assert!(lines[0].spans[0].bold);
+        assert_eq!(lines[0].background, Some(theme.color("toolErrorBg")));
+        assert_eq!(lines[1].spans[0].text, "fallback result");
+
+        let self_framed = entry(pi_rs::RenderedTool {
+            shell: pi_rs::ToolRenderShell::SelfFramed,
+            call: None,
+            result: Some(styled()),
+        });
+        let lines = self_framed.render(
+            &theme,
+            40,
+            false,
+            false,
+            TranscriptOptions {
+                padding: 4,
+                ..Default::default()
+            },
+        );
+        assert!(lines[0].spans.is_empty());
+        assert_eq!(lines[1].spans[0].text, "search test");
+        assert_eq!(lines[2].spans[0].text, "custom");
+        assert!(lines.iter().all(|line| line.background.is_none()));
+    }
+
+    #[test]
     fn expanded_tools_keep_text_and_images_in_sequence() {
         use base64::Engine;
         let mut bytes = std::io::Cursor::new(Vec::new());
@@ -4683,6 +4788,8 @@ mod tests {
             failed: false,
             finished: true,
             numbered_diff: false,
+            render_records: None,
+            rendered: None,
             parts: vec![
                 ToolPart::Text("before".into()),
                 ToolPart::Image(image),

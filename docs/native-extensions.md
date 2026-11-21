@@ -83,7 +83,7 @@ errors remain failures because their origin is unknown. The standard extension
 server advertises the capability and propagates typed errors from extensions it
 hosts, including executable extensions.
 
-## Render tool calls and results in an SDK host
+## Render tool calls and results
 
 A Rust tool can implement `Tool::tool_renderers` to provide separate call
 and result callbacks. An extension can wrap or replace renderers for any
@@ -112,8 +112,14 @@ effect. Return `null` when a callback should opt out for a particular call.
 
 Call and result requests run in separate processes, so executable renderers
 should use the supplied context for their inputs. Resolver wrappers for
-other tools use the in-process API. Workbench terminal integration is
-tracked separately.
+other tools use the in-process API.
+
+Workbench uses these callbacks for journaled tool calls and their committed
+results, including when a session is resumed. It runs the callbacks off
+the terminal paint path and supplies expansion state, viewport width and
+the configured output padding. The active theme maps the returned
+semantic roles. Each section can fall back to the standard presentation.
+Streaming argument and partial result redraws use the standard presentation.
 
 ## Observe extension UI prompts
 

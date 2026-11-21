@@ -1043,6 +1043,13 @@ struct CustomMessageRenderPending {
     options: pi_rs::CustomMessageRenderOptions,
 }
 
+struct PendingToolRender {
+    request: uuid::Uuid,
+    operation: String,
+    records: super::backend::ToolRenderRecords,
+    retried: bool,
+}
+
 #[derive(Default)]
 struct View {
     async_transitions: bool,
@@ -1059,6 +1066,10 @@ struct View {
     widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
     lines: Vec<Entry>,
     custom_render_options: Option<pi_rs::CustomMessageRenderOptions>,
+    tool_render_options: Option<super::backend::ToolRenderOptions>,
+    tool_render_pending: Option<PendingToolRender>,
+    tool_render_attempted: std::collections::BTreeMap<String, super::backend::ToolRenderRecords>,
+    tool_render_retry: std::collections::BTreeMap<String, super::backend::ToolRenderRecords>,
     custom_render_attempted: BTreeSet<u64>,
     custom_render_pending: Option<CustomMessageRenderPending>,
     custom_render_redraw_at: Option<Instant>,
@@ -1176,6 +1187,8 @@ impl View {
                 finished: false,
                 parts: Vec::new(),
                 numbered_diff: false,
+                render_records: None,
+                rendered: None,
             })
         })
     }
@@ -1474,6 +1487,157 @@ impl View {
             self.add_images(&images);
         }
     }
+    fn invalidate_tool_renderings(&mut self) -> bool {
+        self.tool_render_attempted.clear();
+        self.tool_render_retry.clear();
+        let mut changed = false;
+        for (index, entry) in self.lines.iter_mut().enumerate() {
+            if let Entry::Tool { rendered, .. } = entry
+                && rendered.take().is_some()
+            {
+                self.regular.redraw |= index < self.regular.committed;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn prepare_tool_render(&mut self, worker: &mut Worker, args: &Cli) -> bool {
+        if !worker.tool_rendering {
+            return false;
+        }
+        let options = super::backend::ToolRenderOptions {
+            expanded: self.expand_tools,
+            show_images: self.graphics.enabled() && args.settings.show_terminal_images(),
+            output_pad: args.settings.output_padding(),
+            expand_key: self
+                .expand_key
+                .map(|key| crate::ui::keys::binding_hint(Some(key))),
+            width: crossterm::terminal::size()
+                .ok()
+                .map(|(width, _)| usize::from(width)),
+        };
+        let changed = if self.tool_render_options.as_ref() == Some(&options) {
+            false
+        } else {
+            self.tool_render_options = Some(options.clone());
+            self.invalidate_tool_renderings()
+        };
+        if self.tool_render_pending.is_some() {
+            return changed;
+        }
+        let candidate = self.lines.iter().rev().find_map(|entry| match entry {
+            Entry::Tool {
+                id,
+                render_records: Some(records),
+                ..
+            } if self.tool_render_attempted.get(id) != Some(records) => {
+                Some((id.clone(), *records))
+            }
+            _ => None,
+        });
+        if let Some((operation, records)) = candidate {
+            self.tool_render_attempted
+                .insert(operation.clone(), records);
+            let retried = self.tool_render_retry.remove(&operation) == Some(records);
+            let request = uuid::Uuid::new_v4();
+            if worker
+                .send(json!({
+                    "type":"render_tool","id":request,"operation":operation,
+                    "records":records,"options":options,
+                }))
+                .is_ok()
+            {
+                self.tool_render_pending = Some(PendingToolRender {
+                    request,
+                    operation,
+                    records,
+                    retried,
+                });
+            }
+        }
+        changed
+    }
+
+    fn receive_tool_render(&mut self, event: Value) -> bool {
+        if !self.tool_render_pending.as_ref().is_some_and(|pending| {
+            event["id"].as_str().and_then(|id| id.parse().ok()) == Some(pending.request)
+        }) {
+            return false;
+        }
+        let pending = self
+            .tool_render_pending
+            .take()
+            .expect("matching tool render");
+        if self.tool_render_attempted.get(&pending.operation) != Some(&pending.records) {
+            return false;
+        }
+        let Some((index, rendered)) =
+            self.lines
+                .iter_mut()
+                .enumerate()
+                .rev()
+                .find_map(|(index, entry)| match entry {
+                    Entry::Tool {
+                        id,
+                        render_records: Some(records),
+                        rendered,
+                        ..
+                    } if id == &pending.operation && records == &pending.records => {
+                        Some((index, rendered))
+                    }
+                    _ => None,
+                })
+        else {
+            return false;
+        };
+        if event["rendered"].is_null() {
+            if event["available"].is_null() && !pending.retried {
+                self.tool_render_attempted.remove(&pending.operation);
+                self.tool_render_retry
+                    .insert(pending.operation, pending.records);
+            }
+            return false;
+        }
+        let Ok(rendering) =
+            serde_json::from_value::<pi_rs::RenderedTool>(event["rendered"].clone())
+        else {
+            return false;
+        };
+        *rendered = Some(std::sync::Arc::new(rendering));
+        if index < self.regular.committed {
+            self.custom_render_redraw_at
+                .get_or_insert_with(|| Instant::now() + Duration::from_millis(40));
+        }
+        true
+    }
+
+    fn track_tool_render(&mut self, operation: &str, record: u64, started: bool) {
+        for (index, entry) in self.lines.iter_mut().enumerate().rev() {
+            let Entry::Tool {
+                id,
+                render_records: Some(records),
+                rendered,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            if id != operation {
+                continue;
+            }
+            if started {
+                records.started = Some(record);
+            } else {
+                records.result = Some(record);
+            }
+            if rendered.take().is_some() && index < self.regular.committed {
+                self.regular.redraw = true;
+            }
+            break;
+        }
+    }
+
     fn invalidate_custom_message_renderings(&mut self) -> bool {
         self.custom_render_attempted.clear();
         self.custom_render_redraw_at = None;
@@ -1806,6 +1970,8 @@ impl View {
         self.custom_render_redraw_at = None;
         // Keep an in-flight request as the only one until its response. The
         // cleared attempted set prevents it from updating the restored rows.
+        self.tool_render_attempted.clear();
+        self.tool_render_retry.clear();
         self.custom_render_attempted.clear();
         self.viewport.follow();
         self.search = None;
@@ -1894,6 +2060,8 @@ impl View {
                         finished: false,
                         parts: Vec::new(),
                         numbered_diff: false,
+                        render_records: None,
+                        rendered: None,
                     });
                     self.finish_tool(&id, &outcome);
                 }
@@ -1913,6 +2081,8 @@ impl View {
                         finished: true,
                         parts: Vec::new(),
                         numbered_diff: false,
+                        render_records: None,
+                        rendered: None,
                     });
                 }
                 pi_rs::Event::UserImages { images } => {
@@ -1958,10 +2128,15 @@ impl View {
                         self.lines.push(Entry::Assistant(content.clone()));
                     }
                     for invocation in invocations {
-                        self.add_tool(invocation);
+                        self.add_tool(invocation, Some(record.id));
                     }
                 }
-                pi_rs::Event::ToolPlanned { invocation, .. } => self.add_tool(invocation),
+                pi_rs::Event::ToolPlanned { invocation, .. } => {
+                    self.add_tool(invocation, Some(record.id))
+                }
+                pi_rs::Event::ToolStarted { operation_id, .. } => {
+                    self.track_tool_render(&operation_id.to_string(), record.id, true);
+                }
                 pi_rs::Event::ToolFinished {
                     operation_id,
                     outcome,
@@ -1971,6 +2146,7 @@ impl View {
                     operation_id,
                     outcome,
                 } => {
+                    self.track_tool_render(&operation_id.to_string(), record.id, false);
                     self.finish_tool(&operation_id.to_string(), outcome);
                 }
                 _ => {}
@@ -2012,7 +2188,7 @@ impl View {
             );
         }
     }
-    fn add_tool(&mut self, invocation: &pi_rs::Invocation) {
+    fn add_tool(&mut self, invocation: &pi_rs::Invocation, record: Option<u64>) {
         if invocation.call.name == super::operation_models::TOOL {
             self.model_operations
                 .insert(invocation.operation_id.to_string());
@@ -2027,6 +2203,12 @@ impl View {
             finished: false,
             parts: Vec::new(),
             numbered_diff: false,
+            render_records: record.map(|invocation| super::backend::ToolRenderRecords {
+                invocation,
+                started: None,
+                result: None,
+            }),
+            rendered: None,
         });
     }
     fn finish_tool(&mut self, operation: &str, outcome: &pi_rs::Outcome) {
@@ -2134,6 +2316,8 @@ impl View {
                     finished: false,
                     parts: Vec::new(),
                     numbered_diff: false,
+                    render_records: None,
+                    rendered: None,
                 });
             }
             Some("bash_execution_update") => {
@@ -2290,6 +2474,10 @@ impl View {
                                     finished: false,
                                     parts: Vec::new(),
                                     numbered_diff: false,
+                                    render_records: value["record"]["id"].as_u64().map(|invocation| {
+                                        super::backend::ToolRenderRecords { invocation, started: None, result: None }
+                                    }),
+                                    rendered: None,
                                 });
                             }
                         }
@@ -2298,11 +2486,19 @@ impl View {
                         self.phase = Some("ツール実行中");
                         if let Ok(invocation) = serde_json::from_value(event["invocation"].clone())
                         {
-                            self.add_tool(&invocation);
+                            self.add_tool(&invocation, value["record"]["id"].as_u64());
+                        }
+                    }
+                    Some("tool_started") => {
+                        if let Some(record) = value["record"]["id"].as_u64() {
+                            self.track_tool_render(event["operation_id"].as_str().unwrap_or_default(), record, true);
                         }
                     }
                     Some("tool_finished" | "tool_reconciled") => {
                         self.phase = Some("処理を継続中");
+                        if let Some(record) = value["record"]["id"].as_u64() {
+                            self.track_tool_render(event["operation_id"].as_str().unwrap_or_default(), record, false);
+                        }
                         if let Ok(outcome) = serde_json::from_value(event["outcome"].clone()) {
                             self.finish_tool(
                                 event["operation_id"].as_str().unwrap_or_default(),
@@ -4542,6 +4738,13 @@ pub(super) async fn run(
                 view.custom_render_pending = None;
                 dirty |= view.invalidate_custom_message_renderings();
             }
+            if old.tool_rendering {
+                if !old.message_renderer_types.is_empty() || !view.resources.extensions.is_empty() {
+                    startup_extensions = None;
+                }
+                view.tool_render_pending = None;
+                dirty |= view.invalidate_tool_renderings();
+            }
             for warning in old.take_pending_warnings() {
                 view.append(&warning);
                 dirty = true;
@@ -4710,6 +4913,13 @@ pub(super) async fn run(
                             .unwrap_or_default();
                     view.custom_render_pending = None;
                     dirty |= view.invalidate_custom_message_renderings();
+                    active.tool_rendering = value["tool_rendering"] == true;
+                    view.tool_render_pending = None;
+                    dirty |= view.invalidate_tool_renderings();
+                }
+                if value["type"] == "tool_rendered" {
+                    dirty |= view.receive_tool_render(value);
+                    continue;
                 }
                 if value["type"] == "custom_message_rendered" {
                     dirty |= view.receive_custom_message_render(value);
@@ -4823,10 +5033,13 @@ pub(super) async fn run(
                 dirty = true;
             }
             dirty |= view.prepare_custom_message_render(active, &args);
+            dirty |= view.prepare_tool_render(active, &args);
             if let Some(status) = active.child.try_wait()? {
                 let mut finished = worker.take().expect("active worker");
                 view.custom_render_pending = None;
                 view.invalidate_custom_message_renderings();
+                view.tool_render_pending = None;
+                view.invalidate_tool_renderings();
                 for reader in finished.readers.drain(..) {
                     let _ = reader.join();
                 }
@@ -11477,6 +11690,84 @@ exit {exit}
         assert_eq!(full.widgets.last().unwrap().0, "widget-0");
         set(&mut full, "widget-0", None, "aboveEditor");
         assert_eq!(full.widgets.len(), 63);
+    }
+
+    #[test]
+    fn tool_renderer_response_is_discarded_when_call_state_changes() {
+        let mut view = super::View::default();
+        let operation_id = uuid::Uuid::new_v4();
+        let operation = operation_id.to_string();
+        view.add_tool(
+            &pi_rs::Invocation {
+                operation_id,
+                call: pi_rs::ToolCall {
+                    id: "call".into(),
+                    name: "lookup".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            Some(1),
+        );
+        let original = crate::backend::ToolRenderRecords {
+            invocation: 1,
+            started: None,
+            result: None,
+        };
+        let request = uuid::Uuid::new_v4();
+        view.tool_render_attempted
+            .insert(operation.clone(), original);
+        view.tool_render_pending = Some(super::PendingToolRender {
+            request,
+            operation: operation.clone(),
+            records: original,
+            retried: false,
+        });
+        view.track_tool_render(&operation, 2, true);
+        let response = |id| {
+            json!({
+                "type":"tool_rendered", "id":id,
+                "rendered": pi_rs::RenderedTool::default(),
+            })
+        };
+        assert!(!view.receive_tool_render(response(request)));
+        assert!(view.tool_render_pending.is_none());
+
+        let started = crate::backend::ToolRenderRecords {
+            started: Some(2),
+            ..original
+        };
+        let request = uuid::Uuid::new_v4();
+        view.tool_render_attempted
+            .insert(operation.clone(), started);
+        view.tool_render_pending = Some(super::PendingToolRender {
+            request,
+            operation: operation.clone(),
+            records: started,
+            retried: false,
+        });
+        assert!(!view.receive_tool_render(json!({"id":request,"rendered":null})));
+        assert_eq!(view.tool_render_retry.remove(&operation), Some(started));
+        assert!(!view.tool_render_attempted.contains_key(&operation));
+
+        let request = uuid::Uuid::new_v4();
+        view.tool_render_attempted
+            .insert(operation.clone(), started);
+        view.tool_render_pending = Some(super::PendingToolRender {
+            request,
+            operation,
+            records: started,
+            retried: true,
+        });
+        view.regular.committed = 1;
+        assert!(view.receive_tool_render(response(request)));
+        assert!(matches!(
+            &view.lines[0],
+            super::Entry::Tool {
+                rendered: Some(_),
+                ..
+            }
+        ));
+        assert!(view.custom_render_redraw_at.is_some());
     }
 
     #[test]
