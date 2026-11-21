@@ -3048,6 +3048,8 @@ CLI's ignore-file behavior instead of unconditionally excluding `node_modules`
 and `.git`. Git ignore rules also apply outside repositories. Basename patterns
 use smart case; patterns containing a slash match full paths with the reference's
 implicit `**/` prefix. Results use forward slashes and sorted output.
+Unrestricted local `find` uses fd's diagnostics for missing or non-directory
+search roots and invalid glob patterns. Search-root validation comes first.
 
 Result and byte limits use the reference CLI's combined notices and complete-line
 50 KB cutoff. Tests cover directories, case-sensitive uppercase patterns,
