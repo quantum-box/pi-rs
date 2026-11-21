@@ -3749,6 +3749,16 @@ impl Agent<'_> {
                 invocation.operation_id,
                 "recovered_tool_result",
             );
+            let message_hooks = (!is_programmatic_tool(session, &invocation))
+                .then(|| {
+                    crate::message_hooks::MessageHooks::for_states(
+                        self.registry,
+                        states,
+                        self.limits.model_timeout,
+                    )
+                })
+                .flatten()
+                .map(|hooks| (hooks, self.tool_output_limit(session, &invocation)));
             let mut errors = Vec::new();
             let mut collect = |event: Notification<'_>| {
                 if let Notification::ExtensionLifecycleError {
@@ -3785,6 +3795,15 @@ impl Agent<'_> {
                         Some(result_host),
                     )
                     .await;
+                    if let Some((mut hooks, max_output_bytes)) = message_hooks {
+                        if let Some(outcome) = hooks
+                            .tool(&invocation.call.id, &reply.outcome, max_output_bytes)
+                            .await
+                        {
+                            reply.outcome = outcome;
+                        }
+                        hooks.report_errors(&mut collect);
+                    }
                     Ok::<_, Error>(reply)
                 };
                 tokio::pin!(future);
@@ -3843,6 +3862,21 @@ impl Agent<'_> {
         .await;
     }
 
+    fn tool_output_limit(&self, session: &Session, invocation: &Invocation) -> usize {
+        // Programmatic results remain in the journal but are not injected into
+        // model context. Leave room for a 1 MiB string and its JSON escaping.
+        if is_programmatic_tool(session, invocation) {
+            8 * 1024 * 1024
+        } else {
+            self.registry
+                .tools
+                .get(&invocation.call.name)
+                .map_or(1024 * 1024, |tool| {
+                    tool.tool.output_limit().min(8 * 1024 * 1024)
+                })
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn finish_tool(
         &self,
@@ -3858,79 +3892,8 @@ impl Agent<'_> {
             outcome,
             state: update,
         } = reply;
-        // Programmatic results remain in the journal but are not injected into
-        // model context. Leave room for a 1 MiB string and its JSON escaping.
-        let max_output_bytes = if session.records().iter().any(|record| {
-            matches!(&record.event, Event::ToolPlanned { invocation: nested, .. } if nested.operation_id == invocation.operation_id)
-        }) {
-            8 * 1024 * 1024
-        } else {
-            self.registry.tools.get(&invocation.call.name)
-                .map_or(1024 * 1024, |tool| tool.tool.output_limit().min(8 * 1024 * 1024))
-        };
-        let outcome = match outcome {
-            Outcome::Succeeded(output) if output.len() > max_output_bytes => Outcome::Truncated {
-                original_bytes: output.len(),
-            },
-            outcome @ Outcome::SucceededWithDetails { .. } => {
-                let size = serde_json::to_vec(&outcome)?.len();
-                if size > max_output_bytes {
-                    Outcome::Truncated {
-                        original_bytes: size,
-                    }
-                } else {
-                    outcome
-                }
-            }
-            outcome @ (Outcome::TextResult { .. }
-            | Outcome::TextResultWithStructuredContent { .. }) => {
-                let size = serde_json::to_vec(&outcome)?.len();
-                if size > max_output_bytes {
-                    Outcome::TextResult {
-                        output: format!("Tool output omitted ({size} bytes exceeded the limit)."),
-                        details: None,
-                        is_error: outcome.is_error(),
-                    }
-                } else {
-                    outcome
-                }
-            }
-            outcome @ Outcome::Structured { .. } => {
-                let size = outcome.tool_content().len();
-                if size > max_output_bytes {
-                    Outcome::Truncated {
-                        original_bytes: size,
-                    }
-                } else {
-                    outcome
-                }
-            }
-            outcome @ Outcome::StructuredWithDetails { .. } => {
-                let size = serde_json::to_vec(&outcome)?.len();
-                if size > max_output_bytes {
-                    Outcome::Truncated {
-                        original_bytes: size,
-                    }
-                } else {
-                    outcome
-                }
-            }
-            Outcome::Failed(reason) if reason.len() > max_output_bytes => {
-                Outcome::Failed("failure detail exceeds size limit".into())
-            }
-            Outcome::Skipped(reason) if reason.len() > max_output_bytes => {
-                Outcome::Skipped("skip detail exceeds size limit".into())
-            }
-            Outcome::Unknown(reason) if reason.len() > max_output_bytes => {
-                Outcome::Unknown("uncertain result detail exceeds size limit".into())
-            }
-            Outcome::Pending { reference }
-                if reference.trim().is_empty() || reference.len() > 1024 =>
-            {
-                Outcome::Unknown("tool returned an invalid operation reference".into())
-            }
-            outcome => outcome,
-        };
+        let max_output_bytes = self.tool_output_limit(session, invocation);
+        let outcome = bound_tool_outcome(outcome, max_output_bytes)?;
         let operation_id = invocation.operation_id;
         let event_metadata = if allow_event_metadata {
             self.registry
@@ -7149,6 +7112,76 @@ fn commit_compaction_record(
         observer(Notification::Committed(record))
     });
     Ok(())
+}
+
+fn is_programmatic_tool(session: &Session, invocation: &Invocation) -> bool {
+    session.records().iter().any(|record| {
+        matches!(&record.event, Event::ToolPlanned { invocation: nested, .. } if nested.operation_id == invocation.operation_id)
+    })
+}
+
+pub(crate) fn bound_tool_outcome(outcome: Outcome, max_output_bytes: usize) -> Result<Outcome> {
+    Ok(match outcome {
+        Outcome::Succeeded(output) if output.len() > max_output_bytes => Outcome::Truncated {
+            original_bytes: output.len(),
+        },
+        outcome @ Outcome::SucceededWithDetails { .. } => {
+            let size = serde_json::to_vec(&outcome)?.len();
+            if size > max_output_bytes {
+                Outcome::Truncated {
+                    original_bytes: size,
+                }
+            } else {
+                outcome
+            }
+        }
+        outcome
+        @ (Outcome::TextResult { .. } | Outcome::TextResultWithStructuredContent { .. }) => {
+            let size = serde_json::to_vec(&outcome)?.len();
+            if size > max_output_bytes {
+                Outcome::TextResult {
+                    output: format!("Tool output omitted ({size} bytes exceeded the limit)."),
+                    details: None,
+                    is_error: outcome.is_error(),
+                }
+            } else {
+                outcome
+            }
+        }
+        outcome @ Outcome::Structured { .. } => {
+            let size = outcome.tool_content().len();
+            if size > max_output_bytes {
+                Outcome::Truncated {
+                    original_bytes: size,
+                }
+            } else {
+                outcome
+            }
+        }
+        outcome @ Outcome::StructuredWithDetails { .. } => {
+            let size = serde_json::to_vec(&outcome)?.len();
+            if size > max_output_bytes {
+                Outcome::Truncated {
+                    original_bytes: size,
+                }
+            } else {
+                outcome
+            }
+        }
+        Outcome::Failed(reason) if reason.len() > max_output_bytes => {
+            Outcome::Failed("failure detail exceeds size limit".into())
+        }
+        Outcome::Skipped(reason) if reason.len() > max_output_bytes => {
+            Outcome::Skipped("skip detail exceeds size limit".into())
+        }
+        Outcome::Unknown(reason) if reason.len() > max_output_bytes => {
+            Outcome::Unknown("uncertain result detail exceeds size limit".into())
+        }
+        Outcome::Pending { reference } if reference.trim().is_empty() || reference.len() > 1024 => {
+            Outcome::Unknown("tool returned an invalid operation reference".into())
+        }
+        outcome => outcome,
+    })
 }
 
 // Serialize cancellation's snapshot read with the durable append and publication.

@@ -4402,6 +4402,14 @@ registry refreshed for that turn.
 Rust hosts applying queued inputs outside a run can await
 `Agent::apply_queued_inputs_with_lifecycle` to dispatch these hooks.
 
+Model-facing tool results emit `message_start` and `message_end` after
+tool-result transformations and before the completed result is saved. The
+same record carries the edited text and the tool's state update. A text edit
+retains the call ID, error status, details and attachments, including non-text
+blocks in a structured result. Native `tool_execution_end` follows the
+journal commit. Programmatic tools and outcomes awaiting polling or
+reconciliation do not emit a model-facing result at that point.
+
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and

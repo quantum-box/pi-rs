@@ -2482,6 +2482,23 @@ impl Agent<'_> {
                     unreachable!()
                 };
                 let outcome = Outcome::Skipped(reason);
+                if calls[index].lane.is_none()
+                    && let Some(mut hooks) = crate::message_hooks::MessageHooks::for_states(
+                        self.registry,
+                        states,
+                        self.limits.model_timeout,
+                    )
+                {
+                    let invocation = &calls[index].invocation;
+                    hooks
+                        .tool(
+                            &invocation.call.id,
+                            &outcome,
+                            self.tool_output_limit(session, invocation),
+                        )
+                        .await;
+                    hooks.report_errors(observer);
+                }
                 commit_with_reply(
                     session,
                     Event::ToolFinished {
@@ -2531,6 +2548,16 @@ impl Agent<'_> {
                     invocation.operation_id,
                     "recovered_tool_result",
                 );
+                let message_hooks = if calls[index].lane.is_none() {
+                    crate::message_hooks::MessageHooks::for_states(
+                        &registry,
+                        &snapshot,
+                        self.limits.model_timeout,
+                    )
+                } else {
+                    None
+                }
+                .map(|hooks| (hooks, self.tool_output_limit(session, &invocation)));
                 let future = async move {
                     let mut errors = Vec::new();
                     let mut collect = |event: Notification<'_>| {
@@ -2554,6 +2581,15 @@ impl Agent<'_> {
                         Some(hook_host),
                     )
                     .await;
+                    if let Some((mut hooks, output_limit)) = message_hooks {
+                        if let Some(outcome) = hooks
+                            .tool(&invocation.call.id, &reply.outcome, output_limit)
+                            .await
+                        {
+                            reply.outcome = outcome;
+                        }
+                        hooks.report_errors(&mut collect);
+                    }
                     TurnEvent::Transformed(index, reply, duration, errors, replaced)
                 }
                 .boxed();
