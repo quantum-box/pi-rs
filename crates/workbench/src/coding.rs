@@ -6252,6 +6252,14 @@ mod tests {
                 json!([{"oldText":"c","newText":"C\nD"}]),
                 "a\nb\rC\nD",
             ),
+            (
+                "head\r\na\n“b” tail\r\n",
+                json!([
+                    {"oldText":"a\n\"b\"","newText":"x"},
+                    {"oldText":"tail","newText":"Y\nZ"}
+                ]),
+                "head\r\nx Y\nZ\n",
+            ),
         ] {
             std::fs::write(&path, original).unwrap();
             tool.edit(&json!({"path":"mixed.txt","edits":edits}))
