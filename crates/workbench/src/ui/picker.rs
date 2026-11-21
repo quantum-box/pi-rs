@@ -76,6 +76,24 @@ pub enum TreeEntryKind {
     Hidden,
 }
 
+/// The heading and body carry independent theme roles in the session tree.
+pub struct TreeDescription {
+    pub heading: String,
+    pub heading_role: &'static str,
+    pub body: String,
+    pub body_role: &'static str,
+}
+
+impl TreeDescription {
+    fn spans(&self, theme: &Theme, selected: bool) -> [super::render::Span; 2] {
+        let mut heading = super::render::Span::themed(&self.heading, theme, self.heading_role);
+        let mut body = super::render::Span::themed(&self.body, theme, self.body_role);
+        heading.bold = selected;
+        body.bold = selected;
+        [heading, body]
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TreeFilter {
     Default,
@@ -584,6 +602,15 @@ impl Picker {
         picker.focus_record(head);
         picker
     }
+    pub fn set_tree_descriptions(
+        &mut self,
+        descriptions: std::collections::BTreeMap<u64, TreeDescription>,
+    ) {
+        if let Some(tree) = &mut self.tree {
+            tree.descriptions = descriptions;
+        }
+    }
+
     pub fn set_label_timestamps(&mut self, timestamps: std::collections::BTreeMap<u64, String>) {
         if let Some(tree) = &mut self.tree {
             tree.label_timestamps = timestamps;
@@ -1217,19 +1244,13 @@ impl Picker {
                     continue;
                 };
                 let marker = if tree.active_path.contains(&id) { 2 } else { 0 };
-                let timestamp = if tree.show_label_timestamps {
-                    tree.label_timestamps
-                        .get(&id)
-                        .map_or(0, |value| format_label_timestamp(value).width() + 1)
-                } else {
-                    0
-                };
                 let anchor = prefix.width().saturating_add(marker);
-                max_body = max_body.max(
-                    anchor
-                        .saturating_add(timestamp)
-                        .saturating_add(super::render::clean(&item.label).width()),
-                );
+                let text_width = tree
+                    .description_spans(id, item, theme, index == self.selected)
+                    .iter()
+                    .map(|span| span.text.width())
+                    .sum::<usize>();
+                max_body = max_body.max(anchor.saturating_add(text_width));
                 if index == self.selected {
                     selected_anchor = Some(anchor);
                 }
@@ -1275,34 +1296,19 @@ impl Picker {
                 (&self.tree, &tree_layout, &item.selection)
             {
                 let selected = index == self.selected;
-                let timestamp = if tree.show_label_timestamps {
-                    tree.label_timestamps
-                        .get(id)
-                        .map_or_else(String::new, |timestamp| {
-                            format!("{} ", format_label_timestamp(timestamp))
-                        })
-                } else {
-                    String::new()
-                };
                 let prefix = &layout.rows[id];
                 let viewport = width.saturating_sub(2);
                 let prefix_text = prefix.slice(&layout.gutters, tree_scroll, viewport);
-                let suffix = [
-                    super::render::Span::themed(
-                        if tree.active_path.contains(id) {
-                            "• "
-                        } else {
-                            ""
-                        },
-                        theme,
-                        "accent",
-                    ),
-                    super::render::Span::themed(
-                        format!("{timestamp}{}", item.label),
-                        theme,
-                        "text",
-                    ),
-                ];
+                let mut suffix = vec![super::render::Span::themed(
+                    if tree.active_path.contains(id) {
+                        "• "
+                    } else {
+                        ""
+                    },
+                    theme,
+                    "accent",
+                )];
+                suffix.extend(tree.description_spans(*id, item, theme, selected));
                 let mut spans = vec![super::render::Span::themed(
                     if selected { "› " } else { "  " },
                     theme,
@@ -1698,6 +1704,7 @@ struct TreeState {
     parents: std::collections::BTreeMap<u64, Option<u64>>,
     children: std::collections::BTreeMap<u64, Vec<u64>>,
     labels: std::collections::BTreeMap<u64, String>,
+    descriptions: std::collections::BTreeMap<u64, TreeDescription>,
     label_timestamps: std::collections::BTreeMap<u64, String>,
     show_label_timestamps: bool,
     last_filter_focus: u64,
@@ -1853,6 +1860,7 @@ impl TreeState {
             parents,
             children,
             labels,
+            descriptions: Default::default(),
             label_timestamps: Default::default(),
             show_label_timestamps: false,
             last_filter_focus: head,
@@ -1983,6 +1991,33 @@ impl TreeState {
             rows: result,
             gutters: gutter_arena,
         }
+    }
+
+    fn description_spans(
+        &self,
+        id: u64,
+        item: &Item,
+        theme: &Theme,
+        selected: bool,
+    ) -> Vec<super::render::Span> {
+        use super::render::Span;
+
+        let mut spans = Vec::new();
+        if let Some(label) = self.labels.get(&id).filter(|label| !label.is_empty()) {
+            spans.push(Span::themed(format!("[{label}] "), theme, "warning"));
+            if self.show_label_timestamps
+                && let Some(timestamp) = self.label_timestamps.get(&id)
+            {
+                let timestamp = format_label_timestamp(timestamp);
+                spans.push(Span::themed(format!("{timestamp} "), theme, "muted"));
+            }
+        }
+        if let Some(description) = self.descriptions.get(&id) {
+            spans.extend(description.spans(theme, selected));
+        } else {
+            spans.push(Span::themed(&item.label, theme, "text"));
+        }
+        spans
     }
 
     fn passes_filter(&self, id: u64) -> bool {

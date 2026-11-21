@@ -2453,8 +2453,12 @@ journal lock before restoring the view.
 
 Unit tests and fullscreen/regular PTY fixtures cover branch navigation,
 folding, search, labels, checkout and terminal restoration. Session and queue
-selector regressions pass. Tree timestamps and richer branch summaries remain
-in the outstanding session work.
+selector regressions pass. Tree rows show themed user and assistant roles, tool calls, shell commands,
+custom messages, branch summaries, and compaction token counts. Selected
+content is bold, and labels and their optional local timestamps have separate
+theme roles. Native record IDs remain searchable for direct checkout. Custom
+messages and imported compaction summaries can be copied from the tree.
+Message preview and navigation gaps remain in the Sessions row.
 
 ### Package identity checkpoint
 

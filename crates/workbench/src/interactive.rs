@@ -10,9 +10,7 @@ use crate::ui::{
     keys::Keys,
     mermaid::Mermaid,
     mouse_selection::MouseSelection,
-    picker::{
-        Input, Item, MouseInput, Picker, Selection, ThemeSettingsAction, TreeEntryKind, TreeFilter,
-    },
+    picker::{Input, Item, MouseInput, Picker, Selection, ThemeSettingsAction, TreeFilter},
     render::{Entry, Line, SummaryKind, ToolPart, TranscriptOptions},
     theme::{Theme, ThemeWatcher},
     transcript_search::Search,
@@ -3843,80 +3841,9 @@ fn slash(
         }
         "/tree" => {
             let session = Session::open(&args.session)?;
-            let labels = session.labels();
-            let items = session
-                .records()
-                .iter()
-                .filter(|record| !matches!(record.event, pi_rs::Event::Checkout { .. }))
-                .map(|record| {
-                    let description = match &record.event {
-                        pi_rs::Event::User { content, .. }
-                        | pi_rs::Event::UserWithImages { content, .. }
-                        | pi_rs::Event::Assistant { content, .. } => {
-                            content.chars().take(70).collect::<String>()
-                        }
-                        pi_rs::Event::BranchSummary { summary, .. } => format!(
-                            "Branch summary: {}",
-                            summary.chars().take(56).collect::<String>()
-                        ),
-                        pi_rs::Event::CompactionSummaryMessage { summary, .. } => format!(
-                            "Compaction: {}",
-                            summary.chars().take(58).collect::<String>()
-                        ),
-                        _ => super::metadata(record)["event"]
-                            .as_str()
-                            .unwrap_or("record")
-                            .into(),
-                    };
-                    Item {
-                        label: format!(
-                            "{} {} {}",
-                            record.id,
-                            labels.get(&record.id).map(String::as_str).unwrap_or(""),
-                            description
-                        ),
-                        selection: Selection::Checkout(record.id),
-                    }
-                })
-                .collect();
-            let head = session.head();
-            let entries = session
-                .records()
-                .iter()
-                .filter(|record| !matches!(record.event, pi_rs::Event::Checkout { .. }))
-                .map(|record| {
-                    let kind = match &record.event {
-                        pi_rs::Event::User { .. } | pi_rs::Event::UserWithImages { .. } => {
-                            TreeEntryKind::User
-                        }
-                        pi_rs::Event::ToolFinished { .. }
-                        | pi_rs::Event::ToolReconciled { .. }
-                        | pi_rs::Event::ImportedUnattributedToolResult { .. } => {
-                            TreeEntryKind::Tool
-                        }
-                        pi_rs::Event::Assistant { content, .. }
-                            if content.trim().is_empty() && record.id != head =>
-                        {
-                            TreeEntryKind::Hidden
-                        }
-                        pi_rs::Event::Assistant { .. }
-                        | pi_rs::Event::BashExecution { .. }
-                        | pi_rs::Event::Compacted { .. }
-                        | pi_rs::Event::CompactionSummaryMessage { .. }
-                        | pi_rs::Event::BranchSummary { .. } => TreeEntryKind::Message,
-                        pi_rs::Event::ModelFinished {
-                            failure: Some(_), ..
-                        } => TreeEntryKind::Message,
-                        _ => TreeEntryKind::Bookkeeping,
-                    };
-                    (record.id, (record.parent, kind))
-                })
-                .collect();
             let filter =
                 TreeFilter::parse(args.settings.string("treeFilterMode").unwrap_or("default"));
-            let mut picker = Picker::tree(items, entries, labels, head, filter);
-            picker.set_label_timestamps(session.label_timestamps());
-            view.picker = Some(picker);
+            view.picker = Some(session_tree::picker(&session, filter));
         }
         "/checkout" => {
             let id = rest
@@ -8001,6 +7928,7 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
 
 #[cfg(unix)]
 mod editor_pty;
+mod session_tree;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExternalEditorTarget {
