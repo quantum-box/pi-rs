@@ -1502,7 +1502,7 @@ impl Tool for RemoteEditTool {
         self.tool.output_limit()
     }
     async fn prepare_arguments(&self, arguments: Value) -> pi_rs::ExtensionResult<Value> {
-        self.tool.prepare_arguments(arguments).await
+        crate::text_edit::prepare_arguments(arguments).map_err(edit_error_text)
     }
     async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
         let result = async {
@@ -2227,7 +2227,18 @@ impl Tool for CodingTool {
         }
     }
 
-    async fn prepare_arguments(&self, arguments: Value) -> pi_rs::ExtensionResult<Value> {
+    async fn prepare_arguments(&self, mut arguments: Value) -> pi_rs::ExtensionResult<Value> {
+        if self.unrestricted {
+            if matches!(self.kind, Kind::Edit)
+                && let Some(edits) = arguments.get_mut("edits")
+                && let Some(encoded) = edits.as_str()
+                && let Ok(decoded @ (Value::Array(_) | Value::Object(_))) =
+                    serde_json::from_str(encoded)
+            {
+                *edits = decoded;
+            }
+            coerce_local_tool_argument(&mut arguments, &self.spec().parameters);
+        }
         if matches!(self.kind, Kind::Edit) {
             crate::text_edit::prepare_arguments(arguments).map_err(edit_error_text)
         } else {
@@ -2312,11 +2323,20 @@ impl Tool for CodingTool {
         _state: Option<&pi_rs::ExtensionState>,
         host: Arc<dyn ToolHost>,
     ) -> Outcome {
-        if matches!(self.kind, Kind::Bash | Kind::PowerShell) {
+        let outcome = if matches!(self.kind, Kind::Bash | Kind::PowerShell) {
             self.bash_with_host(&args, &context.cancellation, Some(host))
                 .await
         } else {
             self.invoke(args, context).await
+        };
+        // Pi reports the tool's diagnostic as model-facing text with a separate error bit.
+        match outcome {
+            Outcome::Failed(output) if self.unrestricted => Outcome::TextResult {
+                output,
+                details: None,
+                is_error: true,
+            },
+            outcome => outcome,
         }
     }
 
@@ -2482,6 +2502,142 @@ fn is_unix_access_denied(_error: &std::io::Error) -> bool {
     false
 }
 
+// These are the scalar and container types advertised by the local tool specs.
+fn coerce_local_tool_argument(value: &mut Value, schema: &Value) {
+    match schema["type"].as_str() {
+        Some("object") => {
+            let (Some(object), Some(properties)) =
+                (value.as_object_mut(), schema["properties"].as_object())
+            else {
+                return;
+            };
+            let required = schema["required"].as_array();
+            for (key, property) in properties {
+                if object.get(key) == Some(&Value::Null)
+                    && !required
+                        .is_some_and(|fields| fields.iter().any(|field| field == key.as_str()))
+                {
+                    object.remove(key);
+                } else if let Some(member) = object.get_mut(key) {
+                    coerce_local_tool_argument(member, property);
+                }
+            }
+        }
+        Some("array") => {
+            if !value.is_array() {
+                *value = Value::Array(vec![value.take()]);
+            }
+            if let Some(values) = value.as_array_mut() {
+                for item in values {
+                    coerce_local_tool_argument(item, &schema["items"]);
+                }
+            }
+        }
+        Some("string") => {
+            let converted = match value {
+                Value::Bool(boolean) => Some(boolean.to_string()),
+                Value::Number(number) => number.as_f64().map(js_number),
+                Value::Null => Some("null".into()),
+                _ => None,
+            };
+            if let Some(converted) = converted {
+                *value = Value::String(converted);
+            }
+        }
+        Some(kind @ ("number" | "integer")) if !value.is_number() || kind == "integer" => {
+            let parsed = match value {
+                Value::Bool(boolean) => Some(u8::from(*boolean).into()),
+                Value::Null => Some(0.0),
+                Value::String(text) => parse_local_tool_number(text),
+                Value::Number(number) if number.is_f64() => number.as_f64(),
+                _ => None,
+            };
+            if let Some(number) = parsed {
+                *value = if kind == "integer"
+                    && number.fract() == 0.0
+                    && (0.0..u64::MAX as f64).contains(&number)
+                {
+                    json!(number as u64)
+                } else {
+                    json!(number)
+                };
+            }
+        }
+        Some("boolean") => {
+            let converted = match value {
+                Value::String(text) if text == "1" || text.eq_ignore_ascii_case("true") => {
+                    Some(true)
+                }
+                Value::String(text) if text == "0" || text.eq_ignore_ascii_case("false") => {
+                    Some(false)
+                }
+                Value::Number(number) if number.as_f64() == Some(1.0) => Some(true),
+                Value::Number(number) if number.as_f64() == Some(0.0) => Some(false),
+                Value::Null => Some(false),
+                _ => None,
+            };
+            if let Some(converted) = converted {
+                *value = Value::Bool(converted);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_local_tool_number(text: &str) -> Option<f64> {
+    let trimmed = text.trim_matches(is_ecmascript_whitespace);
+    if trimmed.is_empty() {
+        return Some(0.0);
+    }
+    let radix = match trimmed.get(..2) {
+        Some("0b" | "0B") => Some(2),
+        Some("0o" | "0O") => Some(8),
+        Some("0x" | "0X") => Some(16),
+        _ => None,
+    };
+    if let Some(radix) = radix {
+        let digits = &trimmed[2..];
+        if digits.is_empty() || !digits.chars().all(|digit| digit.is_digit(radix)) {
+            return None;
+        }
+        let digits = digits.trim_start_matches('0');
+        if digits.is_empty() {
+            return Some(0.0);
+        }
+        let bits_per_digit = radix.trailing_zeros() as usize;
+        let (prefix, suffix) = digits.split_at(digits.len().min(128 / bits_per_digit));
+        let shift = suffix.len().saturating_mul(bits_per_digit);
+        if shift >= 1024 {
+            return None;
+        }
+        // Keep a sticky bit so the cast rounds correctly when digits were discarded.
+        let prefix = u128::from_str_radix(prefix, radix).ok()?;
+        let sticky = suffix.bytes().any(|digit| digit != b'0');
+        let number = (prefix | u128::from(sticky)) as f64 * 2.0_f64.powi(shift as i32);
+        return number.is_finite().then_some(number);
+    }
+    if let Ok(number) = trimmed.parse::<f64>()
+        && number.is_finite()
+    {
+        return Some(number);
+    }
+    if text.eq_ignore_ascii_case("true") {
+        return Some(1.0);
+    }
+    if text.eq_ignore_ascii_case("false") {
+        return Some(0.0);
+    }
+    let bigint = text.strip_suffix('n')?;
+    let digits = bigint.strip_prefix('-').unwrap_or(bigint);
+    if digits == "0"
+        || (!digits.starts_with('0') && digits.bytes().all(|digit| digit.is_ascii_digit()))
+    {
+        let number: i64 = bigint.parse().ok()?;
+        return (number.unsigned_abs() <= 9_007_199_254_740_991).then_some(number as f64);
+    }
+    None
+}
+
 // Pi parses JSON numbers as JavaScript doubles and formats them using Number.toString.
 fn local_numeric_limit(args: &Value, default: f64) -> f64 {
     args.get("limit").and_then(Value::as_f64).unwrap_or(default)
@@ -2502,6 +2658,41 @@ fn fd_numeric_limit(value: f64) -> std::result::Result<usize, String> {
     Err(format!(
         "error: invalid value '{text}' for '--max-results <count>': {reason}\n\nFor more information, try '--help'."
     ))
+}
+
+fn grep_glob_overrides(
+    root: &Path,
+    glob: &str,
+    unrestricted: bool,
+) -> Result<ignore::overrides::Override> {
+    let normalized = if unrestricted {
+        // Directory globs are rooted at the search directory. Strip explicit
+        // current-directory markers after any negation marker as well.
+        let (negation, pattern) = glob
+            .strip_prefix('!')
+            .map_or(("", glob), |pattern| ("!", pattern));
+        let pattern = pattern.trim_start_matches("./");
+        if negation.is_empty() {
+            std::borrow::Cow::Borrowed(pattern)
+        } else {
+            std::borrow::Cow::Owned(format!("{negation}{pattern}"))
+        }
+    } else {
+        std::borrow::Cow::Borrowed(glob)
+    };
+    let mut builder = ignore::overrides::OverrideBuilder::new(root);
+    builder
+        .add(&normalized)
+        .and_then(|builder| builder.build())
+        .map_err(|error| {
+            Error::Config(match error {
+                ignore::Error::Glob { glob: Some(_), err } if unrestricted => {
+                    format!("rg: error parsing glob '{glob}': {err}")
+                }
+                error if unrestricted => format!("rg: {error}"),
+                error => error.to_string(),
+            })
+        })
 }
 
 impl CodingTool {
@@ -2546,8 +2737,8 @@ impl CodingTool {
                     "EACCES: permission denied, access '{}'",
                     path.display()
                 ))
-            } else if error.kind() == std::io::ErrorKind::NotFound
-                && matches!(self.kind, Kind::Grep | Kind::List)
+            } else if matches!(self.kind, Kind::Grep | Kind::List)
+                && (self.unrestricted || error.kind() == std::io::ErrorKind::NotFound)
             {
                 Error::Config(format!("Path not found: {}", path.display()))
             } else {
@@ -3152,6 +3343,20 @@ impl CodingTool {
         } else {
             None
         };
+        let grep_glob = (!is_find).then(|| args["glob"].as_str()).flatten();
+        let overrides = if self.unrestricted
+            && let Some(glob) = grep_glob.filter(|glob| !glob.is_empty())
+        {
+            // Ripgrep builds its glob filter before compiling the regex.
+            let root = if grep_file_name.is_some() {
+                Path::new(".")
+            } else {
+                &base
+            };
+            Some(grep_glob_overrides(root, glob, true)?)
+        } else {
+            None
+        };
         let mut grep = if is_find {
             None
         } else {
@@ -3209,34 +3414,12 @@ impl CodingTool {
                 // next sibling: this is the same global order as sorting the
                 // selected full paths afterwards.
                 .sort_by_file_path(std::path::Path::cmp);
-        } else if let Some(glob) = args["glob"].as_str() {
-            // Pi runs directory searches from the search directory and strips
-            // leading ./ components, including after a negation marker. File
-            // searches retain ripgrep's existing explicit-file behavior.
-            let glob_root = match (self.unrestricted, grep_file_name.is_some()) {
-                (false, _) => &self.root,
-                (true, true) => Path::new("."),
-                (true, false) => &base,
-            };
-            let glob = if self.unrestricted {
-                let (negation, pattern) = glob
-                    .strip_prefix('!')
-                    .map_or(("", glob), |pattern| ("!", pattern));
-                let pattern = pattern.trim_start_matches("./");
-                if negation.is_empty() {
-                    std::borrow::Cow::Borrowed(pattern)
-                } else {
-                    std::borrow::Cow::Owned(format!("{negation}{pattern}"))
-                }
-            } else {
-                std::borrow::Cow::Borrowed(glob)
-            };
-            let mut overrides = ignore::overrides::OverrideBuilder::new(glob_root);
-            let overrides = overrides
-                .add(&glob)
-                .and_then(|builder| builder.build())
-                .map_err(|error| Error::Config(error.to_string()))?;
+        } else if let Some(overrides) = overrides {
             walker.overrides(overrides);
+        } else if !self.unrestricted
+            && let Some(glob) = grep_glob
+        {
+            walker.overrides(grep_glob_overrides(&self.root, glob, false)?);
         }
         let mut find_error = None;
         for entry in walker.build() {
@@ -4962,6 +5145,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_tool_argument_coercion_stays_within_the_unrestricted_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let args = json!({
+            "pattern": 42,
+            "path": null,
+            "ignoreCase": "TRUE",
+            "literal": 1,
+            "limit": "1.5",
+            "context": "0x2",
+        });
+        let prepared = tool.prepare_arguments(args.clone()).await.unwrap();
+        assert_eq!(
+            prepared,
+            json!({"pattern":"42", "ignoreCase":true, "literal":true, "limit":1.5, "context":2})
+        );
+        assert!(
+            jsonschema::validator_for(&tool.spec().parameters)
+                .unwrap()
+                .is_valid(&prepared)
+        );
+        tool.unrestricted = false;
+        assert_eq!(tool.prepare_arguments(args.clone()).await.unwrap(), args);
+
+        tool.unrestricted = true;
+        tool.kind = Kind::Edit;
+        let prepared = tool
+            .prepare_arguments(json!({"path":true,"edits":"[{\"oldText\":42,\"newText\":null}]"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared,
+            json!({"path":"true", "edits":[{"oldText":"42","newText":"null"}]})
+        );
+    }
+
+    #[test]
+    fn local_tool_numeric_strings_follow_javascript_conversion() {
+        for (input, expected) in [
+            ("", Some(0.0)),
+            ("\u{feff} 4.5e1 ", Some(45.0)),
+            ("0Xf", Some(15.0)),
+            ("0b10", Some(2.0)),
+            ("0o10", Some(8.0)),
+            ("1n", Some(1.0)),
+            ("-1n", Some(-1.0)),
+            ("FALSE", Some(0.0)),
+            (" true ", None),
+            ("0x+1", None),
+            ("-0x10", None),
+            ("01n", None),
+            ("9007199254740992n", None),
+            ("1e400", None),
+        ] {
+            assert_eq!(parse_local_tool_number(input), expected, "{input}");
+        }
+        // A radix value just above a halfway point must round up even when its
+        // lowest set bit falls outside the integer prefix.
+        let long = format!("0b1{}1{}1", "0".repeat(52), "0".repeat(80));
+        assert_eq!(
+            parse_local_tool_number(&long),
+            Some(2.0_f64.powi(134) + 2.0_f64.powi(82))
+        );
+    }
+
+    #[tokio::test]
     async fn unrestricted_grep_numeric_limits_through_dispatch() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("fixture"), "needle\n".repeat(4)).unwrap();
@@ -4997,8 +5251,17 @@ mod tests {
                 "2.5 matches limit reached. Use limit=5",
                 json!(2.5),
             ),
+            (
+                json!("0b10"),
+                2,
+                "2 matches limit reached. Use limit=4",
+                json!(2.0),
+            ),
         ] {
-            let args = json!({"pattern":"needle", "limit":limit, "context":1});
+            let args = tool
+                .prepare_arguments(json!({"pattern":"needle", "limit":limit, "context":1}))
+                .await
+                .unwrap();
             assert!(validator.is_valid(&args));
             let outcome = tool
                 .invoke(
@@ -5067,11 +5330,15 @@ mod tests {
         assert!(!output.contains("file.txt:2:"));
         for kind in [Kind::Grep, Kind::List] {
             tool.kind = kind;
-            let output = tool
-                .invoke(json!({"pattern": "match", "path": "missing"}), context())
-                .await;
-            assert!(matches!(output, Outcome::Failed(message)
-                    if message == format!("Path not found: {}", root.join("missing").display())));
+            for path in ["missing", "file.txt/child"] {
+                let mut args = json!({"path": path});
+                if matches!(kind, Kind::Grep) {
+                    args["pattern"] = json!("match");
+                }
+                let output = tool.invoke(args, context()).await;
+                assert!(matches!(output, Outcome::Failed(message)
+                        if message == format!("Path not found: {}", root.join(path).display())));
+            }
         }
         tool.kind = Kind::Read {
             auto_resize: true,
@@ -5097,6 +5364,43 @@ mod tests {
             tool.kind = kind;
             let output = tool.invoke(json!({"pattern": "match"}), context()).await;
             assert!(matches!(output, Outcome::Failed(message) if message == "Operation aborted"));
+        }
+    }
+
+    #[tokio::test]
+    async fn unrestricted_grep_reports_ripgrep_glob_errors_before_regex_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), "needle").unwrap();
+        let grep = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::nil(),
+            cancellation: pi_rs::CancellationToken::new(),
+        };
+        for (glob, path, pattern) in [
+            ("[abc", ".", "needle"),
+            ("![abc", ".", "needle"),
+            ("./[abc", ".", "needle"),
+            ("[abc", "file.txt", "needle"),
+            ("[abc", ".", "["),
+        ] {
+            let outcome = grep
+                .invoke(
+                    json!({"pattern":pattern, "path":path, "glob":glob}),
+                    context(),
+                )
+                .await;
+            let expected =
+                format!("rg: error parsing glob '{glob}': unclosed character class; missing ']'");
+            assert!(
+                matches!(&outcome, Outcome::Failed(message) if *message == expected),
+                "{outcome:?}"
+            );
         }
     }
 
