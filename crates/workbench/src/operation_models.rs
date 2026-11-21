@@ -1539,15 +1539,13 @@ mod tests {
             .iter()
             .filter(|entry| entry.provider == "llama.cpp")
         {
-            let headers = operations.request_headers(entry, &keys).await;
+            let target = operations.request_target(entry, &keys).await;
             if entry.model.id == "decision" {
-                assert!(
-                    !headers
-                        .unwrap()
-                        .contains_key(reqwest::header::AUTHORIZATION)
-                );
+                let (endpoint, headers) = target.unwrap();
+                assert_eq!(endpoint, entry.endpoint);
+                assert!(!headers.contains_key(reqwest::header::AUTHORIZATION));
             } else {
-                assert!(headers.is_err());
+                assert!(target.is_err());
             }
         }
     }
