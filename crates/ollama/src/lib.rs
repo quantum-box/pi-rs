@@ -930,12 +930,20 @@ impl Model for Ollama {
         if self.mistral.is_some() {
             return match message {
                 Message::Assistant {
+                    calls,
                     replay: Some(replay),
                     ..
                 } if replay.identity == self.replay_identity(&request.model)
                     && replay.supports_api(ModelApi::MistralConversations) =>
                 {
-                    base.max(pi_rs_core::estimate_replay_tokens(&replay.blocks))
+                    mistral::replay_parts(&replay.blocks).map_or(base, |parts| {
+                        let calls = calls
+                            .iter()
+                            .map(|call| json!({"name":call.name,"arguments":call.arguments}))
+                            .collect::<Vec<_>>();
+                        pi_rs_core::estimate_replay_tokens(&parts)
+                            .saturating_add(pi_rs_core::estimate_replay_tokens(&calls))
+                    })
                 }
                 _ => base,
             };
@@ -1387,6 +1395,7 @@ impl Ollama {
                         } else if mistral {
                             mistral::stream_call_index(
                                 delta.id.as_deref(), delta.function.as_ref(), position, had_calls, &calls,
+                                &declared_mistral_tools,
                             )?
                         } else {
                             Err(Error::Model("missing tool call index".into()))?;

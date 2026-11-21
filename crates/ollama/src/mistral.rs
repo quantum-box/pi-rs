@@ -133,7 +133,7 @@ pub(super) fn messages(
     Ok(messages)
 }
 
-fn replay_parts(blocks: &[Value]) -> Option<Vec<Value>> {
+pub(super) fn replay_parts(blocks: &[Value]) -> Option<Vec<Value>> {
     if let Some(parts) = blocks
         .iter()
         .find_map(|block| block.get("mistral_content")?.as_array())
@@ -220,6 +220,7 @@ pub(super) fn stream_call_index(
     position: usize,
     had_calls: bool,
     calls: &std::collections::BTreeMap<usize, super::CallDelta>,
+    declared: &[String],
 ) -> Result<usize> {
     if let Some(id) = id.filter(|id| !id.is_empty() && *id != "null") {
         if let Some(index) = calls
@@ -232,19 +233,7 @@ pub(super) fn stream_call_index(
             if let Some((index, active)) = calls.first_key_value()
                 && calls.len() == 1
                 && position == 0
-                && function.is_none_or(|function| {
-                    let name = function.name.as_deref().unwrap_or_default();
-                    let has_arguments = function
-                        .arguments
-                        .as_ref()
-                        .is_some_and(|value| !value.as_str().is_some_and(str::is_empty));
-                    name.is_empty()
-                        || (name == active.name
-                            && (!has_arguments
-                                || (!active.arguments.is_empty()
-                                    && serde_json::from_str::<Value>(&active.arguments)
-                                        .is_err_and(|error| error.is_eof()))))
-                })
+                && compatible_continuation(active, function, declared)
             {
                 return Ok(*index);
             }
@@ -277,12 +266,42 @@ pub(super) fn stream_call_index(
             .find(|index| !calls.contains_key(index))
             .unwrap_or(64));
     }
-    if calls.len() == 1 && position == 0 {
-        return Ok(*calls.first_key_value().expect("one active tool call").0);
+    if let Some((index, active)) = calls.first_key_value()
+        && calls.len() == 1
+        && position == 0
+        && compatible_continuation(active, function, declared)
+    {
+        return Ok(*index);
     }
     Err(Error::Model(
         "ambiguous Mistral tool call continuation without an ID or index".into(),
     ))
+}
+
+fn compatible_continuation(
+    active: &super::CallDelta,
+    incoming: Option<&super::WireFunction>,
+    declared: &[String],
+) -> bool {
+    let Some(incoming) = incoming else {
+        return true;
+    };
+    let name = incoming.name.as_deref().unwrap_or_default();
+    let has_arguments = incoming
+        .arguments
+        .as_ref()
+        .is_some_and(|value| !value.as_str().is_some_and(str::is_empty));
+    let has_open_arguments = active.arguments.trim().is_empty()
+        || serde_json::from_str::<Value>(&active.arguments).is_err_and(|error| error.is_eof());
+    if name.is_empty() || repeats_declared_name(declared, &active.name, name) {
+        return !has_arguments || has_open_arguments;
+    }
+    has_open_arguments
+        && (active.name.is_empty()
+            || declared.iter().any(|tool| {
+                tool.strip_prefix(&active.name)
+                    .is_some_and(|suffix| suffix.starts_with(name))
+            }))
 }
 
 pub(super) fn call_id(original: &str, attempt: usize) -> String {
@@ -431,6 +450,7 @@ mod tests {
                 )
             })
             .collect();
+        let declared = ["read".into(), "other".into()];
         let read_delta = super::super::WireFunction {
             name: Some("read".into()),
             arguments: Some(json!("}")),
@@ -454,14 +474,60 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(
-            stream_call_index(Some("late"), None, 0, true, &anonymous).unwrap(),
+            stream_call_index(Some("late"), None, 0, true, &anonymous, &declared).unwrap(),
             0
         );
         assert_eq!(
-            stream_call_index(Some("late"), Some(&read_delta), 0, true, &anonymous).unwrap(),
+            stream_call_index(
+                Some("late"),
+                Some(&read_delta),
+                0,
+                true,
+                &anonymous,
+                &declared
+            )
+            .unwrap(),
             0
         );
-        assert!(stream_call_index(Some("late"), Some(&other_delta), 0, true, &anonymous).is_err());
+        assert!(
+            stream_call_index(
+                Some("late"),
+                Some(&other_delta),
+                0,
+                true,
+                &anonymous,
+                &declared
+            )
+            .is_err()
+        );
+        let name_only = [(
+            0,
+            crate::CallDelta {
+                name: "read".into(),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        let first_arguments = super::super::WireFunction {
+            name: Some("read".into()),
+            arguments: Some(json!("{")),
+        };
+        assert_eq!(
+            stream_call_index(
+                Some("late"),
+                Some(&first_arguments),
+                0,
+                true,
+                &name_only,
+                &declared
+            )
+            .unwrap(),
+            0,
+        );
+        assert!(
+            stream_call_index(None, Some(&other_delta), 0, true, &anonymous, &declared).is_err()
+        );
         let complete = [(
             0,
             crate::CallDelta {
@@ -472,21 +538,76 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        assert!(stream_call_index(Some("late"), Some(&read_delta), 0, true, &complete).is_err());
+        assert!(
+            stream_call_index(
+                Some("late"),
+                Some(&read_delta),
+                0,
+                true,
+                &complete,
+                &declared
+            )
+            .is_err()
+        );
         assert_eq!(
-            stream_call_index(Some("new"), Some(&other_delta), 0, true, &complete).unwrap(),
+            stream_call_index(
+                Some("new"),
+                Some(&other_delta),
+                0,
+                true,
+                &complete,
+                &declared
+            )
+            .unwrap(),
             1
         );
 
+        assert!(
+            stream_call_index(None, Some(&other_delta), 0, true, &complete, &declared).is_err()
+        );
+        assert!(
+            stream_call_index(None, Some(&first_arguments), 0, true, &complete, &declared).is_err()
+        );
         assert_eq!(
-            stream_call_index(Some("late"), Some(&named_id), 0, true, &complete).unwrap(),
+            stream_call_index(Some("late"), Some(&named_id), 0, true, &complete, &declared)
+                .unwrap(),
             0
         );
-        assert!(stream_call_index(None, None, 0, true, &calls).is_err());
+        assert!(stream_call_index(None, None, 0, true, &calls, &declared).is_err());
         assert_eq!(
-            stream_call_index(Some("fixture-1"), None, 0, true, &calls).unwrap(),
+            stream_call_index(Some("fixture-1"), None, 0, true, &calls, &declared).unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn budgets_replayed_thinking_and_tool_arguments_together() {
+        let model = Ollama::new("https://example.com", None)
+            .unwrap()
+            .with_mistral(true, false, None);
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let message = Message::Assistant {
+            content: "visible".into(),
+            calls: vec![ToolCall {
+                id: "fixture".into(),
+                name: "read".into(),
+                arguments: json!({"value":"a".repeat(4000)}).to_string(),
+            }],
+            replay: Some(Box::new(pi_rs_core::ProviderReplay {
+                identity: model.replay_identity(&request.model),
+                blocks: vec![replay_block(vec![
+                    Segment::Text("visible".into()),
+                    Segment::Thinking("b".repeat(4000)),
+                ])],
+            })),
+        };
+        let estimate = model.estimate_message_tokens(&request, &message);
+        assert!((2000..2100).contains(&estimate), "estimate: {estimate}");
     }
 
     #[tokio::test]
