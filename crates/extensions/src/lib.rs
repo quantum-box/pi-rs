@@ -2,9 +2,11 @@
 pub mod codemode;
 mod exec;
 mod json_size;
+mod loader;
 mod process;
 pub mod tool_search;
 pub use exec::{ExecOptions, ExecResult, exec_command};
+pub use loader::{NativeExtensionLoader, NativeExtensionSource};
 pub use process::{ExecutableExtension, extension_flag, serve_extension};
 use std::sync::Arc;
 

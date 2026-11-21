@@ -5870,6 +5870,19 @@ to the selected route. When they do, they retain provider-default or
 Gemini-version inference. Standalone Google SDK capability overrides remain
 endpoint-wide.
 
+### Native SDK extension factory
+
+`pi_rs_extensions::NativeExtensionLoader` composes a fresh registry from
+host-supplied Rust extensions and explicitly granted executable paths. It uses
+native protocol discovery and validates executable flags and dependencies
+before returning the registry for a `SessionBuilder`. Executable grants
+include symlink targets and authorize discovery before the loader applies
+disabled IDs. Hosts can omit a path to skip executing its discovery hook.
+A replaceable inline extension yields when an enabled, non-replaceable
+extension claims a tool, command or flag of the same kind and name. The SDK
+host controls settings, load order, and package discovery. Pi's default
+resource loader also discovers project and package extensions automatically.
+
 ### Combined native SDK resource snapshots
 
 `pi_rs_workbench::resource_factory::ResourceFactory` loads system prompts,
