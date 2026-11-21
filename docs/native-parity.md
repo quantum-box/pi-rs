@@ -1390,9 +1390,11 @@ keeps stale responses out of a later query but means a terminal that never sends
 DA1 cannot refresh colors during that session. After an external editor or
 suspend hands terminal ownership away, further color queries are disabled for
 the session: another owner may consume the old DA1 or leave an unrelated one.
-If a later appearance report changes, stale colors are cleared and the reported
-light/dark mode is used with the ANSI fallback. A repeated report does not discard
-colors: a terminal's colors can intentionally differ from the OS appearance.
+If a later appearance report changes, or automatic mode is enabled after
+running with a fixed theme, the next applicable report clears stale colors and
+uses the reported light/dark mode with the ANSI fallback. A repeated report in
+continuous automatic mode retains the colors: a terminal's colors can
+intentionally differ from the OS appearance.
 The first appearance report received during the initial color query is treated as
 the startup status report, not a color change; the protocol
 does not distinguish this report from a simultaneous notification.

@@ -166,6 +166,7 @@ struct ColorQueries {
     color_requery: bool,
     disabled: bool,
     last_appearance_report: Option<bool>,
+    refresh_after_subscription: bool,
 }
 
 impl Terminal {
@@ -373,6 +374,13 @@ impl ColorQueries {
         Ok(())
     }
 
+    fn refresh_after_appearance_subscription(&mut self, output: &mut dyn Write) -> Result<()> {
+        // When OSC queries are disabled after a handoff, the first report
+        // after switching from a fixed theme is the freshest appearance we have.
+        self.refresh_after_subscription = self.disabled;
+        self.query_terminal_colors(output)
+    }
+
     fn appearance_report(&mut self, dark: bool, output: &mut dyn Write) -> Result<bool> {
         let previous = self.last_appearance_report.replace(dark);
         // The first report may be the response to ?996n sent at startup.
@@ -385,7 +393,8 @@ impl ColorQueries {
         if !initial_report {
             self.query_terminal_colors(output)?;
         }
-        Ok(previous.is_some_and(|value| value != dark))
+        Ok(std::mem::take(&mut self.refresh_after_subscription)
+            || previous.is_some_and(|value| value != dark))
     }
 
     fn accepts_color_reply(&mut self, target: u8, _output: &mut dyn Write) -> Result<bool> {
@@ -4352,7 +4361,9 @@ pub(super) async fn run(
             let enabled = follows_terminal_appearance(args.use_theme.as_deref());
             let mut output = std::io::stdout();
             if terminal.set_appearance_notifications(enabled, &mut output)? && enabled {
-                terminal.colors.query_terminal_colors(&mut output)?;
+                terminal
+                    .colors
+                    .refresh_after_appearance_subscription(&mut output)?;
             }
         }
         if let Some(task) = &auth_reload {
@@ -12387,6 +12398,7 @@ exit {exit}
             color_requery: false,
             disabled: false,
             last_appearance_report: None,
+            refresh_after_subscription: false,
         };
         assert!(!super::expire_initial_terminal_colors(
             &terminal, &mut theme
@@ -12562,6 +12574,33 @@ exit {exit}
                 .unwrap();
         assert!(changed && redraw);
         assert!(matches!(theme.color("accent"), Color::AnsiValue(_)));
+
+        // Starting with a fixed theme leaves no initial appearance report.
+        // Re-enabling automatic mode must still replace stale OSC colors.
+        set_terminal_color(false, 0, 0, 0);
+        theme = super::Theme::system();
+        let mut colors = super::ColorQueries::default();
+        colors.disable_after_handoff();
+        let mut output = Vec::new();
+        colors
+            .refresh_after_appearance_subscription(&mut output)
+            .unwrap();
+        let (changed, redraw) =
+            super::handle_terminal_appearance(&mut colors, &mut theme, false, &mut output).unwrap();
+        assert!(changed && redraw);
+        assert!(matches!(theme.color("accent"), Color::AnsiValue(_)));
+        assert_eq!(
+            super::Theme::load("light/dark", &[], std::path::Path::new("."), false, false)
+                .unwrap()
+                .name,
+            "light"
+        );
+        assert!(output.is_empty());
+        assert!(
+            !super::handle_terminal_appearance(&mut colors, &mut theme, false, &mut output)
+                .unwrap()
+                .1
+        );
     }
 
     #[cfg(any(unix, windows))]
