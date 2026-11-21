@@ -286,7 +286,7 @@ pub enum Entry {
         text: String,
         rendered: Option<pi_rs::RenderedCustomMessage>,
     },
-    CustomEntry {
+    CustomRecord {
         id: u64,
         custom_type: String,
         presentation: CustomEntryPresentation,
@@ -411,12 +411,12 @@ impl Entry {
                 lines.push(Line::default());
                 lines
             }
-            Self::CustomEntry { rendered: None, .. } => return Vec::new(),
+            Self::CustomRecord { rendered: None, .. } => return Vec::new(),
             Self::CustomMessage {
                 rendered: Some(rendered),
                 ..
             }
-            | Self::CustomEntry {
+            | Self::CustomRecord {
                 rendered: Some(rendered),
                 ..
             } => {

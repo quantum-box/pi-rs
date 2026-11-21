@@ -1443,7 +1443,7 @@ impl View {
             self.lines
                 .iter()
                 .enumerate()
-                .filter(|(_, entry)| !matches!(entry, Entry::CustomEntry { .. }))
+                .filter(|(_, entry)| !matches!(entry, Entry::CustomRecord { .. }))
                 .nth(excess - 1)
                 .expect("ordinary transcript entries")
                 .0
@@ -1451,7 +1451,7 @@ impl View {
         };
         for entry in self.lines.drain(..removed) {
             match entry {
-                Entry::CustomEntry { id, .. } => {
+                Entry::CustomRecord { id, .. } => {
                     self.custom_entry_count -= 1;
                     self.custom_render_attempted.remove(&id);
                 }
@@ -1472,16 +1472,16 @@ impl View {
                 .lines
                 .iter()
                 .position(|line| {
-                    matches!(line, Entry::CustomEntry { presentation, .. }
+                    matches!(line, Entry::CustomRecord { presentation, .. }
                         if *presentation != CustomEntryPresentation::Included)
                 })
                 .or_else(|| {
                     self.lines
                         .iter()
-                        .position(|line| matches!(line, Entry::CustomEntry { .. }))
+                        .position(|line| matches!(line, Entry::CustomRecord { .. }))
                 })
                 .expect("retained custom entry");
-            let Entry::CustomEntry { id, rendered, .. } = self.lines.remove(oldest) else {
+            let Entry::CustomRecord { id, rendered, .. } = self.lines.remove(oldest) else {
                 unreachable!("custom entry position")
             };
             self.custom_render_attempted.remove(&id);
@@ -1492,7 +1492,7 @@ impl View {
         } else {
             self.custom_entry_count += 1;
         }
-        self.lines.push(Entry::CustomEntry {
+        self.lines.push(Entry::CustomRecord {
             id,
             custom_type: entry.custom_type.clone(),
             presentation: CustomEntryPresentation::Pending,
@@ -1536,7 +1536,7 @@ impl View {
     fn refresh_transcript_extension_renderers(&mut self) -> bool {
         self.custom_render_pending = None;
         for line in &mut self.lines {
-            if let Entry::CustomEntry { presentation, .. } = line {
+            if let Entry::CustomRecord { presentation, .. } = line {
                 *presentation = CustomEntryPresentation::Pending;
             }
         }
@@ -1548,7 +1548,7 @@ impl View {
         self.custom_render_redraw_at = None;
         let mut redrawn = false;
         for (index, entry) in self.lines.iter_mut().enumerate() {
-            if let Entry::CustomMessage { rendered, .. } | Entry::CustomEntry { rendered, .. } =
+            if let Entry::CustomMessage { rendered, .. } | Entry::CustomRecord { rendered, .. } =
                 entry
                 && rendered.take().is_some()
             {
@@ -1586,7 +1586,7 @@ impl View {
             {
                 Some(*id)
             }
-            Entry::CustomEntry {
+            Entry::CustomRecord {
                 id,
                 custom_type,
                 presentation,
@@ -1639,7 +1639,7 @@ impl View {
         for (index, entry) in self.lines.iter_mut().enumerate().rev() {
             let target = match entry {
                 Entry::CustomMessage { id, rendered, .. } if *id == pending.record => rendered,
-                Entry::CustomEntry {
+                Entry::CustomRecord {
                     id,
                     presentation,
                     rendered,
@@ -11637,14 +11637,14 @@ exit {exit}
         }
         assert_eq!(view.custom_entry_count, 4000);
         assert!(matches!(view.lines[0], Entry::Notice(_)));
-        assert!(matches!(view.lines[1], Entry::CustomEntry { id: 2, .. }));
-        let Entry::CustomEntry { presentation, .. } = &mut view.lines[1] else {
+        assert!(matches!(view.lines[1], Entry::CustomRecord { id: 2, .. }));
+        let Entry::CustomRecord { presentation, .. } = &mut view.lines[1] else {
             unreachable!()
         };
         *presentation = super::CustomEntryPresentation::Included;
         view.show_custom_entry(4002, &entry);
-        assert!(matches!(view.lines[1], Entry::CustomEntry { id: 2, .. }));
-        assert!(matches!(view.lines[2], Entry::CustomEntry { id: 4, .. }));
+        assert!(matches!(view.lines[1], Entry::CustomRecord { id: 2, .. }));
+        assert!(matches!(view.lines[2], Entry::CustomRecord { id: 4, .. }));
         let options = pi_rs::CustomMessageRenderOptions::default();
         view.custom_render_options = Some(options.clone());
         let request = uuid::Uuid::new_v4();
@@ -11661,7 +11661,7 @@ exit {exit}
         );
         assert!(matches!(
             view.lines.last(),
-            Some(Entry::CustomEntry {
+            Some(Entry::CustomRecord {
                 presentation: super::CustomEntryPresentation::Omitted,
                 rendered: None,
                 ..
@@ -11670,7 +11670,7 @@ exit {exit}
         view.invalidate_custom_message_renderings();
         assert!(matches!(
             view.lines.last(),
-            Some(Entry::CustomEntry {
+            Some(Entry::CustomRecord {
                 presentation: super::CustomEntryPresentation::Omitted,
                 ..
             })
@@ -11678,7 +11678,7 @@ exit {exit}
         view.refresh_transcript_extension_renderers();
         assert!(matches!(
             view.lines.last(),
-            Some(Entry::CustomEntry {
+            Some(Entry::CustomRecord {
                 presentation: super::CustomEntryPresentation::Pending,
                 ..
             })
