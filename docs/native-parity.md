@@ -125,7 +125,9 @@ containing glob characters takes precedence over glob expansion across providers
 with an optional thinking suffix applied to the selected models.
 With no explicit provider or endpoint, a known `--model` ID can select the only
 authenticated matching provider across catalogs, including a gateway model
-whose literal ID starts with another provider's name. An inline key does not
+whose literal ID starts with another provider's name. Bedrock environment
+credentials count during provider selection, and a configured default Bedrock
+provider can use the AWS SDK credential chain. An inline key does not
 break a tie using stored authentication. Unknown IDs can still select local
 or custom models through the native fallback.
 

@@ -333,8 +333,33 @@ pub fn scoped_choices<'a>(
     (selected, warnings)
 }
 
+fn bedrock_environment_configured(present: impl Fn(&str) -> bool) -> bool {
+    [
+        "AWS_PROFILE",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+    ]
+    .into_iter()
+    .any(&present)
+        || (present("AWS_ACCESS_KEY_ID") && present("AWS_SECRET_ACCESS_KEY"))
+}
+
 /// Resolve a known CLI model before an inline key is bound to a provider.
 pub fn cli_catalog_model(args: &Cli, value: &str, inline: bool) -> Result<Option<ScopedChoice>> {
+    let ambient_bedrock = bedrock_environment_configured(|name| {
+        std::env::var_os(name).is_some_and(|value| !value.is_empty())
+    });
+    resolve_cli_catalog_model(args, value, inline, ambient_bedrock)
+}
+
+fn resolve_cli_catalog_model(
+    args: &Cli,
+    value: &str,
+    inline: bool,
+    ambient_bedrock: bool,
+) -> Result<Option<ScopedChoice>> {
     let profiles = &args.model_profiles;
     let value = value.trim();
     let suffix = thinking_suffix(value).map(|(id, level)| (id, Some(level)));
@@ -368,12 +393,19 @@ pub fn cli_catalog_model(args: &Cli, value: &str, inline: bool) -> Result<Option
                 .model_endpoint(&provider, &id)
                 .unwrap_or_else(|| profiles.endpoint(&provider));
             let usable = !inline
-                && (provider == Provider::Ollama
-                    || args
-                        .configured_model_credential(&provider, endpoint)
-                        .is_some_and(|credential| {
-                            !matches!(credential, super::model_auth::Credential::Invalid)
-                        }));
+                && match args.configured_model_credential(&provider, endpoint) {
+                    Some(credential) => {
+                        !matches!(credential, super::model_auth::Credential::Invalid)
+                    }
+                    None => {
+                        provider == Provider::Ollama
+                            || (provider == Provider::Bedrock
+                                && (ambient_bedrock
+                                    || args.settings.string("defaultProvider").is_some_and(|id| {
+                                        id.eq_ignore_ascii_case(Provider::Bedrock.id())
+                                    })))
+                    }
+                };
             matches.push((
                 ScopedChoice {
                     provider,
@@ -858,6 +890,49 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn cli_counts_ambient_bedrock_auth_when_a_gateway_lists_the_same_model() {
+        use clap::Parser;
+        use serde_json::json;
+
+        for configured in [
+            &["AWS_PROFILE"][..],
+            &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"][..],
+            &["AWS_BEARER_TOKEN_BEDROCK"][..],
+            &["AWS_CONTAINER_CREDENTIALS_FULL_URI"][..],
+            &["AWS_WEB_IDENTITY_TOKEN_FILE"][..],
+        ] {
+            assert!(super::bedrock_environment_configured(
+                |name| configured.contains(&name)
+            ));
+        }
+        assert!(!super::bedrock_environment_configured(
+            |name| name == "AWS_ACCESS_KEY_ID"
+        ));
+
+        let mut args = super::Cli::parse_from(["pi"]);
+        let model = "us.anthropic.claude-opus-4-6-v1";
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers":{"gateway":{"api":"openai-completions",
+                "baseUrl":"https://gateway.example/v1","models":[{"id":model}]}}
+        }))
+        .unwrap();
+        let bedrock = super::resolve_cli_catalog_model(&args, model, false, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bedrock.qualified(), format!("amazon-bedrock/{model}"));
+        assert!(super::resolve_cli_catalog_model(&args, model, true, true).is_err());
+        args.model_keys = super::super::model_auth::Keys::parse(&json!({
+            "gateway":{"type":"api_key","key":"fixture",
+                "endpoint":"https://gateway.example/v1/chat/completions"}
+        }));
+        assert!(super::resolve_cli_catalog_model(&args, model, false, true).is_err());
+        let gateway = super::resolve_cli_catalog_model(&args, model, false, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(gateway.qualified(), format!("gateway/{model}"));
     }
 
     #[test]
