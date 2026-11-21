@@ -514,7 +514,12 @@ impl Stream {
             update["toolName"] = call["name"].clone();
         }
         update["partial"] = self.assistant.clone();
-        events.push(json!({"type":"message_update","message":self.assistant,"assistantMessageEvent":update}));
+        events.push(json!({
+            "type":"message_update",
+            "usage":self.assistant["usage"],
+            "message":self.assistant,
+            "assistantMessageEvent":update,
+        }));
     }
 
     fn delta(&mut self, kind: &'static str, delta: &str, events: &mut Vec<Value>) {

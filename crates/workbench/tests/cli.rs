@@ -5695,6 +5695,24 @@ fn print_and_json_modes_accept_positional_prompts() {
                 .collect();
             assert_eq!(records[0]["type"], "session");
             assert_eq!(records[0]["version"], 3);
+            let mut saw_final_usage = false;
+            for update in records
+                .iter()
+                .filter(|event| event["type"] == "message_update")
+            {
+                let usage = &update["usage"];
+                assert!(usage.is_object(), "{update:?}");
+                assert_eq!(*usage, update["message"]["usage"]);
+                assert_eq!(*usage, update["assistantMessageEvent"]["partial"]["usage"]);
+                if update["assistantMessageEvent"]["type"] == "text_end" {
+                    assert_eq!(usage["input"], 12);
+                    assert_eq!(usage["output"], 2);
+                    assert_eq!(usage["cacheRead"], 7);
+                    assert_eq!(usage["totalTokens"], 21);
+                    saw_final_usage = true;
+                }
+            }
+            assert!(saw_final_usage);
             let updates: Vec<_> = records
                 .iter()
                 .filter_map(|event| event.get("assistantMessageEvent"))

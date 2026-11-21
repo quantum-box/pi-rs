@@ -464,9 +464,9 @@ form, including multiple keys and explicitly unbound actions.
 
 ## RPC support
 
-RPC startup ignores ordinary positional messages, as Pi does; it accepts
-prompts through stdin. Both reject `@file` arguments in RPC mode, with
-different diagnostic wording.
+RPC startup ignores ordinary positional messages and accepts prompts through
+stdin. The root CLI rejects `@file` arguments in RPC mode before loading
+settings and prints Pi's diagnostic to stderr.
 
 Completed tool-call JSON parsing and incremental argument previews live in the
 portable `pi-rs-tool-arguments` crate, shared by the SDK and terminal/RPC
@@ -514,11 +514,12 @@ submitted while a turn is active cannot yet execute immediately. A normal model 
 turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
 blocks, tool calls, tool results and turn boundaries.
-`toolcall_start` includes the ID and tool name available at that point. Native
-does not yet expose Pi's top-level live usage in `message_update`; provider
-usage currently reaches the stream only on completion. Native retains the cumulative
-`message` and `partial` snapshots as extensions; unlike Pi's compact wire
-format, update size therefore grows with streamed content. Fragmented provider
+`toolcall_start` includes the ID and tool name available at that point.
+JSON and RPC `message_update` events include Pi's top-level `usage` object.
+Its counters start at zero and use the reported totals once the provider
+finishes. Providers that report usage incrementally in Pi can therefore expose
+nonzero counts earlier there. Native retains cumulative `message` and `partial`
+snapshots, which grow with streamed content. Fragmented provider
 IDs or names can be incomplete in `toolcall_start`; the final call is authoritative.
 Failed live assistant messages include a fixed `errorMessage` based on the
 native failure classification, including cancellation and retryable failures.
