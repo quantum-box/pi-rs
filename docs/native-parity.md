@@ -830,6 +830,10 @@ In fullscreen mode with `fullscreenCopyOnSelect` disabled, the configured
 `app.message.copy` shortcut copies the active mouse selection before falling
 back to the last assistant message. The fallback reads a session snapshot, so
 it remains available while a model turn owns the journal lock.
+The copy actions and RPC `get_last_assistant_text` skip assistant replies
+without visible text after an interruption, error, tool call, or token limit.
+A partial reply with visible text remains copyable. A reply that ends
+normally with no text remains the latest reply, matching Pi v1.6.0.
 
 ### Session checkpoint
 
