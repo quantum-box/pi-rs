@@ -1,6 +1,8 @@
 //! Parse complete provider tool arguments, repairing only string escapes.
 use serde_json::{Map, Value};
 
+use crate::json_syntax_diagnostic;
+
 /// Parse a completed tool call. The returned object is separate from the raw
 /// journaled model response. Invalid or incomplete documents are never repaired
 /// by adding members, values, or closing delimiters.
@@ -8,8 +10,20 @@ pub fn parse_tool_arguments(raw: &str) -> std::result::Result<Value, String> {
     if raw.trim().is_empty() {
         return Ok(Value::Object(Map::new()));
     }
-    let value = serde_json::from_str::<Value>(raw)
-        .or_else(|_| serde_json::from_str::<Value>(&repair_string_escapes(raw)));
+    let value = match serde_json::from_str::<Value>(raw) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let repaired = repair_string_escapes(raw);
+            if repaired == raw {
+                Err(json_syntax_diagnostic(raw, &error))
+            } else {
+                // Pi 1.6 reports positions in its second parse and echoes the
+                // original provider text under Received arguments.
+                serde_json::from_str(&repaired)
+                    .map_err(|error| json_syntax_diagnostic(&repaired, &error))
+            }
+        }
+    };
     match value {
         Ok(value @ Value::Object(_)) => Ok(value),
         Ok(_) => Err(format!(
@@ -53,6 +67,11 @@ fn repair_string_escapes(raw: &str) -> String {
                     result.push_str("\\\\");
                 }
             }
+            '\u{8}' => result.push_str(r"\b"),
+            '\u{c}' => result.push_str(r"\f"),
+            '\n' => result.push_str(r"\n"),
+            '\r' => result.push_str(r"\r"),
+            '\t' => result.push_str(r"\t"),
             c if c <= '\u{1f}' => {
                 use std::fmt::Write as _;
                 let _ = write!(result, "\\u{:04x}", c as u32);
@@ -89,6 +108,75 @@ mod tests {
             let error = parse_tool_arguments(raw).unwrap_err();
             assert!(error.contains("Received arguments:"));
             assert!(error.ends_with(raw));
+        }
+    }
+
+    #[test]
+    fn reports_pi_diagnostics_for_malformed_arguments() {
+        for (raw, expected) in [
+            (r#"[]"#, r#"Tool arguments must be a JSON object"#),
+            (r#""str""#, r#"Tool arguments must be a JSON object"#),
+            (r#"null"#, r#"Tool arguments must be a JSON object"#),
+            (r#"7"#, r#"Tool arguments must be a JSON object"#),
+            (
+                r#"{"path":"unfinished"#,
+                r#"Unterminated string in JSON at position 19 (line 1 column 20)"#,
+            ),
+            (r#"{"path":"#, r#"Unexpected end of JSON input"#),
+            (
+                r#"{"path""#,
+                r#"Expected ':' after property name in JSON at position 7 (line 1 column 8)"#,
+            ),
+            (
+                r#"{"path":"x""#,
+                r#"Expected ',' or '}' after property value in JSON at position 11 (line 1 column 12)"#,
+            ),
+            (
+                r#"{"path":"ok",}"#,
+                r#"Expected double-quoted property name in JSON at position 13 (line 1 column 14)"#,
+            ),
+            (
+                r#"{"path" "ok"}"#,
+                r#"Expected ':' after property name in JSON at position 8 (line 1 column 9)"#,
+            ),
+            (
+                r#"{"path":01}"#,
+                r#"Unexpected number in JSON at position 9 (line 1 column 10)"#,
+            ),
+            (
+                r#"{"path":"ok"}tail"#,
+                r#"Unexpected non-whitespace character after JSON at position 13 (line 1 column 14)"#,
+            ),
+            (
+                r#"{unquoted:1}"#,
+                r#"Expected property name or '}' in JSON at position 1 (line 1 column 2)"#,
+            ),
+            (
+                r#"{"path":[1,]}"#,
+                r#"Unexpected token ']', "{"path":[1,]}" is not valid JSON"#,
+            ),
+            (
+                r#"{"path":?}"#,
+                r#"Unexpected token '?', "{"path":?}" is not valid JSON"#,
+            ),
+            (
+                r#"{"abcdef":?         }"#,
+                r#"Unexpected token '?', ..."{"abcdef":?         "... is not valid JSON"#,
+            ),
+            (
+                r#"{"path":"C:\work",}"#,
+                "Expected double-quoted property name in JSON at position 19 (line 1 column 20)",
+            ),
+            (
+                "{\"x\":\"a\nb\",}",
+                "Expected double-quoted property name in JSON at position 12 (line 1 column 13)",
+            ),
+        ] {
+            assert_eq!(
+                parse_tool_arguments(raw).unwrap_err(),
+                format!("{expected}\n\nReceived arguments:\n{raw}"),
+                "{raw}"
+            );
         }
     }
 }

@@ -619,7 +619,9 @@ reported without preventing other discovered resources from loading.
 Completed tool arguments repair invalid string escapes and unescaped control
 characters as Pi does. Incomplete JSON and non-object values produce a tool
 error containing the received arguments. The original model response remains
-in the journal; subsequent model requests use the repaired object.
+in the journal; subsequent model requests use the repaired object. For a
+failed repair, Pi's syntax positions refer to the repaired text. The
+`Received arguments` block displays the original model response.
 
 When all sibling timestamps are valid, `get_tree` sorts them in chronological
 order and retains append order for the same instant. This includes imported timestamps with UTC offsets and ISO year, year-month, and date forms
@@ -5675,8 +5677,9 @@ separators and commas in nested containers. They also identify a raw control
 after a surrogate in another string if no other parse error occurs first.
 Malformed object property names and separators, object trailing commas, missing
 array separators and trailing text after a complete JSON value also use Pi's
-position-aware wording. Other malformed records, including array trailing
-commas, retain the native parser's diagnostics. Malformed numbers use Pi's
+position-aware wording. Unexpected values and array trailing commas use Pi's
+quoted input excerpt. Unmapped malformed records retain the native parser's
+diagnostics. Malformed numbers use Pi's
 position-aware wording for leading zeroes and missing digits after a minus
 sign, decimal point or exponent.
 
