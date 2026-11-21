@@ -719,6 +719,19 @@ static BUILTIN_MODELS: LazyLock<BTreeMap<String, Vec<ConfiguredModel>>> = LazyLo
 });
 
 fn configure_azure(data: &mut Value, env: impl Fn(&str) -> Option<String>) -> Result<()> {
+    let configured_base = data
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| {
+            providers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("azure"))
+        })
+        .is_some_and(|(_, provider)| provider.get("baseUrl").is_some());
+    if configured_base {
+        return Ok(());
+    }
+
     let explicit = env("AZURE_OPENAI_BASE_URL").filter(|base| !base.trim().is_empty());
     let base = if let Some(base) = explicit {
         base.trim().to_owned()
@@ -2783,6 +2796,17 @@ mod tests {
                 (key == "AZURE_OPENAI_RESOURCE_NAME").then(|| "other.example/path".into())
             })
             .is_err()
+        );
+        let mut configured = json!({
+            "providers":{"Azure":{"baseUrl":"https://configured.openai.azure.com"}}
+        });
+        let profiles = Profiles::parse_with_azure_env(&mut configured, |key| {
+            (key == "AZURE_OPENAI_RESOURCE_NAME").then(|| "other.example/path".into())
+        })
+        .unwrap();
+        assert_eq!(
+            profiles.endpoint(&profiles.provider("azure").unwrap()),
+            "https://configured.openai.azure.com/openai/v1/responses"
         );
     }
 
