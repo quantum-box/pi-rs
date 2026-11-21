@@ -15,6 +15,7 @@ mod model_catalog;
 mod persistent_map;
 #[doc(hidden)]
 pub mod pi_import;
+mod provider_response;
 mod resource;
 mod retry;
 mod runtime;
@@ -49,6 +50,7 @@ pub use lifecycle::{
 };
 pub use model_catalog::*;
 pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};
+pub use provider_response::{ProviderResponseEvent, observe_provider_response};
 pub use resource::Resource;
 pub use retry::*;
 pub use sdk::*;
