@@ -104,6 +104,8 @@ struct Cli {
     #[arg(skip)]
     extension_flags: cli_compat::ExtensionFlags,
     #[arg(skip)]
+    extension_flag_order: Vec<String>,
+    #[arg(skip)]
     initial_connection: Option<(Provider, String)>,
     #[arg(skip)]
     initial_model_endpoint: Option<String>,
@@ -339,6 +341,19 @@ struct InitialSelection {
 }
 
 impl Cli {
+    fn ordered_extension_flags(
+        &self,
+    ) -> impl Iterator<Item = (&String, &pi_rs::ExtensionFlagValue)> {
+        self.extension_flag_order
+            .iter()
+            .filter_map(|name| self.extension_flags.get_key_value(name))
+            .chain(
+                self.extension_flags
+                    .iter()
+                    .filter(|_| self.extension_flag_order.is_empty()),
+            )
+    }
+
     fn effective_context_window(&self) -> Option<u32> {
         self.context_window.or_else(|| {
             self.model_profiles
@@ -1381,17 +1396,21 @@ async fn run_cli() -> i32 {
             return 0;
         }
     }
-    let (matches, extension_flags) = match cli_compat::parse(argv.iter().cloned()) {
-        Ok(parsed) => parsed,
-        Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
-            let _ = error.print();
-            if let Some(help) = cli_compat::extension_help(&argv) {
-                print!("{help}");
+    // Export can write a file before extension flags are resolved. Require
+    // complete built-in options on that path as part of parse validation.
+    let defer_missing_pi_options = export_plan.is_none() && literal_export.is_none();
+    let (matches, extension_flags, extension_flag_order) =
+        match cli_compat::parse_ordered(argv.iter().cloned(), defer_missing_pi_options) {
+            Ok(parsed) => parsed,
+            Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
+                let _ = error.print();
+                if let Some(help) = cli_compat::extension_help(&argv) {
+                    print!("{help}");
+                }
+                return 0;
             }
-            return 0;
-        }
-        Err(error) => error.exit(),
-    };
+            Err(error) => error.exit(),
+        };
     let mut output_truncated = false;
     let mut cli_exit_code = 0;
     let result = async {
@@ -1410,6 +1429,7 @@ async fn run_cli() -> i32 {
         }
         args.command_cancel = command_cancel;
         args.extension_flags = extension_flags;
+        args.extension_flag_order = extension_flag_order;
         if let Some(paths) = &args.export_session {
             return export_from_file(paths, &paths[..1]);
         }
@@ -1609,7 +1629,15 @@ async fn run_cli() -> i32 {
     }
     .await;
     if let Err(err) = result {
-        eprintln!("{err}");
+        match &err {
+            Error::Config(message)
+                if message.starts_with("Unknown option: --")
+                    || message.starts_with("Unknown options: --") =>
+            {
+                eprintln!("Error: {message}");
+            }
+            _ => eprintln!("{err}"),
+        }
         return if matches!(err, Error::Cancelled) {
             130
         } else {
@@ -1747,6 +1775,19 @@ async fn execute(
         Vec::new()
     };
     if let Some(search) = &args.list_models {
+        if pi_style_invocation
+            && !args.extension_flags.is_empty()
+            && let Some(registered) = cli_compat::discovered_extension_flags(&args)
+        {
+            let unknown: Vec<_> = args
+                .ordered_extension_flags()
+                .filter(|(name, _)| !registered.iter().any(|flag| flag.name == **name))
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if !unknown.is_empty() {
+                eprintln!("Error: {}", cli_compat::unknown_extension_options(&unknown));
+            }
+        }
         return model_listing::list(&args, search).await;
     }
     let needs_default_model = args.model.is_empty()

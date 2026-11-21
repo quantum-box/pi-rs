@@ -1926,6 +1926,14 @@ session ID validation remain in force, and arguments after `--` remain prompt
 text. Parser regressions cover these cases; a CLI fixture verifies that only
 the last named session is created.
 
+Root CLI invocations report Pi-style argument diagnostics whether or not
+help or version was requested. A missing value for a Pi long option with no
+dedicated parse error is reported along with any unrecognized long options,
+in their first-occurrence order after checking registered extension flags.
+Model listing reports these diagnostics on stderr and still lists the models.
+Native subcommands retain their own argument diagnostics, and an incomplete
+final export leaves any earlier input and the destination untouched.
+
 Repeated `--tools` and `-t` selections use the last value. Each selection is
 checked for mixed names and modifiers or wildcard modifiers, including an
 invalid selection followed by a valid one.

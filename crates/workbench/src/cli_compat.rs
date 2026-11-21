@@ -10,9 +10,20 @@ pub(super) type ExtensionFlags = BTreeMap<String, ExtensionFlagValue>;
 pub(super) fn parse(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<(ArgMatches, ExtensionFlags), clap::Error> {
+    parse_ordered(args, true).map(|(matches, flags, _)| (matches, flags))
+}
+
+pub(super) fn parse_ordered(
+    args: impl IntoIterator<Item = OsString>,
+    defer_missing_pi_options: bool,
+) -> Result<(ArgMatches, ExtensionFlags, Vec<String>), clap::Error> {
     let command = command();
-    let (args, flags, _, _) = normalize(&command, args, false);
-    Ok((command.try_get_matches_from(args)?, flags))
+    let normalized = normalize(&command, args, false, defer_missing_pi_options);
+    Ok((
+        command.try_get_matches_from(normalized.args)?,
+        normalized.flags,
+        normalized.flag_order,
+    ))
 }
 
 fn command() -> Command {
@@ -72,15 +83,25 @@ fn validate_tool_list(value: &str) -> Result<String, String> {
     Ok(value.into())
 }
 
+struct NormalizedArguments {
+    args: Vec<OsString>,
+    flags: ExtensionFlags,
+    flag_order: Vec<String>,
+    native_subcommand: bool,
+    literal_export_output: Option<usize>,
+}
+
 fn normalize(
     root: &Command,
     args: impl IntoIterator<Item = OsString>,
     metadata_ownership: bool,
-) -> (Vec<OsString>, ExtensionFlags, bool, Option<usize>) {
+    defer_missing_pi_options: bool,
+) -> NormalizedArguments {
     let mut input = args.into_iter().peekable();
     let mut output: Vec<_> = input.next().into_iter().collect();
     let mut prompt = Vec::new();
     let mut flags = BTreeMap::new();
+    let mut flag_order = Vec::new();
     let mut command = root;
     let mut remaining = 0;
     let mut hyphen_values = false;
@@ -247,6 +268,10 @@ fn normalize(
             }
             continue;
         };
+        if std::ptr::eq(command, root) && value == "-xt" && input.peek().is_none() {
+            output.push(arg);
+            continue;
+        }
         let canonical = match value {
             "-v" => "--version",
             "-nt" => "--no-tools",
@@ -263,8 +288,14 @@ fn normalize(
             let (name, attached) = long
                 .split_once('=')
                 .map_or((long, None), |(name, value)| (name, Some(value)));
-            if long_arg(command, name).is_none()
-                && flag_name(name)
+            let missing_pi_value = defer_missing_pi_options
+                && std::ptr::eq(command, root)
+                && value == canonical
+                && canonical != "--name"
+                && attached.is_none()
+                && pi_unconditional_value(canonical)
+                && input.peek().is_none();
+            if (missing_pi_value || (long_arg(command, name).is_none() && flag_name(name)))
                 && accepts_extension_flags(command, root)
             {
                 let value = if let Some(value) = attached {
@@ -284,7 +315,9 @@ fn normalize(
                 } else {
                     ExtensionFlagValue::Boolean(true)
                 };
-                flags.insert(name.into(), value);
+                if flags.insert(name.into(), value).is_none() {
+                    flag_order.push(name.into());
+                }
                 continue;
             }
         }
@@ -364,7 +397,13 @@ fn normalize(
         output.push("--".into());
         output.extend(prompt);
     }
-    (output, flags, selected_subcommand, literal_export_output)
+    NormalizedArguments {
+        args: output,
+        flags,
+        flag_order,
+        native_subcommand: selected_subcommand,
+        literal_export_output,
+    }
 }
 
 fn list_models_search(value: &std::ffi::OsStr) -> bool {
@@ -449,8 +488,6 @@ pub(super) fn extension_help(argv: &[OsString]) -> Option<String> {
 }
 
 pub(super) fn extension_help_from_args(argv: &[OsString]) -> Option<String> {
-    use pi_rs::Extension;
-
     let (matches, _) = parse(argv.iter().cloned()).ok()?;
     let mut args = super::Cli::from_arg_matches(&matches).ok()?;
     if args.command.is_some() {
@@ -467,40 +504,25 @@ pub(super) fn extension_help_from_args(argv: &[OsString]) -> Option<String> {
         .ok()?
         .unwrap_or(false);
     args.settings = super::config::Settings::load(&args.workspace, args.trusted).ok()?;
-    let resources = super::resources::Resources::load(&args).ok()?;
     let mut flags = BTreeMap::new();
-    let reserved = reserved_flag_names();
-    for path in resources.extensions {
-        let Ok(extension) = pi_rs_extensions::ExecutableExtension::load(&path) else {
-            continue;
+    for flag in discovered_extension_flags(&args)? {
+        let usage = match flag.default {
+            ExtensionFlagValue::Boolean(_) => format!("--{}", flag.name),
+            ExtensionFlagValue::String(_) => format!("--{} <value>", flag.name),
         };
-        if args.disable_extension.iter().any(|id| id == extension.id()) {
-            continue;
-        }
-        for flag in extension.cli_flags() {
-            if reserved.contains(&flag.name) {
-                continue;
-            }
-            let usage = match flag.default {
-                ExtensionFlagValue::Boolean(_) => format!("--{}", flag.name),
-                ExtensionFlagValue::String(_) => format!("--{} <value>", flag.name),
-            };
-            let description = flag
-                .description
-                .unwrap_or_else(|| format!("Registered by {}", extension.id()));
-            let description: String = description
-                .chars()
-                .take(200)
-                .map(|character| {
-                    if character.is_control() {
-                        ' '
-                    } else {
-                        character
-                    }
-                })
-                .collect();
-            flags.entry(usage).or_insert(description);
-        }
+        let description = flag.description.unwrap_or_default();
+        let description: String = description
+            .chars()
+            .take(200)
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+        flags.entry(usage).or_insert(description);
     }
     if flags.is_empty() {
         return None;
@@ -511,6 +533,30 @@ pub(super) fn extension_help_from_args(argv: &[OsString]) -> Option<String> {
         let _ = writeln!(help, "  {usage:<25} {description}");
     }
     Some(help)
+}
+
+pub(super) fn discovered_extension_flags(args: &super::Cli) -> Option<Vec<pi_rs::ExtensionFlag>> {
+    use pi_rs::Extension;
+
+    let resources = super::resources::Resources::load(args).ok()?;
+    let reserved = reserved_flag_names();
+    let mut flags = Vec::new();
+    for path in resources.extensions {
+        let Ok(extension) = pi_rs_extensions::ExecutableExtension::load(&path) else {
+            continue;
+        };
+        if args.disable_extension.iter().any(|id| id == extension.id()) {
+            continue;
+        }
+        for mut flag in extension.cli_flags() {
+            if !reserved.contains(&flag.name) {
+                flag.description
+                    .get_or_insert_with(|| format!("Registered by {}", extension.id()));
+                flags.push(flag);
+            }
+        }
+    }
+    Some(flags)
 }
 
 /// Export paths are resolved independently of Clap's multi-value `--export`.
@@ -546,13 +592,12 @@ pub(super) fn export_plan(args: &[OsString]) -> Option<ExportPlan> {
             break;
         }
         if arg == "--export" {
-            saw_export = true;
             i += 1;
             if i == args.len() {
-                // Keep the incomplete option for Clap's normal diagnostic.
                 validation.push(arg.clone());
                 break;
             }
+            saw_export = true;
             let path = std::path::PathBuf::from(&args[i]);
             inputs.push(path.clone());
             input = Some(path);
@@ -672,7 +717,7 @@ pub(super) fn export_plan(args: &[OsString]) -> Option<ExportPlan> {
     })
 }
 
-/// Parse-time diagnostics that Pi emits before displaying root metadata.
+/// Root metadata flags and diagnostics that may stop CLI startup.
 pub(super) struct Metadata {
     pub(super) version: bool,
     pub(super) short_help: bool,
@@ -685,11 +730,12 @@ pub(super) struct Metadata {
 
 pub(super) fn metadata(args: &[OsString]) -> Option<Metadata> {
     let command = command();
-    let (args, _, subcommand, literal_export_output) =
-        normalize(&command, args.iter().cloned(), true);
-    if subcommand {
+    let normalized = normalize(&command, args.iter().cloned(), true, false);
+    if normalized.native_subcommand {
         return None;
     }
+    let args = normalized.args;
+    let literal_export_output = normalized.literal_export_output;
     let mut result = Metadata {
         version: false,
         short_help: false,
@@ -794,6 +840,9 @@ pub(super) fn metadata(args: &[OsString]) -> Option<Metadata> {
                         None
                     }
                 });
+                if value.is_none() && option == "-t" {
+                    result.diagnostics.push((true, "Unknown option: -t".into()));
+                }
                 if let Some(value) = value {
                     if option == "--thinking" && !super::thinking::LEVELS.contains(&value) {
                         result.diagnostics.push((
@@ -843,6 +892,11 @@ pub(super) fn metadata(args: &[OsString]) -> Option<Metadata> {
                                     .is_some_and(|aliases| aliases.contains(&short))
                         });
                         match known {
+                            Some(_)
+                                if arg == "-e" && iter.peek().is_none_or(|next| *next == "--") =>
+                            {
+                                result.diagnostics.push((true, "Unknown option: -e".into()));
+                            }
                             Some(a) if a.get_action().takes_values() => {
                                 let remainder = &arg[1 + offset + short.len_utf8()..];
                                 without_help.push_str(remainder);
@@ -899,7 +953,21 @@ pub(super) fn metadata(args: &[OsString]) -> Option<Metadata> {
         .enumerate()
         .filter_map(|(index, arg)| help_edits.remove(&index).unwrap_or(Some(arg)))
         .collect();
-    (help || result.version).then_some(result)
+    (help || result.version || result.diagnostics.iter().any(|(error, _)| *error)).then_some(result)
+}
+
+pub(super) fn unknown_extension_options(names: &[&str]) -> String {
+    let label = if names.len() == 1 {
+        "option"
+    } else {
+        "options"
+    };
+    let options = names
+        .iter()
+        .map(|name| format!("--{name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Unknown {label}: {options}")
 }
 
 fn option_values(command: &Command, option: &str) -> (usize, bool) {
