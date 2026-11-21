@@ -440,6 +440,7 @@ Live acceptance with an Ant Ling account remains open.
 
 ### OpenCode Zen and Go
 
+The pinned Pi CLI defaults to Kimi K2.6 for Zen and Kimi K3 for Go.
 OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
 using its official System One endpoint and `OPENCODE_API_KEY`.
 
