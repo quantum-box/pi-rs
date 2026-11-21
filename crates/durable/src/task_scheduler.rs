@@ -436,6 +436,278 @@ pub(crate) struct WokenConversationCancelTerminalMarker {
     pub receipt_version: u64,
 }
 #[allow(dead_code)]
+/// Durable manifest of all owned-conversation markers for one woken claim.
+/// This is provisional infrastructure: graph, identity, attempt, selection and
+/// the callback start leases must be authenticated by the caller's transaction.
+#[cfg(feature = "experimental-graph-revision")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WokenOwnedCallbackMarkers {
+    version: u32,
+    root: Uuid,
+    claim_id: Uuid,
+    graph_version: u64,
+    marker: Vec<u8>,
+    conversations: Vec<Uuid>,
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WokenOwnedMarkerRetirement {
+    version: u32,
+    root: Uuid,
+    claim_id: Uuid,
+    manifest_version: u64,
+    graph_version: u64,
+}
+#[cfg(feature = "experimental-graph-revision")]
+pub(crate) fn woken_owned_marker_retirement_key(root: Uuid) -> Vec<u8> {
+    format!("runtime/woken-owned-callback-retired/v1/{root}").into_bytes()
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+pub(crate) fn woken_owned_callback_markers_key(root: Uuid) -> Vec<u8> {
+    format!("runtime/woken-owned-callback-markers/v1/{root}").into_bytes()
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[allow(dead_code)]
+pub(crate) fn prepare_woken_owned_callback_start(
+    store: &durable_store::Store,
+    claim: &WokenConversationCancelClaim,
+    marker: &[u8],
+) -> Result<(Vec<Uuid>, task_store::OwnedBatch), String> {
+    if claim.version != 3 || claim.claim_id.is_nil() || marker.is_empty() {
+        return Err("invalid woken owned marker claim".into());
+    }
+    let graph_key = crate::runtime::woken_owned_graph_key(claim.task);
+    let graph_entry = store
+        .get(&graph_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing owned graph")?;
+    let graph: crate::runtime::WokenOwnedGraphEvidence =
+        serde_json::from_slice(&graph_entry.value).map_err(|e| e.to_string())?;
+    if graph.version != 1
+        || graph.root != claim.task
+        || graph.interrupted_attempt != claim.woken_attempt
+        || graph.edges.is_empty()
+    {
+        return Err("woken owned graph identity mismatch".into());
+    }
+    let mut conversations: Vec<_> = graph.edges.iter().map(|edge| edge.edge.child).collect();
+    conversations.sort_unstable();
+    if conversations
+        .iter()
+        .any(|id| id.is_nil() || *id == claim.conversation)
+        || conversations.windows(2).any(|pair| pair[0] == pair[1])
+        || graph
+            .edges
+            .iter()
+            .any(|edge| edge.edge.mode != crate::ownership_edge::Mode::Foreground)
+    {
+        return Err("invalid woken owned conversations".into());
+    }
+    let mut batch = task_store::OwnedBatch {
+        checks: vec![durable_store::Check {
+            key: graph_key,
+            expected: durable_store::Expected::Version(graph_entry.version),
+        }],
+        mutations: vec![],
+    };
+    for &id in &conversations {
+        let part =
+            crate::conversation_signal::prepare_callback_start_signal_fence(store, id, marker)
+                .map_err(|e| e.to_string())?;
+        batch.checks.extend(part.checks);
+        batch.mutations.extend(part.mutations);
+    }
+    let manifest = WokenOwnedCallbackMarkers {
+        version: 1,
+        root: claim.task,
+        claim_id: claim.claim_id,
+        graph_version: graph_entry.version,
+        marker: marker.to_vec(),
+        conversations: conversations.clone(),
+    };
+    let key = woken_owned_callback_markers_key(claim.task);
+    batch.checks.push(durable_store::Check {
+        key: key.clone(),
+        expected: durable_store::Expected::Missing,
+    });
+    batch.mutations.push(durable_store::Mutation::Put {
+        key,
+        value: serde_json::to_vec(&manifest).map_err(|e| e.to_string())?,
+    });
+    Ok((conversations, batch))
+}
+
+/// Retire exactly the persisted owned marker set. The caller must also fence
+/// its claim and receipt or unknown outcome in this same transaction.
+#[cfg(feature = "experimental-graph-revision")]
+#[allow(dead_code)]
+pub(crate) fn prepare_woken_owned_callback_finish(
+    store: &durable_store::Store,
+    claim: &WokenConversationCancelClaim,
+    marker: &[u8],
+) -> Result<task_store::OwnedBatch, String> {
+    let key = woken_owned_callback_markers_key(claim.task);
+    let entry = store
+        .get(&key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing owned marker manifest")?;
+    let manifest: WokenOwnedCallbackMarkers =
+        serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+    let graph_key = crate::runtime::woken_owned_graph_key(claim.task);
+    let graph = store
+        .get(&graph_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing owned graph")?;
+    let evidence: crate::runtime::WokenOwnedGraphEvidence =
+        serde_json::from_slice(&graph.value).map_err(|e| e.to_string())?;
+    let mut ids: Vec<_> = evidence.edges.iter().map(|edge| edge.edge.child).collect();
+    ids.sort_unstable();
+    if manifest.version != 1
+        || manifest.root != claim.task
+        || manifest.claim_id != claim.claim_id
+        || manifest.marker != marker
+        || manifest.graph_version != graph.version
+        || evidence.root != claim.task
+        || evidence.interrupted_attempt != claim.woken_attempt
+        || ids != manifest.conversations
+        || ids
+            .iter()
+            .any(|id| id.is_nil() || *id == claim.conversation)
+        || ids.windows(2).any(|pair| pair[0] == pair[1])
+    {
+        return Err("woken owned marker manifest mismatch".into());
+    }
+    let mut batch = task_store::OwnedBatch {
+        checks: vec![
+            durable_store::Check {
+                key,
+                expected: durable_store::Expected::Version(entry.version),
+            },
+            durable_store::Check {
+                key: graph_key,
+                expected: durable_store::Expected::Version(graph.version),
+            },
+        ],
+        mutations: vec![],
+    };
+    for id in ids {
+        let part =
+            crate::conversation_signal::prepare_callback_finish_signal_fence(store, id, marker)
+                .map_err(|e| e.to_string())?;
+        batch.checks.extend(part.checks);
+        batch.mutations.extend(part.mutations);
+    }
+    let retired_key = woken_owned_marker_retirement_key(claim.task);
+    batch.checks.push(durable_store::Check {
+        key: retired_key.clone(),
+        expected: durable_store::Expected::Missing,
+    });
+    let retired = WokenOwnedMarkerRetirement {
+        version: 1,
+        root: claim.task,
+        claim_id: claim.claim_id,
+        manifest_version: entry.version,
+        graph_version: graph.version,
+    };
+    batch.mutations.push(durable_store::Mutation::Put {
+        key: retired_key,
+        value: serde_json::to_vec(&retired).map_err(|e| e.to_string())?,
+    });
+    Ok(batch)
+}
+
+/// Prove receipt publication retired the complete immutable marker set in
+/// that very commit. A cleanup-only retirement is not a successful receipt.
+#[cfg(feature = "experimental-graph-revision")]
+fn woken_owned_retirement_checks(
+    store: &durable_store::Store,
+    claim: &WokenConversationCancelClaim,
+    receipt_version: u64,
+    boundary: u64,
+) -> Result<Vec<durable_store::Check>, String> {
+    let graph_key = crate::runtime::woken_owned_graph_key(claim.task);
+    if store
+        .first_commit_for_key(&graph_key)
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
+        return Ok(vec![durable_store::Check {
+            key: graph_key,
+            expected: durable_store::Expected::MissingUnchangedSince(boundary),
+        }]);
+    }
+    let graph = store
+        .get(&graph_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("owned graph was removed")?;
+    let manifest_key = woken_owned_callback_markers_key(claim.task);
+    let entry = store
+        .get(&manifest_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("owned marker manifest missing")?;
+    let manifest: WokenOwnedCallbackMarkers =
+        serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+    let retired_key = woken_owned_marker_retirement_key(claim.task);
+    let retired_entry = store
+        .get(&retired_key)
+        .map_err(|e| e.to_string())?
+        .ok_or("owned marker retirement missing")?;
+    let retired: WokenOwnedMarkerRetirement =
+        serde_json::from_slice(&retired_entry.value).map_err(|e| e.to_string())?;
+    if manifest.version != 1
+        || manifest.root != claim.task
+        || manifest.claim_id != claim.claim_id
+        || manifest.graph_version != graph.version
+        || retired.version != 1
+        || retired.root != claim.task
+        || retired.claim_id != claim.claim_id
+        || retired.manifest_version != entry.version
+        || retired.graph_version != graph.version
+        || store
+            .commit_for_version(&retired_key, retired_entry.version)
+            .map_err(|e| e.to_string())?
+            .is_none()
+        || store
+            .commit_for_version(&retired_key, retired_entry.version)
+            .map_err(|e| e.to_string())?
+            != store
+                .commit_for_version(&woken_conversation_receipt_key(claim.task), receipt_version)
+                .map_err(|e| e.to_string())?
+    {
+        return Err("owned marker retirement does not bind receipt".into());
+    }
+    let mut checks = vec![
+        durable_store::Check {
+            key: graph_key,
+            expected: durable_store::Expected::Version(graph.version),
+        },
+        durable_store::Check {
+            key: manifest_key,
+            expected: durable_store::Expected::Version(entry.version),
+        },
+        durable_store::Check {
+            key: retired_key,
+            expected: durable_store::Expected::Version(retired_entry.version),
+        },
+    ];
+    for id in manifest.conversations {
+        let key = crate::conversation_signal::callback_start_key(id);
+        if store.get(&key).map_err(|e| e.to_string())?.is_some() {
+            return Err("owned callback marker remains".into());
+        }
+        checks.push(durable_store::Check {
+            key,
+            expected: durable_store::Expected::MissingUnchangedSince(boundary),
+        });
+    }
+    Ok(checks)
+}
+
 pub(crate) fn woken_conversation_terminal_key(task: Uuid) -> Vec<u8> {
     format!("durable/replay-safe-async/{task}/conversation-woken-cancel-terminal-v1").into_bytes()
 }
@@ -488,6 +760,13 @@ pub(crate) fn woken_after_candidate_checks(
         key,
         expected: durable_store::Expected::Version(entry.version),
     });
+    #[cfg(feature = "experimental-graph-revision")]
+    checks.extend(woken_owned_retirement_checks(
+        store,
+        claim,
+        entry.version,
+        boundary,
+    )?);
     Ok((result, entry.version, checks))
 }
 
@@ -587,6 +866,13 @@ pub(crate) fn woken_terminal_after_checks(
             expected: durable_store::Expected::Version(version),
         },
     ]);
+    #[cfg(feature = "experimental-graph-revision")]
+    checks.extend(woken_owned_retirement_checks(
+        store,
+        &claim,
+        receipt_entry.version,
+        boundary,
+    )?);
     Ok((result, checks))
 }
 
@@ -3922,6 +4208,33 @@ impl AdmissionHandle<'_> {
             .ok_or_else(|| "conversation callback start busy; reconciliation required".into())
     }
 
+    /// Pin all owned conversations until the first callback poll. Durable
+    /// markers and graph/claim checks must be committed before that poll.
+    #[cfg(feature = "experimental-graph-revision")]
+    pub(crate) fn woken_owned_start_leases(
+        &self,
+    ) -> Result<(Vec<Uuid>, Vec<durable_store::controls::CallbackStartLease>), String> {
+        let owner = &self.lease.attachment.owner;
+        let key = crate::runtime::woken_owned_graph_key(self.running.task.id());
+        let Some(entry) = owner.store().get(&key).map_err(|e| e.to_string())? else {
+            return Ok((vec![], vec![]));
+        };
+        let graph: crate::runtime::WokenOwnedGraphEvidence =
+            serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+        let mut ids: Vec<_> = graph.edges.iter().map(|edge| edge.edge.child).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        for &id in &ids {
+            owner.conversation_controls().get(id);
+        }
+        let leases = owner
+            .conversation_controls()
+            .try_callback_start_many(ids.iter().copied())
+            .map_err(|e| format!("owned start lease: {e:?}"))?
+            .ok_or("owned start lease busy")?;
+        Ok((ids, leases))
+    }
+
     /// Obtain a nested target's conversation start lease. The caller must
     /// compose the returned identity in a checked marker transaction before
     /// polling a callback; this lookup alone does not authorize it.
@@ -4294,8 +4607,8 @@ impl AdmissionHandle<'_> {
             )
             .map_err(|e| e.to_string())?,
         );
-        // Until evidence traversal covers conversation ownership edges, refuse
-        // to authorize cleanup through one, including after a live graph abort.
+        // An owned conversation requires explicitly captured graph evidence.
+        // The feature-gated graph checks above validate that evidence atomically.
         let records = tasks.list().map_err(|e| e.to_string())?;
         let mut task_ids = HashSet::from([current.task.id()]);
         loop {
@@ -4315,7 +4628,19 @@ impl AdmissionHandle<'_> {
         if crate::ownership_edge::reject_foreground_children(owner.store(), task_ids)
             .map_err(|e| e.to_string())?
         {
-            return Err("owned conversation requires reconciliation".into());
+            // The graph checks above authenticate this recorded snapshot; the
+            // first-poll path separately holds every owned conversation gate.
+            #[cfg(feature = "experimental-graph-revision")]
+            let authenticated_graph = owner
+                .store()
+                .get(&crate::runtime::woken_owned_graph_key(current.task.id()))
+                .map_err(|e| e.to_string())?
+                .is_some();
+            #[cfg(not(feature = "experimental-graph-revision"))]
+            let authenticated_graph = false;
+            if !authenticated_graph {
+                return Err("owned conversation requires reconciliation".into());
+            }
         }
         let (uncertain, descendant_checks, _nested_identity_leases) =
             authenticated_unsafe_descendant_reconciliation(
@@ -4699,6 +5024,7 @@ impl AdmissionHandle<'_> {
         identity_lease: &crate::nested_identity::IdentityLease,
         expected_identity: &str,
         policy: crate::async_task_tool::ConversationCancelPolicy,
+        owned_ids: &[Uuid],
     ) -> Result<Vec<u8>, String> {
         if identity_lease.as_deref() != Some(expected_identity)
             || !self.abort
@@ -4879,6 +5205,20 @@ impl AdmissionHandle<'_> {
         checks.extend(task_start.checks);
         let mut mutations = conversation_start.mutations;
         mutations.extend(task_start.mutations);
+        #[cfg(feature = "experimental-graph-revision")]
+        if !owned_ids.is_empty() {
+            let (marked_ids, owned) =
+                prepare_woken_owned_callback_start(owner.store(), claim, &marker)?;
+            if marked_ids != owned_ids {
+                return Err("owned start lease graph changed".into());
+            }
+            checks.extend(owned.checks);
+            mutations.extend(owned.mutations);
+        }
+        #[cfg(not(feature = "experimental-graph-revision"))]
+        if !owned_ids.is_empty() {
+            return Err("owned markers unavailable".into());
+        }
         let result = owner
             .store()
             .commit_with_prefix_put_fence(
@@ -5674,6 +6014,19 @@ impl AdmissionHandle<'_> {
             .map_err(|e| e.to_string())?;
             checks.extend(conversation_finish.checks);
             checks.extend(task_finish.checks);
+            #[cfg(feature = "experimental-graph-revision")]
+            if owner
+                .store()
+                .get(&crate::runtime::woken_owned_graph_key(claim.task))
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                let owned = prepare_woken_owned_callback_finish(owner.store(), claim, marker)?;
+                checks.extend(owned.checks);
+                if memo.is_none() {
+                    mutations.extend(owned.mutations);
+                }
+            }
             if memo.is_none() {
                 mutations.extend(conversation_finish.mutations);
                 mutations.extend(task_finish.mutations);
@@ -6013,6 +6366,17 @@ impl AdmissionHandle<'_> {
         checks.extend(task_finish.checks);
         let mut mutations = conversation_finish.mutations;
         mutations.extend(task_finish.mutations);
+        #[cfg(feature = "experimental-graph-revision")]
+        if owner
+            .store()
+            .get(&crate::runtime::woken_owned_graph_key(claim.task))
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            let owned = prepare_woken_owned_callback_finish(owner.store(), claim, marker)?;
+            checks.extend(owned.checks);
+            mutations.extend(owned.mutations);
+        }
         mutations.push(durable_store::Mutation::Put {
             key,
             value: serde_json::to_vec(claim).map_err(|e| e.to_string())?,
@@ -13373,6 +13737,19 @@ impl Scheduler {
                                     return Err(Error::Handler(
                                         "interrupted woken marker mismatch".into(),
                                     ));
+                                }
+                                #[cfg(feature = "experimental-graph-revision")]
+                                if store
+                                    .get(&crate::runtime::woken_owned_graph_key(claim.task))
+                                    .map_err(task_store::Error::from)?
+                                    .is_some()
+                                {
+                                    let owned = prepare_woken_owned_callback_finish(
+                                        store, &claim, &expected,
+                                    )
+                                    .map_err(Error::Handler)?;
+                                    batch.checks.extend(owned.checks);
+                                    batch.mutations.extend(owned.mutations);
                                 }
                                 for (key, marker) in [
                                     (task_key, task_marker),

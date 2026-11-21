@@ -157,8 +157,7 @@ pub(crate) fn clear_callback_start_check(
 }
 
 pub(crate) fn reentrant_callback(store: &Store, conversation: Uuid) -> Result<bool, Error> {
-    let Some(marker) = durable_store::controls::callback_marker_for_conversation(conversation)
-    else {
+    let Some(marker) = durable_store::controls::current_callback_marker() else {
         return Ok(false);
     };
     Ok(store

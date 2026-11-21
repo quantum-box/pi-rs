@@ -44,6 +44,14 @@ receipt settlement and remains reconciliation evidence. The callback is polled
 at most once. A successful callback does not determine the interrupted Tool's
 outcome: the task fails for reconciliation and `abort_and_wait` can report
 pending cleanup. Woken roots with live owned work fail closed; woken child cancellation remains unsupported.
+With the non-default `experimental-graph-revision` feature, a woken root may
+also cancel after its recorded foreground owned-conversation graph has drained,
+when every task reached through a conversation edge is replay-safe and terminal.
+Legacy stores, missing or changed graph evidence, and unsafe owned-conversation
+tasks remain reconciliation-required. All recorded owned conversations are
+fenced through first poll and their durable markers retire with the receipt or
+unknown outcome. Without this feature, owned-conversation cancellation remains
+disabled.
 A separate `register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_woken_cancel`
 registration runs the replay-safe selected after hook with fenced memo and
 retains its rich result with the callback receipt and snapshot version. An
@@ -150,10 +158,11 @@ as uncommitted.
 Interrupted-woken cancellation drains foreground task descendants before the
 parent callback. When a foreground owned conversation is present, driver
 recovery atomically preserves the wake and marks the foreground graph for abort.
-The parent callback remains disabled for this case: conversation-edge and
-child-conversation terminal evidence are not yet authenticated. Invalid wake
-or binding evidence holds the root in failure for reconciliation while normal
-graph cleanup proceeds.
+Without `experimental-graph-revision` the parent callback remains disabled for
+this case. With the feature, callback admission and result publication require
+the authenticated drained graph described above. Invalid wake, binding, legacy,
+or unsafe owned-child evidence remains blocked for reconciliation; it does not
+authorize an external callback.
 
 The sections below describe the earlier stages; references to dispatch being
 disabled apply to those stages and to the original registration.

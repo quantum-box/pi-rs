@@ -381,6 +381,26 @@ impl ConversationControls {
         Ok(gate.try_start())
     }
 
+    /// Acquire every existing target start gate without waiting. IDs are
+    /// deduplicated and ordered; partial acquisitions are released on failure.
+    /// This does not persist markers or authorize callback dispatch.
+    pub fn try_callback_start_many(
+        &self,
+        ids: impl IntoIterator<Item = Uuid>,
+    ) -> Result<Option<Vec<CallbackStartLease>>, CallbackStartGateError> {
+        let mut ids: Vec<_> = ids.into_iter().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut leases = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.try_callback_start(id)? {
+                Some(lease) => leases.push(lease),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(leases))
+    }
+
     /// Fence all registered polls while `commit` discovers and persists its
     /// affected graph. Only after a successful commit are their epochs cancelled.
     /// The callback must not acquire a conversation control or await.
@@ -591,6 +611,41 @@ mod tests {
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(lease.poll_first(future.as_mut(), &mut context).is_pending());
         assert!(controls.try_callback_start(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn callback_start_many_is_atomic_and_fences_first_poll() {
+        let controls = ConversationControls::default();
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let other = Uuid::from_u128(3);
+        controls.get(first);
+        controls.get(second);
+        controls.get(other);
+        let busy = controls.get(second).callback_start.try_enter().unwrap();
+        assert!(controls
+            .try_callback_start_many([second, first])
+            .unwrap()
+            .is_none());
+        assert!(controls.get(first).callback_start.try_enter().is_some());
+        drop(busy);
+        let leases = controls
+            .try_callback_start_many([second, first, first])
+            .unwrap()
+            .unwrap();
+        assert_eq!(leases.len(), 2);
+        let mut future = std::pin::pin!(std::future::poll_fn(|_| {
+            assert!(controls.get(first).callback_start.try_enter().is_none());
+            assert!(controls.get(second).callback_start.try_enter().is_none());
+            assert!(controls.get(other).callback_start.try_enter().is_some());
+            std::task::Poll::<()>::Pending
+        }));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            CallbackStartLease::poll_first_many(leases, future.as_mut(), &mut context).is_pending()
+        );
+        assert!(controls.get(first).callback_start.try_enter().is_some());
+        assert!(controls.get(second).callback_start.try_enter().is_some());
     }
 
     #[test]

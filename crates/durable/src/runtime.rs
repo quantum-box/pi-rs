@@ -12731,6 +12731,13 @@ impl Harness {
         use crate::task::TaskOwner;
         use std::collections::{HashMap, HashSet};
         let store = self.owner.store();
+        // A legacy store cannot prove that its pre-migration owned graph did
+        // not have an erased edge or task. Keep external cleanup fail-closed.
+        if store.legacy_version_boundary()? != 0 {
+            return Err(Error::Invalid(
+                "legacy owned graph requires reconciliation".into(),
+            ));
+        }
         let evidence_key = woken_owned_graph_key(root.task.id());
         let evidence_entry = store
             .get(&evidence_key)?

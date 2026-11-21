@@ -1165,12 +1165,22 @@ impl SelectionStartGates {
 
 impl SelectionStartLease {
     pub(crate) fn poll_first<F: std::future::Future + ?Sized>(
-        mut self,
+        self,
         conversation: durable_store::controls::CallbackStartLease,
         future: std::pin::Pin<&mut F>,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<F::Output> {
-        self.leases.push(conversation);
+        self.poll_first_many(vec![conversation], future, context)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn poll_first_many<F: std::future::Future + ?Sized>(
+        mut self,
+        conversations: Vec<durable_store::controls::CallbackStartLease>,
+        future: std::pin::Pin<&mut F>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        self.leases.extend(conversations);
         durable_store::controls::CallbackStartLease::poll_first_many(
             std::mem::take(&mut self.leases),
             future,
