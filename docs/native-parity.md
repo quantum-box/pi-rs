@@ -4794,6 +4794,22 @@ and headers inferred from classifier-only model URLs apply to those operations.
 When the inferred URL is on the configured official account, its provider
 credentials also apply to chat. Live Workers AI inference has not been verified.
 
+### Cloudflare AI Gateway
+
+Cloudflare AI Gateway includes the 59 pinned Pi AI chat models. It uses
+the account and gateway identifiers in `CLOUDFLARE_ACCOUNT_ID` and
+`CLOUDFLARE_GATEWAY_ID`, or their equivalents in a Pi-format saved
+credential. `CLOUDFLARE_API_KEY` supplies the gateway token. The model's API
+selects the Chat Completions, Messages, or Responses path. All three send
+`cf-aig-authorization` for gateway authentication, and saved keys remain
+scoped to their account and gateway. A concrete provider `baseUrl` can
+supply missing route identifiers for an imported key when the configured
+route agrees with any saved or environment identifiers.
+
+The published Pi AI package and local fixtures cover each route and
+authentication header. Live gateway authentication was unverified because
+no gateway credentials were available.
+
 ### Configured llama.cpp classifiers
 
 A `models.json` provider can declare an entry with `"type": "classifier"` and
@@ -4898,11 +4914,19 @@ the effective minimum validity after the saved refresh. Loopback fixtures
 covered early refresh and persistence. Live Codex and Copilot refresh was
 unverified.
 
-The native transport sends uncompressed JSON over HTTP SSE. The upstream
-WebSocket transport and specialized Codex
-grammar tools and tool search remain open. Authentication was exercised with
-fixtures. Live sign-in and inference were unverified because no account was
-available for acceptance.
+The native transport sends uncompressed JSON over HTTP SSE. OpenAI Responses
+and Codex models with `compat.supportsOpenAIGrammarTools` advertise grammar
+tools as custom tools. They choose a nonempty Lark definition before a regex
+definition and map streamed input onto the single required string argument.
+Replay uses the matching call and result item types for the tools advertised
+on the current request. Historical function arguments retain their full JSON
+when they cannot be represented as a single string. Models without the
+capability and the pi-rs ChatGPT plan namespace use function tools.
+
+OpenAI Codex WebSocket transport and provider tool search remain open.
+Authentication and grammar tool streaming were exercised with fixtures.
+Live sign-in and inference were unverified because no account was available
+for acceptance.
 
 ### GitHub Copilot
 
