@@ -162,6 +162,14 @@ conversation mutations against the boundary captured before callback start.
 Changes in the affected graph leave the receipt pending; unrelated graphs can
 continue and do not invalidate it.
 
+When both experimental features are enabled, graph-revision protocol v4
+blocks older raw SQLite writers rather than letting graph-scope track their
+writes. Installing or upgrading that protocol on disk requires exclusive
+scheduler ownership; a concurrent opener may need to retry. A database
+protected by graph-revision cannot be opened by a build lacking that feature.
+Legacy stores remain ineligible for owned-conversation cancellation because
+their pre-migration graph history cannot be proven.
+
 Interrupted-woken cancellation drains foreground task descendants before the
 parent callback. When a foreground owned conversation is present, driver
 recovery atomically preserves the wake and marks the foreground graph for abort.
@@ -419,8 +427,9 @@ selection. Neither check is wired into parent settlement; a caller must hold
 the selection gate and the returned identity lease through the parent commit.
 
 The experimental `experimental-graph-scope` feature records before and after
-values for task, ownership-edge and conversation writes, including writes by
-older open SQLite connections. It checks the union of current and historical
+values for task, ownership-edge and conversation writes. When enabled alone,
+it also tracks writes by older open SQLite connections; when graph-revision is
+also enabled, protocol v4 rejects those writers instead. It checks the union of current and historical
 ownership paths so transient creation, deletion and reparenting are not lost.
 Malformed or oversized records and boundaries older than the last 4,096
 history entries fail closed. History values are limited to 16 KiB each and

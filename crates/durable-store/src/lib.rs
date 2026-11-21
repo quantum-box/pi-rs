@@ -4056,6 +4056,8 @@ mod graph_mutation_revision_tests {
         ));
     }
 
+    // Protocol v4 deliberately blocks legacy raw SQLite writers.
+    #[cfg(not(feature = "experimental-graph-revision"))]
     #[test]
     fn experimental_graph_history_tracks_legacy_insert_delete_and_reparent() {
         use serde_json::json;
@@ -4153,6 +4155,36 @@ mod graph_mutation_revision_tests {
         assert!(reopened.commit(&[check(boundary)], &[]).is_err());
     }
 
+    #[cfg(feature = "experimental-graph-revision")]
+    #[test]
+    fn combined_protocol_blocks_old_writer_and_tracks_store_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("combined.sqlite");
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch("CREATE TABLE durable_store_entries (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL, version INTEGER NOT NULL CHECK(version>0)) WITHOUT ROWID;").unwrap();
+        let store = Store::open(&path).unwrap();
+        let key = b"durable/task/old".to_vec();
+        assert!(old
+            .execute(
+                "INSERT INTO durable_store_entries(key,value,version) VALUES(?1,X'31',1)",
+                [&key]
+            )
+            .is_err());
+        let boundary = store.graph_mutation_revision().unwrap();
+        store
+            .commit(
+                &[],
+                &[Mutation::Put {
+                    key,
+                    value: b"new".to_vec(),
+                }],
+            )
+            .unwrap();
+        assert!(store.graph_mutation_revision().unwrap() > boundary);
+    }
+
+    // Protocol v4 deliberately blocks legacy raw SQLite writers.
+    #[cfg(not(feature = "experimental-graph-revision"))]
     #[test]
     fn migration_tracks_writes_from_connection_opened_before_installation() {
         let dir = tempfile::tempdir().unwrap();
@@ -4220,6 +4252,8 @@ mod graph_mutation_revision_tests {
                 {
                     ()
                 }
+                #[cfg(feature = "experimental-graph-revision")]
+                Err(Error::MigrationOwnerUnavailable(_)) => (),
                 Err(error) => panic!("unexpected concurrent open error: {error}"),
             }
         }
@@ -4259,7 +4293,7 @@ mod graph_mutation_revision_tests {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
-        assert!(Store::initialize(readonly, true).is_err());
+        assert!(Store::initialize(readonly, true, true).is_err());
         let probe = rusqlite::Connection::open(&path).unwrap();
         let installed: bool = probe.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='durable_graph_mutation_history')", [], |r| r.get(0)).unwrap();
         assert!(!installed);
@@ -4291,6 +4325,8 @@ mod graph_mutation_revision_tests {
         assert!(Store::open(&path).is_err());
     }
 
+    // Protocol v4 deliberately blocks legacy raw SQLite writers.
+    #[cfg(not(feature = "experimental-graph-revision"))]
     #[test]
     fn graph_fence_detects_deletes_and_aba_across_reopen_and_old_connection() {
         let dir = tempfile::tempdir().unwrap();

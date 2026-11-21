@@ -2074,7 +2074,8 @@ impl Handler for Executor {
                         admission.conversation_callback_start_lease()?
                     };
                     let graph_start_boundary = admission.graph_start_boundary()?;
-                    let bounded_admission = admission.with_graph_start_boundary(graph_start_boundary);
+                    let bounded_admission =
+                        admission.with_graph_start_boundary(graph_start_boundary);
                     let admission = &bounded_admission;
                     let marker = admission.record_woken_conversation_start_markers(
                         self,

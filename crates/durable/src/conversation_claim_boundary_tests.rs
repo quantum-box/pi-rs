@@ -8432,6 +8432,24 @@ async fn woken_owned_callback_driver_fixture_runs_once() {
     }
 }
 
+#[cfg(all(
+    feature = "experimental-graph-revision",
+    feature = "experimental-graph-scope"
+))]
+#[tokio::test]
+async fn woken_owned_busy_receipt_retries_without_callback_replay() {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "conversation_claim_boundary_tests::woken_owned_callback_fixture",
+            "--nocapture",
+        ])
+        .env("PI_TEST_WOKEN_OWNED_CASE", "27")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
 #[cfg(feature = "experimental-graph-revision")]
 #[tokio::test]
 async fn woken_owned_callback_kill_and_reopen() {
@@ -8516,7 +8534,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
         )
         .unwrap();
     }
-    if matches!(graph_aba, 10 | 18 | 20 | 23) {
+    if matches!(graph_aba, 10 | 18 | 20 | 23 | 27) {
         std::fs::write(dir.path().join("selected-mode"), b"yes").unwrap();
     }
     let mut child = Command::new(std::env::current_exe().unwrap())
@@ -8542,7 +8560,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
     let path = dir.path().join("db");
     let (options, registry, extensions) = build_woken_any(&path);
     let mut harness = crate::runtime::Harness::open_paused(&path, options).unwrap();
-    if matches!(graph_aba, 10 | 18 | 20 | 23) {
+    if matches!(graph_aba, 10 | 18 | 20 | 23 | 27) {
         harness.set_extension_registry_for_test(extensions);
     }
     let conversation = harness
@@ -9345,7 +9363,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             .replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap())
             .unwrap();
         store.commit(&checks, &[]).unwrap();
-        if matches!(graph_aba, 17 | 18 | 19 | 20 | 23) {
+        if matches!(graph_aba, 17 | 18 | 19 | 20 | 23 | 27) {
             let root_id = root.task.id();
             drop(store);
             drop(harness);
@@ -9384,13 +9402,27 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                             Err(crate::runtime::Error::TaskPublicationBusy)
                         ));
                     }
-                    if matches!(graph_aba, 18 | 20 | 23) {
+                    if matches!(graph_aba, 18 | 20 | 23 | 27) {
                         assert!(matches!(
                             worker.uninstall_extension("policy"),
                             Err(crate::runtime::Error::TaskPublicationBusy)
                         ));
                     }
                     observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+            if graph_aba == 27 {
+                let writer_path = path.clone();
+                crate::task_scheduler::on_conversation_receipt_before_commit(root_id, move || {
+                    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let conn = rusqlite::Connection::open(writer_path).unwrap();
+                        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                        ready_tx.send(()).unwrap();
+                        std::thread::sleep(Duration::from_secs(6));
+                        conn.execute_batch("ROLLBACK").unwrap();
+                    });
+                    ready_rx.recv().unwrap();
                 });
             }
             let driver = scheduler.start_tasks(registry).unwrap();
@@ -9465,9 +9497,13 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             assert_eq!(receipt.result, "callback returned");
             assert_eq!(
                 receipt.version,
-                if matches!(graph_aba, 18 | 20) { 2 } else { 1 }
+                if matches!(graph_aba, 18 | 20 | 27) {
+                    2
+                } else {
+                    1
+                }
             );
-            if matches!(graph_aba, 18 | 20) {
+            if matches!(graph_aba, 18 | 20 | 27) {
                 assert!(selection_observed.load(std::sync::atomic::Ordering::SeqCst));
                 let crate::task::TaskOwner::Conversation(owner) = final_task.owner() else {
                     panic!("missing conversation");
