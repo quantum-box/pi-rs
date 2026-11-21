@@ -1227,7 +1227,7 @@ impl OpenAiResponses {
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
-            &error_secrets,
+            error_secrets,
             &self.headers,
         )
         .await;

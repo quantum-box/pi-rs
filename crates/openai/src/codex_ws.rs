@@ -466,6 +466,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
+            // Tungstenite owns the handshake callback's error type.
+            #[allow(clippy::result_large_err)]
             let mut socket = tokio_tungstenite::accept_hdr_async(
                 tcp,
                 |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
