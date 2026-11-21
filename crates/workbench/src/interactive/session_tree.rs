@@ -2,7 +2,7 @@ use crate::{
     sessions,
     ui::picker::{Item, Picker, Selection, TreeDescription, TreeEntryKind, TreeFilter},
 };
-use pi_rs::{Event, ModelFailure, Record, Session};
+use pi_rs::{Event, ModelFailure, Session};
 use serde_json::Value;
 
 pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
@@ -11,7 +11,7 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
     for record in session.records() {
         match &record.event {
             Event::Assistant { invocations, .. } => {
-                if let Some(completion) = preceding_completion(session, record) {
+                if let Some(completion) = sessions::tree_assistant_completion(session, record) {
                     assistant_completions.insert(completion.id);
                 }
                 calls.extend(
@@ -39,21 +39,13 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
                 tree_description("user: ", "accent", tree_preview(content, 200)),
             ),
             Event::Assistant { content, .. } => {
-                let completion = preceding_completion(session, record);
+                let completion = sessions::tree_assistant_completion(session, record);
                 let failure = completion.and_then(|record| match record.event {
                     Event::ModelFinished { failure, .. } => failure,
                     _ => None,
                 });
-                let source_error = completion
-                    .and_then(|record| preceding_record(session, record))
-                    .and_then(|record| match &record.event {
-                        Event::SourceEntry { format, entry }
-                            if format == "pi" && entry["message"]["role"] == "assistant" =>
-                        {
-                            entry["message"]["errorMessage"].as_str()
-                        }
-                        _ => None,
-                    });
+                let source_error =
+                    completion.and_then(|record| sessions::tree_completion_error(session, record));
                 let kind = if content.trim().is_empty() && failure.is_none() && record.id != head {
                     TreeEntryKind::Hidden
                 } else {
@@ -70,7 +62,11 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
                 ..
             } if !assistant_completions.contains(&record.id) => (
                 TreeEntryKind::Message,
-                tree_assistant_description(partial, Some(*failure), None),
+                tree_assistant_description(
+                    partial,
+                    Some(*failure),
+                    sessions::tree_completion_error(session, record),
+                ),
             ),
             Event::ToolFinished { operation_id, .. }
             | Event::ToolReconciled { operation_id, .. } => (
@@ -176,25 +172,6 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
     picker.set_tree_descriptions(descriptions);
     picker.set_label_timestamps(session.label_timestamps());
     picker
-}
-
-fn preceding_record<'a>(session: &'a Session, record: &Record) -> Option<&'a Record> {
-    session
-        .records()
-        .get(record.parent?.checked_sub(1)? as usize)
-}
-
-fn preceding_completion<'a>(session: &'a Session, assistant: &Record) -> Option<&'a Record> {
-    let Event::Assistant {
-        request_id: Some(request_id),
-        ..
-    } = &assistant.event
-    else {
-        return None;
-    };
-    let parent = preceding_record(session, assistant)?;
-    matches!(parent.event, Event::ModelFinished { request_id: id, .. } if id == *request_id)
-        .then_some(parent)
 }
 
 fn tree_description(
@@ -320,7 +297,7 @@ mod tests {
             json!({"type":"message","id":"user","parentId":null,"timestamp":timestamp,
                 "message":{"role":"user","content":"user\ntext"}}),
             json!({"type":"message","id":"error","parentId":"user","timestamp":timestamp,
-                "message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"fixture error"}}),
+                "message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"fixture\nerror"}}),
             json!({"type":"custom_message","id":"custom","parentId":"error","timestamp":timestamp,
                 "customType":"checkpoint","content":[{"type":"text","text":"first\t"},{"type":"text","text":"second"}],"display":false}),
             json!({"type":"label","id":"label","parentId":"custom","timestamp":timestamp,"targetId":"custom","label":"milestone"}),
@@ -384,6 +361,15 @@ mod tests {
         assert_eq!(
             sessions::tree_record_text(&session, id).unwrap(),
             "first\tsecond"
+        );
+        let failed = session
+            .records()
+            .iter()
+            .find(|record| matches!(&record.event, Event::Assistant { content, .. } if content.is_empty()))
+            .unwrap();
+        assert_eq!(
+            sessions::tree_record_text(&session, failed.id).unwrap(),
+            "fixture\nerror"
         );
         picker.input(
             crossterm::event::KeyEvent::new(
