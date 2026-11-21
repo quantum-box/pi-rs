@@ -778,6 +778,14 @@ use their existing editor border and keep the elapsed time and cancel hint.
 Pi accepts styled terminal strings in custom frames. Native frames use plain
 text in the active border theme. Retry, summary, and shell status are retained.
 
+### Native extension collapsed thinking label
+
+Extensions can override the themed `Thinking...` label for past and
+streaming thinking blocks in both terminal modes. A blank label suppresses
+the block and spacing while collapsed. Changes preserve each block's
+expansion state and the recorded thinking content. Native labels are
+limited to 16 rendered rows.
+
 ### Native custom message renderers
 
 Native Rust and executable extensions can match a visible custom message by
