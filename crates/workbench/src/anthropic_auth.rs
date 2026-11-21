@@ -325,7 +325,7 @@ where
     if no_refresh || !expires_soon(&value, window) {
         return Ok(value.access);
     }
-    tokio::task::spawn_blocking(move || {
+    super::model_auth::await_admitted_oauth_refresh("anthropic", move |admitted| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -333,10 +333,8 @@ where
         let service = service()?;
         let barrier = super::process::refresh_barrier()?;
         let guard = super::process::guard_refresh_auth(barrier, guard);
-        let value = runtime.block_on(super::model_auth::with_oauth_refresh_deadline(
-            "anthropic",
-            service.refresh(&value),
-        ))?;
+        let _ = admitted.send(());
+        let value = runtime.block_on(service.refresh(&value))?;
         super::config::update_object_locked(&path, Some(&guard), |data| {
             let current = data
                 .get_mut("anthropic")
@@ -355,7 +353,6 @@ where
         Ok(value.access)
     })
     .await
-    .map_err(|_| error("refresh task failed"))?
 }
 pub(super) async fn access(
     settings: &super::config::Settings,

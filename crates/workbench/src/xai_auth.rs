@@ -325,17 +325,15 @@ async fn access_at(
     }
     // Tokio waits for started blocking tasks on runtime shutdown. The separate
     // runtime keeps the exchange alive even when the caller's runtime stops.
-    tokio::task::spawn_blocking(move || {
+    super::model_auth::await_admitted_oauth_refresh("xai", move |admitted| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| error("cannot start refresh runtime"))?;
         let barrier = super::process::refresh_barrier()?;
         let guard = super::process::guard_refresh_auth(barrier, guard);
-        let value = runtime.block_on(super::model_auth::with_oauth_refresh_deadline(
-            "xai",
-            service.refresh(&value.refresh),
-        ))?;
+        let _ = admitted.send(());
+        let value = runtime.block_on(service.refresh(&value.refresh))?;
         super::config::update_object_locked(&path, Some(&guard), |data| {
             let current = data
                 .get_mut("xai")
@@ -356,7 +354,6 @@ async fn access_at(
         Ok(value.access)
     })
     .await
-    .map_err(|_| error("refresh task failed"))?
 }
 pub(super) async fn access(
     settings: &super::config::Settings,

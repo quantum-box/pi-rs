@@ -11,13 +11,36 @@ use super::{Provider, config};
 pub(super) const PI_OAUTH_MINIMUM_VALIDITY: std::time::Duration =
     std::time::Duration::from_secs(300);
 
+const OAUTH_REFRESH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub(super) async fn with_oauth_refresh_deadline<T>(
     provider: &str,
     refresh: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
-    tokio::time::timeout(std::time::Duration::from_secs(15), refresh)
+    tokio::time::timeout(OAUTH_REFRESH_DEADLINE, refresh)
         .await
         .map_err(|_| Error::Config(format!("OAuth token refresh timed out for {provider}")))?
+}
+
+/// Bound the caller's wait after admission while retaining the native
+/// durability guarantee for a refresh that already reached its provider.
+pub(super) async fn await_admitted_oauth_refresh<T: Send + 'static>(
+    provider: Option<&str>,
+    refresh: impl FnOnce(tokio::sync::oneshot::Sender<()>) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let (admitted, admission) = tokio::sync::oneshot::channel();
+    let task = tokio::task::spawn_blocking(move || refresh(admitted));
+    let completion = async {
+        task.await
+            .map_err(|_| Error::Config("OAuth refresh task failed".into()))?
+    };
+    if let Some(provider) = provider
+        && admission.await.is_ok()
+    {
+        with_oauth_refresh_deadline(provider, completion).await
+    } else {
+        completion.await
+    }
 }
 
 #[derive(Clone)]
@@ -824,6 +847,31 @@ pub(super) use pi_rs_workbench::auth_factory::valid_api_key as valid_key;
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn refresh_wait_times_out_without_interrupting_admitted_credential_persistence() {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (finish, finish_in_worker) = std::sync::mpsc::channel();
+        let (persisted, observe_persistence) = tokio::sync::oneshot::channel();
+        let wait = tokio::spawn(super::await_admitted_oauth_refresh(
+            Some("fixture"),
+            move |admitted| {
+                admitted.send(()).unwrap();
+                started.send(()).unwrap();
+                finish_in_worker.recv().unwrap();
+                persisted.send(()).unwrap();
+                Ok(())
+            },
+        ));
+        ready.await.unwrap();
+        tokio::time::pause();
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(15)).await;
+        let result = wait.await.unwrap();
+        assert!(matches!(result, Err(err) if err.to_string().contains("refresh timed out")));
+        finish.send(()).unwrap();
+        observe_persistence.await.unwrap();
+    }
+
     #[test]
     fn cloudflare_login_saves_only_valid_account_and_gateway_routes() {
         use super::*;
