@@ -388,8 +388,9 @@ pub(super) async fn open(
             let kind = event["type"].as_str().unwrap_or_default();
             let failure_code = event["error"]["code"].as_str().or_else(|| event["code"].as_str())
                 .or_else(|| event["response"]["error"]["code"].as_str());
-            if sent_continuation && !has_output
-                && matches!(kind, "error" | "response.failed")
+            let refused = matches!(kind, "error" | "response.failed")
+                || (kind == "response.done" && event["response"]["status"] == "failed");
+            if sent_continuation && !has_output && refused
                 && failure_code == Some("previous_response_not_found")
             {
                 socket = handshake.connect().await?;
@@ -480,7 +481,7 @@ mod tests {
                     assert_eq!(body["input"][0]["content"], "second");
                     for event in [
                         json!({"type":"response.created","response":{"id":"expired"}}),
-                        json!({"type":"error","error":{"code":"previous_response_not_found"}}),
+                        json!({"type":"response.done","response":{"status":"failed","error":{"code":"previous_response_not_found"}}}),
                     ] {
                         socket
                             .send(Message::Text(event.to_string().into()))
