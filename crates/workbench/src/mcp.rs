@@ -1660,12 +1660,13 @@ impl McpTool {
                 Ok(json!({"resources": visible_resource_listing(serde_json::to_value(resources)?)}))
             }
             "list_resource_templates" => {
-                let templates = all_pages("resources/templates/list", |params| async move {
-                    let result = service.list_resource_templates(Some(params)).await?;
-                    Ok((result.resource_templates, result.next_cursor))
-                })
-                .await
-                .map_err(call_error)?;
+                let templates = templates_or_empty(
+                    all_pages("resources/templates/list", |params| async move {
+                        let result = service.list_resource_templates(Some(params)).await?;
+                        Ok((result.resource_templates, result.next_cursor))
+                    })
+                    .await,
+                )?;
                 Ok(
                     json!({"resourceTemplates": visible_resource_listing(serde_json::to_value(templates)?)}),
                 )
@@ -1683,10 +1684,11 @@ impl McpTool {
                 ))
             }
             "list_resource_templates_page" => {
-                let result = service
-                    .list_resource_templates(Some(resource_page_params(arguments)?))
-                    .await
-                    .map_err(call_error)?;
+                let result = templates_or_empty(
+                    service
+                        .list_resource_templates(Some(resource_page_params(arguments)?))
+                        .await,
+                )?;
                 Ok(resource_page(
                     &self.connection.name,
                     "resourceTemplates",
@@ -1764,6 +1766,20 @@ where
 
 fn nonempty_cursor(cursor: Option<String>) -> Option<String> {
     cursor.filter(|value| !value.is_empty())
+}
+
+// Servers can provide resources without implementing resource templates.
+fn templates_or_empty<T: Default>(
+    result: std::result::Result<T, ServiceError>,
+) -> std::result::Result<T, CallError> {
+    match result {
+        Err(ServiceError::McpError(error))
+            if error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
+        {
+            Ok(T::default())
+        }
+        other => other.map_err(call_error),
+    }
 }
 
 fn resource_page_params(arguments: &Value) -> Result<rmcp::model::PaginatedRequestParams> {

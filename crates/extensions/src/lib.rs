@@ -4,6 +4,7 @@ mod exec;
 mod json_size;
 mod loader;
 mod process;
+mod schema_ref;
 pub mod tool_search;
 pub use exec::{ExecOptions, ExecResult, exec_command};
 pub use loader::{NativeExtensionLoader, NativeExtensionSource};
