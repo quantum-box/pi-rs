@@ -4406,6 +4406,17 @@ extension callback finishes, including initial-prompt input hooks. Host scopes
 are bound to their session owner, so nested sessions cannot write to the
 caller’s journal. Ordinary control clones used by independently spawned tasks
 enter the normal FIFO queue.
+Native extensions can declare MCP servers during loading. Workbench connects
+them through its existing MCP catalog. Explicit configuration takes precedence
+over extension declarations in the same normalized namespace. Provider
+tokens and host credential references require explicit configuration. Embedded hosts can
+read the declarations and choose a connector. The SDK can register and
+unregister a server for a loaded extension and awaits `mcp_servers_change`
+handlers with the updated declaration list. Only the owner can replace or
+remove a registration. The SDK reports notification and follow-up errors
+through its session events after applying the registration change. The executable protocol negotiates that event
+independently of ordinary lifecycle events.
+
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and

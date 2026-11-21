@@ -814,6 +814,7 @@ dependencies = [
  "base64",
  "cap-std",
  "chrono",
+ "fluent-uri",
  "futures-util",
  "getrandom 0.3.4",
  "hmac",
