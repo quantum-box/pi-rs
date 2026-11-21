@@ -4004,6 +4004,13 @@ native read tool round trip, usage and RPC. Live account sign-in and provider sw
 
 ### Anthropic thinking checkpoint
 
+Budgeted Anthropic Messages requests use Pi's interleaved-thinking beta by
+default. An explicit `anthropic-beta` header overrides the defaults, including
+for OAuth. Adaptive and disabled thinking do not add the interleaved beta.
+Embedders can opt out of interleaving or request omitted thinking text while
+retaining its replay signature. Loopback requests verified the header and
+payload. Live authenticated interleaved thinking was unverified.
+
 Native Anthropic streams expose individual text and thinking block boundaries,
 and show redacted thinking as `[Reasoning redacted]` while retaining its opaque
 payload for provider replay. Live Pi RPC thinking-start partial messages include
