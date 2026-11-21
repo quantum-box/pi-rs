@@ -4133,6 +4133,23 @@ mod estimation_tests {
         }
     }
 
+    #[test]
+    fn google_gemini_4_xhigh_is_rejected_like_pi_before_dispatch() {
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.thinking = Some("xhigh".into());
+        for provider in [Provider::Google, Provider::named("google-vertex").unwrap()] {
+            args.provider = provider;
+            for model in ["gemini-4-hydrogen", "gemini-4-neon"] {
+                args.model = model.into();
+                let base = Client::Google(Google::new("https://example.com", "fixture").unwrap());
+                let Err(pi_rs::Error::Config(error)) = base.with_model_options(&args, false) else {
+                    panic!("{model} should reject the xhigh mapping");
+                };
+                assert!(error.contains("unsupported Google thinking level mapping \"xhigh\""));
+            }
+        }
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn google_thinking_budget_settings_follow_model_options() {

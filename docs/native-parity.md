@@ -4282,6 +4282,13 @@ is an API base such as `https://generativelanguage.googleapis.com/v1beta`.
 The official endpoint can use `GEMINI_API_KEY`. Custom endpoints can use a
 matching profile key, saved key, or explicit `--api-key`.
 
+The direct Google catalog includes Pi AI 1.6.0's 26 chat models. Gemini 4
+Carbon, Hydrogen and Neon are in both Google catalogs. Gemini Robotics-ER 2
+Preview joins the Vertex catalog and uses a dynamic thinking budget by default.
+Pi AI 1.6.0 lists xhigh for Hydrogen and Neon, but its Gemini adapter rejects
+that mapping before sending a request. The native CLI follows the same
+validation. Live calls to these model additions were unverified.
+
 The adapter discovers chat models through the paginated Models API and
 streams text, thought summaries, and tool calls. It encodes image inputs and
 tool results, records measured usage including thought tokens, and preserves
@@ -5137,8 +5144,8 @@ updated catalogs was unverified.
 
 ### Google Vertex AI
 
-The native Google Vertex AI provider includes the 13 chat models from Pi AI
-1.5.0 and uses the Vertex publisher model endpoint. The Express API route
+The native Google Vertex AI provider includes the 17 chat models from Pi AI
+1.6.0 and uses the Vertex publisher model endpoint. The Express API route
 accepts `GOOGLE_CLOUD_API_KEY` or a saved key. Vertex projects can use
 Application Default Credentials through the installed Google Cloud CLI,
 including Pi-format saved project, location, and service-account file settings.
