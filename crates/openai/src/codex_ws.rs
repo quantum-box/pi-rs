@@ -22,11 +22,12 @@ const IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_SOCKET_AGE: Duration = Duration::from_secs(55 * 60);
 const MAX_IDLE_CONNECTIONS: usize = 8;
 const MAX_FALLBACK_SESSIONS: usize = 64;
+const FALLBACK_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_CACHED_CONTEXT: usize = 2 * 1024 * 1024;
 type Socket = WebSocketStream<reqwest::Upgraded>;
 
 static POOL: Mutex<VecDeque<IdleConnection>> = Mutex::new(VecDeque::new());
-static FALLBACK: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+static FALLBACK: Mutex<VecDeque<(String, Instant)>> = Mutex::new(VecDeque::new());
 
 pub(super) struct Request<'a> {
     pub client: &'a Client,
@@ -106,22 +107,23 @@ fn request_options(request: &Value) -> Option<Value> {
 }
 
 fn falls_back(key: &str) -> bool {
-    FALLBACK
-        .lock()
-        .is_ok_and(|keys| keys.iter().any(|known| known == key))
+    let Ok(mut keys) = FALLBACK.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    keys.retain(|(_, expires)| *expires > now);
+    keys.iter().any(|(known, _)| known == key)
 }
 
 fn remember_fallback(key: String) {
     let Ok(mut keys) = FALLBACK.lock() else {
         return;
     };
-    if keys.iter().any(|known| known == &key) {
-        return;
-    }
+    keys.retain(|(known, _)| known != &key);
     if keys.len() >= MAX_FALLBACK_SESSIONS {
         keys.pop_front();
     }
-    keys.push_back(key);
+    keys.push_back((key, Instant::now() + FALLBACK_COOLDOWN));
 }
 
 fn take_connection(key: &str) -> Option<IdleConnection> {
@@ -396,7 +398,8 @@ pub(super) async fn open(
                 sent_continuation = false;
                 continue;
             }
-            has_output |= super::recognized_response_event(kind);
+            has_output |= super::recognized_response_event(kind)
+                && !matches!(kind, "response.created" | "response.queued" | "response.in_progress");
             if matches!(kind, "response.done" | "response.completed" | "response.incomplete") {
                 let response = &event["response"];
                 if response["status"] == "completed" && reuse_connection
@@ -475,6 +478,16 @@ mod tests {
                 } else {
                     assert_eq!(body["previous_response_id"], "fixture-0");
                     assert_eq!(body["input"][0]["content"], "second");
+                    for event in [
+                        json!({"type":"response.created","response":{"id":"expired"}}),
+                        json!({"type":"error","error":{"code":"previous_response_not_found"}}),
+                    ] {
+                        socket
+                            .send(Message::Text(event.to_string().into()))
+                            .await
+                            .unwrap();
+                    }
+                    break;
                 }
                 let completion = json!({
                     "type":"response.completed","response":{
@@ -487,6 +500,20 @@ mod tests {
                     .await
                     .unwrap();
             }
+            drop(socket);
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let text = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let body: Value = serde_json::from_str(text.as_str()).unwrap();
+            assert_eq!(body["input"].as_array().unwrap().len(), 3);
+            assert!(body.get("previous_response_id").is_none());
+            let completion = json!({"type":"response.completed","response":{
+                "id":"replacement","status":"completed","output":[]
+            }});
+            socket
+                .send(Message::Text(completion.to_string().into()))
+                .await
+                .unwrap();
         });
         let endpoint = format!("http://{address}/backend-api/codex/responses");
         let model = client(endpoint, CodexTransport::WebSocketCached)

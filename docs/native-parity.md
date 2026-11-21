@@ -4606,7 +4606,9 @@ Codex also accepts Pi's `transport` setting. `auto` and `websocket-cached`
 can reuse a direct connection and send a transcript suffix when the request
 matches the previous conversation. `websocket` sends the full history on
 the connection, and `sse` uses HTTP directly. An unavailable WebSocket
-upgrade falls back to HTTP SSE before any inference request is sent.
+upgrade falls back to HTTP SSE before any inference request is sent. A
+transient upgrade failure suppresses new attempts for a minute. A server
+that loses the previous response ID receives the full transcript on retry.
 The native HTTP fallback sends uncompressed JSON. Specialized Codex
 grammar tools and tool search remain open. Authentication was exercised with
 fixtures. Live sign-in and inference were unverified because no account was
