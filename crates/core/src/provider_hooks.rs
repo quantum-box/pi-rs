@@ -78,6 +78,7 @@ pub(crate) struct ProviderHooks {
     handlers: Vec<Handler>,
     started: Instant,
     model_timeout: Duration,
+    stream_budget: Mutex<Duration>,
     errors: Mutex<Vec<Failure>>,
 }
 
@@ -113,6 +114,7 @@ impl ProviderHooks {
             handlers,
             started: Instant::now(),
             model_timeout,
+            stream_budget: Mutex::new(model_timeout / 4),
             errors: Mutex::default(),
         }))
     }
@@ -184,12 +186,31 @@ impl ProviderHooks {
             Hook::Response => "provider response hook",
             Hook::Stream => "provider stream hook",
         };
-        let outcome = timeout(duration, PROVIDER_HOOKS.scope(None, callback)).await;
+        let duration = match hook {
+            Hook::Response => duration,
+            Hook::Stream => {
+                duration.min(*self.stream_budget.lock().expect("provider stream budget"))
+            }
+        };
+        let started = Instant::now();
+        let outcome = if duration.is_zero() && hook == Hook::Stream {
+            None
+        } else {
+            Some(timeout(duration, PROVIDER_HOOKS.scope(None, callback)).await)
+        };
+        if hook == Hook::Stream {
+            let mut remaining = self.stream_budget.lock().expect("provider stream budget");
+            *remaining = remaining.saturating_sub(started.elapsed());
+        }
         let (message, timed_out) = match outcome {
-            Ok(Ok(Ok(()))) => return,
-            Ok(Ok(Err(message))) => (message, false),
-            Ok(Err(_)) => (format!("{event} panicked"), false),
-            Err(_) => (format!("{event} timed out"), true),
+            Some(Ok(Ok(Ok(())))) => return,
+            Some(Ok(Ok(Err(message)))) => (message, false),
+            Some(Ok(Err(_))) => (format!("{event} panicked"), false),
+            Some(Err(_)) => (format!("{event} timed out"), true),
+            None => (
+                "provider stream hook exhausted its request budget".into(),
+                true,
+            ),
         };
         let mut errors = self.errors.lock().expect("provider hook errors");
         if let Some(previous) = errors
@@ -349,8 +370,18 @@ fn scrub_stream_data(value: &mut Value, secrets: &[&str]) {
         }
         Value::Object(fields) => {
             fields.retain(|name, value| {
-                if crate::retry::is_provider_auth_header(name)
-                    || matches!(name.to_ascii_lowercase().as_str(), "cookie" | "set-cookie")
+                let field = name.to_ascii_lowercase().replace('_', "-");
+                if crate::retry::is_provider_auth_header(&field)
+                    || matches!(
+                        field.as_str(),
+                        "cookie"
+                            | "set-cookie"
+                            | "apikey"
+                            | "access-token"
+                            | "accesstoken"
+                            | "refresh-token"
+                            | "refreshtoken"
+                    )
                     || secrets.iter().any(|&secret| name.contains(secret))
                 {
                     return false;
@@ -362,7 +393,11 @@ fn scrub_stream_data(value: &mut Value, secrets: &[&str]) {
         Value::Array(items) => items
             .iter_mut()
             .for_each(|value| scrub_stream_data(value, secrets)),
-        _ => {}
+        scalar => {
+            if !secrets.is_empty() && secrets.contains(&scalar.to_string().as_str()) {
+                *scalar = Value::String("[redacted]".into());
+            }
+        }
     }
 }
 
@@ -570,10 +605,12 @@ mod tests {
                                 "model-id",
                                 &serde_json::json!({
                                     "ordinal": ordinal,
+                                    "numeric": 8675309,
                                     "unknown": ["preserved", "prefix fixture-token suffix"],
-                                    "authorization": "unconfigured credential"
+                                    "authorization": "unconfigured credential",
+                                    "refreshToken": "unconfigured refresh credential"
                                 }),
-                                &["fixture-token".into()],
+                                &["fixture-token".into(), "8675309".into()],
                                 &headers,
                             )
                             .await;
@@ -633,9 +670,63 @@ mod tests {
                 event.data,
                 serde_json::json!({
                     "ordinal": ordinal,
+                    "numeric": "[redacted]",
                     "unknown": ["preserved", "[redacted]"]
                 })
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_stream_callbacks_share_one_budget_across_frames() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SlowObserver(AtomicUsize);
+        #[async_trait::async_trait]
+        impl Extension for SlowObserver {
+            fn id(&self) -> &str {
+                "slow"
+            }
+            fn handles_provider_stream_event(&self) -> bool {
+                true
+            }
+            async fn provider_stream_event(
+                &self,
+                _: &ProviderStreamEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                tokio::time::sleep(Duration::from_millis(7)).await;
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let extension = Arc::new(SlowObserver(AtomicUsize::new(0)));
+        let mut registry = Registry::default();
+        registry.register(extension.clone()).unwrap();
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let hooks = ProviderHooks::for_session(&registry, &session, Duration::from_millis(80));
+        ProviderHooks::scope(hooks.clone(), async {
+            for _ in 0..10 {
+                observe_provider_stream(
+                    "fixture",
+                    ModelApi::OpenaiResponses,
+                    "model-id",
+                    &Value::Null,
+                    &[],
+                    &HeaderMap::new(),
+                )
+                .await;
+            }
+        })
+        .await;
+        assert_eq!(extension.0.load(Ordering::Relaxed), 2);
+        let mut errors = Vec::new();
+        hooks.unwrap().report_errors(&mut |event| {
+            if let Notification::ExtensionLifecycleError { message, .. } = event {
+                errors.push(message.to_owned());
+            }
+        });
+        assert_eq!(errors, ["provider stream hook timed out"]);
     }
 }

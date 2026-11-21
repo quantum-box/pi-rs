@@ -4370,7 +4370,8 @@ and is never persisted. Executable extensions negotiate
 `provider_stream_event_hook` and receive `provider_stream_event` requests.
 Repeated callback failures produce one diagnostic per observer and request,
 and a timeout ends that observer's participation in the remaining frames.
-The Bedrock adapter currently supplies HTTP metadata at this boundary.
+Stream callbacks share up to one quarter of the model request timeout across
+all frames. The Bedrock adapter currently supplies HTTP metadata at this boundary.
 
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,

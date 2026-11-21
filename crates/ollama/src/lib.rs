@@ -1245,9 +1245,7 @@ impl Ollama {
                     yield ModelEvent::Complete { calls, usage };
                     return;
                 }
-                if observe_stream {
-                    let raw: Value = serde_json::from_str(&event.data)
-                        .map_err(|_| Error::Model("malformed SSE chunk".into()))?;
+                if observe_stream && let Ok(raw) = serde_json::from_str::<Value>(&event.data) {
                     pi_rs_core::observe_provider_stream(
                         &loading_probe.provider, ModelApi::OpenaiCompletions, &requested_model,
                         &raw, &error_secrets, &loading_probe.headers,
