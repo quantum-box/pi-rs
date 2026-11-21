@@ -187,9 +187,9 @@ fn valid_oauth(value: &Value) -> bool {
     if !["clientId", "clientSecret", "scope"]
         .iter()
         .all(|field| config.get(*field).is_none_or(Value::is_string))
-        || !config
+        || config
             .get("clientName")
-            .is_none_or(|value| value.as_str().is_some_and(|name| !name.trim().is_empty()))
+            .is_some_and(|value| value.as_str().is_none_or(|name| name.trim().is_empty()))
         || !config.get("authServerMetadataUrl").is_none_or(|value| {
             value
                 .as_str()
