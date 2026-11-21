@@ -137,6 +137,46 @@ struct Terminal {
     appearance_notifications: bool,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
+    #[cfg(unix)]
+    _suspend_signal: SuspendSignal,
+}
+
+#[cfg(unix)]
+static SUSPEND_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn request_terminal_suspend(_: libc::c_int) {
+    SUSPEND_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+struct SuspendSignal(libc::sigaction);
+
+#[cfg(unix)]
+impl SuspendSignal {
+    fn install() -> std::io::Result<Self> {
+        // Restore the previous disposition when relinquishing the terminal.
+        // In particular, the editor and Ctrl+Z must still stop the job.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = request_terminal_suspend as *const () as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            let mut previous = std::mem::MaybeUninit::uninit();
+            if libc::sigaction(libc::SIGTSTP, &action, previous.as_mut_ptr()) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self(previous.assume_init()))
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SuspendSignal {
+    fn drop(&mut self) {
+        unsafe { libc::sigaction(libc::SIGTSTP, &self.0, std::ptr::null_mut()) };
+        SUSPEND_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(unix)]
@@ -174,6 +214,8 @@ impl Terminal {
         #[cfg(any(unix, windows))] previous_colors: Option<ColorQueries>,
         #[cfg(any(unix, windows))] auto_appearance: bool,
     ) -> Result<Self> {
+        #[cfg(unix)]
+        let suspend_signal = SuspendSignal::install()?;
         terminal::enable_raw_mode()?;
         #[cfg(any(unix, windows))]
         let initial_colors = previous_colors.is_none();
@@ -187,6 +229,8 @@ impl Terminal {
             appearance_notifications: false,
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
+            #[cfg(unix)]
+            _suspend_signal: suspend_signal,
         };
         if guard.alternate {
             execute!(
@@ -2892,6 +2936,27 @@ impl View {
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn suspend_terminal(
+        &mut self,
+        terminal: &mut Option<Terminal>,
+        mode: Option<TuiMode>,
+    ) -> Result<()> {
+        if mode == Some(TuiMode::Regular) {
+            self.finish_regular()?;
+        }
+        if let Err(error) = Terminal::suspend(terminal, mode, self.graphics.cleanup()) {
+            self.append(&error.to_string());
+        }
+        if self.graphics.enabled() {
+            images::query_cell_size()?;
+        }
+        self.graphics.reset();
+        self.regular.redraw = true;
+        self.regular.started = false;
+        Ok(())
+    }
+
     fn transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions {
         TranscriptOptions {
             image_width: (self.graphics.enabled() && args.settings.show_terminal_images())
@@ -4423,6 +4488,13 @@ pub(super) async fn run(
         if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
             interrupted = true;
             break 'interactive;
+        }
+        #[cfg(unix)]
+        if SUSPEND_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
+            && _terminal.is_some()
+        {
+            view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+            dirty = true;
         }
         #[cfg(any(unix, windows))]
         if let Some(terminal) = &mut _terminal {
@@ -5962,24 +6034,7 @@ pub(super) async fn run(
                 match action {
                     "app.suspend" => {
                         #[cfg(unix)]
-                        {
-                            if args.tui_mode == Some(TuiMode::Regular) {
-                                view.finish_regular()?;
-                            }
-                            if let Err(error) = Terminal::suspend(
-                                &mut _terminal,
-                                args.tui_mode,
-                                view.graphics.cleanup(),
-                            ) {
-                                view.append(&error.to_string());
-                            }
-                            if view.graphics.enabled() {
-                                images::query_cell_size()?;
-                            }
-                            view.graphics.reset();
-                            view.regular.redraw = true;
-                            view.regular.started = false;
-                        }
+                        view.suspend_terminal(&mut _terminal, args.tui_mode)?;
                         #[cfg(not(unix))]
                         view.append("Suspending the terminal is unavailable on this platform");
                     }

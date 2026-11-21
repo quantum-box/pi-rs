@@ -1288,6 +1288,17 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
 
 #[test]
 fn resize_and_suspend_preserve_input_and_restore_terminal() {
+    exercise_terminal_suspend("fullscreen", false);
+}
+
+#[test]
+fn external_suspend_restores_the_terminal_and_preserves_the_draft() {
+    for mode in ["regular", "fullscreen"] {
+        exercise_terminal_suspend(mode, true);
+    }
+}
+
+fn exercise_terminal_suspend(mode: &str, external: bool) {
     let root = tempfile::tempdir().unwrap();
     let mut master_fd = -1;
     let mut slave_fd = -1;
@@ -1341,6 +1352,8 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
                 "--no-trust",
                 "--no-mcp",
                 "--no-extensions",
+                "--tui-mode",
+                mode,
             ])
             .env("PI_RS_HOME", root.path().join("home"))
             .env("TERM", "xterm-256color")
@@ -1368,10 +1381,22 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
     }
     master.write_all(b"resume-draft").unwrap();
     output_until(&mut master, |text| text.contains("resume-draft"));
-    master.write_all(b"\x1a").unwrap();
+    if external {
+        assert_eq!(
+            unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGTSTP) },
+            0
+        );
+    } else {
+        master.write_all(b"\x1a").unwrap();
+    }
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut stopped = false;
+    let mut before_stop = Vec::new();
+    let mut buffer = [0; 8192];
     while Instant::now() < deadline {
+        while let Ok(count @ 1..) = master.read(&mut buffer) {
+            before_stop.extend_from_slice(&buffer[..count]);
+        }
         let mut status = 0;
         let observed = unsafe {
             libc::waitpid(
@@ -1386,11 +1411,18 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
             stopped = true;
             break;
         }
-        let mut buffer = [0; 8192];
-        let _ = master.read(&mut buffer);
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(stopped, "foreground job did not suspend");
+    while let Ok(count @ 1..) = master.read(&mut buffer) {
+        before_stop.extend_from_slice(&buffer[..count]);
+    }
+    let before_stop = String::from_utf8_lossy(&before_stop);
+    assert!(before_stop.contains("\x1b[?2004l"), "{before_stop:?}");
+    if mode == "fullscreen" {
+        assert!(before_stop.contains("\x1b[?1049l"), "{before_stop:?}");
+        assert!(before_stop.contains("\x1b[?1006l"), "{before_stop:?}");
+    }
     let mut paused = std::mem::MaybeUninit::<libc::termios>::uninit();
     assert_eq!(
         unsafe { libc::tcgetattr(slave.as_raw_fd(), paused.as_mut_ptr()) },
