@@ -5361,7 +5361,10 @@ pub(super) async fn run(
                         Input::SetTreeLabel(id, label) => {
                             let result = Session::open(&args.session).and_then(|mut session| {
                                 session.set_label(id, (!label.is_empty()).then_some(label))?;
-                                picker.refresh_tree_labels(&session, id);
+                                picker.refresh_tree(
+                                    session_tree::picker(&session, TreeFilter::Default),
+                                    id,
+                                );
                                 Ok(())
                             });
                             if let Err(error) = result {

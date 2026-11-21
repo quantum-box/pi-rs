@@ -616,12 +616,17 @@ impl Picker {
             tree.label_timestamps = timestamps;
         }
     }
-    pub fn refresh_tree_labels(&mut self, session: &pi_rs::Session, record: u64) {
-        if let Some(tree) = &mut self.tree {
-            tree.labels = session.labels();
-            tree.label_timestamps = session.label_timestamps();
-        }
-        self.focus_record(record);
+    pub fn refresh_tree(&mut self, mut replacement: Self, record: u64) {
+        let (Some(previous), Some(next)) = (&mut self.tree, &mut replacement.tree) else {
+            return;
+        };
+        next.filter = previous.filter;
+        next.collapsed = std::mem::take(&mut previous.collapsed);
+        next.show_label_timestamps = previous.show_label_timestamps;
+        next.rebuild_visible();
+        replacement.query = std::mem::take(&mut self.query);
+        replacement.focus_record(record);
+        *self = replacement;
     }
     pub fn focus_thinking(&mut self, current: &str) {
         if let Some(index) = self.items.iter().position(
