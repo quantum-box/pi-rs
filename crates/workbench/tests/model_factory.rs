@@ -408,6 +408,7 @@ fn auth_file_snapshot_binds_only_granted_routes() {
     let other = "https://other.example.test/v1/chat/completions";
     let keys = serde_json::json!({
         "compatible": { "type": "api_key", "key": "prefix-${TOKEN}-$!$$", "env": { "TOKEN": "saved" } },
+        "malformed": { "type": "api_key", "key": "${bad-$INNER}-${TOKEN}-${open-$TOKEN", "env": { "INNER": "private", "TOKEN": "saved" } },
         "bound": { "type": "api_key", "key": "$LITERAL", "literal": true, "endpoint": endpoint },
         "command": { "type": "api_key", "key": "!printf should-not-be-read" },
         "process_env": { "type": "api_key", "key": "$PATH" },
@@ -419,6 +420,7 @@ fn auth_file_snapshot_binds_only_granted_routes() {
         file: file.clone(),
         routes: [
             ("compatible", endpoint),
+            ("malformed", endpoint),
             ("bound", endpoint),
             ("bound", other),
             ("command", endpoint),
@@ -438,6 +440,10 @@ fn auth_file_snapshot_binds_only_granted_routes() {
         "prefix-saved-!$"
     );
     assert_eq!(auth.get("bound", endpoint).unwrap().secret(), "$LITERAL");
+    assert_eq!(
+        auth.get("malformed", endpoint).unwrap().secret(),
+        "${bad-$INNER}-saved-${open-saved"
+    );
     for provider in ["command", "process_env", "login", "ungranted"] {
         assert!(auth.get(provider, endpoint).is_none());
     }
