@@ -684,7 +684,16 @@ pub fn validate_settings(value: &Value, path: &Path) -> Result<()> {
     migrate_legacy_settings(&mut normalized);
     let mut errors: Vec<_> = SCHEMA
         .iter_errors(&normalized)
-        .map(|error| (error.instance_path.to_string(), error.to_string()))
+        .map(|error| {
+            let mut field = error.instance_path.to_string();
+            if let jsonschema::error::ValidationErrorKind::Required { property } = &error.kind
+                && let Some(property) = property.as_str()
+            {
+                field.push('/');
+                field.push_str(&property.replace('~', "~0").replace('/', "~1"));
+            }
+            (field, error.masked().to_string())
+        })
         .collect();
     if let Some(timeout) = normalized.get("httpIdleTimeoutMs")
         && parse_http_idle_timeout(timeout).is_none()
@@ -702,7 +711,18 @@ pub fn validate_settings(value: &Value, path: &Path) -> Result<()> {
         return Err(Error::Config(
             errors
                 .into_iter()
-                .map(|(field, error)| format!("{}{field}: {error}", path.display()))
+                .map(|(field, error)| {
+                    let location = format!("{}{field}", path.display());
+                    let mut escaped = String::with_capacity(location.len());
+                    for character in location.chars() {
+                        if character.is_control() {
+                            escaped.extend(character.escape_default());
+                        } else {
+                            escaped.push(character);
+                        }
+                    }
+                    format!("{escaped}: {error}")
+                })
                 .collect::<Vec<_>>()
                 .join("\n"),
         ));
@@ -1704,6 +1724,60 @@ mod tests {
         }
         assert!(!error.contains("/extension"), "{error}");
         assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn settings_validation_reports_nested_package_errors_without_values() {
+        let path = Path::new("settings.json");
+        let invalid = json!({
+            "hideThinkingBlock": "secret-setting-value",
+            "packages": [
+                {
+                    "source": "https://user:secret-url-password@example.com/package",
+                    "autoload": "secret-autoload-value",
+                    "skills": [123],
+                    "extensionMetadata": "secret-extra-value"
+                },
+                {"themes": false},
+                {"source": false, "autoload": 123},
+                null
+            ]
+        });
+        let error = validate_settings(&invalid, path).unwrap_err().to_string();
+        for field in [
+            "/hideThinkingBlock",
+            "/packages/0/autoload",
+            "/packages/0/skills/0",
+            "/packages/1/source",
+            "/packages/1/themes",
+            "/packages/2/autoload",
+            "/packages/2/source",
+            "/packages/3",
+        ] {
+            assert!(error.contains(&format!("settings.json{field}:")), "{error}");
+        }
+        assert_eq!(error.lines().count(), 8, "{error}");
+        assert!(!error.contains("secret-"), "{error}");
+        validate_settings(
+            &json!({"packages": ["npm:example", {"source": "npm:example", "autoload": false}]}),
+            path,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn settings_validation_escapes_controls_in_file_and_field_names() {
+        let error = validate_settings(
+            &json!({"modelThinkingLevels": {"モデル\n\u{1b}/~": false}}),
+            Path::new("settings\n.json"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error.lines().count(), 1, "{error}");
+        assert!(
+            error.contains(r"settings\n.json/modelThinkingLevels/モデル\n\u{1b}~1~0:"),
+            "{error}"
+        );
     }
 
     #[test]

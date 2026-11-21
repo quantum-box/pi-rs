@@ -2195,8 +2195,11 @@ finishes. Settings, theme and hotkey commands are handled before streaming
 input is queued. Tests cover schema diagnostics and dialog error layout.
 Remaining upstream settings and specialized selector behavior are still open.
 Unlike upstream's permissive settings loading, pi-rs validates implemented
-settings. When several values are invalid, the diagnostic reports each path
-at once, including invalid HTTP idle timeout strings, without changing the file.
+settings. When several values in a file are invalid, the diagnostic lists the
+settings file and affected JSON paths, including nested package fields and
+invalid HTTP idle timeout strings. It omits the rejected values and preserves
+the file. If the editor cannot fit the diagnostic, Page Up and Page Down show
+the other pages without discarding the edit.
 
 Like Pi, user and trusted-project `settings.json` files may start with a UTF-8
 BOM when loaded or updated. Malformed or unreadable user and trusted-project
