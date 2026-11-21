@@ -1064,6 +1064,7 @@ struct View {
     custom_render_redraw_at: Option<Instant>,
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
+    theme_refresh_requested: bool,
     thinking_settings: Option<ThinkingSettings>,
     pending_thinking: Option<PendingThinking>,
     session_name: Option<String>,
@@ -4427,11 +4428,14 @@ pub(super) async fn run(
         #[cfg(any(unix, windows))]
         if let Some(terminal) = &mut _terminal {
             let enabled = follows_terminal_appearance(args.use_theme.as_deref());
+            let refresh_requested = std::mem::take(&mut view.theme_refresh_requested);
             let mut output = std::io::stdout();
             if terminal.set_appearance_notifications(enabled, &mut output)? && enabled {
                 terminal
                     .colors
                     .refresh_after_appearance_subscription(&mut output)?;
+            } else if refresh_requested {
+                terminal.colors.query_terminal_colors(&mut output)?;
             }
         }
         if let Some(task) = &auth_reload {
@@ -6158,6 +6162,7 @@ pub(super) async fn run(
                                     args.settings.set_user("theme", json!(name.trim()))?;
                                     args.use_theme = Some(name.trim().into());
                                     theme = next;
+                                    view.theme_refresh_requested = true;
                                 }
                                 Err(error) => view.append(&error.to_string()),
                             }
@@ -7930,6 +7935,7 @@ fn select(
                 args.settings.set_user(&key, value.clone())?;
                 args.use_theme = value.as_str().map(str::to_owned);
                 *theme = next;
+                view.theme_refresh_requested = true;
             } else {
                 args.settings.set_user(&key, value.clone())?;
             }
@@ -7972,6 +7978,7 @@ fn select(
             args.settings.set_user("theme", json!(name))?;
             args.use_theme = Some(name);
             *theme = next;
+            view.theme_refresh_requested = true;
         }
         Selection::ThemeSettings(_) => {
             return Err(Error::Config(
