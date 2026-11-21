@@ -2088,6 +2088,12 @@ mod tests {
         assert_eq!(model.max_tokens, Some(1_048_576));
         assert_eq!(model.supports_images(), Some(true));
         assert_eq!(model.mapped_effort("medium"), Some(None));
+        assert_eq!(
+            profiles
+                .chat_compatibility(&provider, Some(&model))
+                .supports_developer_role(),
+            None
+        );
     }
 
     #[test]
