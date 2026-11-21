@@ -4048,8 +4048,9 @@ support continue to omit it.
 Responses-compatible endpoints that reject `max_output_tokens` can set
 `compat.supportsMaxOutputTokens: false` at the provider or model level, or in
 `modelOverrides`. Dispatch then omits the field. A conservative local size
-guard stops runaway visible output. The agent uses reported usage to apply
-the actual token budget, including hidden reasoning when reported.
+guard stops runaway visible output. The agent applies reported usage
+including hidden reasoning when available. When the provider omits usage,
+Pi's estimate of the visible output applies before accepting the completion.
 
 Grammar declarations on this SDK path currently fall back to function tools.
 Responses accepts initial and finalized argument fragments that extend the
