@@ -11055,8 +11055,22 @@ async fn exercise_nested_woken_owned_rejection(selected: bool) {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    assert!(resumed.try_wait().unwrap().is_none());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(resumed.try_wait().unwrap().is_none());
+            let store = durable_store::Store::open(&path).unwrap();
+            let task = crate::task_store::TaskStore::new(&store)
+                .load(edge.task)
+                .unwrap()
+                .unwrap();
+            if task.task.is_terminal() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(!dir.path().join("nested-cancelled").exists());
     assert!(!dir.path().join("child-after").exists());
     resumed.kill().unwrap();
