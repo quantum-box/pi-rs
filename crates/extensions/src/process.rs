@@ -191,6 +191,10 @@ enum ProtocolRequest {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
     },
+    AgentBeforeSettle {
+        event: pi_rs_core::AgentBeforeSettle,
+        state: Option<ExtensionState>,
+    },
     CompactionLifecycleV1 {
         event: LifecycleEvent,
         trigger: pi_rs_core::CompactionTrigger,
@@ -364,6 +368,8 @@ struct Description {
     user_bash_operations_hook: bool,
     #[serde(default)]
     lifecycle_hook: bool,
+    #[serde(default)]
+    agent_before_settle_hook: bool,
     #[serde(default)]
     lifecycle_host_calls: bool,
     #[serde(default)]
@@ -792,6 +798,22 @@ impl ExecutableExtension {
 
 #[async_trait::async_trait]
 impl Extension for ExecutableExtension {
+    fn handles_agent_before_settle(&self) -> bool {
+        self.description.agent_before_settle_hook
+    }
+
+    async fn agent_before_settle(
+        &self,
+        event: &pi_rs_core::AgentBeforeSettle,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<pi_rs_core::BoundaryDecision> {
+        self.request_async(ProtocolRequest::AgentBeforeSettle {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+
     fn id(&self) -> &str {
         &self.description.id
     }
@@ -3593,6 +3615,7 @@ async fn dispatch_inner(
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
             lifecycle_hook: extension.handles_lifecycle(),
+            agent_before_settle_hook: extension.handles_agent_before_settle(),
             lifecycle_host_calls: true,
             tool_hook_host_calls: true,
             before_tool_host_calls: true,
@@ -3756,6 +3779,9 @@ async fn dispatch_inner(
             } else {
                 encode(extension.lifecycle(&event, state.as_ref()).await)
             }
+        }
+        ProtocolRequest::AgentBeforeSettle { event, state } => {
+            encode(extension.agent_before_settle(&event, state.as_ref()).await)
         }
         ProtocolRequest::CompactionLifecycleV1 {
             event,
