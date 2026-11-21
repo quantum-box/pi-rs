@@ -210,10 +210,22 @@ pub(super) fn stream_call_index(
     calls: &std::collections::BTreeMap<usize, super::CallDelta>,
 ) -> Result<usize> {
     if let Some(id) = id.filter(|id| !id.is_empty() && *id != "null") {
-        return Ok(calls
+        if let Some(index) = calls
             .iter()
             .find_map(|(index, call)| (call.id == id).then_some(*index))
-            .or_else(|| (position..64).find(|index| !calls.contains_key(index)))
+        {
+            return Ok(index);
+        }
+        if had_calls && calls.values().any(|call| call.id.is_empty()) {
+            if calls.len() == 1 && position == 0 {
+                return Ok(*calls.first_key_value().expect("one active tool call").0);
+            }
+            return Err(Error::Model(
+                "ambiguous Mistral tool call ID without an index".into(),
+            ));
+        }
+        return Ok((position..64)
+            .find(|index| !calls.contains_key(index))
             .unwrap_or(64));
     }
     if !had_calls {
@@ -364,6 +376,11 @@ mod tests {
                 )
             })
             .collect();
+        let anonymous = [(0, crate::CallDelta::default())].into_iter().collect();
+        assert_eq!(
+            stream_call_index(Some("late"), 0, true, &anonymous).unwrap(),
+            0
+        );
         assert!(stream_call_index(None, 0, true, &calls).is_err());
         assert_eq!(
             stream_call_index(Some("fixture-1"), 0, true, &calls).unwrap(),
@@ -419,7 +436,7 @@ mod tests {
                 {"function":{"name":"list","arguments":{}}}
             ]}}]});
             let third = json!({"choices":[{"index":0,"delta":{
-                "tool_calls":[{"index":0,"function":{"name":"ad","arguments":"\"file\":\"doc\"}"}}]
+                "tool_calls":[{"index":0,"id":"late-call","function":{"name":"ad","arguments":"\"file\":\"doc\"}"}}]
             },"finish_reason":"tool_calls"}],
                 "usage":{"prompt_tokens":12,"completion_tokens":3,"num_cached_tokens":7}});
             let output = format!("data: {first}\n\ndata: {second}\n\ndata: {third}\n\n");
@@ -472,7 +489,8 @@ mod tests {
         assert_eq!(calls[1].name, "list");
         assert_ne!(calls[0].id, calls[1].id);
         let call_id = calls[0].id.clone();
-        assert_eq!(call_id, super::call_id("toolcall:0", 0));
+        assert_eq!(call_id, "late-call");
+        assert_eq!(calls[1].id, super::call_id("toolcall:1", 0));
         let wire = messages(
             vec![
                 Message::Assistant {

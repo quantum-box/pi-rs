@@ -1398,9 +1398,10 @@ impl Ollama {
                         let call = calls.entry(index).or_default();
                         if mistral {
                             mistral_after_tool = true;
-                            if call.id.is_empty() && (id.is_empty() || id == "null") {
-                                id = mistral::call_id(&format!("toolcall:{index}"), 0);
-                            } else if !call.id.is_empty() {
+                            if id == "null" {
+                                id.clear();
+                            }
+                            if !call.id.is_empty() {
                                 if id == call.id && name == call.name {
                                     name.clear();
                                 }
@@ -1445,8 +1446,9 @@ impl Ollama {
             if !mistral_segments.is_empty() {
                 replay_blocks.push(mistral::replay_block(mistral_segments));
             }
-            let calls = calls.into_values().map(|call| ToolCall {
-                id: call.id, name: call.name, arguments: if mistral && call.arguments.is_empty() { "{}".into() } else { call.arguments },
+            let calls = calls.into_iter().map(|(index, call)| ToolCall {
+                id: if mistral && call.id.is_empty() { mistral::call_id(&format!("toolcall:{index}"), 0) } else { call.id },
+                name: call.name, arguments: if mistral && call.arguments.is_empty() { "{}".into() } else { call.arguments },
             }).collect();
             if preserve_reasoning && !reasoning_text.is_empty() {
                 replay_blocks.push(json!({"type":"reasoning_content","text":reasoning_text}));
