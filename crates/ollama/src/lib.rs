@@ -1370,16 +1370,19 @@ impl Ollama {
                     let input_tokens = stats.prompt_tokens.unwrap_or(previous.input_tokens);
                     usage = Some(Usage { input_tokens, output_tokens: stats.completion_tokens.unwrap_or(previous.output_tokens) });
                     let details = stats.prompt_tokens_details.unwrap_or_default();
-                    metadata.cached_input_tokens = details.cached_tokens
+                    let cached = details.cached_tokens
                         .or(stats.prompt_cache_hit_tokens)
                         .or(stats.cached_tokens);
-                    if mistral {
-                        metadata.cached_input_tokens = metadata.cached_input_tokens
-                            .or(stats.mistral_cached_tokens)
+                    metadata.cached_input_tokens = if mistral {
+                        cached.or(stats.mistral_cached_tokens)
                             .or_else(|| stats.mistral_prompt_details.and_then(|details| details.cached_tokens))
-                            .map(|cached| cached.min(input_tokens));
-                    }
-                    metadata.cache_creation_input_tokens = details.cache_write_tokens;
+                            .or(metadata.cached_input_tokens)
+                            .map(|cached| cached.min(input_tokens))
+                    } else {
+                        cached.or(metadata.cached_input_tokens)
+                    };
+                    metadata.cache_creation_input_tokens = details.cache_write_tokens
+                        .or(metadata.cache_creation_input_tokens);
                     let nested = stats.completion_tokens_details.and_then(|details| details.reasoning_tokens);
                     metadata.reasoning_output_tokens = nested.filter(|count| *count != 0)
                         .or(stats.reasoning_tokens).or(nested).or(metadata.reasoning_output_tokens);
