@@ -1,7 +1,7 @@
 use aws_smithy_eventstream::frame::write_message_to;
 use aws_smithy_types::event_stream::{Header, HeaderValue, Message as Frame};
 use futures_util::StreamExt;
-use pi_rs_bedrock::{Bedrock, ThinkingBudgets, ThinkingDisplay};
+use pi_rs_bedrock::{Bedrock, ThinkingBudgets, ThinkingDisplay, ToolChoice};
 use pi_rs_core::{CacheRetention, Message, Model, ModelEvent, ModelRequest, ToolSpec};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -686,4 +686,48 @@ async fn checkpoints_skip_blank_system_and_assistant_tail() {
     assert_eq!(body["messages"][1]["role"], "assistant");
     assert_eq!(body["messages"][1]["content"], json!([{"text":"answer"}]));
     assert_eq!(body["messages"][0]["content"], json!([{"text":"hi"}]));
+}
+
+#[tokio::test]
+async fn tool_choice_matches_pi_converse_stream_payload() {
+    for (choice, wire) in [
+        (None, None),
+        (Some(ToolChoice::Auto), Some(json!({"auto":{}}))),
+        (Some(ToolChoice::Any), Some(json!({"any":{}}))),
+        (
+            Some(ToolChoice::Tool {
+                name: "lookup".into(),
+            }),
+            Some(json!({"tool":{"name":"lookup"}})),
+        ),
+        (Some(ToolChoice::None), None),
+    ] {
+        let disabled = choice == Some(ToolChoice::None);
+        let (body, _) = capture(
+            "us-east-1",
+            |client| match choice {
+                Some(choice) => client.with_tool_choice(choice),
+                None => client,
+            },
+            request("test-model", 128),
+            false,
+        )
+        .await;
+        assert_eq!(body.get("toolConfig").is_none(), disabled);
+        assert_eq!(body["toolConfig"].get("toolChoice"), wire.as_ref());
+        if !disabled {
+            assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "lookup");
+        }
+    }
+
+    let mut tool_free = request("test-model", 128);
+    tool_free.tools.clear();
+    let (body, _) = capture(
+        "us-east-1",
+        |client| client.with_tool_choice(ToolChoice::Any),
+        tool_free,
+        false,
+    )
+    .await;
+    assert!(body.get("toolConfig").is_none());
 }

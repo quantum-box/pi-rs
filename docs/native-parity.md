@@ -5753,8 +5753,15 @@ During requests and stream reads with custom values, SDK and HTTP transport
 events are suppressed because signing and error traces can contain unredacted
 headers or echoed response frames; application tracing remains enabled.
 
-Not yet supported: non-image multimodal inputs, workbench-specific thinking display controls, tool
-choice/strict sampling, guardrails, prompt management ARNs, live account-specific
+The Rust adapter exposes Pi's optional ConverseStream tool choice through
+`Bedrock::with_tool_choice`. It supports automatic, required and named tool
+selection, and can omit tool configuration entirely. A request without tools
+also omits tool configuration. The option is covered by signed loopback
+requests and a comparison with published Pi payloads. Live Bedrock tool
+selection with account credentials was unverified.
+
+Not yet supported: non-image multimodal inputs, workbench-specific thinking
+display controls, strict tool sampling, guardrails, prompt management ARNs, live account-specific
 model discovery, and workbench proxy/idle-timeout settings. Custom model endpoints in workbench configuration are rejected;
 callers embedding the adapter can pass a configured AWS SDK client, including a
 test endpoint, through `Bedrock::new`.
