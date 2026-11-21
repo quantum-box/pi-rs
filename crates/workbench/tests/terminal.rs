@@ -2059,15 +2059,20 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
             .spawn()
             .unwrap(),
     );
-    output_until(&mut master, |text| text.contains("Enter to send"));
-    master.write_all(b"/settings\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Enter to send") && text.contains("\x1b]11;?\x07")
+    });
+    master.write_all(b"\x1b[?1;2c/settings\r").unwrap();
     output_until(&mut master, |text| text.contains("Auto-compact"));
     master.write_all(b"Theme\r").unwrap();
     output_until(&mut master, |text| {
         text.contains("Automatic · follow terminal appearance")
     });
     master.write_all(b"light").unwrap();
-    output_until(&mut master, |text| text.contains("Theme · light"));
+    output_until(&mut master, |text| {
+        assert!(!text.contains("\x1b]11;?\x07"));
+        text.contains("Theme · light")
+    });
     let read_theme = || -> String {
         serde_json::from_slice::<serde_json::Value>(
             &std::fs::read(home.join("settings.json")).unwrap(),
@@ -2089,9 +2094,22 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
     });
     master.write_all(b"light\r").unwrap();
     output_until(&mut master, |text| {
-        settings_row_shows(text, "Theme", "light") && text.contains("to change")
+        assert!(!text.contains("\x1b[?2031h"));
+        text.contains("\x1b]11;?\x07")
+            && settings_row_shows(text, "Theme", "light")
+            && text.contains("to change")
     });
     assert_eq!(read_theme(), "light");
+    master.write_all(b"\x1b[?1;2c\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Automatic · follow terminal appearance")
+    });
+    master.write_all(b"light\r").unwrap();
+    output_until(&mut master, |text| {
+        assert!(!text.contains("\x1b[?2031h"));
+        text.contains("\x1b]11;?\x07") && settings_row_shows(text, "Theme", "light")
+    });
+    master.write_all(b"\x1b[?1;2c").unwrap();
     master.write_all(b"\r").unwrap();
     output_until(&mut master, |text| {
         text.contains("Automatic · follow terminal appearance")
