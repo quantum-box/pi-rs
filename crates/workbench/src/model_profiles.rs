@@ -202,6 +202,7 @@ struct ModelCompatibility {
     #[serde(flatten)]
     chat: ChatCompatibility,
     allow_empty_signature: Option<bool>,
+    supports_strict_tools: Option<bool>,
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
     session_affinity_format: Option<AffinityFormat>,
@@ -217,6 +218,7 @@ impl ModelCompatibility {
         Self {
             chat: self.chat.overlay(newer.chat),
             allow_empty_signature: newer.allow_empty_signature.or(self.allow_empty_signature),
+            supports_strict_tools: newer.supports_strict_tools.or(self.supports_strict_tools),
             force_adaptive_thinking: newer
                 .force_adaptive_thinking
                 .or(self.force_adaptive_thinking),
@@ -688,6 +690,22 @@ static BUILTIN_MODELS: LazyLock<BTreeMap<String, Vec<ConfiguredModel>>> = LazyLo
     let mut models: BTreeMap<String, Vec<ConfiguredModel>> =
         serde_json::from_str(include_str!("../assets/builtin-chat-models.json"))
             .expect("bundled Pi chat models");
+    // Pi's direct Anthropic catalog marks its Messages models as strict capable.
+    if let Some(anthropic) = models.get_mut("anthropic") {
+        for model in anthropic {
+            if model
+                .api
+                .as_deref()
+                .is_none_or(|api| api == "anthropic-messages")
+            {
+                model
+                    .metadata
+                    .compat
+                    .supports_strict_tools
+                    .get_or_insert(true);
+            }
+        }
+    }
     models.insert(
         "amazon-bedrock".into(),
         serde_json::from_str(include_str!("../assets/bedrock-models.json"))
@@ -1039,6 +1057,29 @@ impl Profiles {
             .static_headers(provider, token)
     }
 
+    /// Explicit settings only; bundled chat defaults do not apply to Google.
+    pub fn google_strict_tool_policy(
+        &self,
+        provider: &Provider,
+    ) -> (Option<bool>, BTreeMap<String, bool>) {
+        let Some(profile) = self.entries.get(provider.id()) else {
+            return (None, BTreeMap::new());
+        };
+        let default = profile.compat.chat.supports_strict_mode();
+        let mut models = BTreeMap::new();
+        for model in &profile.models {
+            if let Some(value) = model.metadata.compat.chat.supports_strict_mode() {
+                models.insert(model.id.clone(), value);
+            }
+        }
+        for (id, model) in &profile.overrides {
+            if let Some(value) = model.compat.chat.supports_strict_mode() {
+                models.insert(id.clone(), value);
+            }
+        }
+        (default, models)
+    }
+
     pub fn chat_compatibility(
         &self,
         provider: &Provider,
@@ -1060,6 +1101,16 @@ impl Profiles {
                 .map(|model| model.compat.chat.clone())
                 .unwrap_or_default(),
         )
+    }
+
+    pub(super) fn responses_strict_tool_support(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> bool {
+        self.chat_compatibility(provider, model)
+            .supports_strict_mode()
+            .unwrap_or_else(|| provider.id() == "openai-chatgpt")
     }
 
     fn cache_compatibility(
@@ -1085,6 +1136,53 @@ impl Profiles {
     ) -> Option<bool> {
         self.cache_compatibility(provider, model)
             .supports_long_cache_retention
+    }
+
+    pub fn anthropic_strict_tool_support(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> bool {
+        self.cache_compatibility(provider, model)
+            .supports_strict_tools
+            .unwrap_or(false)
+    }
+
+    /// Freeze known Anthropic model capabilities sharing the selected route.
+    pub fn anthropic_strict_tool_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> BTreeMap<String, bool> {
+        let endpoint = explicit_endpoint
+            .or_else(|| self.model_endpoint(provider, selected))
+            .unwrap_or_else(|| self.endpoint(provider));
+        // A partial model override does not establish a routable model.
+        let ids = self.model_ids(provider);
+        let mut models: BTreeMap<String, bool> = ids
+            .into_iter()
+            .filter_map(|id| {
+                if self.model_adapter(provider, &id) != Adapter::Anthropic
+                    || explicit_endpoint
+                        .or_else(|| self.model_endpoint(provider, &id))
+                        .unwrap_or_else(|| self.endpoint(provider))
+                        != endpoint
+                {
+                    return None;
+                }
+                let metadata = self.model(provider, &id)?;
+                let supported = self.anthropic_strict_tool_support(provider, Some(&metadata));
+                Some((id, supported))
+            })
+            .collect();
+        // The selected model may be absent from the catalog; its provider-level
+        // capability (or the default false) still applies to that selection.
+        models.entry(selected.to_owned()).or_insert_with(|| {
+            let metadata = self.model(provider, selected);
+            self.anthropic_strict_tool_support(provider, metadata.as_ref())
+        });
+        models
     }
 
     pub fn messages_cache_support(
@@ -1315,6 +1413,10 @@ impl Profiles {
             })
     }
 
+    pub(super) fn has_model_definition(&self, provider: &Provider, id: &str) -> bool {
+        self.definition(provider, id).is_some()
+    }
+
     pub fn model_adapter(&self, provider: &Provider, model: &str) -> Adapter {
         self.definition(provider, model)
             .and_then(|model| model.api.as_deref())
@@ -1458,6 +1560,109 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::json;
+
+    #[test]
+    fn anthropic_explicit_endpoint_overrides_model_endpoints() {
+        let profiles = Profiles::parse(&json!({"providers":{"proxy":{
+            "api":"anthropic-messages", "baseUrl":"http://localhost:1/v1",
+            "models":[
+                {"id":"a", "baseUrl":"http://localhost:1/v1", "compat":{"supportsStrictTools":true}},
+                {"id":"b", "baseUrl":"http://localhost:2/v1", "compat":{"supportsStrictTools":false}},
+                {"id":"other-api", "api":"openai-completions", "compat":{"supportsStrictTools":true}}
+            ]
+        }}})).unwrap();
+        let provider = profiles.provider("proxy").unwrap();
+        for (selected, rewritten, expected) in [("a", "b", false), ("b", "a", true)] {
+            let normal = profiles.anthropic_strict_tool_models(&provider, selected, None);
+            assert!(!normal.contains_key(rewritten));
+            let explicit = profiles.anthropic_strict_tool_models(
+                &provider,
+                selected,
+                Some("http://localhost:3/v1"),
+            );
+            assert_eq!(explicit.get(rewritten), Some(&expected));
+            assert!(!explicit.contains_key("other-api"));
+        }
+    }
+
+    #[test]
+    fn anthropic_selected_uncatalogued_model_keeps_provider_capability() {
+        for configured in [None, Some(false), Some(true)] {
+            let profiles = Profiles::parse(&json!({"providers":{"proxy":{
+                "api":"anthropic-messages", "baseUrl":"http://127.0.0.1:1234/v1", "compat":{"supportsStrictTools":configured},
+                "models":[{"id":"known","compat":{"supportsStrictTools":true}}],
+                "modelOverrides":{"rewritten-unknown":{"name":"partial override"},"selected-overridden":{"compat":{"supportsStrictTools":false}}}
+            }}})).unwrap();
+            let provider = profiles.provider("proxy").unwrap();
+            let models = profiles.anthropic_strict_tool_models(&provider, "selected-unknown", None);
+            assert_eq!(
+                models.get("selected-unknown"),
+                Some(&configured.unwrap_or(false))
+            );
+            assert_eq!(models.get("known"), Some(&true));
+            assert!(!models.contains_key("rewritten-unknown"));
+            assert!(!models.contains_key("selected-overridden"));
+            let selected =
+                profiles.anthropic_strict_tool_models(&provider, "selected-overridden", None);
+            assert_eq!(selected.get("selected-overridden"), Some(&false));
+        }
+    }
+
+    #[test]
+    fn anthropic_strict_tool_profile_overlays_and_catalog_defaults() {
+        let default = Profiles::default();
+        let anthropic = Provider::Anthropic;
+        let id = default.model_ids(&anthropic).into_iter().next().unwrap();
+        assert!(
+            default
+                .anthropic_strict_tool_support(&anthropic, default.model(&anthropic, &id).as_ref())
+        );
+        assert!(!default.anthropic_strict_tool_support(
+            &anthropic,
+            default.model(&anthropic, "unknown").as_ref()
+        ));
+        let config = json!({"providers":{
+            "anthropic":{"compat":{"supportsStrictTools":false}, "modelOverrides":{(id.clone()):{"compat":{"supportsStrictTools":true}}}},
+            "proxy":{"api":"anthropic-messages","baseUrl":"https://example.com", "compat":{"supportsStrictTools":true}, "models":[
+                {"id":"inherit"},{"id":"disabled","compat":{"supportsStrictTools":false}},{"id":"enabled","compat":{"supportsStrictTools":true}}],
+                "modelOverrides":{"inherit":{"compat":{"supportsStrictTools":false}}}},
+            "other":{"api":"anthropic-messages","baseUrl":"https://example.com", "models":[{"id":"plain"}]}
+        }});
+        let profiles = Profiles::parse(&config).unwrap();
+        let other_builtin = default
+            .model_ids(&anthropic)
+            .into_iter()
+            .find(|name| name != &id)
+            .unwrap();
+        assert!(!profiles.anthropic_strict_tool_support(
+            &anthropic,
+            profiles.model(&anthropic, &other_builtin).as_ref()
+        ));
+        assert!(
+            profiles.anthropic_strict_tool_support(
+                &anthropic,
+                profiles.model(&anthropic, &id).as_ref()
+            )
+        );
+        let proxy = profiles.provider("proxy").unwrap();
+        for (id, expected) in [
+            ("inherit", false),
+            ("disabled", false),
+            ("enabled", true),
+            ("unknown", true),
+        ] {
+            assert_eq!(
+                profiles.anthropic_strict_tool_support(&proxy, profiles.model(&proxy, id).as_ref()),
+                expected,
+                "{id}"
+            );
+        }
+        let other = profiles.provider("other").unwrap();
+        assert!(
+            !profiles
+                .anthropic_strict_tool_support(&other, profiles.model(&other, "plain").as_ref())
+        );
+    }
 
     #[test]
     fn bedrock_application_profile_retains_configured_model_name() {

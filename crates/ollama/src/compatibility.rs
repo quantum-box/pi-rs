@@ -203,6 +203,11 @@ enum ThinkingFormat {
 }
 
 impl ChatCompatibility {
+    /// Whether the model explicitly declares strict tool support.
+    pub fn supports_strict_mode(&self) -> Option<bool> {
+        self.supports_strict_mode
+    }
+
     /// Whether the configured model accepts the developer instruction role.
     pub fn supports_developer_role(&self) -> Option<bool> {
         self.supports_developer_role

@@ -79,10 +79,138 @@ pub struct OpenAiResponses {
     session_cache_key: Option<String>,
     session_affinity_format: Option<SessionAffinityFormat>,
     prompt_cache_key_enabled: bool,
+    strict_tool_support: bool,
     use_developer_role: bool,
 }
 
+/// A Responses request whose wire tools and effective sampling are fixed.
+pub struct PreparedResponsesRequest {
+    client: OpenAiResponses,
+    request: ModelRequest,
+    reservation_request: ModelRequest,
+    wire_tools: Vec<Value>,
+    effective_tools: Vec<pi_rs_core::EffectiveToolDeclaration>,
+}
+
+impl PreparedResponsesRequest {
+    /// The exact per-tool decisions associated with this prepared request.
+    pub fn effective_tools(&self) -> &[pi_rs_core::EffectiveToolDeclaration] {
+        &self.effective_tools
+    }
+
+    /// Dispatch using an external session identity.
+    pub async fn stream_in_session(
+        self,
+        external_id: &str,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let client = self
+            .client
+            .with_session_cache_key(external_id)
+            .with_session_routing(external_id)?;
+        let stream = client
+            .stream_enriched_with_tools(self.request, Some(self.wire_tools))
+            .await?;
+        Ok(Box::pin(stream.map(|event| event.map(Into::into))))
+    }
+
+    /// Dispatch as a summary without reusing the session cache.
+    pub async fn stream_for_summary(self) -> Result<pi_rs_core::DetailedModelStream> {
+        let stream = self
+            .client
+            .without_cache()
+            .stream_enriched_with_tools(self.request, Some(self.wire_tools))
+            .await?;
+        Ok(Box::pin(stream.map(|event| event.map(Into::into))))
+    }
+}
+
+struct PreparedResponsesDispatch {
+    request: PreparedResponsesRequest,
+    context: pi_rs_core::ToolDispatchContext,
+    snapshot: pi_rs_core::ToolDecisionSnapshot,
+}
+
+#[async_trait::async_trait]
+impl pi_rs_core::PreparedToolDispatch for PreparedResponsesDispatch {
+    fn effective_tools(&self) -> &[pi_rs_core::EffectiveToolDeclaration] {
+        self.request.effective_tools()
+    }
+
+    fn decision_snapshot(&self) -> &pi_rs_core::ToolDecisionSnapshot {
+        &self.snapshot
+    }
+
+    fn dispatch_request(&self) -> &ModelRequest {
+        &self.request.request
+    }
+
+    fn reservation_request(&self) -> &ModelRequest {
+        &self.request.reservation_request
+    }
+
+    async fn dispatch(self: Box<Self>) -> Result<pi_rs_core::DetailedModelStream> {
+        if self.context.summary {
+            self.request.stream_for_summary().await
+        } else {
+            self.request
+                .stream_in_session(&self.context.external_id)
+                .await
+        }
+    }
+}
+
 impl OpenAiResponses {
+    /// Prepare an owned dispatch bound to its request and session context.
+    pub fn prepare_bound_tool_dispatch(
+        &self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Box<dyn pi_rs_core::PreparedToolDispatch>> {
+        let prepared = self.prepare_tool_request(request.clone(), declarations)?;
+        let snapshot = pi_rs_core::ToolDecisionSnapshot::capture(
+            context,
+            request,
+            declarations,
+            prepared.effective_tools(),
+        )
+        .map_err(|error| Error::Config(error.to_string()))?;
+        Ok(Box::new(PreparedResponsesDispatch {
+            request: prepared,
+            context: context.clone(),
+            snapshot,
+        }))
+    }
+
+    /// Resolve tool constraints once and bind their decisions to this request.
+    pub fn prepare_tool_request(
+        &self,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<PreparedResponsesRequest> {
+        let (wire_tools, effective_tools) = resolved_constrained_tools(
+            &request,
+            declarations,
+            self.strict_tool_support,
+            self.has_implicit_strict_tools(),
+        )?;
+        let mut reservation_request = request.clone();
+        for (spec, wire) in reservation_request.tools.iter_mut().zip(&wire_tools) {
+            spec.parameters = wire["parameters"].clone();
+        }
+        Ok(PreparedResponsesRequest {
+            client: self.clone(),
+            request,
+            reservation_request,
+            wire_tools,
+            effective_tools,
+        })
+    }
+    fn has_implicit_strict_tools(&self) -> bool {
+        // OpenAI Responses may enable strict sampling when the field is omitted.
+        self.provider == "openai-chatgpt" || self.endpoint.host_str() == Some("api.openai.com")
+    }
+
     pub fn with_http_options(
         mut self,
         timeout: Option<std::time::Duration>,
@@ -165,12 +293,20 @@ impl OpenAiResponses {
             session_cache_key: None,
             session_affinity_format: None,
             prompt_cache_key_enabled: true,
+            strict_tool_support: false,
             use_developer_role: false,
         })
     }
 
     pub fn with_thinking(mut self, level: Option<&str>) -> Self {
         self.thinking = level.map(|level| if level == "off" { "none" } else { level }.to_owned());
+        self
+    }
+
+    /// Set endpoint-wide strict JSON Schema tool support for this client.
+    /// Callers routing different models must ensure the setting applies to each.
+    pub fn with_strict_tool_support(mut self, supported: bool) -> Self {
+        self.strict_tool_support = supported;
         self
     }
 
@@ -540,6 +676,74 @@ fn payload(
     body
 }
 
+fn resolved_constrained_tools(
+    request: &ModelRequest,
+    declarations: &[pi_rs_core::ToolDeclaration],
+    supports_strict: bool,
+    implicit_strict_tools: bool,
+) -> Result<(Vec<Value>, Vec<pi_rs_core::EffectiveToolDeclaration>)> {
+    if request.tools.len() != declarations.len()
+        || request
+            .tools
+            .iter()
+            .zip(declarations)
+            .any(|(spec, declaration)| spec != &declaration.spec)
+    {
+        return Err(Error::Config(
+            "tool declarations do not match the effective request".into(),
+        ));
+    }
+    let mut wire = Vec::with_capacity(declarations.len());
+    let mut effective = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
+        let spec = &declaration.spec;
+        let strict_schema = match &declaration.constrained_sampling {
+            Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => {
+                pi_rs_core::resolve_strict_tool_schema(
+                    &spec.name,
+                    &spec.parameters,
+                    *strict,
+                    supports_strict,
+                    |_, _| false,
+                )
+                .map_err(|error| Error::Config(error.to_string()))?
+            }
+            // Grammar is sent as an ordinary function until custom tool streaming
+            // and replay are supported by this path.
+            _ => None,
+        };
+        let mut tool = json!({"type":"function","name":spec.name,"description":spec.description,"parameters":strict_schema.as_ref().unwrap_or(&spec.parameters)});
+        if supports_strict || implicit_strict_tools {
+            tool["strict"] = json!(strict_schema.is_some());
+        }
+        let sampling = if strict_schema.is_some() {
+            pi_rs_core::EffectiveToolSampling::StrictJsonSchema {
+                original_schema: spec.parameters.clone(),
+                normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
+            }
+        } else {
+            pi_rs_core::EffectiveToolSampling::Unconstrained
+        };
+        wire.push(tool);
+        effective.push(pi_rs_core::EffectiveToolDeclaration {
+            spec: spec.clone(),
+            sampling,
+        });
+    }
+    pi_rs_core::validate_effective_tool_declarations(request, declarations, &effective)
+        .map_err(|error| Error::Config(error.to_string()))?;
+    Ok((wire, effective))
+}
+
+#[cfg(test)]
+fn constrained_tools(
+    request: &ModelRequest,
+    declarations: &[pi_rs_core::ToolDeclaration],
+    supports_strict: bool,
+) -> Result<Vec<Value>> {
+    resolved_constrained_tools(request, declarations, supports_strict, false).map(|(wire, _)| wire)
+}
+
 fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
     value[name]
         .as_str()
@@ -570,6 +774,18 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs_core::PreparedToolDispatch + 'a>>> {
+        Ok(Some(self.prepare_bound_tool_dispatch(
+            request,
+            declarations,
+            context,
+        )?))
+    }
     fn context_identity(&self) -> Option<String> {
         if !self.identity_safe_transport {
             return None;
@@ -635,12 +851,19 @@ impl Model for OpenAiResponses {
                 pi_rs_core::protected_model_fingerprint(&(base, "prompt-cache-key-disabled"))
             })
         };
-        if self.use_developer_role {
+        let base = if self.use_developer_role {
             base
         } else {
             base.and_then(|base| {
                 pi_rs_core::protected_model_fingerprint(&(base, "system-instruction-role"))
             })
+        };
+        if self.strict_tool_support {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(base, "strict-tools-enabled"))
+            })
+        } else {
+            base
         }
     }
 
@@ -740,12 +963,108 @@ impl Model for OpenAiResponses {
     ) -> Result<pi_rs_core::EnrichedModelStream> {
         self.clone().without_cache().stream_enriched(request).await
     }
+
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let tools =
+            self.stream_only_constrained_tools(&request, declarations, self.strict_tool_support)?;
+        let stream = self
+            .clone()
+            .with_session_cache_key(external_id)
+            .with_session_routing(external_id)?
+            .stream_enriched_with_tools(request, Some(tools))
+            .await?;
+        Ok(Box::pin(stream.map(|event| event.map(Into::into))))
+    }
+
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let tools =
+            self.stream_only_constrained_tools(&request, declarations, self.strict_tool_support)?;
+        let stream = self
+            .clone()
+            .without_cache()
+            .stream_enriched_with_tools(request, Some(tools))
+            .await?;
+        Ok(Box::pin(stream.map(|event| event.map(Into::into))))
+    }
 }
 
 impl OpenAiResponses {
+    fn stream_only_constrained_tools(
+        &self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        supports_strict: bool,
+    ) -> Result<Vec<Value>> {
+        let (wire, effective) = resolved_constrained_tools(
+            request,
+            declarations,
+            supports_strict,
+            self.has_implicit_strict_tools(),
+        )?;
+        if effective.iter().any(|tool| {
+            matches!(
+                tool.sampling,
+                pi_rs_core::EffectiveToolSampling::StrictJsonSchema { .. }
+            )
+        }) {
+            return Err(Error::Config("strict tool sampling requires prepared dispatch so its effective decisions can be retained".into()));
+        }
+        Ok(wire)
+    }
+
+    /// Stream with explicit per-tool declarations and strict capability.
+    ///
+    /// Strict decisions require the prepared-dispatch API; unconstrained
+    /// fallbacks can be streamed here without losing a normalization decision.
+    pub async fn stream_with_tool_declarations(
+        &self,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        supports_strict: bool,
+    ) -> Result<ModelStream> {
+        let tools = self.stream_only_constrained_tools(&request, declarations, supports_strict)?;
+        let stream = self
+            .stream_enriched_with_tools(request, Some(tools))
+            .await?;
+        Ok(Box::pin(stream.filter_map(|event| async move {
+            match event {
+                Ok(pi_rs_core::EnrichedModelEvent::Legacy(event)) => Some(Ok(event)),
+                Ok(pi_rs_core::EnrichedModelEvent::TextDelta { delta, .. }) => {
+                    Some(Ok(ModelEvent::Text(delta)))
+                }
+                Ok(pi_rs_core::EnrichedModelEvent::ReasoningDelta { delta, .. }) => {
+                    Some(Ok(ModelEvent::Reasoning(delta)))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })))
+    }
+
     async fn stream_enriched(
         &self,
         request: ModelRequest,
+    ) -> Result<pi_rs_core::EnrichedModelStream> {
+        self.stream_enriched_with_tools(request, None).await
+    }
+
+    async fn stream_enriched_with_tools(
+        &self,
+        request: ModelRequest,
+        tools: Option<Vec<Value>>,
     ) -> Result<pi_rs_core::EnrichedModelStream> {
         let model = request.model.clone();
         let edited_scope =
@@ -760,6 +1079,15 @@ impl OpenAiResponses {
                 "system"
             },
         );
+        if let Some(tools) = tools
+            && !tools.is_empty()
+        {
+            body["tools"] = if self.provider == "openai-chatgpt" {
+                json!([{"type":"namespace","name":NAMESPACE,"description":"Local tools","tools":tools}])
+            } else {
+                json!(tools)
+            };
+        }
         let provider = self.provider.clone();
         if let Some(thinking) = &self.thinking {
             body["reasoning"] = json!({"effort":thinking, "summary":"auto"});
@@ -925,15 +1253,28 @@ impl OpenAiResponses {
                         let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
                         let item = &event["item"];
                         if provider == "openai-chatgpt" && item["namespace"] != NAMESPACE { Err(Error::Model("unexpected OpenAI tool namespace".into()))?; }
-                        let call = ToolCall { id:field(item,"call_id")?.into(), name:field(item,"name")?.into(), arguments:String::new() };
+                        let initial = item.get("arguments").map(|value| value.as_str().ok_or_else(|| Error::Model("invalid OpenAI tool arguments".into()))).transpose()?.unwrap_or("");
+                        let call = ToolCall { id:field(item,"call_id")?.into(), name:field(item,"name")?.into(), arguments:initial.into() };
                         if calls.insert(index, call.clone()).is_some() { Err(Error::Model("duplicate OpenAI tool index".into()))?; }
-                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index, id:call.id, name:call.name, arguments:String::new() }));
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index, id:call.id, name:call.name, arguments:call.arguments }));
                     }
                     "response.function_call_arguments.delta" => {
                         let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
                         let delta = field(&event,"delta")?;
                         calls.get_mut(&index).ok_or_else(|| Error::Model("unknown OpenAI tool call".into()))?.arguments.push_str(delta);
                         yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index, id:String::new(), name:String::new(), arguments:delta.into() }));
+                    }
+                    "response.function_call_arguments.done" | "response.output_item.done" if event["type"] == "response.function_call_arguments.done" || event["item"]["type"] == "function_call" => {
+                        let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
+                        let item = if event["type"] == "response.output_item.done" { &event["item"] } else { &event };
+                        let call = calls.get_mut(&index).ok_or_else(|| Error::Model("unknown OpenAI tool call".into()))?;
+                        if item.get("call_id").is_some_and(|id| id != &call.id) || item.get("name").is_some_and(|name| name != &call.name) { Err(Error::Model("OpenAI tool call changed during stream".into()))?; }
+                        if let Some(value) = item.get("arguments") {
+                            let final_arguments = value.as_str().ok_or_else(|| Error::Model("invalid OpenAI tool arguments".into()))?;
+                            let suffix = final_arguments.strip_prefix(&call.arguments).ok_or_else(|| Error::Model("OpenAI tool call changed during stream".into()))?.to_owned();
+                            call.arguments.push_str(&suffix);
+                            if !suffix.is_empty() { yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index, id:String::new(), name:String::new(), arguments:suffix })); }
+                        }
                     }
                     "response.completed" | "response.incomplete" => {
                         let response = &event["response"];
@@ -948,8 +1289,12 @@ impl OpenAiResponses {
                         let output = response["output"].as_array().ok_or_else(|| Error::Model("OpenAI completion missing output".into()))?;
                         let reported_calls: Vec<_> = output.iter().filter(|item| item["type"] == "function_call").collect();
                         if reported_calls.len() != calls.len() { Err(Error::Model("incomplete OpenAI tool stream".into()))?; }
-                        for (call, item) in calls.values().zip(reported_calls) {
-                            if item["call_id"] != call.id || item["name"] != call.name || item["arguments"] != call.arguments || (provider == "openai-chatgpt" && item["namespace"] != NAMESPACE) { Err(Error::Model("OpenAI tool call changed during stream".into()))?; }
+                        for ((index, call), item) in calls.iter_mut().zip(reported_calls) {
+                            if item["call_id"] != call.id || item["name"] != call.name || (provider == "openai-chatgpt" && item["namespace"] != NAMESPACE) { Err(Error::Model("OpenAI tool call changed during stream".into()))?; }
+                            let final_arguments = field(item, "arguments")?;
+                            let suffix = final_arguments.strip_prefix(&call.arguments).ok_or_else(|| Error::Model("OpenAI tool call changed during stream".into()))?.to_owned();
+                            call.arguments.push_str(&suffix);
+                            if !suffix.is_empty() { yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index:*index, id:String::new(), name:String::new(), arguments:suffix })); }
                         }
                         let usage = response["usage"]["input_tokens"].as_u64().zip(response["usage"]["output_tokens"].as_u64()).map(|(input_tokens,output_tokens)| Usage { input_tokens, output_tokens });
                         let identity = ResolvedModelIdentity { provider:provider.clone(), model:model.clone() };
@@ -1679,6 +2024,671 @@ mod tests {
                 parameters: json!({"type":"object"}),
             }],
             max_output_tokens: 100,
+        }
+    }
+
+    #[test]
+    fn constrained_responses_tools_match_capability_and_policy() {
+        let mut req = request();
+        req.tools[0].parameters = json!({"type":"object","properties":{"path":{"type":"string"}}});
+        let mut declaration = pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Prefer,
+            }),
+        };
+        let strict = constrained_tools(&req, std::slice::from_ref(&declaration), true).unwrap();
+        assert_eq!(strict[0]["strict"], true);
+        assert_eq!(strict[0]["parameters"]["required"], json!(["path"]));
+        assert_eq!(
+            strict[0]["parameters"]["properties"]["path"]["anyOf"][1],
+            json!({"type":"null"})
+        );
+        let fallback = constrained_tools(&req, std::slice::from_ref(&declaration), false).unwrap();
+        assert!(fallback[0].get("strict").is_none());
+        assert_eq!(fallback[0]["parameters"], req.tools[0].parameters);
+        declaration.constrained_sampling = Some(pi_rs_core::ToolConstraint::JsonSchema {
+            strict: pi_rs_core::StrictToolPolicy::Require,
+        });
+        assert!(constrained_tools(&req, std::slice::from_ref(&declaration), false).is_err());
+        declaration.spec.name = "other".into();
+        assert!(constrained_tools(&req, &[declaration], true).is_err());
+    }
+
+    #[test]
+    fn prepared_request_exposes_actual_strict_and_fallback_decisions() {
+        let req = request();
+        let mut declaration = pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Prefer,
+            }),
+        };
+        let model =
+            OpenAiResponses::new_api("https://example.test/responses", "fixture".into()).unwrap();
+        let fallback = model
+            .prepare_tool_request(req.clone(), std::slice::from_ref(&declaration))
+            .unwrap();
+        assert!(matches!(
+            fallback.effective_tools()[0].sampling,
+            pi_rs_core::EffectiveToolSampling::Unconstrained
+        ));
+        let supported = model.with_strict_tool_support(true);
+        let prepared = supported
+            .prepare_tool_request(req.clone(), std::slice::from_ref(&declaration))
+            .unwrap();
+        assert!(
+            matches!(&prepared.effective_tools()[0].sampling, pi_rs_core::EffectiveToolSampling::StrictJsonSchema { original_schema, normalization_version:1 } if original_schema == &req.tools[0].parameters)
+        );
+        declaration.spec.name = "changed".into();
+        assert!(supported.prepare_tool_request(req, &[declaration]).is_err());
+    }
+
+    #[test]
+    fn official_responses_explicitly_disables_implicit_strict_sampling() {
+        let model = OpenAiResponses::new_api(DEFAULT_ENDPOINT, "fixture".into()).unwrap();
+        let req = request();
+        let declarations = [pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Prefer,
+            }),
+        }];
+        let prepared = model
+            .prepare_tool_request(req.clone(), &declarations)
+            .unwrap();
+        assert_eq!(prepared.wire_tools[0]["strict"], false);
+        assert_eq!(
+            prepared.wire_tools[0]["parameters"],
+            req.tools[0].parameters
+        );
+        let stream_tools = model
+            .stream_only_constrained_tools(&req, &declarations, false)
+            .unwrap();
+        assert_eq!(stream_tools, prepared.wire_tools);
+    }
+
+    #[tokio::test]
+    async fn prepared_fallback_session_sends_the_reported_unconstrained_tool() {
+        assert_prepared_fallback_session(false).await;
+        assert_prepared_fallback_session(true).await;
+    }
+
+    async fn assert_prepared_fallback_session(plan: bool) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let end = loop {
+                let mut block = [0; 4096];
+                let count = socket.read(&mut block).unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&block[..count]);
+                if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < end + length {
+                let mut block = [0; 4096];
+                let count = socket.read(&mut block).unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&block[..count]);
+            }
+            let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            (headers, body)
+        });
+        let req = request();
+        let declaration = pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Prefer,
+            }),
+        };
+        let endpoint = format!("http://{address}/responses");
+        let model = if plan {
+            OpenAiResponses::new(&endpoint, "fixture".into()).unwrap()
+        } else {
+            OpenAiResponses::new_api(&endpoint, "fixture".into()).unwrap()
+        };
+        let mut context = pi_rs_core::ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "prepared-session".into(),
+            summary: false,
+        };
+        let prepared = (&model as &dyn Model)
+            .prepare_tool_dispatch(&req, &[declaration], &context)
+            .await
+            .unwrap()
+            .unwrap();
+        context.external_id = "changed-after-preparation".into();
+        assert_eq!(context.external_id, "changed-after-preparation");
+        assert!(matches!(
+            prepared.effective_tools()[0].sampling,
+            pi_rs_core::EffectiveToolSampling::Unconstrained
+        ));
+        let _ = prepared.dispatch().await;
+        let (headers, body) = server.join().unwrap();
+        let tool = if plan {
+            let tool = &body["tools"][0]["tools"][0];
+            assert_eq!(tool["strict"], false);
+            tool
+        } else {
+            assert!(
+                headers
+                    .lines()
+                    .any(|line| line == "session-id: prepared-session")
+            );
+            let tool = &body["tools"][0];
+            assert!(tool.get("strict").is_none());
+            tool
+        };
+        assert_eq!(body["prompt_cache_key"], "prepared-session");
+        assert_eq!(tool["parameters"], req.tools[0].parameters);
+    }
+
+    #[tokio::test]
+    async fn responses_stream_only_rejects_strict_or_unsupported_before_dispatch() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+        for (support, policy) in [
+            (true, pi_rs_core::StrictToolPolicy::Require),
+            (true, pi_rs_core::StrictToolPolicy::Prefer),
+            (false, pi_rs_core::StrictToolPolicy::Require),
+        ] {
+            let model = OpenAiResponses::new_api(&endpoint, "fixture".into())
+                .unwrap()
+                .with_strict_tool_support(support);
+            let req = request();
+            let declaration = pi_rs_core::ToolDeclaration {
+                spec: req.tools[0].clone(),
+                constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                    strict: policy,
+                }),
+            };
+            let declarations = std::slice::from_ref(&declaration);
+            assert!(matches!(
+                model
+                    .stream_detailed_with_tool_declarations(
+                        uuid::Uuid::nil(),
+                        uuid::Uuid::nil(),
+                        "session",
+                        req.clone(),
+                        declarations
+                    )
+                    .await,
+                Err(Error::Config(_))
+            ));
+            assert!(matches!(
+                model
+                    .stream_detailed_summary_with_tool_declarations(
+                        uuid::Uuid::nil(),
+                        uuid::Uuid::nil(),
+                        req.clone(),
+                        declarations
+                    )
+                    .await,
+                Err(Error::Config(_))
+            ));
+            assert!(matches!(
+                model
+                    .stream_with_tool_declarations(req, declarations, support)
+                    .await,
+                Err(Error::Config(_))
+            ));
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn declaration_stream_defaults_to_unsupported_and_changes_identity_when_enabled() {
+        let model =
+            OpenAiResponses::new_api("https://example.test/responses", "fixture".into()).unwrap();
+        let req = request();
+        let declaration = pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Require,
+            }),
+        };
+        assert!(
+            model
+                .stream_detailed_with_tool_declarations(
+                    uuid::Uuid::nil(),
+                    uuid::Uuid::nil(),
+                    "s",
+                    req.clone(),
+                    std::slice::from_ref(&declaration)
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            model
+                .stream_detailed_summary_with_tool_declarations(
+                    uuid::Uuid::nil(),
+                    uuid::Uuid::nil(),
+                    req,
+                    &[declaration]
+                )
+                .await
+                .is_err()
+        );
+        assert_ne!(
+            model.context_identity(),
+            model
+                .clone()
+                .with_strict_tool_support(true)
+                .context_identity()
+        );
+    }
+
+    #[tokio::test]
+    async fn constrained_summary_sends_strict_tools_without_session_cache() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let end = loop {
+                let mut block = [0; 4096];
+                let count = socket.read(&mut block).unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&block[..count]);
+                if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..end]);
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < end + length {
+                let mut block = [0; 4096];
+                let count = socket.read(&mut block).unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&block[..count]);
+            }
+            let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            body
+        });
+        let mut req = request();
+        req.messages = vec![Message::System {
+            content: "rules".into(),
+        }];
+        let declaration = pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Require,
+            }),
+        };
+        let model =
+            OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                .unwrap()
+                .with_strict_tool_support(true)
+                .with_developer_role(true)
+                .with_session_cache_key("prior-session");
+        let prepared = model.prepare_tool_request(req, &[declaration]).unwrap();
+        assert!(matches!(
+            prepared.effective_tools()[0].sampling,
+            pi_rs_core::EffectiveToolSampling::StrictJsonSchema { .. }
+        ));
+        let _ = prepared.stream_for_summary().await;
+        let body = server.join().unwrap();
+        assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn sdk_prepared_responses_sends_strict_schema() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut data = Vec::new();
+            let end = loop {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                data.extend_from_slice(&chunk[..count]);
+                if let Some(pos) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&data[..end]);
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while data.len() < end + length {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                data.extend_from_slice(&chunk[..count]);
+            }
+            let body: Value = serde_json::from_slice(&data[end..end + length]).unwrap();
+            let final_arguments = r#"{"path":null}"#;
+            let events = [
+                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"read","arguments":"{\"path\":"}}),
+                json!({"type":"response.function_call_arguments.done","output_index":0,"arguments":final_arguments}),
+                json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"read","arguments":final_arguments}}),
+                json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"c1","name":"read","arguments":final_arguments}]}}),
+            ];
+            let events = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+            body
+        });
+        let mut req = request();
+        req.messages = vec![Message::System {
+            content: "rules".into(),
+        }];
+        req.tools[0].parameters = json!({"type":"object","properties":{"path":{"type":"string"}}});
+        let declaration = pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Require,
+            }),
+        };
+        let model =
+            OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                .unwrap()
+                .with_strict_tool_support(true);
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "strict-session".into(),
+            summary: false,
+        };
+        let prepared = model
+            .prepare_bound_tool_dispatch(&req, std::slice::from_ref(&declaration), &context)
+            .unwrap();
+        let original = match &prepared.effective_tools()[0].sampling {
+            pi_rs_core::EffectiveToolSampling::StrictJsonSchema {
+                original_schema, ..
+            } => original_schema.clone(),
+            _ => panic!("expected strict decision"),
+        };
+        let mut stream = prepared.dispatch().await.unwrap();
+        let mut calls = None;
+        while let Some(event) = stream.next().await {
+            if let pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete {
+                calls: completed,
+                ..
+            }) = event.unwrap().event
+            {
+                calls = Some(completed);
+            }
+        }
+        let raw = calls.unwrap()[0].arguments.clone();
+        assert_eq!(raw, r#"{"path":null}"#);
+        let args: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            pi_rs_core::normalize_strict_tool_arguments(&original, &args).unwrap(),
+            json!({})
+        );
+        assert_eq!(args, json!({"path":null}));
+        let body = server.join().unwrap();
+        assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["input"][0]["role"], "system");
+        assert_eq!(body["tools"][0]["parameters"]["required"], json!(["path"]));
+        assert_eq!(body["prompt_cache_key"], "strict-session");
+    }
+
+    #[tokio::test]
+    async fn responses_preferred_fallback_stream_keeps_raw_arguments() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut data = Vec::new();
+            let end = loop {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                data.extend_from_slice(&chunk[..count]);
+                if let Some(pos) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&data[..end]);
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while data.len() < end + length {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                data.extend_from_slice(&chunk[..count]);
+            }
+            let body: Value = serde_json::from_slice(&data[end..end + length]).unwrap();
+            let final_arguments = r#"{"path":null}"#;
+            let events = [
+                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"read","arguments":"{\"path\":"}}),
+                json!({"type":"response.function_call_arguments.done","output_index":0,"arguments":final_arguments}),
+                json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"read","arguments":final_arguments}}),
+                json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"c1","name":"read","arguments":final_arguments}]}}),
+            ];
+            let events = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+            body
+        });
+        let mut req = request();
+        req.messages = vec![Message::System {
+            content: "rules".into(),
+        }];
+        req.tools[0].parameters = json!({"type":"object","properties":{"path":{"type":"string"}}});
+        let declaration = pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                strict: pi_rs_core::StrictToolPolicy::Prefer,
+            }),
+        };
+        let model =
+            OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                .unwrap()
+                .with_strict_tool_support(false);
+        let original = req.tools[0].parameters.clone();
+        let mut stream = model
+            .stream_detailed_with_tool_declarations(
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+                "strict-session",
+                req,
+                &[declaration],
+            )
+            .await
+            .unwrap();
+        let mut calls = None;
+        while let Some(event) = stream.next().await {
+            if let pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete {
+                calls: completed,
+                ..
+            }) = event.unwrap().event
+            {
+                calls = Some(completed);
+            }
+        }
+        let raw = calls.unwrap()[0].arguments.clone();
+        assert_eq!(raw, r#"{"path":null}"#);
+        let body = server.join().unwrap();
+        assert!(body["tools"][0].get("strict").is_none());
+        assert_eq!(body["tools"][0]["parameters"], original);
+        assert_eq!(body["input"][0]["role"], "system");
+        assert_eq!(body["prompt_cache_key"], "strict-session");
+    }
+
+    #[tokio::test]
+    async fn final_tool_arguments_can_arrive_on_item_or_completion() {
+        use std::io::{Read, Write};
+        for item_done in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let _ = socket.read(&mut [0; 8192]).unwrap();
+                let final_arguments = r#"{"path":"hello"}"#;
+                let item = json!({"type":"function_call","call_id":"c1","name":"read","arguments":final_arguments});
+                let mut events = vec![
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"read","arguments":"{\"path\":"}}),
+                ];
+                if item_done {
+                    events.push(
+                        json!({"type":"response.output_item.done","output_index":0,"item":item}),
+                    );
+                }
+                events.push(json!({"type":"response.completed","response":{"status":"completed","output":[item]}}));
+                let events = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect::<String>();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+            });
+            let model =
+                OpenAiResponses::new_api(&format!("http://{address}/responses"), "fixture".into())
+                    .unwrap();
+            let mut stream = model.stream(request()).await.unwrap();
+            let mut emitted = String::new();
+            let mut completed = None;
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    ModelEvent::ToolCallDelta(delta) => emitted.push_str(&delta.arguments),
+                    ModelEvent::Complete { calls, .. } => completed = Some(calls),
+                    _ => {}
+                }
+            }
+            assert_eq!(emitted, r#"{"path":"hello"}"#);
+            assert_eq!(completed.unwrap()[0].arguments, emitted);
+            server.join().unwrap();
         }
     }
 

@@ -79,6 +79,8 @@ pub struct Anthropic {
     allow_empty_signature: bool,
     cache_retention: CacheRetention,
     cache_tools: bool,
+    strict_tool_support: bool,
+    strict_tool_models: Option<Arc<BTreeMap<String, bool>>>,
     progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
 }
@@ -170,9 +172,68 @@ impl Anthropic {
             allow_empty_signature: false,
             cache_retention: CacheRetention::None,
             cache_tools: true,
+            strict_tool_support: false,
+            strict_tool_models: None,
             progress: None,
             reasoning: None,
         })
+    }
+
+    /// Set the selected model's JSON Schema strict-tool capability.
+    /// Unknown and compatible endpoints default to unsupported.
+    pub fn with_strict_tool_support(mut self, supported: bool) -> Self {
+        self.strict_tool_support = supported;
+        self
+    }
+
+    /// Freeze strict-tool capabilities for models on this route.
+    /// A constrained request for an absent model fails closed.
+    pub fn with_strict_tool_models(mut self, models: BTreeMap<String, bool>) -> Self {
+        self.strict_tool_models = Some(Arc::new(models));
+        self
+    }
+
+    /// Bind the configured strict capability to a single selected model.
+    pub fn with_strict_tool_model(self, model: &str) -> Self {
+        let supported = self.strict_tool_support;
+        self.with_strict_tool_models([(model.to_owned(), supported)].into_iter().collect())
+    }
+
+    /// Resolve and bind the exact tools to be sent for this dispatch.
+    pub fn prepare_bound_tool_dispatch(
+        &self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Box<dyn pi_rs_core::PreparedToolDispatch>> {
+        let constrained = declarations.iter().any(|declaration| {
+            matches!(
+                declaration.constrained_sampling,
+                Some(pi_rs_core::ToolConstraint::JsonSchema { .. })
+            )
+        });
+        let supported = match (&self.strict_tool_models, constrained) {
+            (Some(models), true) => *models.get(&request.model).ok_or_else(|| {
+                Error::Config("Anthropic strict-tool capability cannot be resolved for the final request model and route".into())
+            })?,
+            _ => self.strict_tool_support,
+        };
+        let (wire_tools, effective) = resolve_tools(request, declarations, supported)?;
+        let snapshot =
+            pi_rs_core::ToolDecisionSnapshot::capture(context, request, declarations, &effective)
+                .map_err(|error| Error::Config(error.to_string()))?;
+        let mut reservation = request.clone();
+        for (tool, wire) in reservation.tools.iter_mut().zip(&wire_tools) {
+            tool.parameters = wire["input_schema"].clone();
+        }
+        Ok(Box::new(PreparedAnthropicDispatch {
+            client: self.clone(),
+            request: request.clone(),
+            reservation,
+            wire_tools,
+            effective,
+            snapshot,
+        }))
     }
 
     /// Set the per-read HTTP idle timeout; `None` disables it.
@@ -1224,8 +1285,207 @@ impl StreamUsage {
     }
 }
 
+struct PreparedAnthropicDispatch {
+    client: Anthropic,
+    request: ModelRequest,
+    reservation: ModelRequest,
+    wire_tools: Vec<Value>,
+    effective: Vec<pi_rs_core::EffectiveToolDeclaration>,
+    snapshot: pi_rs_core::ToolDecisionSnapshot,
+}
+
+#[async_trait::async_trait]
+impl pi_rs_core::PreparedToolDispatch for PreparedAnthropicDispatch {
+    fn effective_tools(&self) -> &[pi_rs_core::EffectiveToolDeclaration] {
+        &self.effective
+    }
+    fn decision_snapshot(&self) -> &pi_rs_core::ToolDecisionSnapshot {
+        &self.snapshot
+    }
+    fn dispatch_request(&self) -> &ModelRequest {
+        &self.request
+    }
+    fn reservation_request(&self) -> &ModelRequest {
+        &self.reservation
+    }
+    async fn dispatch(self: Box<Self>) -> Result<pi_rs_core::DetailedModelStream> {
+        self.client
+            .stream_detailed_with_tools(self.request, Some(self.wire_tools))
+            .await
+    }
+}
+
+fn anthropic_unsupported_keyword(key: &str, value: &Value) -> bool {
+    match key {
+        "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum" | "multipleOf"
+        | "maxItems" | "uniqueItems" | "minContains" | "maxContains" | "minProperties"
+        | "maxProperties" => true,
+        "minItems" => !matches!(value.as_f64(), Some(n) if n == 0.0 || n == 1.0),
+        "format" => !matches!(
+            value.as_str(),
+            Some(
+                "date-time"
+                    | "time"
+                    | "date"
+                    | "duration"
+                    | "email"
+                    | "hostname"
+                    | "uri"
+                    | "ipv4"
+                    | "ipv6"
+                    | "uuid"
+            )
+        ),
+        _ => false,
+    }
+}
+
+// Pi keeps strict root annotations, while ordinary tools use only the
+// Anthropic-supported root fields. Root combinators cannot be sent.
+fn anthropic_input_schema(parameters: &Value, strict: bool) -> Value {
+    let mut root = if strict {
+        parameters.as_object().cloned().unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+    for key in ["anyOf", "oneOf", "allOf"] {
+        root.remove(key);
+    }
+    root.insert("type".into(), json!("object"));
+    for (key, default) in [("properties", json!({})), ("required", json!([]))] {
+        let value = parameters
+            .get(key)
+            .filter(|v| !v.is_null())
+            .cloned()
+            .unwrap_or(default);
+        root.insert(key.into(), value);
+    }
+    for key in ["additionalProperties", "$defs", "definitions"] {
+        if let Some(value) = parameters.get(key) {
+            root.insert(key.into(), value.clone());
+        }
+    }
+    Value::Object(root)
+}
+
+fn resolve_tools(
+    request: &ModelRequest,
+    declarations: &[pi_rs_core::ToolDeclaration],
+    supported: bool,
+) -> Result<(Vec<Value>, Vec<pi_rs_core::EffectiveToolDeclaration>)> {
+    if request.tools.len() != declarations.len()
+        || request
+            .tools
+            .iter()
+            .zip(declarations)
+            .any(|(a, b)| a != &b.spec)
+    {
+        return Err(Error::Config(
+            "tool declarations do not match the effective request".into(),
+        ));
+    }
+    let mut wire = Vec::new();
+    let mut effective = Vec::new();
+    for declaration in declarations {
+        let spec = &declaration.spec;
+        // Removing a root constraint would change what strict sampling promises.
+        // Fall back or fail before advertising such a decision.
+        let root_combinator = ["anyOf", "oneOf", "allOf"]
+            .iter()
+            .any(|key| spec.parameters.get(key).is_some());
+        let strict = match &declaration.constrained_sampling {
+            Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => {
+                pi_rs_core::resolve_strict_tool_schema(
+                    &spec.name,
+                    &spec.parameters,
+                    *strict,
+                    supported && !root_combinator,
+                    anthropic_unsupported_keyword,
+                )
+                .map_err(|error| Error::Config(error.to_string()))?
+            }
+            _ => None,
+        };
+        let sampling = if strict.is_some() {
+            pi_rs_core::EffectiveToolSampling::StrictJsonSchema {
+                original_schema: spec.parameters.clone(),
+                normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
+            }
+        } else {
+            pi_rs_core::EffectiveToolSampling::Unconstrained
+        };
+        let schema = anthropic_input_schema(
+            strict.as_ref().unwrap_or(&spec.parameters),
+            strict.is_some(),
+        );
+        let mut tool =
+            json!({"name":spec.name,"description":spec.description,"input_schema":schema});
+        if strict.is_some() {
+            tool["strict"] = json!(true);
+        }
+        wire.push(tool);
+        effective.push(pi_rs_core::EffectiveToolDeclaration {
+            spec: spec.clone(),
+            sampling,
+        });
+    }
+    pi_rs_core::validate_effective_tool_declarations(request, declarations, &effective)
+        .map_err(|error| Error::Config(error.to_string()))?;
+    Ok((wire, effective))
+}
+
 #[async_trait::async_trait]
 impl Model for Anthropic {
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs_core::PreparedToolDispatch + 'a>>> {
+        Ok(Some(self.prepare_bound_tool_dispatch(
+            request,
+            declarations,
+            context,
+        )?))
+    }
+
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id,
+            session_id,
+            external_id: external_id.into(),
+            summary: false,
+        };
+        self.stream_without_retained_decision(request, declarations, context)
+            .await
+    }
+
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id,
+            session_id,
+            external_id: session_id.to_string(),
+            summary: true,
+        };
+        self.clone()
+            .without_cache()
+            .stream_without_retained_decision(request, declarations, context)
+            .await
+    }
+
     fn context_identity(&self) -> Option<String> {
         // Thinking and discovered output limits can depend on a changing catalog.
         if !self.http_proxies.is_empty()
@@ -1240,7 +1500,7 @@ impl Model for Anthropic {
             .map(|(name, value)| (name.as_str(), value.as_bytes()))
             .collect();
         headers.sort();
-        pi_rs_core::protected_model_fingerprint(&(
+        let identity = (
             headers,
             "anthropic-v1",
             self.endpoint.as_str(),
@@ -1255,7 +1515,24 @@ impl Model for Anthropic {
             self.allow_empty_signature,
             self.cache_retention.anthropic_control(),
             self.cache_tools,
-        ))
+        );
+        let base = if self.strict_tool_support {
+            pi_rs_core::protected_model_fingerprint(&(identity, "strict-tools-v1"))
+        } else {
+            pi_rs_core::protected_model_fingerprint(&identity)
+        }?;
+        match &self.strict_tool_models {
+            // A map containing only unsupported models cannot change any
+            // successful request's sampling compared with the default.
+            Some(models) if models.values().any(|supported| *supported) => {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    "strict-models-v1",
+                    models.as_ref(),
+                ))
+            }
+            _ => Some(base),
+        }
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
@@ -1343,6 +1620,30 @@ impl Model for Anthropic {
 }
 
 impl Anthropic {
+    async fn stream_without_retained_decision(
+        &self,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: pi_rs_core::ToolDispatchContext,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let prepared = self.prepare_bound_tool_dispatch(&request, declarations, &context)?;
+        pi_rs_core::validate_prepared_tool_dispatch(
+            prepared.as_ref(),
+            &context,
+            &request,
+            declarations,
+        )?;
+        if prepared.effective_tools().iter().any(|tool| {
+            matches!(
+                tool.sampling,
+                pi_rs_core::EffectiveToolSampling::StrictJsonSchema { .. }
+            )
+        }) {
+            return Err(Error::Config("strict tool sampling requires prepared dispatch so its effective decisions can be retained".into()));
+        }
+        prepared.dispatch().await
+    }
+
     async fn stream_enriched(
         &self,
         request: ModelRequest,
@@ -1356,7 +1657,15 @@ impl Anthropic {
 
     async fn stream_detailed(
         &self,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        self.stream_detailed_with_tools(request, None).await
+    }
+
+    async fn stream_detailed_with_tools(
+        &self,
         mut request: ModelRequest,
+        wire_tools: Option<Vec<Value>>,
     ) -> Result<pi_rs_core::DetailedModelStream> {
         let discovered = if self.thinking_level.is_some() {
             self.model(&request.model).await
@@ -1413,6 +1722,11 @@ impl Anthropic {
             &edited_scope,
             self.allow_empty_signature,
         )?;
+        if let Some(tools) = wire_tools
+            && !tools.is_empty()
+        {
+            body["tools"] = json!(tools);
+        }
         apply_cache_control(&mut body, self.cache_retention, self.cache_tools);
         if self.oauth {
             prepare_oauth_request(&mut body, self.cache_retention);
@@ -1736,6 +2050,547 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    fn constrained_fixture(
+        policy: pi_rs_core::StrictToolPolicy,
+        schema: Value,
+    ) -> (ModelRequest, pi_rs_core::ToolDeclaration) {
+        let spec = pi_rs_core::ToolSpec {
+            name: "lookup".into(),
+            description: "lookup".into(),
+            parameters: schema,
+        };
+        (
+            ModelRequest {
+                model: "claude".into(),
+                messages: vec![Message::User {
+                    content: "hello".into(),
+                }],
+                tools: vec![spec.clone()],
+                max_output_tokens: 32,
+            },
+            pi_rs_core::ToolDeclaration {
+                spec,
+                constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                    strict: policy,
+                }),
+            },
+        )
+    }
+
+    #[test]
+    fn constrained_anthropic_policy_and_schema_decisions() {
+        use pi_rs_core::{EffectiveToolSampling as S, StrictToolPolicy as P};
+        let schema =
+            json!({"type":"object","properties":{"query":{"type":"string"}},"required":[]});
+        for policy in [P::Prefer, P::Require] {
+            let (req, decl) = constrained_fixture(policy, schema.clone());
+            let (wire, effective) =
+                super::resolve_tools(&req, std::slice::from_ref(&decl), true).unwrap();
+            assert_eq!(wire[0]["strict"], true);
+            assert_eq!(wire[0]["input_schema"]["required"], json!(["query"]));
+            assert!(matches!(effective[0].sampling, S::StrictJsonSchema { .. }));
+            let no_support = super::resolve_tools(&req, &[decl], false);
+            if policy == P::Require {
+                assert!(no_support.is_err());
+            } else {
+                let (wire, effective) = no_support.unwrap();
+                assert!(wire[0].get("strict").is_none());
+                assert_eq!(wire[0]["input_schema"], schema);
+                assert!(matches!(effective[0].sampling, S::Unconstrained));
+            }
+        }
+        for unsupported in [
+            json!({"type":"integer","minimum":1}),
+            json!({"type":"string","format":"regex"}),
+            json!({"type":"array","items":{"type":"string"},"minItems":2}),
+        ] {
+            let schema = json!({"type":"object","properties":{"x":unsupported}});
+            for policy in [P::Prefer, P::Require] {
+                let (req, decl) = constrained_fixture(policy, schema.clone());
+                let result = super::resolve_tools(&req, &[decl], true);
+                if policy == P::Require {
+                    assert!(result.is_err());
+                } else {
+                    assert!(result.unwrap().0[0].get("strict").is_none());
+                }
+            }
+        }
+        let (req, mut decl) = constrained_fixture(P::Require, schema);
+        decl.spec.name = "different".into();
+        assert!(super::resolve_tools(&req, &[decl], true).is_err());
+    }
+
+    #[test]
+    fn constrained_root_projection_and_reservation_match() {
+        use pi_rs_core::{StrictToolPolicy as P, ToolDispatchContext};
+        let model = Anthropic::new(DEFAULT_ENDPOINT, "key")
+            .unwrap()
+            .with_strict_tool_support(true);
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        let schema = json!({"type":"object", "anyOf":[{"type":"object"}], "oneOf":[], "allOf":[], "description":"omit", "additionalProperties":false, "$defs":{"x":{"type":"string"}}, "definitions":{}});
+        let (request, decl) = constrained_fixture(P::Prefer, schema);
+        let (wire, effective) =
+            super::resolve_tools(&request, std::slice::from_ref(&decl), true).unwrap();
+        assert!(matches!(
+            effective[0].sampling,
+            pi_rs_core::EffectiveToolSampling::Unconstrained
+        ));
+        assert_eq!(
+            wire[0]["input_schema"],
+            json!({"type":"object","properties":{},"required":[],"additionalProperties":false,"$defs":{"x":{"type":"string"}},"definitions":{}})
+        );
+        let prepared = model
+            .prepare_bound_tool_dispatch(&request, &[decl], &context)
+            .unwrap();
+        assert_eq!(
+            prepared.reservation_request().tools[0].parameters,
+            wire[0]["input_schema"]
+        );
+        let (required, declaration) = constrained_fixture(
+            P::Require,
+            json!({"type":"object","anyOf":[{"type":"string"}]}),
+        );
+        assert!(
+            model
+                .prepare_bound_tool_dispatch(&required, &[declaration], &context)
+                .is_err()
+        );
+
+        let (request, decl) =
+            constrained_fixture(P::Require, json!({"type":"object","title":"strict title"}));
+        let (wire, _) = super::resolve_tools(&request, std::slice::from_ref(&decl), true).unwrap();
+        assert_eq!(wire[0]["strict"], true);
+        assert_eq!(wire[0]["input_schema"]["properties"], json!({}));
+        assert_eq!(wire[0]["input_schema"]["required"], json!([]));
+        assert_eq!(wire[0]["input_schema"]["title"], "strict title");
+        let prepared = model
+            .prepare_bound_tool_dispatch(&request, &[decl], &context)
+            .unwrap();
+        assert_eq!(
+            prepared.reservation_request().tools[0].parameters,
+            wire[0]["input_schema"]
+        );
+        let defaults =
+            super::anthropic_input_schema(&json!({"properties":null,"required":null}), false);
+        assert_eq!(
+            defaults,
+            json!({"type":"object","properties":{},"required":[]})
+        );
+    }
+
+    #[test]
+    fn constrained_min_items_accepts_javascript_numeric_equivalents() {
+        for number in [json!(0), json!(0.0), json!(1), json!(1.0), json!(-0.0)] {
+            assert!(
+                !super::anthropic_unsupported_keyword("minItems", &number),
+                "{number}"
+            );
+        }
+        for value in [json!(2), json!(0.5), json!("1"), Value::Null] {
+            assert!(
+                super::anthropic_unsupported_keyword("minItems", &value),
+                "{value}"
+            );
+        }
+        for number in [json!(0.0), json!(1.0)] {
+            let (request, decl) = constrained_fixture(
+                pi_rs_core::StrictToolPolicy::Require,
+                json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"string"},"minItems":number}}}),
+            );
+            assert!(super::resolve_tools(&request, &[decl], true).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn constrained_declaration_streams_reject_strict_and_dispatch_fallback() {
+        use pi_rs_core::StrictToolPolicy as P;
+        use std::io::{Read, Write};
+        for summary in [false, true] {
+            for policy in [P::Prefer, P::Require] {
+                let (request, declaration) = constrained_fixture(policy, json!({"type":"object"}));
+                let client = Anthropic::new("http://127.0.0.1:9/v1/messages", "key")
+                    .unwrap()
+                    .with_strict_tool_support(true)
+                    .with_context_probe(false);
+                let result = if summary {
+                    client
+                        .stream_detailed_summary_with_tool_declarations(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            request,
+                            &[declaration],
+                        )
+                        .await
+                } else {
+                    client
+                        .stream_detailed_with_tool_declarations(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            "session",
+                            request,
+                            &[declaration],
+                        )
+                        .await
+                };
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("effective decisions can be retained")
+                );
+            }
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut data = Vec::new();
+                let mut buf = [0; 4096];
+                loop {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    data.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..pos]);
+                        let len: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(|s| s.parse().unwrap())
+                            })
+                            .unwrap();
+                        if data.len() >= pos + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let pos = data.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                let body: Value = serde_json::from_slice(&data[pos + 4..]).unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                body
+            });
+            let client = Anthropic::new(&format!("http://{address}/v1/messages"), "key")
+                .unwrap()
+                .with_context_probe(false)
+                .with_cache_retention(CacheRetention::Short, true);
+            let (request, declaration) = constrained_fixture(
+                P::Prefer,
+                json!({"type":"object","anyOf":[{"type":"object"}]}),
+            );
+            let result = if summary {
+                client
+                    .stream_detailed_summary_with_tool_declarations(
+                        uuid::Uuid::nil(),
+                        uuid::Uuid::nil(),
+                        request,
+                        &[declaration],
+                    )
+                    .await
+            } else {
+                client
+                    .stream_detailed_with_tool_declarations(
+                        uuid::Uuid::nil(),
+                        uuid::Uuid::nil(),
+                        "session",
+                        request,
+                        &[declaration],
+                    )
+                    .await
+            };
+            assert!(result.is_ok());
+            let body = server.join().unwrap();
+            assert!(body["tools"][0].get("strict").is_none());
+            assert_eq!(
+                body["tools"][0]["input_schema"],
+                json!({"type":"object","properties":{},"required":[]})
+            );
+            assert_eq!(body["tools"][0].get("cache_control").is_some(), !summary);
+        }
+    }
+
+    #[test]
+    fn constrained_bound_model_rejects_rewritten_request() {
+        use pi_rs_core::{StrictToolPolicy as P, ToolDispatchContext};
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        for supported in [false, true] {
+            let client = Anthropic::new(DEFAULT_ENDPOINT, "key")
+                .unwrap()
+                .with_strict_tool_support(supported)
+                .with_strict_tool_model("selected");
+            for policy in [P::Prefer, P::Require] {
+                let (mut request, decl) = constrained_fixture(policy, json!({"type":"object"}));
+                request.model = "rewritten".into();
+                let error = client
+                    .prepare_bound_tool_dispatch(&request, &[decl], &context)
+                    .err()
+                    .unwrap();
+                assert!(error.to_string().contains("cannot be resolved"));
+            }
+            let (mut request, mut decl) = constrained_fixture(P::Prefer, json!({"type":"object"}));
+            request.model = "rewritten".into();
+            decl.constrained_sampling = None;
+            assert!(
+                client
+                    .prepare_bound_tool_dispatch(&request, &[decl], &context)
+                    .is_ok()
+            );
+            if supported {
+                assert_ne!(
+                    client.context_identity(),
+                    client
+                        .clone()
+                        .with_strict_tool_model("other")
+                        .context_identity()
+                );
+            } else {
+                assert_eq!(
+                    client.context_identity(),
+                    client
+                        .clone()
+                        .with_strict_tool_model("other")
+                        .context_identity()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn constrained_final_model_uses_frozen_capability_map() {
+        use pi_rs_core::{EffectiveToolSampling as S, StrictToolPolicy as P, ToolDispatchContext};
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        let client = Anthropic::new(DEFAULT_ENDPOINT, "key")
+            .unwrap()
+            .with_strict_tool_models(
+                [("strict".into(), true), ("loose".into(), false)]
+                    .into_iter()
+                    .collect(),
+            );
+        let other = Anthropic::new(DEFAULT_ENDPOINT, "key")
+            .unwrap()
+            .with_strict_tool_models(
+                [("strict".into(), false), ("loose".into(), false)]
+                    .into_iter()
+                    .collect(),
+            );
+        assert_ne!(client.context_identity(), other.context_identity());
+        for (model, supported) in [("strict", true), ("loose", false)] {
+            for policy in [P::Prefer, P::Require] {
+                let (mut request, declaration) =
+                    constrained_fixture(policy, json!({"type":"object"}));
+                request.model = model.into();
+                let result = client.prepare_bound_tool_dispatch(
+                    &request,
+                    std::slice::from_ref(&declaration),
+                    &context,
+                );
+                if !supported && policy == P::Require {
+                    assert!(result.is_err());
+                } else {
+                    let prepared = result.unwrap();
+                    pi_rs_core::validate_prepared_tool_dispatch(
+                        prepared.as_ref(),
+                        &context,
+                        &request,
+                        &[declaration],
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        matches!(
+                            prepared.effective_tools()[0].sampling,
+                            S::StrictJsonSchema { .. }
+                        ),
+                        supported
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn constrained_disabled_capability_map_preserves_legacy_fingerprint() {
+        let legacy = Anthropic::new(DEFAULT_ENDPOINT, "key").unwrap();
+        let disabled = legacy.clone().with_strict_tool_models(
+            [("selected".into(), false), ("other".into(), false)]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(legacy.context_identity(), disabled.context_identity());
+        let enabled = legacy.clone().with_strict_tool_models(
+            [("selected".into(), false), ("other".into(), true)]
+                .into_iter()
+                .collect(),
+        );
+        assert_ne!(legacy.context_identity(), enabled.context_identity());
+        // Prepared fallback can still alter the wire even with strict disabled.
+        let (request, declaration) = constrained_fixture(
+            pi_rs_core::StrictToolPolicy::Prefer,
+            json!({"type":"object","title":"dropped"}),
+        );
+        let old = encode_request(request.clone(), &legacy.replay_scope, "", false).unwrap();
+        let (wire, _) = super::resolve_tools(&request, &[declaration], false).unwrap();
+        assert_ne!(old["tools"][0]["input_schema"], wire[0]["input_schema"]);
+        assert_eq!(
+            wire[0]["input_schema"],
+            json!({"type":"object","properties":{},"required":[]})
+        );
+    }
+
+    #[test]
+    fn constrained_capability_preserves_legacy_context_identity() {
+        let model = Anthropic::new(DEFAULT_ENDPOINT, "key").unwrap();
+        let mut headers: Vec<_> = model
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort();
+        let legacy = pi_rs_core::protected_model_fingerprint(&(
+            headers,
+            "anthropic-v1",
+            model.endpoint.as_str(),
+            model.provider.as_ref(),
+            model.replay_scope.as_ref(),
+            model.auth.0.as_str(),
+            model.auth.1.as_bytes(),
+            &model.thinking_level,
+            &model.thinking_budgets,
+            format!("{:?}", model.configured_thinking),
+            model.configured_thinking_is_fallback,
+            model.allow_empty_signature,
+            model.cache_retention.anthropic_control(),
+            model.cache_tools,
+        ));
+        assert!(legacy.is_some());
+        assert_eq!(model.context_identity(), legacy);
+        assert_eq!(
+            model
+                .clone()
+                .with_strict_tool_support(false)
+                .context_identity(),
+            legacy
+        );
+        assert_ne!(
+            model.with_strict_tool_support(true).context_identity(),
+            legacy
+        );
+    }
+
+    #[tokio::test]
+    async fn constrained_prepared_dispatch_sends_schema_and_observes_model_tool_output() {
+        use pi_rs_core::{EnrichedModelEvent, StrictToolPolicy as P, ToolDispatchContext};
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut data = Vec::new();
+            let mut buf = [0; 4096];
+            loop {
+                let n = socket.read(&mut buf).unwrap();
+                assert!(n > 0);
+                data.extend_from_slice(&buf[..n]);
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&data[..pos]);
+                    let len: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(|s| s.parse().unwrap())
+                        })
+                        .unwrap();
+                    if data.len() >= pos + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let pos = data.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let body: Value = serde_json::from_slice(&data[pos + 4..]).unwrap();
+            assert_eq!(body["tools"][0]["strict"], true);
+            assert_eq!(
+                body["tools"][0]["input_schema"]["required"],
+                json!(["query"])
+            );
+            let events = [
+                json!({"type":"message_start","message":{"id":"msg","model":"claude","usage":{}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call","name":"lookup","input":{}}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":null}"}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{}}),
+                json!({"type":"message_stop"}),
+            ];
+            let body: String = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let client = Anthropic::new(&format!("http://{addr}/v1/messages"), "key")
+            .unwrap()
+            .with_context_probe(false)
+            .with_strict_tool_support(true);
+        let (request, decl) = constrained_fixture(
+            P::Require,
+            json!({"type":"object","properties":{"query":{"type":"string"}},"required":[]}),
+        );
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "session".into(),
+            summary: false,
+        };
+        let prepared = client
+            .prepare_bound_tool_dispatch(&request, std::slice::from_ref(&decl), &context)
+            .unwrap();
+        pi_rs_core::validate_prepared_tool_dispatch(prepared.as_ref(), &context, &request, &[decl])
+            .unwrap();
+        assert_eq!(
+            prepared.reservation_request().tools[0].parameters["required"],
+            json!(["query"])
+        );
+        let mut stream = prepared.dispatch().await.unwrap();
+        let mut found = false;
+        while let Some(event) = stream.next().await {
+            if let EnrichedModelEvent::Legacy(ModelEvent::Complete { calls, .. }) =
+                event.unwrap().event
+            {
+                assert_eq!(calls[0].name, "lookup");
+                let raw: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+                assert_eq!(raw, json!({"query":null}));
+                assert_eq!(
+                    pi_rs_core::normalize_strict_tool_arguments(&request.tools[0].parameters, &raw)
+                        .unwrap(),
+                    json!({})
+                );
+                found = true;
+            }
+        }
+        assert!(found);
+        worker.join().unwrap();
+    }
+
     #[test]
     fn oauth_and_api_key_replay_share_only_the_official_endpoint() {
         let oauth = Anthropic::with_oauth_token(DEFAULT_ENDPOINT, "sk-ant-oat-secret").unwrap();

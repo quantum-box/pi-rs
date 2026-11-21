@@ -3198,6 +3198,7 @@ mod share_context_tests {
                 context_sha256: None,
                 context_transformed: None,
                 context_configuration_sha256: None,
+                tool_decision: None,
             },
         };
         let mut summary = false;
