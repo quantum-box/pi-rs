@@ -292,6 +292,7 @@ fn protected_values<'a>(
                     }
                 })
                 .flat_map(|value| {
+                    let value = value.trim_matches([' ', '\t']);
                     let credential = value.split_once([' ', '\t']).and_then(|(scheme, value)| {
                         (scheme.eq_ignore_ascii_case("bearer")
                             || scheme.eq_ignore_ascii_case("basic"))
@@ -925,6 +926,7 @@ mod tests {
                     "x-combined",
                     "x-reflected",
                     "x-gateway-echo",
+                    "x-proxy-echo",
                 ] {
                     assert!(!headers.contains_key(hidden));
                 }
@@ -960,9 +962,17 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "authorization",
-            HeaderValue::from_static("Bearer credential"),
+            HeaderValue::from_static(" \tBearer credential \t"),
         );
         headers.insert("x-api-key", HeaderValue::from_static("gateway-key"));
+        headers.insert(
+            "proxy-authorization",
+            HeaderValue::from_static("\t Basic proxy-key \t"),
+        );
+        headers.insert(
+            "x-proxy-echo",
+            HeaderValue::from_static("reflected proxy-key"),
+        );
         headers.insert(
             "x-gateway-echo",
             HeaderValue::from_static("reflected gateway-key"),
@@ -987,7 +997,7 @@ mod tests {
                 .unwrap()
         })
         .await;
-        assert_eq!(edited["authorization"], "Bearer credential");
+        assert_eq!(edited["authorization"], " \tBearer credential \t");
         assert_eq!(edited["x-reflected"], "echo credential");
         assert_eq!(edited["x-private"], "hidden");
         assert_eq!(edited["x-trace"], "edited");
