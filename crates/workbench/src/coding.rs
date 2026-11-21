@@ -4562,7 +4562,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_empty_truncated_snapshot_keeps_placeholder_and_exit_status() {
+    fn shell_partial_line_snapshot_keeps_output_and_exit_status() {
         for code in [0, 2] {
             let input = format!("{}\n", "x".repeat(300_000));
             let mut output = super::super::shell_output::Accumulator::default();
@@ -4581,12 +4581,13 @@ mod tests {
             else {
                 panic!("missing structured result")
             };
-            assert!(output.starts_with(
-                "(no output)\n\n[Showing lines 2-1 of 1 (50.0KB limit). Full output: "
-            ));
+            assert!(output.starts_with(&format!(
+                "{}\n\n[Showing last 50.0KB of line 1 (line is 0B). Full output: ",
+                "x".repeat(50 * 1024)
+            )));
             assert_eq!(is_error, code != 0);
             assert_eq!(output.ends_with("Command exited with code 2"), code == 2);
-            assert_eq!(details.unwrap()["truncation"]["outputLines"], 0);
+            assert_eq!(details.unwrap()["truncation"]["outputLines"], 1);
             assert_eq!(structured_content["output"], input);
             assert_eq!(std::fs::read(&path).unwrap(), input.as_bytes());
             std::fs::remove_file(path).unwrap();
@@ -8074,7 +8075,25 @@ mod tests {
             return;
         }
         let root = tempfile::tempdir().unwrap();
-        let command = "python3 -c 'import os,time; parent=os.getppid(); open(\"ready\",\"w\").close();\nwhile os.getppid()==parent: time.sleep(.001)\nend=time.monotonic()+.6; os.write(1,b\"out0\\n\"); os.write(2,b\"err0\\n\");\nwhile time.monotonic()<end:\n os.write(1,b\".\"); os.write(2,b\".\"); until=time.monotonic()+.002\n while time.monotonic()<until: pass\nos.write(1,b\"out11\\n\"); os.write(2,b\"err11\\n\")' & while [ ! -f ready ]; do sleep .01; done; rm ready; exit 0";
+        // Yield between writes so the producer and pipe readers can run on
+        // constrained CI hosts. The stream still outlives the idle window.
+        let command = r#"python3 -c '
+import os
+import time
+
+parent = os.getppid()
+open("ready", "w").close()
+while os.getppid() == parent:
+    time.sleep(.001)
+os.write(1, b"out0\n")
+os.write(2, b"err0\n")
+for _ in range(80):
+    os.write(1, b".")
+    os.write(2, b".")
+    time.sleep(.004)
+os.write(1, b"out11\n")
+os.write(2, b"err11\n")
+' & while [ ! -f ready ]; do sleep .01; done; rm ready; exit 0"#;
         let local = CodingTool {
             root: root.path().to_path_buf(),
             unrestricted: true,
@@ -8126,8 +8145,14 @@ mod tests {
         .await
         .unwrap();
         let output = result.tool_content();
-        assert!(output.contains("out11\n"), "{output:?}");
-        assert!(output.contains("err11\n"), "{output:?}");
+        assert!(
+            output.contains("out11\n"),
+            "backend stdout missing: {output:?}"
+        );
+        assert!(
+            output.contains("err11\n"),
+            "backend stderr missing: {output:?}"
+        );
     }
 
     #[cfg(unix)]
