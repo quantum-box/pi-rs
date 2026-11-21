@@ -953,7 +953,7 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
     fn minimum_output_tokens(&self) -> u32 {
-        if self.codex_account.is_some() && self.send_max_output_tokens {
+        if self.send_max_output_tokens && (self.codex_account.is_some() || self.is_azure()) {
             16
         } else {
             1
@@ -1377,7 +1377,11 @@ impl OpenAiResponses {
             if let Some(deployment) = self.deployments.get(&model) {
                 body["model"] = json!(deployment);
             }
-            body["max_output_tokens"] = json!(request.max_output_tokens.max(16));
+            if request.max_output_tokens == 0 {
+                body.as_object_mut()
+                    .expect("Responses request object")
+                    .remove("max_output_tokens");
+            }
         }
         if let Some(tools) = tools
             && !tools.is_empty()

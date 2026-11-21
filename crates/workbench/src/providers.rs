@@ -4234,6 +4234,25 @@ mod estimation_tests {
                 .unwrap();
             let expected_replay_provider =
                 pi_rs::endpoint_replay_scope(provider, &format!("{endpoint}\nmy-deployment"));
+            if responses {
+                let below_minimum = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.stream_enriched_with_headers(
+                        ModelRequest {
+                            model: model.into(),
+                            messages: vec![],
+                            tools: vec![],
+                            max_output_tokens: 4,
+                        },
+                        &HeaderMap::new(),
+                        false,
+                        None,
+                    ),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(below_minimum, Err(pi_rs::Error::Budget)));
+            }
 
             let serve = tokio::spawn(async move {
                 let (socket, _) = listener.accept().await.unwrap();
@@ -4283,7 +4302,7 @@ mod estimation_tests {
                             content: "hello".into(),
                         }],
                         tools: vec![],
-                        max_output_tokens: 4,
+                        max_output_tokens: if responses { 16 } else { 4 },
                     },
                     &HeaderMap::new(),
                     false,

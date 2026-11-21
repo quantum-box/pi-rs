@@ -387,8 +387,9 @@ query parameter, and `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` replaces the wire
 model name while preserving the catalog ID. Responses uses an `api-key`
 header and Chat Completions uses a bearer token, following Pi and the
 [Azure v1 Chat Completions API](https://learn.microsoft.com/en-us/rest/api/microsoft-foundry/azureopenai/chat?view=rest-microsoft-foundry-v1).
-Model discovery on named
-Responses relays uses the same API key, version and URL prefix. The bundled
+Model discovery on named Responses relays uses the same API key, version
+and URL prefix. A positive output budget under 16 tokens ends the run before
+an Azure Responses request is sent. The bundled
 o-series entries support low, medium and high effort. With thinking off and no
 explicit model mapping, the original GPT-5 reasoning models and o-series
 leave effort unset so Azure can apply its default. This differs from Pi's
