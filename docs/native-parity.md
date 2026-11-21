@@ -465,9 +465,10 @@ a Vercel account remains open.
 
 Mistral exposes the 34 pinned chat models using `MISTRAL_API_KEY` and the
 `mistral-conversations` transport. It sends each model's reasoning control,
-replays streamed thinking and text on the same route, and normalizes tool IDs
-for the provider. Tool errors and supported images are encoded in the tool
-message. In a session, routing and cache hints include `x-affinity` and
+replays streamed thinking and text on the same route, and pads short tool ID
+hashes to nine characters for [Mistral's validator](https://github.com/mistralai/mistral-common/blob/main/src/mistral_common/protocol/instruct/validator.py).
+Tool errors and supported images are encoded in the tool message. In a
+session, routing and cache hints include `x-affinity` and
 `prompt_cache_key`. Parallel continuations need a tool ID or index when the
 stream does not uniquely identify the target call. Live Mistral account
 inference has not been verified.

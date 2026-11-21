@@ -337,6 +337,7 @@ pub(super) fn call_id(original: &str, attempt: usize) -> String {
         ^ (first ^ (first >> 13)).wrapping_mul(3266489909);
     format!("{}{}", base36(second), base36(first))
         .chars()
+        .chain(std::iter::repeat('0'))
         .take(9)
         .collect()
 }
@@ -427,6 +428,14 @@ mod tests {
     use futures_util::StreamExt;
     use pi_rs_core::{Model, ModelEvent, ModelRequest, ToolCall, ToolSpec};
     use std::io::{BufRead, BufReader, Read, Write};
+
+    #[test]
+    fn mistral_tool_call_id_pads_short_hashes() {
+        let id = call_id("call_190964", 0);
+        assert_eq!(id.len(), 9);
+        assert!(id.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+        assert_eq!(call_id(&id, 0), id);
+    }
 
     #[test]
     fn preserves_repeated_fragments_of_a_declared_name() {
