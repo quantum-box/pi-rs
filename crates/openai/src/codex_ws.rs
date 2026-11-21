@@ -37,6 +37,7 @@ pub(super) struct Request<'a> {
     pub headers: &'a HeaderMap,
     pub token: &'a str,
     pub account: &'a str,
+    pub error_secrets: &'a [String],
     pub session: Option<&'a str>,
     pub timeout: Option<Duration>,
     pub cache_context: bool,
@@ -198,6 +199,7 @@ struct Handshake {
     account: String,
     token: String,
     session: String,
+    error_secrets: Vec<String>,
 }
 
 impl Handshake {
@@ -244,6 +246,13 @@ impl Handshake {
             .send()
             .await
             .map_err(|_| unavailable())?;
+        pi_rs_core::observe_provider_response(
+            response.status(),
+            response.headers(),
+            &self.error_secrets,
+            &self.headers,
+        )
+        .await;
         let headers = response.headers();
         let contains = |name: header::HeaderName, value: &str| {
             headers
@@ -369,6 +378,12 @@ pub(super) async fn open(
         headers: options.headers.clone(),
         account: options.account.into(),
         token: options.token.into(),
+        error_secrets: options
+            .error_secrets
+            .iter()
+            .cloned()
+            .chain(std::iter::once(options.account.to_owned()))
+            .collect(),
         session: options
             .session
             .map(str::to_owned)
@@ -528,6 +543,104 @@ mod tests {
             idle_expiry(connected, age_limit + Duration::from_secs(1)),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_reports_sanitized_handshake_before_inference() {
+        use pi_rs_core::{
+            Agent, CancellationToken, Extension, ExtensionResult, ExtensionState, Limits,
+            MemoryStore, ProviderResponseEvent, Registry, Session,
+        };
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Observer(Mutex<Vec<ProviderResponseEvent>>);
+        #[async_trait::async_trait]
+        impl Extension for Observer {
+            fn id(&self) -> &str {
+                "fixture-observer"
+            }
+            fn handles_after_provider_response(&self) -> bool {
+                true
+            }
+            async fn after_provider_response(
+                &self,
+                event: &ProviderResponseEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                self.0.lock().unwrap().push(event.clone());
+                Ok(())
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let model = client(
+            format!(
+                "http://{}/backend-api/codex/responses",
+                listener.local_addr().unwrap()
+            ),
+            CodexTransport::WebSocket,
+        );
+        let callback = Arc::new(Observer::default());
+        let mut registry = Registry::default();
+        registry.register(callback.clone()).unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            #[allow(clippy::result_large_err)]
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                tcp,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                    mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    let headers = response.headers_mut();
+                    headers.insert("x-request-id", HeaderValue::from_static("fixture-req"));
+                    headers.insert("x-reflected-token", request.headers()["authorization"].clone());
+                    headers.insert("x-reflected-account", request.headers()["chatgpt-account-id"].clone());
+                    headers.insert("set-cookie", HeaderValue::from_static("fixture=hidden"));
+                    Ok(response)
+                },
+            ).await.unwrap();
+            assert_eq!(read_request(&mut socket).await["type"], "response.create");
+            {
+                let events = callback.0.lock().unwrap();
+                assert_eq!(events.len(), 1);
+                let event = &events[0];
+                assert_eq!(event.status, 101);
+                assert_eq!(event.headers["x-request-id"], "fixture-req");
+                for hidden in ["x-reflected-token", "x-reflected-account", "set-cookie"] {
+                    assert!(!event.headers.contains_key(hidden));
+                }
+            }
+            let complete = json!({"type":"response.completed","response":{
+                "id":"fixture", "status":"completed", "output":[]
+            }});
+            socket
+                .send(Message::Text(complete.to_string().into()))
+                .await
+                .unwrap();
+        });
+        let agent = Agent {
+            model: &model,
+            model_name: "gpt-6.1-sol",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let (_tx, mut input) = tokio::sync::mpsc::channel::<String>(1);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            agent.run(
+                &mut session,
+                Some("hello".into()),
+                &mut input,
+                &CancellationToken::new(),
+                &mut |_| {},
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]

@@ -1584,6 +1584,7 @@ impl OpenAiResponses {
                     headers: &self.headers,
                     token: &self.token,
                     account,
+                    error_secrets: &error_secrets,
                     session,
                     timeout: self.idle_timeout,
                     reuse_connection: self.identity_safe_transport,

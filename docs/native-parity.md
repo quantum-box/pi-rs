@@ -4962,8 +4962,9 @@ matches the previous conversation. `websocket` sends the full history on
 the connection, and `sse` uses HTTP directly. WebSocket requests omit the
 HTTP-only `stream` flag as specified by the [Responses WebSocket protocol](https://developers.openai.com/api/reference/resources/responses/websocket-events).
 An unavailable WebSocket
-upgrade falls back to HTTP SSE before any inference request is sent. A
-transient upgrade failure suppresses new attempts for a minute. A server
+upgrade falls back to HTTP SSE before any inference request is sent. Native
+provider-response hooks receive the sanitized HTTP handshake status and
+headers when a connection is opened. A transient upgrade failure suppresses new attempts for a minute. A server
 that loses the previous response ID receives the full transcript on retry.
 The client checks an idle connection with a WebSocket ping before sending the
 next request and replaces the connection if the check fails.
