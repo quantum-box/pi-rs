@@ -4936,8 +4936,11 @@ together, and `--provider` can restrict the list to one. Built-in environment
 keys and endpoint-bound saved credentials stay off user-configured relays.
 Baseten and NVIDIA's pinned chat-completions catalogs are also available,
 including model-specific compatibility, NVIDIA polling headers and Baseten's
-thinking template. Catalog entries that use other upstream APIs still need
-their own adapters.
+thinking template. Pi 1.6.0 supplies 12 bundled NVIDIA NIM models and 87
+Hugging Face Router models. Hugging Face still uses the system instruction
+role. Users can configure additional NVIDIA deployments by ID. Catalog
+entries that use other upstream APIs still need their own adapters. Live
+inference on the updated catalogs was unverified.
 
 ### OpenAI Codex
 

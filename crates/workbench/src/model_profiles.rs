@@ -2817,7 +2817,13 @@ mod tests {
         let baseten = profiles.provider("baseten").unwrap();
         let nvidia = profiles.provider("nvidia").unwrap();
         assert_eq!(profiles.model_ids(&baseten).len(), 14);
-        assert_eq!(profiles.model_ids(&nvidia).len(), 21);
+        assert_eq!(profiles.model_ids(&nvidia).len(), 12);
+        assert!(
+            !profiles
+                .model_ids(&nvidia)
+                .iter()
+                .any(|id| id == "deepseek-ai/deepseek-v4.1-flash")
+        );
         let model = profiles.model(&baseten, "zai-org/GLM-5.2").unwrap();
         assert_eq!(model.reasoning, Some(true));
         assert_eq!(
@@ -2829,7 +2835,7 @@ mod tests {
             .request_headers(
                 &nvidia,
                 endpoint,
-                Some("deepseek-ai/deepseek-v4.1-flash"),
+                Some("nvidia/nemotron-3.5-super-vl-120b-a12b"),
                 Some("fixture"),
             )
             .unwrap();
@@ -2838,20 +2844,20 @@ mod tests {
             .request_headers(
                 &nvidia,
                 "https://relay.example/v1/chat/completions",
-                Some("deepseek-ai/deepseek-v4.1-flash"),
+                Some("nvidia/nemotron-3.5-super-vl-120b-a12b"),
                 None,
             )
             .unwrap();
         assert!(untrusted.get("nvcf-poll-seconds").is_none());
         let configured = Profiles::parse(&json!({"providers":{"nvidia":{
             "baseUrl":"https://relay.example/v1",
-            "modelOverrides":{"deepseek-ai/deepseek-v4.1-flash":{"headers":{"X-Relay-Secret":"private"}}}
+            "modelOverrides":{"nvidia/nemotron-3.5-super-vl-120b-a12b":{"headers":{"X-Relay-Secret":"private"}}}
         }}})).unwrap();
         let official = configured
             .request_headers(
                 &nvidia,
                 endpoint,
-                Some("deepseek-ai/deepseek-v4.1-flash"),
+                Some("nvidia/nemotron-3.5-super-vl-120b-a12b"),
                 None,
             )
             .unwrap();
@@ -2861,11 +2867,33 @@ mod tests {
             .request_headers(
                 &nvidia,
                 "https://relay.example/v1/chat/completions",
-                Some("deepseek-ai/deepseek-v4.1-flash"),
+                Some("nvidia/nemotron-3.5-super-vl-120b-a12b"),
                 None,
             )
             .unwrap();
         assert_eq!(relay["x-relay-secret"], "private");
+    }
+
+    #[test]
+    fn huggingface_catalog_uses_text_and_vision_metadata_from_the_router() {
+        let profiles = Profiles::default();
+        let provider = profiles.provider("huggingface").unwrap();
+        assert_eq!(profiles.model_ids(&provider).len(), 87);
+        let model = profiles
+            .model(&provider, "moonshotai/Kimi-K3.1-Pro")
+            .unwrap();
+        assert_eq!(model.supports_images(), Some(true));
+        assert_eq!(
+            profiles
+                .chat_compatibility(&provider, Some(&model))
+                .supports_developer_role(),
+            None
+        );
+        assert_eq!(model.image_resize().unwrap().max_width, Some(2000));
+        let llama = profiles
+            .model(&provider, "meta-llama/Llama-3.2-1B-Instruct")
+            .unwrap();
+        assert_eq!(llama.supports_images(), Some(false));
     }
 
     #[test]
