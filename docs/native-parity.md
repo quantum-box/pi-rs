@@ -4233,6 +4233,13 @@ unconstrained calls on official OpenAI and ChatGPT plan routes so the server
 preserves the recorded decision. Compatible endpoints that lack strict-field
 support continue to omit it.
 
+Responses-compatible endpoints that reject `max_output_tokens` can set
+`compat.supportsMaxOutputTokens: false` at the provider or model level, or in
+`modelOverrides`. Dispatch then omits the field. A conservative local size
+guard stops runaway visible output. The agent applies reported usage
+including hidden reasoning when available. When the provider omits usage,
+Pi's estimate of the visible output applies before accepting the completion.
+
 Grammar declarations on this SDK path currently fall back to function tools.
 Responses accepts initial and finalized argument fragments that extend the
 streamed text. Unlike Pi, it rejects a non-monotonic replacement of earlier
@@ -4858,6 +4865,9 @@ their own adapters.
 `openai-codex` exposes the eight pinned models through the ChatGPT Codex
 Responses route. It supports native HTTP streaming, model-specific reasoning
 levels, image inputs, tool calls, and endpoint-bound response replay.
+Codex's provider-side output limit starts at 16 tokens. With that limit enabled,
+a smaller positive budget ends the run before a request goes to Codex.
+A model with `compat.supportsMaxOutputTokens: false` uses local output safeguards.
 `pi login openai-codex` uses browser PKCE, and `--device-code` selects
 device authorization. Browser sign-in also accepts a pasted code or redirect.
 The terminal offers both methods. Existing Pi Codex

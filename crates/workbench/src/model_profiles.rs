@@ -203,6 +203,7 @@ struct ModelCompatibility {
     chat: ChatCompatibility,
     allow_empty_signature: Option<bool>,
     supports_strict_tools: Option<bool>,
+    supports_max_output_tokens: Option<bool>,
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
     session_affinity_format: Option<AffinityFormat>,
@@ -219,6 +220,9 @@ impl ModelCompatibility {
             chat: self.chat.overlay(newer.chat),
             allow_empty_signature: newer.allow_empty_signature.or(self.allow_empty_signature),
             supports_strict_tools: newer.supports_strict_tools.or(self.supports_strict_tools),
+            supports_max_output_tokens: newer
+                .supports_max_output_tokens
+                .or(self.supports_max_output_tokens),
             force_adaptive_thinking: newer
                 .force_adaptive_thinking
                 .or(self.force_adaptive_thinking),
@@ -1293,6 +1297,16 @@ impl Profiles {
             compat.supports_long_cache_retention.unwrap_or(true),
             compat.supports_cache_control_on_tools.unwrap_or(true),
         )
+    }
+
+    pub fn responses_max_output_tokens(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> bool {
+        self.cache_compatibility(provider, model)
+            .supports_max_output_tokens
+            .unwrap_or(true)
     }
 
     pub fn responses_cache_support(
