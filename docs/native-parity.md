@@ -1374,6 +1374,9 @@ redraw the active view. Invalid edits retain the last valid colors and show one
 diagnostic per changed file contents. A PTY check covers live updates and
 terminal restoration. System appearance discovery queries terminal foreground and background colors
 using OSC 10 and 11 and updates light/dark theme selection as replies arrive.
+Like Pi, the system theme and automatic light/dark pairs subscribe to
+terminal appearance notifications. Fixed themes still request the initial
+terminal colors, and switching back to an automatic theme refreshes them.
 System theme accent and syntax roles use Pi's fallback ANSI palette slots.
 Neutral fallback roles use terminal-default foreground with Pi's dim
 attribute. The terminal palette is queried with OSC 4 and applied after all 16 colors

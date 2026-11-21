@@ -135,6 +135,8 @@ struct Terminal {
     progress: Option<Instant>,
     #[cfg(any(unix, windows))]
     colors: ColorQueries,
+    #[cfg(any(unix, windows))]
+    appearance_notifications: bool,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
 }
@@ -171,6 +173,7 @@ impl Terminal {
         mode: Option<TuiMode>,
         images: Cleanup,
         #[cfg(any(unix, windows))] previous_colors: Option<ColorQueries>,
+        #[cfg(any(unix, windows))] auto_appearance: bool,
     ) -> Result<Self> {
         terminal::enable_raw_mode()?;
         #[cfg(any(unix, windows))]
@@ -181,6 +184,8 @@ impl Terminal {
             progress: None,
             #[cfg(any(unix, windows))]
             colors: previous_colors.unwrap_or_default(),
+            #[cfg(any(unix, windows))]
+            appearance_notifications: false,
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
         };
@@ -200,7 +205,7 @@ impl Terminal {
             if initial_colors {
                 crate::ui::theme::reset_terminal_background();
             }
-            execute!(std::io::stdout(), Print("\x1b[?2031h\x1b[?996n"))?;
+            guard.set_appearance_notifications(auto_appearance, &mut std::io::stdout())?;
             guard.colors.query_terminal_colors(&mut std::io::stdout())?;
         }
         // Reentry disables color queries, so no DA1 will trigger the usual
@@ -210,6 +215,26 @@ impl Terminal {
             guard.keyboard_reply(false)?;
         }
         Ok(guard)
+    }
+
+    #[cfg(any(unix, windows))]
+    fn set_appearance_notifications(
+        &mut self,
+        enabled: bool,
+        output: &mut dyn Write,
+    ) -> Result<bool> {
+        if self.appearance_notifications == enabled {
+            return Ok(false);
+        }
+        self.appearance_notifications = enabled;
+        let command = if enabled {
+            "\x1b[?2031h\x1b[?996n"
+        } else {
+            "\x1b[?2031l"
+        };
+        output.write_all(command.as_bytes())?;
+        output.flush()?;
+        Ok(true)
     }
 
     fn switch_mode(&mut self, alternate: bool, view: &mut View) -> Result<()> {
@@ -281,6 +306,9 @@ impl Terminal {
     }
     #[cfg(unix)]
     fn suspend(guard: &mut Option<Self>, mode: Option<TuiMode>, images: Cleanup) -> Result<()> {
+        let auto_appearance = guard
+            .as_ref()
+            .is_some_and(|terminal| terminal.appearance_notifications);
         let colors = guard.as_mut().map(|terminal| {
             let mut colors = std::mem::take(&mut terminal.colors);
             colors.disable_after_handoff();
@@ -309,7 +337,7 @@ impl Terminal {
                 }
             }
         };
-        *guard = Some(Self::enter(mode, images, colors)?);
+        *guard = Some(Self::enter(mode, images, colors, auto_appearance)?);
         result.map_err(Error::Io)
     }
 }
@@ -472,7 +500,7 @@ impl Drop for Terminal {
         self.disable_keyboard_protocol();
         #[cfg(any(unix, windows))]
         {
-            let _ = execute!(std::io::stdout(), Print("\x1b[?2031l"));
+            let _ = self.set_appearance_notifications(false, &mut std::io::stdout());
         }
         let _ = execute!(std::io::stdout(), ResetColor, Show, DisableBracketedPaste);
         if self.alternate {
@@ -3967,6 +3995,12 @@ fn load_resolved_theme(
 }
 
 #[cfg(any(unix, windows))]
+fn follows_terminal_appearance(selection: Option<&str>) -> bool {
+    let selection = selection.unwrap_or("system");
+    selection == "system" || crate::ui::theme::parse_auto_theme_setting(selection).is_some()
+}
+
+#[cfg(any(unix, windows))]
 fn apply_terminal_appearance(theme: &mut Theme, dark: bool) -> (bool, bool) {
     // A reported background remains authoritative until a newer color reply arrives.
     let changed = crate::ui::theme::set_appearance(dark);
@@ -4271,6 +4305,8 @@ pub(super) async fn run(
         view.graphics.cleanup(),
         #[cfg(any(unix, windows))]
         None,
+        #[cfg(any(unix, windows))]
+        follows_terminal_appearance(args.use_theme.as_deref()),
     )?);
     let mut input = crate::ui::input::Reader::new()?;
     let terminal_signal = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -4310,6 +4346,14 @@ pub(super) async fn run(
         if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
             interrupted = true;
             break 'interactive;
+        }
+        #[cfg(any(unix, windows))]
+        if let Some(terminal) = &mut _terminal {
+            let enabled = follows_terminal_appearance(args.use_theme.as_deref());
+            let mut output = std::io::stdout();
+            if terminal.set_appearance_notifications(enabled, &mut output)? && enabled {
+                terminal.colors.query_terminal_colors(&mut output)?;
+            }
         }
         if let Some(task) = &auth_reload {
             match task.receiver.try_recv() {
@@ -5019,16 +5063,18 @@ pub(super) async fn run(
             ) => {
                 let changed = match event {
                     crate::ui::input::InputEvent::Appearance { dark } => {
-                        let (changed, redraw_system) = if let Some(terminal) = &mut _terminal {
-                            handle_terminal_appearance(
-                                &mut terminal.colors,
-                                &mut theme,
-                                dark,
-                                &mut std::io::stdout(),
-                            )?
-                        } else {
-                            apply_terminal_appearance(&mut theme, dark)
+                        let Some(terminal) = &mut _terminal else {
+                            continue;
                         };
+                        if !terminal.appearance_notifications {
+                            continue;
+                        }
+                        let (changed, redraw_system) = handle_terminal_appearance(
+                            &mut terminal.colors,
+                            &mut theme,
+                            dark,
+                            &mut std::io::stdout(),
+                        )?;
                         dirty |= redraw_system;
                         changed
                     }
@@ -8399,6 +8445,8 @@ fn finish_external_editor(
         view.graphics.cleanup(),
         #[cfg(any(unix, windows))]
         editor_colors.take(),
+        #[cfg(any(unix, windows))]
+        follows_terminal_appearance(args.use_theme.as_deref()),
     )?);
     EXTERNAL_EDITOR_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
     if view.graphics.enabled() {
@@ -12372,6 +12420,7 @@ exit {exit}
             images: Default::default(),
             progress: None,
             colors: super::ColorQueries::default(),
+            appearance_notifications: false,
             #[cfg(unix)]
             keyboard: super::KeyboardProtocol::Disabled,
         };
