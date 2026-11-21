@@ -360,6 +360,13 @@ fn resolve_cli_catalog_model(
     inline: bool,
     ambient_bedrock: bool,
 ) -> Result<Option<ScopedChoice>> {
+    struct Match {
+        choice: ScopedChoice,
+        named: bool,
+        authenticated: bool,
+        bedrock_chain: bool,
+    }
+
     let profiles = &args.model_profiles;
     let value = value.trim();
     let suffix = thinking_suffix(value).map(|(id, level)| (id, Some(level)));
@@ -392,43 +399,46 @@ fn resolve_cli_catalog_model(
             let endpoint = profiles
                 .model_endpoint(&provider, &id)
                 .unwrap_or_else(|| profiles.endpoint(&provider));
-            let usable = !inline
-                && match args.configured_model_credential(&provider, endpoint) {
+            let credential = args.configured_model_credential(&provider, endpoint);
+            let bedrock_chain = provider == Provider::Bedrock
+                && endpoint.is_empty()
+                && profiles.model_adapter(&provider, &id) == super::providers::Adapter::Bedrock
+                && credential.is_none();
+            let authenticated = !inline
+                && match credential {
                     Some(credential) => {
                         !matches!(credential, super::model_auth::Credential::Invalid)
                     }
-                    None => {
-                        provider == Provider::Ollama
-                            || (provider == Provider::Bedrock && ambient_bedrock)
-                    }
+                    None => provider == Provider::Ollama || (bedrock_chain && ambient_bedrock),
                 };
-            matches.push((
-                ScopedChoice {
+            matches.push(Match {
+                choice: ScopedChoice {
                     provider,
                     model: id,
                     thinking: thinking.map(str::to_owned),
                 },
-                explicit.is_some(),
-                usable,
-            ));
+                named: explicit.is_some(),
+                authenticated,
+                bedrock_chain,
+            });
         }
         if matches.is_empty() {
             continue;
         }
-        let usable_count = matches.iter().filter(|(_, _, usable)| *usable).count();
+        let usable_count = matches.iter().filter(|model| model.authenticated).count();
         if matches.len() == 1 {
-            return Ok(matches.pop().map(|(model, _, _)| model));
+            return Ok(matches.pop().map(|model| model.choice));
         }
-        if let Some((model, _, _)) = matches
+        if let Some(model) = matches
             .iter()
-            .find(|(_, named, usable)| *named && (*usable || usable_count == 0))
+            .find(|model| model.named && (model.authenticated || usable_count == 0))
             .or_else(|| {
                 matches
                     .iter()
-                    .find(|(_, _, usable)| *usable && usable_count == 1)
+                    .find(|model| model.authenticated && usable_count == 1)
             })
         {
-            return Ok(Some(model.clone()));
+            return Ok(Some(model.choice.clone()));
         }
         // The native default may use the SDK chain even when no startup
         // credential is visible. It cannot overrule evidence of usable auth.
@@ -438,21 +448,13 @@ fn resolve_cli_catalog_model(
                 .settings
                 .string("defaultProvider")
                 .is_some_and(|id| id.eq_ignore_ascii_case(Provider::Bedrock.id()))
-            && let Some((model, _, _)) = matches.iter().find(|(model, _, _)| {
-                model.provider == Provider::Bedrock
-                    && args
-                        .configured_model_credential(
-                            &model.provider,
-                            profiles.endpoint(&model.provider),
-                        )
-                        .is_none()
-            })
+            && let Some(model) = matches.iter().find(|model| model.bedrock_chain)
         {
-            return Ok(Some(model.clone()));
+            return Ok(Some(model.choice.clone()));
         }
         let mut names: Vec<_> = matches
             .iter()
-            .map(|(model, _, _)| model.qualified())
+            .map(|model| model.choice.qualified())
             .collect();
         names.sort_unstable();
         let hint = if inline {
@@ -960,6 +962,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(default.qualified(), format!("amazon-bedrock/{model}"));
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers":{
+                "amazon-bedrock": {"models":[{"id":model,"api":"openai-completions",
+                    "baseUrl":"https://relay.example/v1"}]},
+                "gateway":{"api":"openai-completions",
+                    "baseUrl":"https://gateway.example/v1","models":[{"id":model}]}
+            }
+        }))
+        .unwrap();
+        assert!(super::resolve_cli_catalog_model(&args, model, false, true).is_err());
     }
 
     #[test]
