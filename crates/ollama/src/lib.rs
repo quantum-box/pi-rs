@@ -1366,7 +1366,9 @@ impl Ollama {
                     metadata.provider_request_id = Some(id);
                 }
                 if let Some(stats) = chunk.usage {
-                    usage = Some(Usage { input_tokens: stats.prompt_tokens, output_tokens: stats.completion_tokens });
+                    let previous: Usage = usage.unwrap_or_default();
+                    let input_tokens = stats.prompt_tokens.unwrap_or(previous.input_tokens);
+                    usage = Some(Usage { input_tokens, output_tokens: stats.completion_tokens.unwrap_or(previous.output_tokens) });
                     let details = stats.prompt_tokens_details.unwrap_or_default();
                     metadata.cached_input_tokens = details.cached_tokens
                         .or(stats.prompt_cache_hit_tokens)
@@ -1375,12 +1377,12 @@ impl Ollama {
                         metadata.cached_input_tokens = metadata.cached_input_tokens
                             .or(stats.mistral_cached_tokens)
                             .or_else(|| stats.mistral_prompt_details.and_then(|details| details.cached_tokens))
-                            .map(|cached| cached.min(stats.prompt_tokens));
+                            .map(|cached| cached.min(input_tokens));
                     }
                     metadata.cache_creation_input_tokens = details.cache_write_tokens;
                     let nested = stats.completion_tokens_details.and_then(|details| details.reasoning_tokens);
                     metadata.reasoning_output_tokens = nested.filter(|count| *count != 0)
-                        .or(stats.reasoning_tokens).or(nested);
+                        .or(stats.reasoning_tokens).or(nested).or(metadata.reasoning_output_tokens);
                     if let Some(cost) = stats.accounting.total() {
                         metadata.cost_usd = Some(cost);
                         metadata.cost_from_provider = Some(true);
@@ -1796,10 +1798,8 @@ struct Chunk {
 
 #[derive(Deserialize)]
 struct WireUsage {
-    #[serde(default)]
-    prompt_tokens: u64,
-    #[serde(default)]
-    completion_tokens: u64,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
     completion_tokens_details: Option<CompletionTokenDetails>,
     reasoning_tokens: Option<u64>,
     prompt_cache_hit_tokens: Option<u64>,
@@ -1986,10 +1986,11 @@ mod content_tests {
             let _ = socket.read(&mut request).unwrap();
             let body = format!(
                 "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-                json!({"choices":[{"index":0,"delta":{"reasoning_content":"internal"}}]}),
+                json!({"choices":[{"index":0,"delta":{"reasoning_content":"internal"}}],
+                    "usage":{"prompt_tokens":12,"reasoning_tokens":2,
+                        "completion_tokens_details":{"reasoning_tokens":4}}}),
                 json!({"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}],
-                    "usage":{"prompt_tokens":12,"completion_tokens":9,"reasoning_tokens":2,
-                        "completion_tokens_details":{"reasoning_tokens":4}}})
+                    "usage":{"completion_tokens":9}})
             );
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
         });

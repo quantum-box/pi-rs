@@ -1314,13 +1314,18 @@ impl Model for Google {
                     metadata.resolved_model = Some(identity(&provider, version));
                 }
                 if let Some(stats) = value.get("usageMetadata") {
-                    let count = |key: &str| stats[key].as_u64().unwrap_or_default();
+                    let previous: Usage = usage.unwrap_or_default();
+                    let previous_thoughts = metadata.reasoning_output_tokens.unwrap_or_default();
+                    let candidates = stats["candidatesTokenCount"].as_u64()
+                        .unwrap_or_else(|| previous.output_tokens.saturating_sub(previous_thoughts));
+                    metadata.reasoning_output_tokens = stats["thoughtsTokenCount"].as_u64()
+                        .or(metadata.reasoning_output_tokens);
+                    metadata.cached_input_tokens = stats["cachedContentTokenCount"].as_u64()
+                        .or(metadata.cached_input_tokens);
                     usage = Some(Usage {
-                        input_tokens: count("promptTokenCount"),
-                        output_tokens: count("candidatesTokenCount").saturating_add(count("thoughtsTokenCount")),
+                        input_tokens: stats["promptTokenCount"].as_u64().unwrap_or(previous.input_tokens),
+                        output_tokens: candidates.saturating_add(metadata.reasoning_output_tokens.unwrap_or_default()),
                     });
-                    metadata.cached_input_tokens = stats["cachedContentTokenCount"].as_u64();
-                    metadata.reasoning_output_tokens = stats["thoughtsTokenCount"].as_u64();
                 }
                 if value["promptFeedback"]["blockReason"].as_str().is_some_and(|reason| !reason.is_empty() && reason != "BLOCK_REASON_UNSPECIFIED") {
                     Err(Error::Model("Google Gemini blocked the prompt".into()))?;
@@ -2953,10 +2958,19 @@ mod tests {
                     json!({"candidates":[{"content":{"parts":[part]}}]})
                 ));
             }
-            body.push_str(&format!("data: {}\n\n", json!({
-                "candidates":[{"finishReason":"STOP"}],
-                "usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":5,"thoughtsTokenCount":4}
-            })));
+            body.push_str(&format!(
+                "data: {}\n\n",
+                json!({
+                    "usageMetadata":{"promptTokenCount":12,"thoughtsTokenCount":4}
+                })
+            ));
+            body.push_str(&format!(
+                "data: {}\n\n",
+                json!({
+                    "candidates":[{"finishReason":"STOP"}],
+                    "usageMetadata":{"candidatesTokenCount":5}
+                })
+            ));
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
         });
         let model = Google::new(&endpoint, "test")
