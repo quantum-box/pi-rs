@@ -1661,7 +1661,10 @@ mod tests {
             "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
         );
         assert_eq!(profiles.model_ids(&provider).len(), 19);
-        assert_eq!(profiles.model_ids(&provider)[0], "@cf/moonshotai/kimi-k2.6");
+        assert_eq!(
+            profiles.model_ids(&provider)[0],
+            "@cf/moonshotai/kimi-k2.7-code"
+        );
         assert_eq!(
             keys.custom_credential(&provider, endpoint, &profiles)
                 .and_then(|key| key.literal()),
