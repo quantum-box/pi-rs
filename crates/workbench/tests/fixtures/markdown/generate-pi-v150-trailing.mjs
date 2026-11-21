@@ -28,6 +28,11 @@ const blocks = ['hello', '# head', '---', '- item', '> quoted', '```\nx\n```', '
 const tails = ['', '\n', '\n\n', '\n\n\n', '\n\n[r]: https://e.co', '\n\n[r]: https://e.co\n', '\n\n[r]: https://e.co\n\n'];
 const sources = blocks.flatMap(block => tails.map(tail => block + tail));
 const extras = [
+  'one\ntwo', 'one  \ntwo', 'one\r\ntwo', 'one\rtwo', '> one\n> two',
+  '- one\n  two', '- one\ntwo', '- one  \n  two', '- **a\n  b**',
+  '- one\n    two', '- one\n two', '-   a\n    b', '- a\n   **b**', '- a  \n    b',
+  '- outer\n  - inner\n       second\n  tail',
+
   '- a\n  - b\n  1. b', '- a\n\n  ```\n  x\n  ```\n  - b',
   '- outer\n\n  - inner\n\n    second\n\n  tail',
   '- outer\n\n  1. inner\n\n     next\n\n  tail\n\n- sibling',
@@ -80,8 +85,24 @@ for (const source of extras) if (!sources.includes(source)) sources.push(source)
 const fixture = {
   reference: `Pi v1.5.0 ${commit} packages/tui/src/components/markdown.ts`,
   width: 80,
-  narrowCases: ['- > abc'].map(source => ({
-    source, width: 3, lines: new Markdown(source, 0, 0, theme).render(3).map(line => line.trimEnd()),
+  narrowCases: [
+    ['- > abc', 3],
+    ['alpha beta gamma', 9],
+    ['alpha **beta** gamma', 9],
+    ['alpha beta\ngamma delta', 9],
+    ['- alpha beta gamma', 11],
+    ['- [x] alpha beta gamma', 14],
+    ['> alpha beta gamma', 11],
+    ['alpha chartreuse', 9],
+    ['abc 日本語 test', 8],
+    ['paint 🧑‍💻 next', 8],
+    ['- one\n\n  ***', 14],
+    ['1. before\n\n   ***\n\n   after', 14],
+    ['- a\n  - b\n\n    ***\n  - c', 14],
+    ['- one\n  ***\n  two', 14],
+    ['- ***\n\n- two', 14],
+  ].map(([source, width]) => ({
+    source, width, lines: new Markdown(source, 0, 0, theme).render(width).map(line => line.trimEnd()),
   })),
   cases: sources.map(source => ({
     source,

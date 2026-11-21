@@ -161,6 +161,13 @@ async fn resolve(
                 no_refresh,
             )
             .await?
+        } else if matches!(credential, super::model_auth::Credential::Copilot) {
+            super::copilot_auth::access(
+                &args.settings,
+                (wanted == Some(AuthType::OAuth)).then_some(minimum),
+                no_refresh,
+            )
+            .await?
         } else if matches!(credential, super::model_auth::Credential::Kimi) {
             super::kimi_auth::access(
                 &args.settings,

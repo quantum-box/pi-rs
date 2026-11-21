@@ -16,6 +16,7 @@ pub(super) enum Credential {
     StoredCommand(String),
     Invalid,
     ChatGpt,
+    Copilot,
     AnthropicOAuth,
     Kimi,
     Meta,
@@ -55,6 +56,7 @@ impl Credential {
             | Self::StoredCommand(_)
             | Self::Invalid
             | Self::ChatGpt
+            | Self::Copilot
             | Self::AnthropicOAuth
             | Self::Kimi
             | Self::Meta
@@ -70,6 +72,7 @@ impl Credential {
             self,
             Self::Bearer(_)
                 | Self::ChatGpt
+                | Self::Copilot
                 | Self::Kimi
                 | Self::AnthropicOAuth
                 | Self::VertexAdc(_)
@@ -85,6 +88,7 @@ impl Credential {
             || matches!(
                 self,
                 Self::ChatGpt
+                    | Self::Copilot
                     | Self::AnthropicOAuth
                     | Self::Kimi
                     | Self::Meta
@@ -116,6 +120,10 @@ impl Credential {
             Self::ChatGpt => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
                 return super::chatgpt_auth::access(&settings).await;
+            }
+            Self::Copilot => {
+                let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
+                return super::copilot_auth::access(&settings, None, false).await;
             }
             Self::AnthropicOAuth => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
@@ -174,6 +182,7 @@ struct SavedKey {
     endpoint: Option<String>,
     official_routes: bool,
     oauth: bool,
+    available_model_ids: Option<Vec<String>>,
     key: Option<Credential>,
     env: Option<serde_json::Map<String, Value>>,
 }
@@ -212,23 +221,29 @@ impl Keys {
                 }
                 let chatgpt =
                     name.eq_ignore_ascii_case("openai-chatgpt") && entry["type"] == "oauth";
+                let copilot =
+                    name.eq_ignore_ascii_case("github-copilot") && entry["type"] == "oauth";
+                let copilot_credential = copilot
+                    .then(|| super::copilot_auth::read_entry(entry))
+                    .transpose()
+                    .ok()?;
                 let kimi = name.eq_ignore_ascii_case("kimi-coding") && entry["type"] == "oauth";
                 let meta = name.eq_ignore_ascii_case("meta") && entry["type"] == "oauth";
                 let xai = name.eq_ignore_ascii_case("xai") && entry["type"] == "oauth";
                 let anthropic = name.eq_ignore_ascii_case("anthropic") && entry["type"] == "oauth";
                 let oauth = (name.eq_ignore_ascii_case("openrouter")
                     || chatgpt
+                    || copilot
                     || kimi
                     || meta
                     || xai
                     || anthropic)
                     && entry["type"] == "oauth";
                 let key = if chatgpt {
-                    serde_json::from_value::<pi_rs::openai::oauth::Credential>(
-                        entry["credential"].clone(),
-                    )
-                    .ok()?;
+                    super::chatgpt_auth::decode_entry(entry).ok()?;
                     Some(Credential::ChatGpt)
+                } else if copilot {
+                    Some(Credential::Copilot)
                 } else if anthropic {
                     let valid =
                         serde_json::from_value::<super::anthropic_auth::Credential>(entry.clone())
@@ -327,6 +342,8 @@ impl Keys {
                         "kimi-coding"
                     } else if meta {
                         "meta"
+                    } else if copilot {
+                        "github-copilot"
                     } else if xai {
                         "xai"
                     } else {
@@ -334,6 +351,9 @@ impl Keys {
                     })
                     .is_none_or(|builtin| Some(builtin.endpoint()) != endpoint)
                 {
+                    return None;
+                }
+                if chatgpt && endpoint != Some(pi_rs::openai::DEFAULT_ENDPOINT) {
                     return None;
                 }
                 if anthropic && endpoint != Some(pi_rs::anthropic::DEFAULT_ENDPOINT) {
@@ -345,6 +365,8 @@ impl Keys {
                         endpoint: endpoint.map(str::to_owned),
                         official_routes: oauth || entry.get("endpoint").is_none(),
                         oauth,
+                        available_model_ids: copilot_credential
+                            .and_then(|credential| credential.available_model_ids),
                         key,
                         env: entry["env"].as_object().cloned(),
                     },
@@ -412,6 +434,12 @@ impl Keys {
             })?
             .env
             .as_ref()
+    }
+
+    pub fn available_model_ids(&self, provider: &Provider, endpoint: &str) -> Option<&[String]> {
+        self.entry_for(provider, endpoint)?
+            .available_model_ids
+            .as_deref()
     }
 
     pub fn oauth(&self, provider: &Provider, endpoint: &str) -> bool {
@@ -604,9 +632,7 @@ pub(super) fn remove(provider: &Provider) -> Result<bool> {
     Ok(removed)
 }
 
-pub(super) fn valid_key(key: &str) -> bool {
-    !key.is_empty() && key.len() <= 4096 && key.bytes().all(|byte| byte.is_ascii_graphic())
-}
+pub(super) use pi_rs_workbench::auth_factory::valid_api_key as valid_key;
 
 #[cfg(test)]
 mod tests {
@@ -843,6 +869,26 @@ mod tests {
         ));
         assert!(
             keys.credential(&provider, "http://127.0.0.1:1234/v1/responses")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn imported_pi_chatgpt_oauth_is_official_endpoint_only() {
+        let provider = Provider::named("openai-chatgpt").unwrap();
+        let mut entry = json!({"type":"oauth","access":"access","refresh":"refresh","expires":1000,
+            "clientId":"issued-client","scopes":["chatgpt.tokens.use.direct"]});
+        let keys = Keys::parse(&json!({"openai-chatgpt":entry}));
+        assert!(matches!(
+            keys.credential(&provider, pi_rs::openai::DEFAULT_ENDPOINT),
+            Some(Credential::ChatGpt)
+        ));
+        let loopback = "http://127.0.0.1:1234/v1/responses";
+        entry["endpoint"] = json!(loopback);
+        let keys = Keys::parse(&json!({"openai-chatgpt":entry}));
+        assert!(keys.credential(&provider, loopback).is_none());
+        assert!(
+            keys.credential(&provider, pi_rs::openai::DEFAULT_ENDPOINT)
                 .is_none()
         );
     }

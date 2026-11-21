@@ -10,9 +10,7 @@ use crate::ui::{
     keys::Keys,
     mermaid::Mermaid,
     mouse_selection::MouseSelection,
-    picker::{
-        Input, Item, MouseInput, Picker, Selection, ThemeSettingsAction, TreeEntryKind, TreeFilter,
-    },
+    picker::{Input, Item, MouseInput, Picker, Selection, ThemeSettingsAction, TreeFilter},
     render::{Entry, Line, SummaryKind, ToolPart, TranscriptOptions},
     theme::{Theme, ThemeWatcher},
     transcript_search::Search,
@@ -135,6 +133,8 @@ struct Terminal {
     progress: Option<Instant>,
     #[cfg(any(unix, windows))]
     colors: ColorQueries,
+    #[cfg(any(unix, windows))]
+    appearance_notifications: bool,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
 }
@@ -164,6 +164,7 @@ struct ColorQueries {
     color_requery: bool,
     disabled: bool,
     last_appearance_report: Option<bool>,
+    refresh_after_subscription: bool,
 }
 
 impl Terminal {
@@ -171,6 +172,7 @@ impl Terminal {
         mode: Option<TuiMode>,
         images: Cleanup,
         #[cfg(any(unix, windows))] previous_colors: Option<ColorQueries>,
+        #[cfg(any(unix, windows))] auto_appearance: bool,
     ) -> Result<Self> {
         terminal::enable_raw_mode()?;
         #[cfg(any(unix, windows))]
@@ -181,6 +183,8 @@ impl Terminal {
             progress: None,
             #[cfg(any(unix, windows))]
             colors: previous_colors.unwrap_or_default(),
+            #[cfg(any(unix, windows))]
+            appearance_notifications: false,
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
         };
@@ -200,7 +204,7 @@ impl Terminal {
             if initial_colors {
                 crate::ui::theme::reset_terminal_background();
             }
-            execute!(std::io::stdout(), Print("\x1b[?2031h\x1b[?996n"))?;
+            guard.set_appearance_notifications(auto_appearance, &mut std::io::stdout())?;
             guard.colors.query_terminal_colors(&mut std::io::stdout())?;
         }
         // Reentry disables color queries, so no DA1 will trigger the usual
@@ -210,6 +214,26 @@ impl Terminal {
             guard.keyboard_reply(false)?;
         }
         Ok(guard)
+    }
+
+    #[cfg(any(unix, windows))]
+    fn set_appearance_notifications(
+        &mut self,
+        enabled: bool,
+        output: &mut dyn Write,
+    ) -> Result<bool> {
+        if self.appearance_notifications == enabled {
+            return Ok(false);
+        }
+        self.appearance_notifications = enabled;
+        let command = if enabled {
+            "\x1b[?2031h\x1b[?996n"
+        } else {
+            "\x1b[?2031l"
+        };
+        output.write_all(command.as_bytes())?;
+        output.flush()?;
+        Ok(true)
     }
 
     fn switch_mode(&mut self, alternate: bool, view: &mut View) -> Result<()> {
@@ -281,6 +305,9 @@ impl Terminal {
     }
     #[cfg(unix)]
     fn suspend(guard: &mut Option<Self>, mode: Option<TuiMode>, images: Cleanup) -> Result<()> {
+        let auto_appearance = guard
+            .as_ref()
+            .is_some_and(|terminal| terminal.appearance_notifications);
         let colors = guard.as_mut().map(|terminal| {
             let mut colors = std::mem::take(&mut terminal.colors);
             colors.disable_after_handoff();
@@ -309,7 +336,7 @@ impl Terminal {
                 }
             }
         };
-        *guard = Some(Self::enter(mode, images, colors)?);
+        *guard = Some(Self::enter(mode, images, colors, auto_appearance)?);
         result.map_err(Error::Io)
     }
 }
@@ -345,6 +372,13 @@ impl ColorQueries {
         Ok(())
     }
 
+    fn refresh_after_appearance_subscription(&mut self, output: &mut dyn Write) -> Result<()> {
+        // When OSC queries are disabled after a handoff, the first report
+        // after switching from a fixed theme is the freshest appearance we have.
+        self.refresh_after_subscription = self.disabled;
+        self.query_terminal_colors(output)
+    }
+
     fn appearance_report(&mut self, dark: bool, output: &mut dyn Write) -> Result<bool> {
         let previous = self.last_appearance_report.replace(dark);
         // The first report may be the response to ?996n sent at startup.
@@ -357,7 +391,8 @@ impl ColorQueries {
         if !initial_report {
             self.query_terminal_colors(output)?;
         }
-        Ok(previous.is_some_and(|value| value != dark))
+        Ok(std::mem::take(&mut self.refresh_after_subscription)
+            || previous.is_some_and(|value| value != dark))
     }
 
     fn accepts_color_reply(&mut self, target: u8, _output: &mut dyn Write) -> Result<bool> {
@@ -472,7 +507,7 @@ impl Drop for Terminal {
         self.disable_keyboard_protocol();
         #[cfg(any(unix, windows))]
         {
-            let _ = execute!(std::io::stdout(), Print("\x1b[?2031l"));
+            let _ = self.set_appearance_notifications(false, &mut std::io::stdout());
         }
         let _ = execute!(std::io::stdout(), ResetColor, Show, DisableBracketedPaste);
         if self.alternate {
@@ -2866,6 +2901,13 @@ impl View {
         Ok(path)
     }
 
+    fn show_debug_log(&mut self, args: &Cli, theme: &Theme) {
+        match self.write_debug_log(args, theme) {
+            Ok(path) => self.append(&format!("Debug log written\n{}", path.display())),
+            Err(error) => self.append(&format!("Debug log: {error}")),
+        }
+    }
+
     fn replay_transcript(&mut self, args: &Cli, theme: &Theme) -> Result<()> {
         self.graphics.reset();
         let output = self.transcript_options(args, false);
@@ -3455,6 +3497,13 @@ fn slash(
             super::Provider::named("openrouter").expect("built-in OpenRouter provider"),
             view,
         ),
+        "/login" if rest.eq_ignore_ascii_case("github-copilot") => {
+            start_copilot_login(view, &args.settings)
+        }
+        "/login" if rest.eq_ignore_ascii_case("github-copilot api-key") => edit_provider_key(
+            super::Provider::named("github-copilot").expect("built-in Copilot provider"),
+            view,
+        ),
         "/login" | "/logout" => {
             let login = name == "/login";
             if rest.is_empty() {
@@ -3487,6 +3536,13 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "github-copilot · Subscription OAuth".into(),
+                            selection: Selection::LoginCopilot,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -3843,80 +3899,9 @@ fn slash(
         }
         "/tree" => {
             let session = Session::open(&args.session)?;
-            let labels = session.labels();
-            let items = session
-                .records()
-                .iter()
-                .filter(|record| !matches!(record.event, pi_rs::Event::Checkout { .. }))
-                .map(|record| {
-                    let description = match &record.event {
-                        pi_rs::Event::User { content, .. }
-                        | pi_rs::Event::UserWithImages { content, .. }
-                        | pi_rs::Event::Assistant { content, .. } => {
-                            content.chars().take(70).collect::<String>()
-                        }
-                        pi_rs::Event::BranchSummary { summary, .. } => format!(
-                            "Branch summary: {}",
-                            summary.chars().take(56).collect::<String>()
-                        ),
-                        pi_rs::Event::CompactionSummaryMessage { summary, .. } => format!(
-                            "Compaction: {}",
-                            summary.chars().take(58).collect::<String>()
-                        ),
-                        _ => super::metadata(record)["event"]
-                            .as_str()
-                            .unwrap_or("record")
-                            .into(),
-                    };
-                    Item {
-                        label: format!(
-                            "{} {} {}",
-                            record.id,
-                            labels.get(&record.id).map(String::as_str).unwrap_or(""),
-                            description
-                        ),
-                        selection: Selection::Checkout(record.id),
-                    }
-                })
-                .collect();
-            let head = session.head();
-            let entries = session
-                .records()
-                .iter()
-                .filter(|record| !matches!(record.event, pi_rs::Event::Checkout { .. }))
-                .map(|record| {
-                    let kind = match &record.event {
-                        pi_rs::Event::User { .. } | pi_rs::Event::UserWithImages { .. } => {
-                            TreeEntryKind::User
-                        }
-                        pi_rs::Event::ToolFinished { .. }
-                        | pi_rs::Event::ToolReconciled { .. }
-                        | pi_rs::Event::ImportedUnattributedToolResult { .. } => {
-                            TreeEntryKind::Tool
-                        }
-                        pi_rs::Event::Assistant { content, .. }
-                            if content.trim().is_empty() && record.id != head =>
-                        {
-                            TreeEntryKind::Hidden
-                        }
-                        pi_rs::Event::Assistant { .. }
-                        | pi_rs::Event::BashExecution { .. }
-                        | pi_rs::Event::Compacted { .. }
-                        | pi_rs::Event::CompactionSummaryMessage { .. }
-                        | pi_rs::Event::BranchSummary { .. } => TreeEntryKind::Message,
-                        pi_rs::Event::ModelFinished {
-                            failure: Some(_), ..
-                        } => TreeEntryKind::Message,
-                        _ => TreeEntryKind::Bookkeeping,
-                    };
-                    (record.id, (record.parent, kind))
-                })
-                .collect();
             let filter =
                 TreeFilter::parse(args.settings.string("treeFilterMode").unwrap_or("default"));
-            let mut picker = Picker::tree(items, entries, labels, head, filter);
-            picker.set_label_timestamps(session.label_timestamps());
-            view.picker = Some(picker);
+            view.picker = Some(session_tree::picker(&session, filter));
         }
         "/checkout" => {
             let id = rest
@@ -3964,6 +3949,12 @@ fn load_resolved_theme(
         }
     }
     Err(error)
+}
+
+#[cfg(any(unix, windows))]
+fn follows_terminal_appearance(selection: Option<&str>) -> bool {
+    let selection = selection.unwrap_or("system");
+    selection == "system" || crate::ui::theme::parse_auto_theme_setting(selection).is_some()
 }
 
 #[cfg(any(unix, windows))]
@@ -4271,6 +4262,8 @@ pub(super) async fn run(
         view.graphics.cleanup(),
         #[cfg(any(unix, windows))]
         None,
+        #[cfg(any(unix, windows))]
+        follows_terminal_appearance(args.use_theme.as_deref()),
     )?);
     let mut input = crate::ui::input::Reader::new()?;
     let terminal_signal = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -4310,6 +4303,16 @@ pub(super) async fn run(
         if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
             interrupted = true;
             break 'interactive;
+        }
+        #[cfg(any(unix, windows))]
+        if let Some(terminal) = &mut _terminal {
+            let enabled = follows_terminal_appearance(args.use_theme.as_deref());
+            let mut output = std::io::stdout();
+            if terminal.set_appearance_notifications(enabled, &mut output)? && enabled {
+                terminal
+                    .colors
+                    .refresh_after_appearance_subscription(&mut output)?;
+            }
         }
         if let Some(task) = &auth_reload {
             match task.receiver.try_recv() {
@@ -5019,16 +5022,18 @@ pub(super) async fn run(
             ) => {
                 let changed = match event {
                     crate::ui::input::InputEvent::Appearance { dark } => {
-                        let (changed, redraw_system) = if let Some(terminal) = &mut _terminal {
-                            handle_terminal_appearance(
-                                &mut terminal.colors,
-                                &mut theme,
-                                dark,
-                                &mut std::io::stdout(),
-                            )?
-                        } else {
-                            apply_terminal_appearance(&mut theme, dark)
+                        let Some(terminal) = &mut _terminal else {
+                            continue;
                         };
+                        if !terminal.appearance_notifications {
+                            continue;
+                        }
+                        let (changed, redraw_system) = handle_terminal_appearance(
+                            &mut terminal.colors,
+                            &mut theme,
+                            dark,
+                            &mut std::io::stdout(),
+                        )?;
                         dirty |= redraw_system;
                         changed
                     }
@@ -5068,6 +5073,15 @@ pub(super) async fn run(
             }
             _ => continue,
         };
+        if let Event::Key(key) = &event
+            && key.kind != KeyEventKind::Release
+            && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('d' | 'D'))
+        {
+            view.show_debug_log(&args, &theme);
+            dirty = true;
+            continue;
+        }
         if view
             .picker
             .as_ref()
@@ -5429,6 +5443,20 @@ pub(super) async fn run(
                                     .map(|()| "Copied entry".into())
                                     .map_err(|error| error.to_string()),
                             );
+                            view.picker = Some(picker);
+                        }
+                        Input::SetTreeLabel(id, label) => {
+                            let result = Session::open(&args.session).and_then(|mut session| {
+                                session.set_label(id, (!label.is_empty()).then_some(label))?;
+                                picker.refresh_tree(
+                                    session_tree::picker(&session, TreeFilter::Default),
+                                    id,
+                                );
+                                Ok(())
+                            });
+                            if let Err(error) = result {
+                                picker.show_feedback(Err(error.to_string()));
+                            }
                             view.picker = Some(picker);
                         }
                         Input::UpdateModelScope { save } => {
@@ -5989,12 +6017,7 @@ pub(super) async fn run(
                         } else if input.trim() == "/hotkeys" {
                             view.append(&keys.describe());
                         } else if input.trim() == "/debug" {
-                            match view.write_debug_log(&args, &theme) {
-                                Ok(path) => {
-                                    view.append(&format!("Debug log written\n{}", path.display()))
-                                }
-                                Err(error) => view.append(&format!("Debug log: {error}")),
-                            }
+                            view.show_debug_log(&args, &theme);
                         } else if input.trim() == "/settings" {
                             view.picker = Some(Picker::new(
                                 "Settings",
@@ -6495,6 +6518,29 @@ fn take_device_code_action(
     view.remote_task.as_mut()?.device_code.take()
 }
 
+fn start_copilot_login(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to GitHub Copilot",
+        "GitHub Copilot login cancelled",
+        move |sender| async move {
+            super::copilot_auth::login(&settings, task_control, |url, code| {
+                let _ = sender.send(RemoteEvent::DeviceCode {
+                    url: url.to_string(),
+                    code: code.to_owned(),
+                });
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to GitHub Copilot".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
 fn start_xai_login(view: &mut View, settings: &crate::config::Settings) {
     let settings = settings.clone();
     let control = super::meta_auth::LoginControl::default();
@@ -6645,6 +6691,8 @@ fn interrupt_remote_task(view: &mut View) {
     } else if task.meta_login_control.is_some() {
         view.append(if task.status == "Signing in to xAI" {
             "xAI sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to GitHub Copilot" {
+            "GitHub Copilot sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to Anthropic" {
             "Anthropic sign-in is completing; waiting for the result"
         } else {
@@ -6829,13 +6877,20 @@ fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()>
             _ => None,
         });
     restore_workspace(args)?;
-    view.restore(args)?;
+    let images = std::mem::take(&mut view.draft_images);
+    let restored = view.restore(args);
+    view.draft_images = images;
+    restored?;
     for warning in args.settings.diagnostics() {
         view.append(warning);
     }
-    if let Some(input) = input {
+    if view.editor.text.trim().is_empty()
+        && view.draft_images.is_empty()
+        && let Some(input) = input
+    {
         view.editor.replace(input);
     }
+    view.append("Navigated to selected point");
     Ok(())
 }
 
@@ -7542,13 +7597,6 @@ fn select(
                 Some(worker),
             )?;
         }
-        Selection::Label(id, label) => {
-            Session::open(&args.session)?.set_label(id, (!label.is_empty()).then_some(label))?;
-            slash("/tree", args, view, None)?;
-            if let Some(picker) = &mut view.picker {
-                picker.focus_record(id);
-            }
-        }
         Selection::Checkout(id) => {
             if id == Session::open(&args.session)?.head() {
                 view.append("Already at this point");
@@ -7611,6 +7659,7 @@ fn select(
             );
             view.local_editor = Some((LocalEditor::BedrockChain, dialog));
         }
+        Selection::LoginCopilot => start_copilot_login(view, &args.settings),
         Selection::LoginXai => start_xai_login(view, &args.settings),
         Selection::LoginMeta => start_meta_login(view, &args.settings),
         Selection::LoginKimi => start_kimi_login(view, &args.settings),
@@ -8001,6 +8050,7 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
 
 #[cfg(unix)]
 mod editor_pty;
+mod session_tree;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExternalEditorTarget {
@@ -8399,6 +8449,8 @@ fn finish_external_editor(
         view.graphics.cleanup(),
         #[cfg(any(unix, windows))]
         editor_colors.take(),
+        #[cfg(any(unix, windows))]
+        follows_terminal_appearance(args.use_theme.as_deref()),
     )?);
     EXTERNAL_EDITOR_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
     if view.graphics.enabled() {
@@ -12339,6 +12391,7 @@ exit {exit}
             color_requery: false,
             disabled: false,
             last_appearance_report: None,
+            refresh_after_subscription: false,
         };
         assert!(!super::expire_initial_terminal_colors(
             &terminal, &mut theme
@@ -12372,6 +12425,7 @@ exit {exit}
             images: Default::default(),
             progress: None,
             colors: super::ColorQueries::default(),
+            appearance_notifications: false,
             #[cfg(unix)]
             keyboard: super::KeyboardProtocol::Disabled,
         };
@@ -12513,6 +12567,33 @@ exit {exit}
                 .unwrap();
         assert!(changed && redraw);
         assert!(matches!(theme.color("accent"), Color::AnsiValue(_)));
+
+        // Starting with a fixed theme leaves no initial appearance report.
+        // Re-enabling automatic mode must still replace stale OSC colors.
+        set_terminal_color(false, 0, 0, 0);
+        theme = super::Theme::system();
+        let mut colors = super::ColorQueries::default();
+        colors.disable_after_handoff();
+        let mut output = Vec::new();
+        colors
+            .refresh_after_appearance_subscription(&mut output)
+            .unwrap();
+        let (changed, redraw) =
+            super::handle_terminal_appearance(&mut colors, &mut theme, false, &mut output).unwrap();
+        assert!(changed && redraw);
+        assert!(matches!(theme.color("accent"), Color::AnsiValue(_)));
+        assert_eq!(
+            super::Theme::load("light/dark", &[], std::path::Path::new("."), false, false)
+                .unwrap()
+                .name,
+            "light"
+        );
+        assert!(output.is_empty());
+        assert!(
+            !super::handle_terminal_appearance(&mut colors, &mut theme, false, &mut output)
+                .unwrap()
+                .1
+        );
     }
 
     #[cfg(any(unix, windows))]
@@ -12752,6 +12833,42 @@ exit {exit}
         assert!(output.len() > first_len);
         assert!(!colors.color_requery);
         assert!(colors.accepts_color_reply(17, &mut output).unwrap());
+    }
+
+    #[test]
+    fn tree_navigation_preserves_an_existing_editor_draft() {
+        use clap::Parser;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = pi_rs::Session::open(&path).unwrap();
+        session
+            .append_user_with_images("previous user message".into(), vec![], None)
+            .unwrap();
+        let selected = session.head();
+        drop(session);
+        let mut args = super::Cli::parse_from(["pi", "--offline", "--no-trust"]);
+        args.workspace = directory.path().into();
+        args.session = path;
+        let mut view = super::View::default();
+
+        view.editor.replace("unsent draft".into());
+        super::restore_tree_position(&mut args, &mut view, selected).unwrap();
+        assert_eq!(view.editor.text, "unsent draft");
+
+        let image = pi_rs::ImageContent {
+            mime_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        };
+        view.editor.replace(String::new());
+        view.draft_images.push(image.clone());
+        super::restore_tree_position(&mut args, &mut view, selected).unwrap();
+        assert!(view.editor.text.is_empty());
+        assert_eq!(view.draft_images, [image]);
+
+        view.draft_images.clear();
+        super::restore_tree_position(&mut args, &mut view, selected).unwrap();
+        assert_eq!(view.editor.text, "previous user message");
     }
 
     #[test]

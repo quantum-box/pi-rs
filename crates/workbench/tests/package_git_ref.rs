@@ -73,6 +73,96 @@ fn git(directory: &Path, args: &[&str]) -> String {
 }
 
 #[test]
+fn unavailable_transient_git_package_warns_and_keeps_rpc_available() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("agent");
+    std::fs::create_dir(&home).unwrap();
+    let repo = "https://example.invalid/acme/missing";
+    let source = format!("git:{repo}");
+    let missing = reqwest::Url::from_directory_path(directory.path().join("missing")).unwrap();
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(directory.path())
+            .env("PI_RS_HOME", &home)
+            .env_remove("PI_OFFLINE")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", directory.path().join("gitconfig"))
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", format!("url.{missing}.insteadOf"))
+            .env("GIT_CONFIG_VALUE_0", repo)
+            .arg("--no-trust");
+        command
+    };
+    let mut child = command()
+        .args([
+            "--no-mcp",
+            "--no-extensions",
+            "--no-skills",
+            "--no-session",
+            "--mode",
+            "rpc",
+            "-e",
+            &source,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in stdout.lines().map_while(Result::ok) {
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"id":"package-startup","type":"get_commands"})
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut warned = false;
+    let response = loop {
+        let Ok(line) =
+            receive.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        else {
+            let _ = child.kill();
+            break None;
+        };
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if value["id"] == "package-startup" {
+            break Some(value);
+        }
+        warned |= value["message"].as_str().is_some_and(|message| {
+            message.contains(&format!("Package {source}:"))
+                && message.contains("package command failed")
+        });
+    };
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(output.status.success(), "{response:?}");
+    assert!(
+        warned,
+        "missing package warning before RPC response: {response:?}"
+    );
+    assert!(response.is_some_and(|value| value["success"] == true));
+
+    let explicit = command().args(["install", &source]).output().unwrap();
+    assert!(!explicit.status.success());
+    assert!(String::from_utf8_lossy(&explicit.stderr).contains("package command failed"));
+}
+
+#[test]
 fn installs_explicit_ref_and_preserves_legacy_at_sign_repository() {
     let directory = tempfile::tempdir().unwrap();
     let repo = directory.path().join("org@team/repo");
@@ -593,4 +683,81 @@ fn project_delta_prepares_user_revision_when_cache_is_empty() {
         .collect();
     assert!(sources.contains(&other.as_str()), "{sources:?}");
     assert!(!sources.contains(&missing.as_str()), "{sources:?}");
+}
+
+#[test]
+fn a_transient_git_commit_pin_reuses_its_checkout_without_fetching() {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = directory.path().join("repo");
+    let prompts = repo.join("prompts");
+    std::fs::create_dir_all(&prompts).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(prompts.join("older.md"), "older").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "--quiet", "-m", "older"]);
+    let full = git(&repo, &["rev-parse", "HEAD"]);
+    let abbreviation = &full[..9];
+    std::fs::write(prompts.join("newer.md"), "newer").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "--quiet", "-m", "newer"]);
+
+    let home = directory.path().join("agent");
+    let url = reqwest::Url::from_directory_path(&repo).unwrap();
+    let source = format!("git:{}#{abbreviation}", url.as_str().trim_end_matches('/'));
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(directory.path())
+            .env("PI_RS_HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", directory.path().join("gitconfig"))
+            .env_remove("PI_OFFLINE")
+            .env_remove("GEMINI_API_KEY")
+            .env_remove("GOOGLE_API_KEY")
+            .env_remove("PI_RS_MODEL_TOKEN")
+            .args(["--no-trust", "--no-mcp", "--no-extensions", "--no-skills"]);
+        command
+    };
+    let output = command().args(["install", &source]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let index = std::fs::read(home.join("packages/index.json")).unwrap();
+    let package: serde_json::Value = serde_json::from_slice(&index).unwrap();
+    let root = Path::new(
+        package.as_object().unwrap().values().next().unwrap()["root"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), full);
+    assert!(root.join("prompts/older.md").is_file());
+    assert!(!root.join("prompts/newer.md").exists());
+
+    let trace = directory.path().join("trace.log");
+    let _output = command()
+        .env("GIT_TRACE", &trace)
+        .args([
+            "-e",
+            &source,
+            "--provider",
+            "google",
+            "--model",
+            "gemini-2.5-flash",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    let trace = std::fs::read_to_string(trace).unwrap();
+    assert!(trace.contains("rev-parse"), "{trace}");
+    assert!(
+        !trace.contains("git clone") && !trace.contains("git fetch"),
+        "{trace}"
+    );
+    assert_eq!(
+        std::fs::read(home.join("packages/index.json")).unwrap(),
+        index
+    );
 }

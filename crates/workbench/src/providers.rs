@@ -205,7 +205,7 @@ impl Provider {
                 } else if bearer
                     || matches!(
                         self.id(),
-                        "fireworks" | "openrouter" | "minimax" | "minimax-cn"
+                        "fireworks" | "openrouter" | "minimax" | "minimax-cn" | "github-copilot"
                     )
                 {
                     Anthropic::with_bearer_token(endpoint, &token)?
@@ -381,6 +381,13 @@ impl Deferred {
                 super::chatgpt_auth::access(self.http_settings.as_ref().expect("settings checked"))
                     .await?,
             ),
+            Some(Credential::Copilot) => {
+                let settings = match &self.http_settings {
+                    Some(settings) => settings.clone(),
+                    None => super::config::Settings::load(&std::env::current_dir()?, false)?,
+                };
+                Some(super::copilot_auth::access_for_path(auth_path, &settings, None, false).await?)
+            }
             Some(Credential::Kimi) if self.http_settings.is_some() => Some(
                 super::kimi_auth::access(
                     self.http_settings.as_ref().expect("settings checked"),
@@ -436,13 +443,17 @@ impl Deferred {
                 {
                     headers.insert("x-goog-user-project", value);
                 }
-                adc.endpoint.as_str()
+                adc.endpoint.clone()
             }
-            _ => &self.endpoint,
+            Some(Credential::Copilot) => super::copilot_auth::routed_endpoint(
+                &self.endpoint,
+                token.as_deref().expect("resolved Copilot access"),
+            )?,
+            _ => self.endpoint.clone(),
         };
         let mut client = self
             .provider
-            .connect_prechecked(self.adapter, endpoint, token, bearer, radius_checked)?
+            .connect_prechecked(self.adapter, &endpoint, token, bearer, radius_checked)?
             .with_headers(headers.clone())
             .with_context_probes(self.probe_context);
         match (&self.credential, &mut client) {
