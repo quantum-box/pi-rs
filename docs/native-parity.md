@@ -4874,6 +4874,8 @@ An unavailable WebSocket
 upgrade falls back to HTTP SSE before any inference request is sent. A
 transient upgrade failure suppresses new attempts for a minute. A server
 that loses the previous response ID receives the full transcript on retry.
+A closed idle connection is replaced before the next request when its closure
+is already visible to the client.
 The native HTTP fallback sends uncompressed JSON. Specialized Codex
 grammar tools and tool search remain open. Authentication was exercised with
 fixtures. Live sign-in and inference were unverified because no account was

@@ -1,6 +1,6 @@
 //! Codex WebSocket transport over the same TLS and proxy settings as Responses SSE.
 use base64::Engine;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use pi_rs_core::{Error, Result};
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::{Client, StatusCode, Url, Version};
@@ -342,7 +342,17 @@ pub(super) async fn open(
     let cached = pool_key
         .as_deref()
         .filter(|_| options.reuse_connection)
-        .and_then(take_connection);
+        .and_then(take_connection)
+        .and_then(|mut entry| {
+            // Check for a close or other pending frame before sending any inference.
+            // The idle socket has no outstanding request, so replace it if it is readable.
+            entry
+                .socket
+                .next()
+                .now_or_never()
+                .is_none()
+                .then_some(entry)
+        });
     let (mut socket, mut connected, previous) = match cached {
         Some(entry) => (entry.socket, entry.connected, entry.previous),
         None => match handshake.connect().await {
@@ -551,6 +561,64 @@ mod tests {
             .unwrap()
             .collect::<Vec<_>>()
             .await;
+        assert!(matches!(
+            second.last(),
+            Some(Ok(ModelEvent::Complete { .. }))
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_reconnects_before_sending_on_a_closed_idle_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (closed, idle_closed) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut closed = Some(closed);
+            for turn in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let text = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                let body: Value = serde_json::from_str(text.as_str()).unwrap();
+                assert!(body.get("previous_response_id").is_none());
+                assert_eq!(body["input"].as_array().unwrap().len(), turn + 1);
+                let completion = json!({"type":"response.completed","response":{
+                    "id":"fixture", "status":"completed", "output":[]
+                }});
+                socket
+                    .send(Message::Text(completion.to_string().into()))
+                    .await
+                    .unwrap();
+                if let Some(closed) = closed.take() {
+                    socket.close(None).await.unwrap();
+                    closed.send(()).unwrap();
+                }
+            }
+        });
+        let endpoint = format!("http://{address}/backend-api/codex/responses");
+        let model = client(endpoint, CodexTransport::WebSocketCached)
+            .with_session_cache_key(&uuid::Uuid::new_v4().to_string());
+        let first = model
+            .stream(request(vec![prompt("first")]))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(
+            first.last(),
+            Some(Ok(ModelEvent::Complete { .. }))
+        ));
+        idle_closed.await.unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), async {
+            model
+                .stream(request(vec![prompt("first"), prompt("second")]))
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await
+        })
+        .await
+        .unwrap();
         assert!(matches!(
             second.last(),
             Some(Ok(ModelEvent::Complete { .. }))
