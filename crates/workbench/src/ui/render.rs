@@ -1655,10 +1655,11 @@ fn markdown_at_depth(
     let text = normalized.as_deref().unwrap_or(text);
     let expanded = text.contains('\t').then(|| text.replace('\t', "   "));
     let text = expanded.as_deref().unwrap_or(text);
-    let sanitized = super::math_blocks::reference_source(text);
+    let parsed = super::markdown_lists::normalize_nested_ordered(text);
+    let sanitized = super::math_blocks::reference_source(&parsed);
     let reference_source = sanitized.as_ref();
     markdown_at_depth_with_refs(
-        (text, reference_source),
+        (text, &parsed, reference_source),
         theme,
         width,
         depth,
@@ -1669,7 +1670,7 @@ fn markdown_at_depth(
 }
 
 fn markdown_at_depth_with_refs(
-    (text, reference_source): (&str, &str),
+    (text, parsed, reference_source): (&str, &str, &str),
     theme: &Theme,
     width: usize,
     depth: usize,
@@ -1677,22 +1678,8 @@ fn markdown_at_depth_with_refs(
     hyperlinks: bool,
     preserve_source: bool,
 ) -> Vec<Line> {
-    // Marked normalizes line endings before invoking the block extension. Keep
-    // all offsets local to this normalized document, including list contents.
-    if text.contains('\r') {
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        return markdown_at_depth_with_refs(
-            (&normalized, reference_source),
-            theme,
-            width,
-            depth,
-            mermaid,
-            hyperlinks,
-            preserve_source,
-        );
-    }
     if let Some(lines) = markdown_with_block_spacing(
-        (text, reference_source),
+        (text, parsed, reference_source),
         theme,
         width,
         depth,
@@ -1702,13 +1689,13 @@ fn markdown_at_depth_with_refs(
     ) {
         return lines;
     }
-    let blocks = super::math_blocks::top_level(text);
+    let blocks = super::math_blocks::top_level(parsed);
     if blocks.is_empty()
         || blocks.len() > 64
         || text.len().saturating_mul(blocks.len() + 1) > 1024 * 1024
     {
         return markdown_plain_at_depth(
-            (text, text, reference_source),
+            (text, parsed, reference_source),
             theme,
             width,
             depth,
@@ -1720,7 +1707,7 @@ fn markdown_at_depth_with_refs(
     let mut lines = Vec::new();
     let mut start = 0;
     for block in &blocks {
-        let segment = masked_math_segment(text, start..block.source.start);
+        let segment = masked_math_segment(parsed, start..block.source.start);
         let before = markdown_plain_at_depth(
             (text, &segment, reference_source),
             theme,
@@ -1748,7 +1735,7 @@ fn markdown_at_depth_with_refs(
         );
         start = block.source.end;
     }
-    let segment = masked_math_segment(text, start..text.len());
+    let segment = masked_math_segment(parsed, start..text.len());
     let after = markdown_plain_at_depth(
         (text, &segment, reference_source),
         theme,
@@ -1767,7 +1754,7 @@ fn markdown_at_depth_with_refs(
 // The bounded fallback uses the existing
 // renderer when a source cannot be safely inventoried in time or space.
 fn markdown_with_block_spacing(
-    (text, reference_source): (&str, &str),
+    (text, parsed, reference_source): (&str, &str, &str),
     theme: &Theme,
     width: usize,
     depth: usize,
@@ -1779,7 +1766,7 @@ fn markdown_with_block_spacing(
     if text.trim().is_empty() {
         return Some(Vec::new());
     }
-    let tokens = super::markdown_spaces::block_inventory(text)?;
+    let tokens = super::markdown_spaces::block_inventory(parsed)?;
     if !tokens.iter().any(|token| {
         matches!(
             token.kind,
@@ -1820,7 +1807,7 @@ fn markdown_with_block_spacing(
                 lines.extend(wrap(&[Span::themed(rendered, theme, "text")], width));
             }
             BlockTokenKind::Block(flavor) => {
-                let masked = masked_math_segment(text, token.range.clone());
+                let masked = masked_math_segment(parsed, token.range.clone());
                 let mut block_lines = markdown_plain_at_depth(
                     (text, &masked, reference_source),
                     theme,
@@ -2005,7 +1992,7 @@ fn markdown_plain_at_depth(
     let mut code_text = String::new();
     let mut lists: Vec<(Option<u64>, bool, bool)> = Vec::new();
     let options = Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
-    let loose_lists = loose_list_offsets(text, options);
+    let loose_lists = loose_list_offsets(parsed, options);
     let mut definition_ranges: Vec<_> = Parser::new_ext(parsed, options)
         .reference_definitions()
         .iter()
@@ -2325,6 +2312,10 @@ fn markdown_plain_at_depth(
                 }
             }
             Event::Start(Tag::List(start)) => {
+                let start = start.map(|value| {
+                    super::markdown_lists::source_ordered_start(&text[range.clone()])
+                        .unwrap_or(value)
+                });
                 lists.push((start, loose_lists.contains(&range.start), false));
             }
             Event::End(TagEnd::List(_)) => {
@@ -2369,8 +2360,11 @@ fn markdown_plain_at_depth(
                 item_block_ends.push(None);
                 item_after_math.push(false);
                 item_prefixes.push(prefix.clone());
-                item_source_indents
-                    .push(super::strike::item_indent(parsed, range.start).unwrap_or(0));
+                let indent = super::strike::item_indent(parsed, range.start).unwrap_or(0);
+                let line_start = parsed[..range.start]
+                    .rfind('\n')
+                    .map_or(0, |index| index + 1);
+                item_source_indents.push((indent, range.start - line_start + indent));
                 spans.push(prefix);
             }
             Event::Start(Tag::BlockQuote(_)) => {
@@ -2386,11 +2380,14 @@ fn markdown_plain_at_depth(
                 let quote = text[range.clone()]
                     .replace("\r\n", "\n")
                     .replace('\r', "\n");
+                let quote_indent = item_source_indents
+                    .last()
+                    .map_or(3, |&(_, column)| column + 3);
                 let body = quote
                     .lines()
                     .map(|line| {
                         let trimmed = line.trim_start_matches(' ');
-                        if line.len() - trimmed.len() <= 3 {
+                        if line.len() - trimmed.len() <= quote_indent {
                             trimmed
                                 .strip_prefix('>')
                                 .map(|line| line.strip_prefix([' ', '\t']).unwrap_or(line))
@@ -2411,8 +2408,9 @@ fn markdown_plain_at_depth(
                 let bordered = available_width >= 3;
                 let content_width = available_width.saturating_sub(if bordered { 2 } else { 0 });
                 let mut quoted = if depth < 32 {
+                    let parsed_body = super::markdown_lists::normalize_nested_ordered(&body);
                     markdown_at_depth_with_refs(
-                        (&body, reference_source),
+                        (&body, &parsed_body, reference_source),
                         theme,
                         content_width,
                         depth + 1,
@@ -2814,13 +2812,13 @@ fn markdown_plain_at_depth(
 }
 // Marked removes each list container's indent only when the source line
 // supplies it. Its text rule then removes up to one extra four-space indent.
-fn list_continuation_spaces(source: &str, indents: &[usize]) -> usize {
+fn list_continuation_spaces(source: &str, indents: &[(usize, usize)]) -> usize {
     let trimmed = source.trim_start_matches(' ');
     if trimmed.is_empty() || trimmed.starts_with(['\n', '\t']) {
         return 0;
     }
     let spaces = source.len() - trimmed.len();
-    let remaining = indents.iter().fold(spaces, |spaces, &indent| {
+    let remaining = indents.iter().fold(spaces, |spaces, &(indent, _)| {
         spaces.checked_sub(indent).unwrap_or(spaces)
     });
     remaining.checked_sub(4).unwrap_or(remaining)
@@ -3074,6 +3072,89 @@ mod tests {
             .flat_map(|i| [format!("paragraph {i}"), String::new()])
             .collect();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn markdown_parses_nested_ordered_list_interruptions_like_pinned_pi() {
+        let theme = Theme::system();
+        let mut mismatches = Vec::new();
+        for (source, expected) in [
+            (
+                "- root\n  2. child\n  3. sibling",
+                vec!["- root", "    2. child", "    3. sibling"],
+            ),
+            (
+                "1. root\n   7. child\n   8. sibling",
+                vec!["1. root", "    7. child", "    8. sibling"],
+            ),
+            (
+                "- root\n  007. child\n  012. sibling",
+                vec!["- root", "    7. child", "    8. sibling"],
+            ),
+            (
+                "- root\n  0. child\n  2. sibling",
+                vec!["- root", "    0. child", "    1. sibling"],
+            ),
+            (
+                "- root\n    2. child\n    3. sibling",
+                vec!["- root", "    2. child", "    3. sibling"],
+            ),
+            (
+                "- root\n      2. child\n      3. sibling",
+                vec!["- root", "  2. child", "  3. sibling"],
+            ),
+            (
+                "- root\n  2) child\n\n  tail\n- sibling",
+                vec!["- root", "    2. child", "", "  tail", "", "- sibling"],
+            ),
+            (
+                "- root\n  7. child\n     8. grandchild\n     9. sibling",
+                vec![
+                    "- root",
+                    "    7. child",
+                    "        8. grandchild",
+                    "        9. sibling",
+                ],
+            ),
+            (
+                "> - root\n>   2. child\n>      **continuation**",
+                vec!["│ - root", "│     2. child", "│        continuation"],
+            ),
+            (
+                "- root\n  2. > quote\n     > continuation",
+                vec!["- root", "    2. │ quote", "       │ continuation"],
+            ),
+            (
+                "- root\n  6. [child][link]\n\n     [link]: /inside",
+                vec!["- root", "    6. child (/inside)", ""],
+            ),
+            (
+                "- root `inline\n  2. literal`",
+                vec!["- root `inline", "    2. literal`"],
+            ),
+            (
+                "- root\n  ```\n  2. literal\n  ```",
+                vec!["- root", "  ```", "    2. literal", "  ```"],
+            ),
+            (
+                "- root\n  2\\. not a marker",
+                vec!["- root", "  2. not a marker"],
+            ),
+        ] {
+            let lines: Vec<_> = markdown(source, &theme, 72)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                })
+                .collect();
+            if lines != expected {
+                mismatches.push(format!("{source:?}: {lines:?} != {expected:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     }
 
     #[test]
