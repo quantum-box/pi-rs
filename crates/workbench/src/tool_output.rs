@@ -27,6 +27,11 @@ pub(super) struct Truncation<'a> {
     pub max_bytes: usize,
 }
 
+// JavaScript's shortest round-trip spelling for numeric tool arguments.
+pub(super) fn js_number(value: f64) -> String {
+    ryu_js::Buffer::new().format(value).to_owned()
+}
+
 pub(super) fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
         return format!("{bytes}B");

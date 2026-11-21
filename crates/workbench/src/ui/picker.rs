@@ -18,7 +18,6 @@ pub enum Selection {
     CheckoutWithoutSummary(u64),
     CheckoutWithSummary(u64),
     EditBranchSummary(u64),
-    Label(u64, String),
     Fork(u64),
     Model(String),
     Completion {
@@ -36,6 +35,7 @@ pub enum Selection {
     LoginKimi,
     LoginMeta,
     LoginXai,
+    LoginCopilot,
     LoginChatGpt,
     LoginChatGptNew,
     LoginChatGptAccount(String),
@@ -193,7 +193,7 @@ enum SessionSort {
 enum SessionAction {
     Rename(PathBuf),
     Delete(PathBuf),
-    Label(u64),
+    Label(u64, String),
 }
 pub enum Input {
     Continue,
@@ -201,6 +201,7 @@ pub enum Input {
     Select(Selection),
     Save(Selection),
     CopyTreeRecord(u64),
+    SetTreeLabel(u64, String),
     UpdateModelScope { save: bool },
 }
 pub enum MouseInput {
@@ -616,6 +617,18 @@ impl Picker {
             tree.label_timestamps = timestamps;
         }
     }
+    pub fn refresh_tree(&mut self, mut replacement: Self, record: u64) {
+        let (Some(previous), Some(next)) = (&mut self.tree, &mut replacement.tree) else {
+            return;
+        };
+        next.filter = previous.filter;
+        next.collapsed = std::mem::take(&mut previous.collapsed);
+        next.show_label_timestamps = previous.show_label_timestamps;
+        next.rebuild_visible();
+        replacement.query = std::mem::take(&mut self.query);
+        replacement.focus_record(record);
+        *self = replacement;
+    }
     pub fn focus_thinking(&mut self, current: &str) {
         if let Some(index) = self.items.iter().position(
             |item| matches!(&item.selection, Selection::Thinking(level) if level == current),
@@ -791,8 +804,13 @@ impl Picker {
         if let Some(action) = self.session_action.clone() {
             if cancel {
                 self.session_action = None;
-                if matches!(action, SessionAction::Rename(_) | SessionAction::Label(_)) {
-                    self.query.clear();
+                match action {
+                    SessionAction::Rename(_) => self.query.clear(),
+                    SessionAction::Label(id, search) => {
+                        self.query = search;
+                        self.focus_record(id);
+                    }
+                    SessionAction::Delete(_) => {}
                 }
                 return Input::Continue;
             }
@@ -807,10 +825,13 @@ impl Picker {
                 SessionAction::Rename(path) if confirm => {
                     return Input::Select(Selection::RenameSession(path, self.query.clone()));
                 }
-                SessionAction::Label(id) if confirm => {
-                    return Input::Select(Selection::Label(id, self.query.clone()));
+                SessionAction::Label(id, search) if confirm => {
+                    let label = std::mem::replace(&mut self.query, search);
+                    self.session_action = None;
+                    self.focus_record(id);
+                    return Input::SetTreeLabel(id, label);
                 }
-                SessionAction::Rename(_) | SessionAction::Label(_) => {}
+                SessionAction::Rename(_) | SessionAction::Label(..) => {}
             }
         } else if self.active_session.is_some() {
             if keys.matches("tui.input.tab", key) {
@@ -891,13 +912,9 @@ impl Picker {
                     return Input::CopyTreeRecord(id);
                 }
                 if keys.matches("app.tree.editLabel", key) {
-                    self.query = self
-                        .tree
-                        .as_ref()
-                        .and_then(|tree| tree.labels.get(&id))
-                        .cloned()
-                        .unwrap_or_default();
-                    self.session_action = Some(SessionAction::Label(id));
+                    let label = tree.labels.get(&id).cloned().unwrap_or_default();
+                    let search = std::mem::replace(&mut self.query, label);
+                    self.session_action = Some(SessionAction::Label(id, search));
                     return Input::Continue;
                 }
                 if keys.matches("app.tree.foldOrUp", key) {
@@ -1135,7 +1152,7 @@ impl Picker {
                     format!("Rename session · {}", self.query),
                     format!("Type the new name · {confirm} to save · {cancel} to cancel"),
                 ),
-                SessionAction::Label(id) => (
+                SessionAction::Label(id, _) => (
                     format!("Label record {id} · {}", self.query),
                     format!(
                         "Type the label · {confirm} to save · Empty to remove · {cancel} to cancel"
@@ -1164,7 +1181,8 @@ impl Picker {
             "accent",
         )];
         let items = self.matches();
-        let description = if self.title == "Settings" {
+        let settings = self.title == "Settings";
+        let description = if settings {
             items
                 .get(self.selected)
                 .and_then(|item| setting_description(&item.selection))
@@ -1229,12 +1247,17 @@ impl Picker {
         if self.tree.is_some() {
             available = available.min((terminal_height / 2).max(5));
         }
-        let scrolling = self.active_session.is_some() && items.len() > available;
+        const SETTINGS_MAX_ROWS: usize = 10;
+        let scrolling = (settings && items.len() > available.min(SETTINGS_MAX_ROWS))
+            || (self.active_session.is_some() && items.len() > available);
         if scrolling {
             available = available.saturating_sub(1).max(1);
         }
+        if settings {
+            available = available.min(SETTINGS_MAX_ROWS);
+        }
         self.page_size.set(available);
-        let start = if self.tree.is_some() || self.active_session.is_some() {
+        let start = if settings || self.tree.is_some() || self.active_session.is_some() {
             self.selected
                 .saturating_sub(available / 2)
                 .min(items.len().saturating_sub(available))
@@ -1424,6 +1447,8 @@ impl Picker {
             let message =
                 if self.active_session.is_some() && self.query.is_empty() && !self.all_workspaces {
                     "No sessions in current folder. Press Tab to view all."
+                } else if settings {
+                    "No matching settings"
                 } else if self.tree.is_some() {
                     "  No entries found"
                 } else {
@@ -2532,6 +2557,42 @@ mod tests {
     }
 
     #[test]
+    fn settings_scroll_window_stays_centered_and_keeps_mouse_rows_aligned() {
+        let items = (0..19)
+            .map(|index| Item {
+                label: format!("Setting {index:02}"),
+                selection: Selection::EditSetting(format!("key{index}")),
+            })
+            .collect();
+        let mut picker = Picker::new("Settings", items);
+        let theme = Theme::system();
+        let keys = Keys::default();
+        let contains = |lines: &[Line], value: &str| {
+            lines
+                .iter()
+                .any(|line| line.spans.iter().any(|span| span.text.contains(value)))
+        };
+        for (selected, first) in [(0, 0), (8, 3), (18, 9)] {
+            picker.selected = selected;
+            let lines = picker.render(&theme, 80, 32, &keys);
+            assert!(contains(&lines, format!("({}/19)", selected + 1).as_str()));
+            assert_eq!(picker.mouse_layout.get(), (first, 10, 32));
+            for index in 0..19 {
+                assert_eq!(
+                    contains(&lines, format!("Setting {index:02}").as_str()),
+                    (first..first + 10).contains(&index)
+                );
+            }
+        }
+        let lines = picker.render(&theme, 80, 8, &keys);
+        assert!(lines.len() <= 8);
+        assert!(contains(&lines, "Setting 18"));
+        picker.paste("missing");
+        let lines = picker.render(&theme, 80, 32, &keys);
+        assert!(contains(&lines, "No matching settings"));
+    }
+
+    #[test]
     fn settings_paste_preserves_filter_semantics_and_sanitizes_display() {
         let mut picker = Picker::new(
             "Settings",
@@ -2606,15 +2667,33 @@ mod tests {
             picker.matches()[picker.selected].selection,
             Selection::Checkout(1)
         ));
+        let edit_label = KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let confirm = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        picker.paste("node 1");
         picker.input(
-            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
             &keys,
         );
+        picker.input(
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            &keys,
+        );
+        picker.input(edit_label, &keys);
         assert_eq!(picker.query, "root");
+        assert!(matches!(picker.input(escape, &keys), Input::Continue));
+        assert_eq!(picker.query, "node 1");
+        assert!(matches!(picker.selected(), Some(Selection::Checkout(1))));
+        picker.input(edit_label, &keys);
         picker.query = "updated".into();
         assert!(
-            matches!(picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys), Input::Select(Selection::Label(1, value)) if value == "updated")
+            matches!(picker.input(confirm, &keys), Input::SetTreeLabel(1, value) if value == "updated")
         );
+        assert_eq!(picker.query, "node 1");
+        assert!(matches!(picker.selected(), Some(Selection::Checkout(1))));
+        let tree = picker.tree.as_ref().unwrap();
+        assert_eq!(tree.filter.name(), "labeled-only");
+        assert!(tree.show_label_timestamps);
     }
 
     #[test]

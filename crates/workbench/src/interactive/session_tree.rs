@@ -157,16 +157,7 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
             }
         };
         items.push(Item {
-            label: format!(
-                "{} {} {}{}",
-                record.id,
-                labels
-                    .get(&record.id)
-                    .map(String::as_str)
-                    .unwrap_or_default(),
-                description.heading,
-                description.body
-            ),
+            label: format!("{} {}{}", record.id, description.heading, description.body),
             selection: Selection::Checkout(record.id),
         });
         entries.insert(record.id, (record.parent, kind));
@@ -331,7 +322,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(&path, fixture).unwrap();
-        let session = crate::session_import::read(&path).unwrap();
+        let mut session = crate::session_import::read(&path).unwrap();
         let mut picker = picker(&session, TreeFilter::Default);
         let keys = Keys::default();
         let theme = Theme::load("dark", &[], root.path(), false, false).unwrap();
@@ -397,5 +388,23 @@ mod tests {
                 .iter()
                 .any(|span| span.text.starts_with("25/") && span.color == theme.color("muted"))
         }));
+        session.set_label(id, Some("updated label".into())).unwrap();
+        let updated = super::picker(&session, TreeFilter::Default);
+        picker.refresh_tree(updated, id);
+        picker.input(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('a'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+            &keys,
+        );
+        assert!(
+            picker.render(&theme, 100, 22, &keys).iter().any(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.text == "[label: updated label]")
+            }),
+            "all entries include the newly committed label record"
+        );
     }
 }
