@@ -645,7 +645,7 @@ mod owned_reservation_validation_tests {
         let graph_key = format!("runtime/woken-owned-graph/v1/{root}").into_bytes();
         let marker_key =
             format!("runtime/woken-owned-child-reservation/v1/{root}/{child}").into_bytes();
-        let mut root_task = json!({"id":root,"owner":{"Conversation":outer},"checkpoint":{"phase":"wait","data":null},"state":"Running","restarts":0,"restart_limit":4,"abort_requested":true,"woken_interrupted_attempt":interrupted});
+        let mut root_task = json!({"id":root,"owner":{"Conversation":outer},"checkpoint":{"phase":"wait","data":null},"state":"Running","restarts":0,"restart_limit":4,"abort_requested":false,"woken_interrupted_attempt":interrupted});
         let mut child_task = json!({"id":child,"owner":{"Conversation":conversation},"checkpoint":{"phase":"parked","data":null},"state":"Ready","restarts":0,"restart_limit":4,"abort_requested":true,"kind":"unsafe-child","replay_safe":false,"retired_attempt_id":uuid::Uuid::from_u128(15)});
         let edge = json!({"task":root,"task_owner":{"Conversation":outer},"child":conversation,"mode":"Foreground"});
         store
@@ -681,6 +681,7 @@ mod owned_reservation_validation_tests {
         let boundary = store.put_version().unwrap();
         let graph = json!({"version":1,"root":root,"interrupted_attempt":interrupted,"tasks":[root_task,child_task],"edges":[{"edge":edge,"edge_version":edge_version}],"structure":{"boundary":boundary,"root_revision":root_revision,"global_revision":global_revision}});
         root_task["state"] = json!("Ready");
+        root_task["abort_requested"] = json!(true);
         store
             .commit(
                 &[Check {
@@ -893,7 +894,7 @@ mod owned_reservation_validation_tests {
         let task_key = [b"durable/task/".as_slice(), id.as_bytes()].concat();
         let graph_key = format!("runtime/woken-owned-graph/v1/{id}").into_bytes();
         let marker_key = format!("runtime/woken-owned-reservation/v1/{id}").into_bytes();
-        let mut task = json!({"id": id, "owner": {"Conversation": uuid::Uuid::from_u128(3)}, "checkpoint": {"phase":"wait", "data":null}, "state":"Running", "restarts":0, "restart_limit":4, "abort_requested":true, "woken_interrupted_attempt":interrupted});
+        let mut task = json!({"id": id, "owner": {"Conversation": uuid::Uuid::from_u128(3)}, "checkpoint": {"phase":"wait", "data":null}, "state":"Running", "restarts":0, "restart_limit":4, "abort_requested":false, "woken_interrupted_attempt":interrupted});
         store
             .commit(
                 &[],
@@ -915,6 +916,7 @@ mod owned_reservation_validation_tests {
         let boundary = store.put_version().unwrap();
         let graph = json!({"version":1, "root":id, "interrupted_attempt":interrupted, "structure":{"boundary":boundary,"root_revision":root_revision,"global_revision":global_revision}});
         task["state"] = json!("Ready");
+        task["abort_requested"] = json!(true);
         store
             .commit(
                 &[Check {

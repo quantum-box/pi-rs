@@ -1,6 +1,22 @@
 use durable_store::{Check, Error, Expected, Mutation, Store};
 use std::sync::{Arc, Barrier};
 
+// These connections only exercise uncommitted SQLite rollback on non-graph
+// keys. Authorize the test transaction under the experimental protocol; it
+// is deliberately dropped or the process exits without committing.
+fn rollback_connection(path: impl AsRef<std::path::Path>) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    #[cfg(feature = "experimental-graph-revision")]
+    conn.create_scalar_function(
+        "pi_graph_protocol_v4",
+        0,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+        |_| Ok(1i64),
+    )
+    .unwrap();
+    conn
+}
+
 fn put(key: &[u8], value: &[u8]) -> Mutation {
     Mutation::Put {
         key: key.into(),
@@ -171,7 +187,7 @@ fn uncommitted_sqlite_transaction_is_rolled_back_on_reopen() {
         store.commit(&[], &[put(b"stable", b"yes")]).unwrap();
     }
     {
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        let conn = rollback_connection(&path);
         conn.execute_batch("BEGIN IMMEDIATE; UPDATE durable_store_entries SET value=x'6e6f' WHERE key=x'737461626c65'; INSERT INTO durable_store_entries VALUES(x'6c6f7374',x'79',100);").unwrap();
         // Simulate a connection disappearing before COMMIT.
     }
@@ -220,7 +236,7 @@ fn crash_recovery_child() {
     let Ok(path) = std::env::var("DURABLE_STORE_CRASH_DB") else {
         return;
     };
-    let conn = rusqlite::Connection::open(path).unwrap();
+    let conn = rollback_connection(path);
     conn.execute_batch("BEGIN IMMEDIATE; UPDATE durable_store_entries SET value=x'62726f6b656e' WHERE key=x'737461626c65'; INSERT INTO durable_store_entries VALUES(x'6c6f7374',x'79',100);").unwrap();
     std::process::exit(0);
 }
@@ -441,7 +457,18 @@ fn concurrent_opens_migrate_once_and_writers_share_boundary() {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                let store = Store::open(path).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let store = loop {
+                    match Store::open(&path) {
+                        Ok(store) => break store,
+                        Err(Error::MigrationOwnerUnavailable(_))
+                            if std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::yield_now()
+                        }
+                        Err(error) => panic!("store open failed: {error}"),
+                    }
+                };
                 store.commit(&[], &[put(&[i], b"value")]).unwrap();
                 assert_eq!(store.legacy_version_boundary().unwrap(), 7);
             })
@@ -548,7 +575,7 @@ fn sequence_crash_child() {
     let Ok(path) = std::env::var("DURABLE_SEQUENCE_CRASH_DB") else {
         return;
     };
-    let conn = rusqlite::Connection::open(path).unwrap();
+    let conn = rollback_connection(path);
     conn.execute_batch("BEGIN IMMEDIATE; UPDATE durable_commit_meta SET sequence=2; UPDATE durable_store_meta SET version=2; INSERT INTO durable_store_entries VALUES(x'62',x'76',2); INSERT INTO durable_commit_versions VALUES(x'62',2,2);").unwrap();
     std::process::exit(0);
 }
