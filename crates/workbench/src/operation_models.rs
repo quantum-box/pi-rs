@@ -469,7 +469,9 @@ impl Catalogue {
                     .api
                     .or_else(|| serde_json::from_value(provider["api"].clone()).ok())
                     .or(match (name.as_str(), kind) {
-                        ("typesafe" | "openrouter", Kind::Classifier) => Some(Api::SystemOne),
+                        ("typesafe" | "openrouter" | "github-copilot", Kind::Classifier) => {
+                            Some(Api::SystemOne)
+                        }
                         ("openai", Kind::Classifier) => Some(Api::OpenAiDecisions),
                         ("openrouter", Kind::Image) => Some(Api::OpenRouterImages),
                         _ => None,
@@ -523,7 +525,18 @@ impl Catalogue {
                 let cloudflare_default = cloudflare
                     && (base.contains("{CLOUDFLARE_ACCOUNT_ID}")
                         || (configured.base_url.is_none() && provider["baseUrl"].is_null()));
-                let (base, endpoint) = operation_endpoints(base, api, cloudflare)?;
+                let endpoint_for = |base: &str| {
+                    let base = if name == "github-copilot"
+                        && matches!(api, Api::SystemOne)
+                        && base.trim_end_matches('/') == "https://api.individual.githubcopilot.com"
+                    {
+                        official_base(&name).expect("official Copilot base")
+                    } else {
+                        base
+                    };
+                    operation_endpoints(base, api, cloudflare)
+                };
+                let (base, endpoint) = endpoint_for(base)?;
                 let key_base = match &configured_binding {
                     Some(binding) => binding.as_deref(),
                     None => provider["baseUrl"]
@@ -532,7 +545,7 @@ impl Catalogue {
                         .or(inferred_base.as_deref()),
                 };
                 let key_endpoint = key_base
-                    .map(|base| operation_endpoints(base, api, cloudflare))
+                    .map(endpoint_for)
                     .transpose()?
                     .map(|(_, endpoint)| endpoint);
                 let inherited: BTreeMap<String, String> = if provider["headers"].is_null() {
@@ -623,6 +636,9 @@ impl Catalogue {
                             .ok()
                             .and_then(|model| model.credential(keys))
                         {
+                            // Pi considers a saved Copilot subscription authenticated
+                            // for discovery without refreshing it or applying its chat-only model filter.
+                            Some(Credential::Copilot) => true,
                             Some(credential) => credential.resolve().await.is_ok(),
                             None => model.allows_keyless(),
                         };
@@ -692,6 +708,7 @@ pub(super) fn official_base(provider: &str) -> Option<&'static str> {
         "vercel-ai-gateway" => Some("https://ai-gateway.vercel.sh/typesafe/v1"),
         "cloudflare-workers-ai" => Some(CLOUDFLARE_TEMPLATE),
         "opencode" => Some("https://opencode.ai/inference/systemone/v1"),
+        "github-copilot" => Some("https://api.individual.githubcopilot.com/v1"),
         _ => None,
     }
 }
@@ -788,6 +805,10 @@ impl Entry {
     }
 
     fn is_official(&self) -> bool {
+        if self.provider == "github-copilot" {
+            return matches!(self.api, Api::SystemOne)
+                && self.endpoint.as_str() == super::copilot_auth::CLASSIFIER_ENDPOINT;
+        }
         self.cloudflare_default
             || (self.provider == "cloudflare-workers-ai"
                 && matches!(self.api, Api::WorkersAiSystemOne)
@@ -883,6 +904,7 @@ impl Entry {
                 ("vercel-ai-gateway", true) => "AI_GATEWAY_API_KEY",
                 ("cloudflare-workers-ai", true) => "CLOUDFLARE_API_KEY",
                 ("opencode", true) => "OPENCODE_API_KEY",
+                ("github-copilot", true) => "COPILOT_GITHUB_TOKEN",
                 _ => return None,
             };
             env(key)
@@ -1224,7 +1246,7 @@ impl Operations {
         let (payload, image_opt_in) = match entry.api {
             Api::LlamaCppClassifier => {
                 let questions = llama_cpp::prepare(context)?;
-                let headers = self.request_headers(entry, keys).await?;
+                let (_, headers) = self.request_target(entry, keys).await?;
                 data["answers"] =
                     llama_cpp::classify(&self.client, entry, &headers, questions).await?;
                 return Ok(());
@@ -1233,7 +1255,7 @@ impl Operations {
             Api::OpenAiDecisions => (decisions::payload(entry, context)?, false),
             Api::OpenRouterImages => (image_payload(entry, context)?, false),
         };
-        let mut headers = self.request_headers(entry, keys).await?;
+        let (endpoint, mut headers) = self.request_target(entry, keys).await?;
         // Pi adds the automatic classifier image opt-in as request options,
         // after provider and model headers have been combined.
         if image_opt_in {
@@ -1242,14 +1264,7 @@ impl Operations {
                 HeaderValue::from_static("true"),
             );
         }
-        let body = send_model_json(
-            &self.client,
-            entry.endpoint.clone(),
-            &headers,
-            &payload,
-            entry.api,
-        )
-        .await?;
+        let body = send_model_json(&self.client, endpoint, &headers, &payload, entry.api).await?;
         let result_body = if matches!(entry.api, Api::WorkersAiSystemOne) {
             classifier_response(&body)?
         } else {
@@ -1282,15 +1297,22 @@ impl Operations {
         Ok(())
     }
 
-    async fn request_headers(&self, entry: &Entry, keys: &Keys) -> Result<HeaderMap> {
+    async fn request_target(&self, entry: &Entry, keys: &Keys) -> Result<(Url, HeaderMap)> {
         let credential_env = keys.operation_environment(
             &entry.provider,
             entry.endpoint.as_str(),
             entry.is_official(),
         );
+        let mut endpoint = entry.endpoint.clone();
         let mut headers = HeaderMap::new();
         if let Some(credential) = entry.credential(keys) {
-            let key = credential.resolve().await?;
+            let key = if matches!(credential, Credential::Copilot) {
+                let key = super::copilot_auth::access(&self.args.settings, None, false).await?;
+                endpoint = super::copilot_auth::routed_classifier_endpoint(&endpoint, &key)?;
+                key
+            } else {
+                credential.resolve().await?
+            };
             let mut authorization = HeaderValue::from_str(&format!("Bearer {key}"))
                 .map_err(|_| Error::Config("invalid model operation credential".into()))?;
             authorization.set_sensitive(true);
@@ -1313,7 +1335,7 @@ impl Operations {
                 value,
             );
         }
-        Ok(headers)
+        Ok((endpoint, headers))
     }
 }
 
@@ -1446,6 +1468,128 @@ mod tests {
             .find(|entry| entry.provider == "opencode")
             .unwrap();
         assert!(model.credential_with_env(&saved, env).is_none());
+    }
+
+    #[tokio::test]
+    async fn copilot_classifier_availability_and_credentials_are_scoped() {
+        let provider = "github-copilot";
+        let catalogue = Catalogue::parse(&Map::new()).unwrap();
+        let model = catalogue
+            .0
+            .iter()
+            .find(|model| model.provider == provider)
+            .unwrap();
+        let id = "microsoft-decision-1";
+        assert_eq!(model.model.id, id);
+        assert_eq!(
+            model.endpoint.as_str(),
+            super::super::copilot_auth::CLASSIFIER_ENDPOINT
+        );
+        assert_eq!(model.descriptor()["input"], json!(["text"]));
+        assert!(model.descriptor().get("headers").is_none());
+        // A stale access token and an empty chat catalogue do not prevent discovery.
+        let oauth = Keys::parse(&json!({provider:{
+            "type":"oauth","access":"fixture","refresh":"fixture","expires":1,
+            "availableModelIds":[]
+        }}));
+        assert!(matches!(
+            model.credential_with_env(&oauth, |_| None),
+            Some(Credential::Copilot)
+        ));
+        let available = catalogue
+            .list(Kind::Classifier, Some(provider), Some(id), true, &oauth)
+            .await;
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0]["id"], id);
+        let api_key = |name: &str| (name == "COPILOT_GITHUB_TOKEN").then(|| "fixture-env".into());
+        assert!(
+            matches!(model.credential_with_env(&Keys::default(), api_key),
+            Some(Credential::Literal(token)) if token == "fixture-env")
+        );
+        let custom = json!({provider:{"baseUrl":"http://127.0.0.1:1/v1"}});
+        let custom = Catalogue::parse(custom.as_object().unwrap()).unwrap();
+        let custom = custom
+            .0
+            .iter()
+            .find(|model| model.provider == provider)
+            .unwrap();
+        assert!(!custom.is_official());
+        assert!(custom.credential_with_env(&oauth, api_key).is_none());
+        let canonical = json!({provider:{"baseUrl":"https://api.individual.githubcopilot.com/"}});
+        let canonical = Catalogue::parse(canonical.as_object().unwrap()).unwrap();
+        assert!(
+            canonical
+                .0
+                .iter()
+                .find(|model| model.provider == provider)
+                .unwrap()
+                .is_official()
+        );
+    }
+
+    #[tokio::test]
+    async fn copilot_classifier_sends_system_one_request_with_model_headers() {
+        use clap::Parser;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "POST /v1/systemone HTTP/1.1\r\n");
+            let mut headers = BTreeMap::new();
+            loop {
+                line.clear();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.split_once(':').unwrap();
+                headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
+            }
+            assert_eq!(headers["authorization"], "Bearer loopback-key");
+            assert_eq!(headers["user-agent"], "GitHubCopilotChat/0.35.0");
+            assert_eq!(headers["copilot-integration-id"], "vscode-chat");
+            let mut body = vec![0; headers["content-length"].parse().unwrap()];
+            stream.read_exact(&mut body).await.unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["model"], "microsoft-decision-1");
+            assert_eq!(request["questions"]["ok"]["type"], "noul");
+            let body = r#"{"answers":{"ok":{"type":"noul","noul":0.75}}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let config = json!({"github-copilot":{"baseUrl":base,"apiKey":"loopback-key"}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let model = catalogue
+            .0
+            .iter()
+            .find(|model| model.provider == "github-copilot")
+            .unwrap();
+        let operations = Operations::new(&Cli::parse_from(["pi"])).unwrap();
+        let context = json!({
+            "state":{},"questions":{"ok":{"type":"bool","instructions":"Decide",
+            "criteria":{"true":"yes","false":"no"}}},
+        });
+        let mut data = json!({});
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            operations.perform(model, &context, &Keys::default(), &mut data),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            data["answers"]["ok"],
+            json!({"type":"bool","probability":0.75})
+        );
     }
 
     #[test]
