@@ -1259,10 +1259,27 @@ impl Client {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
                 let azure = client.is_azure();
                 let client = if azure {
+                    // Older Azure reasoning models use the service default
+                    // when effort is omitted and reject the literal "none".
+                    let default_off = (!matches!(
+                        args.model.as_str(),
+                        "gpt-5"
+                            | "gpt-5-mini"
+                            | "gpt-5-nano"
+                            | "gpt-5-pro"
+                            | "gpt-5-codex"
+                            | "o1"
+                            | "o1-pro"
+                            | "o3"
+                            | "o3-mini"
+                            | "o3-pro"
+                            | "o4-mini"
+                    ))
+                    .then_some("none");
                     let off_reasoning = metadata
                         .as_ref()
                         .filter(|model| model.reasoning == Some(true))
-                        .and_then(|model| model.mapped_effort("off").unwrap_or(Some("none")));
+                        .and_then(|model| model.mapped_effort("off").unwrap_or(default_off));
                     client.with_azure_routes(
                         args.model_profiles.azure_api_version(),
                         args.model_profiles.azure_deployments(),
@@ -4004,6 +4021,7 @@ mod estimation_tests {
 
         for (provider, model, responses) in [
             ("azure", "o4-mini", true),
+            ("azure", "gpt-5.1", true),
             ("azure", "deepseek-v4-pro", false),
             ("azure-relay", "o4-mini", true),
         ] {
@@ -4105,7 +4123,11 @@ mod estimation_tests {
                 );
                 assert!(!headers.contains("authorization:"), "{headers}");
                 assert_eq!(body["max_output_tokens"], 16);
-                assert_eq!(body["reasoning"], json!({"effort":"none"}));
+                if model == "gpt-5.1" {
+                    assert_eq!(body["reasoning"], json!({"effort":"none"}));
+                } else {
+                    assert!(body.get("reasoning").is_none());
+                }
                 assert_eq!(body["prompt_cache_key"], "session-fixture");
             } else {
                 assert_eq!(body["max_completion_tokens"], 4);
