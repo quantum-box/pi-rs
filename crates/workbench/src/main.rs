@@ -55,6 +55,7 @@ mod rpc_messages;
 mod runtime;
 mod session_import;
 mod sessions;
+mod share_refresh;
 use pi_rs::StreamingJson;
 mod thinking;
 mod tool_selection;
@@ -130,7 +131,7 @@ struct Cli {
     #[arg(skip)]
     trusted: bool,
     #[arg(skip)]
-    mcp_login_cancel: CancellationToken,
+    command_cancel: CancellationToken,
     #[arg(skip)]
     trust_pending: bool,
     /// Load this project's executable configuration.
@@ -1322,8 +1323,8 @@ async fn run_cli() -> i32 {
         .nth(1)
         .is_some_and(|arg| arg == "--terminal-managed-worker");
     let (signal_tx, mut signal_rx) = tokio::sync::oneshot::channel();
-    let mcp_login_cancel = CancellationToken::new();
-    let signal_cancel = mcp_login_cancel.clone();
+    let command_cancel = CancellationToken::new();
+    let signal_cancel = command_cancel.clone();
     tokio::spawn(async move {
         loop {
             if tokio::signal::ctrl_c().await.is_err() {
@@ -1400,7 +1401,7 @@ async fn run_cli() -> i32 {
         if let Some(paths) = literal_export {
             return export_from_file(&paths, &paths[..1]);
         }
-        args.mcp_login_cancel = mcp_login_cancel;
+        args.command_cancel = command_cancel;
         args.extension_flags = extension_flags;
         if let Some(paths) = &args.export_session {
             return export_from_file(paths, &paths[..1]);
@@ -1551,6 +1552,7 @@ async fn run_cli() -> i32 {
             None | Some(Command::Interactive | Command::Serve | Command::Run { .. } | Command::Resume | Command::Compact { .. } | Command::Review { .. })
         );
         let mcp_login = args.list_models.is_none() && matches!(&args.command, Some(Command::Mcp { command }) if matches!(command.as_ref(), mcp_config::McpCommand::Login { .. }));
+        let standalone_share = args.list_models.is_none() && matches!(&args.command, Some(Command::Share));
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let mut execution = Box::pin(execute(args, &mut output_truncated, Some(ready_tx)));
         if managed {
@@ -1560,9 +1562,9 @@ async fn run_cli() -> i32 {
                 result = &mut execution => result,
                 _ = ready_rx => execution.await,
             }
-        } else if mcp_login {
-            // Login handles cancellation itself so an in-progress credential
-            // commit can finish and its result can be reported.
+        } else if mcp_login || standalone_share {
+            // These commands own cancellation so an admitted credential commit
+            // can finish and its result can be reported.
             execution.await
         } else {
             tokio::select! {
@@ -1730,7 +1732,7 @@ async fn execute(
         {
             tokio::select! {
                 result = model_selection::catalogs(&args, true) => result?,
-                _ = args.mcp_login_cancel.cancelled() => return Err(Error::Cancelled),
+                _ = args.command_cancel.cancelled() => return Err(Error::Cancelled),
             }
         } else {
             model_selection::catalogs(&args, true).await?
@@ -2191,7 +2193,28 @@ async fn execute(
         }
         Command::Share => {
             let destination = sessions::ShareDestination::configured(&args.settings)?;
-            let shared = destination.share(session, &args.workspace, None).await?;
+            let workspace = args.workspace.clone();
+            let shared = if destination.is_radius() {
+                let prepare = share_refresh::Broker::new();
+                let snapshot = runtime::standalone_share_snapshot(&args, &session, &prepare).await;
+                prepare.finish().await?;
+                let snapshot = snapshot?;
+
+                let upload = share_refresh::Broker::new();
+                let shared = tokio::select! {
+                    biased;
+                    _ = args.command_cancel.cancelled() => Err(Error::Cancelled),
+                    result = destination.share_with_broker(session, &workspace, Some(snapshot), Some(&upload)) => result,
+                };
+                upload.finish().await?;
+                shared?
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = args.command_cancel.cancelled() => Err(Error::Cancelled),
+                    result = destination.share(session, &workspace, None) => result,
+                }?
+            };
             let mut event = serde_json::to_value(shared)?;
             event["type"] = json!("shared");
             output(event);

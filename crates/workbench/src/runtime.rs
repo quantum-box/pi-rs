@@ -99,6 +99,17 @@ impl Runtime {
         session: &mut Session,
         reason: pi_rs::ResourceDiscoveryReason,
     ) -> Result<pi_rs::DiscoveredResources> {
+        self.discover_resources_checked(args, session, reason, false)
+            .await
+    }
+
+    async fn discover_resources_checked(
+        &mut self,
+        args: &Cli,
+        session: &mut Session,
+        reason: pi_rs::ResourceDiscoveryReason,
+        require_complete: bool,
+    ) -> Result<pi_rs::DiscoveredResources> {
         if !self.registry.has_resource_discovery_hooks() {
             return Ok(pi_rs::DiscoveredResources::default());
         }
@@ -109,22 +120,25 @@ impl Runtime {
                 .unwrap_or_else(|_| args.workspace.clone()),
             reason,
         };
+        let mut failed = false;
+        let mut on_error = |extension: &str, message: &str| {
+            failed = true;
+            super::observe(
+                pi_rs::Notification::ExtensionLifecycleError {
+                    extension,
+                    event: "resources_discover",
+                    message,
+                },
+                args.trace,
+            );
+        };
         let results = if session.host_binding().is_some() {
             self.registry
                 .discover_resources(
                     &event,
                     &session.extension_states(),
                     args.tool_timeout(),
-                    |extension, error| {
-                        super::observe(
-                            pi_rs::Notification::ExtensionLifecycleError {
-                                extension,
-                                event: "resources_discover",
-                                message: error,
-                            },
-                            args.trace,
-                        )
-                    },
+                    &mut on_error,
                 )
                 .await
         } else {
@@ -134,16 +148,7 @@ impl Runtime {
                     session,
                     args.tool_timeout(),
                     &mut |event| super::observe(event, args.trace),
-                    |extension, error| {
-                        super::observe(
-                            pi_rs::Notification::ExtensionLifecycleError {
-                                extension,
-                                event: "resources_discover",
-                                message: error,
-                            },
-                            args.trace,
-                        )
-                    },
+                    &mut on_error,
                 )
                 .await?
         };
@@ -156,10 +161,11 @@ impl Runtime {
                 .as_deref()
                 .and_then(std::path::Path::parent)
                 .map(std::path::Path::to_path_buf);
-            let resolve = |path: std::path::PathBuf| {
+            let mut resolve = |path: std::path::PathBuf| {
                 let path = match resolve_discovered_path(&path, &event.cwd) {
                     Ok(path) => path,
                     Err(error) => {
+                        failed = true;
                         eprintln!("Extension {}: {error}", item.extension_id);
                         return None;
                     }
@@ -167,6 +173,7 @@ impl Runtime {
                 if path.exists() {
                     Some(path)
                 } else {
+                    failed = true;
                     eprintln!(
                         "Extension {}: resource {} was not found",
                         item.extension_id,
@@ -175,10 +182,10 @@ impl Runtime {
                     None
                 }
             };
-            let add = |paths: Vec<std::path::PathBuf>,
-                       target: &mut Vec<std::path::PathBuf>,
-                       records: &mut Vec<ResourceOrigin>| {
-                for path in paths.into_iter().filter_map(&resolve) {
+            let mut add = |paths: Vec<std::path::PathBuf>,
+                           target: &mut Vec<std::path::PathBuf>,
+                           records: &mut Vec<ResourceOrigin>| {
+                for path in paths.into_iter().filter_map(&mut resolve) {
                     let root = path.canonicalize().unwrap_or_else(|_| path.clone());
                     let origin = ResourceOrigin {
                         root: root.clone(),
@@ -208,6 +215,11 @@ impl Runtime {
                 &mut discovered.theme_paths,
                 &mut origins.themes,
             );
+        }
+        if require_complete && failed {
+            return Err(pi_rs::Error::Config(
+                "Extension resource discovery failed while preparing Radius share".into(),
+            ));
         }
         let resources = resources::Resources::load_with_discovered(args, &discovered)?;
         for warning in &resources.warnings {
@@ -500,16 +512,36 @@ impl Runtime {
         session: &Session,
         event: pi_rs::LifecycleEvent,
     ) {
+        self.session_lifecycle_failed(args, session, event, |_| true)
+            .await;
+    }
+
+    async fn session_lifecycle_failed(
+        &self,
+        args: &Cli,
+        session: &Session,
+        event: pi_rs::LifecycleEvent,
+        include: impl FnMut(&str) -> bool + Send,
+    ) -> bool {
+        let mut failed = false;
         if self.registry.has_session_lifecycle_hooks() && session.host_binding().is_none() {
-            pi_rs::notify_extension_lifecycle(
+            pi_rs::notify_extension_lifecycle_filtered(
                 &self.registry,
                 event,
                 &session.extension_states(),
                 args.tool_timeout(),
-                &mut |notification| super::observe(notification, args.trace),
+                &mut |notification| {
+                    failed |= matches!(
+                        notification,
+                        pi_rs::Notification::ExtensionLifecycleError { .. }
+                    );
+                    super::observe(notification, args.trace);
+                },
+                include,
             )
             .await;
         }
+        failed
     }
 
     pub async fn session_lifecycle_owned(
@@ -533,6 +565,174 @@ impl Runtime {
     pub async fn close(&self) -> Result<()> {
         self.registry.shutdown().await
     }
+}
+
+pub(super) struct ShareServices<'a> {
+    pub refresh: &'a super::share_refresh::Broker,
+    pub processes: pi_rs_workbench::process_cleanup::Children,
+}
+
+/// Prepare an idle context on an in-memory copy. A cancellation or deadline
+/// stops preparation; a configured runtime still receives its shutdown hooks.
+pub(super) async fn standalone_share_snapshot(
+    args: &Cli,
+    source: &Session,
+    refresh: &super::share_refresh::Broker,
+) -> Result<super::sessions::ShareSnapshot> {
+    standalone_share_snapshot_after(args, source, refresh, std::future::ready(())).await
+}
+
+async fn standalone_share_snapshot_after(
+    args: &Cli,
+    source: &Session,
+    refresh: &super::share_refresh::Broker,
+    before_configure: impl std::future::Future<Output = ()>,
+) -> Result<super::sessions::ShareSnapshot> {
+    if args.trust_pending {
+        return Err(pi_rs::Error::Config("project trust is pending".into()));
+    }
+    let mut args = args.clone();
+    args.restore_session_model(source)?;
+    super::thinking::adjust(&mut args);
+    let session = standalone_share_session_copy(source)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let services = ShareServices {
+        refresh,
+        processes: pi_rs_workbench::process_cleanup::Children::default(),
+    };
+    let result = async {
+        let runtime = share_preparation_step(
+            &args,
+            deadline,
+            refresh,
+            configure_after(&args, false, before_configure, Some(&services)),
+        )
+        .await?;
+        standalone_share_snapshot_with_runtime(&args, source, session, runtime, deadline, refresh)
+            .await
+    }
+    .await;
+    if let Err(cleanup) = services.processes.finish().await {
+        if let Err(error) = result {
+            eprintln!("{error}");
+        }
+        return Err(cleanup);
+    }
+    let snapshot = result?;
+    if args.command_cancel.is_cancelled() {
+        return Err(pi_rs::Error::Cancelled);
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err(pi_rs::Error::Config(
+            "Radius share preparation timed out".into(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+async fn share_preparation_step<T>(
+    args: &Cli,
+    deadline: tokio::time::Instant,
+    refresh: &super::share_refresh::Broker,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let error = tokio::select! {
+        biased;
+        _ = args.command_cancel.cancelled() => pi_rs::Error::Cancelled,
+        _ = tokio::time::sleep_until(deadline) =>
+            pi_rs::Error::Config("Radius share preparation timed out".into()),
+        result = work => return result,
+    };
+    refresh.seal();
+    Err(error)
+}
+
+fn standalone_share_session_copy(source: &Session) -> Result<Session> {
+    let metadata = source
+        .records()
+        .iter()
+        .filter_map(|record| {
+            source
+                .record_metadata(record.id)
+                .map(|value| (record.id, value.clone()))
+        })
+        .collect();
+    Session::from_records_with_metadata(source.records().to_vec(), metadata)
+}
+
+async fn standalone_share_snapshot_with_runtime(
+    args: &Cli,
+    source: &Session,
+    mut session: Session,
+    mut runtime: Runtime,
+    deadline: tokio::time::Instant,
+    refresh: &super::share_refresh::Broker,
+) -> Result<super::sessions::ShareSnapshot> {
+    let mut started = std::collections::BTreeSet::new();
+    let result = share_preparation_step(args, deadline, refresh, async {
+        if runtime
+            .session_lifecycle_failed(
+                args,
+                &session,
+                pi_rs::LifecycleEvent::SessionStart {
+                    reason: pi_rs::SessionStartReason::Startup,
+                    previous_session_file: None,
+                },
+                |extension| started.insert(extension.to_owned()),
+            )
+            .await
+        {
+            return Err(pi_rs::Error::Config(
+                "Extension session start failed while preparing Radius share".into(),
+            ));
+        }
+        runtime
+            .discover_resources_checked(
+                args,
+                &mut session,
+                pi_rs::ResourceDiscoveryReason::Startup,
+                true,
+            )
+            .await?;
+        let base = runtime.share_base();
+        let (system_prompt, _) =
+            source.effective_system_context(&base.system_prompt, base.tools.clone());
+        Ok(super::sessions::ShareSnapshot {
+            session_id: source.session_id(),
+            head: source.head(),
+            context: super::sessions::ShareContext {
+                system_prompt,
+                tools: base.tools,
+            },
+        })
+    })
+    .await;
+    let shutdown_failed = runtime
+        .session_lifecycle_failed(
+            args,
+            &session,
+            pi_rs::LifecycleEvent::SessionShutdown {
+                reason: pi_rs::SessionShutdownReason::Quit,
+                target_session_file: None,
+            },
+            |extension| started.contains(extension),
+        )
+        .await;
+    let servers = runtime
+        .catalog
+        .servers
+        .lock()
+        .expect("MCP catalogs")
+        .clone();
+    futures_util::future::join_all(servers.iter().map(|server| server.close())).await;
+    let closed = runtime.close().await;
+    let snapshot = result?;
+    if shutdown_failed {
+        return Err(pi_rs::Error::Config(
+            "Extension session shutdown failed while preparing Radius share".into(),
+        ));
+    }
+    closed.map(|()| snapshot)
 }
 
 fn resolve_discovered_path(
@@ -627,12 +827,23 @@ pub(super) fn shell_config(args: &Cli) -> ShellConfig {
 }
 
 pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
-    super::packages::prepare(args).await?;
+    configure_after(args, interactive_mcp, std::future::ready(()), None).await
+}
+
+async fn configure_after(
+    args: &Cli,
+    interactive_mcp: bool,
+    before_preparation: impl std::future::Future<Output = ()>,
+    share_services: Option<&ShareServices<'_>>,
+) -> Result<Runtime> {
+    before_preparation.await;
+    super::packages::prepare_with_cleanup(args, share_services.map(|services| &services.processes))
+        .await?;
     let local_resources = resources::Resources::load(args)?;
     for warning in &local_resources.warnings {
         eprintln!("{warning}");
     }
-    let discovered = mcp_config::discover(args, false, interactive_mcp).await?;
+    let discovered = mcp_config::discover(args, false, interactive_mcp, share_services).await?;
     let mcp_connections = discovered.connected;
     let result = async {
         let (selection, documents, hidden) = tool_discovery(args, &mcp_connections)?;
@@ -725,7 +936,8 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
                     )));
                 }
                 _ => {
-                    let mut extension = pi_rs_extensions::ExecutableExtension::load(name)?;
+                    let mut extension =
+                        pi_rs_extensions::ExecutableExtension::load_async(name).await?;
                     if !args.disable_extension.iter().any(|id| id == extension.id()) {
                         for flag in extension.cli_flags() {
                             if !flag_names.insert(flag.name.clone()) {
@@ -760,10 +972,18 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
                     .map(|path| (extension.id().to_owned(), path.to_owned()))
             })
             .collect();
-        let mut registry = Registry::compose(
-            extensions,
-            &args.disable_extension.iter().cloned().collect(),
-        )?;
+        let disabled = args
+            .disable_extension
+            .iter()
+            .filter(|id| {
+                !discovered.skipped_disabled.contains(*id)
+                    || extensions
+                        .iter()
+                        .any(|extension| extension.id() == id.as_str())
+            })
+            .cloned()
+            .collect();
+        let mut registry = Registry::compose(extensions, &disabled)?;
         registry.omit_default_tool_timeout(args.tool_timeout_secs.is_none());
         registry.register(Arc::new(LocalCommandPolicy(CommandPolicy {
             allow_commands: args.allow_commands,
@@ -838,9 +1058,8 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
     }
     .await;
     if result.is_err() {
-        for connection in mcp_connections {
-            connection.close().await;
-        }
+        futures_util::future::join_all(mcp_connections.iter().map(|connection| connection.close()))
+            .await;
     }
     result
 }
@@ -1004,6 +1223,296 @@ impl pi_rs::Extension for LocalCommandPolicy {
         } else {
             self.0.before_tool(name, arguments, context, state).await
         }
+    }
+}
+
+#[cfg(test)]
+mod standalone_share_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn share_session_copy_preserves_imported_provenance_and_compaction_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.jsonl");
+        std::fs::write(&path, concat!(
+            "{\"type\":\"session\",\"version\":3}\n",
+            "{\"type\":\"message\",\"id\":\"u\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"question\"}}\n",
+            "{\"type\":\"compaction\",\"id\":\"c\",\"parentId\":\"u\",\"firstKeptEntryId\":\"u\",\"summary\":\"summary\",\"tokensBefore\":42,\"fromHook\":true,\"details\":{\"source\":\"extension\"}}\n",
+        )).unwrap();
+        let source = crate::session_import::read(&path).unwrap();
+        let expected_counts = source.validated_pi_conversion_counts().unwrap();
+        let copy = standalone_share_session_copy(&source).unwrap();
+        assert_eq!(copy.session_id(), source.session_id());
+        assert_eq!(copy.head(), source.head());
+        assert_eq!(
+            copy.validated_pi_conversion_counts().unwrap(),
+            expected_counts
+        );
+        let compacted = copy
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, pi_rs::Event::Compacted { .. }))
+            .unwrap();
+        assert_eq!(
+            copy.record_metadata(compacted.id),
+            Some(&serde_json::json!({"fromExtension":true,"details":{"source":"extension"}}))
+        );
+    }
+
+    struct LifecycleRecorder {
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        invalid_prompt: Option<std::path::PathBuf>,
+    }
+
+    #[async_trait::async_trait]
+    impl pi_rs::Extension for LifecycleRecorder {
+        fn id(&self) -> &str {
+            "share-lifecycle-recorder"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_resource_discovery(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &pi_rs::LifecycleEvent,
+            _: Option<&pi_rs::ExtensionState>,
+        ) -> pi_rs::ExtensionResult<()> {
+            let event = match event {
+                pi_rs::LifecycleEvent::SessionStart {
+                    reason: pi_rs::SessionStartReason::Startup,
+                    previous_session_file: None,
+                } => "start",
+                pi_rs::LifecycleEvent::SessionShutdown {
+                    reason: pi_rs::SessionShutdownReason::Quit,
+                    target_session_file: None,
+                } => "shutdown",
+                _ => "unexpected",
+            };
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+        async fn discover_resources(
+            &self,
+            _: &pi_rs::ResourceDiscoveryEvent,
+            _: Option<&pi_rs::ExtensionState>,
+        ) -> pi_rs::ExtensionResult<pi_rs::DiscoveredResources> {
+            self.events.lock().unwrap().push("discover");
+            if let Some(path) = &self.invalid_prompt {
+                std::fs::write(path, vec![b'x'; 64 * 1024 + 1]).unwrap();
+            }
+            Ok(pi_rs::DiscoveredResources::default())
+        }
+        async fn shutdown(&self) -> pi_rs::ExtensionResult<()> {
+            self.events.lock().unwrap().push("close");
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn standalone_share_pairs_session_start_and_shutdown_on_success_and_failure() {
+        for fail in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            let prompt = directory.path().join("prompt.md");
+            std::fs::write(&prompt, "test prompt").unwrap();
+            let source = Session::open(&path).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let mut args = Cli::try_parse_from([
+                "pi",
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+                "--endpoint",
+                "http://127.0.0.1:1/v1/chat/completions",
+            ])
+            .unwrap();
+            args.workspace = directory.path().to_owned();
+            args.session = path.clone();
+            args.system_prompt = Some(prompt.clone());
+            let mut runtime = configure(&args, false).await.unwrap();
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            runtime
+                .registry
+                .register(Arc::new(LifecycleRecorder {
+                    events: events.clone(),
+                    invalid_prompt: fail.then_some(prompt),
+                }))
+                .unwrap();
+            let session = Session::from_records(source.records().to_vec()).unwrap();
+            let result = standalone_share_snapshot_with_runtime(
+                &args,
+                &source,
+                session,
+                runtime,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                &super::super::share_refresh::Broker::new(),
+            )
+            .await;
+            assert_eq!(result.is_err(), fail);
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["start", "discover", "shutdown", "close"]
+            );
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn standalone_share_keeps_active_tools_after_imported_system_checkpoint() {
+        for checkpoint in [
+            serde_json::json!({"type":"message","id":"s","parentId":null,"message":{"role":"system","content":[{"type":"text","text":"checkpoint prompt"}]}}),
+            serde_json::json!({"type":"compaction","id":"c","parentId":null,"firstKeptEntryId":"c","summary":"prior","systemMessage":{"role":"system","content":[{"type":"text","text":"checkpoint prompt"}]}}),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("source.jsonl");
+            let entries = [
+                serde_json::json!({"type":"session","version":3}),
+                checkpoint,
+            ];
+            std::fs::write(
+                &path,
+                entries
+                    .iter()
+                    .map(|entry| entry.to_string() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let source = super::super::session_import::read(&path).unwrap();
+            let mut args = Cli::try_parse_from([
+                "pi",
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+                "--endpoint",
+                "http://127.0.0.1:1/v1/chat/completions",
+            ])
+            .unwrap();
+            args.workspace = directory.path().to_owned();
+            args.session = path.clone();
+            let runtime = configure(&args, false).await.unwrap();
+            let expected = runtime.share_base().tools;
+            assert!(!expected.is_empty());
+            let session = Session::from_records(source.records().to_vec()).unwrap();
+            let snapshot = standalone_share_snapshot_with_runtime(
+                &args,
+                &source,
+                session,
+                runtime,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                &super::super::share_refresh::Broker::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(snapshot.context.system_prompt, "checkpoint prompt");
+            assert_eq!(snapshot.context.tools, expected);
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn slow_preparation_waits_for_metadata_without_detaching() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let session = Session::open(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut args = Cli::try_parse_from([
+            "pi",
+            "--offline",
+            "--no-trust",
+            "--no-mcp",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+            "--endpoint",
+            "http://127.0.0.1:1/v1/chat/completions",
+        ])
+        .unwrap();
+        args.workspace = directory.path().to_owned();
+        args.session = path.clone();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let refresh = super::super::share_refresh::Broker::new();
+        let mut preparation = Box::pin(standalone_share_snapshot_after(
+            &args,
+            &session,
+            &refresh,
+            async {
+                let _ = gate.await;
+            },
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(11), &mut preparation)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        let snapshot = preparation.await.unwrap();
+        assert_eq!(snapshot.session_id, session.session_id());
+        assert_eq!(snapshot.head, session.head());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn standalone_share_deadline_stops_preparation_before_configure() {
+        let args = Cli::try_parse_from(["pi", "--offline", "--no-trust"]).unwrap();
+        let source = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let refresh = super::super::share_refresh::Broker::new();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let Err(error) = standalone_share_snapshot_after(&args, &source, &refresh, async {
+            let _ = gate.await;
+        })
+        .await
+        else {
+            panic!("preparation should time out");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Radius share preparation timed out")
+        );
+        assert!(release.send(()).is_err());
+        refresh.finish().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_preparation_drops_it_without_starting_configure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let session = Session::open(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline", "--no-trust"]).unwrap();
+        args.session = path.clone();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let refresh = super::super::share_refresh::Broker::new();
+        let mut preparation = Box::pin(standalone_share_snapshot_after(
+            &args,
+            &session,
+            &refresh,
+            async {
+                let _ = gate.await;
+            },
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut preparation)
+                .await
+                .is_err()
+        );
+        drop(preparation);
+        assert!(release.send(()).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 }
 

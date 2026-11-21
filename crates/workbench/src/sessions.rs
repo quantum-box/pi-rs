@@ -1108,6 +1108,17 @@ impl ShareDestination {
         workspace: &Path,
         snapshot: Option<ShareSnapshot>,
     ) -> Result<SharedSession> {
+        self.share_with_broker(session, workspace, snapshot, None)
+            .await
+    }
+
+    pub(super) async fn share_with_broker(
+        self,
+        session: Session,
+        workspace: &Path,
+        snapshot: Option<ShareSnapshot>,
+        refresh: Option<&super::share_refresh::Broker>,
+    ) -> Result<SharedSession> {
         match self {
             Self::Radius {
                 mut endpoint,
@@ -1132,12 +1143,16 @@ impl ShareDestination {
                 drop(session);
                 let token = match *credential {
                     RadiusCredential::ApiKey(key) => key,
-                    RadiusCredential::OAuth(gateway) => gateway
-                        .access(std::time::Duration::from_secs(300))
-                        .await?
+                    RadiusCredential::OAuth(gateway) => {
+                        let min_validity = std::time::Duration::from_secs(300);
+                        match refresh {
+                            Some(refresh) => refresh.access(gateway, min_validity).await,
+                            None => gateway.access(min_validity).await,
+                        }?
                         .ok_or_else(|| {
                             Error::Config("Radius credentials were removed. Sign in again.".into())
-                        })?,
+                        })?
+                    }
                 };
                 endpoint
                     .query_pairs_mut()

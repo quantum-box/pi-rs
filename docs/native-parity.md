@@ -124,7 +124,7 @@ without `defaultProvider` are still accepted.
 | Terminal | Default `pi` startup, Unicode multiline editor with word-aware wrapping, visual movement, character jumps and kill ring, text/image clipboard paste, fullscreen transcript search and semantic prompt jumps, configurable scrolling and scrollbar, mouse text selection with clipboard copy, exit transcript or resume hint, prompt history, Markdown, aligned tables, links, syntax highlighting and native Mermaid diagrams, configurable transcript padding and hardware or software cursor, optional regular-screen clear on shrink, tool panels and collapse, visible thinking blocks and model progress, file completion, external editor, user keybindings for editor and selectors, model and thinking default selection, cancel, double-Escape navigation and tree filters | Remaining Markdown and diff layout fidelity, remaining application actions and real-terminal image clipping verification |
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, configurable Bash and Windows PowerShell with session metadata and Pi-style exit and truncation text, structured read, search, listing and shell truncation details, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
-| Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors and toggleable label timestamps, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks, share metadata for standalone CLI exports |
+| Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors and toggleable label timestamps, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks |
 | Model access | Ollama, configurable OpenAI-compatible chat endpoint, native OpenAI Responses, Anthropic Messages, Google Gemini Generate Content, Radius Pi Messages, and Amazon Bedrock Converse streaming, named profiles for those APIs, API keys and bearer tokens, searchable built-in chat model catalog, including native OpenAI, Anthropic and Gemini catalogs and the Fireworks and OpenRouter Messages models, model declarations and overrides including model-specific APIs and endpoints, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, catalog pricing and usage estimates, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh, OpenRouter browser OAuth with manual redirect fallback, ChatGPT plan browser OAuth with token refresh and account selection, Kimi Code device OAuth with refresh | OAuth and refresh for other model providers; ChatGPT live acceptance |
 | Native extensions | Rust tool, prompt input, direct process execution, command-created branch-local custom entries and model-context messages, durable custom messages from native tools and supported callbacks during runs or while idle, user-shell result replacement and streaming operations, in-process shell spawn hooks, injectable model read, write, edit, shell, grep, find and ls operations, model and thinking selection, context and full-system context hooks, policy, command, state/migration, compaction, resource discovery and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, typed command-line flags, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, and styled modal components | Remaining Pi events and selection paths, custom entries and messages from all callbacks, custom message renderers, resource provenance in other surfaces and general component render callbacks |
@@ -4137,8 +4137,11 @@ Radius again or explicitly log out. Never remove a lock held by a live process.
 If a caller cancels while a Radius refresh is queued at the refresh barrier,
 the exchange is discarded. Once admitted, it continues through credential
 persistence even if the caller is cancelled. Admission can precede the actual
-network request; this does not provide a separate refresh broker or a bounded
-standalone-share shutdown.
+network request. Standalone Radius share owns its refreshes in the CLI process
+during both MCP preparation and upload authorization. It seals queued work
+on interruption or when the phase ends, waits for admitted exchanges through
+their final write, and reports a failed write even if MCP reports a generic
+authentication error.
 The [pinned upstream OAuth resolver](https://github.com/earendil-works/pi/blob/f9a26365568127461c47a07a37dcb42c140a3ac5/packages/ai/src/auth/resolve.ts)
 also completes and persists an admitted refresh despite caller cancellation.
 Upstream admits it under the credential-store lock and bounds the exchange to
@@ -4437,9 +4440,22 @@ its entry projection. If a request's journal entry and context are not yet
 paired, the upload proceeds without metadata. Refreshed runtime prompts and
 tool catalogs remain selected after the run settles; summary requests do not replace
 the active context. The metadata is not written to the journal, and the 128 MiB share limit includes
-it. Gist sharing continues to export HTML. When runtime metadata is unavailable, including missing model credentials,
-startup failure, pending project trust, or standalone `pi share`, Radius uploads
-continue without metadata rather than reconstructing it from stale settings.
+it. Gist sharing continues to export HTML. Standalone `pi share` builds an
+idle runtime against an in-memory copy of the source journal. It uses the
+branch's effective system prompt and the runtime's active tool catalog.
+Missing model credentials, pending project trust, enabled MCP discovery
+failures, and failed extension preparation stop the command before upload.
+Interactive Radius sharing can still upload when runtime metadata is
+unavailable.
+
+Standalone preparation has a 60-second deadline for runtime setup and
+discovery. Ctrl-C and the deadline stop preparation and prevent upload.
+Completed runtime setup is followed by session shutdown and connection
+cleanup. Active package commands, stdio MCP servers and MCP credential
+commands are terminated and reaped on interruption. On Unix, process-group
+cleanup covers descendants that remain in an active owned group. Native
+executable requests use process groups on Unix and Job Objects on Windows. Filesystem calls, owned process cleanup and admitted
+credential writes can extend the elapsed time past the preparation deadline.
 Idle journal reads run on a detached thread, while active shares use the in-memory
 snapshot; only one read can be outstanding. Journal preparation runs outside worker
 locks and validates the captured version before publication. Transient streaming

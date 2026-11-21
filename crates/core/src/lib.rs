@@ -38,7 +38,7 @@ pub use lifecycle::{
     BeforeSessionTransition, CompactionReason, ExtensionTreeSummary, ForkPosition, LifecycleEvent,
     LifecycleMessage, ModelSelectSource, SessionShutdownReason, SessionStartReason,
     SessionSwitchReason, TreeDecision, TreePreparation, TreeSummary,
-    notify as notify_extension_lifecycle,
+    notify as notify_extension_lifecycle, notify_filtered as notify_extension_lifecycle_filtered,
     notify_in_session as notify_extension_lifecycle_in_session,
 };
 pub use model_catalog::*;

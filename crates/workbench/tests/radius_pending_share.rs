@@ -108,3 +108,181 @@ fn pending_radius_stops_auto_share_but_explicit_api_key_still_works() {
         auth
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn standalone_share_finishes_admitted_radius_refresh_on_interrupt() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    // Test both preparation via MCP and authorization of the artifact upload.
+    for (mcp, fail_save) in [(false, false), (true, false), (true, true)] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let session = root.path().join("session.jsonl");
+        drop(pi_rs::Session::open(&session).unwrap());
+        let journal_before = std::fs::read(&session).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let auth = home.join("auth.json");
+        std::fs::write(
+            &auth,
+            json!({
+                "radius": {"type":"oauth","gateway":origin,"access":"old","refresh":"old-refresh","expires":0},
+                "other": {"type":"api_key","key":"keep"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        if mcp {
+            std::fs::write(
+                home.join("mcp.json"),
+                json!({
+                    "mcpServers": {
+                        "fixture": {"url": format!("{origin}mcp"), "auth":{"provider":"radius"}}
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("PI_RADIUS_GATEWAY", &origin)
+            .env_remove("PI_RS_RADIUS_SHARE_URL")
+            .env_remove("RADIUS_API_KEY")
+            .env_remove("PI_RS_MODEL_TOKEN")
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+                "--provider",
+                "ollama",
+                "--model",
+                "fixture",
+            ])
+            .arg("--session")
+            .arg(&session)
+            .arg("share")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = FixtureChild(command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    assert!(
+                        child.0.try_wait().unwrap().is_none(),
+                        "pi exited before OAuth"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("OAuth request not received: {error}"),
+            }
+        };
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        assert!(first.starts_with("POST /v1/oauth/token "), "{first}");
+        let mut content_length = 0;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some((key, value)) = line.split_once(':')
+                && key.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("refresh_token=old-refresh"));
+
+        let pending: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&auth).unwrap()).unwrap();
+        assert!(pending["radius"]["_piRsRefreshPending"].is_object());
+        assert!(pending["radius"]["refresh"].is_null());
+
+        // On the save-failure case, let MCP surface the result under normal
+        // execution. The broker must prevent a metadata upload even if rmcp
+        // reports only a generic authentication error.
+        if fail_save {
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
+        } else {
+            assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGINT) }, 0);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "pi abandoned an admitted refresh"
+            );
+        }
+        let response = r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "pi did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut stderr = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&auth).unwrap()).unwrap();
+        assert_eq!(after["other"]["key"], "keep");
+        if fail_save {
+            assert_eq!(status.code(), Some(1), "{stderr}");
+            assert!(stderr.contains("could not be durably saved"), "{stderr}");
+            assert!(after["radius"]["_piRsRefreshPending"].is_object());
+        } else {
+            assert_eq!(status.code(), Some(130), "{stderr}");
+            assert_eq!(after["radius"]["refresh"], "rotated");
+            assert!(after["radius"]["_piRsRefreshPending"].is_null());
+            assert!(!home.join("auth.json.lock").exists());
+        }
+        assert_eq!(std::fs::read(&session).unwrap(), journal_before);
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "cancelled or failed refresh proceeded to an HTTP request"
+        );
+    }
+}
+
+#[cfg(unix)]
+struct FixtureChild(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for FixtureChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
