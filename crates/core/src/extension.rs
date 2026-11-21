@@ -1431,6 +1431,20 @@ pub trait Extension: Send + Sync {
         Ok(None)
     }
 
+    /// Opt in to observing custom messages delivered into a model turn.
+    fn handles_custom_message_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// Edit a completed custom message while retaining its type and protected content.
+    async fn custom_message_lifecycle(
+        &self,
+        _event: &crate::CustomMessageLifecycleEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<CustomMessage>> {
+        Ok(None)
+    }
+
     /// Opt in to observing tool execution start and end events.
     fn handles_tool_execution_lifecycle(&self) -> bool {
         false

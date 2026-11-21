@@ -4511,6 +4511,15 @@ journal commit. Callbacks run for scheduler results and terminal polls.
 Programmatic results, canceled cleanup, and administrative reconciliation
 keep their existing native journal paths.
 
+The custom message lifecycle callback receives messages entering a
+model turn through trigger, next-turn, steering and follow-up delivery.
+`message_end` may revise text, display and details while preserving the
+custom type, attachments and signed blocks. Edits are saved with the same
+durable queue delivery ID. Idle and after-turn appends send the ordinary
+session notification to subscribers.
+Executables negotiate `custom_message_lifecycle_hook` independently of the
+ordinary `message_lifecycle_hook`.
+
 Native extensions can subscribe to `after_provider_response` to observe the
 HTTP status and normalized headers from an agent turn. The OpenAI Responses,
 OpenAI-compatible chat, Anthropic Messages, Google Gemini, and Ollama adapters
