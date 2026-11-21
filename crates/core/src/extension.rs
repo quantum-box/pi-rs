@@ -1432,6 +1432,19 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Opt in to observing HTTP metadata before consuming a provider response body.
+    fn handles_after_provider_response(&self) -> bool {
+        false
+    }
+
+    async fn after_provider_response(
+        &self,
+        _event: &crate::ProviderResponseEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        Ok(())
+    }
+
     /// Opt in to model and thinking-level selection events.
     fn handles_model_selection(&self) -> bool {
         false

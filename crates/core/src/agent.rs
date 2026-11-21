@@ -2932,6 +2932,15 @@ impl Agent<'_> {
         let mut reasoning_item_ids = HashSet::new();
         let mut observed_reasoning = std::collections::HashMap::<u64, String>::new();
         let mut reasoning_final_bytes = 0_usize;
+        let response_hooks = retain_reply
+            .then(|| {
+                crate::provider_response::ResponseHooks::for_session(
+                    self.registry,
+                    session,
+                    self.limits.model_timeout,
+                )
+            })
+            .flatten();
         let collect = async {
             let session_id = session.session_id();
             let external_id = session.external_session_id();
@@ -2953,6 +2962,8 @@ impl Agent<'_> {
                         .await
                 }
             };
+            let opening =
+                crate::provider_response::ResponseHooks::scope(response_hooks.clone(), opening);
             tokio::pin!(opening);
             let mut stream = loop {
                 tokio::select! {
@@ -2962,7 +2973,7 @@ impl Agent<'_> {
             };
             loop {
                 let event = tokio::select! {
-                    event = stream.next() => event,
+                    event = crate::provider_response::ResponseHooks::scope(response_hooks.clone(), stream.next()) => event,
                     Some(input) = receive_input(&mut inputs) => {
                         queue_input(session, input.into(), observer)?;
                         continue;
@@ -3181,6 +3192,9 @@ impl Agent<'_> {
             result = platform_time::timeout(self.limits.model_timeout, collect) =>
                 result.unwrap_or_else(|_| Err(Error::RetryableModel("request timed out".into()))),
         };
+        if let Some(hooks) = response_hooks {
+            hooks.report_errors(observer);
+        }
         let content = if result.is_ok() {
             String::new()
         } else {

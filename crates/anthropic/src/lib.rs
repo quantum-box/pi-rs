@@ -761,7 +761,11 @@ async fn is_permanent_quota(mut response: Response, secrets: &[String]) -> bool 
 }
 
 async fn send(request: reqwest::RequestBuilder, secrets: &[String]) -> Result<Response> {
-    let response = request.send().await.map_err(|error| {
+    check_status(send_http(request).await?, secrets).await
+}
+
+async fn send_http(request: reqwest::RequestBuilder) -> Result<Response> {
+    request.send().await.map_err(|error| {
         Error::RetryableModel(
             if error.is_timeout() && !error.is_connect() {
                 "HTTP idle timeout"
@@ -770,7 +774,10 @@ async fn send(request: reqwest::RequestBuilder, secrets: &[String]) -> Result<Re
             }
             .into(),
         )
-    })?;
+    })
+}
+
+async fn check_status(response: Response, secrets: &[String]) -> Result<Response> {
     let status = response.status();
     if status.is_success() {
         Ok(response)
@@ -1750,7 +1757,15 @@ impl Anthropic {
         } else {
             request
         };
-        let response = send(self.authenticate(request), &error_secrets).await?;
+        let response = send_http(self.authenticate(request)).await?;
+        pi_rs_core::observe_provider_response(
+            response.status(),
+            response.headers(),
+            &error_secrets,
+            &self.headers,
+        )
+        .await;
+        let response = check_status(response, &error_secrets).await?;
         if !response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)

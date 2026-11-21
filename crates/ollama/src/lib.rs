@@ -1128,6 +1128,13 @@ impl Ollama {
                 }
             }
         };
+        pi_rs_core::observe_provider_response(
+            response.status(),
+            response.headers(),
+            &error_secrets,
+            &self.headers,
+        )
+        .await;
         if !response.status().is_success() {
             let status = response.status();
             let description = format!("HTTP status {status}");
