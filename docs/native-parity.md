@@ -5438,7 +5438,9 @@ the agent remain governed by the configured SDK policy.
 
 Pi's non-chat System One provider-level policy retries transient HTTP status
 codes including 429 without classifying the response body; native keeps that
-separate policy.
+separate policy. A single `x-should-retry` value of `true` or `false` overrides
+the status rule. Repeated values fall back to the status, and the rule covers
+server statuses from 500 upward, as in Pi.
 
 ### Provider quota retry classification
 
