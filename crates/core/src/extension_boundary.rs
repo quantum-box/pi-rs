@@ -1188,7 +1188,7 @@ mod tests {
         ));
         assert!(model.requests.lock().unwrap().is_empty());
 
-        let records = failed.records()[..failed.records().len() - 2].to_vec();
+        let records = failed.records()[..response.id as usize - 1].to_vec();
         let metadata = records
             .iter()
             .filter_map(|record| {
