@@ -115,6 +115,12 @@ pub struct Editor {
     scroll_offset: usize,
     jump_forward: Option<bool>,
 }
+enum InputMode {
+    Text,
+    TranscriptSearch,
+    SettingsSearch,
+}
+
 impl Editor {
     fn remember(&mut self) {
         self.undo.push(Snapshot {
@@ -392,14 +398,18 @@ impl Editor {
     }
 
     pub fn action(&mut self, action: &str) -> bool {
-        self.action_inner(action, false)
+        self.action_inner(action, InputMode::Text)
     }
 
     pub(super) fn search_action(&mut self, action: &str) -> bool {
-        self.action_inner(action, true)
+        self.action_inner(action, InputMode::TranscriptSearch)
     }
 
-    fn action_inner(&mut self, action: &str, search: bool) -> bool {
+    pub(super) fn settings_search_action(&mut self, action: &str) -> bool {
+        self.action_inner(action, InputMode::SettingsSearch)
+    }
+
+    fn action_inner(&mut self, action: &str, mode: InputMode) -> bool {
         if !matches!(
             action,
             "tui.editor.deleteWordBackward"
@@ -469,10 +479,10 @@ impl Editor {
             "tui.editor.yank" => {
                 if let Some(text) = self.kills.first().cloned() {
                     let start = self.cursor;
-                    if search {
-                        self.insert_search(&text);
-                    } else {
-                        self.insert(&text);
+                    match mode {
+                        InputMode::Text => self.insert(&text),
+                        InputMode::TranscriptSearch => self.insert_search(&text),
+                        InputMode::SettingsSearch => self.insert_settings_search(&text),
                     }
                     self.yank = Some((start..self.cursor, 0));
                 }

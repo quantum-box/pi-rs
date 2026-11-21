@@ -1015,7 +1015,7 @@ impl Picker {
             && action.starts_with("tui.editor.")
         {
             let previous = self.query.text.clone();
-            if self.query.search_action(action) {
+            if self.query.settings_search_action(action) {
                 if self.query.text != previous {
                     self.selected = 0;
                 }
@@ -2599,6 +2599,23 @@ mod tests {
                 .sum::<usize>()
                 <= 27
         );
+    }
+
+    #[test]
+    fn settings_search_yank_preserves_the_original_query() {
+        let mut picker = Picker::new("Settings", vec![]);
+        let keys = Keys::default();
+        picker.paste("http\u{1b}timeout");
+        picker.input(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &keys,
+        );
+        assert!(picker.query.text.is_empty());
+        picker.input(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &keys,
+        );
+        assert_eq!(picker.query.text, "http\u{1b}timeout");
     }
 
     #[test]
