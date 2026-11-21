@@ -4396,7 +4396,9 @@ If cancellation arrives during a message callback, that delivery can finish
 and subsequent inputs remain queued. An interruption before the journal
 append can replay callbacks for an undelivered input. Initial text callbacks
 run before the model turn starts. Multimodal prompts are staged before the
-correlated run and emit their callbacks at staging time.
+correlated run and emit their callbacks at staging time. Inputs already ready
+at run start use the initial extension registry. Turn-time delivery uses the
+registry refreshed for that turn.
 Rust hosts applying queued inputs outside a run can await
 `Agent::apply_queued_inputs_with_lifecycle` to dispatch these hooks.
 

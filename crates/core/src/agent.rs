@@ -490,10 +490,7 @@ impl Agent<'_> {
         let mut accepted = false;
         for event in pending_input_events(session, include_followups) {
             if cancel.is_cancelled() {
-                if accepted {
-                    notify_queue(session, observer);
-                }
-                return Err(Error::Cancelled);
+                break;
             }
             let mut event = event?;
             if matches!(event, Event::User { .. } | Event::UserWithImages { .. }) {
@@ -504,6 +501,9 @@ impl Agent<'_> {
         }
         if accepted {
             notify_queue(session, observer);
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
         }
         Ok(accepted)
     }
@@ -2268,24 +2268,24 @@ impl Agent<'_> {
                 if cancel.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
-                let compact_agent = Agent {
+                let current_agent = Agent {
                     registry: &runtime_registry,
                     system_prompt: &runtime_prompt,
                     model: self.model,
                     model_name: self.model_name,
                     limits: self.limits.clone(),
                 };
-                if compact_agent
+                if current_agent
                     .deliver_inputs(session, false, cancel, observer)
                     .await?
                 {
                     continue;
                 }
-                if !compact_agent
+                if !current_agent
                     .deliver_inputs(session, true, cancel, observer)
                     .await?
                 {
-                    compact_agent
+                    current_agent
                         .compact_silent_overflow(
                             session, run_id, &states, cancel, observer, followups,
                         )

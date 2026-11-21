@@ -1032,36 +1032,46 @@ mod tests {
             }
         }
 
-        let cancel = CancellationToken::new();
-        let mut registry = Registry::default();
-        registry
-            .register(Arc::new(StopDelivery(cancel.clone())))
-            .unwrap();
-        let model = TextModel(std::sync::atomic::AtomicUsize::new(0));
-        let agent = Agent {
-            model: &model,
-            model_name: "fixture",
-            registry: &registry,
-            system_prompt: "",
-            limits: Limits::default(),
-        };
-        let mut session = Session::with_store(MemoryStore::default()).unwrap();
-        let first = crate::QueuedInput::from("first".to_owned());
-        let second = crate::QueuedInput::from("second".to_owned());
-        for input in [first.clone(), second.clone()] {
-            session.append(Event::InputQueued { input }).unwrap();
+        for queue_more in [false, true] {
+            let cancel = CancellationToken::new();
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(StopDelivery(cancel.clone())))
+                .unwrap();
+            let model = TextModel(std::sync::atomic::AtomicUsize::new(0));
+            let agent = Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits::default(),
+            };
+            let mut session = Session::with_store(MemoryStore::default()).unwrap();
+            let first = crate::QueuedInput::from("first".to_owned());
+            session
+                .append(Event::InputQueued {
+                    input: first.clone(),
+                })
+                .unwrap();
+            let mut remaining = Vec::new();
+            if queue_more {
+                let second = crate::QueuedInput::from("second".to_owned());
+                session
+                    .append(Event::InputQueued {
+                        input: second.clone(),
+                    })
+                    .unwrap();
+                remaining.push(crate::QueuedMessage::from(second));
+            }
+            let delivery = agent
+                .apply_queued_inputs_with_lifecycle(&mut session, &cancel, &mut |_| {})
+                .await;
+            assert!(matches!(delivery, Err(crate::Error::Cancelled)));
+            assert_eq!(session.queued_inputs(), remaining);
+            assert!(
+                matches!(&session.records().last().unwrap().event, Event::User { input_id: Some(id), .. } if *id == first.id)
+            );
         }
-        let delivery = agent
-            .apply_queued_inputs_with_lifecycle(&mut session, &cancel, &mut |_| {})
-            .await;
-        assert!(matches!(delivery, Err(crate::Error::Cancelled)));
-        assert_eq!(
-            session.queued_inputs(),
-            [crate::QueuedMessage::from(second)]
-        );
-        assert!(
-            matches!(&session.records().last().unwrap().event, Event::User { input_id: Some(id), .. } if *id == first.id)
-        );
     }
 
     #[tokio::test]
