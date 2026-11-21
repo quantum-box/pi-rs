@@ -12,10 +12,11 @@ use crate::{
 };
 
 const PLAN_FORMAT: &str = "pi-rs:before-settle-plan-v1";
+const TURN_PLAN_FORMAT: &str = "pi-rs:turn-end-plan-v1";
 const ACTIVITY_FORMAT: &str = "pi-rs:before-settle-activity-v1";
 
 pub(crate) fn is_marker(format: &str) -> bool {
-    matches!(format, PLAN_FORMAT | ACTIVITY_FORMAT)
+    matches!(format, PLAN_FORMAT | TURN_PLAN_FORMAT | ACTIVITY_FORMAT)
 }
 
 pub(crate) fn validate_navigation(session: &Session, target: u64) -> Result<()> {
@@ -25,9 +26,13 @@ pub(crate) fn validate_navigation(session: &Session, target: u64) -> Result<()> 
             .into_iter()
             .rev()
             .find_map(|record| match &record.event {
-                Event::SourceEntry { format, entry } if format == PLAN_FORMAT => entry["entries"]
-                    .as_array()
-                    .map(|entries| record.id.saturating_add(entries.len() as u64)),
+                Event::SourceEntry { format, entry }
+                    if matches!(format.as_str(), PLAN_FORMAT | TURN_PLAN_FORMAT) =>
+                {
+                    entry["entries"]
+                        .as_array()
+                        .map(|entries| record.id.saturating_add(entries.len() as u64))
+                }
                 _ => None,
             });
     if boundary_end.is_some_and(|end| target < end) {
@@ -68,6 +73,8 @@ struct BoundaryPlan {
     entries: Vec<BoundaryDraft>,
     should_continue: bool,
     settled: BoundaryResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_record: Option<u64>,
 }
 
 /// The result returned to the caller if the planned boundary stops the run.
@@ -123,7 +130,9 @@ impl BoundaryResult {
 
 pub(crate) enum RecoveredBoundary {
     Continue { activity_started: bool },
-    Stop(Result<String>),
+    TurnContinue,
+    ProviderFailure(Error),
+    Stop { result: Result<String>, ended: bool },
 }
 
 pub(crate) fn recover_agent_before_settle(
@@ -132,6 +141,10 @@ pub(crate) fn recover_agent_before_settle(
     observer: &mut Observer<'_>,
 ) -> Result<Option<RecoveredBoundary>> {
     let mut activity_started = false;
+    let mut terminal_failure = None;
+    let mut observed_completion = false;
+    let recovering_compaction =
+        crate::agent::resumable_compaction_run(session).is_some_and(|(id, _, _)| id == run_id);
     for record in session.branch().into_iter().rev() {
         if record.run_id != Some(run_id) {
             continue;
@@ -142,15 +155,39 @@ pub(crate) fn recover_agent_before_settle(
                     crate::RunState::Completed | crate::RunState::Cancelled | crate::RunState::Failed,
                 ..
             }
-            | Event::TurnFinished { .. }
             | Event::Assistant { .. } => break,
+            Event::ModelFinished { failure, .. }
+                if !observed_completion && !recovering_compaction =>
+            {
+                observed_completion = true;
+                terminal_failure = match failure {
+                    Some(crate::ModelFailure::Failed) => {
+                        Some(Error::Model("saved continuation request failed".into()))
+                    }
+                    Some(crate::ModelFailure::Cancelled) => Some(Error::Cancelled),
+                    Some(crate::ModelFailure::Retryable) | None => None,
+                };
+            }
             Event::SourceEntry { format, .. } if format == ACTIVITY_FORMAT => {
                 activity_started = true;
             }
-            Event::SourceEntry { format, entry } if format == PLAN_FORMAT => {
+            Event::SourceEntry { format, entry }
+                if matches!(format.as_str(), PLAN_FORMAT | TURN_PLAN_FORMAT) =>
+            {
                 let marker = record.id;
+                let turn = format == TURN_PLAN_FORMAT;
                 let plan: BoundaryPlan = serde_json::from_value(entry.clone())?;
                 persist_plan_suffix(session, marker, &plan, observer)?;
+                if (turn || activity_started)
+                    && let Some(error) = terminal_failure
+                {
+                    return Ok(Some(RecoveredBoundary::ProviderFailure(error)));
+                }
+                if turn {
+                    return Ok(plan
+                        .should_continue
+                        .then_some(RecoveredBoundary::TurnContinue));
+                }
                 if session.ensure_settled().is_ok() {
                     crate::agent::apply_settled_after_turn(session, observer)?;
                 }
@@ -286,6 +323,77 @@ pub struct AgentBeforeSettle {
     #[serde(rename = "continue")]
     pub should_continue: bool,
     pub context: BoundaryContext,
+}
+
+/// Actionable turn boundary over the just-persisted assistant and tool results.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnEndBoundary {
+    pub run_id: uuid::Uuid,
+    pub turn_index: u32,
+    pub message_entry_id: u64,
+    pub message: Message,
+    pub tool_result_entry_ids: Vec<u64>,
+    pub tool_results: Vec<LifecycleMessage>,
+    pub outcome: AgentActivityOutcome,
+    pub entries: Vec<BoundaryDraft>,
+    #[serde(rename = "continue")]
+    pub should_continue: bool,
+    pub context: BoundaryContext,
+}
+
+enum StructuralBoundary {
+    Settle(AgentBeforeSettle),
+    Turn(TurnEndBoundary),
+}
+
+impl StructuralBoundary {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Settle(_) => "agent_before_settle",
+            Self::Turn(_) => "turn_end",
+        }
+    }
+
+    fn format(&self) -> &'static str {
+        match self {
+            Self::Settle(_) => PLAN_FORMAT,
+            Self::Turn(_) => TURN_PLAN_FORMAT,
+        }
+    }
+
+    fn proposal(&mut self) -> (&mut Vec<BoundaryDraft>, &mut bool, &mut BoundaryContext) {
+        match self {
+            Self::Settle(event) => (
+                &mut event.entries,
+                &mut event.should_continue,
+                &mut event.context,
+            ),
+            Self::Turn(event) => (
+                &mut event.entries,
+                &mut event.should_continue,
+                &mut event.context,
+            ),
+        }
+    }
+
+    fn supported_by(&self, extension: &dyn crate::Extension) -> bool {
+        match self {
+            Self::Settle(_) => extension.handles_agent_before_settle(),
+            Self::Turn(_) => extension.handles_turn_end_boundary(),
+        }
+    }
+
+    async fn call(
+        &self,
+        extension: &dyn crate::Extension,
+        state: Option<&crate::ExtensionState>,
+    ) -> ExtensionResult<BoundaryDecision> {
+        match self {
+            Self::Settle(event) => extension.agent_before_settle(event, state).await,
+            Self::Turn(event) => extension.turn_end_boundary(event, state).await,
+        }
+    }
 }
 
 /// Each supplied field replaces the previous handler's proposal. Omitted
@@ -480,11 +588,7 @@ pub(crate) async fn dispatch_agent_before_settle(
     timeout: Duration,
     observer: &mut Observer<'_>,
 ) -> Result<bool> {
-    let started = crate::runtime::time::Instant::now();
-    let hook_budget = timeout.min(Duration::from_secs(10));
-    let deadline = started + hook_budget;
-    let states = session.extension_states();
-    let mut event = AgentBeforeSettle {
+    let event = AgentBeforeSettle {
         outcome: if result.is_ok() {
             AgentActivityOutcome::Completed
         } else {
@@ -494,17 +598,193 @@ pub(crate) async fn dispatch_agent_before_settle(
         should_continue: false,
         context: context(session),
     };
-    let mut invalid_entries = None;
-    for extension in registry
+    persist_boundary(
+        registry,
+        session,
+        StructuralBoundary::Settle(event),
+        result,
+        cancel,
+        timeout,
+        observer,
+    )
+    .await
+}
+
+fn turn_plan_record(
+    session: &Session,
+    run_id: uuid::Uuid,
+    assistant_record: u64,
+) -> Option<&crate::Record> {
+    session.branch().into_iter().rev().find(|record| {
+        record.run_id == Some(run_id)
+            && matches!(&record.event, Event::SourceEntry { format, entry }
+                if format == TURN_PLAN_FORMAT && entry["turn_record"].as_u64() == Some(assistant_record))
+    })
+}
+
+pub(crate) fn recovered_turn_observation(
+    session: &Session,
+    run_id: uuid::Uuid,
+    assistant: u64,
+    include: impl Fn(u64) -> bool,
+) -> Vec<LifecycleMessage> {
+    let Some(parent) =
+        turn_plan_record(session, run_id, assistant).and_then(|record| record.parent)
+    else {
+        return crate::lifecycle::messages(session, include);
+    };
+    session
+        .current_message_entries_at(parent)
+        .into_iter()
+        .filter(|(id, _)| include(*id))
+        .map(|(record_id, mut message)| {
+            if let Message::Assistant { replay, .. } = &mut message {
+                *replay = None;
+            }
+            LifecycleMessage { record_id, message }
+        })
+        .collect()
+}
+
+/// Dispatch a completed native turn before notifying observational handlers.
+pub(crate) async fn dispatch_turn_end(
+    registry: &Registry,
+    session: &mut Session,
+    turn: (uuid::Uuid, u32, u64),
+    cancel: &crate::CancellationToken,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+) -> Result<bool> {
+    let (run_id, turn_index, message_entry_id) = turn;
+    if let Some(record) = turn_plan_record(session, run_id, message_entry_id) {
+        let Event::SourceEntry { entry, .. } = &record.event else {
+            unreachable!()
+        };
+        let plan: BoundaryPlan = serde_json::from_value(entry.clone())?;
+        return persist_plan_suffix(session, record.id, &plan, observer);
+    }
+    if !registry
         .extensions
         .iter()
-        .filter(|ext| ext.handles_agent_before_settle())
+        .any(|extension| extension.handles_turn_end_boundary())
     {
+        return Ok(false);
+    }
+
+    let Event::Assistant {
+        content,
+        invocations,
+        ..
+    } = &session.records()[(message_entry_id - 1) as usize].event
+    else {
+        return Err(Error::Session(
+            "turn boundary assistant record is missing".into(),
+        ));
+    };
+    let message = Message::Assistant {
+        content: content.clone(),
+        calls: invocations
+            .iter()
+            .map(|invocation| invocation.call.clone())
+            .collect(),
+        replay: None,
+    };
+    let branch = session.branch();
+    let next_assistant = branch.iter().find_map(|record| {
+        (record.id > message_entry_id
+            && record.run_id == Some(run_id)
+            && matches!(record.event, Event::Assistant { .. }))
+        .then_some(record.id)
+    });
+    let tool_results: Vec<_> = crate::lifecycle::messages(session, |id| {
+        id > message_entry_id
+            && next_assistant.is_none_or(|end| id < end)
+            && session.records()[(id - 1) as usize].run_id == Some(run_id)
+    })
+    .into_iter()
+    .filter(|entry| matches!(entry.message, Message::Tool { .. }))
+    .collect();
+    let outcome = if cancel.is_cancelled() {
+        AgentActivityOutcome::Aborted
+    } else if crate::journal::failed_assistant_records(&branch).contains(&message_entry_id) {
+        AgentActivityOutcome::Error
+    } else {
+        AgentActivityOutcome::Completed
+    };
+    let mut preview = context(session);
+    preview.can_continue |= !preview.pending_messages.is_empty();
+    let event = TurnEndBoundary {
+        run_id,
+        turn_index,
+        message_entry_id,
+        message,
+        tool_result_entry_ids: tool_results.iter().map(|result| result.record_id).collect(),
+        tool_results,
+        outcome,
+        entries: Vec::new(),
+        should_continue: false,
+        context: preview,
+    };
+    let result = Ok(String::new());
+    persist_boundary(
+        registry,
+        session,
+        StructuralBoundary::Turn(event),
+        &result,
+        cancel,
+        timeout,
+        observer,
+    )
+    .await
+}
+
+pub(crate) fn turn_continuation_is_runnable(
+    session: &Session,
+    requested: bool,
+    observer: &mut Observer<'_>,
+) -> bool {
+    if !requested {
+        return false;
+    }
+    let preview = context(session);
+    if preview.can_continue || !preview.pending_messages.is_empty() {
+        return true;
+    }
+    report_event(
+        "turn_end",
+        "<boundary>",
+        "continuation requires runnable model context",
+        observer,
+    );
+    false
+}
+
+async fn persist_boundary(
+    registry: &Registry,
+    session: &mut Session,
+    mut event: StructuralBoundary,
+    result: &Result<String>,
+    cancel: &crate::CancellationToken,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+) -> Result<bool> {
+    let started = crate::runtime::time::Instant::now();
+    let hook_budget = timeout.min(Duration::from_secs(10));
+    let deadline = started + hook_budget;
+    let states = session.extension_states();
+    let kind = event.kind();
+    let format = event.format();
+    let mut invalid_entries = None;
+    for extension in &registry.extensions {
+        if !event.supported_by(extension.as_ref()) {
+            continue;
+        }
         if cancel.is_cancelled() {
             break;
         }
         if started.elapsed() >= hook_budget {
-            report(
+            report_event(
+                kind,
                 extension.id(),
                 "boundary handler deadline expired",
                 observer,
@@ -512,8 +792,8 @@ pub(crate) async fn dispatch_agent_before_settle(
             break;
         }
         let callback = std::panic::AssertUnwindSafe(async {
-            extension
-                .agent_before_settle(&event, states.get(extension.id()))
+            event
+                .call(extension.as_ref(), states.get(extension.id()))
                 .await
         })
         .catch_unwind();
@@ -523,42 +803,60 @@ pub(crate) async fn dispatch_agent_before_settle(
                 Ok(Err(_)) => Err("boundary handler panicked".into()),
                 Err(_) => Err("boundary handler timed out".into()),
             };
+        let (drafts, continuation, projection) = event.proposal();
         match result {
             Ok(decision) => {
                 if let Some(should_continue) = decision.should_continue {
-                    event.should_continue = should_continue;
+                    *continuation = should_continue;
                 }
                 if let Some(entries) = decision.entries {
-                    event.entries = entries;
-                    invalid_entries = match preview(session, &event.entries) {
-                        Ok(context) => {
-                            event.context = context;
+                    *drafts = entries;
+                    invalid_entries = match preview(session, drafts) {
+                        Ok(mut context) => {
+                            if format == TURN_PLAN_FORMAT && !context.pending_messages.is_empty() {
+                                context.can_continue = true;
+                            }
+                            *projection = context;
                             None
                         }
                         Err(error) => Some(format!("invalid boundary entries: {error}")),
                     };
                 }
             }
-            Err(error) => report(extension.id(), &error, observer),
+            Err(error) => report_event(kind, extension.id(), &error, observer),
         }
         if let Some(error) = &invalid_entries {
-            report(extension.id(), error, observer);
+            report_event(kind, extension.id(), error, observer);
         }
     }
     if invalid_entries.is_some() {
         return Ok(false);
     }
     let cancelled = cancel.is_cancelled();
-    let should_continue = !cancelled && event.should_continue;
-    let plan = BoundaryPlan {
-        entries: event.entries,
-        should_continue,
-        settled: BoundaryResult::capture(session, result, cancelled),
+    let turn_record = match &event {
+        StructuralBoundary::Turn(turn) => Some(turn.message_entry_id),
+        StructuralBoundary::Settle(_) => None,
     };
-    let marker = plan_marker(serde_json::to_value(&plan)?);
+    let hard_exit = matches!(&event, StructuralBoundary::Turn(turn)
+        if !matches!(turn.outcome, AgentActivityOutcome::Completed));
+    let (entries, continuation, _) = event.proposal();
+    let plan = BoundaryPlan {
+        entries: std::mem::take(entries),
+        should_continue: !cancelled && !hard_exit && *continuation,
+        settled: turn_record.map_or_else(
+            || BoundaryResult::capture(session, result, cancelled),
+            BoundaryResult::AnswerAt,
+        ),
+        turn_record,
+    };
+    let marker = Event::SourceEntry {
+        format: format.into(),
+        entry: serde_json::to_value(&plan)?,
+    };
     // Catch deterministic store limits before writing the plan itself.
     if let Err(error) = session.extension_boundary_snapshot().append(marker.clone()) {
-        report(
+        report_event(
+            kind,
             "<boundary>",
             &format!("cannot persist boundary plan: {error}"),
             observer,
@@ -667,6 +965,14 @@ fn matches_committed_draft(draft: &BoundaryDraft, event: &Event, metadata: Optio
     }
 }
 
+fn report_event(kind: &'static str, extension: &str, message: &str, observer: &mut Observer<'_>) {
+    observer(Notification::ExtensionLifecycleError {
+        extension,
+        event: kind,
+        message,
+    });
+}
+
 fn report(extension: &str, message: &str, observer: &mut Observer<'_>) {
     observer(Notification::ExtensionLifecycleError {
         extension,
@@ -681,6 +987,218 @@ mod tests {
 
     use super::*;
     use crate::{Extension, MemoryStore};
+
+    #[tokio::test]
+    async fn actionable_turn_end_continues_without_new_input_and_replays_the_durable_plan() {
+        struct Model {
+            requests: Mutex<Vec<crate::ModelRequest>>,
+            responses: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl crate::Model for Model {
+            async fn stream(&self, request: crate::ModelRequest) -> Result<crate::ModelStream> {
+                let turn = self
+                    .responses
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.requests.lock().unwrap().push(request);
+                let answer = if turn == 0 {
+                    "replace this"
+                } else {
+                    "final answer"
+                };
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(crate::ModelEvent::Text(answer.into())),
+                    Ok(crate::ModelEvent::Complete {
+                        calls: Vec::new(),
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+
+        struct Replace(Arc<Mutex<Vec<Vec<u64>>>>);
+        #[async_trait::async_trait]
+        impl Extension for Replace {
+            fn id(&self) -> &str {
+                "replace-turn"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+
+            async fn lifecycle(
+                &self,
+                event: &crate::LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+            ) -> ExtensionResult<()> {
+                if let crate::LifecycleEvent::TurnEnd { messages, .. } = event {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push(messages.iter().map(|message| message.record_id).collect());
+                }
+                Ok(())
+            }
+
+            fn handles_turn_end_boundary(&self) -> bool {
+                true
+            }
+            async fn turn_end_boundary(
+                &self,
+                event: &TurnEndBoundary,
+                _: Option<&crate::ExtensionState>,
+            ) -> ExtensionResult<BoundaryDecision> {
+                if event.turn_index != 0 {
+                    return Ok(BoundaryDecision::default());
+                }
+                assert!(
+                    matches!(&event.message, Message::Assistant { content, .. } if content == "replace this")
+                );
+                assert!(event.tool_result_entry_ids.is_empty());
+                Ok(BoundaryDecision {
+                    entries: Some(vec![BoundaryDraft::ContextEdit {
+                        target_id: event.message_entry_id,
+                        replacement: None,
+                    }]),
+                    should_continue: Some(true),
+                })
+            }
+        }
+
+        let model = Model {
+            requests: Mutex::default(),
+            responses: 0.into(),
+        };
+        let mut registry = Registry::default();
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        registry
+            .register(Arc::new(Replace(observations.clone())))
+            .unwrap();
+        let agent = crate::Agent {
+            model: &model,
+            registry: &registry,
+            model_name: "fixture",
+            system_prompt: "help",
+            limits: Default::default(),
+        };
+        let mut journal = Session::with_store(MemoryStore::default()).unwrap();
+        let (_, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+        let run = uuid::Uuid::new_v4();
+        let cancel = crate::CancellationToken::new();
+        assert_eq!(
+            agent
+                .run_correlated(
+                    &mut journal,
+                    run,
+                    Some("review".into()),
+                    &mut inputs,
+                    &cancel,
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "final answer"
+        );
+        {
+            let requests = model.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                !requests[1]
+                    .messages
+                    .iter()
+                    .any(|message| matches!(message, Message::Assistant { .. }))
+            );
+        }
+        let marker = journal.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == TURN_PLAN_FORMAT)).unwrap().id;
+        let before_drafts = observations.lock().unwrap()[0].clone();
+        assert_eq!(before_drafts.len(), 1);
+        let finished = journal
+            .records()
+            .iter()
+            .find(|record| record.id > marker && matches!(record.event, Event::TurnFinished { .. }))
+            .unwrap()
+            .id;
+        for cutoff in [marker, finished] {
+            let records = journal.records()[..cutoff as usize].to_vec();
+            let metadata = records
+                .iter()
+                .filter_map(|record| {
+                    journal
+                        .record_metadata(record.id)
+                        .cloned()
+                        .map(|value| (record.id, value))
+                })
+                .collect();
+            let mut restored = Session::from_records_with_metadata(records, metadata).unwrap();
+            model.requests.lock().unwrap().clear();
+            observations.lock().unwrap().clear();
+            assert_eq!(
+                agent
+                    .run_correlated(&mut restored, run, None, &mut inputs, &cancel, &mut |_| {})
+                    .await
+                    .unwrap(),
+                "final answer"
+            );
+            assert_eq!(model.requests.lock().unwrap().len(), 1);
+            if cutoff == marker {
+                assert_eq!(observations.lock().unwrap()[0], before_drafts);
+            }
+            assert_eq!(
+                restored
+                    .records()
+                    .iter()
+                    .filter(|record| matches!(record.event, Event::ContextEdited { .. }))
+                    .count(),
+                1
+            );
+        }
+        let response = journal
+            .records()
+            .iter()
+            .find(|record| {
+                record.id > finished && matches!(record.event, Event::ModelFinished { .. })
+            })
+            .unwrap();
+        let records = journal.records()[..response.id as usize - 1].to_vec();
+        let metadata = records
+            .iter()
+            .filter_map(|record| {
+                journal
+                    .record_metadata(record.id)
+                    .cloned()
+                    .map(|value| (record.id, value))
+            })
+            .collect();
+        let mut failed = Session::from_records_with_metadata(records, metadata).unwrap();
+        let mut event = response.event.clone();
+        let Event::ModelFinished { failure, reply, .. } = &mut event else {
+            unreachable!()
+        };
+        *failure = Some(crate::ModelFailure::Failed);
+        *reply = None;
+        failed.set_run_id(Some(run));
+        failed.append(event).unwrap();
+        failed.set_run_id(None);
+        model.requests.lock().unwrap().clear();
+        assert!(matches!(
+            agent
+                .run_correlated(&mut failed, run, None, &mut inputs, &cancel, &mut |_| {})
+                .await,
+            Err(Error::Model(_))
+        ));
+        assert!(model.requests.lock().unwrap().is_empty());
+
+        journal.checkout(marker + 1).unwrap();
+        assert_eq!(journal.pending_extension_boundary_run(), None);
+        assert_eq!(
+            agent
+                .run_correlated(&mut journal, run, None, &mut inputs, &cancel, &mut |_| {})
+                .await
+                .unwrap(),
+            "replace this"
+        );
+        assert!(model.requests.lock().unwrap().is_empty());
+    }
 
     #[derive(Default)]
     struct CaptureModel(Mutex<Vec<crate::ModelRequest>>);
@@ -1352,6 +1870,7 @@ mod tests {
             ],
             should_continue: true,
             settled: BoundaryResult::Answer("prior answer".into()),
+            turn_record: None,
         };
         let marker_id = session
             .append(plan_marker(serde_json::to_value(&plan).unwrap()))

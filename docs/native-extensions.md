@@ -192,6 +192,13 @@ entries. A continuation runs within the original run's request and token
 limits. Cancelling during delivery of this callback preserves valid entries
 and suppresses continuation.
 
+Use `handles_turn_end_boundary` and `turn_end_boundary` for structural
+changes to the completed turn. The callback sees the assistant record and
+tool-result IDs before observational `turn_end` delivery. It uses the same
+draft types and ordered validation as settlement. Continuing shares the
+existing turn loop with tool results and queued input, so a natural next
+provider request also satisfies the decision.
+
 Executable extensions negotiate the callback capability in their description.
 `AgentSession::resume` recovers a saved plan under the original run ID,
 including proposals interrupted partway through persistence. Hosts that drive

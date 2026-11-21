@@ -1501,6 +1501,18 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    fn handles_turn_end_boundary(&self) -> bool {
+        false
+    }
+
+    async fn turn_end_boundary(
+        &self,
+        _event: &crate::TurnEndBoundary,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<crate::BoundaryDecision> {
+        Ok(crate::BoundaryDecision::default())
+    }
+
     fn handles_agent_before_settle(&self) -> bool {
         false
     }
