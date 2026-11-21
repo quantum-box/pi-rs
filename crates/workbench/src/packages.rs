@@ -1090,7 +1090,7 @@ pub(crate) fn resource_matches(
         pattern
     };
     #[cfg(windows)]
-    let windows_pattern = super::coding_paths::windows_shell_path(pattern);
+    let windows_pattern = pi_rs_workbench::windows_shell_path(pattern);
     #[cfg(windows)]
     let pattern = windows_pattern.as_str();
     // Pi normalizes home-relative paths and file URLs before matching both
@@ -1504,7 +1504,7 @@ fn normalize(source: &str, base: &Path) -> Result<String> {
         ));
     }
     #[cfg(windows)]
-    let windows_path = super::coding_paths::windows_shell_path(trimmed);
+    let windows_path = pi_rs_workbench::windows_shell_path(trimmed);
     #[cfg(windows)]
     let trimmed = windows_path.as_str();
     let path = if trimmed.starts_with("file://") {
