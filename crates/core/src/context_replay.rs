@@ -25,6 +25,7 @@ pub(crate) fn replacement_replay(
         ModelApi::AnthropicMessages
             | ModelApi::GoogleGenerativeAi
             | ModelApi::OpenaiResponses
+            | ModelApi::OpenaiCodexResponses
             | ModelApi::OpenaiCompletions
     ) {
         let identity = metadata.replay_identity.clone()?;
@@ -134,11 +135,12 @@ pub(crate) fn replacement_replay(
                     None
                 }
             }
-            (ModelApi::OpenaiResponses, ContentBlock::Text { text, .. }) => {
-                Some(json!({"role":"assistant","content":text}))
-            }
             (
-                ModelApi::OpenaiResponses,
+                ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses,
+                ContentBlock::Text { text, .. },
+            ) => Some(json!({"role":"assistant","content":text})),
+            (
+                ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses,
                 ContentBlock::Thinking {
                     thinking_signature, ..
                 },
@@ -190,7 +192,7 @@ pub(crate) fn replacement_replay(
                     }
                     Some(part)
                 }
-                ModelApi::OpenaiResponses => Some(
+                ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses => Some(
                     json!({"type":"function_call","call_id":id,"name":name,"arguments":arguments.to_string()}),
                 ),
                 _ => None,
@@ -474,6 +476,38 @@ mod tests {
             json!({"type":"reasoning","text":"reason","signature":"signature"})
         );
         assert!(bedrock.blocks.iter().all(|b| b["type"] != "tool_use"));
+    }
+
+    #[test]
+    fn codex_replacement_keeps_text_around_signed_reasoning() {
+        let reasoning = json!({"type":"reasoning","encrypted_content":"fixture"});
+        let replacement: ContextContent = serde_json::from_value(json!([
+            {"type":"text","text":"before"},
+            {"type":"thinking","thinking":"reason","thinkingSignature":reasoning.to_string()},
+            {"type":"text","text":"after"}
+        ]))
+        .unwrap();
+        let metadata = ModelMetadata {
+            provider_api: Some(ModelApi::OpenaiCodexResponses),
+            replay_identity: Some(ResolvedModelIdentity {
+                provider: endpoint_replay_scope(
+                    "openai-codex",
+                    "https://chatgpt.com/backend-api/codex/responses",
+                ),
+                model: "model".into(),
+            }),
+            ..Default::default()
+        };
+        let replay = replacement_replay(&replacement, &metadata, &[]).unwrap();
+        assert_eq!(
+            replay.blocks,
+            [
+                json!({"role":"assistant","content":"before"}),
+                reasoning,
+                json!({"role":"assistant","content":"after"}),
+                json!({"_pi_context_edit_api":"openai-codex-responses"})
+            ]
+        );
     }
 
     #[test]

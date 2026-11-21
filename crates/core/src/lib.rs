@@ -6,6 +6,7 @@ mod context;
 mod context_fingerprint;
 mod context_replay;
 mod extension;
+mod extension_boundary;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod host_auth;
 mod journal;
@@ -14,6 +15,7 @@ mod model_catalog;
 mod persistent_map;
 #[doc(hidden)]
 pub mod pi_import;
+mod provider_response;
 mod resource;
 mod retry;
 mod runtime;
@@ -32,6 +34,9 @@ pub use context::*;
 pub use context_fingerprint::protected_model_fingerprint;
 pub use context_replay::endpoint_replay_scope;
 pub use extension::*;
+pub use extension_boundary::{
+    AgentActivityOutcome, AgentBeforeSettle, BoundaryContext, BoundaryDecision, BoundaryDraft,
+};
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use host_auth::*;
 pub use journal::*;
@@ -44,6 +49,7 @@ pub use lifecycle::{
 };
 pub use model_catalog::*;
 pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};
+pub use provider_response::{ProviderResponseEvent, observe_provider_response};
 pub use resource::Resource;
 pub use retry::*;
 pub use sdk::*;
