@@ -1027,7 +1027,9 @@ fn limit_visible_output(
         Legacy, ReasoningDelta, ReasoningEnd, TextDelta, TextEnd,
     };
     Box::pin(async_stream::try_stream! {
-        let limit = u64::from(allowance);
+        // The provider's tokenizer is unknown. This is a runaway output guard,
+        // not a token counter. The agent uses reported usage for accounting.
+        let limit = u64::from(allowance).saturating_mul(128);
         let mut visible_units = 0_u64;
         let mut text = BTreeMap::new();
         let mut reasoning = BTreeMap::new();
@@ -1060,7 +1062,7 @@ fn limit_visible_output(
                 }
                 _ => {}
             }
-            if visible_units.div_ceil(4) > limit {
+            if visible_units > limit {
                 Err(Error::Budget)?;
             }
             yield event;
@@ -1411,7 +1413,7 @@ impl OpenAiResponses {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    async fn responses_without_a_wire_limit_enforce_the_visible_budget() {
+    async fn responses_without_a_wire_limit_bound_runaway_output() {
         use pi_rs_core::EnrichedModelEvent::{TextDelta, TextEnd};
         let events = vec![
             Ok(TextDelta {
@@ -1424,7 +1426,7 @@ mod tests {
             }),
             Ok(TextDelta {
                 index: 1,
-                delta: "over!".into(),
+                delta: "x".repeat(260),
             }),
         ];
         let mut stream = limit_visible_output(Box::pin(futures_util::stream::iter(events)), 2);
