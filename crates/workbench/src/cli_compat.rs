@@ -10,14 +10,15 @@ pub(super) type ExtensionFlags = BTreeMap<String, ExtensionFlagValue>;
 pub(super) fn parse(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<(ArgMatches, ExtensionFlags), clap::Error> {
-    parse_ordered(args).map(|(matches, flags, _)| (matches, flags))
+    parse_ordered(args, true).map(|(matches, flags, _)| (matches, flags))
 }
 
 pub(super) fn parse_ordered(
     args: impl IntoIterator<Item = OsString>,
+    defer_missing_pi_options: bool,
 ) -> Result<(ArgMatches, ExtensionFlags, Vec<String>), clap::Error> {
     let command = command();
-    let normalized = normalize(&command, args, false);
+    let normalized = normalize(&command, args, false, defer_missing_pi_options);
     Ok((
         command.try_get_matches_from(normalized.args)?,
         normalized.flags,
@@ -94,6 +95,7 @@ fn normalize(
     root: &Command,
     args: impl IntoIterator<Item = OsString>,
     metadata_ownership: bool,
+    defer_missing_pi_options: bool,
 ) -> NormalizedArguments {
     let mut input = args.into_iter().peekable();
     let mut output: Vec<_> = input.next().into_iter().collect();
@@ -286,7 +288,8 @@ fn normalize(
             let (name, attached) = long
                 .split_once('=')
                 .map_or((long, None), |(name, value)| (name, Some(value)));
-            let missing_pi_value = std::ptr::eq(command, root)
+            let missing_pi_value = defer_missing_pi_options
+                && std::ptr::eq(command, root)
                 && value == canonical
                 && canonical != "--name"
                 && attached.is_none()
@@ -591,10 +594,6 @@ pub(super) fn export_plan(args: &[OsString]) -> Option<ExportPlan> {
         if arg == "--export" {
             i += 1;
             if i == args.len() {
-                if saw_export {
-                    // An incomplete final export must never use an earlier input.
-                    input = Some(std::path::PathBuf::new());
-                }
                 validation.push(arg.clone());
                 break;
             }
@@ -731,7 +730,7 @@ pub(super) struct Metadata {
 
 pub(super) fn metadata(args: &[OsString]) -> Option<Metadata> {
     let command = command();
-    let normalized = normalize(&command, args.iter().cloned(), true);
+    let normalized = normalize(&command, args.iter().cloned(), true, false);
     if normalized.native_subcommand {
         return None;
     }

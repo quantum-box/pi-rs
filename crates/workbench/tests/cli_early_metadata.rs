@@ -733,6 +733,8 @@ fn missing_or_empty_last_export_never_falls_back_to_earlier_input() {
             &["--export"][..],
             &["--export="][..],
             &["--export", "missing.jsonl"][..],
+            &["--model"][..],
+            &["--provider"][..],
         ] {
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_pi"));
             cmd.current_dir(dir.path())
