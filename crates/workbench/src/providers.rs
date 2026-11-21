@@ -1645,8 +1645,10 @@ mod contention_tests {
             assert_eq!(client.uses_final_strict_policy(), expected, "{adapter:?}");
         }
         assert!(
-            !Client::Anthropic(Anthropic::new(endpoint, "fixture").unwrap())
-                .uses_final_strict_policy()
+            !Client::Anthropic(
+                Anthropic::new("http://127.0.0.1:1234/v1/messages", "fixture").unwrap()
+            )
+            .uses_final_strict_policy()
         );
         assert!(
             !Client::Google(pi_rs::google::Google::new(endpoint, "fixture").unwrap())

@@ -1014,13 +1014,13 @@ mod resource_origin_tests {
     #[test]
     fn runtime_final_strict_policy_is_limited_to_openai_adapters() {
         use clap::Parser;
-        for (api, expected) in [
-            ("openai-responses", true),
-            ("openai-completions", true),
-            ("anthropic-messages", false),
-            ("google-generative-ai", false),
+        for (api, path, expected) in [
+            ("openai-responses", "v1", true),
+            ("openai-completions", "v1", true),
+            ("anthropic-messages", "v1/messages", false),
+            ("google-generative-ai", "v1", false),
         ] {
-            let endpoint = "http://127.0.0.1:1234/v1";
+            let endpoint = format!("http://127.0.0.1:1234/{path}");
             let mut args = super::super::Cli::parse_from(["pi"]);
             args.model_profiles =
                 super::super::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{
@@ -1029,7 +1029,7 @@ mod resource_origin_tests {
                 .unwrap();
             args.provider = args.model_profiles.provider("fixture").unwrap();
             args.model = "a".into();
-            args.endpoint = endpoint.into();
+            args.endpoint = endpoint;
             args.api_key = Some("fixture".into());
             let model = model_client(&args, false, false).unwrap();
             assert_eq!(model.strict_policy.is_some(), expected, "{api}");
