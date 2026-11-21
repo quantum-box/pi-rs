@@ -3274,6 +3274,25 @@ mod tests {
             .unwrap();
         assert_eq!(model.mapped_effort("high"), Some(Some("high")));
         assert_eq!(model.mapped_effort("off"), Some(Some("none")));
+        assert_eq!(model.supports_images(), Some(true));
+        assert_eq!(
+            model.image_resize(),
+            Some(ImageResizeProfile {
+                max_width: Some(2000),
+                max_height: Some(2000),
+                max_bytes: Some(4_718_592),
+                jpeg_quality: Some(80),
+            })
+        );
+
+        let ministral = profiles.model(&provider, "ministral-3b-2512").unwrap();
+        assert_eq!(ministral.max_tokens, Some(131_072));
+
+        let large = profiles.model(&provider, "mistral-large-latest").unwrap();
+        assert_eq!(large.context_window, Some(1_048_576));
+        assert_eq!(large.reasoning, Some(true));
+        assert_eq!(large.mapped_effort("medium"), Some(Some("medium")));
+        assert_eq!(large.mapped_effort("off"), Some(None));
     }
 
     #[test]
