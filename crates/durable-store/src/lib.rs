@@ -1266,7 +1266,7 @@ impl Store {
                     "NULL",
                 ),
             ] {
-                let definition = format!("CREATE TRIGGER {name} {timing} {action} ON durable_store_entries WHEN substr({row}.key,1,13)=CAST('durable/task/' AS BLOB) OR substr({row}.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr({row}.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_history_v2(key,before_value,after_value) VALUES(CASE WHEN length({row}.key)>512 THEN X'' ELSE {row}.key END,CASE WHEN length({before})>65536 THEN X'' ELSE {before} END,CASE WHEN length({after})>65536 THEN X'' ELSE {after} END); END");
+                let definition = format!("CREATE TRIGGER {name} {timing} {action} ON durable_store_entries WHEN substr({row}.key,1,13)=CAST('durable/task/' AS BLOB) OR substr({row}.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr({row}.key,1,21)=CAST('runtime/conversation/' AS BLOB) BEGIN INSERT INTO durable_graph_history_v2(key,before_value,after_value) VALUES(CASE WHEN length({row}.key)>512 THEN X'' ELSE {row}.key END,CASE WHEN length({before})>16384 THEN X'' ELSE {before} END,CASE WHEN length({after})>16384 THEN X'' ELSE {after} END); END");
                 let existing: Option<String> = conn
                     .query_row(
                         "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
@@ -1288,7 +1288,7 @@ impl Store {
                 }
             }
             let prune_name = "durable_graph_history_v2_prune";
-            let prune_definition = "CREATE TRIGGER durable_graph_history_v2_prune AFTER INSERT ON durable_graph_history_v2 WHEN NEW.revision > 100000 BEGIN DELETE FROM durable_graph_history_v2 WHERE revision <= NEW.revision - 100000; END";
+            let prune_definition = "CREATE TRIGGER durable_graph_history_v2_prune AFTER INSERT ON durable_graph_history_v2 WHEN NEW.revision > 4096 BEGIN DELETE FROM durable_graph_history_v2 WHERE revision <= NEW.revision - 4096; END";
             let existing: Option<String> = conn
                 .query_row(
                     "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
@@ -1309,7 +1309,7 @@ impl Store {
                 None => conn.execute_batch(prune_definition)?,
             }
             let move_name = "durable_graph_history_v2_move";
-            let move_definition = "CREATE TRIGGER durable_graph_history_v2_move BEFORE UPDATE OF key ON durable_store_entries WHEN OLD.key != NEW.key AND (substr(OLD.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(OLD.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(OLD.key,1,21)=CAST('runtime/conversation/' AS BLOB) OR substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB)) BEGIN INSERT INTO durable_graph_history_v2(key,before_value,after_value) VALUES(CASE WHEN length(OLD.key)>512 THEN X'' ELSE OLD.key END,CASE WHEN length(OLD.value)>65536 THEN X'' ELSE OLD.value END,NULL); INSERT INTO durable_graph_history_v2(key,before_value,after_value) VALUES(CASE WHEN length(NEW.key)>512 THEN X'' ELSE NEW.key END,NULL,CASE WHEN length(NEW.value)>65536 THEN X'' ELSE NEW.value END); END";
+            let move_definition = "CREATE TRIGGER durable_graph_history_v2_move BEFORE UPDATE OF key ON durable_store_entries WHEN OLD.key != NEW.key AND (substr(OLD.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(OLD.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(OLD.key,1,21)=CAST('runtime/conversation/' AS BLOB) OR substr(NEW.key,1,13)=CAST('durable/task/' AS BLOB) OR substr(NEW.key,1,27)=CAST('durable/conversation-owner/' AS BLOB) OR substr(NEW.key,1,21)=CAST('runtime/conversation/' AS BLOB)) BEGIN INSERT INTO durable_graph_history_v2(key,before_value,after_value) VALUES(CASE WHEN length(OLD.key)>512 THEN X'' ELSE OLD.key END,CASE WHEN length(OLD.value)>16384 THEN X'' ELSE OLD.value END,NULL); INSERT INTO durable_graph_history_v2(key,before_value,after_value) VALUES(CASE WHEN length(NEW.key)>512 THEN X'' ELSE NEW.key END,NULL,CASE WHEN length(NEW.value)>16384 THEN X'' ELSE NEW.value END); END";
             let existing: Option<String> = conn
                 .query_row(
                     "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
@@ -3864,6 +3864,24 @@ mod graph_mutation_revision_tests {
     use super::*;
 
     #[test]
+    fn experimental_reopen_rejects_old_retention_trigger_without_rewriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old-retention.sqlite");
+        drop(Store::open(&path).unwrap());
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch("DROP TRIGGER durable_graph_history_v2_prune; CREATE TRIGGER durable_graph_history_v2_prune AFTER INSERT ON durable_graph_history_v2 WHEN NEW.revision > 100000 BEGIN DELETE FROM durable_graph_history_v2 WHERE revision <= NEW.revision - 100000; END;").unwrap();
+        assert!(matches!(Store::open(&path), Err(Error::InvalidSnapshot)));
+        let definition: String = old
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='durable_graph_history_v2_prune'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(definition.contains("100000"));
+    }
+
+    #[test]
     fn experimental_reopen_rejects_missing_v2_trigger() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing-v2.sqlite");
@@ -3914,7 +3932,7 @@ mod graph_mutation_revision_tests {
         let boundary = store.graph_history_v2_revision().unwrap();
         {
             let conn = store.connection.lock().unwrap();
-            conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000) INSERT INTO durable_graph_history_v2(key,before_value,after_value) SELECT ?1,NULL,?2 FROM n",rusqlite::params![&key,&value]).unwrap();
+            conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<4096) INSERT INTO durable_graph_history_v2(key,before_value,after_value) SELECT ?1,NULL,zeroblob(5000) FROM n",rusqlite::params![&key]).unwrap();
         }
         assert!(matches!(
             store.commit(
@@ -4021,7 +4039,7 @@ mod graph_mutation_revision_tests {
         let old = store.graph_history_v2_revision().unwrap();
         {
             let conn = store.connection.lock().unwrap();
-            conn.execute("INSERT INTO durable_graph_history_v2(revision,key,before_value,after_value) VALUES(100002,?1,NULL,?2)",rusqlite::params![&key,&value]).unwrap();
+            conn.execute("INSERT INTO durable_graph_history_v2(revision,key,before_value,after_value) VALUES(4098,?1,NULL,?2)",rusqlite::params![&key,&value]).unwrap();
         }
         assert!(matches!(
             store.commit(

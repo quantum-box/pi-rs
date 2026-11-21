@@ -422,8 +422,8 @@ The experimental `experimental-graph-scope` feature records before and after
 values for task, ownership-edge and conversation writes, including writes by
 older open SQLite connections. It checks the union of current and historical
 ownership paths so transient creation, deletion and reparenting are not lost.
-Malformed or oversized records and boundaries older than the last 100,000
-history entries fail closed. History values are limited to 64 KiB each and
+Malformed or oversized records and boundaries older than the last 4,096
+history entries fail closed. History values are limited to 16 KiB each and
 keys to 512 bytes; larger values also fail closed. Before loading graph data,
 the feature rejects scans exceeding 16 MiB or 100,000 current-plus-history
 records. These database-wide limits can conservatively hold a receipt even when
@@ -435,3 +435,8 @@ history.
 New databases opened without the experimental feature do not install either
 history. Existing v1 triggers are left in place: removing them while an older
 process is still using the database could invalidate that process's fences.
+The v2 row and value limits bound retained payloads to approximately 130 MiB
+plus SQLite index, page and WAL overhead. An older experimental v2 schema with
+different trigger definitions is rejected on reopen; mixed versions require
+coordination rather than automatic replacement. SQLite WAL growth can still
+exceed this bound while long-running readers prevent checkpointing.
