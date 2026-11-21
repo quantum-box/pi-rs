@@ -85,7 +85,7 @@ impl FinalStrictPolicy {
 }
 
 pub(super) fn session_affinity_headers(
-    names: &[&str],
+    names: &[&'static str],
     external_id: &str,
     configured: &HeaderMap,
 ) -> Result<HeaderMap> {

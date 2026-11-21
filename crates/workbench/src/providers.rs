@@ -582,7 +582,7 @@ impl Client {
     pub(super) async fn prepare_for_context_with_header_hook(
         &self,
         model: &str,
-        affinity: Option<(&[&str], &str)>,
+        affinity: Option<(&[&'static str], &str)>,
     ) -> Result<Option<(Client, Option<String>)>> {
         let (mut client, mut headers) = match self {
             Self::Deferred(deferred) => deferred.resolve_with_headers().await?,
