@@ -1089,7 +1089,8 @@ impl Picker {
             "accent",
         )];
         let items = self.matches();
-        let description = if self.title == "Settings" {
+        let settings = self.title == "Settings";
+        let description = if settings {
             items
                 .get(self.selected)
                 .and_then(|item| setting_description(&item.selection))
@@ -1151,12 +1152,17 @@ impl Picker {
         if let Some(limit) = self.completion_limit {
             available = available.min(limit);
         }
-        let scrolling = self.active_session.is_some() && items.len() > available;
+        const SETTINGS_MAX_ROWS: usize = 10;
+        let scrolling = (settings && items.len() > available.min(SETTINGS_MAX_ROWS))
+            || (self.active_session.is_some() && items.len() > available);
         if scrolling {
             available = available.saturating_sub(1).max(1);
         }
+        if settings {
+            available = available.min(SETTINGS_MAX_ROWS);
+        }
         self.page_size.set(available);
-        let start = if self.active_session.is_some() {
+        let start = if settings || self.active_session.is_some() {
             self.selected
                 .saturating_sub(available / 2)
                 .min(items.len().saturating_sub(available))
@@ -1356,6 +1362,8 @@ impl Picker {
             let message =
                 if self.active_session.is_some() && self.query.is_empty() && !self.all_workspaces {
                     "No sessions in current folder. Press Tab to view all."
+                } else if settings {
+                    "No matching settings"
                 } else {
                     "No matches"
                 };
@@ -2232,6 +2240,42 @@ mod tests {
             Input::UpdateModelScope { save: false }
         ));
         assert!(picker.model_scope().unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn settings_scroll_window_stays_centered_and_keeps_mouse_rows_aligned() {
+        let items = (0..19)
+            .map(|index| Item {
+                label: format!("Setting {index:02}"),
+                selection: Selection::EditSetting(format!("key{index}")),
+            })
+            .collect();
+        let mut picker = Picker::new("Settings", items);
+        let theme = Theme::system();
+        let keys = Keys::default();
+        let contains = |lines: &[Line], value: &str| {
+            lines
+                .iter()
+                .any(|line| line.spans.iter().any(|span| span.text.contains(value)))
+        };
+        for (selected, first) in [(0, 0), (8, 3), (18, 9)] {
+            picker.selected = selected;
+            let lines = picker.render(&theme, 80, 32, &keys);
+            assert!(contains(&lines, format!("({}/19)", selected + 1).as_str()));
+            assert_eq!(picker.mouse_layout.get(), (first, 10, 32));
+            for index in 0..19 {
+                assert_eq!(
+                    contains(&lines, format!("Setting {index:02}").as_str()),
+                    (first..first + 10).contains(&index)
+                );
+            }
+        }
+        let lines = picker.render(&theme, 80, 8, &keys);
+        assert!(lines.len() <= 8);
+        assert!(contains(&lines, "Setting 18"));
+        picker.paste("missing");
+        let lines = picker.render(&theme, 80, 32, &keys);
+        assert!(contains(&lines, "No matching settings"));
     }
 
     #[test]
