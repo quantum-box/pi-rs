@@ -118,11 +118,17 @@ impl Google {
         })
     }
 
-    /// Set the per-read HTTP idle timeout; `None` disables it.
-    /// Use Vertex AI's publisher model collection with a Cloud API key.
+    /// Use Vertex AI's publisher model collection with a Cloud API key or access token.
     pub fn with_vertex(mut self, bearer: bool) -> Result<Self> {
         self.vertex = true;
         self.probe_context = false;
+        if self.provider.as_ref() == "google" {
+            self.provider = Arc::from("google-vertex");
+        }
+        if self.replay_scope.as_ref() == "google" {
+            self.replay_scope =
+                pi_rs_core::endpoint_replay_scope("google-vertex", self.endpoint.as_str()).into();
+        }
         if bearer {
             let mut auth = HeaderValue::from_str(&format!(
                 "Bearer {}",
@@ -2635,6 +2641,58 @@ mod tests {
                 }
             );
             assert!(parts[1].get("thoughtSignature").is_none());
+        }
+    }
+
+    #[test]
+    fn default_vertex_sdk_replay_is_bound_to_its_provider_and_endpoint() {
+        let endpoint = "https://vertex.example/v1/projects/one/locations/global";
+        let gemini = Google::new(endpoint, "fixture").unwrap();
+        let vertex = gemini.clone().with_vertex(false).unwrap();
+        let other_vertex = Google::new(
+            "https://vertex.example/v1/projects/two/locations/global",
+            "fixture",
+        )
+        .unwrap()
+        .with_vertex(false)
+        .unwrap();
+        let custom = gemini
+            .clone()
+            .with_provider("configured", "configured-route")
+            .with_vertex(false)
+            .unwrap();
+        assert_eq!(custom.provider.as_ref(), "configured");
+        assert_eq!(custom.replay_scope.as_ref(), "configured-route");
+        assert_eq!(vertex.provider.as_ref(), "google-vertex");
+        for (origin, target, matching) in [
+            (&gemini, &gemini, true),
+            (&vertex, &vertex, true),
+            (&gemini, &vertex, false),
+            (&vertex, &gemini, false),
+            (&vertex, &other_vertex, false),
+        ] {
+            let request = ModelRequest {
+                model: "gemini-3-pro".into(),
+                messages: vec![Message::Assistant {
+                    content: String::new(),
+                    calls: vec![ToolCall {
+                        id: "call".into(),
+                        name: "test".into(),
+                        arguments: "{}".into(),
+                    }],
+                    replay: Some(Box::new(ProviderReplay {
+                        identity: identity(&origin.replay_scope, "gemini-3-pro"),
+                        blocks: vec![
+                            json!({"functionCall":{"name":"test","args":{}},"thoughtSignature":"fixture-signature"}),
+                        ],
+                    })),
+                }],
+                tools: vec![],
+                max_output_tokens: 32,
+            };
+            let body = wire_request_for_api(&request, None, &target.replay_scope, "", target.api())
+                .unwrap();
+            assert_eq!(body.to_string().contains("fixture-signature"), matching);
         }
     }
 

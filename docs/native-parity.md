@@ -4944,7 +4944,8 @@ including Pi-format saved project, location, and service-account file settings.
 ADC attaches only to the official endpoint. Use `GOOGLE_CLOUD_PROJECT` or
 `GCLOUD_PROJECT`, and `GOOGLE_CLOUD_LOCATION` to configure it without a saved
 credential. Google-authenticated calls use the quota project from the credentials
-file when it supplies one.
+file when it supplies one. Vertex SDK clients scope signed replay to their
+Vertex endpoint by default. Explicit provider replay scopes remain available.
 
 Native ADC discovery checks the explicitly configured file or the local gcloud
 credentials file. The Vertex sign-in wizard and metadata-only ambient credentials
