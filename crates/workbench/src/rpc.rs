@@ -1024,7 +1024,10 @@ mod jsonl_framing_tests {
             ("[1e400,1.", "number out of range"),
             (r#"["\ud800",1."#, "unexpected end of hex escape"),
             ("{\"n\":\"1.", "Unterminated string in JSON"),
-            ("{\"n\":1.0", "EOF while parsing an object"),
+            (
+                "{\"n\":1.0",
+                "Expected ',' or '}' after property value in JSON",
+            ),
         ] {
             let error = parse_request(input).unwrap_err().to_string();
             assert!(error.contains(expected), "{input:?}: {error}");
@@ -1074,6 +1077,48 @@ mod jsonl_framing_tests {
         for input in [r#"{"n":1e2}"#, r#"{"n":-2E-3}"#, r#"{"n":"1e+"}"#] {
             assert!(parse_request(input).is_ok(), "{input:?}");
         }
+    }
+
+    #[test]
+    fn truncated_json_objects_and_nested_commas_report_pi_diagnostics() {
+        for (input, expected) in [
+            (
+                r#"{"x""#,
+                "Expected ':' after property name in JSON at position 4 (line 1 column 5)",
+            ),
+            (
+                r#"{"x": "y""#,
+                "Expected ',' or '}' after property value in JSON at position 9 (line 1 column 10)",
+            ),
+            (
+                r#"{"x": 1,"#,
+                "Expected double-quoted property name in JSON at position 8 (line 1 column 9)",
+            ),
+            (r#"{"x":[1,"#, "Unexpected end of JSON input"),
+            (r#"[{"x":0},"#, "Unexpected end of JSON input"),
+            (
+                r#"{"x":[{"nested""#,
+                "Expected ':' after property name in JSON at position 15 (line 1 column 16)",
+            ),
+            (
+                r#"{"a": { "b": 2 }"#,
+                "Expected ',' or '}' after property value in JSON at position 16 (line 1 column 17)",
+            ),
+            (
+                "{\"😀\":1,\r\n ",
+                "Expected double-quoted property name in JSON at position 11 (line 2 column 2)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.ends_with(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+
+        let too_long = format!(r#"{{"{}""#, "x".repeat(super::JSON_DIAGNOSTIC_RETRY_LIMIT));
+        let error = parse_request(&too_long).unwrap_err().to_string();
+        assert!(error.contains("EOF while parsing an object"), "{error}");
     }
 
     #[test]
@@ -1354,8 +1399,8 @@ mod jsonl_framing_tests {
         let prefix = "[\"\\ud800\",\"";
         let suffix = "\t\"]";
         for (size, mapped) in [
-            (super::SURROGATE_DIAGNOSTIC_LIMIT, true),
-            (super::SURROGATE_DIAGNOSTIC_LIMIT + 1, false),
+            (super::JSON_DIAGNOSTIC_RETRY_LIMIT, true),
+            (super::JSON_DIAGNOSTIC_RETRY_LIMIT + 1, false),
         ] {
             let input = format!(
                 "{prefix}{}{suffix}",
@@ -1489,6 +1534,8 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         Some("Expected ',' or ']' after array element in JSON")
     } else if message.starts_with("EOF while parsing an object") && tail.ends_with('{') {
         Some("Expected property name or '}' in JSON")
+    } else if let Some(diagnostic) = incomplete_json_structure(line, tail, &message) {
+        return diagnostic;
     } else if message.starts_with("EOF while parsing a value")
         && (tail.is_empty()
             || tail.ends_with(':')
@@ -1503,6 +1550,42 @@ fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
         None
     };
     reason.map_or(message, |reason| json_error_at(reason, line))
+}
+
+fn incomplete_json_structure(line: &str, tail: &str, message: &str) -> Option<String> {
+    let in_object = message.starts_with("EOF while parsing an object");
+    let after_comma = message.starts_with("EOF while parsing a value") && tail.ends_with(',');
+    if line.len() > JSON_DIAGNOSTIC_RETRY_LIMIT || !(in_object || after_comma) {
+        return None;
+    }
+
+    // The closing brace distinguishes a missing colon from a missing object
+    // delimiter. After a comma, it distinguishes an object key from an array
+    // element even when requests contain nested objects and arrays.
+    let mut probe = String::with_capacity(line.len() + 1);
+    probe.push_str(line);
+    probe.push('}');
+    let separator = || json_error_at("Expected ',' or '}' after property value in JSON", line);
+    match serde_json::from_str::<Value>(&probe) {
+        Ok(_) if in_object => Some(separator()),
+        Err(error) if in_object && error.is_eof() => Some(separator()),
+        Err(error) if serde_error_offset(&probe, &error) == Some(probe.len()) => {
+            let diagnostic = error.to_string();
+            match diagnostic.split_once(" at line ")?.0 {
+                "expected `:`" if in_object => Some(json_error_at(
+                    "Expected ':' after property name in JSON",
+                    line,
+                )),
+                "trailing comma" if after_comma => Some(json_error_at(
+                    "Expected double-quoted property name in JSON",
+                    line,
+                )),
+                "expected value" if after_comma => Some("Unexpected end of JSON input".into()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn json_structure_error(line: &str, error: &serde_json::Error, message: &str) -> Option<String> {
@@ -1547,13 +1630,13 @@ fn json_error_at(reason: &str, prefix: &str) -> String {
     format!("{reason} at position {position} (line {row} column {column})")
 }
 
-// This is only a diagnostic retry; it never changes the JSON parsed by the
-// caller. Cap both the copy and the second parse for untrusted RPC input.
-const SURROGATE_DIAGNOSTIC_LIMIT: usize = 1024 * 1024;
+// Diagnostic retries never change the JSON parsed by the caller. Cap both
+// the copy and the second parse for untrusted RPC input.
+const JSON_DIAGNOSTIC_RETRY_LIMIT: usize = 1024 * 1024;
 
 fn surrogate_retry_control(line: &str, error: &serde_json::Error, offset: usize) -> bool {
     let message = error.to_string();
-    if line.len() > SURROGATE_DIAGNOSTIC_LIMIT
+    if line.len() > JSON_DIAGNOSTIC_RETRY_LIMIT
         || !(message.starts_with("lone leading surrogate in hex escape")
             || message.starts_with("unexpected end of hex escape"))
     {
