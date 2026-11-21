@@ -3270,15 +3270,7 @@ impl Agent<'_> {
                         crate::MessageStatus::Failed
                     };
                     let partial = text_parts.concat();
-                    let settle = async {
-                        hooks.start(true).await;
-                        hooks.end(&partial, &[], status, MAX_RESPONSE_BYTES).await
-                    };
-                    let _ = platform_time::timeout(
-                        self.limits.model_timeout.min(Duration::from_secs(1)),
-                        settle,
-                    )
-                    .await;
+                    hooks.fail(&partial, status, MAX_RESPONSE_BYTES).await;
                 }
             }
             hooks.report_errors(observer);

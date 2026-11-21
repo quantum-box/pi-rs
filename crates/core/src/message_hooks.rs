@@ -222,6 +222,20 @@ impl MessageHooks {
         (current != content).then_some(current)
     }
 
+    pub(crate) async fn fail(
+        &mut self,
+        content: &str,
+        status: MessageStatus,
+        response_limit: usize,
+    ) {
+        let subscribers = u32::try_from(self.handlers.len()).unwrap_or(u32::MAX);
+        self.end_timeout = self
+            .end_timeout
+            .min(self.model_timeout.min(Duration::from_secs(1)) / 2 / subscribers);
+        self.start(true).await;
+        self.end(content, &[], status, response_limit).await;
+    }
+
     async fn invoke(
         &mut self,
         index: usize,
@@ -615,7 +629,7 @@ mod tests {
         assert_eq!(errors, 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn native_message_opening_failure_still_has_start_and_end() {
         struct Refused;
 
@@ -623,6 +637,29 @@ mod tests {
         impl Model for Refused {
             async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
                 Err(crate::Error::Model("could not open fixture stream".into()))
+            }
+        }
+
+        struct Stall;
+
+        #[async_trait::async_trait]
+        impl Extension for Stall {
+            fn id(&self) -> &str {
+                "stall"
+            }
+            fn handles_message_lifecycle(&self) -> bool {
+                true
+            }
+            async fn message_lifecycle(
+                &self,
+                event: &MessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Message>> {
+                if matches!(event, MessageLifecycleEvent::Start { .. }) {
+                    std::future::pending().await
+                } else {
+                    Ok(None)
+                }
             }
         }
 
@@ -656,6 +693,7 @@ mod tests {
         }
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut registry = Registry::default();
+        registry.register(Arc::new(Stall)).unwrap();
         registry.register(Arc::new(Observe(log.clone()))).unwrap();
         let agent = Agent {
             model: &Refused,
