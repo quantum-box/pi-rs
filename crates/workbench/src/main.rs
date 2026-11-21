@@ -2595,7 +2595,13 @@ fn trace_tool_progress(
     trace: bool,
     json_stream: bool,
 ) -> Option<Value> {
-    (trace && !json_stream).then(|| serde_json::to_value(event).expect("tool progress"))
+    if json_stream {
+        return None;
+    }
+    if let Some(id) = pi_rs::tool_attempt_operation_id() {
+        return Some(json!({"type":"internal_tool_attempt","operationId":id}));
+    }
+    trace.then(|| serde_json::to_value(event).expect("tool progress"))
 }
 
 fn observe(event: Notification<'_>, trace: bool) {

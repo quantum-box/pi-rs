@@ -540,6 +540,9 @@ turn. The interface emits native journal events alongside Pi-style
 message start, update and end events, including indexed text and reasoning
 blocks, tool calls, tool results and turn boundaries.
 `toolcall_start` includes the ID and tool name available at that point.
+JSON and RPC emit `tool_execution_start` with the supplied arguments before
+preparation and authorization, including for rejected attempts. The native
+`ToolStarted` journal record is reserved for dispatch.
 JSON and RPC `message_update` events include Pi's top-level `usage` object.
 Its counters start at zero and use the reported totals once the provider
 finishes. Providers that report usage incrementally in Pi can therefore expose
