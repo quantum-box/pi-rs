@@ -26,6 +26,12 @@ impl Model for Script {
                 ("read-offset", "read", json!({"path": "a", "offset": 9})),
                 ("ls-invalid", "ls", json!({"limit": " true "})),
                 ("read-missing", "read", json!({})),
+                ("edit-missing", "edit", json!({})),
+                (
+                    "edit-invalid",
+                    "edit",
+                    json!({"path":"a","edits":[{"newText":"no edit"}]}),
+                ),
                 (
                     "grep-invalid",
                     "grep",
@@ -145,6 +151,14 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
         (
             "read-missing",
             "Validation failed for tool \"read\":\n  - path: missing\n\nReceived arguments:\n{}",
+        ),
+        (
+            "edit-missing",
+            "Validation failed for tool \"edit\":\n  - path: missing\n  - edits: missing\n\nReceived arguments:\n{}",
+        ),
+        (
+            "edit-invalid",
+            "Validation failed for tool \"edit\":\n  - edits.0.oldText: missing\n\nReceived arguments:\n{\n  \"path\": \"a\",\n  \"edits\": [\n    {\n      \"newText\": \"no edit\"\n    }\n  ]\n}",
         ),
         (
             "grep-invalid",

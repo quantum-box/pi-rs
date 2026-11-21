@@ -2240,10 +2240,19 @@ impl Tool for CodingTool {
             coerce_local_tool_argument(&mut arguments, &self.spec().parameters);
         }
         if matches!(self.kind, Kind::Edit) {
-            crate::text_edit::prepare_arguments(arguments).map_err(edit_error_text)
-        } else {
-            Ok(arguments)
+            let legacy_pair = arguments["oldText"].is_string() && arguments["newText"].is_string();
+            if self.unrestricted && arguments.get("edits").is_none() && !legacy_pair {
+                return Ok(arguments);
+            }
+            match crate::text_edit::prepare_arguments_in_place(&mut arguments) {
+                // Keep the normalized shape for the schema validator to identify
+                // the offending field. Valid edit arguments still use edit preparation.
+                Ok(()) => {}
+                Err(Error::Json(_)) if self.unrestricted => {}
+                Err(error) => return Err(edit_error_text(error)),
+            }
         }
+        Ok(arguments)
     }
     async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
         let result = match self.kind {
