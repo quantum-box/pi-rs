@@ -5692,6 +5692,10 @@ atomic paste markers.
 
 ### Session tree branch navigation checkpoint
 
+Session tree search matches the full shell command, branch summary, and
+plain-string custom message content, even beyond the row preview. Text
+blocks in custom messages retain Pi's 200 UTF-16 unit search limit.
+
 Tree fold and jump keys now follow visible branch segments rather than folding
 or stepping through every record. Filtered-out intermediate records attach to
 nearest visible ancestors for navigation. Search matches every whitespace-separated

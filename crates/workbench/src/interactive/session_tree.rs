@@ -167,7 +167,7 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
             label.push_str(&preview);
         }
         items.push(Item {
-            label,
+            label: tree_search_label(label, &record.event),
             selection: Selection::Checkout(record.id),
         });
         entries.insert(record.id, (record.parent, kind));
@@ -301,6 +301,28 @@ fn tree_tool_result_preview(event: &Event) -> Option<String> {
     })
 }
 
+fn tree_search_label(mut label: String, event: &Event) -> String {
+    let full_text = match event {
+        Event::BashExecution { execution } => {
+            label.push_str(" bashExecution");
+            Some(execution.command.as_str())
+        }
+        Event::BranchSummary { summary, .. } => Some(summary.as_str()),
+        Event::CustomMessage { message } | Event::CustomMessageDelivered { message, .. } => {
+            match &message.content {
+                pi_rs::ContextContent::Text(text) => Some(text.as_str()),
+                pi_rs::ContextContent::Blocks(_) => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some(text) = full_text.filter(|text| text.encode_utf16().nth(200).is_some()) {
+        label.push(' ');
+        label.push_str(text);
+    }
+    label
+}
+
 fn tree_assistant_description(
     content: &str,
     failure: Option<ModelFailure>,
@@ -382,6 +404,58 @@ mod tests {
     use super::*;
     use crate::ui::{keys::Keys, theme::Theme};
     use serde_json::json;
+
+    #[test]
+    fn tree_search_finds_text_beyond_the_display_preview() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pi.jsonl");
+        let prefix = "x".repeat(220);
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"user","parentId":null,
+                "message":{"role":"user","content":"search fixture"}}),
+            json!({"type":"message","id":"bash","parentId":"user","message":{
+                "role":"bashExecution","command":format!("{prefix} shell-tail-marker"),
+                "exitCode":0}}),
+            json!({"type":"branch_summary","id":"summary","parentId":"bash","fromId":"user",
+                "summary":format!("{prefix} summary-tail-marker")}),
+            json!({"type":"custom_message","id":"text","parentId":"summary","customType":"plain-custom",
+                "content":format!("{prefix} custom-tail-marker"),"display":false}),
+            json!({"type":"custom_message","id":"blocks","parentId":"text","customType":"blocks-custom",
+                "content":[{"type":"text","text":format!("{prefix} blocks-tail-marker")}],"display":false}),
+        ];
+        let fixture = entries
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, fixture).unwrap();
+        let session = crate::session_import::read(&path).unwrap();
+        let theme = Theme::system();
+        let keys = Keys::default();
+
+        for (query, heading) in [
+            ("bashExecution shell-tail-marker", "[bash]"),
+            ("summary-tail-marker", "[branch summary]"),
+            ("custom-tail-marker", "[plain-custom]"),
+        ] {
+            let mut search = picker(&session, TreeFilter::Default);
+            search.paste(query);
+            assert!(
+                matches!(search.selected(), Some(Selection::Checkout(_))),
+                "{query}"
+            );
+            let rows = search.render(&theme, 80, 20, &keys);
+            assert!(
+                rows.iter()
+                    .any(|row| row.spans.iter().any(|span| span.text.contains(heading))),
+                "{query} should select {heading}"
+            );
+        }
+        let mut blocks_search = picker(&session, TreeFilter::Default);
+        blocks_search.paste("blocks-tail-marker");
+        assert!(blocks_search.selected().is_none());
+    }
 
     #[test]
     fn tree_distinguishes_thinking_changes_from_model_changes() {
