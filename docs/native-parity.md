@@ -5297,10 +5297,11 @@ active. Configuration updates apply the stored level before each recorded
 reply and the current level at the end of the request, including after a
 tool result. Pi session imports retain the recorded effort and replay the
 portable assistant history. Compatible custom profiles retain their own
-effort mappings. RPC exposes the recorded level. Off and ChatGPT
-or Codex subscription requests use their existing reasoning options.
-Local request fixtures covered the payload and replay. Live authenticated
-configuration updates were unverified.
+effort mappings. RPC exposes the recorded level. With API-key Responses,
+`off` uses top-level reasoning and leaves no configuration update to replay
+when thinking resumes, as in Pi 1.5.0 and 1.6.0. ChatGPT and Codex subscriptions
+use their existing reasoning options. Local request fixtures covered the
+payload and replay. Live authenticated configuration updates were unverified.
 
 ### Responses prompt cache key configuration
 
