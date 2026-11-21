@@ -628,7 +628,7 @@ pub(super) async fn discover(
     Ok(discovery)
 }
 
-async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExtension> {
+pub(super) async fn connect(args: &Cli, name: &str, server: &ServerConfig) -> Result<McpExtension> {
     connect_for_discovery(args, name, server, None).await
 }
 
@@ -906,6 +906,7 @@ pub(super) struct Inspection {
     scope: &'static str,
     description: String,
     tools: Vec<String>,
+    config: Option<ServerConfig>,
 }
 
 fn inspection_entries(
@@ -916,7 +917,8 @@ fn inspection_entries(
     servers
         .iter()
         .map(|(name, config)| {
-            let status = if report_server_config(config).is_none() {
+            let parsed = report_server_config(config);
+            let status = if parsed.is_none() {
                 "invalid"
             } else if config["enabled"] == false {
                 "disabled"
@@ -939,6 +941,7 @@ fn inspection_entries(
                     config["description"].as_str().unwrap_or_default(),
                 ),
                 tools: Vec::new(),
+                config: parsed,
             }
         })
         .collect()
@@ -954,12 +957,18 @@ fn inspection_description(description: &str) -> String {
         .collect()
 }
 
+pub(super) struct ReconnectRequest {
+    pub name: String,
+    pub config: ServerConfig,
+}
+
 pub(super) async fn inspect_servers(
     configured: &[Inspection],
     connected: &[Arc<McpExtension>],
+    selected: Option<(&str, &str)>,
     ui: &dyn ExtensionUi,
     cancel: &CancellationToken,
-) -> Result<()> {
+) -> Result<Option<ReconnectRequest>> {
     let mut entries = configured.to_vec();
     for entry in &mut entries {
         if let Some(server) = connected
@@ -998,17 +1007,31 @@ pub(super) async fn inspect_servers(
             "MCP servers".into(),
             vec!["No MCP servers configured.".into()],
             false,
+            false,
             ui,
             cancel,
         )
         .await?;
-        return Ok(());
+        return Ok(None);
     }
     let mut page = 0;
-    while let Some(index) =
-        select_inspection("MCP servers", &options, &mut page, ui, cancel).await?
-    {
+    let mut resume =
+        selected.and_then(|(name, _)| entries.iter().position(|entry| entry.name == name));
+    loop {
+        let index = match resume.take() {
+            Some(index) => index,
+            None => {
+                match select_inspection("MCP servers", &options, &mut page, ui, cancel).await? {
+                    Some(index) => index,
+                    None => return Ok(None),
+                }
+            }
+        };
         let entry = &entries[index];
+        let config = entry
+            .config
+            .as_ref()
+            .filter(|config| config.enabled != Some(false));
         let mut lines = vec![
             format!("Status · {}", entry.status),
             format!("Scope · {}", entry.scope),
@@ -1018,30 +1041,48 @@ pub(super) async fn inspect_servers(
         if !entry.description.is_empty() {
             lines.push(entry.description.clone());
         }
-        while show_inspection(
-            format!("MCP server · {}", entry.name),
-            lines.clone(),
-            !entry.tools.is_empty(),
-            ui,
-            cancel,
-        )
-        .await?
+        if let Some((name, message)) = selected
+            && entry.name == name
         {
-            let title = format!("MCP tools · {}", entry.name);
-            let mut tool_page = 0;
-            let _ = select_inspection(&title, &entry.tools, &mut tool_page, ui, cancel).await?;
+            lines.push(message.into());
+        }
+        loop {
+            let action = show_inspection(
+                format!("MCP server · {}", entry.name),
+                lines.clone(),
+                !entry.tools.is_empty(),
+                config.is_some(),
+                ui,
+                cancel,
+            )
+            .await?;
+            match (action.as_str(), config) {
+                ("tools", _) => {
+                    let title = format!("MCP tools · {}", entry.name);
+                    let mut tool_page = 0;
+                    let _ =
+                        select_inspection(&title, &entry.tools, &mut tool_page, ui, cancel).await?;
+                }
+                ("reconnect", Some(config)) => {
+                    return Ok(Some(ReconnectRequest {
+                        name: entry.name.clone(),
+                        config: config.clone(),
+                    }));
+                }
+                _ => break,
+            }
         }
     }
-    Ok(())
 }
 
 async fn show_inspection(
     title: String,
     lines: Vec<String>,
     tools: bool,
+    reconnect: bool,
     ui: &dyn ExtensionUi,
     cancel: &CancellationToken,
-) -> Result<bool> {
+) -> Result<String> {
     let mut actions = vec![UiComponentAction {
         key: "enter".into(),
         value: "back".into(),
@@ -1052,6 +1093,13 @@ async fn show_inspection(
             key: "t".into(),
             value: "tools".into(),
             label: Some("Tools".into()),
+        });
+    }
+    if reconnect {
+        actions.push(UiComponentAction {
+            key: "r".into(),
+            value: "reconnect".into(),
+            label: Some("Reconnect".into()),
         });
     }
     let request = UiRequest::Custom {
@@ -1072,7 +1120,10 @@ async fn show_inspection(
         .request(request, cancel.clone())
         .await
         .map_err(|error| Error::Config(format!("MCP inspector UI failed: {error}")))?;
-    Ok(matches!(response, UiResponse::Text(action) if action == "tools"))
+    Ok(match response {
+        UiResponse::Text(action) => action,
+        _ => String::new(),
+    })
 }
 
 async fn select_inspection(

@@ -393,13 +393,97 @@ impl Runtime {
         }
         Ok(())
     }
-    pub async fn inspect_mcp(
-        &self,
+    pub async fn manage_mcp(
+        &mut self,
+        args: &Cli,
         ui: &dyn ExtensionUi,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let servers = self.catalog.servers.lock().expect("MCP catalogs").clone();
-        mcp_config::inspect_servers(&self.mcp_inspection, &servers, ui, cancel).await
+        let mut status: Option<(String, &str)> = None;
+        loop {
+            let servers = self.catalog.servers.lock().expect("MCP catalogs").clone();
+            let selected = status
+                .as_ref()
+                .map(|(name, message)| (name.as_str(), *message));
+            let Some(request) =
+                mcp_config::inspect_servers(&self.mcp_inspection, &servers, selected, ui, cancel)
+                    .await?
+            else {
+                return Ok(());
+            };
+            let message = match self.reconnect_mcp(args, &request, cancel).await {
+                Ok(()) => "Reconnected",
+                Err(pi_rs::Error::Cancelled) => return Err(pi_rs::Error::Cancelled),
+                Err(pi_rs::Error::AuthorizationRequired { .. }) => "Sign-in required",
+                Err(pi_rs::Error::Config(_)) => "Reconnect failed. Check the MCP configuration.",
+                Err(_) => "Could not reconnect",
+            };
+            status = Some((request.name, message));
+        }
+    }
+
+    async fn reconnect_mcp(
+        &mut self,
+        args: &Cli,
+        request: &mcp_config::ReconnectRequest,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let name = &request.name;
+        let id = format!("mcp-{}", name.replace('-', "_"));
+        let check_config = || {
+            let current = mcp_config::configurations(args)?
+                .remove(name)
+                .map(serde_json::from_value::<pi_rs_workbench::mcp::ServerConfig>)
+                .transpose()?;
+            if current.as_ref() != Some(&request.config) || args.disable_extension.contains(&id) {
+                return Err(pi_rs::Error::Config(
+                    "MCP configuration changed. Reload before reconnecting.".into(),
+                ));
+            }
+            Ok(())
+        };
+
+        let catalog = self.catalog.clone();
+        let _mutation = catalog.mutation.lock().await;
+        check_config()?;
+        if cancel.is_cancelled() {
+            return Err(pi_rs::Error::Cancelled);
+        }
+        let mut servers = catalog.servers.lock().expect("MCP catalogs").clone();
+        let index = servers
+            .iter()
+            .position(|server| server.server_name == *name);
+        if let Some(index) = index {
+            let old = servers.remove(index);
+            let mut registry = self.registry.clone();
+            registry.unregister(old.id());
+            let prompt = catalog.select_mcp_tools(&mut registry, &servers)?;
+            self.registry = registry;
+            self.system_prompt = prompt;
+            *catalog.servers.lock().expect("MCP catalogs") = servers.clone();
+            old.close().await;
+        }
+        check_config()?;
+        let replacement = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(pi_rs::Error::Cancelled),
+            result = mcp_config::connect(args, name, &request.config) => Arc::new(result?),
+        };
+        servers.insert(index.unwrap_or(servers.len()), replacement.clone());
+        let apply = (|| {
+            check_config()?;
+            let mut registry = self.registry.clone();
+            registry.register(replacement.clone())?;
+            let prompt = catalog.select_mcp_tools(&mut registry, &servers)?;
+            self.registry = registry;
+            self.system_prompt = prompt;
+            *catalog.servers.lock().expect("MCP catalogs") = servers;
+            Ok(())
+        })();
+        if apply.is_err() {
+            replacement.close().await;
+        }
+        apply
     }
 
     pub async fn refresh_mcp(&mut self, _args: &Cli) -> Result<()> {
@@ -791,10 +875,28 @@ struct LiveMcpCatalog {
     args: Cli,
     resources: std::sync::Mutex<resources::Resources>,
     servers: std::sync::Mutex<Vec<Arc<pi_rs_workbench::mcp::McpExtension>>>,
+    mutation: tokio::sync::Mutex<()>,
+}
+impl LiveMcpCatalog {
+    fn select_mcp_tools(
+        &self,
+        registry: &mut Registry,
+        servers: &[Arc<pi_rs_workbench::mcp::McpExtension>],
+    ) -> Result<String> {
+        let (selection, documents, hidden) = tool_discovery(&self.args, servers)?;
+        registry.replace(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
+            documents,
+        )))?;
+        let resources = self.resources.lock().expect("resource catalog");
+        select_tools(
+            registry, &selection, &hidden, &resources, &self.args, servers,
+        )
+    }
 }
 #[async_trait::async_trait]
 impl pi_rs::RegistryRefresher for LiveMcpCatalog {
     async fn refresh(&self, current: &Registry) -> Result<Option<pi_rs::RegistryUpdate>> {
+        let _mutation = self.mutation.lock().await;
         let previous = self.servers.lock().expect("MCP catalogs").clone();
         if previous.is_empty() {
             return Ok(None);
@@ -808,19 +910,7 @@ impl pi_rs::RegistryRefresher for LiveMcpCatalog {
             registry.replace(refreshed.clone())?;
             servers.push(refreshed);
         }
-        let (selection, documents, hidden) = tool_discovery(&self.args, &servers)?;
-        registry.replace(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
-            documents,
-        )))?;
-        let resources = self.resources.lock().expect("resource catalog").clone();
-        let system_prompt = select_tools(
-            &mut registry,
-            &selection,
-            &hidden,
-            &resources,
-            &self.args,
-            &servers,
-        )?;
+        let system_prompt = self.select_mcp_tools(&mut registry, &servers)?;
         *self.servers.lock().expect("MCP catalogs") = servers;
         Ok(Some(pi_rs::RegistryUpdate {
             registry,
@@ -1027,6 +1117,7 @@ async fn configure_after(
             args: args.clone(),
             resources: std::sync::Mutex::new(local_resources.clone()),
             servers: std::sync::Mutex::new(mcp_connections.clone()),
+            mutation: tokio::sync::Mutex::new(()),
         });
         registry.set_refresher(catalog.clone());
         let provider = model_client(args, super::thinking::reported(args).is_some(), true)?;

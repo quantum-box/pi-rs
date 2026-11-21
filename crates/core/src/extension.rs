@@ -2859,6 +2859,15 @@ impl Registry {
         Ok(true)
     }
 
+    /// Remove an extension and its declarations. The caller owns its shutdown.
+    pub fn unregister(&mut self, id: &str) {
+        self.extensions.retain(|extension| extension.id() != id);
+        self.tools.retain(|_, tool| tool.owner != id);
+        if let Some(active) = &mut self.active {
+            active.retain(|name| self.tools.contains_key(name));
+        }
+    }
+
     pub fn register(&mut self, extension: Arc<dyn Extension>) -> Result<()> {
         let id = extension.id();
         if id.is_empty() || self.extensions.iter().any(|item| item.id() == id) {

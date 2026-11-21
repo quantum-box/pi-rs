@@ -1198,7 +1198,10 @@ async fn run_worker(
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
                     result = async {
                         runtime.authorize_pending_mcp(&args, ui.as_ref(), &cancel).await?;
-                        runtime.refresh_mcp(&args).await
+                        if !matches!(&request, Request::McpStatus { inspect: true }) {
+                            runtime.refresh_mcp(&args).await?;
+                        }
+                        Ok::<_, Error>(())
                     } => result?,
                 }
             }
@@ -1526,7 +1529,7 @@ async fn run_worker(
                 }
                 Request::McpStatus { inspect } => {
                     if inspect {
-                        runtime.inspect_mcp(ui.as_ref(), &cancel).await?;
+                        runtime.manage_mcp(&args, ui.as_ref(), &cancel).await?;
                     } else {
                         runtime.mcp_status(&args)?;
                     }
