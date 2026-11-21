@@ -463,8 +463,12 @@ a Vercel account remains open.
 
 ### Mistral checkpoint
 
-Mistral exposes the 34 pinned chat models using `MISTRAL_API_KEY` and the
-`mistral-conversations` transport. It sends each model's reasoning control,
+Mistral exposes the 34 Pi 1.6.0 chat models using `MISTRAL_API_KEY` and the
+`mistral-conversations` transport. DeepSeek V4.1 Flash 1017 supports images
+with the catalog's resize limits. Ministral 3 3B has a 131,072-token output
+limit. Mistral Large (latest) uses the updated pricing and a 1,048,576-token
+context window with low, medium, and high reasoning effort. The transport
+sends each model's reasoning control,
 replays streamed thinking and text on the same route, and pads short tool ID
 hashes to nine characters for [Mistral's validator](https://github.com/mistralai/mistral-common/blob/main/src/mistral_common/protocol/instruct/validator.py).
 Tool errors and supported images are encoded in the tool message. In a
@@ -4019,6 +4023,13 @@ native read tool round trip, usage and RPC. Live account sign-in and provider sw
 
 ### Anthropic thinking checkpoint
 
+Budgeted Anthropic Messages requests use Pi's interleaved-thinking beta by
+default. An explicit `anthropic-beta` header overrides the defaults, including
+for OAuth. Adaptive and disabled thinking do not add the interleaved beta.
+Embedders can opt out of interleaving or request omitted thinking text while
+retaining its replay signature. Loopback requests verified the header and
+payload. Live authenticated interleaved thinking was unverified.
+
 Native Anthropic streams expose individual text and thinking block boundaries,
 and show redacted thinking as `[Reasoning redacted]` while retaining its opaque
 payload for provider replay. Live Pi RPC thinking-start partial messages include
@@ -4114,7 +4125,11 @@ streams text, thought summaries, and tool calls. It encodes image inputs and
 tool results, records measured usage including thought tokens, and preserves
 ordered signed response parts for the same model across tools and journal
 reopening. Gemini 2.5 and newer model families use their budget or level
-controls. A truncated response keeps its text and skips tool dispatch.
+controls. Host-prefixed Gemini IDs use the same version checks for thinking,
+tool call IDs, and tool-result images as in current Pi. A response ending in
+`CONTINUATION` or `MAX_TOKENS` keeps its text, drops unfinished tool calls,
+and ends with a length stop. The native adapter does not consume continuation
+tokens.
 
 Loopback checks covered these paths and a PTY showed thinking, generation,
 and the final answer. [Generate Content API](https://ai.google.dev/api/generate-content?hl=en)
@@ -4440,11 +4455,12 @@ rejected before any credentials are sent there.
 Local acceptance covered both authentication methods, model filtering,
 inference against the catalog route, the advertised output cap and
 rejection of an unrelated endpoint. The built-in gateway ships the
-public chat model metadata from Pi 1.5.0. An authenticated catalog
-replaces that baseline and is cached privately for the gateway and
-credential. Offline startup and transient discovery failures can use
-the matching cache. Successful empty catalogs remain authoritative.
-[Pi AI 1.5.0 distribution](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.5.0)
+39 public chat models from Pi 1.6. An authenticated catalog replaces that
+baseline and is cached privately for the gateway and credential. Offline
+startup and transient discovery failures can use the matching cache.
+Successful empty catalogs remain authoritative. Live authenticated Radius
+discovery for this release was unverified.
+[Pi AI 1.6.0 distribution](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.6.0)
 
 ### Single-shot JSON event stream
 
@@ -4962,15 +4978,22 @@ for acceptance.
 
 ### GitHub Copilot
 
-The native catalog includes the pinned Pi AI release's 27 Copilot models across
-Chat Completions, Anthropic Messages, and OpenAI Responses.
+The native catalog includes Pi AI v1.6.0's 35 Copilot chat models across
+Chat Completions, Anthropic Messages, and OpenAI Responses. Models that
+advertise thinking effort on Chat Completions use its reasoning-effort field.
+Copilot Messages and Responses expose strict sampling for supported tools.
+Ordinary Responses function declarations explicitly send `strict: false` to
+prevent Copilot from imposing strict sampling and filling optional fields.
+Projection of Copilot's transcript-level `additional_tools` remains open.
 `COPILOT_GITHUB_TOKEN` supplies a short-lived Copilot API token.
 `pi login github-copilot` and `/login github-copilot` support GitHub.com's
 device authorization and store a Pi-compatible OAuth entry. pi-rs can also
 read an existing entry, refresh access, and filter the picker by the stored
 account catalog. If catalog discovery fails during refresh, inference uses the
-new token and the last saved catalog. Saved OAuth tokens can route to individual, business, or
-enterprise Copilot inference hosts. Requests carry the Copilot initiator and
+new token and the last saved catalog. An admitted refresh and its write finish
+even if the caller cancels. Copilot's device poller follows the server interval
+on `slow_down` and adds five seconds when it supplies no interval. Saved OAuth
+tokens can route to individual, business, or enterprise Copilot inference hosts. Requests carry the Copilot initiator and
 vision headers.
 
 Native sign-in leaves account model policies as configured. Authentication

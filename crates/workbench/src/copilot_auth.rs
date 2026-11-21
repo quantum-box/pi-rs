@@ -82,6 +82,14 @@ pub(super) fn routed_endpoint(endpoint: &str, token: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+fn poll_interval(seconds: &Value) -> Option<Duration> {
+    let seconds = seconds
+        .as_f64()
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)?;
+    let millis = (seconds * 1000.0).floor() as u64;
+    Some(Duration::from_millis(millis.max(1000)))
+}
+
 struct Service {
     client: Client,
     device_code_url: String,
@@ -149,14 +157,14 @@ impl Service {
             .filter(|seconds| (1..=1800).contains(seconds))
             .ok_or_else(|| error("invalid device code expiry"))?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(lifetime);
-        let mut interval =
-            Duration::from_secs(device["interval"].as_u64().unwrap_or(5).clamp(1, 60));
+        let mut interval = poll_interval(&device["interval"]).unwrap_or(Duration::from_secs(5));
         announce(&url, user_code);
         loop {
-            if deadline.saturating_duration_since(tokio::time::Instant::now()) <= interval {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(interval.min(remaining)).await;
+            if tokio::time::Instant::now() >= deadline {
                 return Err(error("device code expired"));
             }
-            tokio::time::sleep(interval).await;
             let request = self.client.post(&self.github_access_url).form(&[
                 ("client_id", CLIENT_ID),
                 ("device_code", code),
@@ -182,10 +190,8 @@ impl Service {
             match token["error"].as_str() {
                 Some("authorization_pending") => {}
                 Some("slow_down") => {
-                    let updated = token["interval"].as_u64().map(Duration::from_secs);
-                    interval = interval
-                        .saturating_add(Duration::from_secs(5))
-                        .max(updated.unwrap_or_default());
+                    interval = poll_interval(&token["interval"])
+                        .unwrap_or_else(|| interval.saturating_add(Duration::from_secs(5)));
                 }
                 Some("access_denied") => return Err(error("access denied")),
                 Some("expired_token") => return Err(error("device code expired")),
@@ -368,30 +374,54 @@ async fn access_at(
         .max(super::model_auth::PI_OAUTH_MINIMUM_VALIDITY)
         .as_millis()
         .min(u128::from(u64::MAX)) as u64;
-    let fresh = |expires: u64| expires > now().saturating_add(window_ms);
-    let guard = super::auth_lock::acquire_async(path).await?;
-    let mut credential = read(&super::config::read_auth_object_locked(&guard)?)?;
+    let fresh = move |expires: u64| expires > now().saturating_add(window_ms);
+    let guard = match super::auth_lock::acquire_async(path).await {
+        Ok(guard) => guard,
+        Err(lock_error) => {
+            let credential = read(&super::config::read_readonly_auth(path, lock_error)?)?;
+            if fresh(credential.expires) {
+                return Ok(credential.access);
+            }
+            return Err(error("cannot refresh credentials in a read-only store"));
+        }
+    };
+    let stored = super::config::read_auth_object_locked(&guard)?;
+    let credential = read(&stored)?;
     guard.check()?;
-    if !fresh(credential.expires) {
-        credential = service.refresh(&credential).await?;
-        super::config::update_object_locked(path, Some(&guard), |data| {
+    if fresh(credential.expires) {
+        return Ok(credential.access);
+    }
+
+    let path = path.to_owned();
+    let previous = stored[PROVIDER].clone();
+    // The refresh and its write continue together after the caller is cancelled.
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| error("cannot start refresh runtime"))?;
+        let barrier = super::process::refresh_barrier()?;
+        let guard = super::process::guard_refresh_auth(barrier, guard);
+        let credential = runtime.block_on(service.refresh(&credential))?;
+        super::config::update_object_locked(&path, Some(&guard), |data| {
             let entry = data
                 .get_mut(PROVIDER)
-                .and_then(Value::as_object_mut)
                 .ok_or_else(|| error("saved credential disappeared"))?;
-            entry.insert("access".into(), serde_json::json!(credential.access));
-            entry.insert("expires".into(), serde_json::json!(credential.expires));
-            entry.insert(
-                "availableModelIds".into(),
-                serde_json::json!(credential.available_model_ids),
-            );
+            if *entry != previous {
+                return Err(error("saved credential changed during refresh"));
+            }
+            entry["access"] = serde_json::json!(credential.access);
+            entry["expires"] = serde_json::json!(credential.expires);
+            entry["availableModelIds"] = serde_json::json!(credential.available_model_ids);
             Ok(())
         })?;
         if minimum.is_some() && !fresh(credential.expires) {
             return Err(error("refreshed token expires too soon"));
         }
-    }
-    Ok(credential.access)
+        Ok(credential.access)
+    })
+    .await
+    .map_err(|_| error("refresh task failed"))?
 }
 
 #[cfg(test)]
@@ -513,6 +543,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_copilot_refresh_still_saves_the_token_and_catalog() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let root = tempfile::tempdir().unwrap();
+        let auth = root.path().join("auth.json");
+        let original = json!({"github-copilot":{
+            "type":"oauth","access":"old","refresh":"long-lived-fixture",
+            "expires":1,"extra":"preserve",
+        }});
+        std::fs::write(&auth, original.to_string()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let service = Service {
+            client: Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            device_code_url: format!("{base}/device"),
+            github_access_url: format!("{base}/access"),
+            token_url: format!("{base}/token"),
+            catalog_url: Some(format!("{base}/models")),
+        };
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first = Some((started, reply_rx));
+            for exchange in token_and_catalogue() {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with(exchange.request));
+                loop {
+                    line.clear();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                if let Some((started, reply)) = first.take() {
+                    started.send(()).unwrap();
+                    reply.await.unwrap();
+                }
+                let body = exchange.response.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let pending = {
+            let auth = auth.clone();
+            tokio::spawn(async move { access_at(&auth, service, None, false).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        let mut read = tokio::spawn(async move { crate::config::read_auth_object(&auth).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut read)
+                .await
+                .is_err()
+        );
+        reply.send(()).unwrap();
+        let saved = tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_ne!(saved[PROVIDER]["access"], "old");
+        assert_eq!(saved[PROVIDER]["refresh"], "long-lived-fixture");
+        assert_eq!(saved[PROVIDER]["extra"], "preserve");
+        assert_eq!(saved[PROVIDER]["availableModelIds"], json!(["gpt-6.1-sol"]));
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn short_copilot_refresh_is_saved_before_explicit_validity_is_enforced() {
         for minimum in [None, Some(Duration::ZERO)] {
             let root = tempfile::tempdir().unwrap();
@@ -564,7 +683,7 @@ mod tests {
                 form: Some("scope=read%3Auser"),
                 response: json!({
                     "device_code":"fixture-device","user_code":"AB12-CD34",
-                    "verification_uri":"https://github.com/login/device","interval":1,"expires_in":90,
+                    "verification_uri":"https://github.com/login/device","interval":1,"expires_in":7,
                 }),
             },
             Exchange {
@@ -572,6 +691,12 @@ mod tests {
                 header: None,
                 form: Some("device_code=fixture-device"),
                 response: json!({"error":"authorization_pending"}),
+            },
+            Exchange {
+                request: "POST /access ",
+                header: None,
+                form: Some("device_code=fixture-device"),
+                response: json!({"error":"slow_down","interval":1}),
             },
             Exchange {
                 request: "POST /access ",
@@ -602,7 +727,23 @@ mod tests {
         use super::super::{Provider, model_auth::Keys, model_profiles::Profiles};
         let profile = Profiles::parse(&json!({})).unwrap();
         let provider = Provider::named(PROVIDER).unwrap();
-        assert_eq!(profile.model_ids(&provider).len(), 27);
+        assert_eq!(profile.model_ids(&provider).len(), 35);
+        for (model, adapter) in [
+            (
+                "gemini-4-carbon",
+                crate::providers::Adapter::ChatCompletions,
+            ),
+            ("claude-fable-5.2", crate::providers::Adapter::Anthropic),
+            ("gpt-6.2-sol", crate::providers::Adapter::OpenAiResponses),
+            ("mai-code-2", crate::providers::Adapter::OpenAiResponses),
+        ] {
+            assert!(profile.model_ids(&provider).iter().any(|id| id == model));
+            assert_eq!(profile.model_adapter(&provider, model), adapter);
+        }
+        let claude = profile.model(&provider, "claude-fable-5.2").unwrap();
+        assert!(profile.anthropic_strict_tool_support(&provider, Some(&claude)));
+        let gpt = profile.model(&provider, "gpt-6.2-sol").unwrap();
+        assert!(profile.responses_strict_tool_support(&provider, Some(&gpt)));
         let keys = Keys::parse(&json!({"github-copilot": {
             "type":"oauth","access":"fixture","refresh":"refresh-fixture","expires":1,
         }}));
