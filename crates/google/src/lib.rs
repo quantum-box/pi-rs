@@ -953,6 +953,7 @@ fn wire_request(
                 call_id,
                 content,
                 is_structured,
+                is_error,
                 ..
             } => {
                 let Some((name, id)) = calls.get(call_id.as_str()) else {
@@ -966,7 +967,12 @@ fn wire_request(
                     } else {
                         (content.clone(), Vec::new())
                     };
-                let mut response = json!({"name":name,"response":{"output":text}});
+                let result = if *is_error {
+                    json!({"error": text})
+                } else {
+                    json!({"output": text})
+                };
+                let mut response = json!({"name": name, "response": result});
                 if let Some(id) = id {
                     response["id"] = json!(id);
                 }
@@ -2689,7 +2695,7 @@ mod tests {
                     },
                     Message::Tool {
                         is_structured: Some(false),
-                        is_error: false,
+                        is_error: true,
                         call_id: "b".into(),
                         content: "second result".into(),
                     },
@@ -2710,8 +2716,8 @@ mod tests {
             let responses = contents[1]["parts"].as_array().unwrap();
             assert_eq!(responses.len(), 2, "{model}");
             assert_eq!(
-                responses[1]["functionResponse"]["response"]["output"],
-                "second result"
+                responses[1]["functionResponse"]["response"],
+                json!({"error": "second result"})
             );
             let images = json!([
                 {"inlineData":{"mimeType":"image/png","data":"YWJj"}},
