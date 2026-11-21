@@ -17,6 +17,7 @@ use super::{Provider, builtin_chat, config, model_auth::Credential, providers::A
 pub(super) struct Profiles {
     entries: BTreeMap<String, Profile>,
     revision: String,
+    cloudflare_saved_account: Option<String>,
     radius_endpoint: Option<String>,
     operations: super::operation_models::Catalogue,
 }
@@ -749,10 +750,16 @@ fn configure_cloudflare_workers(
             super::operation_models::valid_cloudflare_account(configured).then_some(configured)
         }),
     };
-    let route_account = route_account.map(str::to_owned);
-    if entry.get("api").and_then(Value::as_str) == Some("cloudflare-workers-ai-system-one") {
-        // The operation catalogue has already consumed this classifier-only profile.
-        entry.clear();
+    let classifier_profile =
+        entry.get("api").and_then(Value::as_str) == Some("cloudflare-workers-ai-system-one");
+    let route_account = route_account
+        .or(account.filter(|_| classifier_profile))
+        .map(str::to_owned);
+    if classifier_profile {
+        // Provider-level operations settings were consumed by the operation catalogue.
+        for field in ["api", "baseUrl", "apiKey", "authHeader", "headers"] {
+            entry.remove(field);
+        }
     }
     if let Some(account) = route_account {
         let base = format!("{PREFIX}{account}/ai/v1");
@@ -776,6 +783,7 @@ impl Profiles {
             &data,
             keys.cloudflare_chat_account().or(account.as_deref()),
         )?;
+        profiles.cloudflare_saved_account = keys.cloudflare_chat_account().map(str::to_owned);
         if std::env::var_os("PI_RADIUS_GATEWAY").is_some() {
             let endpoint = super::radius_auth::model_endpoint(
                 &super::radius_auth::Gateway::configured_origin()?,
@@ -795,6 +803,10 @@ impl Profiles {
             profiles.radius_endpoint = Some(endpoint);
         }
         Ok(profiles)
+    }
+
+    pub(super) fn cloudflare_saved_account(&self) -> Option<&str> {
+        self.cloudflare_saved_account.as_deref()
     }
 
     pub(super) fn parse(data: &Value) -> Result<Self> {
@@ -1000,6 +1012,7 @@ impl Profiles {
         Ok(Self {
             entries,
             revision,
+            cloudflare_saved_account: None,
             radius_endpoint: None,
             operations,
         })
@@ -1701,6 +1714,34 @@ mod tests {
         );
         assert!(profiles.credential(&provider, endpoint).is_none());
         assert_eq!(profiles.model_ids(&provider).len(), 19);
+    }
+
+    #[test]
+    fn cloudflare_chat_models_survive_a_custom_classifier_route() {
+        let profiles = Profiles::parse_with_cloudflare_account(
+            &json!({"providers":{"cloudflare-workers-ai":{
+                "baseUrl":"https://classifiers.example/v1",
+                "api":"cloudflare-workers-ai-system-one","apiKey":"classifier-only",
+                "models":[
+                    {"id":"typesafe/jev","type":"classifier"},
+                    {"id":"custom-chat","api":"openai-completions","name":"Custom chat"}
+                ]
+            }}}),
+            Some("mine"),
+        )
+        .unwrap();
+        let provider = profiles.provider("cloudflare-workers-ai").unwrap();
+        let endpoint = profiles.endpoint(&provider);
+        assert_eq!(
+            endpoint,
+            "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
+        );
+        assert!(profiles.credential(&provider, endpoint).is_none());
+        assert!(
+            profiles
+                .model_ids(&provider)
+                .contains(&"custom-chat".to_owned())
+        );
     }
 
     #[test]
