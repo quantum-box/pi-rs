@@ -4264,6 +4264,7 @@ mod tests {
                 ("low", None, false),
                 ("xhigh", Some("low"), true),
                 ("none", None, false),
+                ("high", Some("low"), false),
             ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
@@ -4306,14 +4307,30 @@ mod tests {
                     assert_eq!(input[3]["type"], "function_call");
                     assert_eq!(input[4]["type"], "function_call_output");
                 }
+                if level == "high" {
+                    let updates: Vec<_> = input
+                        .iter()
+                        .filter(|item| item["type"] == "configuration_update")
+                        .collect();
+                    assert_eq!(
+                        updates,
+                        [&configuration_update("low"), &configuration_update("high")]
+                    );
+                    assert_eq!(input[5]["content"][0]["text"], "reply with thinking off");
+                }
                 let state = if incomplete {
                     "incomplete"
                 } else {
                     "completed"
                 };
+                let text = if level == "none" {
+                    "reply with thinking off"
+                } else {
+                    "reply"
+                };
                 let mut response = json!({
                     "status":state,"output":[{"type":"message","role":"assistant","content":[
-                        {"type":"output_text","text":"reply"}
+                        {"type":"output_text","text":text}
                     ]}],"usage":{"input_tokens":3,"output_tokens":1}
                 });
                 if incomplete {
@@ -4355,7 +4372,7 @@ mod tests {
             }],
             max_output_tokens: 64,
         };
-        for level in ["low", "xhigh", "off"] {
+        for level in ["low", "xhigh", "off", "high"] {
             let mut stream = client
                 .clone()
                 .with_thinking(Some(level))
@@ -4393,6 +4410,17 @@ mod tests {
                 ]);
             } else if level == "xhigh" {
                 assert_eq!(replay.unwrap().blocks.len(), 1);
+            } else if level == "off" {
+                request.messages.extend([
+                    Message::Assistant {
+                        content: "reply with thinking off".into(),
+                        calls,
+                        replay,
+                    },
+                    Message::User {
+                        content: "resume thinking".into(),
+                    },
+                ]);
             }
         }
         server.await.unwrap();
