@@ -1427,6 +1427,11 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Observe when an extension starts and stops waiting on a native UI prompt.
+    fn handles_ui_prompt_lifecycle(&self) -> bool {
+        false
+    }
+
     /// Opt in to model and thinking-level selection events.
     fn handles_model_selection(&self) -> bool {
         false

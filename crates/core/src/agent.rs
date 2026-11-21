@@ -815,15 +815,19 @@ impl Agent<'_> {
         };
         let mut result = match start_result {
             Ok(()) => {
-                self.drive(
-                    session,
-                    run_id,
-                    effective_input,
-                    followups,
-                    cancel,
-                    &mut retry_observer,
-                )
-                .await
+                let ui_events = crate::ui_prompt::RunEvents::default();
+                let result = ui_events
+                    .scope(self.drive(
+                        session,
+                        run_id,
+                        effective_input,
+                        followups,
+                        cancel,
+                        &mut retry_observer,
+                    ))
+                    .await;
+                ui_events.finish(&mut retry_observer).await;
+                result
             }
             Err(error) => Err(error),
         };

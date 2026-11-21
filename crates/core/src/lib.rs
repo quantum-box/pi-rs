@@ -24,6 +24,7 @@ mod tokens;
 mod tool_execution_snapshot;
 mod types;
 mod ui;
+mod ui_prompt;
 
 pub use agent::*;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -61,3 +62,4 @@ pub use tokio_util::sync::CancellationToken;
 pub use tool_execution_snapshot::{ToolExecutionSnapshot, ValidatedToolExecutionSnapshot};
 pub use types::*;
 pub use ui::*;
+pub use ui_prompt::{UiPromptKind, UiPromptReason};
