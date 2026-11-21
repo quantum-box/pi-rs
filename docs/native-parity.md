@@ -500,9 +500,9 @@ advertise a 1,048,576-token output limit, and K3 256K advertises 262,144.
 Image limits, prices, context windows and reasoning settings remain
 model-specific. The high-speed coding model uses its DeepSeek-style thinking
 switch. Subscription OAuth supports device login, refresh, and Pi-compatible
-credential storage. A refresh has Pi's 15-second deadline across network
-attempts and backoff. Once admitted, an in-flight refresh can still persist
-rotated credentials if its caller is cancelled. Live Kimi acceptance remains
+credential storage. A caller can wait for refresh for up to Pi's 15-second
+deadline. After the deadline the worker cannot start a new attempt. An admitted
+request can still persist a rotated credential after timeout or cancellation. Live Kimi acceptance remains
 open.
 
 On terminals without OSC 8 support, Markdown links use the reference's text
