@@ -4891,6 +4891,13 @@ credentials can be read and refreshed in place. A refresh in flight saves
 rotated credentials even when the requesting turn is cancelled. They stay bound to the
 official Codex endpoint and are independent of native `openai-chatgpt` accounts.
 
+Codex and Copilot use Pi's five-minute refresh window against the expiry
+stored in `auth.json`. A refresh that returns a shorter-lived credential is
+saved for ordinary inference. An explicit bearer-token export still requires
+the effective minimum validity after the saved refresh. Loopback fixtures
+covered early refresh and persistence. Live Codex and Copilot refresh was
+unverified.
+
 The native transport sends uncompressed JSON over HTTP SSE. The upstream
 WebSocket transport and specialized Codex
 grammar tools and tool search remain open. Authentication was exercised with
