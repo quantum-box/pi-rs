@@ -1089,6 +1089,10 @@ pub(crate) fn resource_matches(
     } else {
         pattern
     };
+    #[cfg(windows)]
+    let windows_pattern = pi_rs_workbench::windows_shell_path(pattern);
+    #[cfg(windows)]
+    let pattern = windows_pattern.as_str();
     // Pi normalizes home-relative paths and file URLs before matching both
     // ordinary patterns and exact +/- overrides.
     let expanded = if pattern == "~"
@@ -1499,6 +1503,10 @@ fn normalize(source: &str, base: &Path) -> Result<String> {
             "native packages use Cargo, git, or local paths".into(),
         ));
     }
+    #[cfg(windows)]
+    let windows_path = pi_rs_workbench::windows_shell_path(trimmed);
+    #[cfg(windows)]
+    let trimmed = windows_path.as_str();
     let path = if trimmed.starts_with("file://") {
         pi_rs_file_url::to_file_path(trimmed).map_err(Error::Config)?
     } else if trimmed == "~"
@@ -4681,6 +4689,50 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         assert!(package.iter().any(|source| source.ends_with("#v1")));
         assert!(package.iter().any(|source| source.ends_with("#v2")));
     }
+    #[cfg(windows)]
+    #[test]
+    fn package_sources_and_filters_accept_windows_shell_drive_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("native package");
+        let prompts = root.join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        let prompt = prompts.join("review.md");
+        std::fs::write(&prompt, "review").unwrap();
+        let root = dunce::simplified(&root);
+        let mut components = root.components();
+        let Some(std::path::Component::Prefix(prefix)) = components.next() else {
+            panic!("fixture must have a drive prefix: {root:?}");
+        };
+        let std::path::Prefix::Disk(drive) = prefix.kind() else {
+            panic!("fixture must use a disk: {root:?}");
+        };
+        let suffix = components
+            .as_path()
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let drive = char::from(drive).to_ascii_lowercase();
+        let expected = normalize(root.to_str().unwrap(), directory.path()).unwrap();
+        for prefix in ["", "mnt/", "CYGDRIVE/"] {
+            let source = format!("/{prefix}{drive}{suffix}");
+            assert_eq!(normalize(&source, directory.path()).unwrap(), expected);
+            assert!(resource_matches(
+                &prompt,
+                root,
+                &format!("{source}/prompts/*.md"),
+                false,
+                false
+            ));
+            assert!(resource_matches(
+                &prompt,
+                root,
+                &format!("{source}/prompts/review.md"),
+                true,
+                false
+            ));
+        }
+    }
+
     #[test]
     fn package_sources_normalize_file_urls_and_git_transports() {
         let root = tempfile::tempdir().unwrap();
