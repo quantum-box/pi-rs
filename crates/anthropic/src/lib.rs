@@ -1723,6 +1723,8 @@ impl Anthropic {
         } else {
             Vec::new()
         };
+        let copilot = (self.provider.as_ref() == "github-copilot")
+            .then(|| pi_rs_core::copilot_request_headers(&request.messages).collect::<Vec<_>>());
         let mut body = encode_request(
             request,
             &replay_scope,
@@ -1751,13 +1753,18 @@ impl Anthropic {
             progress(Progress::WaitingForModel);
         }
         let error_secrets = self.error_secrets();
-        let request = self.client.post(self.endpoint.clone()).json(&body);
-        let request = if matches!(self.provider.as_ref(), "opencode" | "opencode-go") {
-            request.query(&[("beta", "true")])
-        } else {
-            request
-        };
-        let response = send_http(self.authenticate(request)).await?;
+        let mut request = self.client.post(self.endpoint.clone());
+        if copilot.is_some() || matches!(self.provider.as_ref(), "opencode" | "opencode-go") {
+            request = request.query(&[("beta", "true")]);
+        }
+        if let Some(headers) = copilot {
+            for (name, value) in headers {
+                if !self.headers.contains_key(name) {
+                    request = request.header(name, value);
+                }
+            }
+        }
+        let response = send_http(self.authenticate(request.json(&body))).await?;
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
