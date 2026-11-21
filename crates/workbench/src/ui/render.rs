@@ -2547,9 +2547,9 @@ fn markdown_plain_at_depth(
                     continue;
                 }
                 if let Some((_, label, _)) = links.last_mut() {
-                    label.push(' ');
+                    label.push('\n');
                 }
-                let mut span = Span::themed(" ", theme, "text");
+                let mut span = Span::themed("\n", theme, "text");
                 span.hyperlink = links.last().and_then(|(url, _, _)| {
                     (hyperlinks && safe_hyperlink(url)).then(|| url.clone())
                 });

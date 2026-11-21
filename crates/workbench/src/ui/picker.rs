@@ -1,5 +1,9 @@
 //! Searchable keyboard selectors for session and model navigation.
-use super::{keys::Keys, render::Line, theme::Theme};
+use super::{
+    keys::Keys,
+    render::{Line, Span},
+    theme::Theme,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
@@ -70,6 +74,24 @@ pub enum TreeEntryKind {
     Message,
     Bookkeeping,
     Hidden,
+}
+
+/// The heading and body carry independent theme roles in the session tree.
+pub struct TreeDescription {
+    pub heading: String,
+    pub heading_role: &'static str,
+    pub body: String,
+    pub body_role: &'static str,
+}
+
+impl TreeDescription {
+    fn spans(&self, theme: &Theme, selected: bool) -> [super::render::Span; 2] {
+        let mut heading = super::render::Span::themed(&self.heading, theme, self.heading_role);
+        let mut body = super::render::Span::themed(&self.body, theme, self.body_role);
+        heading.bold = selected;
+        body.bold = selected;
+        [heading, body]
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -233,6 +255,7 @@ impl Picker {
     }
 
     pub fn paste(&mut self, text: &str) {
+        let tree_focus = self.tree_filter_focus();
         if self.title == "Settings" {
             // Pi's single-line input removes CR/LF, expands tabs, and keeps
             // other characters for filtering. Rendering sanitizes controls.
@@ -247,14 +270,31 @@ impl Picker {
             self.query
                 .extend(text.chars().filter(|character| !character.is_control()));
         }
-        self.selected = 0;
-        self.unfold_tree_for_search();
+        self.apply_search_focus(tree_focus);
     }
 
-    fn unfold_tree_for_search(&mut self) {
-        if let Some(tree) = &mut self.tree {
+    fn tree_filter_focus(&self) -> Option<u64> {
+        let tree = self.tree.as_ref()?;
+        if self.session_action.is_some() {
+            return None;
+        }
+        self.matches()
+            .get(self.selected)
+            .and_then(|item| match item.selection {
+                Selection::Checkout(id) => Some(id),
+                _ => None,
+            })
+            .or(Some(tree.last_filter_focus))
+    }
+
+    fn apply_search_focus(&mut self, focus: Option<u64>) {
+        if let Some(id) = focus {
+            let tree = self.tree.as_mut().expect("tree search");
             tree.collapsed.clear();
             tree.rebuild_visible();
+            self.focus_record(id);
+        } else {
+            self.selected = 0;
         }
     }
 
@@ -562,6 +602,15 @@ impl Picker {
         picker.focus_record(head);
         picker
     }
+    pub fn set_tree_descriptions(
+        &mut self,
+        descriptions: std::collections::BTreeMap<u64, TreeDescription>,
+    ) {
+        if let Some(tree) = &mut self.tree {
+            tree.descriptions = descriptions;
+        }
+    }
+
     pub fn set_label_timestamps(&mut self, timestamps: std::collections::BTreeMap<u64, String>) {
         if let Some(tree) = &mut self.tree {
             tree.label_timestamps = timestamps;
@@ -575,6 +624,9 @@ impl Picker {
         }
     }
     pub fn focus_record(&mut self, id: u64) {
+        if let Some(tree) = &mut self.tree {
+            tree.last_filter_focus = id;
+        }
         let visible: std::collections::HashMap<_, _> = self
             .matches()
             .iter()
@@ -599,6 +651,11 @@ impl Picker {
     }
     fn matches(&self) -> Vec<&Item> {
         let query = self.query.to_lowercase();
+        let tree_tokens: Vec<_> = if self.tree.is_some() {
+            query.split_whitespace().collect()
+        } else {
+            Vec::new()
+        };
         let session_query = super::session_search::Query::new(&self.query);
         let mut matches: Vec<_> = self
             .items
@@ -615,10 +672,19 @@ impl Picker {
                 {
                     return false;
                 }
-                if let (Some(tree), Selection::Checkout(id)) = (&self.tree, &item.selection)
-                    && (!tree.passes_filter(*id) || !tree.visible.contains(id))
-                {
-                    return false;
+                if let (Some(tree), Selection::Checkout(id)) = (&self.tree, &item.selection) {
+                    if !tree.passes_filter(*id) || !tree.visible.contains(id) {
+                        return false;
+                    }
+                    if tree_tokens.is_empty() {
+                        return true;
+                    }
+                    let text = item.label.to_lowercase();
+                    let label = tree.labels.get(id).map(|label| label.to_lowercase());
+                    return tree_tokens.iter().all(|token| {
+                        text.contains(token)
+                            || label.as_ref().is_some_and(|label| label.contains(token))
+                    });
                 }
                 if let Selection::Resume(path) = &item.selection
                     && let Some(document) = self.session_documents.get(path)
@@ -630,8 +696,7 @@ impl Picker {
                     _ => item.label.to_lowercase(),
                 };
                 if self.title == "Settings" {
-                    settings_match_score(&query, label.split(" · ").next().unwrap_or(&label))
-                        .is_some()
+                    settings_match_score(&query, settings_label_parts(&label).0).is_some()
                 } else if self.active_session.is_some()
                     || self.model_scope.is_some()
                     || self.title == "Thinking: select model"
@@ -817,7 +882,7 @@ impl Picker {
                 tree.filter = filter;
                 tree.collapsed.clear();
                 tree.rebuild_visible();
-                let focus = selected.unwrap_or(tree.head);
+                let focus = selected.unwrap_or(tree.last_filter_focus);
                 self.focus_record(focus);
                 return Input::Continue;
             }
@@ -900,14 +965,11 @@ impl Picker {
             }
         }
         if cancel {
-            if let Some(tree) = &mut self.tree
-                && !self.query.is_empty()
+            if !self.query.is_empty()
+                && let Some(focus) = self.tree_filter_focus()
             {
                 self.query.clear();
-                tree.collapsed.clear();
-                tree.rebuild_visible();
-                let head = tree.head;
-                self.focus_record(head);
+                self.apply_search_focus(Some(focus));
                 return Input::Continue;
             }
             return Input::Cancel;
@@ -938,16 +1000,18 @@ impl Picker {
         }
         if keys.matches("tui.editor.deleteCharBackward", key) {
             if let Some((index, _)) = self.query.grapheme_indices(true).next_back() {
+                let focus = self.tree_filter_focus();
                 self.query.truncate(index);
-                self.unfold_tree_for_search();
+                self.apply_search_focus(focus);
+            } else if self.tree.is_none() {
+                self.selected = 0;
             }
-            self.selected = 0;
             return Input::Continue;
         }
         if keys.matches("tui.editor.deleteWordBackward", key) {
+            let focus = self.tree_filter_focus();
             self.query.truncate(previous_word_start(&self.query));
-            self.selected = 0;
-            self.unfold_tree_for_search();
+            self.apply_search_focus(focus);
             return Input::Continue;
         }
         match key.code {
@@ -958,9 +1022,9 @@ impl Picker {
                     KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                 ) =>
             {
+                let focus = self.tree_filter_focus();
                 self.query.push(character);
-                self.selected = 0;
-                self.unfold_tree_for_search();
+                self.apply_search_focus(focus);
             }
             _ => {}
         }
@@ -1180,19 +1244,13 @@ impl Picker {
                     continue;
                 };
                 let marker = if tree.active_path.contains(&id) { 2 } else { 0 };
-                let timestamp = if tree.show_label_timestamps {
-                    tree.label_timestamps
-                        .get(&id)
-                        .map_or(0, |value| format_label_timestamp(value).width() + 1)
-                } else {
-                    0
-                };
                 let anchor = prefix.width().saturating_add(marker);
-                max_body = max_body.max(
-                    anchor
-                        .saturating_add(timestamp)
-                        .saturating_add(super::render::clean(&item.label).width()),
-                );
+                let text_width = tree
+                    .description_spans(id, item, theme, index == self.selected)
+                    .iter()
+                    .map(|span| span.text.width())
+                    .sum::<usize>();
+                max_body = max_body.max(anchor.saturating_add(text_width));
                 if index == self.selected {
                     selected_anchor = Some(anchor);
                 }
@@ -1215,39 +1273,42 @@ impl Picker {
             .max()
             .unwrap_or(12)
             .clamp(12, 32);
+        let settings_column = (self.title == "Settings").then(|| {
+            self.items
+                .iter()
+                .map(|item| settings_label_parts(&item.label).0.width())
+                .max()
+                .unwrap_or(0)
+                .min(36)
+        });
         for (index, item) in items.iter().enumerate().skip(start).take(available) {
+            if let Some(column) = settings_column {
+                lines.push(render_settings_row(
+                    &item.label,
+                    index == self.selected,
+                    theme,
+                    width,
+                    column,
+                ));
+                continue;
+            }
             if let (Some(tree), Some(layout), Selection::Checkout(id)) =
                 (&self.tree, &tree_layout, &item.selection)
             {
                 let selected = index == self.selected;
-                let timestamp = if tree.show_label_timestamps {
-                    tree.label_timestamps
-                        .get(id)
-                        .map_or_else(String::new, |timestamp| {
-                            format!("{} ", format_label_timestamp(timestamp))
-                        })
-                } else {
-                    String::new()
-                };
                 let prefix = &layout.rows[id];
                 let viewport = width.saturating_sub(2);
                 let prefix_text = prefix.slice(&layout.gutters, tree_scroll, viewport);
-                let suffix = [
-                    super::render::Span::themed(
-                        if tree.active_path.contains(id) {
-                            "• "
-                        } else {
-                            ""
-                        },
-                        theme,
-                        "accent",
-                    ),
-                    super::render::Span::themed(
-                        format!("{timestamp}{}", item.label),
-                        theme,
-                        "text",
-                    ),
-                ];
+                let mut suffix = vec![super::render::Span::themed(
+                    if tree.active_path.contains(id) {
+                        "• "
+                    } else {
+                        ""
+                    },
+                    theme,
+                    "accent",
+                )];
+                suffix.extend(tree.description_spans(*id, item, theme, selected));
                 let mut spans = vec![super::render::Span::themed(
                     if selected { "› " } else { "  " },
                     theme,
@@ -1462,6 +1523,43 @@ impl Picker {
     }
 }
 
+fn settings_label_parts(label: &str) -> (&str, &str) {
+    label.split_once(" · ").unwrap_or((label, ""))
+}
+
+fn render_settings_row(
+    label: &str,
+    selected: bool,
+    theme: &Theme,
+    width: usize,
+    column: usize,
+) -> Line {
+    let (label, value) = settings_label_parts(label);
+    let prefix = clip_completion(if selected { "→ " } else { "  " }, width);
+    let available = width.saturating_sub(prefix.width());
+    let label_width = label.width();
+    let aligned_padding = column.saturating_sub(label_width) + 2;
+    let padding = if label_width + aligned_padding + value.width() <= available {
+        aligned_padding
+    } else {
+        2
+    };
+    let label = clip_completion(&format!("{label}{}", " ".repeat(padding)), available);
+    let value_width = available.saturating_sub(label.width());
+    Line {
+        spans: vec![
+            Span::themed(prefix, theme, "accent"),
+            Span::themed(label, theme, if selected { "accent" } else { "text" }),
+            Span::themed(
+                clip_completion(value, value_width),
+                theme,
+                if selected { "accent" } else { "muted" },
+            ),
+        ],
+        ..Line::default()
+    }
+}
+
 // Pi's settings list explains the selected option below the list. Keep
 // descriptions keyed by the action so searching and refreshing do not detach
 // them from the setting they describe.
@@ -1606,14 +1704,15 @@ struct TreeState {
     parents: std::collections::BTreeMap<u64, Option<u64>>,
     children: std::collections::BTreeMap<u64, Vec<u64>>,
     labels: std::collections::BTreeMap<u64, String>,
+    descriptions: std::collections::BTreeMap<u64, TreeDescription>,
     label_timestamps: std::collections::BTreeMap<u64, String>,
     show_label_timestamps: bool,
+    last_filter_focus: u64,
     roots: Vec<u64>,
     order: Vec<u64>,
     active_path: std::collections::BTreeSet<u64>,
     collapsed: std::collections::BTreeSet<u64>,
     visible: std::collections::BTreeSet<u64>,
-    head: u64,
 }
 
 struct TreeGutter {
@@ -1761,14 +1860,15 @@ impl TreeState {
             parents,
             children,
             labels,
+            descriptions: Default::default(),
             label_timestamps: Default::default(),
             show_label_timestamps: false,
+            last_filter_focus: head,
             roots,
             order: vec![],
             active_path,
             collapsed: Default::default(),
             visible: Default::default(),
-            head,
         };
         let mut pending: Vec<_> = tree.roots.iter().rev().copied().collect();
         while let Some(id) = pending.pop() {
@@ -1891,6 +1991,33 @@ impl TreeState {
             rows: result,
             gutters: gutter_arena,
         }
+    }
+
+    fn description_spans(
+        &self,
+        id: u64,
+        item: &Item,
+        theme: &Theme,
+        selected: bool,
+    ) -> Vec<super::render::Span> {
+        use super::render::Span;
+
+        let mut spans = Vec::new();
+        if let Some(label) = self.labels.get(&id).filter(|label| !label.is_empty()) {
+            spans.push(Span::themed(format!("[{label}] "), theme, "warning"));
+            if self.show_label_timestamps
+                && let Some(timestamp) = self.label_timestamps.get(&id)
+            {
+                let timestamp = format_label_timestamp(timestamp);
+                spans.push(Span::themed(format!("{timestamp} "), theme, "muted"));
+            }
+        }
+        if let Some(description) = self.descriptions.get(&id) {
+            spans.extend(description.spans(theme, selected));
+        } else {
+            spans.push(Span::themed(&item.label, theme, "text"));
+        }
+        spans
     }
 
     fn passes_filter(&self, id: u64) -> bool {
@@ -2232,6 +2359,45 @@ mod tests {
             Input::UpdateModelScope { save: false }
         ));
         assert!(picker.model_scope().unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn settings_align_values_and_use_pi_theme_roles() {
+        let item = |label: &str| Item {
+            label: label.into(),
+            selection: Selection::EditSetting("theme".into()),
+        };
+        let mut picker = Picker::new(
+            "Settings",
+            vec![item("Theme · dark"), item("Long setting · on")],
+        );
+        let theme = Theme::system();
+        let keys = Keys::default();
+        let lines = picker.render(&theme, 80, 8, &keys);
+        let plain = |line: &Line| {
+            line.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        };
+        assert_eq!(plain(&lines[1]), "→ Theme         dark");
+        assert_eq!(plain(&lines[2]), "  Long setting  on");
+        assert_eq!(lines[1].spans[1].color, theme.color("accent"));
+        assert_eq!(lines[1].spans[2].color, theme.color("accent"));
+        assert_eq!(lines[2].spans[1].color, theme.color("text"));
+        assert_eq!(lines[2].spans[2].color, theme.color("muted"));
+        assert!(lines[1].background.is_none());
+        picker.paste("Theme");
+        let lines = picker.render(&theme, 80, 8, &keys);
+        assert_eq!(plain(&lines[1]), "→ Theme         dark");
+        let compact = picker.render(&theme, 16, 8, &keys);
+        assert_eq!(plain(&compact[1]), "→ Theme  dark");
+        let exact_width = picker.render(&theme, 20, 8, &keys);
+        assert_eq!(plain(&exact_width[1]), "→ Theme         dark");
+        for width in 0..20 {
+            let lines = picker.render(&theme, width, 8, &keys);
+            assert!(plain(&lines[1]).width() <= width);
+        }
     }
 
     #[test]
@@ -2718,6 +2884,67 @@ mod tests {
         assert!(
             picker.tree.as_ref().unwrap().collapsed.is_empty(),
             "editing search clears folds"
+        );
+    }
+
+    #[test]
+    fn tree_search_keeps_selection_through_empty_results_and_escape() {
+        let entries = [
+            (1, (None, TreeEntryKind::User)),
+            (2, (Some(1), TreeEntryKind::Message)),
+            (3, (Some(2), TreeEntryKind::User)),
+        ]
+        .into_iter()
+        .collect();
+        let items = ["shared alpha", "shared beta", "shared gamma"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, label)| Item {
+                label: label.into(),
+                selection: Selection::Checkout(index as u64 + 1),
+            })
+            .collect();
+        let labels = [(2, "checkpoint".into())].into_iter().collect();
+        let mut picker = Picker::tree(items, entries, labels, 3, TreeFilter::Default);
+        let keys = Keys::default();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let selected = |picker: &Picker| {
+            picker
+                .matches()
+                .get(picker.selected)
+                .map(|item| match item.selection {
+                    Selection::Checkout(id) => id,
+                    _ => unreachable!(),
+                })
+        };
+
+        picker.input(key(KeyCode::Up), &keys);
+        picker.paste("SHARED");
+        assert_eq!(selected(&picker), Some(2));
+        picker.input(key(KeyCode::Char('x')), &keys);
+        assert_eq!(selected(&picker), None);
+        picker.input(key(KeyCode::Backspace), &keys);
+        assert_eq!(selected(&picker), Some(2));
+        picker.paste(" checkpoint beta");
+        assert_eq!(selected(&picker), Some(2));
+        picker.paste(" absent");
+        assert_eq!(selected(&picker), None);
+        assert!(matches!(
+            picker.input(key(KeyCode::Esc), &keys),
+            Input::Continue
+        ));
+        assert_eq!(selected(&picker), Some(2));
+        assert!(matches!(
+            picker.input(key(KeyCode::Esc), &keys),
+            Input::Cancel
+        ));
+
+        picker.focus_record(3);
+        picker.paste("beta");
+        assert_eq!(
+            selected(&picker),
+            Some(2),
+            "fall back to the visible ancestor"
         );
     }
 

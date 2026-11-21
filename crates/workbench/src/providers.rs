@@ -661,6 +661,13 @@ impl Client {
                     .stream(request)
                     .await
             }
+            Self::Google(client) if !defaults.is_empty() => {
+                client
+                    .clone()
+                    .with_default_headers(defaults)
+                    .stream(request)
+                    .await
+            }
             Self::Bedrock(client) => {
                 let client = client.clone().with_default_headers(defaults)?;
                 if cache_disabled {
@@ -856,11 +863,12 @@ impl Client {
                     context,
                 )?))
             }
-            Self::Google(client) => Ok(Some(client.prepare_bound_tool_dispatch(
-                request,
-                declarations,
-                context,
-            )?)),
+            Self::Google(client) => Ok(Some(
+                client
+                    .clone()
+                    .with_default_headers(defaults)
+                    .prepare_bound_tool_dispatch(request, declarations, context)?,
+            )),
             Self::OpenAi(client) => {
                 let client = client.clone().with_default_headers(defaults);
                 let client = if workbench_routing {
@@ -3947,6 +3955,151 @@ mod estimation_tests {
                 .await;
             let body = server.join().unwrap();
             assert_eq!(body["input"][0]["role"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_prepared_requests_send_route_headers_for_every_api() {
+        use clap::Parser;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        for (provider, model, target, auth_header, override_session) in [
+            (
+                "opencode",
+                "kimi-k2.7-code",
+                "/relay/chat/completions",
+                "authorization: bearer fixture",
+                true,
+            ),
+            (
+                "opencode-go",
+                "claude-haiku-5-5",
+                "/relay/messages?beta=true",
+                "x-api-key: fixture",
+                false,
+            ),
+            (
+                "opencode",
+                "gemini-4-argon",
+                "/relay/models/gemini-4-argon:streamGenerateContent?alt=sse",
+                "x-goog-api-key: fixture",
+                false,
+            ),
+            (
+                "opencode-go",
+                "gpt-6-luna",
+                "/relay/responses",
+                "authorization: bearer fixture",
+                false,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}/relay", listener.local_addr().unwrap());
+            let headers = if override_session {
+                json!({"X-OpenCode-Session": "explicit"})
+            } else {
+                json!({})
+            };
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+                "providers":{provider:{"baseUrl":base,"apiKey":"fixture","headers":headers}}
+            }))
+            .unwrap();
+            args.provider = args.model_profiles.provider(provider).unwrap();
+            args.model = model.into();
+            let endpoint = args.model_endpoint_for(&args.provider, Some(model));
+            let client = args
+                .connect_provider(&args.provider, Some(model))
+                .unwrap()
+                .with_context_probes(false)
+                .with_model_options(&args, false)
+                .unwrap();
+            let routed = super::super::image_policy::WorkbenchModel {
+                strict_policy: None,
+                client,
+                block_images: false,
+                supports_images: None,
+                session_affinity: args.model_profiles.session_affinity(
+                    &args.provider,
+                    model,
+                    endpoint,
+                ),
+                price: None,
+            };
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                socket.get_mut().write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                request.to_ascii_lowercase()
+            });
+            let context = pi_rs::ToolDispatchContext {
+                request_id: uuid::Uuid::new_v4(),
+                session_id: uuid::Uuid::new_v4(),
+                external_id: "routing-fixture".into(),
+                summary: false,
+            };
+            let request = ModelRequest {
+                model: model.into(),
+                messages: vec![pi_rs::Message::User {
+                    content: "hello".into(),
+                }],
+                tools: vec![],
+                max_output_tokens: 32,
+            };
+            let prepared = routed
+                .prepare_tool_dispatch(&request, &[], &context)
+                .await
+                .unwrap()
+                .unwrap();
+            let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                if let Ok(mut stream) = prepared.dispatch().await {
+                    assert!(stream.next().await.unwrap().is_err());
+                }
+            })
+            .await;
+            assert!(
+                dispatched.is_ok(),
+                "request timed out for {provider}/{model}"
+            );
+            let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                dispatched.starts_with(&format!("post {} http/", target.to_ascii_lowercase())),
+                "{dispatched}"
+            );
+            assert!(
+                dispatched.lines().any(|line| line == auth_header),
+                "{dispatched}"
+            );
+            let session_header = if override_session {
+                "x-opencode-session: explicit"
+            } else {
+                "x-opencode-session: routing-fixture"
+            };
+            assert!(
+                dispatched.lines().any(|line| line == session_header),
+                "{dispatched}"
+            );
+            if model == "gpt-6-luna" {
+                assert!(
+                    dispatched
+                        .lines()
+                        .any(|line| line == "x-client-request-id: routing-fixture"),
+                    "{dispatched}"
+                );
+            }
         }
     }
 

@@ -180,7 +180,8 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
     let mut plan = resource_declarations(args, false)?;
     plan.extend(resource_declarations(args, true)?);
     for declaration in plan {
-        let cached = if remote(&declaration.source) {
+        let is_remote = remote(&declaration.source);
+        let cached = if is_remote {
             installed.contains_key(&key(&declaration.source))
         } else {
             installed
@@ -191,13 +192,20 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
                         .unwrap_or(true)
                 })
         };
-        if args.offline && remote(&declaration.source) {
+        if args.offline && is_remote {
             if !cached {
                 eprintln!(
                     "Package {}: skipped in offline mode",
                     display_source(&declaration.source)
                 );
             }
+            continue;
+        }
+        if declaration.transient
+            && cached
+            && let Some(value) = installed.get(&key(&declaration.source))
+            && cached_git_pin_matches(&declaration.source, value, cleanup).await
+        {
             continue;
         }
         if declaration.transient || !cached {
@@ -209,7 +217,11 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
                 Ok(package) => {
                     installed.insert(key(&declaration.source), serde_json::to_value(package)?);
                 }
-                Err(error) if cleanup.is_some() || (declaration.transient && !cached) => {
+                // Standalone share requires a complete runtime. Keep strict
+                // validation for explicitly requested native files and directories.
+                Err(error)
+                    if cleanup.is_some() || (!is_remote && declaration.transient && !cached) =>
+                {
                     return Err(error);
                 }
                 Err(error) => eprintln!("Package {}: {error}", display_source(&declaration.source)),
@@ -1089,6 +1101,10 @@ pub(crate) fn resource_matches(
     } else {
         pattern
     };
+    #[cfg(windows)]
+    let windows_pattern = pi_rs_workbench::windows_shell_path(pattern);
+    #[cfg(windows)]
+    let pattern = windows_pattern.as_str();
     // Pi normalizes home-relative paths and file URLs before matching both
     // ordinary patterns and exact +/- overrides.
     let expanded = if pattern == "~"
@@ -1499,6 +1515,10 @@ fn normalize(source: &str, base: &Path) -> Result<String> {
             "native packages use Cargo, git, or local paths".into(),
         ));
     }
+    #[cfg(windows)]
+    let windows_path = pi_rs_workbench::windows_shell_path(trimmed);
+    #[cfg(windows)]
+    let trimmed = windows_path.as_str();
     let path = if trimmed.starts_with("file://") {
         pi_rs_file_url::to_file_path(trimmed).map_err(Error::Config)?
     } else if trimmed == "~"
@@ -1624,6 +1644,47 @@ fn git_reference(source: &str) -> (&str, &str) {
         None => (source, "HEAD"),
     }
 }
+fn is_git_commit_prefix(reference: &str) -> bool {
+    (7..=64).contains(&reference.len()) && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+async fn cached_git_pin_matches(source: &str, cache: &Value, cleanup: Option<&Children>) -> bool {
+    let Some(specification) = source.strip_prefix("git:") else {
+        return false;
+    };
+    let (_, reference) = git_reference(specification);
+    if !is_git_commit_prefix(reference) {
+        return false;
+    }
+    let Ok(package) = serde_json::from_value::<Installed>(cache.clone()) else {
+        return false;
+    };
+    if package.source != source || !package.root.join(".git").is_dir() {
+        return false;
+    }
+    resolve_git_commit(&package.root, "HEAD", source, cleanup)
+        .await
+        .is_some_and(|commit| commit.starts_with(&reference.to_ascii_lowercase()))
+}
+
+async fn resolve_git_commit(
+    root: &Path,
+    reference: &str,
+    source: &str,
+    cleanup: Option<&Children>,
+) -> Option<String> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "--end-of-options"])
+        .arg(format!("{reference}^{{commit}}"));
+    let output = run(command, source, cleanup).await.ok()?;
+    let commit = std::str::from_utf8(&output).ok()?.trim();
+    (matches!(commit.len(), 40 | 64) && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| commit.to_ascii_lowercase())
+}
+
 fn key(source: &str) -> String {
     format!("{:x}", Sha256::digest(source.as_bytes()))
 }
@@ -1748,24 +1809,38 @@ async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Res
             ));
         }
         root = generation.path().join("source");
-        if !root.exists() {
-            let mut command = tokio::process::Command::new("git");
-            command
-                .args(["clone", "--no-checkout", "--depth", "1", "--", url])
-                .arg(&root);
-            run(command, source, cleanup).await?;
+        let abbreviated = is_git_commit_prefix(reference) && !matches!(reference.len(), 40 | 64);
+        let mut command = tokio::process::Command::new("git");
+        command.args(["clone", "--no-checkout"]);
+        if !abbreviated {
+            command.args(["--depth", "1"]);
         }
-        let mut fetch = tokio::process::Command::new("git");
-        fetch
-            .arg("-C")
-            .arg(&root)
-            .args(["fetch", "--depth", "1", "--", "origin", reference]);
-        run(fetch, source, cleanup).await?;
+        command.args(["--", url]).arg(&root);
+        run(command, source, cleanup).await?;
+
+        let mut commit = None;
+        if abbreviated {
+            let prefix = reference.to_ascii_lowercase();
+            commit = resolve_git_commit(&root, &prefix, source, cleanup)
+                .await
+                .filter(|commit| commit.starts_with(&prefix));
+        }
+        let target = if let Some(commit) = commit.as_deref() {
+            commit
+        } else {
+            let mut fetch = tokio::process::Command::new("git");
+            fetch
+                .arg("-C")
+                .arg(&root)
+                .args(["fetch", "--depth", "1", "--", "origin", reference]);
+            run(fetch, source, cleanup).await?;
+            "FETCH_HEAD"
+        };
         let mut checkout = tokio::process::Command::new("git");
         checkout
             .arg("-C")
             .arg(&root)
-            .args(["reset", "--hard", "FETCH_HEAD"]);
+            .args(["reset", "--hard", target]);
         run(checkout, source, cleanup).await?;
     }
     if root.is_file() {
@@ -4681,6 +4756,50 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         assert!(package.iter().any(|source| source.ends_with("#v1")));
         assert!(package.iter().any(|source| source.ends_with("#v2")));
     }
+    #[cfg(windows)]
+    #[test]
+    fn package_sources_and_filters_accept_windows_shell_drive_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("native package");
+        let prompts = root.join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        let prompt = prompts.join("review.md");
+        std::fs::write(&prompt, "review").unwrap();
+        let root = dunce::simplified(&root);
+        let mut components = root.components();
+        let Some(std::path::Component::Prefix(prefix)) = components.next() else {
+            panic!("fixture must have a drive prefix: {root:?}");
+        };
+        let std::path::Prefix::Disk(drive) = prefix.kind() else {
+            panic!("fixture must use a disk: {root:?}");
+        };
+        let suffix = components
+            .as_path()
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let drive = char::from(drive).to_ascii_lowercase();
+        let expected = normalize(root.to_str().unwrap(), directory.path()).unwrap();
+        for prefix in ["", "mnt/", "CYGDRIVE/"] {
+            let source = format!("/{prefix}{drive}{suffix}");
+            assert_eq!(normalize(&source, directory.path()).unwrap(), expected);
+            assert!(resource_matches(
+                &prompt,
+                root,
+                &format!("{source}/prompts/*.md"),
+                false,
+                false
+            ));
+            assert!(resource_matches(
+                &prompt,
+                root,
+                &format!("{source}/prompts/review.md"),
+                true,
+                false
+            ));
+        }
+    }
+
     #[test]
     fn package_sources_normalize_file_urls_and_git_transports() {
         let root = tempfile::tempdir().unwrap();

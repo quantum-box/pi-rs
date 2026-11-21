@@ -66,16 +66,17 @@ impl Api {
 }
 
 fn retryable_classifier_response(response: &reqwest::Response) -> bool {
-    match response
-        .headers()
-        .get("x-should-retry")
-        .and_then(|value| value.to_str().ok())
-    {
-        Some("true") => return true,
-        Some("false") => return false,
-        _ => {}
+    let mut hints = response.headers().get_all("x-should-retry").iter();
+    // Fetch combines repeated fields with commas, so only a single field can
+    // equal "true" or "false" in Pi's retry policy.
+    if let (Some(hint), None) = (hints.next(), hints.next()) {
+        match hint.to_str().ok() {
+            Some("true") => return true,
+            Some("false") => return false,
+            _ => {}
+        }
     }
-    matches!(response.status().as_u16(), 408 | 409 | 429 | 500..=599)
+    matches!(response.status().as_u16(), 408 | 409 | 429 | 500..)
 }
 
 // JavaScript's parseFloat consumes the longest valid numeric prefix, including
@@ -2934,6 +2935,30 @@ mod tests {
                 "HTTP 503",
             ),
             (Api::SystemOne, vec![(400, "")], false, "HTTP 400"),
+            (
+                Api::SystemOne,
+                vec![(400, "x-should-retry: true\r\nx-should-retry: false\r\n")],
+                false,
+                "HTTP 400",
+            ),
+            (
+                Api::SystemOne,
+                vec![
+                    (
+                        503,
+                        "x-should-retry: false\r\nx-should-retry: true\r\nretry-after-ms: 0\r\n",
+                    ),
+                    (200, ""),
+                ],
+                true,
+                "",
+            ),
+            (
+                Api::SystemOne,
+                vec![(601, "retry-after-ms: 0\r\n"), (200, "")],
+                true,
+                "",
+            ),
             (
                 Api::SystemOne,
                 vec![
