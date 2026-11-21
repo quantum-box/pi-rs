@@ -435,7 +435,7 @@ impl Agent<'_> {
     }
 
     /// Move queued input into a settled session synchronously.
-    /// Use [Self::apply_queued_inputs_with_lifecycle] to run asynchronous user-message hooks.
+    /// Use [Self::apply_queued_inputs_with_lifecycle] to run asynchronous message hooks.
     pub fn apply_queued_inputs(
         &self,
         session: &mut Session,
@@ -472,29 +472,57 @@ impl Agent<'_> {
         }
         ensure_settled(session.operations())?;
         let event = Session::user_input_event(content, images, Some(input_id))?;
-        let event = self.edit_user_event(session, event, observer).await;
+        let event = self.edit_input_event(session, event, observer).await;
         session.append(event)?;
         Ok(())
     }
 
-    async fn edit_user_event(
+    async fn edit_input_event(
         &self,
         session: &mut Session,
         event: Event,
         observer: &mut Observer<'_>,
     ) -> Event {
-        match crate::message_hooks::MessageHooks::for_session(
-            self.registry,
-            session,
-            self.limits.model_timeout,
-        ) {
+        use crate::message_hooks::MessageHooks;
+        let hooks = if matches!(&event, Event::CustomMessageDelivered { .. }) {
+            MessageHooks::for_custom_session(self.registry, session, self.limits.model_timeout)
+        } else {
+            MessageHooks::for_session(self.registry, session, self.limits.model_timeout)
+        };
+        match hooks {
             Some(mut hooks) => {
-                let event = hooks.user(event).await;
+                let event = match event {
+                    Event::CustomMessageDelivered { id, message } => {
+                        Event::CustomMessageDelivered {
+                            id,
+                            message: hooks.custom(message).await,
+                        }
+                    }
+                    event => hooks.user(event).await,
+                };
                 hooks.report_errors(observer);
                 event
             }
             None => event,
         }
+    }
+
+    async fn commit_turn_custom_message(
+        &self,
+        session: &mut Session,
+        input: crate::QueuedCustomMessage,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let event = Event::CustomMessageDelivered {
+            id: input.id,
+            message: input.message,
+        };
+        let event = self.edit_input_event(session, event, observer).await;
+        commit(session, event, observer)
     }
 
     async fn deliver_inputs(
@@ -509,10 +537,7 @@ impl Agent<'_> {
             if cancel.is_cancelled() {
                 break;
             }
-            let mut event = event?;
-            if matches!(event, Event::User { .. } | Event::UserWithImages { .. }) {
-                event = self.edit_user_event(session, event, observer).await;
-            }
+            let event = self.edit_input_event(session, event?, observer).await;
             commit(session, event, observer)?;
             accepted = true;
         }
@@ -1520,14 +1545,8 @@ impl Agent<'_> {
                             && message.delivery == crate::CustomMessageDelivery::TriggerTurn
                     })
             {
-                commit(
-                    session,
-                    Event::CustomMessageDelivered {
-                        id: message.id,
-                        message: message.message,
-                    },
-                    observer,
-                )?;
+                self.commit_turn_custom_message(session, message, cancel, observer)
+                    .await?;
             }
             let trigger_started = session
                 .branch()
@@ -1546,14 +1565,8 @@ impl Agent<'_> {
                     if pending.delivery == crate::CustomMessageDelivery::NextTurn
                         && queued_at < started_at
                     {
-                        commit(
-                            session,
-                            Event::CustomMessageDelivered {
-                                id: pending.id,
-                                message: pending.message,
-                            },
-                            observer,
-                        )?;
+                        self.commit_turn_custom_message(session, pending, cancel, observer)
+                            .await?;
                     }
                 }
             }
@@ -1583,7 +1596,7 @@ impl Agent<'_> {
                     content,
                     input_id: Some(id),
                 };
-                let event = self.edit_user_event(session, event, observer).await;
+                let event = self.edit_input_event(session, event, observer).await;
                 commit(session, event, observer)?;
             }
             // Only messages queued before this run's initial user entry belong to it.
@@ -1608,14 +1621,8 @@ impl Agent<'_> {
                         && session.records()[(queued_at - 1) as usize].run_id != Some(run_id)
                         && input.delivery == crate::CustomMessageDelivery::NextTurn
                     {
-                        commit(
-                            session,
-                            Event::CustomMessageDelivered {
-                                id: input.id,
-                                message: input.message,
-                            },
-                            observer,
-                        )?;
+                        self.commit_turn_custom_message(session, input, cancel, observer)
+                            .await?;
                     }
                 }
             }
