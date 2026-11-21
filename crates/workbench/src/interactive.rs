@@ -2918,16 +2918,25 @@ impl View {
         let render_entry = |entry: &Entry| {
             entry.render(theme, width, self.expand_tools, !self.hide_thinking, output)
         };
+        let modal = self.picker.is_some() || self.dialog().is_some();
+        let committing = !busy && !modal;
+        // A trailing cycle notice can still be replaced by another cycle.
+        let trailing_status = matches!(self.lines.last(), Some(Entry::ModelCycleStatus(_)));
+        let commit_end = if committing {
+            (self.lines.len() - usize::from(trailing_status)).max(self.regular.committed)
+        } else {
+            self.regular.committed
+        };
         let pending = || {
-            self.lines[self.regular.committed..]
+            self.lines[self.regular.committed..commit_end]
                 .iter()
                 .flat_map(render_entry)
         };
-        let modal = self.picker.is_some() || self.dialog().is_some();
-        let committing = !busy && !modal;
-        let mut active = Vec::new();
+        let mut active: Vec<_> = self.lines[commit_end..]
+            .iter()
+            .flat_map(render_entry)
+            .collect();
         if !committing {
-            active.extend(pending());
             active.extend(
                 Entry::Thinking {
                     text: self.thinking.clone(),
@@ -3046,7 +3055,7 @@ impl View {
                 queue!(out, Print("\r\n"))?;
                 self.regular.committed_rows += 1;
             }
-            self.regular.committed = self.lines.len();
+            self.regular.committed = commit_end;
         }
         let total_rows = self.regular.committed_rows + region_height;
         self.regular.max_rows = if redraw {
@@ -6370,17 +6379,38 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     } else {
         args.model_scope.as_slice()
     };
-    if let Some(choice) = next_model(args, choices, reverse) {
+    let status = if let Some(choice) = next_model(args, choices, reverse) {
         args.change_model(
             choice.provider,
             choice.model,
             choice.thinking,
             pi_rs::ModelSelectSource::Cycle,
         )?;
+        let name = args
+            .model_profiles
+            .model(&args.provider, &args.model)
+            .and_then(|model| model.name)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| args.model.clone());
+        let mut status = format!("Switched to {name}");
+        if let Some(level) = args.thinking.as_deref().filter(|level| *level != "off")
+            && super::thinking::adopted_reasoning(args) == Some(true)
+        {
+            status.push_str(&format!(" (thinking: {level})"));
+        }
+        status
     } else if args.model_scope.is_empty() {
-        view.append("Only one model available");
+        "Only one model available".into()
     } else {
-        view.append("Only one model in scope");
+        "Only one model in scope".into()
+    };
+    // A normal terminal has already printed committed rows to its scrollback.
+    if (args.tui_mode != Some(TuiMode::Regular) || view.regular.committed < view.lines.len())
+        && let Some(Entry::ModelCycleStatus(previous)) = view.lines.last_mut()
+    {
+        *previous = status;
+    } else {
+        view.append_entry(Entry::ModelCycleStatus(status));
     }
     Ok(())
 }

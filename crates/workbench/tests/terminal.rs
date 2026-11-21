@@ -2481,8 +2481,8 @@ fn save_default_model_persists_provider_and_extends_scope() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(home.join("settings.json"), br#"{"defaultProvider":"anthropic","defaultModel":"old-model","enabledModels":["ollama/first"]}"#).unwrap();
-    std::fs::write(home.join("models.json"), br#"{"providers":{"ollama":{"baseUrl":"http://127.0.0.1:1/v1","models":[{"id":"first","reasoning":false},{"id":"second","reasoning":false}]}}}"#).unwrap();
+    std::fs::write(home.join("settings.json"), br#"{"defaultProvider":"anthropic","defaultModel":"old-model","enabledModels":["ollama/first"],"modelThinkingLevels":{"ollama/first":"high"}}"#).unwrap();
+    std::fs::write(home.join("models.json"), br#"{"providers":{"ollama":{"baseUrl":"http://127.0.0.1:1/v1","models":[{"id":"first","name":"First Fixture","reasoning":true,"thinkingLevelMap":{"high":"high"}},{"id":"second","reasoning":false}]}}}"#).unwrap();
     let mut master_fd = -1;
     let mut slave_fd = -1;
     let mut size = libc::winsize {
@@ -2571,6 +2571,14 @@ fn save_default_model_persists_provider_and_extends_scope() {
         saved["enabledModels"],
         serde_json::json!(["ollama/first", "ollama/second"])
     );
+    master.write_all(b"\x10").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Switched to First Fixture (thinking: high)")
+    });
+    master.write_all(b"\x10").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Switched to second") && !text.contains("Switched to First Fixture")
+    });
     let mut restart = Command::new(env!("CARGO_BIN_EXE_pi"))
         .env("PI_RS_HOME", &home)
         .args([
