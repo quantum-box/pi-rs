@@ -2,12 +2,13 @@
 
 ## Nested and woken cancellation groundwork
 
-Upstream `origin/main` at `edfe6b2ef32283d31efc9e26db86fe48be19d3b2`
+Upstream `main` at `780bf31fcaeb252fa9b68df3964c735eae75bde3`
 uses the same ToolTask cancellation path for nested calls and for a woken
 execution interrupted after intent. It passes the last parked checkpoint and
 prepared arguments, disallows nested work from `cancel`, and runs abort or
-interruption after hooks where applicable. `packages/durable` is unchanged
-from the local `9cd49d2c00ac446f774b878d25923bdb3739dadd` reference.
+interruption after hooks where applicable. The cancellation path is unchanged
+from the local `9cd49d2c00ac446f774b878d25923bdb3739dadd` reference; later
+changes in `packages/durable` include changes to park and slot representations.
 
 Explicitly registered at-most-once park cancellation applies to a conversation
 root and its registered nested children, including selected replay-safe hooks.
