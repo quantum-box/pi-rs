@@ -2234,7 +2234,9 @@ string, number and boolean types before schema validation. Optional null fields
 are treated as omissions, and edit batches also normalize replacement fields.
 Scoped tools and injected operations retain their argument handling.
 Schema rejections for these local built-ins report Pi-style field diagnostics
-and the received arguments. They produce a tool error result before dispatch.
+and the received arguments. Edit preparation also reports Pi's messages for
+empty edit arrays and empty replacement targets. These failures produce a tool
+error result before dispatch.
 
 `grep` streams files with the native ripgrep libraries, supports surrounding
 context lines, bounds long displayed lines at 500 UTF-16 units, and reports

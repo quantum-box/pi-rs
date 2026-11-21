@@ -707,7 +707,7 @@ pub trait Tool: Send + Sync {
     fn output_limit(&self) -> usize {
         1024 * 1024
     }
-    /// Use Pi's field-level diagnostic when model arguments fail schema validation.
+    /// Report argument preparation and schema validation failures as Pi tool errors.
     fn pi_argument_diagnostics(&self) -> bool {
         false
     }

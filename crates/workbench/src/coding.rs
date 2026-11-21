@@ -2244,6 +2244,15 @@ impl Tool for CodingTool {
             if self.unrestricted && arguments.get("edits").is_none() && !legacy_pair {
                 return Ok(arguments);
             }
+            if self.unrestricted
+                && !legacy_pair
+                && arguments["edits"].as_array().is_some_and(Vec::is_empty)
+            {
+                return Err(
+                    "Edit tool input is invalid. edits must contain at least one replacement."
+                        .into(),
+                );
+            }
             match crate::text_edit::prepare_arguments_in_place(&mut arguments) {
                 // Keep the normalized shape for the schema validator to identify
                 // the offending field. Valid edit arguments still use edit preparation.
