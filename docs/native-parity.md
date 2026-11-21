@@ -4858,8 +4858,11 @@ Pi's default or configured `thinkingBudgets`, capped to leave 1,024 tokens for
 the answer within the host's output limit. Off and non-reasoning models omit the
 field. Discovered Ollama reasoning capability is carried through the RPC and
 interactive worker to the request, even when discovery omits explicit thinking
-levels. Chat-template `thinking.budget` variables remain unsupported. The request
-field is covered by loopback tests; no live compatible server was used.
+levels. Both `chatTemplateArgs` for Baseten and `chatTemplateKwargs` for
+`chat-template` can resolve `thinking.budget` using the same cap. The variable
+is omitted when thinking is off or no budget fits. Loopback tests cover the
+top-level field and a Baseten template argument. Live compatible-server
+verification remains open.
 
 Loopback RPC checks exercised model and endpoint switching, header and key
 isolation, reasoning replay, stream completion and reported usage and cost.

@@ -1075,7 +1075,7 @@ impl Ollama {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
-        self.compatibility.thinking_budget_options(
+        let thinking_budget = self.compatibility.thinking_budget_options(
             &mut body,
             self.thinking_budget_level.as_deref(),
             self.thinking_budgets.as_ref(),
@@ -1088,6 +1088,7 @@ impl Ollama {
             self.reasoning_enabled,
             self.reasoning_effort.as_deref(),
             self.allow_reasoning_off,
+            thinking_budget,
         );
         body.as_object_mut().expect("chat request object").extend(
             self.sampling
@@ -1716,13 +1717,17 @@ mod content_tests {
             let body: serde_json::Value =
                 serde_json::from_slice(&bytes[offset..offset + length]).unwrap();
             assert_eq!(body["thinking_budget_tokens"], 2500);
+            assert_eq!(body["chat_template_args"]["budget"], 2500);
             assert_eq!(body["reasoning_effort"], "high");
             let reply = "data: [DONE]\n\n";
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply).unwrap();
         });
-        let compat =
-            serde_json::from_value(json!({"thinkingTokenBudgetField":"thinking_budget_tokens"}))
-                .unwrap();
+        let compat = serde_json::from_value(json!({
+            "thinkingTokenBudgetField":"thinking_budget_tokens",
+            "thinkingFormat":"baseten",
+            "chatTemplateArgs":{"budget":{"$var":"thinking.budget"}},
+        }))
+        .unwrap();
         let model = Ollama::new(&format!("http://{address}"), None)
             .unwrap()
             .with_chat_compatibility(compat, Some(true), true, true)
