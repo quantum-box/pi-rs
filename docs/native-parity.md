@@ -5418,7 +5418,9 @@ control after a surrogate in another string if no other parse error occurs first
 Malformed object property names and separators, object trailing commas, missing
 array separators and trailing text after a complete JSON value also use Pi's
 position-aware wording. Other malformed records, including array trailing
-commas, retain the native parser's diagnostics.
+commas, retain the native parser's diagnostics. Malformed numbers use Pi's
+position-aware wording for leading zeroes and missing digits after a minus
+sign, decimal point or exponent.
 
 ### Shell execution transcript checkpoint
 
