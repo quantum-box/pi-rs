@@ -1059,6 +1059,17 @@ struct MarkdownPending {
     original: String,
 }
 
+fn markdown_input(text: &str, kind: pi_rs::MarkdownMessageType) -> Option<&str> {
+    if text.len() > pi_rs::MarkdownTransformers::MAX_MARKDOWN_BYTES {
+        return None;
+    }
+    let text = match kind {
+        pi_rs::MarkdownMessageType::User => text,
+        _ => text.trim_matches(super::resources::is_prompt_space),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
 #[derive(Default)]
 struct View {
     async_transitions: bool,
@@ -1595,10 +1606,7 @@ impl View {
         let Some((target, context, original)) = self.markdown_candidate(width) else {
             return;
         };
-        let markdown = match context.message_type {
-            pi_rs::MarkdownMessageType::User => original.as_str(),
-            _ => original.trim_matches(super::resources::is_prompt_space),
-        };
+        let markdown = markdown_input(&original, context.message_type).expect("Markdown candidate");
         let request = uuid::Uuid::new_v4();
         if worker
             .send(json!({
@@ -1641,8 +1649,7 @@ impl View {
             ),
         ] {
             if visible
-                && original.len() <= pi_rs::MarkdownTransformers::MAX_MARKDOWN_BYTES
-                && !original.trim().is_empty()
+                && markdown_input(original, kind).is_some()
                 && !cached
                     .as_ref()
                     .is_some_and(|cached| cached.original == *original && cached.attempted(width))
@@ -1667,12 +1674,10 @@ impl View {
             .rev()
             .find_map(|(index, entry)| {
                 let (kind, markdown) = entry.markdown(!self.hide_thinking)?;
-                if markdown.attempted(width)
-                    || markdown.original.len() > pi_rs::MarkdownTransformers::MAX_MARKDOWN_BYTES
-                    || markdown.original.trim().is_empty()
-                {
+                if markdown.attempted(width) {
                     return None;
                 }
+                markdown_input(&markdown.original, kind)?;
                 Some((
                     MarkdownTarget::Recorded(index),
                     pi_rs::MarkdownTransformContext {
@@ -10069,6 +10074,18 @@ mod tests {
     fn markdown_rendering_uses_restored_metadata_and_rejects_stale_stream_chunks() {
         use crate::ui::render::{Entry, TranscriptMarkdown};
 
+        assert_eq!(
+            super::markdown_input("\u{feff}", pi_rs::MarkdownMessageType::Assistant),
+            None
+        );
+        assert_eq!(
+            super::markdown_input("\u{0085}", pi_rs::MarkdownMessageType::Assistant),
+            Some("\u{0085}")
+        );
+        assert_eq!(
+            super::markdown_input("  ", pi_rs::MarkdownMessageType::User),
+            Some("  ")
+        );
         let mut view = super::View::default();
         view.lines.push(Entry::user_markdown(TranscriptMarkdown {
             record: Some((24, Some("2026-11-21T07:00:00Z".into()))),

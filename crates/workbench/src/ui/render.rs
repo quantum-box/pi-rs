@@ -616,7 +616,11 @@ impl Entry {
                     .map_or_else(Vec::new, |limit| image.lines(width, limit, padding));
             }
             Self::Thinking { text, expanded } => {
-                if text.original.trim().is_empty() {
+                if text
+                    .original
+                    .trim_matches(crate::resources::is_prompt_space)
+                    .is_empty()
+                {
                     return vec![];
                 }
                 let mut lines = if !expanded.unwrap_or(show_thinking) {
