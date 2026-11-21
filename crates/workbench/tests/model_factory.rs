@@ -757,3 +757,138 @@ async fn granted_model_file_composes_saved_auth_with_exact_api_and_base_routes()
     std::fs::remove_file(models_path).unwrap();
     assert_eq!(grants.load(&factory).unwrap().identities().len(), 0);
 }
+
+#[tokio::test]
+async fn configured_model_key_requires_exact_opt_in_and_yields_to_saved_auth() {
+    use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
+    use tokio::net::TcpListener;
+
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("models.json");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut route = ModelFileRoute {
+        provider: "relay".into(),
+        api: NativeModelApi::OpenAiChat,
+        base_url: "https://relay.example.test/v1".into(),
+        endpoint: format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        ),
+    };
+    let mut grants = ModelFileReadGrants {
+        file: file.clone(),
+        routes: vec![route.clone()],
+    };
+    let fixture = r#"{
+        // Pi provider configuration
+        "providers": {
+            "relay": {
+                "baseUrl": "https://relay.example.test/v1",
+                "api": "openai-completions",
+                "apiKey": "cfg-$KEY-$!$$",
+                "models": [
+                    {"id":"one","name":"Quoted \"// not a comment\"",},
+                    {"id":"two"}, // trailing array separator
+                ],
+            },
+        },
+    }"#;
+    std::fs::write(&file, fixture).unwrap();
+    let empty = ModelClientFactory::default();
+    assert!(grants.load(&empty).is_err());
+    assert!(
+        grants
+            .load_with_api_keys(
+                &empty,
+                &[ModelFileRoute {
+                    endpoint: "https://other.example.test/v1/chat/completions".into(),
+                    ..route.clone()
+                }],
+                |_, _| panic!("ungranted route looked up a variable"),
+            )
+            .is_err()
+    );
+    let mut requested = Vec::new();
+    let catalog = grants
+        .load_with_api_keys(&empty, std::slice::from_ref(&route), |grant, name| {
+            requested.push((grant.clone(), name.to_owned()));
+            Some("fixture".into())
+        })
+        .unwrap();
+    assert_eq!(requested, [(route.clone(), "KEY".into())]);
+    assert_eq!(catalog.identities().len(), 2);
+    assert_eq!(
+        catalog
+            .info("relay", "one")
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some(r#"Quoted "// not a comment""#),
+    );
+    let request = || pi_rs::ModelRequest {
+        model: "one".into(),
+        messages: vec![pi_rs::Message::User {
+            content: "hello".into(),
+        }],
+        tools: vec![],
+        max_output_tokens: 16,
+    };
+    let captured =
+        capture_model_headers(listener, catalog.get("relay", "one").unwrap(), request()).await;
+    assert!(
+        captured
+            .to_ascii_lowercase()
+            .contains("authorization: bearer cfg-fixture-!$")
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    route.endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    grants.routes = vec![route.clone()];
+    let mut saved = HostAuthBuilder::new();
+    saved
+        .register(
+            "relay",
+            &route.endpoint,
+            HostCredential::new(HostCredentialKind::ApiKey, "stored").unwrap(),
+        )
+        .unwrap();
+    let factory = ModelClientFactory::new(saved.build());
+    std::fs::write(&file, fixture.replace(r#""cfg-$KEY-$!$$""#, "false")).unwrap();
+    let catalog = grants
+        .load_with_api_keys(&factory, std::slice::from_ref(&route), |_, _| {
+            panic!("saved key must win without reading configured key variables")
+        })
+        .unwrap();
+    let captured =
+        capture_model_headers(listener, catalog.get("relay", "one").unwrap(), request()).await;
+    assert!(
+        captured
+            .to_ascii_lowercase()
+            .contains("authorization: bearer stored")
+    );
+    assert!(!captured.contains("cfg-fixture"));
+
+    std::fs::write(&file, fixture.replace("cfg-$KEY-$!$$", "!printf ignored")).unwrap();
+    assert!(
+        grants
+            .load_with_api_keys(&empty, std::slice::from_ref(&route), |_, _| {
+                panic!("command requested key expansion")
+            })
+            .is_err()
+    );
+    std::fs::write(&file, fixture).unwrap();
+    assert!(
+        grants
+            .load_with_api_keys(&empty, std::slice::from_ref(&route), |_, _| None)
+            .is_err()
+    );
+    std::fs::write(
+        &file,
+        fixture.replace("// Pi provider configuration", "/* block comment */"),
+    )
+    .unwrap();
+    assert!(grants.load(&factory).is_err());
+}

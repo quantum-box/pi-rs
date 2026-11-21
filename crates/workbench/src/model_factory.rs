@@ -88,6 +88,10 @@ impl ModelClientFactory {
         }
     }
 
+    pub(crate) fn has_credential(&self, provider: &str, endpoint: &str) -> bool {
+        self.credentials.get(provider, endpoint).is_some()
+    }
+
     fn credential(&self, provider: &str, endpoint: &str) -> Result<&pi_rs::HostCredential> {
         self.credentials
             .get(provider, endpoint)

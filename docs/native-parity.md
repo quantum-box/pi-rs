@@ -1264,7 +1264,8 @@ OAuth, and any credential writes.
 Embedded hosts can build an immutable catalog with
 `pi_rs_workbench::model_file::ModelFileReadGrants`. An explicit file path and
 exact provider, API, and declared base URL grants select custom chat models
-from strict Pi-format JSON. Provider fields are inherited unless the model
+from Pi-format JSON with line comments and trailing commas. Provider fields
+are inherited unless the model
 overrides them. The grant supplies the actual request endpoint and the model
 factory supplies its exact credential. The import applies descriptive
 `modelOverrides` to selected declarations, including partial prices. Transport options such as
@@ -1276,6 +1277,11 @@ Hosts may resolve saved key variables with
 route and variable name after checking saved inline values, and the loader
 never consults process environment variables itself. Catalog and key reloads
 produce independent snapshots.
+
+The optional file-key loader can use a provider's configured API key when the
+host grants the same route for file keys. Credentials already bound in the
+factory take precedence. Host-supplied variable values are resolved once per
+eligible route, and key commands remain outside this factory.
 
 ### Regular terminal checkpoint
 
