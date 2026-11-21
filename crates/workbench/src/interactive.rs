@@ -6604,12 +6604,7 @@ pub(super) async fn run(
                                 Ok(next) => theme = next,
                                 Err(error) => view.append(&error.to_string()),
                             }
-                            #[cfg(any(unix, windows))]
-                            if let Some(terminal) = &mut _terminal {
-                                terminal
-                                    .colors
-                                    .query_terminal_colors(&mut std::io::stdout())?;
-                            }
+                            view.theme_refresh_requested = true;
                             view.append("Reloaded settings, context, skills, prompts, native extensions, MCP, keybindings and theme");
                             args.session_transition = Some(pi_rs::SessionStartReason::Reload);
                         } else if input.starts_with('/') {

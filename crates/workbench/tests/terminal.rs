@@ -317,13 +317,23 @@ fn reload_applies_saved_theme_changes_without_overriding_cli_selection() {
         std::fs::write(&settings, br#"{"theme":"system"}"#).unwrap();
         master.write_all(b"\x1b[?1;2c/reload\r").unwrap();
         output_until(&mut master, |text| {
+            let queries = text.matches("\x1b]11;?\x07").count();
+            assert!(queries <= 1);
             if explicit_theme {
                 assert!(!text.contains("\x1b[?2031h"));
             }
-            text.contains("Reloaded settings") && (explicit_theme || text.contains("\x1b[?2031h"))
+            text.contains("Reloaded settings")
+                && queries == 1
+                && (explicit_theme || text.contains("\x1b[?2031h"))
         });
-        master.write_all(b"/settings\r").unwrap();
-        output_until(&mut master, |text| text.contains("Auto-compact"));
+        if !explicit_theme {
+            master.write_all(b"\x1b[?997;2n").unwrap();
+        }
+        master.write_all(b"\x1b[?1;2c/settings\r").unwrap();
+        output_until(&mut master, |text| {
+            assert!(!text.contains("\x1b]11;?\x07"));
+            text.contains("Auto-compact")
+        });
         master.write_all(b"Theme").unwrap();
         let expected = if explicit_theme { "dark" } else { "system" };
         output_until(&mut master, |text| {
