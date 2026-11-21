@@ -32,8 +32,13 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
     let mut descriptions = std::collections::BTreeMap::new();
     let mut items = Vec::new();
     for record in session.records() {
+        let imported_system = sessions::tree_imported_system_text(session, record);
         let (kind, description) = match &record.event {
             Event::Checkout { .. } => continue,
+            Event::SystemCheckpoint { .. } if imported_system.is_some() => (
+                TreeEntryKind::Message,
+                tree_description("[system]", "dim", String::new()),
+            ),
             Event::User { content, .. } | Event::UserWithImages { content, .. } => (
                 TreeEntryKind::User,
                 tree_description("user: ", "accent", tree_preview(content, 200)),
@@ -156,8 +161,13 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
                 )
             }
         };
+        let mut label = format!("{} {}{}", record.id, description.heading, description.body);
+        if let Some(content) = imported_system {
+            label.push(' ');
+            label.push_str(&tree_preview(content, 200));
+        }
         items.push(Item {
-            label: format!("{} {}{}", record.id, description.heading, description.body),
+            label,
             selection: Selection::Checkout(record.id),
         });
         entries.insert(record.id, (record.parent, kind));
@@ -310,7 +320,9 @@ mod tests {
             json!({"type":"session","version":3,"id":"tree-parity","cwd":root.path(),"timestamp":timestamp}),
             json!({"type":"message","id":"user","parentId":null,"timestamp":timestamp,
                 "message":{"role":"user","content":"user\ntext"}}),
-            json!({"type":"message","id":"error","parentId":"user","timestamp":timestamp,
+            json!({"type":"message","id":"system","parentId":"user","timestamp":timestamp,
+                "message":{"role":"system","content":"unique-system-sentinel\nkeep line breaks"}}),
+            json!({"type":"message","id":"error","parentId":"system","timestamp":timestamp,
                 "message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"fixture error"}}),
             json!({"type":"custom_message","id":"custom","parentId":"error","timestamp":timestamp,
                 "customType":"checkpoint","content":[{"type":"text","text":"first\t"},{"type":"text","text":"second"}],"display":false}),
@@ -388,6 +400,7 @@ mod tests {
                 .iter()
                 .any(|span| span.text.starts_with("25/") && span.color == theme.color("muted"))
         }));
+        assert!(text.iter().any(|line| line == "  • [system]"));
         session.set_label(id, Some("updated label".into())).unwrap();
         let updated = super::picker(&session, TreeFilter::Default);
         picker.refresh_tree(updated, id);
@@ -405,6 +418,20 @@ mod tests {
                     .any(|span| span.text == "[label: updated label]")
             }),
             "all entries include the newly committed label record"
+        );
+
+        let mut system_search = super::picker(&session, TreeFilter::Default);
+        system_search.paste("unique-system-sentinel");
+        let Some(Selection::Checkout(id)) = system_search.selected() else {
+            panic!("expected the imported system message to match the search");
+        };
+        assert!(matches!(
+            session.records()[id as usize - 1].event,
+            Event::SystemCheckpoint { .. }
+        ));
+        assert_eq!(
+            sessions::tree_record_text(&session, id).unwrap(),
+            "unique-system-sentinel\nkeep line breaks"
         );
     }
 }

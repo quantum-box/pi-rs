@@ -2542,6 +2542,8 @@ custom messages, branch summaries, and compaction token counts. Selected
 content is bold, and labels and their optional local timestamps have separate
 theme roles. Native record IDs remain searchable for direct checkout. Custom
 messages and imported compaction summaries can be copied from the tree.
+Imported system messages appear in the default tree as `[system]`. Their text
+can be searched and copied from that entry.
 Message preview and navigation gaps remain in the Sessions row.
 
 ### Package identity checkpoint

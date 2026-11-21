@@ -884,6 +884,21 @@ pub(super) fn tree_context_text(content: &pi_rs::ContextContent) -> std::borrow:
     }
 }
 
+pub(super) fn tree_imported_system_text<'a>(
+    session: &Session,
+    record: &'a pi_rs::Record,
+) -> Option<&'a str> {
+    let Event::SystemCheckpoint { content, .. } = &record.event else {
+        return None;
+    };
+    let source = session
+        .records()
+        .get(record.parent?.checked_sub(1)? as usize)?;
+    matches!(&source.event, Event::SourceEntry { format, entry }
+        if format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "system")
+    .then_some(content.as_str())
+}
+
 pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
     use std::borrow::Cow;
 
@@ -937,6 +952,9 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
             Event::Compacted { summary, .. }
             | Event::CompactionSummaryMessage { summary, .. }
             | Event::BranchSummary { summary, .. } => Some(Cow::Borrowed(summary.as_str())),
+            Event::SystemCheckpoint { .. } => {
+                tree_imported_system_text(session, record).map(Cow::Borrowed)
+            }
             _ => None,
         })
         .filter(|text| !text.trim().is_empty())
