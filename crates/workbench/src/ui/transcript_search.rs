@@ -457,6 +457,7 @@ mod tests {
             parts: vec![],
             numbered_diff: false,
             render_records: None,
+            render_call_id: None,
             rendered: None,
         };
         let lines = entry.render(&theme, 80, true, true, TranscriptOptions::default());

@@ -767,9 +767,10 @@ hosts own framing, image handling, component state and redraws. Executable
 extension tool definitions can supply both sections through stateless
 process requests. Workbench applies them to journaled calls and committed
 results, including restored transcript entries. Expansion and viewport
-changes rerender the active presentation with the host theme. Streaming
-argument and partial result rendering and executable cross-tool resolver
-registration remain pending.
+changes rerender the active presentation with the host theme. Live tool
+calls render progressively parsed arguments and execution updates render
+partial content before the committed result. Executable cross-tool
+resolver registration remains pending.
 
 ### Native custom message renderers
 
