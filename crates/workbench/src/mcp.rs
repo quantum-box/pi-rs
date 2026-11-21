@@ -1179,6 +1179,16 @@ fn publish_page_output(
     Ok(())
 }
 
+fn mcp_tool_outcome(mut data: Value) -> Outcome {
+    if let Some(fields) = data.as_object_mut() {
+        fields.shift_remove("_meta");
+    }
+    Outcome::Structured {
+        data,
+        attachments: vec![],
+    }
+}
+
 enum CallError {
     Other(String),
     TransientHttp(String),
@@ -1376,6 +1386,7 @@ impl McpTool {
             }
         };
         match result {
+            Ok(CallResult::Data(data)) if !self.resource => mcp_tool_outcome(data),
             Ok(CallResult::Data(data)) if data["isError"] == true => {
                 Outcome::Failed(data.to_string())
             }
@@ -1853,15 +1864,7 @@ impl Tool for McpTool {
             };
             match response.task.payload {
                 rmcp::model::TaskPayload::Completed { result } => {
-                    let data = Value::Object(result);
-                    return Some(if data["isError"] == true {
-                        Outcome::Failed(data.to_string())
-                    } else {
-                        Outcome::Structured {
-                            data,
-                            attachments: vec![],
-                        }
-                    });
+                    return Some(mcp_tool_outcome(Value::Object(result)));
                 }
                 rmcp::model::TaskPayload::Failed { error } => {
                     return Some(Outcome::Failed(Value::Object(error).to_string()));
@@ -2621,6 +2624,32 @@ mod tests {
             .finalize();
         assert_eq!(relative, absolute);
     }
+    #[test]
+    fn mcp_tool_results_keep_structured_errors_and_drop_private_metadata() {
+        let result = json!({
+            "isError":true,
+            "content":[{"type":"text","text":"not available"}],
+            "structuredContent":{"reason":"not_ready","_meta":"tool data"},
+            "_meta":{"secret":"private server metadata"}
+        });
+        let outcome = mcp_tool_outcome(result.clone());
+        assert!(outcome.is_error());
+        assert!(outcome.tool_content().contains("not available"));
+        assert!(!outcome.tool_content().contains("private server metadata"));
+        let Outcome::Structured { data, .. } = outcome else {
+            panic!("MCP error result was discarded");
+        };
+        assert_eq!(data["structuredContent"], result["structuredContent"]);
+        assert!(data.get("_meta").is_none());
+        assert_eq!(data["isError"], true);
+
+        let success = mcp_tool_outcome(json!({"content":[],"_meta":{"secret":"private"}}));
+        assert!(!success.is_error());
+        assert!(
+            matches!(success, Outcome::Structured { data, .. } if data == json!({"content":[]}))
+        );
+    }
+
     #[test]
     fn resource_and_prompt_exposure_respects_server_and_tool_overrides() {
         let config: ServerConfig = serde_json::from_value(
