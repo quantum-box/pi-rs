@@ -280,7 +280,7 @@ where
     let auth = directory.join("auth.json");
     let guard = super::auth_lock::acquire_async(&auth).await?;
     let from_pi = if let Some(expected) = expected_active {
-        let data = super::config::read_object_unlocked(&auth)?;
+        let data = super::config::read_auth_object_locked(&guard)?;
         let current = parse_credential(&data)?;
         guard.check()?;
         let from_pi = pi_entry(&data);
@@ -646,7 +646,7 @@ where
 {
     let auth = directory.join("auth.json");
     let guard = super::auth_lock::acquire_async(&auth).await?;
-    let data = super::config::read_object_unlocked(&auth)?;
+    let data = super::config::read_auth_object_locked(&guard)?;
     let credential = parse_credential(&data)?;
     let from_pi = pi_entry(&data);
     guard.check()?;

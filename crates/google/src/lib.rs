@@ -928,7 +928,9 @@ fn wire_request_for_api(
     let mut calls = BTreeMap::new();
     let mut tool_images = Vec::new();
     for message in &request.messages {
-        if !matches!(message, Message::Tool { .. }) && !tool_images.is_empty() {
+        if !matches!(message, Message::Tool { .. } | Message::System { .. })
+            && !tool_images.is_empty()
+        {
             push_content(
                 &mut contents,
                 "user",
@@ -937,7 +939,11 @@ fn wire_request_for_api(
             );
         }
         match message {
-            Message::System { content } => system.push(content.as_str()),
+            Message::System { content } => {
+                if !content.is_empty() {
+                    system.push(content.as_str());
+                }
+            }
             Message::User { content } => {
                 push_content(&mut contents, "user", vec![json!({"text":content})], true)
             }
@@ -1178,11 +1184,11 @@ impl Model for Google {
         pi_rs_core::protected_model_fingerprint(&(
             headers,
             if self.vertex_bearer.is_some() {
-                "google-vertex-adc-v2"
+                "google-vertex-adc-v3"
             } else if self.vertex {
-                "google-vertex-v2"
+                "google-vertex-v3"
             } else {
-                "google-v4-prefixed-model-ids"
+                "google-v5"
             },
             self.endpoint.as_str(),
             self.provider.as_ref(),
@@ -2907,6 +2913,9 @@ mod tests {
             let request = ModelRequest {
                 model: model.into(),
                 messages: vec![
+                    Message::System {
+                        content: "Initial instructions".into(),
+                    },
                     Message::Assistant {
                         content: String::new(),
                         calls: ["a", "b"]
@@ -2925,6 +2934,12 @@ mod tests {
                         call_id: "a".into(),
                         content: image_result.clone(),
                     },
+                    Message::System {
+                        content: String::new(),
+                    },
+                    Message::System {
+                        content: "Later instructions".into(),
+                    },
                     Message::Tool {
                         is_structured: Some(false),
                         is_error: true,
@@ -2939,6 +2954,10 @@ mod tests {
                 max_output_tokens: 32,
             };
             let body = wire_request(&request, None, "google", "google").unwrap();
+            assert_eq!(
+                body["systemInstruction"]["parts"][0]["text"],
+                "Initial instructions\n\nLater instructions"
+            );
             let contents = body["contents"].as_array().unwrap();
             if model.to_ascii_lowercase().starts_with("gemini") {
                 let call = &contents[0]["parts"][0];

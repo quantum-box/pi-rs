@@ -4140,8 +4140,10 @@ tool results, records measured usage including thought tokens, and preserves
 ordered signed response parts for the same model across tools and journal
 reopening. Gemini 2.5 and newer model families use their budget or level
 controls. Host-prefixed Gemini IDs use the same version checks for thinking,
-tool call IDs, and tool-result images as in current Pi. A response ending in
-`CONTINUATION` or `MAX_TOKENS` keeps its text, drops unfinished tool calls,
+tool call IDs, and tool-result images as in current Pi. The adapter folds
+nonempty system updates into `systemInstruction`. Consecutive tool results
+and their follow-up image turn on Gemini 2.5 stay together. A response ending
+in `CONTINUATION` or `MAX_TOKENS` keeps its text, drops unfinished tool calls,
 and ends with a length stop. The native adapter does not consume continuation
 tokens.
 
@@ -4431,9 +4433,10 @@ The pending representation is readable by pinned Pi v1.5.0 as a keyless
 API-key entry, so that version's locked OAuth resolver does not reuse the old
 refresh token. It does not protect tokens already copied into another process,
 non-cooperating writers, storage rollback, or a compromised auth lock. After
-a process crash leaves `auth.json.lock`, stop all Pi and pi-rs processes before
-removing that stale lock directory from the agent directory; then sign in to
-Radius again or explicitly log out. Never remove a lock held by a live process.
+a process crash leaves the auth lock, stop all Pi and pi-rs processes before
+removing the stale lock directory beside the resolved credential file. Then
+sign in to Radius again or explicitly log out. Never remove a lock held by a
+live process.
 If a caller cancels while a Radius refresh is queued at the refresh barrier,
 the exchange is discarded. Once admitted, it continues through credential
 persistence even if the caller is cancelled. Admission can precede the actual
@@ -5127,6 +5130,8 @@ checked with a five-minute floor, even when a shorter minimum was requested.
 The rotated credential is saved before that check. The default
 check output contains only status and metadata.
 
+As in Pi v1.6.0, a symbolic link to an auth file shares the target's lock.
+Credential updates keep the link and atomically replace the target file.
 pi-rs does not automatically remove stale `auth.json.lock` directories.
 After a worker admits a protected OAuth refresh, pi-rs retains its worker
 refresh barrier until the auth lock is released, including on errors. A worker
