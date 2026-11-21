@@ -607,7 +607,11 @@ impl Catalogue {
                 continue;
             }
             if available {
-                let key = (model.provider.as_str(), model.endpoint.as_str());
+                let key = (
+                    model.provider.as_str(),
+                    model.endpoint.as_str(),
+                    model.allows_keyless(),
+                );
                 let usable = match resolved.get(&key) {
                     Some(usable) => *usable,
                     None => {
