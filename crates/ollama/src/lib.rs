@@ -43,6 +43,7 @@ pub struct Ollama {
     reasoning_enabled: bool,
     allow_reasoning_off: bool,
     sampling: BTreeMap<String, Value>,
+    deployments: Arc<BTreeMap<String, String>>,
     native_probes: bool,
     mistral: Option<mistral::Options>,
     progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
@@ -230,6 +231,7 @@ impl Ollama {
             reasoning_enabled: false,
             allow_reasoning_off: true,
             sampling: BTreeMap::new(),
+            deployments: Arc::default(),
             native_probes: true,
             mistral: None,
             progress: None,
@@ -251,6 +253,12 @@ impl Ollama {
         });
         self.compatibility.supports_strict_mode.get_or_insert(true);
         self.native_probes = false;
+        self
+    }
+
+    /// Map catalog model IDs to their wire deployment names.
+    pub fn with_deployments(mut self, deployments: &BTreeMap<String, String>) -> Self {
+        self.deployments = Arc::new(deployments.clone());
         self
     }
 
@@ -412,8 +420,16 @@ impl Ollama {
     }
 
     fn replay_identity(&self, model: &str) -> ResolvedModelIdentity {
+        let provider = if let Some(deployment) = self.deployments.get(model) {
+            pi_rs_core::endpoint_replay_scope(
+                &self.provider,
+                &format!("{}\n{deployment}", self.endpoint),
+            )
+        } else {
+            pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str())
+        };
         ResolvedModelIdentity {
-            provider: pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str()),
+            provider,
             model: model.to_owned(),
         }
     }
@@ -914,6 +930,11 @@ impl Model for Ollama {
         } else {
             base
         };
+        let base = if self.deployments.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(base, self.deployments.as_ref()))
+        };
         if self.prompt_cache_key_enabled || self.prompt_cache_long {
             base.and_then(|base| {
                 pi_rs_core::protected_model_fingerprint(&(
@@ -1124,7 +1145,11 @@ impl Ollama {
         } else {
             Vec::new()
         };
-        let mut body = json!({"model":request.model,"messages":messages,"stream":true});
+        let wire_model = self
+            .deployments
+            .get(&request.model)
+            .unwrap_or(&request.model);
+        let mut body = json!({"model":wire_model,"messages":messages,"stream":true});
         if mistral {
             body["max_tokens"] = json!(request.max_output_tokens);
         } else {

@@ -32,6 +32,7 @@ pub(super) enum Adapter {
     ChatCompletions,
     MistralConversations,
     OpenAiResponses,
+    AzureResponses,
     CodexResponses,
     Anthropic,
     Google,
@@ -45,6 +46,7 @@ impl Adapter {
             "openai-completions" => Some(Self::ChatCompletions),
             "mistral-conversations" => Some(Self::MistralConversations),
             "openai-responses" => Some(Self::OpenAiResponses),
+            "azure-openai-responses" => Some(Self::AzureResponses),
             "openai-codex-responses" => Some(Self::CodexResponses),
             "anthropic-messages" => Some(Self::Anthropic),
             "google-generative-ai" => Some(Self::Google),
@@ -59,6 +61,7 @@ impl Adapter {
             Self::ChatCompletions => "openai-completions",
             Self::MistralConversations => "mistral-conversations",
             Self::OpenAiResponses => "openai-responses",
+            Self::AzureResponses => "azure-openai-responses",
             Self::CodexResponses => "openai-codex-responses",
             Self::Anthropic => "anthropic-messages",
             Self::Google => "google-generative-ai",
@@ -201,6 +204,13 @@ impl Provider {
                     .with_provider(self.id())
                     .with_mistral(false, false, None),
             )),
+            Adapter::AzureResponses => {
+                Ok(Client::OpenAi(pi_rs::openai::OpenAiResponses::new_azure(
+                    endpoint,
+                    token.ok_or_else(missing_key)?,
+                    self.id(),
+                )?))
+            }
             Adapter::ChatCompletions => {
                 if self.id() == "cloudflare-ai-gateway" && endpoint.is_empty() {
                     return Err(Error::Config(
@@ -528,6 +538,7 @@ impl Client {
             Self::Deferred(client) => matches!(
                 client.adapter,
                 Adapter::OpenAiResponses
+                    | Adapter::AzureResponses
                     | Adapter::CodexResponses
                     | Adapter::ChatCompletions
                     | Adapter::MistralConversations
@@ -544,6 +555,7 @@ impl Client {
                 if matches!(
                     client.adapter,
                     Adapter::OpenAiResponses
+                        | Adapter::AzureResponses
                         | Adapter::CodexResponses
                         | Adapter::ChatCompletions
                         | Adapter::MistralConversations
@@ -562,6 +574,7 @@ impl Client {
             Self::Deferred(client) => matches!(
                 client.adapter,
                 Adapter::OpenAiResponses
+                    | Adapter::AzureResponses
                     | Adapter::CodexResponses
                     | Adapter::ChatCompletions
                     | Adapter::MistralConversations
@@ -964,6 +977,7 @@ impl Client {
                 if matches!(
                     client.adapter,
                     Adapter::OpenAiResponses
+                        | Adapter::AzureResponses
                         | Adapter::CodexResponses
                         | Adapter::ChatCompletions
                         | Adapter::MistralConversations
@@ -1009,7 +1023,7 @@ impl Client {
         }
     }
 
-    pub async fn models(&self) -> Result<Vec<String>> {
+    pub async fn models(&self, azure_version: &str) -> Result<Vec<String>> {
         match self {
             Self::Ollama(client) => client.models().await,
             Self::Anthropic(client) => Ok(client
@@ -1025,9 +1039,9 @@ impl Client {
                 .map(|model| model.id)
                 .collect()),
             Self::PiMessages(client) => client.models().await,
-            Self::OpenAi(client) => client.models().await,
+            Self::OpenAi(client) => client.models_with_azure_version(Some(azure_version)).await,
             Self::Bedrock(_) => Ok(Vec::new()),
-            Self::Deferred(client) => Box::pin(client.resolve().await?.models()).await,
+            Self::Deferred(client) => Box::pin(client.resolve().await?.models(azure_version)).await,
         }
     }
 
@@ -1110,6 +1124,11 @@ impl Client {
         let thinking = args.provider_thinking();
         Ok(match self {
             Self::Ollama(client) => {
+                let client = if args.provider.id() == "azure" {
+                    client.with_deployments(args.model_profiles.azure_deployments())
+                } else {
+                    client
+                };
                 let configured = args.model_profiles.model(&args.provider, &args.model);
                 let mistral = args
                     .model_profiles
@@ -1367,18 +1386,51 @@ impl Client {
             Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
             Self::OpenAi(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
+                let azure = client.is_azure();
+                let adapter = if azure {
+                    Adapter::AzureResponses
+                } else {
+                    args.model_profiles
+                        .model_adapter(&args.provider, &args.model)
+                };
+                let client = if azure {
+                    // Older Azure reasoning models use the service default
+                    // when effort is omitted and reject the literal "none".
+                    let default_off = (!matches!(
+                        args.model.as_str(),
+                        "gpt-5"
+                            | "gpt-5-mini"
+                            | "gpt-5-nano"
+                            | "gpt-5-pro"
+                            | "gpt-5-codex"
+                            | "o1"
+                            | "o1-pro"
+                            | "o3"
+                            | "o3-mini"
+                            | "o3-pro"
+                            | "o4-mini"
+                    ))
+                    .then_some("none");
+                    let off_reasoning = metadata
+                        .as_ref()
+                        .filter(|model| model.reasoning == Some(true))
+                        .and_then(|model| model.mapped_effort("off").unwrap_or(default_off));
+                    client.with_azure_routes(
+                        args.model_profiles.azure_api_version(),
+                        args.model_profiles.azure_deployments(),
+                        off_reasoning,
+                    )
+                } else {
+                    client
+                };
+                let thinking = thinking.filter(|level| !azure || *level != "off");
                 let sampling = metadata
                     .as_ref()
                     .map(|model| model.sampling(thinking.unwrap_or("off")))
                     .unwrap_or_default();
                 let levels = metadata
                     .as_ref()
-                    .and_then(|model| {
-                        model.levels(
-                            args.model_profiles
-                                .model_adapter(&args.provider, &args.model),
-                        )
-                    })
+                    .and_then(|model| model.levels(adapter))
                     .unwrap_or_else(|| pi_rs::openai::thinking_levels(&args.model));
                 let thinking = if metadata
                     .as_ref()
@@ -1396,20 +1448,19 @@ impl Client {
                                 .unwrap_or(Some(level))
                         })
                 };
-                let (supports_long, explicit_cache) = args
-                    .model_profiles
-                    .responses_cache_support(&args.provider, metadata.as_ref());
+                let (supports_long, explicit_cache) = if azure {
+                    (false, false)
+                } else {
+                    args.model_profiles
+                        .responses_cache_support(&args.provider, metadata.as_ref())
+                };
                 let compat = args
                     .model_profiles
                     .chat_compatibility(&args.provider, metadata.as_ref());
                 let use_developer = metadata.as_ref().and_then(|model| model.reasoning)
                     == Some(true)
                     && compat.supports_developer_role() != Some(false);
-                let client = if args
-                    .model_profiles
-                    .model_adapter(&args.provider, &args.model)
-                    == Adapter::CodexResponses
-                {
+                let client = if adapter == Adapter::CodexResponses {
                     let off = metadata.as_ref().map_or(Some("none"), |model| {
                         if model.reasoning == Some(false) {
                             None
@@ -1428,10 +1479,11 @@ impl Client {
                     )
                     .with_developer_role(use_developer)
                     .with_cache_retention(cache_retention(supports_long), explicit_cache)
-                    .with_strict_tool_support(
-                        args.model_profiles
-                            .responses_strict_tool_support(&args.provider, metadata.as_ref()),
-                    )
+                    .with_strict_tool_support(args.model_profiles.responses_strict_tool_support(
+                        &args.provider,
+                        adapter,
+                        metadata.as_ref(),
+                    ))
                     .with_grammar_tool_support(
                         compat.supports_openai_grammar_tools().unwrap_or(false),
                     )
@@ -4179,6 +4231,257 @@ mod estimation_tests {
                 body["max_output_tokens"].as_u64(),
                 output_limit.then_some(10)
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn azure_relay_model_discovery_uses_its_prefix_and_api_key() {
+        use clap::Parser;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        let mut data = json!({"providers":{"azure-relay":{
+            "api":"azure-openai-responses",
+            "baseUrl":format!("http://{}/tenant/openai/v1", listener.local_addr().unwrap()),
+            "apiKey":"fixture"
+        }}});
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse_with_azure_env(&mut data, |name| {
+                (name == "AZURE_OPENAI_API_VERSION").then(|| "preview".into())
+            })
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                line,
+                "GET /tenant/openai/v1/models?api-version=preview HTTP/1.1\r\n"
+            );
+            let mut saw_key = false;
+            loop {
+                line.clear();
+                assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                let line = line.to_ascii_lowercase();
+                if line == "\r\n" {
+                    break;
+                }
+                saw_key |= line.trim() == "api-key: fixture";
+                assert!(!line.starts_with("authorization:"));
+            }
+            assert!(saw_key);
+            let body = r#"{"data":[{"id":"relay-model"}]}"#;
+            socket.get_mut().write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            ).as_bytes()).await.unwrap();
+        });
+        let provider = args.model_profiles.provider("azure-relay").unwrap();
+        let catalog = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::super::model_selection::catalog(&args, provider, true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(catalog.models, ["relay-model"]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn azure_uses_distinct_wire_auth_and_deployment_names() {
+        use clap::Parser;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        for (provider, model, responses, thinking) in [
+            ("azure", "o4-mini", true, "off"),
+            ("azure", "o4-mini", true, "high"),
+            ("azure", "gpt-6-luna", true, "off"),
+            ("azure", "deepseek-v4-pro", false, "off"),
+            ("azure-relay", "o4-mini", true, "off"),
+        ] {
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}/openai/v1", listener.local_addr().unwrap());
+            let mut data = if provider == "azure" {
+                json!({"providers":{"azure":{"apiKey":"fixture"}}})
+            } else {
+                json!({"providers":{provider:{
+                    "api":"azure-openai-responses", "baseUrl":base, "apiKey":"fixture",
+                    "models":[{"id":model, "reasoning":true}]
+                }}})
+            };
+            args.model_profiles =
+                super::super::model_profiles::Profiles::parse_with_azure_env(&mut data, |key| {
+                    match key {
+                        "AZURE_OPENAI_BASE_URL" if provider == "azure" => Some(base.clone()),
+                        "AZURE_OPENAI_API_VERSION" => Some("preview".into()),
+                        "AZURE_OPENAI_DEPLOYMENT_NAME_MAP" => {
+                            Some(format!("{model}=my-deployment"))
+                        }
+                        _ => None,
+                    }
+                })
+                .unwrap();
+            let selected = args.model_profiles.provider(provider).unwrap();
+            args.activate_provider(selected, Some(model)).unwrap();
+            args.model = model.into();
+            if provider == "azure" && model == "o4-mini" {
+                assert_eq!(
+                    super::super::thinking::available(&mut args),
+                    ["off", "low", "medium", "high"]
+                );
+            }
+            args.thinking = Some(thinking.into());
+            let endpoint = args.model_endpoint_for(&args.provider, Some(model));
+            assert!(
+                args.model_profiles
+                    .session_affinity(&args.provider, model, endpoint)
+                    .is_empty()
+            );
+            let client = args
+                .connect_provider(&args.provider, Some(model))
+                .unwrap()
+                .with_context_probes(false)
+                .with_model_options(&args, false)
+                .unwrap();
+            let expected_replay_provider =
+                pi_rs::endpoint_replay_scope(provider, &format!("{endpoint}\nmy-deployment"));
+            if responses {
+                let below_minimum = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.stream_enriched_with_headers(
+                        ModelRequest {
+                            model: model.into(),
+                            messages: vec![],
+                            tools: vec![],
+                            max_output_tokens: 4,
+                        },
+                        &HeaderMap::new(),
+                        false,
+                        None,
+                    ),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(below_minimum, Err(pi_rs::Error::Budget)));
+            }
+
+            let serve = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut headers = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    let line = line.to_ascii_lowercase();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    headers.push_str(&line);
+                }
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                let response = if responses {
+                    let event = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{event}",
+                        event.len()
+                    )
+                } else {
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .into()
+                };
+                socket
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+                (
+                    headers,
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                )
+            });
+            let sent = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.stream_enriched_with_headers(
+                    ModelRequest {
+                        model: model.into(),
+                        messages: vec![pi_rs::Message::User {
+                            content: "hello".into(),
+                        }],
+                        tools: vec![],
+                        max_output_tokens: if responses { 16 } else { 4 },
+                    },
+                    &HeaderMap::new(),
+                    false,
+                    Some("session-fixture"),
+                ),
+            )
+            .await
+            .unwrap();
+            if responses {
+                use futures_util::StreamExt;
+                let mut stream = sent.unwrap();
+                let mut replay_provider = None;
+                while let Some(event) = stream.next().await {
+                    if let pi_rs::EnrichedModelEvent::Legacy(pi_rs::ModelEvent::Metadata(
+                        metadata,
+                    )) = event.unwrap()
+                    {
+                        replay_provider = metadata.replay.map(|replay| replay.identity.provider);
+                    }
+                }
+                assert_eq!(
+                    replay_provider.as_deref(),
+                    Some(expected_replay_provider.as_str())
+                );
+            } else {
+                assert!(sent.is_err());
+            }
+            let (headers, body) = serve.await.unwrap();
+            assert_eq!(body["model"], "my-deployment");
+            assert_eq!(body["store"], false);
+            if responses {
+                assert!(
+                    headers.starts_with("post /openai/v1/responses?api-version=preview http/"),
+                    "{headers}"
+                );
+                assert!(
+                    headers.lines().any(|line| line == "api-key: fixture"),
+                    "{headers}"
+                );
+                assert!(!headers.contains("authorization:"), "{headers}");
+                assert_eq!(body["max_output_tokens"], 16);
+                if thinking == "high" {
+                    assert_eq!(body["reasoning"], json!({"effort":"high","summary":"auto"}));
+                } else if model == "gpt-6-luna" {
+                    assert_eq!(body["reasoning"], json!({"effort":"none"}));
+                } else {
+                    assert!(body.get("reasoning").is_none());
+                }
+                assert_eq!(body["prompt_cache_key"], "session-fixture");
+            } else {
+                assert_eq!(body["max_completion_tokens"], 4);
+                assert!(
+                    headers.starts_with("post /openai/v1/chat/completions http/"),
+                    "{headers}"
+                );
+                assert!(
+                    headers
+                        .lines()
+                        .any(|line| line == "authorization: bearer fixture"),
+                    "{headers}"
+                );
+                assert!(!headers.contains("api-key:"), "{headers}");
+            }
         }
     }
 
