@@ -659,6 +659,42 @@ impl SessionStore for MemoryStore {
     }
 }
 
+struct BoundaryPreviewStore {
+    metadata: bool,
+    record_limit: Option<usize>,
+}
+
+impl SessionStore for BoundaryPreviewStore {
+    fn load(&mut self) -> Result<Vec<Record>> {
+        Ok(Vec::new())
+    }
+
+    fn append(&mut self, record: &Record) -> Result<()> {
+        self.append_with_metadata(record, None)
+    }
+
+    fn supports_record_metadata(&self) -> bool {
+        self.metadata
+    }
+
+    fn encoded_record_limit(&self) -> Option<usize> {
+        self.record_limit
+    }
+
+    fn append_with_metadata(
+        &mut self,
+        record: &Record,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        if let Some(limit) = self.record_limit
+            && encode_record(record, metadata)?.len().saturating_add(1) > limit
+        {
+            return Err(Error::Session("journal record exceeds size limit".into()));
+        }
+        Ok(())
+    }
+}
+
 pub struct Session {
     auto_compaction: crate::AutoCompactionControl,
     retry: crate::RetryControl,
@@ -673,6 +709,24 @@ pub struct Session {
 pub(crate) const MAX_USER_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 impl Session {
+    /// Preserve journal IDs and branch selection while validating drafts
+    /// independently of the live store.
+    pub(crate) fn extension_boundary_snapshot(&self) -> Self {
+        Self {
+            auto_compaction: self.auto_compaction.clone(),
+            retry: self.retry.clone(),
+            store: Box::new(BoundaryPreviewStore {
+                metadata: self.supports_record_metadata(),
+                record_limit: self.store.encoded_record_limit(),
+            }),
+            records: self.records.clone(),
+            record_metadata: self.record_metadata.clone(),
+            head: self.head,
+            run_id: self.run_id,
+            poisoned: self.poisoned,
+        }
+    }
+
     pub fn supports_record_metadata(&self) -> bool {
         self.store.supports_record_metadata()
     }
@@ -736,9 +790,16 @@ impl Session {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut session = Self::with_store(FileStore::open(path.as_ref())?)?;
         if session.host_binding().is_none() {
+            crate::extension_boundary::repair_plan_on_open(&mut session)?;
             session.recover_tree_trigger_handoff()?;
         }
         Ok(session)
+    }
+
+    /// An interrupted extension boundary or its continuation on this branch.
+    /// Resume it with the same run ID before submitting another prompt.
+    pub fn pending_extension_boundary_run(&self) -> Option<Uuid> {
+        crate::extension_boundary::resumable_run(self)
     }
 
     /// Hold the journal lock while reading a complete session without repairing it.
@@ -2457,7 +2518,7 @@ impl Session {
         (steering, follow_up)
     }
 
-    fn queued_input_records(&self) -> impl Iterator<Item = &Record> {
+    pub(crate) fn queued_input_records(&self) -> impl Iterator<Item = &Record> {
         let branch = self.branch();
         let mut consumed = std::collections::HashSet::new();
         for record in &branch {
@@ -3117,6 +3178,12 @@ impl Session {
                 Event::ModelRequested { context_head, .. } => {
                     *context_head = context_head.and_then(|id| ids.get(&id).copied());
                 }
+                Event::SourceEntry { format, entry }
+                    if crate::extension_boundary::is_marker(format) =>
+                {
+                    *format = "pi-rs:forked-boundary-history".into();
+                    *entry = serde_json::Value::Null;
+                }
                 Event::SourceEntry { format, entry } if format == "pi-rs:overflow-retention-v1" => {
                     if let Some(old) = entry.get("boundary").and_then(serde_json::Value::as_u64) {
                         if let Some(new) = ids.get(&old) {
@@ -3322,6 +3389,7 @@ impl Session {
         if target == 0 || target > self.records.len() as u64 {
             return Err(Error::Session("invalid fork entry".into()));
         }
+        crate::extension_boundary::validate_navigation(self, target)?;
         let path = self.path(target);
         let mut relevant: std::collections::HashSet<_> =
             path.iter().map(|record| record.id).collect();
@@ -3477,6 +3545,7 @@ impl Session {
         {
             return Err(Error::Session("invalid checkout target".into()));
         }
+        crate::extension_boundary::validate_navigation(self, target)?;
         for path in [self.branch(), self.path(target)] {
             ensure_settled(operations(&path))?;
         }
@@ -4952,7 +5021,7 @@ fn repair_tool_pairs(
     projected
 }
 
-fn project_content(message: Message, replacement: &crate::ContextContent) -> Message {
+pub(crate) fn project_content(message: Message, replacement: &crate::ContextContent) -> Message {
     use crate::{ContentBlock, ContextContent};
     let blocks = match replacement {
         ContextContent::Text(text) => vec![ContentBlock::Text {

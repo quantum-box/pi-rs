@@ -2960,16 +2960,25 @@ impl View {
         let render_entry = |entry: &Entry| {
             entry.render(theme, width, self.expand_tools, !self.hide_thinking, output)
         };
+        let modal = self.picker.is_some() || self.dialog().is_some();
+        let committing = !busy && !modal;
+        // A trailing cycle notice can still be replaced by another cycle.
+        let trailing_status = matches!(self.lines.last(), Some(Entry::ModelCycleStatus(_)));
+        let commit_end = if committing {
+            (self.lines.len() - usize::from(trailing_status)).max(self.regular.committed)
+        } else {
+            self.regular.committed
+        };
         let pending = || {
-            self.lines[self.regular.committed..]
+            self.lines[self.regular.committed..commit_end]
                 .iter()
                 .flat_map(render_entry)
         };
-        let modal = self.picker.is_some() || self.dialog().is_some();
-        let committing = !busy && !modal;
-        let mut active = Vec::new();
+        let mut active: Vec<_> = self.lines[commit_end..]
+            .iter()
+            .flat_map(render_entry)
+            .collect();
         if !committing {
-            active.extend(pending());
             active.extend(
                 Entry::Thinking {
                     text: self.thinking.clone(),
@@ -3088,7 +3097,7 @@ impl View {
                 queue!(out, Print("\r\n"))?;
                 self.regular.committed_rows += 1;
             }
-            self.regular.committed = self.lines.len();
+            self.regular.committed = commit_end;
         }
         let total_rows = self.regular.committed_rows + region_height;
         self.regular.max_rows = if redraw {
@@ -3497,6 +3506,13 @@ fn slash(
             super::Provider::named("openrouter").expect("built-in OpenRouter provider"),
             view,
         ),
+        "/login" if rest.eq_ignore_ascii_case("github-copilot") => {
+            start_copilot_login(view, &args.settings)
+        }
+        "/login" if rest.eq_ignore_ascii_case("github-copilot api-key") => edit_provider_key(
+            super::Provider::named("github-copilot").expect("built-in Copilot provider"),
+            view,
+        ),
         "/login" | "/logout" => {
             let login = name == "/login";
             if rest.is_empty() {
@@ -3529,6 +3545,13 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "github-copilot · Subscription OAuth".into(),
+                            selection: Selection::LoginCopilot,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -6379,17 +6402,38 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     } else {
         args.model_scope.as_slice()
     };
-    if let Some(choice) = next_model(args, choices, reverse) {
+    let status = if let Some(choice) = next_model(args, choices, reverse) {
         args.change_model(
             choice.provider,
             choice.model,
             choice.thinking,
             pi_rs::ModelSelectSource::Cycle,
         )?;
+        let name = args
+            .model_profiles
+            .model(&args.provider, &args.model)
+            .and_then(|model| model.name)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| args.model.clone());
+        let mut status = format!("Switched to {name}");
+        if let Some(level) = args.thinking.as_deref().filter(|level| *level != "off")
+            && super::thinking::adopted_reasoning(args) == Some(true)
+        {
+            status.push_str(&format!(" (thinking: {level})"));
+        }
+        status
     } else if args.model_scope.is_empty() {
-        view.append("Only one model available");
+        "Only one model available".into()
     } else {
-        view.append("Only one model in scope");
+        "Only one model in scope".into()
+    };
+    // A normal terminal has already printed committed rows to its scrollback.
+    if (args.tui_mode != Some(TuiMode::Regular) || view.regular.committed < view.lines.len())
+        && let Some(Entry::ModelCycleStatus(previous)) = view.lines.last_mut()
+    {
+        *previous = status;
+    } else {
+        view.append_entry(Entry::ModelCycleStatus(status));
     }
     Ok(())
 }
@@ -6502,6 +6546,29 @@ fn take_device_code_action(
         return None;
     }
     view.remote_task.as_mut()?.device_code.take()
+}
+
+fn start_copilot_login(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to GitHub Copilot",
+        "GitHub Copilot login cancelled",
+        move |sender| async move {
+            super::copilot_auth::login(&settings, task_control, |url, code| {
+                let _ = sender.send(RemoteEvent::DeviceCode {
+                    url: url.to_string(),
+                    code: code.to_owned(),
+                });
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to GitHub Copilot".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
 }
 
 fn start_xai_login(view: &mut View, settings: &crate::config::Settings) {
@@ -6654,6 +6721,8 @@ fn interrupt_remote_task(view: &mut View) {
     } else if task.meta_login_control.is_some() {
         view.append(if task.status == "Signing in to xAI" {
             "xAI sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to GitHub Copilot" {
+            "GitHub Copilot sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to Anthropic" {
             "Anthropic sign-in is completing; waiting for the result"
         } else {
@@ -7620,6 +7689,7 @@ fn select(
             );
             view.local_editor = Some((LocalEditor::BedrockChain, dialog));
         }
+        Selection::LoginCopilot => start_copilot_login(view, &args.settings),
         Selection::LoginXai => start_xai_login(view, &args.settings),
         Selection::LoginMeta => start_meta_login(view, &args.settings),
         Selection::LoginKimi => start_kimi_login(view, &args.settings),
