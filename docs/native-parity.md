@@ -1466,6 +1466,16 @@ using OSC 10 and 11 and updates light/dark theme selection as replies arrive.
 Like Pi, the system theme and automatic light/dark pairs subscribe to
 terminal appearance notifications. Fixed themes still request the initial
 terminal colors, and switching back to an automatic theme refreshes them.
+
+Live Kitty 0.41.1 verification used a macOS fullscreen session through a PTY
+relay to an isolated Linux display. Changing Kitty's background from dark to
+light triggered a fresh foreground, background and 16-entry ANSI palette
+query in both the system theme and a light/dark pair. The updated colors
+changed the rendered header in each case. A fixed dark theme retained its
+header color and received only its initial query. A live Pi v1.5.0 comparison
+in the same terminal confirmed the subscription and query counts for the
+light/dark pair and fixed theme.
+
 System theme accent and syntax roles use Pi's fallback ANSI palette slots.
 Neutral fallback roles use terminal-default foreground with Pi's dim
 attribute. The terminal palette is queried with OSC 4 and applied after all 16 colors
