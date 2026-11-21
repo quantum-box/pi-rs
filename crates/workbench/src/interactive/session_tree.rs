@@ -6,6 +6,7 @@ use pi_rs::{Event, ModelFailure, Record, Session};
 use serde_json::Value;
 
 pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
+    let thinking = thinking_rows(session);
     let mut calls = std::collections::HashMap::new();
     let mut assistant_completions = std::collections::HashSet::new();
     for record in session.records() {
@@ -34,6 +35,14 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
     for record in session.records() {
         let (kind, description) = match &record.event {
             Event::Checkout { .. } => continue,
+            _ if thinking.contains_key(&record.id) => (
+                TreeEntryKind::Bookkeeping,
+                tree_description(
+                    format!("[thinking: {}]", thinking[&record.id]),
+                    "dim",
+                    String::new(),
+                ),
+            ),
             Event::User { content, .. } | Event::UserWithImages { content, .. } => (
                 TreeEntryKind::User,
                 tree_description("user: ", "accent", tree_preview(content, 200)),
@@ -178,6 +187,49 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
     picker
 }
 
+fn thinking_rows(session: &Session) -> std::collections::HashMap<u64, &str> {
+    let mut imported = Vec::new();
+    let mut rows = std::collections::HashMap::new();
+    for record in session.records() {
+        match &record.event {
+            Event::SourceEntry { format, entry }
+                if format == "pi" && entry["type"] == "thinking_level_change" =>
+            {
+                if let Some(level) = entry["thinkingLevel"].as_str() {
+                    imported.push((record.id, level));
+                }
+            }
+            Event::ModelSelected { thinking, .. }
+                if tree_parent_is_native_thinking_marker(session, record.parent) =>
+            {
+                rows.insert(record.id, thinking.as_deref().unwrap_or("off"));
+            }
+            _ => {}
+        }
+    }
+    if !imported.is_empty()
+        && let Ok(counts) = session.validated_pi_conversion_counts()
+    {
+        for (source, level) in imported {
+            // A thinking entry before model selection has no conversion.
+            // Otherwise use the converted record, which also holds its label.
+            if let Some(count) = counts.get(&source) {
+                rows.insert(source + u64::from(*count > 0), level);
+            }
+        }
+    }
+    rows
+}
+
+fn tree_parent_is_native_thinking_marker(session: &Session, parent: Option<u64>) -> bool {
+    parent
+        .and_then(|id| id.checked_sub(1))
+        .and_then(|index| session.records().get(index as usize))
+        .is_some_and(|parent| {
+            matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection")
+        })
+}
+
 fn preceding_record<'a>(session: &'a Session, record: &Record) -> Option<&'a Record> {
     session
         .records()
@@ -309,6 +361,46 @@ mod tests {
     use super::*;
     use crate::ui::{keys::Keys, theme::Theme};
     use serde_json::json;
+
+    #[test]
+    fn tree_distinguishes_thinking_changes_from_model_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pi.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"thinking_level_change","id":"high","parentId":null,"thinkingLevel":"high"}),
+            json!({"type":"model_change","id":"model","parentId":"high","provider":"ollama","modelId":"fixture-a"}),
+            json!({"type":"thinking_level_change","id":"low","parentId":"model","thinkingLevel":"low"}),
+            json!({"type":"message","id":"user","parentId":"low","message":{"role":"user","content":"question"}}),
+        ];
+        let fixture = entries
+            .iter()
+            .map(|entry| format!("{entry}\n"))
+            .collect::<String>();
+        std::fs::write(&path, fixture).unwrap();
+        let mut session = crate::session_import::read(&path).unwrap();
+        session
+            .select_thinking_level(Some("ollama"), "fixture-a", "medium")
+            .unwrap();
+
+        let theme = Theme::system();
+        let keys = Keys::default();
+        for (filter, expected) in [(TreeFilter::Default, 0), (TreeFilter::All, 1)] {
+            let lines = picker(&session, filter).render(&theme, 100, 28, &keys);
+            for heading in [
+                "[thinking: high]",
+                "[model: fixture-a]",
+                "[thinking: low]",
+                "[thinking: medium]",
+            ] {
+                let matching = lines
+                    .iter()
+                    .filter(|line| line.spans.iter().any(|span| span.text == heading))
+                    .count();
+                assert_eq!(matching, expected, "{heading}");
+            }
+        }
+    }
 
     #[test]
     fn imported_tree_rows_use_pi_message_labels_and_theme_roles() {
