@@ -24,6 +24,7 @@ fn command() -> Command {
         "provider",
         "model",
         "models",
+        "list-models",
         "api-key",
         "session-dir",
         "name",
@@ -287,6 +288,13 @@ fn normalize(
                 continue;
             }
         }
+        if std::ptr::eq(command, root)
+            && canonical == "--list-models"
+            && !input.peek().is_some_and(|next| list_models_search(next))
+        {
+            output.push("--list-models=".into());
+            continue;
+        }
         (remaining, hyphen_values) = option_values(command, canonical);
         if metadata_ownership && (canonical == "--export" || canonical.starts_with("--export=")) {
             export_values = remaining > 0;
@@ -357,6 +365,11 @@ fn normalize(
         output.extend(prompt);
     }
     (output, flags, selected_subcommand, literal_export_output)
+}
+
+fn list_models_search(value: &std::ffi::OsStr) -> bool {
+    let bytes = value.as_encoded_bytes();
+    !bytes.starts_with(b"-") && !bytes.starts_with(b"@")
 }
 
 fn pi_unconditional_value(option: &str) -> bool {
@@ -614,6 +627,10 @@ pub(super) fn export_plan(args: &[OsString]) -> Option<ExportPlan> {
             for _ in 0..count {
                 let Some(next) = args.get(i + 1) else { break };
                 let next_bytes = next.as_encoded_bytes();
+                if canonical == "--list-models" && !list_models_search(next) {
+                    validation.last_mut().expect("option").push("=");
+                    break;
+                }
                 let unconditional = pi_unconditional_value(canonical);
                 if !unconditional
                     && (next == "--"
@@ -1192,6 +1209,55 @@ mod tests {
         ] {
             assert!(parse(args.iter().map(OsString::from)).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn list_models_uses_the_last_optional_search_and_leaves_attachments() {
+        for (tokens, search, prompt) in [
+            (
+                &["--list-models", "first", "--list-models", "last"][..],
+                "last",
+                &[][..],
+            ),
+            (
+                &["--list-models", "first", "--list-models", "@file"][..],
+                "",
+                &["@file"][..],
+            ),
+            (
+                &["--list-models", "-", "@file"][..],
+                "",
+                &["-", "@file"][..],
+            ),
+            (&["--list-models=@literal"][..], "@literal", &[][..]),
+        ] {
+            let argv = ["pi"]
+                .into_iter()
+                .chain(tokens.iter().copied())
+                .collect::<Vec<_>>();
+            let args = cli(&argv);
+            assert_eq!(args.list_models.as_deref(), Some(search), "{argv:?}");
+            assert_eq!(args.prompt, prompt, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn export_projection_preserves_an_unfiltered_model_listing() {
+        let argv = [
+            "pi",
+            "--list-models",
+            "@file",
+            "search",
+            "--export",
+            "input",
+            "output",
+        ]
+        .map(OsString::from);
+        let plan = export_plan(&argv).unwrap();
+        assert_eq!(plan.output.unwrap(), std::path::Path::new("search"));
+        let (matches, _) = parse(plan.validation_args).unwrap();
+        let args = super::super::Cli::from_arg_matches(&matches).unwrap();
+        assert_eq!(args.list_models.as_deref(), Some(""));
     }
 
     #[test]
