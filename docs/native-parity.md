@@ -1142,7 +1142,10 @@ it can replace a read-only file when the parent directory permits replacement,
 requires permission to create and replace entries in that directory, and leaves
 other hard links pointing at the old file. A permission preflight alone cannot
 bind the check to the file that a later pathname replacement will affect.
-RPC user shell commands accept empty and whitespace-only scripts. User shell
+On Unix, unrestricted `write` reports Pi's `EISDIR` open diagnostic for
+directory targets and `EEXIST` or `ENOTDIR` mkdir diagnostics for file
+components in parent paths. These diagnostics name the requested path, including
+when a symlink leads to the directory or file. RPC user shell commands accept empty and whitespace-only scripts. User shell
 output strips terminal escape sequences and control characters before streaming
 and saving the transcript.
 
