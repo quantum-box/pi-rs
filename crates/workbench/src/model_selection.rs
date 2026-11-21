@@ -399,11 +399,7 @@ fn resolve_cli_catalog_model(
                     }
                     None => {
                         provider == Provider::Ollama
-                            || (provider == Provider::Bedrock
-                                && (ambient_bedrock
-                                    || args.settings.string("defaultProvider").is_some_and(|id| {
-                                        id.eq_ignore_ascii_case(Provider::Bedrock.id())
-                                    })))
+                            || (provider == Provider::Bedrock && ambient_bedrock)
                     }
                 };
             matches.push((
@@ -430,6 +426,26 @@ fn resolve_cli_catalog_model(
                 matches
                     .iter()
                     .find(|(_, _, usable)| *usable && usable_count == 1)
+            })
+        {
+            return Ok(Some(model.clone()));
+        }
+        // The native default may use the SDK chain even when no startup
+        // credential is visible. It cannot overrule evidence of usable auth.
+        if !inline
+            && usable_count == 0
+            && args
+                .settings
+                .string("defaultProvider")
+                .is_some_and(|id| id.eq_ignore_ascii_case(Provider::Bedrock.id()))
+            && let Some((model, _, _)) = matches.iter().find(|(model, _, _)| {
+                model.provider == Provider::Bedrock
+                    && args
+                        .configured_model_credential(
+                            &model.provider,
+                            profiles.endpoint(&model.provider),
+                        )
+                        .is_none()
             })
         {
             return Ok(Some(model.clone()));
@@ -929,10 +945,21 @@ mod tests {
                 "endpoint":"https://gateway.example/v1/chat/completions"}
         }));
         assert!(super::resolve_cli_catalog_model(&args, model, false, true).is_err());
+        args.settings = serde_json::from_value(json!({
+            "value":{"defaultProvider":"amazon-bedrock"},
+            "resource_layers":[],
+            "diagnostics":[]
+        }))
+        .unwrap();
         let gateway = super::resolve_cli_catalog_model(&args, model, false, false)
             .unwrap()
             .unwrap();
         assert_eq!(gateway.qualified(), format!("gateway/{model}"));
+        args.model_keys = Default::default();
+        let default = super::resolve_cli_catalog_model(&args, model, false, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(default.qualified(), format!("amazon-bedrock/{model}"));
     }
 
     #[test]
