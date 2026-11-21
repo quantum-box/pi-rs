@@ -996,6 +996,10 @@ Loopback RPC and PTY checks covered consent, decline, scope union, one retry,
 and credential generation changes. The existing OAuth and live catalog checks
 passed with the same implementation.
 
+Servers that return JSON-RPC Method not found for `resources/templates/list`
+produce an empty template list, including when a page cursor is supplied.
+Other template errors remain visible.
+
 ### Remote model read operations
 
 Native hosts can inject asynchronous `ReadOperations` through

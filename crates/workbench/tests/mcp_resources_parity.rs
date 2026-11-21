@@ -45,6 +45,7 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                 if socket.read_line(&mut line).await.is_err() {
                     return;
                 }
+                let templates_unimplemented = line.starts_with("POST /without-templates ");
                 let mut length = 0;
                 loop {
                     line.clear();
@@ -71,6 +72,16 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                         method.to_owned(),
                         request["params"]["cursor"].as_str().map(str::to_owned),
                     ));
+                }
+                if templates_unimplemented && request["method"] == "resources/templates/list" {
+                    let (code, message) = if request["params"]["cursor"] == "fault" {
+                        (-32603, "fixture internal error")
+                    } else {
+                        (-32601, "resource templates are unavailable")
+                    };
+                    let body = json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":code,"message":message}}).to_string();
+                    let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                    return;
                 }
                 let result = match request["method"].as_str() {
                     Some("initialize") => Some(
@@ -360,6 +371,48 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
     let page: Value = serde_json::from_str(&page).unwrap();
     assert_eq!(page["nextCursor"], "after-large");
     assert_eq!(page["resources"][0]["description"], "猫\n".repeat(300_000));
+    let legacy_config: ServerConfig = serde_json::from_value(json!({
+        "url":format!("http://{address}/without-templates"),
+        "oauth":false
+    }))
+    .unwrap();
+    let legacy = McpExtension::connect("legacy", &legacy_config, directory.path())
+        .await
+        .unwrap();
+    for (name, arguments, expected) in [
+        (
+            "mcp__legacy__list_resource_templates",
+            json!({}),
+            json!({"resourceTemplates":[]}),
+        ),
+        (
+            "mcp__legacy__list_resource_templates_page",
+            json!({"cursor":"stale"}),
+            json!({"server":"legacy","resourceTemplates":[]}),
+        ),
+    ] {
+        let tool = legacy
+            .tools()
+            .into_iter()
+            .find(|tool| tool.spec().name == name)
+            .unwrap();
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::new_v4(),
+            cancellation: CancellationToken::new(),
+        };
+        let result = tool.invoke(arguments, context()).await;
+        let Outcome::Structured { data, .. } = result else {
+            panic!("an unimplemented template method should return an empty result: {result:?}");
+        };
+        assert_eq!(data, expected);
+        if name.ends_with("_page") {
+            let error = tool.invoke(json!({"cursor":"fault"}), context()).await;
+            assert!(
+                matches!(error, Outcome::Failed(message) if message.contains("fixture internal error"))
+            );
+        }
+    }
+    legacy.close().await;
     extension.close().await;
     server.abort();
 }
