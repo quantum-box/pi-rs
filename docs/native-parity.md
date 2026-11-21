@@ -2290,7 +2290,8 @@ the frontend keeps its own snapshot until it reloads or changes sessions.
 user selection, while project plain-name lists replace it. Mixed plain names
 and ordered modifiers in settings resolve before CLI tool selection.
 
-The interactive `/debug` command writes `pi-debug.log` in the agent directory,
+The interactive `/debug` command and global Ctrl+Shift+D shortcut write
+`pi-debug.log` in the agent directory,
 including styled transcript and widget lines, terminal dimensions, and the
 current Pi-format session messages. It is available while a response is
 streaming, and the slash-command completion includes it.
