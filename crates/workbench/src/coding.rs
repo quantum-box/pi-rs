@@ -6229,6 +6229,76 @@ mod tests {
     }
 
     #[test]
+    fn local_edit_preserves_mixed_line_endings() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let path = root.path().join("mixed.txt");
+        for (original, edits, expected) in [
+            (
+                "\u{feff}α\nb\r\nX = 1\r\n",
+                json!([{"oldText":"X = 1","newText":"X = 2"}]),
+                "\u{feff}α\nb\r\nX = 2\r\n",
+            ),
+            (
+                "a\r\nb\nc",
+                json!([{"oldText":"c","newText":"C\nD"}]),
+                "a\r\nb\nC\nD",
+            ),
+            (
+                "lf1\nlf2\ncr1\r\ncr2\r\n",
+                json!([
+                    {"oldText":"cr1\n","newText":"C\r\nD\n"},
+                    {"oldText":"lf1\n","newText":"A\nB\n"}
+                ]),
+                "A\nB\nlf2\nC\r\nD\r\ncr2\r\n",
+            ),
+            (
+                "a\r\n“keep”  \nfoo   \r\nb\n",
+                json!([{"oldText":"foo\n","newText":"FOO\nMORE\n"}]),
+                "a\r\n“keep”  \nFOO\r\nMORE\r\nb\n",
+            ),
+            ("a\rb\nc", json!([{"oldText":"b","newText":""}]), "a\r\n\nc"),
+            (
+                "a\rb\rc",
+                json!([{"oldText":"b","newText":"B\nD"}]),
+                "a\rB\rD\rc",
+            ),
+            (
+                "a\rb\r\nc",
+                json!([{"oldText":"a","newText":"A\nB"}]),
+                "A\r\nB\rb\r\nc",
+            ),
+            (
+                "a\nb\rc",
+                json!([{"oldText":"c","newText":"C\nD"}]),
+                "a\nb\rC\nD",
+            ),
+            (
+                "head\r\na\n“b” tail\r\n",
+                json!([
+                    {"oldText":"a\n\"b\"","newText":"x"},
+                    {"oldText":"tail","newText":"Y\nZ"}
+                ]),
+                "head\r\nx Y\nZ\n",
+            ),
+        ] {
+            std::fs::write(&path, original).unwrap();
+            tool.edit(&json!({"path":"mixed.txt","edits":edits}))
+                .unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                expected.as_bytes(),
+                "{original:?}"
+            );
+        }
+    }
+
+    #[test]
     fn local_edit_does_not_remove_u0085_via_fuzzy_match() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("example.txt");
