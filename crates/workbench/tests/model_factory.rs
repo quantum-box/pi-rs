@@ -534,3 +534,211 @@ fn auth_file_snapshot_binds_only_granted_routes() {
     std::fs::remove_file(&file).unwrap();
     assert!(grants.load().unwrap().get("compatible", endpoint).is_none());
 }
+
+#[test]
+fn bedrock_catalog_uses_only_granted_regional_runtime_endpoints() {
+    use pi_rs_workbench::model_factory::NativeModelDefinition;
+
+    let ordinary = "https://bedrock-runtime.us-west-2.amazonaws.com";
+    let fips = "https://bedrock-runtime-fips.us-east-1.amazonaws.com";
+    let custom = "https://bedrock.gateway.example/runtime";
+    let mut auth = HostAuthBuilder::new();
+    for (endpoint, kind) in [
+        (ordinary, HostCredentialKind::ApiKey),
+        (fips, HostCredentialKind::Bearer),
+        (custom, HostCredentialKind::ApiKey),
+    ] {
+        auth.register(
+            "amazon-bedrock",
+            endpoint,
+            HostCredential::new(kind, "fixture-bedrock-token").unwrap(),
+        )
+        .unwrap();
+    }
+    let factory = ModelClientFactory::new(auth.build());
+    let definition = NativeModelDefinition {
+        api: NativeModelApi::BedrockConverse,
+        provider: "amazon-bedrock",
+        endpoint: ordinary,
+        model: "example",
+        info: None,
+    };
+    let catalog = factory.catalog([definition.clone()]).unwrap();
+    assert!(catalog.session_builder("amazon-bedrock", "example").is_ok());
+    assert!(
+        factory
+            .catalog([NativeModelDefinition {
+                endpoint: fips,
+                ..definition.clone()
+            }])
+            .is_ok()
+    );
+    for endpoint in [
+        "https://bedrock-runtime.us-west-2.amazonaws.com/",
+        "https://bedrock-runtime.us-west-2.amazonaws.com.example",
+        custom,
+    ] {
+        assert!(
+            factory
+                .catalog([NativeModelDefinition {
+                    endpoint,
+                    ..definition.clone()
+                }])
+                .is_err()
+        );
+    }
+    assert!(
+        factory
+            .bedrock_client("amazon-bedrock", custom, "us-west-2")
+            .is_ok()
+    );
+    assert!(
+        factory
+            .bedrock_client("alias", custom, "us-west-2")
+            .is_err()
+    );
+    assert!(
+        factory
+            .bedrock_client("amazon-bedrock", custom, "us west 2")
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn bedrock_explicit_factory_prepares_and_sends_bearer_to_the_granted_route() {
+    use pi_rs::{Message, Model, ModelRequest};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/gateway", listener.local_addr().unwrap());
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        "amazon-bedrock",
+        &endpoint,
+        HostCredential::new(HostCredentialKind::ApiKey, "fixture-bedrock-token").unwrap(),
+    )
+    .unwrap();
+    let factory = ModelClientFactory::new(auth.build());
+    let model = factory
+        .bedrock_client("amazon-bedrock", &endpoint, "eu-west-1")
+        .unwrap();
+    let request = ModelRequest {
+        model: "test-model".into(),
+        messages: vec![Message::User {
+            content: "hello".into(),
+        }],
+        tools: vec![],
+        max_output_tokens: 16,
+    };
+    let prepared = model.prepare_context(&request).await.unwrap().unwrap();
+    assert!(prepared.context_identity().is_some());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+
+    let serve = || async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 2048];
+        let (header_end, body_size) = loop {
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert_ne!(count, 0);
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                let size = std::str::from_utf8(&bytes[..position])
+                    .unwrap()
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("Content-Length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                break (position + 4, size);
+            }
+        };
+        while bytes.len() < header_end + body_size {
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert_ne!(count, 0);
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let head = std::str::from_utf8(&bytes[..header_end])
+            .unwrap()
+            .to_owned();
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes[header_end..header_end + body_size]).unwrap();
+        (head, body)
+    };
+    for client in [&model as &dyn Model, prepared.as_ref()] {
+        let ((head, body), response) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serve(), client.stream(request.clone()))
+        })
+        .await
+        .unwrap();
+        assert!(response.is_err());
+        assert!(head.starts_with("POST /gateway/model/test-model/converse-stream HTTP/1.1\r\n"));
+        assert!(
+            head.lines().any(
+                |line| line.eq_ignore_ascii_case("authorization: Bearer fixture-bedrock-token")
+            )
+        );
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 16);
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+    }
+}
+
+#[test]
+fn bedrock_explicit_factory_ignores_ambient_routing_and_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config");
+    let credentials = directory.path().join("credentials");
+    std::fs::write(
+        &config,
+        "[profile ambient]\nregion = ap-northeast-1\nendpoint_url = http://127.0.0.1:9\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &credentials,
+        "[ambient]\naws_access_key_id = ambient-key\naws_secret_access_key = ambient-secret\n",
+    )
+    .unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "bedrock_explicit_factory_prepares_and_sends_bearer_to_the_granted_route",
+        ])
+        .env("AWS_CONFIG_FILE", config)
+        .env("AWS_SHARED_CREDENTIALS_FILE", credentials)
+        .env("AWS_PROFILE", "ambient")
+        .env("AWS_REGION", "ap-northeast-1")
+        .env("AWS_ACCESS_KEY_ID", "ambient-key")
+        .env("AWS_SECRET_ACCESS_KEY", "ambient-secret")
+        .env("AWS_BEARER_TOKEN_BEDROCK", "ambient-token")
+        .env("AWS_ENDPOINT_URL", "http://127.0.0.1:9")
+        .env("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:9")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("NO_PROXY", "")
+        .env("http_proxy", "http://127.0.0.1:9")
+        .env("https_proxy", "http://127.0.0.1:9")
+        .env("no_proxy", "")
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success() && String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr),
+    );
+}
