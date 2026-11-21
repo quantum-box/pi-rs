@@ -289,9 +289,7 @@ impl Anthropic {
 
     #[doc(hidden)]
     pub async fn prepare_header_override(&self, headers: &HeaderMap) -> Option<HeaderMap> {
-        if pi_rs_core::provider_header_session_id().is_none() {
-            return None;
-        }
+        pi_rs_core::provider_header_session_id()?;
         let credential = self.auth.1.to_str().unwrap_or_default();
         let mut secrets = vec![credential.to_owned()];
         if let Some((scheme, token)) = credential.split_once(' ')

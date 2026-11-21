@@ -157,9 +157,7 @@ impl Google {
 
     #[doc(hidden)]
     pub async fn prepare_header_override(&self, headers: &HeaderMap) -> Option<HeaderMap> {
-        if pi_rs_core::provider_header_session_id().is_none() {
-            return None;
-        }
+        pi_rs_core::provider_header_session_id()?;
         let secrets = [self.api_key.to_str().unwrap_or_default().to_owned()];
         pi_rs_core::prepare_provider_headers(headers, &secrets).await
     }

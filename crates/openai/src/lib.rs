@@ -404,9 +404,7 @@ impl OpenAiResponses {
         &self,
         headers: &reqwest::header::HeaderMap,
     ) -> Option<reqwest::header::HeaderMap> {
-        if pi_rs_core::provider_header_session_id().is_none() {
-            return None;
-        }
+        pi_rs_core::provider_header_session_id()?;
         pi_rs_core::prepare_provider_headers(headers, &vec![self.token.clone()]).await
     }
 
