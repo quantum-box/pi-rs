@@ -25,6 +25,7 @@ mod chatgpt_auth;
 mod cli_compat;
 mod clipboard;
 mod config;
+mod copilot_auth;
 mod extension_ui;
 mod http_proxy;
 mod image_policy;
@@ -113,7 +114,7 @@ struct Cli {
     #[arg(skip)]
     model_explicit: bool,
     #[arg(skip)]
-    model_from_settings: bool,
+    model_is_literal: bool,
     #[arg(skip)]
     thinking_explicit: bool,
     #[arg(skip)]
@@ -420,7 +421,7 @@ impl Cli {
             .as_ref()
             .is_some_and(|(provider, _)| provider == &self.provider)
         {
-            let qualified = if self.model_from_settings {
+            let qualified = if self.model_is_literal {
                 self.model.as_str()
             } else {
                 model_selection::qualified_model(&self.model, &self.model_profiles)
@@ -1153,7 +1154,7 @@ enum Command {
     },
     /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding", "xai", "anthropic"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "github-copilot", "kimi-coding", "xai", "anthropic"])]
         provider: String,
         #[arg(long)]
         device_code: bool,
@@ -1172,7 +1173,7 @@ enum Command {
     },
     /// Remove a saved provider credential.
     Logout {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "kimi-coding", "xai", "anthropic"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "github-copilot", "kimi-coding", "xai", "anthropic"])]
         provider: String,
     },
     Run {
@@ -1506,27 +1507,46 @@ async fn run_cli() -> i32 {
             .clone()
             .or_else(|| configured_model.and_then(provider_prefix))
             .unwrap_or_default();
+        let explicit_endpoint =
+            matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine);
+        let resolved = if args.model_explicit
+            && args.provider_argument.is_none()
+            && !explicit_endpoint
+            && !matches!(args.command, Some(Command::Serve))
+        {
+            let inline = args.api_key.is_some() || std::env::var_os("PI_RS_MODEL_TOKEN").is_some();
+            model_selection::cli_catalog_model(&args, &args.model, inline)?
+        } else {
+            None
+        };
         args.provider = if let Some(name) = args.provider_argument.as_deref() {
             args.model_profiles
                 .provider(name)
                 .ok_or_else(|| Error::Config(format!("unknown model provider {name:?}")))?
+        } else if let Some(model) = &resolved {
+            model.provider.clone()
         } else if args.model_explicit {
             provider_prefix(&args.model).unwrap_or_else(|| configured_provider.clone())
         } else {
             configured_provider.clone()
         };
-        let explicit_endpoint =
-            matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine);
         args.endpoint_explicit = explicit_endpoint;
         args.connection_explicit = explicit_endpoint || args.provider_argument.is_some();
         if !explicit_endpoint {
             args.endpoint = args.model_profiles.endpoint(&args.provider).into();
         }
         args.initial_connection = Some((args.provider.clone(), args.endpoint.clone()));
-        if !args.model_explicit {
+        if let Some(model) = resolved {
+            args.model = model.model;
+            args.model_is_literal = true;
+            if !args.thinking_explicit && model.thinking.is_some() {
+                args.thinking = model.thinking;
+                args.thinking_explicit = true;
+            }
+        } else if !args.model_explicit {
             if let Some(model) = configured_model.filter(|_| args.provider == configured_provider) {
                 args.model = model.into();
-                args.model_from_settings = explicit_default_provider.is_some();
+                args.model_is_literal = explicit_default_provider.is_some();
             } else if args.provider != Provider::Ollama {
                 args.model.clear();
             }
@@ -1778,7 +1798,7 @@ async fn execute(
         .collect();
     // The hidden worker command receives an already-resolved, literal model ID.
     if !args.model.is_empty()
-        && !args.model_from_settings
+        && !args.model_is_literal
         && !matches!(args.command, Some(Command::Serve))
     {
         let selected = model_selection::split_with_profiles(
@@ -1906,6 +1926,13 @@ async fn execute(
                         eprintln!("Continue with ChatGPT in your browser: {url}")
                     })
                     .await
+                } else if provider == "github-copilot" {
+                    copilot_auth::login(
+                        &args.settings,
+                        meta_auth::LoginControl::default(),
+                        |url, code| eprintln!("Enter code {code} at {url}"),
+                    )
+                    .await
                 } else if provider == "xai" {
                     xai_auth::login(
                         &args.settings,
@@ -1957,10 +1984,11 @@ async fn execute(
                 xai_auth::logout().await?
             } else if provider == "kimi-coding" {
                 kimi_auth::logout().await?
-            } else if provider == "openrouter" || provider == "anthropic" {
-                model_auth::remove(
-                    &Provider::named(provider).expect("built-in OpenRouter provider"),
-                )?
+            } else if matches!(
+                provider.as_str(),
+                "openrouter" | "anthropic" | "github-copilot"
+            ) {
+                model_auth::remove(&Provider::named(provider).expect("built-in login provider"))?
             } else {
                 radius_auth::Gateway::configured_with_settings(&args.settings)?
                     .logout()
@@ -2107,6 +2135,12 @@ async fn execute(
     if session.host_binding().is_some() {
         return Err(Error::Session(
             "a managed session must be opened by its host".into(),
+        ));
+    }
+    if matches!(&command, Command::Run { .. }) && session.pending_extension_boundary_run().is_some()
+    {
+        return Err(Error::Session(
+            "resume the pending extension boundary before submitting a prompt".into(),
         ));
     }
     let requested_workspace = args.workspace.clone();
@@ -2509,7 +2543,11 @@ async fn execute(
             }
             }
         }
-        let run_id = if index == 0 { args.run_id } else { None }.unwrap_or_else(Uuid::new_v4);
+        let run_id = if index == 0 {
+            args.run_id.or_else(|| input.is_none().then(|| session.pending_extension_boundary_run()).flatten())
+        } else {
+            None
+        }.unwrap_or_else(Uuid::new_v4);
         let image_record = if images.is_empty() {
             None
         } else {
@@ -2709,6 +2747,9 @@ async fn run_pending_custom_trigger(
     runtime: &runtime::Runtime,
     session: &mut Session,
 ) -> Result<()> {
+    if session.pending_extension_boundary_run().is_some() {
+        return Ok(());
+    }
     let Some(run_id) = session.pending_custom_trigger() else {
         return Ok(());
     };

@@ -120,13 +120,19 @@ enum ConfigurationRead {
     TextReport,
 }
 
+impl ConfigurationRead {
+    fn validates_file_shape(self) -> bool {
+        self != Self::Runtime
+    }
+}
+
 fn validate_mcp_file_fields(
     file: &Value,
     path: &std::path::Path,
     mode: ConfigurationRead,
     errors: &mut Vec<String>,
 ) {
-    if matches!(mode, ConfigurationRead::Share | ConfigurationRead::Report)
+    if mode.validates_file_shape()
         && file
             .get("mcpServers")
             .is_some_and(|value| !value.is_object())
@@ -151,7 +157,7 @@ fn configurations_with_project_scope(
     args: &Cli,
     mode: ConfigurationRead,
 ) -> Result<ScopedConfigurations> {
-    let validate_shape = matches!(mode, ConfigurationRead::Share | ConfigurationRead::Report);
+    let validate_shape = mode.validates_file_shape();
     if args.no_mcp || !super::resource_paths::builtin_enabled(args, "builtin:mcp")? {
         return Ok((
             BTreeMap::new(),

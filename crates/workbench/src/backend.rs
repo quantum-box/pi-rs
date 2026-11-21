@@ -883,7 +883,11 @@ async fn run_worker(
     let startup_trigger = session
         .host_binding()
         .is_none()
-        .then(|| session.pending_custom_trigger())
+        .then(|| {
+            session
+                .pending_extension_boundary_run()
+                .or_else(|| session.pending_custom_trigger())
+        })
         .flatten();
     drop(session);
     *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
@@ -1237,7 +1241,11 @@ async fn run_worker(
             };
             match request {
                 Request::TriggerCustom { run_id } => {
-                    if session.pending_custom_trigger() != Some(run_id) {
+                    if session
+                        .pending_extension_boundary_run()
+                        .or_else(|| session.pending_custom_trigger())
+                        != Some(run_id)
+                    {
                         return Err(Error::Session("custom trigger is no longer pending".into()));
                     }
                     let answer = Box::pin(agent.run_correlated_with_events(
