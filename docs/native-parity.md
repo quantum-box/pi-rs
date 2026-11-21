@@ -1174,6 +1174,22 @@ The model and thinking selectors accept Ctrl+S to save a startup default.
 `/settings` currently edits tool-output and thinking-block visibility and saves
 model/thinking defaults. `/settings-json` displays the resolved settings.
 
+### Native SDK saved API keys
+
+`pi_rs_workbench::auth_factory::AuthFileReadGrants` reads a Pi-format
+`auth.json` into an owned `HostAuthSnapshot` for the native model client
+factory. The caller supplies one absolute file path and exact provider and
+endpoint grants. An endpointless entry is usable only on granted routes. A
+pi-rs entry with a saved endpoint must also match that endpoint. File contents
+can supply variables for key expansion, including Pi's `$$` and `$!` escapes.
+The pi-rs `literal` flag preserves the key verbatim.
+
+Each load reads the file afresh and leaves existing clients and snapshots
+usable. The caller owns the lifetime of each client and should load the file
+off the UI thread. Unresolved variable or command references and OAuth entries
+leave the route unconfigured. The SDK host controls ambient environment access,
+OAuth, and any credential writes.
+
 ### Regular terminal checkpoint
 
 `--tui-mode regular` (or `tuiMode` in settings) keeps completed messages in
