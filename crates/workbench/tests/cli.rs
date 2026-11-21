@@ -4325,6 +4325,225 @@ fn rpc_replacement_retry_case(live_retry: bool) {
     assert_eq!(server.join().unwrap(), 1);
 }
 
+#[tokio::test]
+async fn headless_streams_delimit_retried_model_attempts() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    for (mode, rejects, abort_retry) in [
+        ("json", 1, false),
+        ("rpc", 1, false),
+        ("rpc", 2, false),
+        ("rpc", 1, true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(
+            root.path().join("models.json"),
+            json!({"providers":{"fixture":{"baseUrl":endpoint,"api":"openai-completions",
+                "apiKey":"fixture","models":[{"id":"fixture-model"}]}}})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"retry":{"enabled":true,"maxRetries":1,
+                "baseDelayMs":if abort_retry { 60000 } else { 0 },
+                "provider":{"maxRetries":0}}})
+            .to_string(),
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 0..if abort_retry { 1 } else { 2 } {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(30), listener.accept())
+                        .await
+                        .expect("model request timeout")
+                        .unwrap();
+                let mut request = tokio::io::BufReader::new(&mut socket);
+                let mut line = String::new();
+                request.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with("POST /v1/chat/completions "), "{line}");
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    if request.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                request.read_exact(&mut vec![0; length]).await.unwrap();
+                let (status, content_type, body) = if attempt < rejects {
+                    (
+                        "503 Service Unavailable",
+                        "application/json",
+                        r#"{"error":{"message":"fixture service temporarily unavailable"}}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        "text/event-stream",
+                        concat!(
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"recovered\"},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        ),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("NO_PROXY", "127.0.0.1")
+            .args([
+                "--offline",
+                "--no-session",
+                "--no-approve",
+                "--no-extensions",
+                "--no-mcp",
+                "--no-tools",
+                "--provider",
+                "fixture",
+                "--model",
+                "fixture-model",
+                "--mode",
+                mode,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true);
+        if mode == "json" {
+            command.arg("test");
+        }
+        let mut child = command.spawn().unwrap();
+        let mut input = child.stdin.take();
+        if mode == "json" {
+            drop(input.take());
+        } else if let Some(input) = input.as_mut() {
+            input
+                .write_all(b"{\"type\":\"prompt\",\"message\":\"test\"}\n")
+                .await
+                .unwrap();
+        }
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut events = Vec::new();
+        let mut acknowledged_abort = false;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(line) = output.next_line().await.unwrap() {
+                let event: Value = serde_json::from_str(&line).unwrap();
+                let kind = event["type"].as_str().unwrap();
+                if abort_retry && kind == "auto_retry_start" {
+                    input
+                        .as_mut()
+                        .expect("RPC stdin")
+                        .write_all(b"{\"id\":\"cancel-retry\",\"type\":\"abort_retry\"}\n")
+                        .await
+                        .unwrap();
+                }
+                if kind == "response" && event["id"] == "cancel-retry" {
+                    assert_eq!(event["success"], true, "{event}");
+                    acknowledged_abort = true;
+                }
+                if matches!(
+                    kind,
+                    "agent_start"
+                        | "agent_end"
+                        | "turn_start"
+                        | "turn_end"
+                        | "message_end"
+                        | "auto_retry_start"
+                        | "auto_retry_end"
+                        | "agent_settled"
+                ) {
+                    events.push(event);
+                }
+                if events
+                    .last()
+                    .is_some_and(|event| event["type"] == "agent_settled")
+                    && (!abort_retry || acknowledged_abort)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("{mode} with {rejects} rejects, abort={abort_retry}: {events:?}")
+        });
+        drop(input);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        server.await.unwrap();
+
+        let mut expected = vec![
+            "agent_start",
+            "turn_start",
+            "message_end",
+            "message_end",
+            "turn_end",
+            "agent_end",
+            "auto_retry_start",
+        ];
+        if abort_retry {
+            expected.push("auto_retry_end");
+        } else {
+            expected.extend(["agent_start", "turn_start", "message_end"]);
+            if rejects == 1 {
+                expected.extend(["auto_retry_end", "turn_end", "agent_end"]);
+            } else {
+                expected.extend(["turn_end", "agent_end", "auto_retry_end"]);
+            }
+        }
+        expected.push("agent_settled");
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds, expected,
+            "{mode}, {rejects} rejects, abort={abort_retry}"
+        );
+        let failed = &events[5];
+        assert_eq!(failed["willRetry"], true);
+        assert_eq!(failed["success"], false);
+        assert_eq!(
+            failed["messages"],
+            json!([events[2]["message"], events[3]["message"]])
+        );
+        assert_eq!(events[3]["message"]["stopReason"], "error");
+        let success = !abort_retry && rejects == 1;
+        let retry_end = events
+            .iter()
+            .find(|event| event["type"] == "auto_retry_end")
+            .unwrap();
+        assert_eq!(retry_end["success"], success);
+        if !abort_retry {
+            let end = events
+                .iter()
+                .rfind(|event| event["type"] == "agent_end")
+                .unwrap();
+            assert_eq!(end["willRetry"], false);
+            assert_eq!(end["success"], success);
+            assert_eq!(end["messages"], json!([events[9]["message"]]));
+        }
+    }
+}
+
 #[test]
 fn rpc_correlates_commands_and_rejects_unknown_commands() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))

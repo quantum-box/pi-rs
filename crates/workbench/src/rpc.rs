@@ -247,12 +247,9 @@ pub(super) fn run(
                     )?;
                 }
                 if finished.busy {
-                    for event in stream.settle(false) {
+                    for event in stream.settle(false, status.success()) {
                         emit(event)?;
                     }
-                    emit(
-                        json!({"type":"agent_end","success":status.success(),"messages":stream.messages,"willRetry":false}),
-                    )?;
                     emit(json!({"type":"agent_settled","aborted":stream.aborted()}))?;
                     stream.reset();
                 }
@@ -2989,12 +2986,9 @@ fn forward_event(
         Some("agent_settled") => {
             *busy = pending_compact.is_some();
             if event["started"] != false {
-                for mapped in stream.settle(event["aborted"] == true) {
+                for mapped in stream.settle(event["aborted"] == true, event["success"] == true) {
                     emit(mapped)?;
                 }
-                emit(
-                    json!({"type":"agent_end","success":event["success"],"messages":stream.messages,"willRetry":false}),
-                )?;
             }
             emit(
                 json!({"type":"agent_settled","aborted":event["aborted"] == true || (event["started"] != false && stream.aborted())}),
@@ -3029,6 +3023,8 @@ fn forward_event(
                         | "reasoning_item_end"
                         | "tool_call_delta"
                         | "summary_request_start"
+                        | "auto_retry_start"
+                        | "auto_retry_end"
                         | "internal_tool_result_metadata"
                         | "internal_tool_attempt"
                 )
