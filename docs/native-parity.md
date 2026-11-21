@@ -5541,7 +5541,9 @@ unconfigured final model on the selected route uses the provider default or
 Gemini-version inference.
 For a final model configured on a different API or endpoint, Workbench rejects
 constrained Google dispatch instead of applying that model's capability to the
-selected connection. An explicit endpoint is used when comparing effective
-routes. Unconfigured and override-only models must resolve to the selected route; when
-they do, they retain provider-default or Gemini-version inference. Standalone
-Google SDK capability overrides remain endpoint-wide.
+selected connection. Prefixed and bare model IDs cannot bypass an alternate
+route configured for the same wire model. An explicit endpoint is used when
+comparing effective routes. Unconfigured and override-only models must resolve
+to the selected route. When they do, they retain provider-default or
+Gemini-version inference. Standalone Google SDK capability overrides remain
+endpoint-wide.

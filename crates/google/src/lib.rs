@@ -214,6 +214,17 @@ impl Google {
         self
     }
 
+    fn strict_tool_route_allowed(&self, model: &str) -> bool {
+        self.strict_tool_routes
+            .get(model)
+            .or_else(|| match model.strip_prefix("models/") {
+                Some(id) => self.strict_tool_routes.get(id),
+                None => self.strict_tool_routes.get(&format!("models/{model}")),
+            })
+            .copied()
+            .unwrap_or(self.strict_tool_route_default)
+    }
+
     pub fn prepare_bound_tool_dispatch(
         &self,
         request: &ModelRequest,
@@ -236,11 +247,7 @@ impl Google {
                 declaration.constrained_sampling,
                 Some(pi_rs_core::ToolConstraint::JsonSchema { .. })
             )
-        }) && !self
-            .strict_tool_routes
-            .get(&request.model)
-            .copied()
-            .unwrap_or(self.strict_tool_route_default)
+        }) && !self.strict_tool_route_allowed(&request.model)
         {
             return Err(Error::Config("Google strict-tool capability cannot be resolved for the final request model and route".into()));
         }
@@ -1767,12 +1774,9 @@ mod tests {
             .unwrap()
             .with_strict_tool_routes(
                 true,
-                [
-                    ("models/elsewhere".into(), false),
-                    ("elsewhere".into(), false),
-                ]
-                .into_iter()
-                .collect(),
+                [("models/away".into(), false), ("elsewhere".into(), false)]
+                    .into_iter()
+                    .collect(),
             );
         let spec = ToolSpec {
             name: "t".into(),
@@ -1822,7 +1826,7 @@ mod tests {
                 EffectiveToolSampling::StrictJsonSchema { .. }
             ));
         }
-        for id in ["elsewhere", "models/elsewhere"] {
+        for id in ["away", "models/away", "elsewhere", "models/elsewhere"] {
             let request = ModelRequest {
                 model: id.into(),
                 messages: vec![],

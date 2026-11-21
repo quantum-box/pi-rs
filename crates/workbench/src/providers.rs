@@ -1187,11 +1187,12 @@ impl Client {
                 };
                 let unknown_route = args.provider.adapter() == Adapter::Google
                     && args.model_endpoint_for(&args.provider, None) == selected_endpoint;
-                let mut route_models: std::collections::BTreeSet<String> = args
+                let configured_models: std::collections::BTreeSet<String> = args
                     .model_profiles
                     .model_ids(&args.provider)
                     .into_iter()
                     .collect();
+                let mut route_models = configured_models.clone();
                 route_models.extend(strict_models.keys().cloned());
                 let mut route_names = route_models.clone();
                 for id in &route_models {
@@ -1203,13 +1204,24 @@ impl Client {
                     .into_iter()
                     .map(|id| {
                         let canonical = id.strip_prefix("models/").unwrap_or(&id);
+                        let alias = if id == canonical {
+                            format!("models/{canonical}")
+                        } else {
+                            canonical.to_owned()
+                        };
+                        // A spelling without its own profile cannot bypass an explicit route
+                        // for the same wire model.
+                        let inherited_route_safe = configured_models.contains(&id)
+                            || !configured_models.contains(&alias)
+                            || same_route(&alias);
                         // The adapter falls back to a canonical model-specific override;
                         // that override must also belong to this route.
                         let inherited_override_safe = id == canonical
                             || strict_models.contains_key(&id)
                             || !strict_models.contains_key(canonical)
                             || same_route(canonical);
-                        let allowed = same_route(&id) && inherited_override_safe;
+                        let allowed =
+                            same_route(&id) && inherited_route_safe && inherited_override_safe;
                         (id, allowed)
                     })
                     .collect();
@@ -2234,9 +2246,14 @@ mod contention_tests {
                         "models":[
                             {"id":"a", "baseUrl":route_a, "compat":{"supportsStrictMode":false}},
                             {"id":"b", "baseUrl":route_b, "compat":{"supportsStrictMode":true}},
+                            {"id":"b-default", "baseUrl":route_b},
+                            {"id":"models/c", "baseUrl":route_b},
                             {"id":"chat", "api":"openai-completions", "baseUrl":route_a, "compat":{"supportsStrictMode":true}}
                         ],
-                        "modelOverrides":{"unknown-partial":{"reasoning":false}}
+                        "modelOverrides":{
+                            "unknown-partial":{"reasoning":false},
+                            "models/b-default":{"compat":{"supportsStrictMode":true}}
+                        }
                     }}})).unwrap();
                     args.provider = args.model_profiles.provider("fixture").unwrap();
                     args.model = selected.into();
@@ -2284,6 +2301,8 @@ mod contention_tests {
                         ("gemini-3-unknown", explicit || selected == "a", true),
                         ("models/a", explicit || selected == "a", false),
                         ("models/b", explicit, true),
+                        ("models/b-default", explicit, true),
+                        ("c", explicit, true),
                     ] {
                         let request = ModelRequest {
                             model: target.into(),
