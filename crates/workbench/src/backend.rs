@@ -1294,7 +1294,11 @@ async fn run_worker(
                     ..
                 } => {
                     let mut prompt_acknowledged = false;
-                    if queued_only && !agent.apply_queued_inputs(session, &mut observer)? {
+                    if queued_only
+                        && !agent
+                            .apply_queued_inputs_with_lifecycle(session, &cancel, &mut observer)
+                            .await?
+                    {
                         return Ok(());
                     }
                     let command = if let Some(input) = content.as_deref() {
@@ -1391,11 +1395,16 @@ async fn run_worker(
                     }
                     let run_id = Uuid::new_v4();
                     if !images.is_empty() {
-                        session.append_user_with_images(
-                            content.take().unwrap_or_default(),
-                            images,
-                            Some(run_id),
-                        )?;
+                        agent
+                            .append_prompt_with_images(
+                                session,
+                                content.take().unwrap_or_default(),
+                                images,
+                                run_id,
+                                &cancel,
+                                &mut observer,
+                            )
+                            .await?;
                         observer(pi_rs::Notification::Committed(
                             session.records().last().expect("appended user input"),
                         ));

@@ -3399,11 +3399,16 @@ impl AgentSession {
                 agent
                     .resolve_prior_turn_end(&mut journal, run_id, &active.token, &mut observe)
                     .await?;
-                journal.append_user_with_images(
-                    input.take().unwrap_or_default(),
-                    images,
-                    Some(run_id),
-                )?;
+                agent
+                    .append_prompt_with_images(
+                        &mut journal,
+                        input.take().unwrap_or_default(),
+                        images,
+                        run_id,
+                        &active.token,
+                        &mut observe,
+                    )
+                    .await?;
                 observe(Notification::Committed(
                     journal.records().last().expect("appended user message"),
                 ));

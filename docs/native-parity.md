@@ -4487,6 +4487,21 @@ edited text while billing retains measured usage. Failed and aborted
 attempts receive transient start and end notifications when needed. Executable extensions advertise
 `message_lifecycle_hook`. Summary requests stay outside the hook.
 
+User prompts emit `message_start` and `message_end` before delivery, including
+image prompts, steering and follow-ups in the SDK and Workbench. A
+`message_end` edit changes the text sent to the model and saved in the journal.
+Native edits retain the input ID, message role and validated attachments.
+Consuming a queued input and saving its final text share one journal record.
+If cancellation arrives during a message callback, that delivery can finish
+and subsequent inputs remain queued. An interruption before the journal
+append can replay callbacks for an undelivered input. Initial text callbacks
+run before the model turn starts. Multimodal prompts are staged before the
+correlated run and emit their callbacks at staging time. Inputs already ready
+at run start use the initial extension registry. Turn-time delivery uses the
+registry refreshed for that turn.
+Rust hosts applying queued inputs outside a run can await
+`Agent::apply_queued_inputs_with_lifecycle` to dispatch these hooks.
+
 Native extensions can subscribe to `after_provider_response` to observe the
 HTTP status and normalized headers from an agent turn. The OpenAI Responses,
 OpenAI-compatible chat, Anthropic Messages, Google Gemini, and Ollama adapters
