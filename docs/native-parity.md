@@ -2023,7 +2023,9 @@ zero, negative and fractional values. Local `find` reproduces fd's numeric
 argument parsing: zero means unlimited, while negative, fractional, and values
 outside fd's host-sized integer range produce fd-style errors before checking
 the search path. These diagnostics retain error status and reach the model
-without an added failure prefix. Notices and details retain the JavaScript numeric value. Scoped tools retain their positive
+without an added failure prefix. Generated local tool errors carry Pi's empty
+`details` object in JSON and RPC. Notices and details retain the JavaScript
+numeric value. Scoped tools retain their positive
 integer schema and 100,000-entry cap. Their incremental output formatter retains at most 50 KiB
 plus one byte while counting the complete output. Directory enumeration and
 locale sorting still retain all directory entries in memory. `find` uses the
