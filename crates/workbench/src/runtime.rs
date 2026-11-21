@@ -791,6 +791,7 @@ fn resolve_discovered_path(
 
 struct LiveMcpCatalog {
     args: Cli,
+    builtin_tool_search: bool,
     resources: std::sync::Mutex<resources::Resources>,
     servers: std::sync::Mutex<Vec<Arc<pi_rs_workbench::mcp::McpExtension>>>,
 }
@@ -811,9 +812,11 @@ impl pi_rs::RegistryRefresher for LiveMcpCatalog {
             servers.push(refreshed);
         }
         let (selection, documents, hidden) = tool_discovery(&self.args, &servers)?;
-        registry.replace(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
-            documents,
-        )))?;
+        if self.builtin_tool_search {
+            registry.replace(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
+                documents,
+            )))?;
+        }
         let resources = self.resources.lock().expect("resource catalog").clone();
         let system_prompt = select_tools(
             &mut registry,
@@ -1070,6 +1073,7 @@ async fn configure_after(
         )?;
         let catalog = Arc::new(LiveMcpCatalog {
             args: args.clone(),
+            builtin_tool_search,
             resources: std::sync::Mutex::new(local_resources.clone()),
             servers: std::sync::Mutex::new(mcp_connections.clone()),
         });
