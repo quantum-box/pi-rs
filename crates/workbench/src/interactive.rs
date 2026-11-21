@@ -3816,7 +3816,7 @@ fn slash(
                 json!({"type":"compact","summary":null,"keep_turns":1,"use_token_settings":true,"instructions":rest}),
             )
         }
-        "/mcp" => view.pending_request = Some(json!({"type":"mcp_status"})),
+        "/mcp" => view.pending_request = Some(json!({"type":"mcp_status","inspect":true})),
         "/trust" => {
             view.picker = Some(Picker::new(
                 "Load project configuration?",

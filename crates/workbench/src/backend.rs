@@ -104,7 +104,10 @@ enum Request {
         resume: bool,
         task: String,
     },
-    McpStatus,
+    McpStatus {
+        #[serde(default)]
+        inspect: bool,
+    },
     Bash {
         command: String,
         #[serde(default)]
@@ -1192,7 +1195,7 @@ async fn run_worker(
         let mut operation = Box::pin(async {
             if matches!(
                 &request,
-                Request::Prompt { .. } | Request::TriggerCustom { .. } | Request::McpStatus
+                Request::Prompt { .. } | Request::TriggerCustom { .. } | Request::McpStatus { .. }
             ) {
                 tokio::select! {
                     biased;
@@ -1529,7 +1532,13 @@ async fn run_worker(
                     ))
                     .await?;
                 }
-                Request::McpStatus => runtime.mcp_status(&args)?,
+                Request::McpStatus { inspect } => {
+                    if inspect {
+                        runtime.inspect_mcp(ui.as_ref(), &cancel).await?;
+                    } else {
+                        runtime.mcp_status(&args)?;
+                    }
+                }
                 Request::Review {
                     child,
                     from_record,
