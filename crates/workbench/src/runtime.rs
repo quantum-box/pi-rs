@@ -22,6 +22,7 @@ pub struct Runtime {
     resource_origins: ResourceOrigins,
     catalog: Arc<LiveMcpCatalog>,
     mcp_sign_in: std::collections::VecDeque<mcp_config::PendingSignIn>,
+    mcp_inspection: Vec<mcp_config::Inspection>,
 }
 
 #[derive(Clone, Debug)]
@@ -392,6 +393,15 @@ impl Runtime {
         }
         Ok(())
     }
+    pub async fn inspect_mcp(
+        &self,
+        ui: &dyn ExtensionUi,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let servers = self.catalog.servers.lock().expect("MCP catalogs").clone();
+        mcp_config::inspect_servers(&self.mcp_inspection, &servers, ui, cancel).await
+    }
+
     pub async fn refresh_mcp(&mut self, _args: &Cli) -> Result<()> {
         if let Some(update) =
             pi_rs::RegistryRefresher::refresh(self.catalog.as_ref(), &self.registry).await?
@@ -1056,6 +1066,7 @@ async fn configure_after(
             resource_origins: ResourceOrigins::default(),
             catalog,
             mcp_sign_in: discovered.sign_in.into(),
+            mcp_inspection: discovered.inspection,
         })
     }
     .await;

@@ -409,15 +409,15 @@ fn settings_picker_can_be_operated_with_the_mouse() {
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
     master.write_all(b"/settings\r").unwrap();
-    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    output_until(&mut master, |text| text.contains("Auto-compact"));
     // Header row, picker title, then the first setting (SGR mouse uses 1-based coordinates).
     master.write_all(b"\x1b[<0;2;3M\x1b[<0;2;3m").unwrap();
     output_until(&mut master, |text| {
-        text.contains("HTTP idle timeout") && text.contains("disabled")
+        settings_row_shows(text, "Auto-compact", "false")
     });
     let settings: serde_json::Value =
         serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
-    assert_eq!(settings["httpIdleTimeoutMs"], 0);
+    assert_eq!(settings["compaction"]["enabled"], false);
 }
 
 #[test]
@@ -494,26 +494,30 @@ fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
             .unwrap(),
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
-    for (query, label, key) in [
-        ("Auto-compaction", "Auto-compaction", "compaction"),
-        ("Auto-retry", "Auto-retry", "retry"),
+    for (label, key, enabled, disabled) in [
+        ("Auto-compact", "compaction", "true", "false"),
+        ("Auto-retry", "retry", "on", "off"),
     ] {
         master.write_all(b"/settings\r").unwrap();
-        output_until(&mut master, |text| text.contains("HTTP idle timeout"));
-        master.write_all(query.as_bytes()).unwrap();
-        output_until(&mut master, |text| settings_row_shows(text, label, "on"));
+        output_until(&mut master, |text| text.contains("Auto-compact"));
+        master.write_all(label.as_bytes()).unwrap();
+        output_until(&mut master, |text| settings_row_shows(text, label, enabled));
         master.write_all(b"\r").unwrap();
-        output_until(&mut master, |text| settings_row_shows(text, label, "off"));
+        output_until(&mut master, |text| {
+            settings_row_shows(text, label, disabled)
+        });
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
         assert_eq!(saved[key]["enabled"], false);
         master.write_all(b"\r").unwrap();
-        output_until(&mut master, |text| settings_row_shows(text, label, "on"));
+        output_until(&mut master, |text| settings_row_shows(text, label, enabled));
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
         assert_eq!(saved[key]["enabled"], true);
         master.write_all(b"\r").unwrap();
-        output_until(&mut master, |text| settings_row_shows(text, label, "off"));
+        output_until(&mut master, |text| {
+            settings_row_shows(text, label, disabled)
+        });
         master.write_all(b"\x1b").unwrap();
         output_until(&mut master, |text| text.contains("Enter to send"));
     }
@@ -1011,7 +1015,7 @@ fn autocomplete_settings_cycle_starts_at_first_preset_for_custom_value() {
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
     master.write_all(b"/settings\r").unwrap();
-    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    output_until(&mut master, |text| text.contains("Auto-compact"));
     master.write_all(b"Autocomplete max items\r").unwrap();
     output_until(&mut master, |text| {
         settings_row_shows(text, "Autocomplete max items", "3")
@@ -1162,24 +1166,32 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
         output_until(&mut master, |text| text.contains("live-stream-marker"));
         master.write_all(b"/settings\r").unwrap();
         output_until(&mut master, |text| {
-            text.contains("HTTP idle timeout") && text.contains("Maximum idle gap")
+            settings_row_shows(text, "Auto-compact", "true")
         });
         master.write_all(b" ").unwrap();
         output_until(&mut master, |text| {
-            text.contains("HTTP idle timeout") && text.contains("disabled")
+            settings_row_shows(text, "Auto-compact", "false")
         });
         master.write_all(b"\r").unwrap();
         output_until(&mut master, |text| {
-            text.contains("HTTP idle timeout") && text.contains("30 sec")
+            settings_row_shows(text, "Auto-compact", "true")
         });
-        master.write_all(b"\x1b[B\r").unwrap();
-        output_until(&mut master, |text| {
-            settings_row_shows(text, "Steering mode", "all")
-        });
-        master.write_all(b"\x1b[B\r").unwrap();
-        output_until(&mut master, |text| {
-            settings_row_shows(text, "Follow-up mode", "all")
-        });
+        for (setting, first, second) in [
+            ("HTTP idle timeout", "disabled", Some("30 sec")),
+            ("Steering mode", "all", None),
+            ("Follow-up mode", "all", None),
+        ] {
+            master.write_all(setting.as_bytes()).unwrap();
+            master.write_all(b"\r").unwrap();
+            output_until(&mut master, |text| settings_row_shows(text, setting, first));
+            if let Some(second) = second {
+                master.write_all(b"\r").unwrap();
+                output_until(&mut master, |text| {
+                    settings_row_shows(text, setting, second)
+                });
+            }
+            master.write_all(&vec![0x7f; setting.len()]).unwrap();
+        }
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok(session) = pi_rs::Session::snapshot(&session_path)
@@ -1959,7 +1971,7 @@ fn settings_switches_terminal_modes_and_restores_input() {
                     serde_json::json!(1),
                 ),
                 (
-                    "Mermaid rendering",
+                    "Mermaid diagrams",
                     "markdown.mermaid",
                     serde_json::json!("off"),
                 ),
@@ -1969,10 +1981,14 @@ fn settings_switches_terminal_modes_and_restores_input() {
                 master.write_all(label.as_bytes()).unwrap();
                 output_until(&mut master, |text| text.contains(label));
                 master.write_all(b"\r").unwrap();
-                let displayed = expected
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| expected.to_string());
+                let displayed = if key == "defaultProjectTrust" {
+                    "Always trust".into()
+                } else {
+                    expected
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| expected.to_string())
+                };
                 output_until(&mut master, |text| {
                     settings_row_shows(text, label, &displayed)
                 });
@@ -2045,7 +2061,7 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
     master.write_all(b"/settings\r").unwrap();
-    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    output_until(&mut master, |text| text.contains("Auto-compact"));
     master.write_all(b"Theme\r").unwrap();
     output_until(&mut master, |text| {
         text.contains("Automatic · follow terminal appearance")
@@ -2270,7 +2286,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         startup.write_all(b"G").unwrap();
     }
     master.write_all(b"/settings\r").unwrap();
-    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    output_until(&mut master, |text| text.contains("Auto-compact"));
     master
         .write_all(b"Default thinking level per model\r")
         .unwrap();
@@ -2531,7 +2547,7 @@ fn thinking_model_discovery_can_be_cancelled_while_server_is_slow() {
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
     master.write_all(b"/settings\r").unwrap();
-    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    output_until(&mut master, |text| text.contains("Auto-compact"));
     master
         .write_all(b"Default thinking level per model\r")
         .unwrap();
@@ -2552,8 +2568,8 @@ fn save_default_model_persists_provider_and_extends_scope() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(home.join("settings.json"), br#"{"defaultProvider":"anthropic","defaultModel":"old-model","enabledModels":["ollama/first"]}"#).unwrap();
-    std::fs::write(home.join("models.json"), br#"{"providers":{"ollama":{"baseUrl":"http://127.0.0.1:1/v1","models":[{"id":"first","reasoning":false},{"id":"second","reasoning":false}]}}}"#).unwrap();
+    std::fs::write(home.join("settings.json"), br#"{"defaultProvider":"anthropic","defaultModel":"old-model","enabledModels":["ollama/first"],"modelThinkingLevels":{"ollama/first":"high"}}"#).unwrap();
+    std::fs::write(home.join("models.json"), br#"{"providers":{"ollama":{"baseUrl":"http://127.0.0.1:1/v1","models":[{"id":"first","name":"First Fixture","reasoning":true,"thinkingLevelMap":{"high":"high"}},{"id":"second","reasoning":false}]}}}"#).unwrap();
     let mut master_fd = -1;
     let mut slave_fd = -1;
     let mut size = libc::winsize {
@@ -2608,7 +2624,7 @@ fn save_default_model_persists_provider_and_extends_scope() {
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
     master.write_all(b"/settings\r").unwrap();
-    output_until(&mut master, |text| text.contains("HTTP idle timeout"));
+    output_until(&mut master, |text| text.contains("Auto-compact"));
     master.write_all(b"Save default model\r").unwrap();
     output_until(&mut master, |text| {
         text.contains("Save default model") && text.contains("to change")
@@ -2642,6 +2658,14 @@ fn save_default_model_persists_provider_and_extends_scope() {
         saved["enabledModels"],
         serde_json::json!(["ollama/first", "ollama/second"])
     );
+    master.write_all(b"\x10").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Switched to First Fixture (thinking: high)")
+    });
+    master.write_all(b"\x10").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Switched to second") && !text.contains("Switched to First Fixture")
+    });
     let mut restart = Command::new(env!("CARGO_BIN_EXE_pi"))
         .env("PI_RS_HOME", &home)
         .args([
@@ -3967,4 +3991,117 @@ pathlib.Path('editor-end').write_text(line if line else 'disconnected')
     assert_eq!(restored.c_oflag, baseline.c_oflag);
     assert_eq!(restored.c_lflag, baseline.c_lflag);
     assert_eq!(restored.c_cc, baseline.c_cc);
+}
+
+#[test]
+fn mcp_inspector_lists_servers_and_announced_tool_exposure() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join(".pi");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let server = root.path().join("mcp-fixture.py");
+    std::fs::write(
+        &server,
+        r#"
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["method"] == "initialize":
+        result = {
+            "protocolVersion": request["params"]["protocolVersion"],
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fixture", "version": "1"},
+        }
+    elif request["method"] == "tools/list":
+        result = {"tools": [{"name": "fixture_tool", "inputSchema": {"type": "object"}}]}
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("mcp.json"),
+        r#"{"mcpServers":{"retired":{"enabled":false,"command":"unused"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("mcp.json"),
+        serde_json::json!({"mcpServers":{"ready":{"command":"python3","args":[server],"description":"Fixture server description","toolExposure":{"fixture_tool":"hidden"}}}}).to_string(),
+    )
+    .unwrap();
+
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 25,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .args(["--trust", "--offline", "--tui-mode", "fullscreen"])
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/mcp\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("MCP servers")
+            && text.contains("ready · connected · 1 tool · codemode · project")
+            && text.contains("retired · disabled · 0 tools · codemode · global")
+    });
+    master.write_all(b"\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("MCP server · ready") && text.contains("Fixture server description")
+    });
+    master.write_all(b"t").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("MCP tools · ready") && text.contains("fixture_tool · hidden")
+    });
+    master.write_all(b"\x1b").unwrap();
+    output_until(&mut master, |text| text.contains("MCP server · ready"));
+    master.write_all(b"\x1b").unwrap();
+    output_until(&mut master, |text| text.contains("MCP servers"));
+    master.write_all(b"\x1b").unwrap();
+    output_until(&mut master, |text| text.contains("Enter to send"));
+
+    // The inspector reports the applied configuration while the running
+    // connection still uses it, even after mcp.json changes on disk.
+    std::fs::write(project.join("mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    master.write_all(b"/mcp\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("ready · connected · 1 tool")
+    });
+    master.write_all(b"\r").unwrap();
+    output_until(&mut master, |text| text.contains("MCP server · ready"));
+    master.write_all(b"t").unwrap();
+    output_until(&mut master, |text| text.contains("fixture_tool · hidden"));
 }
