@@ -66,6 +66,7 @@ impl ThinkingDisplay {
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const EFFORT_BETA: &str = "mid-conversation-output-config-2026-07-01";
 const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 const OAUTH_BETAS: &str = "claude-code-20250219,oauth-2025-04-20";
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -98,6 +99,8 @@ pub struct Anthropic {
     thinking_display: ThinkingDisplay,
     interleaved_thinking: bool,
     managed_effort_models: Arc<BTreeMap<String, bool>>,
+    eager_tool_input_streaming: bool,
+    eager_tool_input_models: Arc<BTreeMap<String, bool>>,
     configured_thinking: Option<CatalogEntry>,
     configured_thinking_is_fallback: bool,
     allow_empty_signature: bool,
@@ -206,6 +209,8 @@ impl Anthropic {
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
             managed_effort_models: Arc::default(),
+            eager_tool_input_streaming: true,
+            eager_tool_input_models: Arc::default(),
             configured_thinking: None,
             configured_thinking_is_fallback: false,
             allow_empty_signature: false,
@@ -216,6 +221,17 @@ impl Anthropic {
             progress: None,
             reasoning: None,
         })
+    }
+
+    /// Use per-tool eager input streaming, or the legacy beta when disabled.
+    pub fn with_eager_tool_input_streaming(
+        mut self,
+        enabled: bool,
+        models: BTreeMap<String, bool>,
+    ) -> Self {
+        self.eager_tool_input_streaming = enabled;
+        self.eager_tool_input_models = Arc::new(models);
+        self
     }
 
     /// Set the selected model's JSON Schema strict-tool capability.
@@ -424,7 +440,7 @@ impl Anthropic {
         url.path_segments_mut().ok()?.push(model);
         let details = tokio::time::timeout(Duration::from_secs(2), async {
             let response = send(
-                self.authenticate(self.client.get(url), false, false),
+                self.authenticate(self.client.get(url), false, false, false),
                 &self.error_secrets(),
             )
             .await
@@ -487,6 +503,7 @@ impl Anthropic {
         &self,
         mut request: reqwest::RequestBuilder,
         interleaved: bool,
+        legacy_tool_streaming: bool,
         supports_managed_effort: bool,
     ) -> reqwest::RequestBuilder {
         request = request
@@ -504,6 +521,7 @@ impl Anthropic {
         if !headers.contains_key(&beta) {
             let betas = [
                 self.oauth.then_some(OAUTH_BETAS),
+                legacy_tool_streaming.then_some(FINE_GRAINED_TOOL_STREAMING_BETA),
                 interleaved.then_some(INTERLEAVED_THINKING_BETA),
             ]
             .into_iter()
@@ -537,6 +555,25 @@ impl Anthropic {
             );
         }
         request.headers(headers)
+    }
+
+    fn configure_tool_input_streaming(&self, model: &str, body: &mut Value) -> bool {
+        let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+            return false;
+        };
+        let eager = self
+            .eager_tool_input_models
+            .get(model)
+            .copied()
+            .unwrap_or(self.eager_tool_input_streaming);
+        if eager {
+            for tool in tools {
+                tool["eager_input_streaming"] = json!(true);
+            }
+            false
+        } else {
+            !tools.is_empty()
+        }
     }
 
     fn configure_request_thinking(
@@ -583,7 +620,7 @@ impl Anthropic {
                 url.query_pairs_mut().append_pair("after_id", cursor);
             }
             let response = send(
-                self.authenticate(self.client.get(url), false, false),
+                self.authenticate(self.client.get(url), false, false, false),
                 &self.error_secrets(),
             )
             .await?;
@@ -1665,6 +1702,16 @@ impl Model for Anthropic {
         } else {
             pi_rs_core::protected_model_fingerprint(&identity)
         }?;
+        let base = if self.eager_tool_input_streaming && self.eager_tool_input_models.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "tool-input-streaming",
+                self.eager_tool_input_streaming,
+                self.eager_tool_input_models.as_ref(),
+            ))?
+        };
         let active_thinking = self
             .thinking_level
             .as_deref()
@@ -1937,6 +1984,8 @@ impl Anthropic {
         {
             body["tools"] = json!(tools);
         }
+        let legacy_tool_streaming =
+            self.configure_tool_input_streaming(&requested_model, &mut body);
         apply_cache_control(&mut body, self.cache_retention, self.cache_tools);
         if self.oauth {
             prepare_oauth_request(&mut body, self.cache_retention);
@@ -1968,9 +2017,13 @@ impl Anthropic {
                 }
             }
         }
-        let response =
-            send_http(self.authenticate(request.json(&body), interleaved, supports_managed_effort))
-                .await?;
+        let response = send_http(self.authenticate(
+            request.json(&body),
+            interleaved,
+            legacy_tool_streaming,
+            supports_managed_effort,
+        ))
+        .await?;
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
@@ -4107,6 +4160,66 @@ mod tests {
     }
 
     #[test]
+    fn tool_input_streaming_uses_eager_flags_or_the_legacy_beta() {
+        let base = Anthropic::new(DEFAULT_ENDPOINT, "fixture").unwrap();
+        let legacy = base
+            .clone()
+            .with_eager_tool_input_streaming(false, BTreeMap::new());
+        assert_ne!(base.context_identity(), legacy.context_identity());
+        let routed = base
+            .clone()
+            .with_eager_tool_input_streaming(true, BTreeMap::from([("rewritten".into(), false)]));
+        let mut body = json!({"tools":[{"name":"read"}]});
+        assert!(routed.configure_tool_input_streaming("rewritten", &mut body));
+        assert!(body["tools"][0].get("eager_input_streaming").is_none());
+
+        let explicit = legacy.clone().with_headers(
+            [(
+                HeaderName::from_static("anthropic-beta"),
+                HeaderValue::from_static("custom-beta"),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        for (client, tools, eager, beta) in [
+            (base, json!([{"name":"read"}]), Some(true), None),
+            (
+                legacy.clone(),
+                json!([{"name":"read"}]),
+                None,
+                Some(FINE_GRAINED_TOOL_STREAMING_BETA),
+            ),
+            (legacy, json!([]), None, None),
+            (
+                explicit,
+                json!([{"name":"read"}]),
+                None,
+                Some("custom-beta"),
+            ),
+        ] {
+            let mut body = json!({"tools":tools});
+            let legacy_streaming = client.configure_tool_input_streaming("fixture", &mut body);
+            let request = client
+                .authenticate(
+                    client.client.post(DEFAULT_ENDPOINT),
+                    false,
+                    legacy_streaming,
+                    false,
+                )
+                .build()
+                .unwrap();
+            assert_eq!(body["tools"][0]["eager_input_streaming"].as_bool(), eager);
+            assert_eq!(
+                request
+                    .headers()
+                    .get("anthropic-beta")
+                    .and_then(|value| value.to_str().ok()),
+                beta
+            );
+        }
+    }
+
+    #[test]
     fn thinking_request_uses_interleaved_beta_for_budgeted_thinking_only() {
         let base = Anthropic::new(DEFAULT_ENDPOINT, "fixture")
             .unwrap()
@@ -4154,7 +4267,12 @@ mod tests {
                 .unwrap();
             assert_eq!(body["thinking"], thinking);
             let request = client
-                .authenticate(client.client.post(DEFAULT_ENDPOINT), interleaved, false)
+                .authenticate(
+                    client.client.post(DEFAULT_ENDPOINT),
+                    interleaved,
+                    false,
+                    false,
+                )
                 .build()
                 .unwrap();
             assert_eq!(
