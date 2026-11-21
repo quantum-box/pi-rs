@@ -104,7 +104,10 @@ enum Request {
         resume: bool,
         task: String,
     },
-    McpStatus,
+    McpStatus {
+        #[serde(default)]
+        inspect: bool,
+    },
     Bash {
         command: String,
         #[serde(default)]
@@ -883,7 +886,11 @@ async fn run_worker(
     let startup_trigger = session
         .host_binding()
         .is_none()
-        .then(|| session.pending_custom_trigger())
+        .then(|| {
+            session
+                .pending_extension_boundary_run()
+                .or_else(|| session.pending_custom_trigger())
+        })
         .flatten();
     drop(session);
     *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
@@ -1188,7 +1195,7 @@ async fn run_worker(
         let mut operation = Box::pin(async {
             if matches!(
                 &request,
-                Request::Prompt { .. } | Request::TriggerCustom { .. } | Request::McpStatus
+                Request::Prompt { .. } | Request::TriggerCustom { .. } | Request::McpStatus { .. }
             ) {
                 tokio::select! {
                     biased;
@@ -1237,7 +1244,11 @@ async fn run_worker(
             };
             match request {
                 Request::TriggerCustom { run_id } => {
-                    if session.pending_custom_trigger() != Some(run_id) {
+                    if session
+                        .pending_extension_boundary_run()
+                        .or_else(|| session.pending_custom_trigger())
+                        != Some(run_id)
+                    {
                         return Err(Error::Session("custom trigger is no longer pending".into()));
                     }
                     let answer = Box::pin(agent.run_correlated_with_events(
@@ -1521,7 +1532,13 @@ async fn run_worker(
                     ))
                     .await?;
                 }
-                Request::McpStatus => runtime.mcp_status(&args)?,
+                Request::McpStatus { inspect } => {
+                    if inspect {
+                        runtime.inspect_mcp(ui.as_ref(), &cancel).await?;
+                    } else {
+                        runtime.mcp_status(&args)?;
+                    }
+                }
                 Request::Review {
                     child,
                     from_record,

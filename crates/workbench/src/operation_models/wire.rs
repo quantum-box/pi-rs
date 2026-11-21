@@ -286,6 +286,7 @@ pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
             .min(u64::from(u32::MAX))
     };
     let (input, output, cache_read, cache_write) = match entry.api {
+        Api::LlamaCppClassifier => return None,
         Api::SystemOne | Api::WorkersAiSystemOne | Api::OpenAiDecisions => {
             if !value.contains_key("input_tokens") && !value.contains_key("output_tokens") {
                 return None;
