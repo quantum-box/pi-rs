@@ -3208,6 +3208,15 @@ impl Agent<'_> {
                 )
             })
             .flatten();
+        let response_hooks = retain_reply
+            .then(|| {
+                crate::provider_response::ResponseHooks::for_session(
+                    self.registry,
+                    session,
+                    self.limits.model_timeout,
+                )
+            })
+            .flatten();
         let collect = async {
             macro_rules! message_update {
                 ($update:expr) => {
@@ -3236,6 +3245,8 @@ impl Agent<'_> {
                         .await
                 }
             };
+            let opening =
+                crate::provider_response::ResponseHooks::scope(response_hooks.clone(), opening);
             tokio::pin!(opening);
             let mut stream = loop {
                 tokio::select! {
@@ -3245,7 +3256,7 @@ impl Agent<'_> {
             };
             loop {
                 let event = tokio::select! {
-                    event = stream.next() => event,
+                    event = crate::provider_response::ResponseHooks::scope(response_hooks.clone(), stream.next()) => event,
                     Some(input) = receive_input(&mut inputs) => {
                         queue_input(session, input.into(), observer)?;
                         continue;
@@ -3501,6 +3512,9 @@ impl Agent<'_> {
             result = platform_time::timeout(self.limits.model_timeout, collect) =>
                 result.unwrap_or_else(|_| Err(Error::RetryableModel("request timed out".into()))),
         };
+        if let Some(hooks) = response_hooks {
+            hooks.report_errors(observer);
+        }
         metadata.assistant_text_edited = false;
         if let Some(mut hooks) = message_hooks {
             match &mut result {

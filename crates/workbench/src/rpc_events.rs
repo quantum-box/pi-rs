@@ -803,6 +803,9 @@ pub(super) fn tool_result_value(
             .map(|image| json!({"type":"image","data":image.data,"mimeType":image.mime_type})),
     );
     let mut result = json!({"content":content});
+    if matches!(outcome, Some(Outcome::Failed(_) | Outcome::Skipped(_))) {
+        result["details"] = json!({});
+    }
     if let Some(
         Outcome::SucceededWithDetails { details, .. }
         | Outcome::StructuredWithDetails { details, .. },
@@ -1676,6 +1679,67 @@ mod streaming_tool_tests {
         let result = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
         assert_eq!(result["content"], json!([image]));
         assert_eq!(result["structuredContent"], json!({"answer":42}));
+    }
+
+    #[test]
+    fn generated_tool_failures_have_pi_error_details() {
+        for outcome in [
+            Outcome::Failed("execution failed".into()),
+            Outcome::Skipped("validation failed".into()),
+        ] {
+            let mut stream = Stream::default();
+            let args = Cli::parse_from(["pi"]);
+            let operation_id = Uuid::new_v4();
+            stream.calls.insert(
+                operation_id,
+                (
+                    Invocation {
+                        operation_id,
+                        call: ToolCall {
+                            id: "call".into(),
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                    None,
+                ),
+            );
+
+            let mut events = Vec::new();
+            stream.record(
+                Event::ToolFinished {
+                    operation_id,
+                    outcome,
+                    states: Default::default(),
+                },
+                &args,
+                &mut events,
+            );
+            let end = events
+                .iter()
+                .find(|event| event["type"] == "tool_execution_end")
+                .unwrap();
+            let message = events
+                .iter()
+                .find(|event| event["type"] == "message_end")
+                .unwrap();
+            assert_eq!(end["isError"], true);
+            assert_eq!(end["result"]["details"], json!({}));
+            assert_eq!(message["message"]["isError"], true);
+            assert_eq!(message["message"]["details"], json!({}));
+        }
+
+        let returned_error = Outcome::TextResult {
+            output: "explicit result".into(),
+            details: None,
+            is_error: true,
+        };
+        let result = tool_event_result_value(
+            &returned_error.tool_content(),
+            Some(&returned_error),
+            Some(false),
+        );
+        assert!(result.get("details").is_none());
     }
 
     #[test]

@@ -140,13 +140,13 @@ or custom models through the native fallback.
 | Surface | Implemented in Rust | Remaining work |
 | --- | --- | --- |
 | Agent runtime | Streaming, ordered tools, cancellation, steering, follow-up, recovery, usage | Provider-specific thinking and complete multimodal event handling |
-| Terminal | Default `pi` startup, Unicode multiline editor with word-aware wrapping, visual movement, character jumps and kill ring, text/image clipboard paste, fullscreen transcript search and semantic prompt jumps, configurable scrolling and scrollbar, mouse text selection with clipboard copy, exit transcript or resume hint, prompt history, Markdown, aligned tables, links, syntax highlighting and native Mermaid diagrams, configurable transcript padding and hardware or software cursor, optional regular-screen clear on shrink, tool panels and collapse, visible thinking blocks and model progress, file completion, external editor, user keybindings for editor and selectors, model and thinking default selection, cancel, double-Escape navigation and tree filters | Remaining Markdown and diff layout fidelity, remaining application actions and real-terminal image clipping verification |
+| Terminal | Default `pi` startup, Unicode multiline editor with word-aware wrapping, visual movement, character jumps and kill ring, text/image clipboard paste, fullscreen transcript search and semantic prompt jumps, configurable scrolling and scrollbar, mouse text selection with clipboard copy, exit transcript or resume hint, prompt history, Markdown, aligned tables, links, syntax highlighting and native Mermaid diagrams, configurable transcript padding and hardware or software cursor, optional regular-screen clear on shrink, tool panels and collapse, visible thinking blocks and model progress, file completion, external editor, user keybindings for editor and selectors, model and thinking default selection, cancel, double-Escape navigation and tree filters | Remaining Markdown and diff layout fidelity, remaining application actions and visual clipping verification in iTerm2 |
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, configurable Bash and Windows PowerShell with session metadata and Pi-style exit and truncation text, structured read, search, listing and shell truncation details, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors and toggleable label timestamps, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks |
 | Model access | Ollama, configurable OpenAI-compatible chat endpoint, native OpenAI Responses, Anthropic Messages, Google Gemini Generate Content, Radius Pi Messages, and Amazon Bedrock Converse streaming, named profiles for those APIs, API keys and bearer tokens, searchable built-in chat model catalog, including native OpenAI, Anthropic and Gemini catalogs and the Fireworks and OpenRouter Messages models, model declarations and overrides including model-specific APIs and endpoints, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, catalog pricing and usage estimates, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
 | Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh, OpenRouter browser OAuth with manual redirect fallback, ChatGPT plan browser OAuth with token refresh and account selection, Kimi Code device OAuth with refresh | OAuth and refresh for other model providers; ChatGPT live acceptance |
-| Native extensions | Rust tool, prompt input, direct process execution, command-created branch-local custom entries and model-context messages, durable custom messages from native tools and supported callbacks during runs or while idle, user-shell result replacement and streaming operations, in-process shell spawn hooks, injectable model read, write, edit, shell, grep, find and ls operations, model and thinking selection, context and full-system context hooks, policy, command, state/migration, compaction, resource discovery and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, typed command-line flags, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, and styled modal components | Remaining Pi events and selection paths, custom entries and messages from all callbacks, custom message renderers, resource provenance in other surfaces and general component render callbacks |
+| Native extensions | Rust tool, prompt input, direct process execution, command-created branch-local custom entries and model-context messages, durable custom messages from native tools and supported callbacks during runs or while idle, user-shell result replacement and streaming operations, in-process shell spawn hooks, injectable model read, write, edit, shell, grep, find and ls operations, model and thinking selection, context and full-system context hooks, policy, command, state/migration, compaction, resource discovery and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, typed command-line flags, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, styled modal components and custom message renderers | Remaining Pi events and selection paths, custom entries and messages from all callbacks, custom entry and other renderers, resource provenance in other surfaces and general component render callbacks |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts with per-server resource pagination; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; automatic selection of configured hosted client metadata; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Live acceptance with a hosted pi-rs client identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
@@ -208,6 +208,10 @@ filters accept Git Bash/MSYS, Cygwin, and WSL drive spellings such as `/c/...`,
 
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
+Positive extglobs such as `prompts/@(review|triage).md` work in package filters
+for bounded ASCII patterns and paths without dot-prefixed components. Filters
+continue to support the existing exact path and force-inclusion rules.
+
 An invalid file URL in a package settings filter reports an error when
 reached against an available native or Pi manifest diagnostic candidate. For a local directory
 package it stops the current declaration at that resource type, retaining
@@ -436,6 +440,7 @@ Live acceptance with an Ant Ling account remains open.
 
 ### OpenCode Zen and Go
 
+The pinned Pi CLI defaults to Kimi K2.6 for Zen and Kimi K3 for Go.
 OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
 using its official System One endpoint and `OPENCODE_API_KEY`.
 
@@ -504,7 +509,8 @@ form, including multiple keys and explicitly unbound actions.
 
 RPC startup ignores ordinary positional messages and accepts prompts through
 stdin. The root CLI rejects `@file` arguments in RPC mode before loading
-settings and prints Pi's diagnostic to stderr.
+settings or displaying help and prints Pi's diagnostic to stderr.
+Version and session export still take precedence over the attachment check.
 
 Completed tool-call JSON parsing and incremental argument previews live in the
 portable `pi-rs-tool-arguments` crate, shared by the SDK and terminal/RPC
@@ -740,6 +746,10 @@ Imported Gemini conversations carry signed text, thought, and function parts
 into continued requests. Tests covered a live partial, a typed tool result,
 and a resumed signed Gemini tool conversation.
 
+Native tool failures and skipped calls projected from untyped outcomes include
+Pi's empty `details` object in result events and messages. Typed tool results
+retain the details supplied by the tool.
+
 ## Verification
 
 - Run `cargo test --locked --workspace --all-features`.
@@ -748,6 +758,20 @@ and a resumed signed Gemini tool conversation.
   notes persistence, cancellation, and restoring the terminal on exit.
 - Compare each remaining surface against the pinned reference before marking
   that row complete. Existing core acceptance is recorded in [acceptance.md](acceptance.md).
+
+### Native custom message renderers
+
+Native Rust and executable extensions can match a visible custom message by
+type and format its details differently in collapsed and expanded views. The
+first registration in load order wins. The terminal supports themed rows and
+fallback rendering for missing, failed or slow callbacks. This presentation
+does not alter the messages stored in the journal or sent to the model. SDK
+hosts can reuse the callbacks with their own palette. Native inline images
+retain their existing rendering. The native API uses styled rows. Pi also
+supports arbitrary components, custom entry renderers and additional
+renderer hooks. A separately built extension was exercised in the fullscreen
+and regular macOS terminal modes for live delivery, expansion, fallback,
+journal preservation and restored history.
 
 ### Terminal and native-extension checkpoint
 
@@ -952,6 +976,11 @@ stdio and streamable HTTP. It exposes namespaced server tools and resource
 listing/reading. Configuration can reference environment variables or bounded
 credential commands. Server processes are isolated into process groups/jobs,
 and the CLI closes connections after each run.
+In the terminal, `/mcp` now opens a server list with each server's status,
+scope, tool count and exposure. Select one to inspect its description and
+the announced tools with their effective exposure. The view reflects the
+configuration loaded by the running session. Use the CLI MCP commands to
+manage configuration and credentials.
 
 Trusted project overrides of a global MCP server reject unknown fields and
 invalid values before applying any part of that override, so a typo or
@@ -969,6 +998,11 @@ pinned Pi's prefix regex. This also hides non-App profiles such as
 `mcp-app-extra`; the MCP Apps specification identifies `mcp-app` itself, so this
 is a known Pi-fidelity limitation rather than exact profile matching. Native
 resource tools remain namespaced per server and aggregate that server's pages.
+Within the existing initialization deadline, HTTP connections retry after
+250 ms and 1 second on transient network errors, HTTP 408, 429, and 5xx
+other than 501. Remote resource reads and listings, including paged listings
+and templates, retry once on those HTTP statuses. Cancellation interrupts the
+resource retry wait, and ordinary tool calls are sent once on these failures.
 
 Loopback fixtures verified stdio discovery and tool execution, HTTP bearer
 headers, resource reading, and the model/tool/model round trip. Credentials
@@ -1452,6 +1486,16 @@ using OSC 10 and 11 and updates light/dark theme selection as replies arrive.
 Like Pi, the system theme and automatic light/dark pairs subscribe to
 terminal appearance notifications. Fixed themes still request the initial
 terminal colors, and switching back to an automatic theme refreshes them.
+
+Live Kitty 0.41.1 verification used a macOS fullscreen session through a PTY
+relay to an isolated Linux display. Changing Kitty's background from dark to
+light triggered a fresh foreground, background and 16-entry ANSI palette
+query in both the system theme and a light/dark pair. The updated colors
+changed the rendered header in each case. A fixed dark theme retained its
+header color and received only its initial query. A live Pi v1.5.0 comparison
+in the same terminal confirmed the subscription and query counts for the
+light/dark pair and fixed theme.
+
 System theme accent and syntax roles use Pi's fallback ANSI palette slots.
 Neutral fallback roles use terminal-default foreground with Pi's dim
 attribute. The terminal palette is queried with OSC 4 and applied after all 16 colors
@@ -1561,7 +1605,14 @@ extensions and session names.
 
 MCP `deferred` exposure now hides tool schemas until `tool_search` loads a
 match. A native BM25 ranker uses names, descriptions, schema fields and server
-metadata. Selection state follows the journal branch and survives reopening.
+metadata. As in Pi 1.6.0, `tool_search` and Codemode `searchTools` index
+reachable local schema references once. `describeTool` follows local input
+schema references and bounds recursive and oversized declarations. Neither
+operation fetches external schemas. Native resolution also accepts RFC 6901
+array indices, empty keys and encoded separators. The declaration retains
+supported input types stated alongside a reference. A depth bound limits
+reference chains while allowing independent fields to reuse a definition.
+Selection state follows the journal branch and survives reopening.
 Exact exposure overrides and wildcard matching are supported. CLI allowlists
 without MCP names keep MCP discovery available without declaring all schemas.
 Tools receive only their owning extension state through an optional invocation
@@ -1643,8 +1694,9 @@ Classifier results include their API and invocation timestamp even if the
 request fails early or is cancelled, as they do on successful requests.
 
 Classifier retry delays use Pi's numeric-prefix parsing for `Retry-After` and
-`Retry-After-Ms`, including decimal and exponent forms; the existing 60-second
-server-delay cap still applies to the parsed value. GMT retry dates also accept
+`Retry-After-Ms`, including decimal and exponent forms. Values that overflow
+when converted to milliseconds use the usual backoff. The 60-second
+server-delay cap applies to finite values. GMT retry dates also accept
 the obsolete RFC 850 form with JavaScript's two-digit year interpretation.
 
 ### Resource selection checkpoint
@@ -1832,6 +1884,10 @@ Package resource filters distinguish glob patterns from exact `+path` and
 exclusions take precedence regardless of array order. Skill-directory paths
 resolve to their SKILL.md resource. Manifest directory roots still expand to
 their declared resources, and filters remain limited to that declared set.
+Settings filter globs require an explicit leading dot to match a hidden path
+component. A visible basename can still match independently of its hidden
+parent path. Native manifest discovery and brace combinations outside the
+bounded expansion retain native glob matching.
 
 ### Resource discovery checkpoint
 
@@ -2006,6 +2062,11 @@ invoked each version's tool through a model round trip, and verified that the
 same saved notes reached both requests.
 
 ### Streaming search checkpoint
+
+Unrestricted local built-in tools coerce model arguments to their declared
+string, number and boolean types before schema validation. Optional null fields
+are treated as omissions, and edit batches also normalize replacement fields.
+Scoped tools and injected operations retain their argument handling.
 
 `grep` streams files with the native ripgrep libraries, supports surrounding
 context lines, bounds long displayed lines at 500 characters, and reports match
@@ -2236,7 +2297,20 @@ prompt to a loopback model in regular and fullscreen mode. The model received
 the original 320×480 PNG dimensions, both modes exited cleanly, and the pasteboard
 contents were restored after each run. PTY captures verified the cropped Kitty
 placements and the cropped PNG dimensions from the iTerm2 protocol in both
-modes. Visual clipping in a running terminal emulator still needs acceptance.
+modes.
+
+Fullscreen redraws retain Kitty image data while clearing the text viewport.
+If regular mode purges scrollback to rebuild the transcript, it uploads the
+images again. Kitty can discard stored image data when the screen is erased,
+even after pi-rs removes the placements. Placements use the visible source
+rectangle and distinct IDs for the active view and committed transcript.
+
+A Kitty 0.41.1 window in an isolated Linux X11 session displayed the macOS
+pi-rs process through a terminal relay. Ctrl+V read the system pasteboard and
+the loopback model received the 320×480 PNG in both modes. At 72×20 cells,
+pixel checks verified the visible lower portion of the image after fullscreen
+redraws settled and after regular mode purged and rebuilt the transcript.
+The iTerm2 visual check remains open.
 
 ### Edit matching checkpoint
 
@@ -2333,7 +2407,10 @@ and theme changes apply immediately.
 The local settings editor remains open when an outstanding model response
 finishes. Settings, theme and hotkey commands are handled before streaming
 input is queued. Tests cover schema diagnostics and dialog error layout.
-Remaining upstream settings and specialized selector behavior are still open.
+The terminal lists shared settings in Pi's order and uses Pi's labels and
+boolean values for those rows. Native controls and JSON editors remain
+available after the shared settings. The transport, changelog, installation
+telemetry and warnings controls are still open.
 Unlike upstream's permissive settings loading, pi-rs validates implemented
 settings. When several values in a file are invalid, the diagnostic lists the
 settings file and affected JSON paths, including nested package fields and
@@ -2545,6 +2622,8 @@ custom messages, branch summaries, and compaction token counts. Selected
 content is bold, and labels and their optional local timestamps have separate
 theme roles. Native record IDs remain searchable for direct checkout. Custom
 messages and imported compaction summaries can be copied from the tree.
+Copying an imported assistant failure with empty content uses its original
+error message, including line breaks.
 Message preview and navigation gaps remain in the Sessions row.
 
 ### Package identity checkpoint
@@ -2555,7 +2634,9 @@ filters. Project and transient declarations override the corresponding user
 package even when they select another revision. Removal accepts an unversioned
 source and leaves cached artifacts intact.
 
-Missing local paths retain their resolved identity for listing and removal.
+Missing local paths retain their resolved identity for listing and removal. Dot
+segments in local declarations are resolved before comparing symlinks. A path
+such as `./link/../package` selects `./package` from the declaration's base.
 Installing a missing source fails before settings change. CLI fixtures cover
 version replacement, cross-scope revision overrides, inherited resource deltas,
 deleted-source cleanup and the existing transient/offline behaviors.
@@ -3190,6 +3271,10 @@ space for Pi's default inline image payload; scoped hosted tools retain their
 existing tighter output bound.
 
 ### Local file-path input checkpoint
+
+Unrestricted local tools pass failures to the model and JSON/RPC clients
+as error-marked text with the tool's diagnostic. Direct and programmatic calls
+keep their native outcome representation.
 
 The file tools share Pi-style input normalization for leading `@`, home-directory
 paths, file URLs and Unicode space variants. Windows input also accepts drive
@@ -4426,6 +4511,21 @@ journal commit. Callbacks run for scheduler results and terminal polls.
 Programmatic results, canceled cleanup, and administrative reconciliation
 keep their existing native journal paths.
 
+Native extensions can subscribe to `after_provider_response` to observe the
+HTTP status and normalized headers from an agent turn. The OpenAI Responses,
+OpenAI-compatible chat, Anthropic Messages, Google Gemini, and Ollama adapters
+await these callbacks in registration order before reading either a success or
+error body. This includes HTTP errors the native transports receive directly.
+Callback failures are reported as extension diagnostics. The
+callbacks share up to five seconds and at most half the remaining model time. The
+response remains under the adapter's control. Executable extensions advertise
+`after_provider_response_hook` and receive an `after_provider_response`
+request with `event.status`, `event.headers`, and their branch state. Response
+metadata is ephemeral. Credential headers, cookies, sensitive header values and
+reflected configured credentials are withheld. Bedrock and custom transports
+without response metadata reporting do not emit this event. Summary and catalog
+requests remain outside the turn hook.
+
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and
@@ -4688,6 +4788,17 @@ Classifier and image usage is included in the script result, terminal token
 total, and RPC session statistics. The TypeSafe and OpenRouter non-chat
 catalogues are projected from the published
 [Pi AI v1.5.0 package](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.5.0).
+
+### Cloudflare Workers AI chat checkpoint
+
+Cloudflare Workers AI exposes the 19 pinned chat models via Chat Completions.
+`CLOUDFLARE_ACCOUNT_ID` selects the account and `CLOUDFLARE_API_KEY` authorizes
+requests. Pi-format saved credentials may declare an account through their
+`env` field. A stored account scopes the key to that account's chat route.
+An unscoped saved key works only on official Workers AI routes. Credentials
+and headers inferred from classifier-only model URLs apply to those operations.
+When the inferred URL is on the configured official account, its provider
+credentials also apply to chat. Live Workers AI inference has not been verified.
 
 ### Configured llama.cpp classifiers
 
@@ -5595,10 +5706,11 @@ Common truncated RPC JSON records report Pi/V8 wording for incomplete arrays,
 initial object property names, unfinished strings with complete escapes
 (including lone surrogate escapes), dangling backslashes, incomplete Unicode
 escapes, invalid escape characters or Unicode digits, missing values, and numeric
-fractions, exponents, and leading minus signs cut off at EOF. Offsets
-and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
-For records up to 1 MiB, a bounded diagnostic-only retry identifies a raw
-control after a surrogate in another string if no other parse error occurs first.
+fractions, exponents, and leading minus signs cut off at EOF. Offsets and
+columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
+For records up to 1 MiB, diagnostic retries distinguish incomplete object
+separators and commas in nested containers. They also identify a raw control
+after a surrogate in another string if no other parse error occurs first.
 Malformed object property names and separators, object trailing commas, missing
 array separators and trailing text after a complete JSON value also use Pi's
 position-aware wording. Other malformed records, including array trailing
@@ -5703,6 +5815,15 @@ Provider-less legacy selections return `None`; an unavailable historical model
 returns an error rather than the builder default. A busy journal or an
 unreconciled direct journal selection or revoked client binding also returns an
 error. This is a point-in-time check, not a guarantee of later availability.
+
+### SDK skill commands
+
+`SkillResources::expand_command` renders Pi-style `/skill:name` invocations
+from an existing skill catalog and a current exact-file grant. Directly
+invoked skills can be marked manual-only. Expansion reads the current
+body, strips frontmatter, and appends the trimmed arguments. Unknown names
+are passed on for host handling. Missing files and denied grants return errors,
+so a GUI can report the failure and keep the user's original input.
 
 ### Native SDK theme snapshots
 
@@ -5831,6 +5952,19 @@ comparing effective routes. Unconfigured and override-only models must resolve
 to the selected route. When they do, they retain provider-default or
 Gemini-version inference. Standalone Google SDK capability overrides remain
 endpoint-wide.
+
+### Native SDK extension factory
+
+`pi_rs_extensions::NativeExtensionLoader` composes a fresh registry from
+host-supplied Rust extensions and explicitly granted executable paths. It uses
+native protocol discovery and validates executable flags and dependencies
+before returning the registry for a `SessionBuilder`. Executable grants
+include symlink targets and authorize discovery before the loader applies
+disabled IDs. Hosts can omit a path to skip executing its discovery hook.
+A replaceable inline extension yields when an enabled, non-replaceable
+extension claims a tool, command or flag of the same kind and name. The SDK
+host controls settings, load order, and package discovery. Pi's default
+resource loader also discovers project and package extensions automatically.
 
 ### Combined native SDK resource snapshots
 
