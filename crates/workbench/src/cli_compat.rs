@@ -485,8 +485,6 @@ pub(super) fn extension_help(argv: &[OsString]) -> Option<String> {
 }
 
 pub(super) fn extension_help_from_args(argv: &[OsString]) -> Option<String> {
-    use pi_rs::Extension;
-
     let (matches, _) = parse(argv.iter().cloned()).ok()?;
     let mut args = super::Cli::from_arg_matches(&matches).ok()?;
     if args.command.is_some() {
@@ -503,40 +501,25 @@ pub(super) fn extension_help_from_args(argv: &[OsString]) -> Option<String> {
         .ok()?
         .unwrap_or(false);
     args.settings = super::config::Settings::load(&args.workspace, args.trusted).ok()?;
-    let resources = super::resources::Resources::load(&args).ok()?;
     let mut flags = BTreeMap::new();
-    let reserved = reserved_flag_names();
-    for path in resources.extensions {
-        let Ok(extension) = pi_rs_extensions::ExecutableExtension::load(&path) else {
-            continue;
+    for flag in discovered_extension_flags(&args)? {
+        let usage = match flag.default {
+            ExtensionFlagValue::Boolean(_) => format!("--{}", flag.name),
+            ExtensionFlagValue::String(_) => format!("--{} <value>", flag.name),
         };
-        if args.disable_extension.iter().any(|id| id == extension.id()) {
-            continue;
-        }
-        for flag in extension.cli_flags() {
-            if reserved.contains(&flag.name) {
-                continue;
-            }
-            let usage = match flag.default {
-                ExtensionFlagValue::Boolean(_) => format!("--{}", flag.name),
-                ExtensionFlagValue::String(_) => format!("--{} <value>", flag.name),
-            };
-            let description = flag
-                .description
-                .unwrap_or_else(|| format!("Registered by {}", extension.id()));
-            let description: String = description
-                .chars()
-                .take(200)
-                .map(|character| {
-                    if character.is_control() {
-                        ' '
-                    } else {
-                        character
-                    }
-                })
-                .collect();
-            flags.entry(usage).or_insert(description);
-        }
+        let description = flag.description.unwrap_or_default();
+        let description: String = description
+            .chars()
+            .take(200)
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+        flags.entry(usage).or_insert(description);
     }
     if flags.is_empty() {
         return None;
@@ -547,6 +530,30 @@ pub(super) fn extension_help_from_args(argv: &[OsString]) -> Option<String> {
         let _ = writeln!(help, "  {usage:<25} {description}");
     }
     Some(help)
+}
+
+pub(super) fn discovered_extension_flags(args: &super::Cli) -> Option<Vec<pi_rs::ExtensionFlag>> {
+    use pi_rs::Extension;
+
+    let resources = super::resources::Resources::load(args).ok()?;
+    let reserved = reserved_flag_names();
+    let mut flags = Vec::new();
+    for path in resources.extensions {
+        let Ok(extension) = pi_rs_extensions::ExecutableExtension::load(&path) else {
+            continue;
+        };
+        if args.disable_extension.iter().any(|id| id == extension.id()) {
+            continue;
+        }
+        for mut flag in extension.cli_flags() {
+            if !reserved.contains(&flag.name) {
+                flag.description
+                    .get_or_insert_with(|| format!("Registered by {}", extension.id()));
+                flags.push(flag);
+            }
+        }
+    }
+    Some(flags)
 }
 
 /// Export paths are resolved independently of Clap's multi-value `--export`.
@@ -584,6 +591,10 @@ pub(super) fn export_plan(args: &[OsString]) -> Option<ExportPlan> {
         if arg == "--export" {
             i += 1;
             if i == args.len() {
+                if saw_export {
+                    // An incomplete final export must never use an earlier input.
+                    input = Some(std::path::PathBuf::new());
+                }
                 validation.push(arg.clone());
                 break;
             }
