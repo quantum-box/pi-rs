@@ -1670,7 +1670,8 @@ impl Shared {
                             let id = match intent.intent() {
                                 task_scheduler::MaintenanceIntent::Nested(id)
                                 | task_scheduler::MaintenanceIntent::Failed(id)
-                                | task_scheduler::MaintenanceIntent::FailFast(id) => id,
+                                | task_scheduler::MaintenanceIntent::FailFast(id)
+                                | task_scheduler::MaintenanceIntent::Woken(id) => id,
                             };
                             let hook = maintenance_reserved_hooks().lock().unwrap().remove(&id);
                             if let Some(hook) = hook {
@@ -1908,10 +1909,12 @@ impl Shared {
                 hook();
             }
         }
-        if pending
-            .completed()
-            .is_some_and(|value| value.known_cancel_state().is_some())
-        {
+        if pending.completed().is_some_and(|value| {
+            value.known_cancel_state().is_some_and(|state| {
+                !cfg!(feature = "experimental-graph-scope")
+                    || state != task_scheduler::KnownCancelCommitState::Busy
+            })
+        }) {
             self.pending
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
