@@ -200,6 +200,13 @@ pub(super) async fn prepare_with_cleanup(args: &Cli, cleanup: Option<&Children>)
             }
             continue;
         }
+        if declaration.transient
+            && cached
+            && let Some(value) = installed.get(&key(&declaration.source))
+            && cached_git_pin_matches(&declaration.source, value, cleanup).await
+        {
+            continue;
+        }
         if declaration.transient || !cached {
             eprintln!(
                 "Preparing native package {}",
@@ -1632,6 +1639,47 @@ fn git_reference(source: &str) -> (&str, &str) {
         None => (source, "HEAD"),
     }
 }
+fn is_git_commit_prefix(reference: &str) -> bool {
+    (7..=64).contains(&reference.len()) && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+async fn cached_git_pin_matches(source: &str, cache: &Value, cleanup: Option<&Children>) -> bool {
+    let Some(specification) = source.strip_prefix("git:") else {
+        return false;
+    };
+    let (_, reference) = git_reference(specification);
+    if !is_git_commit_prefix(reference) {
+        return false;
+    }
+    let Ok(package) = serde_json::from_value::<Installed>(cache.clone()) else {
+        return false;
+    };
+    if package.source != source || !package.root.join(".git").is_dir() {
+        return false;
+    }
+    resolve_git_commit(&package.root, "HEAD", source, cleanup)
+        .await
+        .is_some_and(|commit| commit.starts_with(&reference.to_ascii_lowercase()))
+}
+
+async fn resolve_git_commit(
+    root: &Path,
+    reference: &str,
+    source: &str,
+    cleanup: Option<&Children>,
+) -> Option<String> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "--end-of-options"])
+        .arg(format!("{reference}^{{commit}}"));
+    let output = run(command, source, cleanup).await.ok()?;
+    let commit = std::str::from_utf8(&output).ok()?.trim();
+    (matches!(commit.len(), 40 | 64) && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| commit.to_ascii_lowercase())
+}
+
 fn key(source: &str) -> String {
     format!("{:x}", Sha256::digest(source.as_bytes()))
 }
@@ -1756,24 +1804,38 @@ async fn install(source: &str, offline: bool, cleanup: Option<&Children>) -> Res
             ));
         }
         root = generation.path().join("source");
-        if !root.exists() {
-            let mut command = tokio::process::Command::new("git");
-            command
-                .args(["clone", "--no-checkout", "--depth", "1", "--", url])
-                .arg(&root);
-            run(command, source, cleanup).await?;
+        let abbreviated = is_git_commit_prefix(reference) && !matches!(reference.len(), 40 | 64);
+        let mut command = tokio::process::Command::new("git");
+        command.args(["clone", "--no-checkout"]);
+        if !abbreviated {
+            command.args(["--depth", "1"]);
         }
-        let mut fetch = tokio::process::Command::new("git");
-        fetch
-            .arg("-C")
-            .arg(&root)
-            .args(["fetch", "--depth", "1", "--", "origin", reference]);
-        run(fetch, source, cleanup).await?;
+        command.args(["--", url]).arg(&root);
+        run(command, source, cleanup).await?;
+
+        let mut commit = None;
+        if abbreviated {
+            let prefix = reference.to_ascii_lowercase();
+            commit = resolve_git_commit(&root, &prefix, source, cleanup)
+                .await
+                .filter(|commit| commit.starts_with(&prefix));
+        }
+        let target = if let Some(commit) = commit.as_deref() {
+            commit
+        } else {
+            let mut fetch = tokio::process::Command::new("git");
+            fetch
+                .arg("-C")
+                .arg(&root)
+                .args(["fetch", "--depth", "1", "--", "origin", reference]);
+            run(fetch, source, cleanup).await?;
+            "FETCH_HEAD"
+        };
         let mut checkout = tokio::process::Command::new("git");
         checkout
             .arg("-C")
             .arg(&root)
-            .args(["reset", "--hard", "FETCH_HEAD"]);
+            .args(["reset", "--hard", target]);
         run(checkout, source, cleanup).await?;
     }
     if root.is_file() {

@@ -594,3 +594,80 @@ fn project_delta_prepares_user_revision_when_cache_is_empty() {
     assert!(sources.contains(&other.as_str()), "{sources:?}");
     assert!(!sources.contains(&missing.as_str()), "{sources:?}");
 }
+
+#[test]
+fn a_transient_git_commit_pin_reuses_its_checkout_without_fetching() {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = directory.path().join("repo");
+    let prompts = repo.join("prompts");
+    std::fs::create_dir_all(&prompts).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(prompts.join("older.md"), "older").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "--quiet", "-m", "older"]);
+    let full = git(&repo, &["rev-parse", "HEAD"]);
+    let abbreviation = &full[..9];
+    std::fs::write(prompts.join("newer.md"), "newer").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "--quiet", "-m", "newer"]);
+
+    let home = directory.path().join("agent");
+    let url = reqwest::Url::from_directory_path(&repo).unwrap();
+    let source = format!("git:{}#{abbreviation}", url.as_str().trim_end_matches('/'));
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(directory.path())
+            .env("PI_RS_HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", directory.path().join("gitconfig"))
+            .env_remove("PI_OFFLINE")
+            .env_remove("GEMINI_API_KEY")
+            .env_remove("GOOGLE_API_KEY")
+            .env_remove("PI_RS_MODEL_TOKEN")
+            .args(["--no-trust", "--no-mcp", "--no-extensions", "--no-skills"]);
+        command
+    };
+    let output = command().args(["install", &source]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let index = std::fs::read(home.join("packages/index.json")).unwrap();
+    let package: serde_json::Value = serde_json::from_slice(&index).unwrap();
+    let root = Path::new(
+        package.as_object().unwrap().values().next().unwrap()["root"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), full);
+    assert!(root.join("prompts/older.md").is_file());
+    assert!(!root.join("prompts/newer.md").exists());
+
+    let trace = directory.path().join("trace.log");
+    let _output = command()
+        .env("GIT_TRACE", &trace)
+        .args([
+            "-e",
+            &source,
+            "--provider",
+            "google",
+            "--model",
+            "gemini-2.5-flash",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    let trace = std::fs::read_to_string(trace).unwrap();
+    assert!(trace.contains("rev-parse"), "{trace}");
+    assert!(
+        !trace.contains("git clone") && !trace.contains("git fetch"),
+        "{trace}"
+    );
+    assert_eq!(
+        std::fs::read(home.join("packages/index.json")).unwrap(),
+        index
+    );
+}

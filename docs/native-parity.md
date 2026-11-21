@@ -3711,7 +3711,10 @@ fixture verified folding, label editing, checkout and terminal restoration.
 `pi update <source>` still updates a single source. `--offline` and
 `PI_OFFLINE=1` suppress automatic Cargo registry and Git package downloads,
 including refreshes of temporary packages, and reuse the installed resources.
-Uncached remote packages are skipped with a diagnostic. Local packages can
+Uncached remote packages are skipped with a diagnostic.
+A transient Git source pinned to a commit reuses its cached checkout when
+HEAD matches the pin. An initial install accepts an abbreviated commit within
+the cloned history. Local packages can
 build with Cargo's offline dependency resolution.
 
 Offline startup also skips automatic model catalog and capability probes for a
