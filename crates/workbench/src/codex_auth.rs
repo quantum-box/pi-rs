@@ -471,7 +471,7 @@ async fn access_at(
     let client = client.clone();
     let token_endpoint = token_endpoint.clone();
     // Keep the exchange and disk write alive if the requesting turn is cancelled.
-    super::model_auth::await_admitted_oauth_refresh(PROVIDER, move |admitted| {
+    super::model_auth::await_admitted_oauth_refresh(Some(PROVIDER), move |admitted| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

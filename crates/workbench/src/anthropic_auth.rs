@@ -325,7 +325,7 @@ where
     if no_refresh || !expires_soon(&value, window) {
         return Ok(value.access);
     }
-    super::model_auth::await_admitted_oauth_refresh("anthropic", move |admitted| {
+    super::model_auth::await_admitted_oauth_refresh(Some("anthropic"), move |admitted| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

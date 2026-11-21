@@ -325,7 +325,7 @@ async fn access_at(
     }
     // Tokio waits for started blocking tasks on runtime shutdown. The separate
     // runtime keeps the exchange alive even when the caller's runtime stops.
-    super::model_auth::await_admitted_oauth_refresh("xai", move |admitted| {
+    super::model_auth::await_admitted_oauth_refresh(Some("xai"), move |admitted| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
