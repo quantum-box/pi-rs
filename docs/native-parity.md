@@ -900,6 +900,21 @@ expanding a quoted prompt argument before the model request.
 
 ### Local MCP checkpoint
 
+As in Pi, an MCP connection advertises filesystem roots and answers
+`roots/list` with its resolved workspace's file URI and directory name. A
+server's stdio launch directory can be overridden independently. The roots
+response contains the workspace location and no file contents. The default
+initialize handshake offers protocol version `2025-11-25`, as in Pi 1.6.0.
+
+MCP server `notifications/message` entries append to `mcp.log` in the agent
+directory with the timestamp, configured server name, severity and logger.
+Multiline continuation lines are indented. The log rotates to `mcp.log.1`
+after 5 MiB, as in Pi. Native writers serialize appends and rotation across
+processes, escape control characters, and bound each record to 256 KiB. On
+Unix, the client restricts existing log files to the current user before
+appending. The client bounds the time spent waiting for a log write so a
+busy or unavailable log does not hold up server requests.
+
 `pi mcp list --json` emits one JSON document with server state, source,
 transport, tool names, per-tool exposure overrides, and resource capability.
 Invalid entries are reported in `errors`. Both forms of `pi mcp list` report
@@ -954,6 +969,11 @@ pinned Pi's prefix regex. This also hides non-App profiles such as
 `mcp-app-extra`; the MCP Apps specification identifies `mcp-app` itself, so this
 is a known Pi-fidelity limitation rather than exact profile matching. Native
 resource tools remain namespaced per server and aggregate that server's pages.
+Within the existing initialization deadline, HTTP connections retry after
+250 ms and 1 second on transient network errors, HTTP 408, 429, and 5xx
+other than 501. Remote resource reads and listings, including paged listings
+and templates, retry once on those HTTP statuses. Cancellation interrupts the
+resource retry wait, and ordinary tool calls are sent once on these failures.
 
 Loopback fixtures verified stdio discovery and tool execution, HTTP bearer
 headers, resource reading, and the model/tool/model round trip. Credentials

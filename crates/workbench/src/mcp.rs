@@ -13,11 +13,15 @@ use rmcp::{
     RoleClient,
     model::{CallToolResponse, ProtocolVersion, SubscriptionFilter},
     service::{
-        ClientLifecycleMode, ClientServiceExt, NotificationContext, RunningService, ServiceError,
+        ClientInitializeError, ClientLifecycleMode, ClientServiceExt, NotificationContext,
+        RunningService, ServiceError,
     },
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
-        streamable_http_client::{InsufficientScopeError, StreamableHttpClientTransportConfig},
+        streamable_http_client::{
+            InsufficientScopeError, StreamableHttpClient, StreamableHttpClientTransportConfig,
+            StreamableHttpError,
+        },
     },
 };
 use serde::{Deserialize, Serialize};
@@ -85,9 +89,39 @@ impl ServerConfig {
 
 #[derive(Clone, Default)]
 struct NativeClient {
+    server_name: Option<Arc<str>>,
+    workspace_root: Option<WorkspaceRoot>,
     interaction: Arc<std::sync::Mutex<Option<Interaction>>>,
     catalog: Arc<CatalogSignal>,
     dispatch_closed: Arc<std::sync::Mutex<crate::mcp_oauth_client::DispatchState>>,
+}
+
+#[derive(Clone)]
+struct WorkspaceRoot {
+    uri: String,
+    name: String,
+}
+
+impl NativeClient {
+    async fn for_server(name: &str, workspace: &Path) -> Self {
+        let workspace_root = tokio::fs::canonicalize(workspace)
+            .await
+            .ok()
+            .and_then(|path| {
+                let uri = reqwest_mcp::Url::from_file_path(&path).ok()?.to_string();
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                Some(WorkspaceRoot { uri, name })
+            });
+        Self {
+            server_name: Some(Arc::from(name)),
+            workspace_root,
+            ..Self::default()
+        }
+    }
 }
 
 struct AbandonedCall {
@@ -142,7 +176,9 @@ impl Drop for InteractionGuard {
 }
 impl rmcp::ClientHandler for NativeClient {
     fn get_info(&self) -> rmcp::model::ClientConfig {
-        let mut info = rmcp::model::ClientConfig::default();
+        let mut info = rmcp::model::ClientConfig::default()
+            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE);
+        info.capabilities.roots = self.workspace_root.as_ref().map(|_| Default::default());
         info.capabilities.elicitation = Some(
             rmcp::model::ElicitationCapability::new()
                 .with_form(rmcp::model::FormElicitationCapability::default())
@@ -158,8 +194,40 @@ impl rmcp::ClientHandler for NativeClient {
         info
     }
 
+    #[allow(deprecated)]
+    async fn list_roots(
+        &self,
+        _context: rmcp::service::RequestContext<RoleClient>,
+    ) -> std::result::Result<rmcp::model::ListRootsResult, rmcp::model::ErrorData> {
+        let roots = self
+            .workspace_root
+            .iter()
+            .map(|root| rmcp::model::Root::new(&root.uri).with_name(&root.name))
+            .collect();
+        Ok(rmcp::model::ListRootsResult::new(roots))
+    }
+
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
         self.catalog.changed();
+    }
+
+    #[allow(deprecated)]
+    async fn on_logging_message(
+        &self,
+        params: rmcp::model::LoggingMessageNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        let Some(name) = self.server_name.clone() else {
+            return;
+        };
+        let level = serde_json::to_value(params.level).unwrap_or_default();
+        crate::mcp_log::record(
+            name,
+            level.as_str().unwrap_or("info"),
+            params.logger,
+            params.data,
+        )
+        .await;
     }
 
     async fn create_elicitation(
@@ -625,12 +693,14 @@ impl McpExtension {
             let initialize = async {
                 let service = match owned_stdio {
                     Some(owner) => {
-                        NativeClient::default()
+                        NativeClient::for_server(name, workspace)
+                            .await
                             .serve_with_lifecycle(owned_stdio_transport(wrapped, owner)?, lifecycle)
                             .await
                     }
                     None => {
-                        NativeClient::default()
+                        NativeClient::for_server(name, workspace)
+                            .await
                             .serve_with_lifecycle(TokioChildProcess::new(wrapped)?, lifecycle)
                             .await
                     }
@@ -718,34 +788,32 @@ impl McpExtension {
                         Some(Uuid::parse_str(&generation).map_err(|_| {
                             Error::Config("invalid MCP credential generation".into())
                         })?);
-                    NativeClient {
+                    let native = NativeClient {
                         dispatch_closed: client.dispatch_state.clone(),
-                        ..Default::default()
-                    }
-                    .serve_with_lifecycle(
-                        StreamableHttpClientTransport::with_client(client, transport_config),
-                        lifecycle,
-                    )
-                    .await
+                        ..NativeClient::for_server(name, workspace).await
+                    };
+                    start_http_service(native, client, transport_config, lifecycle).await
                 } else if let Some(resolver) = provider_token.clone() {
                     let client = ProviderClient {
                         client,
                         endpoint: Arc::from(url.as_str()),
                         resolver,
                     };
-                    NativeClient::default()
-                        .serve_with_lifecycle(
-                            StreamableHttpClientTransport::with_client(client, transport_config),
-                            lifecycle,
-                        )
-                        .await
+                    start_http_service(
+                        NativeClient::for_server(name, workspace).await,
+                        client,
+                        transport_config,
+                        lifecycle,
+                    )
+                    .await
                 } else {
-                    NativeClient::default()
-                        .serve_with_lifecycle(
-                            StreamableHttpClientTransport::with_client(client, transport_config),
-                            lifecycle,
-                        )
-                        .await
+                    start_http_service(
+                        NativeClient::for_server(name, workspace).await,
+                        client,
+                        transport_config,
+                        lifecycle,
+                    )
+                    .await
                 }
                 .map_err(|error| {
                     let challenge = error.auth_challenge().filter(|challenge| {
@@ -1185,6 +1253,7 @@ fn publish_page_output(
 
 enum CallError {
     Other(String),
+    TransientHttp(String),
     Scope(Option<String>),
 }
 
@@ -1200,12 +1269,74 @@ impl From<serde_json::Error> for CallError {
     }
 }
 
+fn transient_http_status(error: &StreamableHttpError<reqwest_mcp::Error>) -> Option<u16> {
+    let status = match error {
+        StreamableHttpError::HttpStatus(error) => Some(error.status),
+        StreamableHttpError::Client(error) => error.status().map(|status| status.as_u16()),
+        // rmcp 3.9 only preserves typed status metadata for 429 and 5xx.
+        StreamableHttpError::UnexpectedServerResponse(detail)
+            if detail.starts_with("HTTP 408 Request Timeout: ") =>
+        {
+            Some(408)
+        }
+        _ => None,
+    };
+    status.filter(|status| matches!(status, 408 | 429 | 500 | 502..=599))
+}
+
+fn transient_http_initialization(error: &ClientInitializeError) -> bool {
+    let transport = match error {
+        ClientInitializeError::TransportError { error, .. } => error,
+        ClientInitializeError::LegacyFallbackFailed { fallback, .. } => {
+            return transient_http_initialization(fallback);
+        }
+        _ => return false,
+    };
+    let mut cause = Some(transport.error.as_ref() as &dyn std::error::Error);
+    while let Some(error) = cause {
+        if let Some(error) = error.downcast_ref::<StreamableHttpError<reqwest_mcp::Error>>() {
+            return transient_http_status(error).is_some()
+                || matches!(error, StreamableHttpError::Client(error) if error.is_connect() || error.is_timeout() || error.is_request());
+        }
+        cause = error.source();
+    }
+    false
+}
+
+async fn start_http_service<C: StreamableHttpClient + Clone>(
+    native: NativeClient,
+    client: C,
+    config: StreamableHttpClientTransportConfig,
+    lifecycle: ClientLifecycleMode,
+) -> std::result::Result<RunningService<RoleClient, NativeClient>, ClientInitializeError> {
+    for delay in [Some(250), Some(1000), None] {
+        let transport = StreamableHttpClientTransport::with_client(client.clone(), config.clone());
+        let result = native
+            .clone()
+            .serve_with_lifecycle(transport, lifecycle.clone())
+            .await;
+        match (result, delay) {
+            (Err(error), Some(delay)) if transient_http_initialization(&error) => {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            (result, _) => return result,
+        }
+    }
+    unreachable!("last initialization attempt has no retry")
+}
+
 fn call_error(error: ServiceError) -> CallError {
     if let ServiceError::TransportSend(transport) = &error {
         let mut cause = Some(transport.error.as_ref() as &dyn std::error::Error);
         while let Some(error) = cause {
             if let Some(scope) = error.downcast_ref::<InsufficientScopeError>() {
                 return CallError::Scope(scope.get_required_scope().map(str::to_owned));
+            }
+            if let Some(status) = error
+                .downcast_ref::<StreamableHttpError<reqwest_mcp::Error>>()
+                .and_then(transient_http_status)
+            {
+                return CallError::TransientHttp(format!("MCP request returned HTTP {status}"));
             }
             cause = error.source();
         }
@@ -1277,22 +1408,45 @@ impl McpTool {
                 result = self.call_once(&arguments, &context, host.as_ref(), &dispatch_cancel) => result,
             }
         };
-        let mut result = attempt().await;
-        if let Err(CallError::Scope(required)) = &result {
-            let Some(scopes) = required.as_deref().and_then(scope_tokens) else {
-                return Outcome::Failed("MCP server requires additional OAuth scopes but did not supply a valid scope list".into());
-            };
-            let authorized = tokio::select! {
-                _ = context.cancellation.cancelled() => Err(Error::Cancelled),
-                result = self.authorize_scopes(&scopes, host.as_deref()) => result,
-            };
-            if let Err(error) = authorized {
-                return Outcome::Failed(error.to_string());
+        let mut may_retry_read = self.resource
+            && matches!(
+                self.remote_name.as_str(),
+                "list_resources"
+                    | "list_resource_templates"
+                    | "list_resources_page"
+                    | "list_resource_templates_page"
+                    | "read_resource"
+            );
+        let mut may_upgrade_scope = true;
+        let result = loop {
+            match attempt().await {
+                Err(CallError::TransientHttp(_)) if may_retry_read => {
+                    may_retry_read = false;
+                    tokio::select! {
+                        biased;
+                        _ = context.cancellation.cancelled() => {
+                            return Outcome::Failed("MCP resource retry cancelled".into());
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    }
+                }
+                Err(CallError::Scope(required)) if may_upgrade_scope => {
+                    may_upgrade_scope = false;
+                    let Some(scopes) = required.as_deref().and_then(scope_tokens) else {
+                        return Outcome::Failed("MCP server requires additional OAuth scopes but did not supply a valid scope list".into());
+                    };
+                    let authorized = tokio::select! {
+                        _ = context.cancellation.cancelled() => Err(Error::Cancelled),
+                        result = self.authorize_scopes(&scopes, host.as_deref()) => result,
+                    };
+                    if let Err(error) = authorized {
+                        return Outcome::Failed(error.to_string());
+                    }
+                    // The 403 rejected dispatch. Keep the original operation ID.
+                }
+                result => break result,
             }
-            // The typed HTTP 403 rejected the request before tool dispatch.
-            // Retry once with the same operation identifier and new authorization.
-            result = attempt().await;
-        }
+        };
         match result {
             Ok(CallResult::Data(data)) if data["isError"] == true => {
                 Outcome::Failed(data.to_string())
@@ -1315,7 +1469,9 @@ impl McpTool {
             Err(CallError::Scope(_)) => Outcome::Failed(
                 "MCP server still requires additional OAuth scopes after reauthorization".into(),
             ),
-            Err(CallError::Other(error)) => Outcome::Unknown(error),
+            Err(CallError::Other(error) | CallError::TransientHttp(error)) => {
+                Outcome::Unknown(error)
+            }
         }
     }
 
@@ -1948,6 +2104,97 @@ pub async fn resolve_value_with_cleanup(value: &str, cleanup: Option<&Children>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mcp_client_lists_only_its_workspace_root() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace café #1");
+        std::fs::create_dir(&workspace).unwrap();
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server = async move {
+            let mut transport = BufReader::new(server_transport);
+            let mut line = String::new();
+            transport.read_line(&mut line).await.unwrap();
+            let init: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(init["method"], "initialize");
+            assert_eq!(init["params"]["protocolVersion"], "2025-11-25");
+            assert!(init["params"]["capabilities"]["roots"].is_object());
+            let reply = json!({
+                "jsonrpc":"2.0", "id": init["id"],
+                "result":{
+                    "protocolVersion":init["params"]["protocolVersion"],
+                    "capabilities":{},
+                    "serverInfo":{"name":"fixture","version":"1"}
+                }
+            });
+            transport
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            line.clear();
+            transport.read_line(&mut line).await.unwrap();
+            let initialized: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(initialized["method"], "notifications/initialized");
+            transport
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":\"roots-fixture\",\"method\":\"roots/list\"}\n",
+                )
+                .await
+                .unwrap();
+            line.clear();
+            transport.read_line(&mut line).await.unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        let native = NativeClient::for_server("fixture", &workspace).await;
+        let (response, client) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                server,
+                native.serve_with_lifecycle(client_transport, ClientLifecycleMode::Initialize),
+            )
+        })
+        .await
+        .expect("MCP roots fixture timed out");
+        let _client = client.unwrap();
+        assert_eq!(response["id"], "roots-fixture");
+        let roots = response["result"]["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1);
+        let root = &roots[0];
+        assert_eq!(root["name"], "workspace café #1");
+        let uri = root["uri"].as_str().unwrap();
+        assert!(uri.ends_with("/workspace%20caf%C3%A9%20%231"), "{uri}");
+        assert_eq!(
+            reqwest_mcp::Url::parse(uri)
+                .unwrap()
+                .to_file_path()
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            workspace.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_workspace_root_resolves_symlinks_before_parent_components() {
+        let directory = tempfile::tempdir().unwrap();
+        let physical = directory.path().join("physical");
+        let child = physical.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&child, &alias).unwrap();
+        let native = NativeClient::for_server("fixture", &alias.join("..")).await;
+        let root = native.workspace_root.unwrap();
+        assert_eq!(root.name, "physical");
+        assert_eq!(
+            reqwest_mcp::Url::parse(&root.uri)
+                .unwrap()
+                .to_file_path()
+                .unwrap(),
+            physical.canonicalize().unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn cancelled_page_preparation_does_not_block_or_leak_file() {
