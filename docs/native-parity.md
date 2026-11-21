@@ -45,6 +45,8 @@ streamed reasoning and replay it as text before the answer for the same model.
 
 Gemini streaming retains the first nonempty, bounded response ID for the turn
 and reports it before completion so a handled interruption can record it.
+Gemini sends failed tool results in `functionResponse.response.error` and
+successful results in `functionResponse.response.output`, matching Pi.
 
 Endpointless API keys in Pi's `auth.json` are accepted for custom providers
 declared in `models.json`. The saved key takes precedence over the profile key
@@ -404,10 +406,18 @@ Ring model, its official endpoint, and `ANT_LING_API_KEY`. Ring sends its
 mapped high or xhigh effort in the provider's nested `reasoning` field.
 Live acceptance with an Ant Ling account remains open.
 
-### OpenCode Zen classifiers
+### OpenCode Zen and Go
 
 OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
 using its official System One endpoint and `OPENCODE_API_KEY`.
+
+OpenCode Zen and Go expose their 79 and 30 pinned chat models, respectively,
+using `OPENCODE_API_KEY`. The model selects the Messages, Gemini, Chat
+Completions or Responses route. Session requests include `x-opencode-session`
+unless configuration supplies the header explicitly. Endpointless saved keys
+apply to the official routes for the corresponding provider. Gemini prepared
+requests also accept an empty tool list. Live inference
+with a Zen or Go account has not been verified.
 
 ### Vercel AI Gateway checkpoint
 
@@ -891,8 +901,10 @@ expanding a quoted prompt argument before the model request.
 
 `pi mcp list --json` emits one JSON document with server state, source,
 transport, tool names, per-tool exposure overrides, and resource capability.
-Invalid entries are reported in `errors`; enabled connection failures cause a
-nonzero exit. An invalid trusted project override currently fails the merged
+Invalid entries are reported in `errors`. Both forms of `pi mcp list` report
+a non-boolean `autoEnableCodemode` with its configuration file path, keep
+listing the servers, and exit with a failure status. Enabled connection
+failures also cause a nonzero exit. An invalid trusted project override currently fails the merged
 configuration as a whole, preserving pi-rs's existing override validation.
 Unlike Pi, JSON transport descriptions omit stdio arguments and URL paths,
 credentials, queries and fragments; failure messages are generic so these
@@ -2239,7 +2251,10 @@ editor for implemented model defaults, resource lists, native packages, tool
 selection, trust defaults, terminal mode and codemode settings. Ctrl+S validates
 and saves, Escape discards the edit. Invalid values keep the editor open and
 show the failing settings path. The selected setting includes an explanatory
-hint below the searchable list. Unrecognized extension-owned keys survive
+hint below the searchable list. Values stay in the same column as the list
+is filtered. On narrow terminals, short rows can use less padding to keep
+their values visible. The selected row uses Pi's arrow and accent color, and other
+values use the muted theme color. Unrecognized extension-owned keys survive
 updates. Runtime/resource changes take effect on reload or the next startup,
 and theme changes apply immediately.
 
@@ -5393,8 +5408,10 @@ fractions, exponents, and leading minus signs cut off at EOF. Offsets
 and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
 For records up to 1 MiB, a bounded diagnostic-only retry identifies a raw
 control after a surrogate in another string if no other parse error occurs first.
-Other malformed JSON retains the native parser's diagnostics; full
-malformed-input parity remains open.
+Malformed object property names and separators, object trailing commas, missing
+array separators and trailing text after a complete JSON value also use Pi's
+position-aware wording. Other malformed records, including array trailing
+commas, retain the native parser's diagnostics.
 
 ### Shell execution transcript checkpoint
 

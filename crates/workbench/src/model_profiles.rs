@@ -1320,12 +1320,18 @@ impl Profiles {
         if adapter == Adapter::MistralConversations {
             return &["x-affinity"];
         }
+        let opencode = matches!(provider.id(), "opencode" | "opencode-go");
+        let routing: &'static [&'static str] = if opencode {
+            &["x-opencode-session"]
+        } else {
+            &[]
+        };
         if !matches!(
             adapter,
             Adapter::Anthropic | Adapter::ChatCompletions | Adapter::OpenAiResponses
         ) || provider.id() == "openai-chatgpt"
         {
-            return &[];
+            return routing;
         }
         let profile = self
             .entries
@@ -1361,7 +1367,7 @@ impl Profiles {
             .or_else(|| profile.and_then(|compat| compat.send_session_affinity_headers))
             .unwrap_or(openrouter || adapter == Adapter::OpenAiResponses);
         if !send {
-            return &[];
+            return routing;
         }
         let format = model_compat
             .and_then(|compat| compat.session_affinity_format)
@@ -1372,6 +1378,25 @@ impl Profiles {
                 AffinityFormat::Openai
             });
         match (adapter, format) {
+            (_, AffinityFormat::Openrouter) if opencode => &["x-opencode-session", "x-session-id"],
+            (Adapter::OpenAiResponses, AffinityFormat::Openai) if opencode => {
+                &["x-opencode-session", "session-id", "x-client-request-id"]
+            }
+            (Adapter::OpenAiResponses, AffinityFormat::OpenaiNosession) if opencode => {
+                &["x-opencode-session", "x-client-request-id"]
+            }
+            (Adapter::Anthropic, _) if opencode => &["x-opencode-session", "x-session-affinity"],
+            (_, AffinityFormat::Openai) if opencode => &[
+                "x-opencode-session",
+                "session_id",
+                "x-client-request-id",
+                "x-session-affinity",
+            ],
+            (_, AffinityFormat::OpenaiNosession) if opencode => &[
+                "x-opencode-session",
+                "x-client-request-id",
+                "x-session-affinity",
+            ],
             (_, AffinityFormat::Openrouter) => &["x-session-id"],
             (Adapter::OpenAiResponses, AffinityFormat::Openai) => {
                 &["session-id", "x-client-request-id"]
@@ -1480,6 +1505,14 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
     let path = url.path().trim_end_matches('/');
     let path = if path.ends_with(suffix) {
         path.to_owned()
+    } else if adapter == Adapter::Anthropic
+        && url.host_str() == Some("opencode.ai")
+        && matches!(
+            (provider.id(), path),
+            ("opencode", "/inference/anthropic") | ("opencode-go", "/inference/go/anthropic")
+        )
+    {
+        format!("{path}/v1{suffix}")
     } else if path.is_empty()
         && provider.id() == "deepseek"
         && url.host_str() == Some("api.deepseek.com")
@@ -2251,6 +2284,95 @@ mod tests {
             let levels = model.levels(Adapter::Anthropic).unwrap();
             assert!(levels.contains(&"high".into()));
             assert!(!levels.contains(&"off".into()));
+        }
+    }
+
+    #[test]
+    fn opencode_catalogs_bind_each_api_to_its_own_official_route() {
+        let profiles = Profiles::default();
+        for (id, prefix, count, default, messages, responses) in [
+            (
+                "opencode",
+                "/inference",
+                79,
+                "kimi-k2.7-code",
+                "claude-fable-5",
+                "gpt-6-sol",
+            ),
+            (
+                "opencode-go",
+                "/inference/go",
+                30,
+                "kimi-k3.1-pro",
+                "claude-haiku-5-5",
+                "gpt-6-luna",
+            ),
+        ] {
+            let provider = profiles.provider(id).unwrap();
+            let builtin = builtin_chat::find(id).unwrap();
+            let available = profiles.model_ids(&provider);
+            assert_eq!(available.len(), count);
+            assert_eq!(available[0], default);
+            assert_eq!(builtin.env(), "OPENCODE_API_KEY");
+
+            let keys = super::super::model_auth::Keys::parse(
+                &json!({id:{"type":"api_key","key":"fixture"}}),
+            );
+            for (model, adapter, suffix, headers) in [
+                (
+                    default,
+                    Adapter::ChatCompletions,
+                    "/openai/v1/chat/completions",
+                    &["x-opencode-session"][..],
+                ),
+                (
+                    messages,
+                    Adapter::Anthropic,
+                    "/anthropic/v1/messages",
+                    &["x-opencode-session"][..],
+                ),
+                (
+                    "gemini-4-argon",
+                    Adapter::Google,
+                    "/google/v1beta",
+                    &["x-opencode-session"][..],
+                ),
+                (
+                    responses,
+                    Adapter::OpenAiResponses,
+                    "/openai/v1/responses",
+                    &["x-opencode-session", "x-client-request-id"][..],
+                ),
+            ] {
+                let endpoint = profiles
+                    .model_endpoint(&provider, model)
+                    .unwrap_or_else(|| profiles.endpoint(&provider));
+                assert_eq!(endpoint, format!("https://opencode.ai{prefix}{suffix}"));
+                assert_eq!(profiles.model_adapter(&provider, model), adapter);
+                assert_eq!(
+                    profiles.session_affinity(&provider, model, endpoint),
+                    headers
+                );
+                assert_eq!(
+                    keys.credential(&provider, endpoint)
+                        .and_then(|key| key.literal()),
+                    Some("fixture")
+                );
+            }
+            assert_eq!(
+                keys.credential(&provider, "https://example.org/v1/responses")
+                    .and_then(|key| key.literal()),
+                None
+            );
+            let configured = Profiles::parse(&json!({"providers":{id:{"models":[{
+                "id": messages, "api": "anthropic-messages",
+                "baseUrl": format!("https://opencode.ai{prefix}/anthropic")
+            }]}}}))
+            .unwrap();
+            assert_eq!(
+                configured.model_endpoint(&provider, messages),
+                builtin.endpoint_for(Adapter::Anthropic)
+            );
         }
     }
 

@@ -1,5 +1,9 @@
 //! Searchable keyboard selectors for session and model navigation.
-use super::{keys::Keys, render::Line, theme::Theme};
+use super::{
+    keys::Keys,
+    render::{Line, Span},
+    theme::Theme,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
@@ -630,8 +634,7 @@ impl Picker {
                     _ => item.label.to_lowercase(),
                 };
                 if self.title == "Settings" {
-                    settings_match_score(&query, label.split(" · ").next().unwrap_or(&label))
-                        .is_some()
+                    settings_match_score(&query, settings_label_parts(&label).0).is_some()
                 } else if self.active_session.is_some()
                     || self.model_scope.is_some()
                     || self.title == "Thinking: select model"
@@ -1215,7 +1218,25 @@ impl Picker {
             .max()
             .unwrap_or(12)
             .clamp(12, 32);
+        let settings_column = (self.title == "Settings").then(|| {
+            self.items
+                .iter()
+                .map(|item| settings_label_parts(&item.label).0.width())
+                .max()
+                .unwrap_or(0)
+                .min(36)
+        });
         for (index, item) in items.iter().enumerate().skip(start).take(available) {
+            if let Some(column) = settings_column {
+                lines.push(render_settings_row(
+                    &item.label,
+                    index == self.selected,
+                    theme,
+                    width,
+                    column,
+                ));
+                continue;
+            }
             if let (Some(tree), Some(layout), Selection::Checkout(id)) =
                 (&self.tree, &tree_layout, &item.selection)
             {
@@ -1459,6 +1480,43 @@ impl Picker {
         };
         lines.push(Line::themed(&hint, theme, "dim"));
         lines
+    }
+}
+
+fn settings_label_parts(label: &str) -> (&str, &str) {
+    label.split_once(" · ").unwrap_or((label, ""))
+}
+
+fn render_settings_row(
+    label: &str,
+    selected: bool,
+    theme: &Theme,
+    width: usize,
+    column: usize,
+) -> Line {
+    let (label, value) = settings_label_parts(label);
+    let prefix = clip_completion(if selected { "→ " } else { "  " }, width);
+    let available = width.saturating_sub(prefix.width());
+    let label_width = label.width();
+    let aligned_padding = column.saturating_sub(label_width) + 2;
+    let padding = if label_width + aligned_padding + value.width() <= available {
+        aligned_padding
+    } else {
+        2
+    };
+    let label = clip_completion(&format!("{label}{}", " ".repeat(padding)), available);
+    let value_width = available.saturating_sub(label.width());
+    Line {
+        spans: vec![
+            Span::themed(prefix, theme, "accent"),
+            Span::themed(label, theme, if selected { "accent" } else { "text" }),
+            Span::themed(
+                clip_completion(value, value_width),
+                theme,
+                if selected { "accent" } else { "muted" },
+            ),
+        ],
+        ..Line::default()
     }
 }
 
@@ -2232,6 +2290,45 @@ mod tests {
             Input::UpdateModelScope { save: false }
         ));
         assert!(picker.model_scope().unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn settings_align_values_and_use_pi_theme_roles() {
+        let item = |label: &str| Item {
+            label: label.into(),
+            selection: Selection::EditSetting("theme".into()),
+        };
+        let mut picker = Picker::new(
+            "Settings",
+            vec![item("Theme · dark"), item("Long setting · on")],
+        );
+        let theme = Theme::system();
+        let keys = Keys::default();
+        let lines = picker.render(&theme, 80, 8, &keys);
+        let plain = |line: &Line| {
+            line.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        };
+        assert_eq!(plain(&lines[1]), "→ Theme         dark");
+        assert_eq!(plain(&lines[2]), "  Long setting  on");
+        assert_eq!(lines[1].spans[1].color, theme.color("accent"));
+        assert_eq!(lines[1].spans[2].color, theme.color("accent"));
+        assert_eq!(lines[2].spans[1].color, theme.color("text"));
+        assert_eq!(lines[2].spans[2].color, theme.color("muted"));
+        assert!(lines[1].background.is_none());
+        picker.paste("Theme");
+        let lines = picker.render(&theme, 80, 8, &keys);
+        assert_eq!(plain(&lines[1]), "→ Theme         dark");
+        let compact = picker.render(&theme, 16, 8, &keys);
+        assert_eq!(plain(&compact[1]), "→ Theme  dark");
+        let exact_width = picker.render(&theme, 20, 8, &keys);
+        assert_eq!(plain(&exact_width[1]), "→ Theme         dark");
+        for width in 0..20 {
+            let lines = picker.render(&theme, width, 8, &keys);
+            assert!(plain(&lines[1]).width() <= width);
+        }
     }
 
     #[test]

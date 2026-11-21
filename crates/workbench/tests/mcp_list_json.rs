@@ -388,3 +388,71 @@ fn list_json_fails_when_stdout_cannot_be_written() {
         .unwrap();
     assert!(!output.status.success());
 }
+
+#[test]
+fn list_reports_invalid_auto_enable_codemode_in_each_trusted_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join(".pi");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let global_config = home.join("mcp.json");
+    let project_config = project.join("mcp.json");
+    std::fs::write(
+        &global_config,
+        r#"{"autoEnableCodemode":"private-value","mcpServers":{"global":{"command":"unused","enabled":false}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &project_config,
+        r#"{"autoEnableCodemode":null,"mcpServers":{"local":{"command":"unused","enabled":false}}}"#,
+    )
+    .unwrap();
+
+    let run = |trust, json_output| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args([trust, "mcp", "list"]);
+        if json_output {
+            command.arg("--json");
+        }
+        command.output().unwrap()
+    };
+    let output = run("--trust", true);
+    assert!(!output.status.success());
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let issue = |path: &std::path::Path| {
+        assert!(!path.as_os_str().is_empty());
+        format!("{}: autoEnableCodemode must be a boolean", path.display())
+    };
+    let errors = data["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 2);
+    assert_eq!(errors[0], issue(&global_config));
+    assert!(
+        errors[1]
+            .as_str()
+            .unwrap()
+            .ends_with(&issue(std::path::Path::new(".pi/mcp.json")))
+    );
+    assert_eq!(data["servers"][0]["name"], "global");
+    assert_eq!(data["servers"][1]["name"], "local");
+    assert!(!data.to_string().contains("private-value"));
+
+    let output = run("--no-trust", true);
+    assert!(!output.status.success());
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(data["errors"], json!([issue(&global_config)]));
+    assert_eq!(data["servers"].as_array().unwrap().len(), 1);
+
+    let output = run("--trust", false);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&issue(&global_config)), "{stderr}");
+    assert!(
+        stderr.contains(&issue(std::path::Path::new(".pi/mcp.json"))),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("private-value"), "{stderr}");
+}
