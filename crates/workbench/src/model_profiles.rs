@@ -2201,6 +2201,17 @@ mod tests {
         let model = profiles.model(&provider, "amazon.nova-lite-v1:0").unwrap();
         assert_eq!(model.context_window, Some(300_000));
         assert_eq!(model.max_tokens, Some(10_000));
+        let nova_cost = model.cost.unwrap().value();
+        assert_eq!(nova_cost["cacheWrite"], 0.06);
+        assert_eq!(profiles.model_ids(&provider).len(), 208);
+        let sol = profiles
+            .model(&provider, "global.openai.gpt-6.2-sol")
+            .unwrap();
+        assert_eq!(sol.context_window, Some(1_050_000));
+        assert_eq!(sol.max_tokens, Some(128_000));
+        let cost = sol.cost.unwrap().value();
+        assert_eq!(cost["tiers"][0]["inputTokensAbove"], 272_000);
+        assert_eq!(cost["tiers"][0]["output"], 15.0);
     }
 
     #[test]
