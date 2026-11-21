@@ -26,6 +26,21 @@ const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 #[derive(Clone, Default)]
 pub struct ShellOutputStore(Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>);
 
+/// Tracks the selected model for tools kept across model switches.
+#[derive(Clone, Default)]
+pub struct ReadImageModel(Arc<std::sync::Mutex<Option<Arc<str>>>>);
+
+impl ReadImageModel {
+    pub fn set(&self, id: &str, supports_images: Option<bool>) {
+        *self.0.lock().expect("read image model") =
+            (supports_images == Some(false)).then(|| Arc::from(id));
+    }
+
+    fn unsupported_model(&self) -> Option<Arc<str>> {
+        self.0.lock().expect("read image model").clone()
+    }
+}
+
 pub struct CodingTools {
     root: PathBuf,
     unrestricted: bool,
@@ -201,9 +216,8 @@ impl CodingTools {
 
     /// Record the selected text-only model in image result details so the
     /// saved tool text can be reused after a model switch.
-    pub fn with_read_image_model(mut self, id: &str, supports_images: Option<bool>) -> Self {
-        self.unsupported_image_model =
-            (supports_images == Some(false)).then(|| UnsupportedImageModel::Named(Arc::from(id)));
+    pub fn with_read_image_model(mut self, model: ReadImageModel) -> Self {
+        self.unsupported_image_model = Some(UnsupportedImageModel::Current(model));
         self
     }
 
@@ -2096,7 +2110,7 @@ fn shell_outcome(output: crate::shell_output::Output, code: i32, elapsed: f64) -
 #[derive(Clone)]
 enum UnsupportedImageModel {
     Legacy,
-    Named(Arc<str>),
+    Current(ReadImageModel),
 }
 
 #[derive(Clone)]
@@ -3073,16 +3087,18 @@ impl CodingTool {
             } = &self.kind
         {
             match model {
-                UnsupportedImageModel::Named(id)
-                    if data["content"].as_array().is_some_and(|blocks| {
-                        blocks.iter().any(|block| block["type"] == "image")
-                    }) =>
-                {
-                    return Outcome::StructuredWithDetails {
-                        data,
-                        attachments: vec![],
-                        details: json!({"imageUnsupportedByModel": id.as_ref()}),
-                    };
+                UnsupportedImageModel::Current(model) => {
+                    if data["content"]
+                        .as_array()
+                        .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
+                        && let Some(id) = model.unsupported_model()
+                    {
+                        return Outcome::StructuredWithDetails {
+                            data,
+                            attachments: vec![],
+                            details: json!({"imageUnsupportedByModel": id.as_ref()}),
+                        };
+                    }
                 }
                 UnsupportedImageModel::Legacy => {
                     if let Some(note) = data["content"][0]["text"].as_str() {
@@ -3091,7 +3107,6 @@ impl CodingTool {
                         ));
                     }
                 }
-                UnsupportedImageModel::Named(_) => {}
             }
         }
         Outcome::Structured {
@@ -6027,15 +6042,22 @@ mod tests {
         image::RgbImage::from_pixel(2, 2, image::Rgb([1, 2, 3]))
             .save(directory.path().join("image.png"))
             .unwrap();
-        for capability in [Some(false), Some(true), None] {
-            let tools = CodingTools::local(directory.path())
-                .unwrap()
-                .with_read_image_model("selected-model", capability);
-            let tool = tools
-                .tools()
-                .into_iter()
-                .find(|tool| tool.spec().name == "read")
-                .unwrap();
+        let selected = ReadImageModel::default();
+        let tools = CodingTools::local(directory.path())
+            .unwrap()
+            .with_read_image_model(selected.clone());
+        let tool = tools
+            .tools()
+            .into_iter()
+            .find(|tool| tool.spec().name == "read")
+            .unwrap();
+        for (id, capability) in [
+            ("text-model", Some(false)),
+            ("vision-model", Some(true)),
+            ("another-text-model", Some(false)),
+            ("unknown-model", None),
+        ] {
+            selected.set(id, capability);
             let result = tool
                 .invoke(
                     json!({"path":"image.png"}),
@@ -6053,14 +6075,14 @@ mod tests {
             assert_eq!(
                 details,
                 (capability == Some(false))
-                    .then(|| json!({"imageUnsupportedByModel":"selected-model"}))
+                    .then(|| json!({"imageUnsupportedByModel":id}))
                     .as_ref()
             );
             assert_eq!(data["content"][0]["text"], "Read image file [image/png]");
             assert_eq!(data["content"][1]["type"], "image");
             let (text, images) = pi_rs::extract_tool_images(result.tool_content());
             assert_eq!(images.len(), 1);
-            assert!(!text.contains("selected-model"));
+            assert!(!text.contains(id));
             assert!(!text.contains("does not support images"));
         }
     }
