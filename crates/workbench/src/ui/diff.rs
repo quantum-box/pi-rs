@@ -1,6 +1,6 @@
 //! Render native unified edit results with line numbers and word-level changes.
 use super::{
-    render::{Line, Span, wrap},
+    render::{Line, Span, wrap, wrap_words},
     theme::Theme,
 };
 mod word_diff;
@@ -114,7 +114,7 @@ pub fn render(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
         .unwrap_or(1)
         .to_string()
         .len();
-    render_rows(&rows, digits, theme, width)
+    render_rows(&rows, digits, theme, width, wrap)
 }
 
 pub fn render_numbered(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
@@ -156,10 +156,16 @@ pub fn render_numbered(text: &str, theme: &Theme, width: usize) -> Vec<Line> {
             }
         })
         .collect();
-    render_rows(&rows, 1, theme, width)
+    render_rows(&rows, 1, theme, width, wrap_words)
 }
 
-fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<Line> {
+fn render_rows(
+    rows: &[Row],
+    digits: usize,
+    theme: &Theme,
+    width: usize,
+    wrap_row: fn(&[Span], usize) -> Vec<Line>,
+) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut index = 0;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
@@ -208,11 +214,11 @@ fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<
                     }
                 }
             }
-            lines.extend(wrap(&removed_spans, width));
-            lines.extend(wrap(&added_spans, width));
+            lines.extend(wrap_row(&removed_spans, width));
+            lines.extend(wrap_row(&added_spans, width));
             index += 2;
         } else {
-            lines.extend(wrap(
+            lines.extend(wrap_row(
                 &[Span::themed(
                     format!("{}{}", row.prefix(digits), row.text),
                     theme,
@@ -229,6 +235,51 @@ fn render_rows(rows: &[Row], digits: usize, theme: &Theme, width: usize) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn numbered_diff_wraps_words_and_keeps_highlighting_across_rows() {
+        let theme = Theme::system();
+        let text = |line: &Line| {
+            line.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        };
+        for (source, width, expected) in [
+            ("-1 red blue", 8, vec!["-1 red", "blue"]),
+            ("+1 red chartreuse", 8, vec!["+1 red", "chartreu", "se"]),
+            ("-9     alpha  beta", 8, vec!["-9", "alpha", "beta"]),
+            ("+1 abc 日本語 test", 9, vec!["+1 abc 日", "本語 test"]),
+            ("+1 🧑‍💻 after", 8, vec!["+1 🧑‍💻", "after"]),
+        ] {
+            let rows = render_numbered(source, &theme, width);
+            assert_eq!(rows.iter().map(text).collect::<Vec<_>>(), expected);
+        }
+        let rows = render_numbered(
+            "-1 first oldword suffix\n+1 first newword suffix",
+            &theme,
+            10,
+        );
+        assert_eq!(
+            rows.iter().map(text).collect::<Vec<_>>(),
+            [
+                "-1 first", "oldword", "suffix", "+1 first", "newword", "suffix"
+            ]
+        );
+        assert!(
+            rows[1]
+                .spans
+                .iter()
+                .all(|span| span.inverse && span.color == theme.color("toolDiffRemoved"))
+        );
+        assert!(
+            rows[4]
+                .spans
+                .iter()
+                .all(|span| span.inverse && span.color == theme.color("toolDiffAdded"))
+        );
+        assert!(rows[5].spans.iter().all(|span| !span.inverse));
+    }
+
     #[test]
     fn grouped_changes_match_pi_whitespace_highlighting() {
         let lines = render_numbered("-1 A x B y\n+1 A  c B  d", &Theme::system(), 80);

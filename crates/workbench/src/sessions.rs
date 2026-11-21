@@ -869,6 +869,21 @@ pub fn copy_last(session: &Session) -> Result<()> {
     copy_text(&text)
 }
 
+pub(super) fn tree_context_text(content: &pi_rs::ContextContent) -> std::borrow::Cow<'_, str> {
+    match content {
+        pi_rs::ContextContent::Text(text) => std::borrow::Cow::Borrowed(text),
+        pi_rs::ContextContent::Blocks(blocks) => std::borrow::Cow::Owned(
+            blocks
+                .iter()
+                .filter_map(|block| match block {
+                    pi_rs::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+        ),
+    }
+}
+
 pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
     use std::borrow::Cow;
 
@@ -901,7 +916,7 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
                             .filter(|block| block["type"] == "text")
                             .filter_map(|block| block["text"].as_str())
                             .collect::<Vec<_>>()
-                            .join("\n"),
+                            .concat(),
                     )
                 })
                 .or_else(|| data["output"].as_str().map(Cow::Borrowed)),
@@ -909,26 +924,19 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
                 Some(Cow::Owned(outcome.tool_content()))
             }
             Event::ImportedUnattributedToolResult { content, .. } => {
-                Some(Cow::Owned(match content {
-                    pi_rs::ContextContent::Text(text) => text.clone(),
-                    pi_rs::ContextContent::Blocks(blocks) => blocks
-                        .iter()
-                        .filter_map(|block| match block {
-                            pi_rs::ContentBlock::Text { text, .. } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                }))
+                Some(tree_context_text(content))
+            }
+            Event::CustomMessage { message } | Event::CustomMessageDelivered { message, .. } => {
+                Some(tree_context_text(&message.content))
             }
             Event::ModelFinished {
                 failure: Some(_),
                 partial,
                 ..
             } => Some(Cow::Borrowed(partial.as_str())),
-            Event::Compacted { summary, .. } | Event::BranchSummary { summary, .. } => {
-                Some(Cow::Borrowed(summary.as_str()))
-            }
+            Event::Compacted { summary, .. }
+            | Event::CompactionSummaryMessage { summary, .. }
+            | Event::BranchSummary { summary, .. } => Some(Cow::Borrowed(summary.as_str())),
             _ => None,
         })
         .filter(|text| !text.trim().is_empty())

@@ -202,6 +202,18 @@ pub enum LifecycleEvent {
     AgentSettled {
         aborted: bool,
     },
+    UiPromptStart {
+        reason: crate::UiPromptReason,
+        kind: crate::UiPromptKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    UiPromptEnd {
+        reason: crate::UiPromptReason,
+        kind: crate::UiPromptKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     TurnStart {
         #[serde(rename = "runId", alias = "run_id")]
         run_id: Uuid,
@@ -283,6 +295,8 @@ impl LifecycleEvent {
             Self::AgentStart { .. } => "agent_start",
             Self::AgentEnd { .. } => "agent_end",
             Self::AgentSettled { .. } => "agent_settled",
+            Self::UiPromptStart { .. } => "ui_prompt_start",
+            Self::UiPromptEnd { .. } => "ui_prompt_end",
             Self::TurnStart { .. } => "turn_start",
             Self::TurnEnd { .. } => "turn_end",
             Self::ToolExecutionStart { .. } => "tool_execution_start",
@@ -627,6 +641,9 @@ async fn notify_inner(
                     extension.handles_session_lifecycle()
                 }
                 LifecycleEvent::SessionTree { .. } => extension.handles_tree_navigation(),
+                LifecycleEvent::UiPromptStart { .. } | LifecycleEvent::UiPromptEnd { .. } => {
+                    extension.handles_ui_prompt_lifecycle()
+                }
                 LifecycleEvent::ToolExecutionStart { .. }
                 | LifecycleEvent::ToolExecutionEnd { .. } => {
                     extension.handles_tool_execution_lifecycle()

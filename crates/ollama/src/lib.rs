@@ -1073,6 +1073,8 @@ impl Ollama {
         if self.has_ambiguous_legacy_replay(&request) {
             return Err(Error::Model("Legacy chat-completions reasoning replay has no provider identity. Edit or remove the affected assistant context, or start a new session, before continuing.".into()));
         }
+        let copilot = (self.provider == "github-copilot")
+            .then(|| pi_rs_core::copilot_request_headers(&request.messages).collect::<Vec<_>>());
         let requested_model = request.model.clone();
         let identity = self.replay_identity(&requested_model);
         let infer_finish = self.compatibility.supports_finish_reason == Some(false);
@@ -1178,7 +1180,14 @@ impl Ollama {
                 value.to_str().ok().map(|value| (name.as_str(), value))
             }),
         );
-        let request = self.client.post(self.endpoint.clone());
+        let mut request = self.client.post(self.endpoint.clone());
+        if let Some(headers) = copilot {
+            for (name, value) in headers {
+                if !self.headers.contains_key(name) {
+                    request = request.header(name, value);
+                }
+            }
+        }
         let request = if mistral && !self.headers.contains_key(reqwest::header::ACCEPT) {
             request.header(reqwest::header::ACCEPT, "text/event-stream")
         } else {
