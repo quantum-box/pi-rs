@@ -10,7 +10,8 @@ pub(super) enum TurnPreparation {
         state: Option<crate::ExtensionState>,
         guard: tokio_util::sync::DropGuard,
     },
-    Skipped(Outcome),
+    Skipped(String),
+    SchemaRejected(String),
 }
 
 enum TurnNormalized {
@@ -18,13 +19,8 @@ enum TurnNormalized {
         tool: Arc<RegisteredTool>,
         args: serde_json::Value,
     },
-    Skipped(Outcome),
-}
-
-impl TurnNormalized {
-    fn skipped(reason: impl Into<String>) -> Self {
-        Self::Skipped(Outcome::Skipped(reason.into()))
-    }
+    Skipped(String),
+    SchemaRejected(String),
 }
 
 fn pi_argument_diagnostic(
@@ -1759,8 +1755,8 @@ impl Agent<'_> {
             .filter(|_| advertised.contains(&call.name))
             .cloned()
         else {
-            return Ok(TurnNormalized::skipped(
-                "tool is not registered or advertised",
+            return Ok(TurnNormalized::Skipped(
+                "tool is not registered or advertised".into(),
             ));
         };
         let validated = decision
@@ -1777,7 +1773,7 @@ impl Agent<'_> {
         let args = match turn_model_arguments(invocation, validated.as_ref()) {
             Ok(arguments) => arguments,
             Err(error) => {
-                return Ok(TurnNormalized::skipped(format!(
+                return Ok(TurnNormalized::Skipped(format!(
                     "Invalid arguments for tool \"{}\": {error}",
                     call.name
                 )));
@@ -1793,23 +1789,21 @@ impl Agent<'_> {
             _ = cancel.cancelled() => return Err(Error::Cancelled),
             result = platform_time::timeout(tool_timeout, tool.tool.prepare_arguments(args)) => match result {
                 Ok(Ok(arguments)) if arguments.to_string().len() <= 16 * 1024 * 1024 => arguments,
-                Ok(Ok(_)) => return Ok(TurnNormalized::skipped("prepared arguments exceed size limit")),
-                Ok(Err(error)) => return Ok(TurnNormalized::skipped(format!("argument preparation failed: {error}"))),
-                Err(_) => return Ok(TurnNormalized::skipped("argument preparation timed out")),
+                Ok(Ok(_)) => return Ok(TurnNormalized::Skipped("prepared arguments exceed size limit".into())),
+                Ok(Err(error)) => return Ok(TurnNormalized::Skipped(format!("argument preparation failed: {error}"))),
+                Err(_) => return Ok(TurnNormalized::Skipped("argument preparation timed out".into())),
             },
         };
         if !tool.validator.is_valid(&args) {
             if tool.tool.pi_argument_diagnostics()
                 && let Ok(input) = turn_model_arguments(invocation, None)
             {
-                return Ok(TurnNormalized::Skipped(Outcome::TextResult {
-                    output: pi_argument_diagnostic(&tool, &input, &args),
-                    details: Some(serde_json::json!({})),
-                    is_error: true,
-                }));
+                return Ok(TurnNormalized::SchemaRejected(pi_argument_diagnostic(
+                    &tool, &input, &args,
+                )));
             }
-            return Ok(TurnNormalized::skipped(
-                "arguments do not match the tool's JSON Schema",
+            return Ok(TurnNormalized::Skipped(
+                "arguments do not match the tool's JSON Schema".into(),
             ));
         }
         Ok(TurnNormalized::Ready { tool, args })
@@ -1826,7 +1820,10 @@ impl Agent<'_> {
     ) -> Result<TurnPreparation> {
         let (tool, mut args) = match normalized {
             TurnNormalized::Ready { tool, args } => (tool, args),
-            TurnNormalized::Skipped(outcome) => return Ok(TurnPreparation::Skipped(outcome)),
+            TurnNormalized::Skipped(reason) => return Ok(TurnPreparation::Skipped(reason)),
+            TurnNormalized::SchemaRejected(output) => {
+                return Ok(TurnPreparation::SchemaRejected(output));
+            }
         };
         let call = &invocation.call;
         let cancellation = cancel.child_token();
@@ -1849,7 +1846,7 @@ impl Agent<'_> {
                 context,
                 guard,
             },
-            Decision::Deny(reason) => TurnPreparation::Skipped(Outcome::Skipped(reason)),
+            Decision::Deny(reason) => TurnPreparation::Skipped(reason),
         })
     }
 
@@ -1933,7 +1930,15 @@ impl Agent<'_> {
                 state,
                 guard,
             } => (tool, args, context, state, guard),
-            TurnPreparation::Skipped(outcome) => return outcome.into(),
+            TurnPreparation::Skipped(reason) => return Outcome::Skipped(reason).into(),
+            TurnPreparation::SchemaRejected(output) => {
+                return Outcome::TextResult {
+                    output,
+                    details: Some(serde_json::json!({})),
+                    is_error: true,
+                }
+                .into();
+            }
         };
         let timeout = if omit_default_tool_timeout && !tool.tool.use_default_timeout() {
             None
@@ -2040,6 +2045,7 @@ struct TurnCall {
     reply: Option<oneshot::Sender<Outcome>>,
     parallel: bool,
     polled: bool,
+    schema_rejected: bool,
     phase: TurnPhase,
 }
 enum TurnPhase {
@@ -2271,6 +2277,7 @@ impl Agent<'_> {
                     .get(&invocation.call.name)
                     .is_some_and(|tool| tool.tool.execution() == ToolExecution::ParallelRead),
                 polled: false,
+                schema_rejected: false,
                 phase: TurnPhase::Queued,
             });
             lanes.entry(None).or_default().calls.push_back(index);
@@ -2608,6 +2615,7 @@ impl Agent<'_> {
                     continue;
                 };
                 let mut reply = *reply;
+                let schema_rejected = calls[index].schema_rejected;
                 let registry = self.registry.clone();
                 let snapshot = states.clone();
                 let invocation = calls[index].invocation.clone();
@@ -2631,7 +2639,7 @@ impl Agent<'_> {
                             errors.push((extension.to_owned(), event, message.to_owned()));
                         }
                     };
-                    let replaced = duration.is_some()
+                    let replaced = !schema_rejected
                         && Self::turn_transform(
                             &registry,
                             timeout,
@@ -2664,7 +2672,7 @@ impl Agent<'_> {
                         let index = calls.len();
                         positions.insert(invocation.operation_id, index);
                         snapshots.insert(invocation.operation_id, request.snapshot);
-                        calls.push(TurnCall { parallel: self.registry.tools.get(&invocation.call.name).is_some_and(|tool| tool.tool.execution() == ToolExecution::ParallelRead), polled: false, invocation, parent, lane, cancellation: request.cancellation, depth: request.depth, call_count: request.call_count, reply: Some(request.reply), phase: TurnPhase::Queued });
+                        calls.push(TurnCall { parallel: self.registry.tools.get(&invocation.call.name).is_some_and(|tool| tool.tool.execution() == ToolExecution::ParallelRead), polled: false, schema_rejected: false, invocation, parent, lane, cancellation: request.cancellation, depth: request.depth, call_count: request.call_count, reply: Some(request.reply), phase: TurnPhase::Queued });
                         lanes.entry(lane).or_default().calls.push_back(index);
                         group_indices.push(index);
                     }
@@ -2722,6 +2730,7 @@ impl Agent<'_> {
                                     continue;
                                 }
                                 let ran = matches!(&prepared, TurnPreparation::Ready { .. });
+                                calls[index].schema_rejected = matches!(&prepared, TurnPreparation::SchemaRejected(_));
                                 if let TurnPreparation::Ready { tool, args, .. } = &prepared {
                                     let strict_decision = if calls[index].lane.is_none() {
                                         match turn_decision.as_ref() {
@@ -2740,7 +2749,7 @@ impl Agent<'_> {
                                         commit(session, Event::ToolStarted { operation_id: calls[index].invocation.operation_id, tool_execution: None }, observer)?;
                                     }
                                 }
-                                let cancellation = match &prepared { TurnPreparation::Ready { context, .. } => context.cancellation.clone(), TurnPreparation::Skipped(_) => calls[index].cancellation.child_token() };
+                                let cancellation = match &prepared { TurnPreparation::Ready { context, .. } => context.cancellation.clone(), TurnPreparation::Skipped(_) | TurnPreparation::SchemaRejected(_) => calls[index].cancellation.child_token() };
                                 let (updates, mut progress_input) = mpsc::channel::<TurnProgress>(32);
                                 let (finish_progress, mut finish_signal) = oneshot::channel();
                                 let progress_output = progress_output.clone();
@@ -2805,7 +2814,7 @@ impl Agent<'_> {
                     }
                     TurnEvent::Transformed(index, reply, duration, errors, replaced) => {
                         for (extension,event,message) in &errors { observer(Notification::ExtensionLifecycleError { extension, event, message }); }
-                        let allow_event_metadata = duration.is_some() && !replaced;
+                        let allow_event_metadata = !calls[index].schema_rejected && !replaced;
                         let finished = self.finish_tool(session, &calls[index].invocation, reply, states, observer, Some(&snapshots), allow_event_metadata);
                         let outcome = session.operations().into_iter().find_map(|(invocation,state)| if invocation.operation_id == calls[index].invocation.operation_id { if let OperationState::Finished(outcome) = state { Some(outcome) } else { None } } else { None }).unwrap_or_else(|| Outcome::Unknown("tool produced no durable result".into()));
                         if matches!(&finished, Err(Error::PendingOperation(_)))
