@@ -45,6 +45,8 @@ streamed reasoning and replay it as text before the answer for the same model.
 
 Gemini streaming retains the first nonempty, bounded response ID for the turn
 and reports it before completion so a handled interruption can record it.
+Gemini sends failed tool results in `functionResponse.response.error` and
+successful results in `functionResponse.response.output`, matching Pi.
 
 Endpointless API keys in Pi's `auth.json` are accepted for custom providers
 declared in `models.json`. The saved key takes precedence over the profile key
@@ -404,10 +406,18 @@ Ring model, its official endpoint, and `ANT_LING_API_KEY`. Ring sends its
 mapped high or xhigh effort in the provider's nested `reasoning` field.
 Live acceptance with an Ant Ling account remains open.
 
-### OpenCode Zen classifiers
+### OpenCode Zen and Go
 
 OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
 using its official System One endpoint and `OPENCODE_API_KEY`.
+
+OpenCode Zen and Go expose their 79 and 30 pinned chat models, respectively,
+using `OPENCODE_API_KEY`. The model selects the Messages, Gemini, Chat
+Completions or Responses route. Session requests include `x-opencode-session`
+unless configuration supplies the header explicitly. Endpointless saved keys
+apply to the official routes for the corresponding provider. Gemini prepared
+requests also accept an empty tool list. Live inference
+with a Zen or Go account has not been verified.
 
 ### Vercel AI Gateway checkpoint
 
@@ -5403,8 +5413,10 @@ fractions, exponents, and leading minus signs cut off at EOF. Offsets
 and columns count UTF-16 units; CR, LF and CRLF are counted as line breaks.
 For records up to 1 MiB, a bounded diagnostic-only retry identifies a raw
 control after a surrogate in another string if no other parse error occurs first.
-Other malformed JSON retains the native parser's diagnostics; full
-malformed-input parity remains open.
+Malformed object property names and separators, object trailing commas, missing
+array separators and trailing text after a complete JSON value also use Pi's
+position-aware wording. Other malformed records, including array trailing
+commas, retain the native parser's diagnostics.
 
 ### Shell execution transcript checkpoint
 

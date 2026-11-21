@@ -1747,8 +1747,10 @@ impl Anthropic {
         }
         let error_secrets = self.error_secrets();
         let mut request = self.client.post(self.endpoint.clone());
-        if let Some(headers) = copilot {
+        if copilot.is_some() || matches!(self.provider.as_ref(), "opencode" | "opencode-go") {
             request = request.query(&[("beta", "true")]);
+        }
+        if let Some(headers) = copilot {
             for (name, value) in headers {
                 if !self.headers.contains_key(name) {
                     request = request.header(name, value);

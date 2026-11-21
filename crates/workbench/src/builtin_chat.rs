@@ -121,6 +121,18 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({}),
     },
     Builtin {
+        id: "opencode",
+        endpoint: "https://opencode.ai/inference/openai/v1/chat/completions",
+        env: "OPENCODE_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
+        id: "opencode-go",
+        endpoint: "https://opencode.ai/inference/go/openai/v1/chat/completions",
+        env: "OPENCODE_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "openrouter",
         endpoint: "https://openrouter.ai/api/v1/chat/completions",
         env: "OPENROUTER_API_KEY",
@@ -271,6 +283,22 @@ impl Builtin {
             (Adapter::OpenAiResponses, "github-copilot") => {
                 Some("https://api.individual.githubcopilot.com/responses")
             }
+            (Adapter::OpenAiResponses, "opencode") => {
+                Some("https://opencode.ai/inference/openai/v1/responses")
+            }
+            (Adapter::OpenAiResponses, "opencode-go") => {
+                Some("https://opencode.ai/inference/go/openai/v1/responses")
+            }
+            (Adapter::Anthropic, "opencode") => {
+                Some("https://opencode.ai/inference/anthropic/v1/messages")
+            }
+            (Adapter::Anthropic, "opencode-go") => {
+                Some("https://opencode.ai/inference/go/anthropic/v1/messages")
+            }
+            (Adapter::Google, "opencode") => Some("https://opencode.ai/inference/google/v1beta"),
+            (Adapter::Google, "opencode-go") => {
+                Some("https://opencode.ai/inference/go/google/v1beta")
+            }
             (Adapter::Anthropic, "openrouter") => Some("https://openrouter.ai/api/v1/messages"),
             _ => None,
         }
@@ -278,8 +306,13 @@ impl Builtin {
 
     pub fn is_official_endpoint(&self, endpoint: &str) -> bool {
         self.endpoint == endpoint
-            || self.endpoint_for(Adapter::Anthropic) == Some(endpoint)
-            || self.endpoint_for(Adapter::OpenAiResponses) == Some(endpoint)
+            || [
+                Adapter::Anthropic,
+                Adapter::Google,
+                Adapter::OpenAiResponses,
+            ]
+            .into_iter()
+            .any(|adapter| self.endpoint_for(adapter) == Some(endpoint))
     }
 
     pub fn env(&self) -> &'static str {
