@@ -233,6 +233,7 @@ impl Picker {
     }
 
     pub fn paste(&mut self, text: &str) {
+        let tree_focus = self.tree_filter_focus();
         if self.title == "Settings" {
             // Pi's single-line input removes CR/LF, expands tabs, and keeps
             // other characters for filtering. Rendering sanitizes controls.
@@ -247,14 +248,31 @@ impl Picker {
             self.query
                 .extend(text.chars().filter(|character| !character.is_control()));
         }
-        self.selected = 0;
-        self.unfold_tree_for_search();
+        self.apply_search_focus(tree_focus);
     }
 
-    fn unfold_tree_for_search(&mut self) {
-        if let Some(tree) = &mut self.tree {
+    fn tree_filter_focus(&self) -> Option<u64> {
+        let tree = self.tree.as_ref()?;
+        if self.session_action.is_some() {
+            return None;
+        }
+        self.matches()
+            .get(self.selected)
+            .and_then(|item| match item.selection {
+                Selection::Checkout(id) => Some(id),
+                _ => None,
+            })
+            .or(Some(tree.last_filter_focus))
+    }
+
+    fn apply_search_focus(&mut self, focus: Option<u64>) {
+        if let Some(id) = focus {
+            let tree = self.tree.as_mut().expect("tree search");
             tree.collapsed.clear();
             tree.rebuild_visible();
+            self.focus_record(id);
+        } else {
+            self.selected = 0;
         }
     }
 
@@ -575,6 +593,9 @@ impl Picker {
         }
     }
     pub fn focus_record(&mut self, id: u64) {
+        if let Some(tree) = &mut self.tree {
+            tree.last_filter_focus = id;
+        }
         let visible: std::collections::HashMap<_, _> = self
             .matches()
             .iter()
@@ -599,6 +620,11 @@ impl Picker {
     }
     fn matches(&self) -> Vec<&Item> {
         let query = self.query.to_lowercase();
+        let tree_tokens: Vec<_> = if self.tree.is_some() {
+            query.split_whitespace().collect()
+        } else {
+            Vec::new()
+        };
         let session_query = super::session_search::Query::new(&self.query);
         let mut matches: Vec<_> = self
             .items
@@ -615,10 +641,19 @@ impl Picker {
                 {
                     return false;
                 }
-                if let (Some(tree), Selection::Checkout(id)) = (&self.tree, &item.selection)
-                    && (!tree.passes_filter(*id) || !tree.visible.contains(id))
-                {
-                    return false;
+                if let (Some(tree), Selection::Checkout(id)) = (&self.tree, &item.selection) {
+                    if !tree.passes_filter(*id) || !tree.visible.contains(id) {
+                        return false;
+                    }
+                    if tree_tokens.is_empty() {
+                        return true;
+                    }
+                    let text = item.label.to_lowercase();
+                    let label = tree.labels.get(id).map(|label| label.to_lowercase());
+                    return tree_tokens.iter().all(|token| {
+                        text.contains(token)
+                            || label.as_ref().is_some_and(|label| label.contains(token))
+                    });
                 }
                 if let Selection::Resume(path) = &item.selection
                     && let Some(document) = self.session_documents.get(path)
@@ -817,7 +852,7 @@ impl Picker {
                 tree.filter = filter;
                 tree.collapsed.clear();
                 tree.rebuild_visible();
-                let focus = selected.unwrap_or(tree.head);
+                let focus = selected.unwrap_or(tree.last_filter_focus);
                 self.focus_record(focus);
                 return Input::Continue;
             }
@@ -900,14 +935,11 @@ impl Picker {
             }
         }
         if cancel {
-            if let Some(tree) = &mut self.tree
-                && !self.query.is_empty()
+            if !self.query.is_empty()
+                && let Some(focus) = self.tree_filter_focus()
             {
                 self.query.clear();
-                tree.collapsed.clear();
-                tree.rebuild_visible();
-                let head = tree.head;
-                self.focus_record(head);
+                self.apply_search_focus(Some(focus));
                 return Input::Continue;
             }
             return Input::Cancel;
@@ -938,16 +970,18 @@ impl Picker {
         }
         if keys.matches("tui.editor.deleteCharBackward", key) {
             if let Some((index, _)) = self.query.grapheme_indices(true).next_back() {
+                let focus = self.tree_filter_focus();
                 self.query.truncate(index);
-                self.unfold_tree_for_search();
+                self.apply_search_focus(focus);
+            } else if self.tree.is_none() {
+                self.selected = 0;
             }
-            self.selected = 0;
             return Input::Continue;
         }
         if keys.matches("tui.editor.deleteWordBackward", key) {
+            let focus = self.tree_filter_focus();
             self.query.truncate(previous_word_start(&self.query));
-            self.selected = 0;
-            self.unfold_tree_for_search();
+            self.apply_search_focus(focus);
             return Input::Continue;
         }
         match key.code {
@@ -958,9 +992,9 @@ impl Picker {
                     KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                 ) =>
             {
+                let focus = self.tree_filter_focus();
                 self.query.push(character);
-                self.selected = 0;
-                self.unfold_tree_for_search();
+                self.apply_search_focus(focus);
             }
             _ => {}
         }
@@ -1608,12 +1642,12 @@ struct TreeState {
     labels: std::collections::BTreeMap<u64, String>,
     label_timestamps: std::collections::BTreeMap<u64, String>,
     show_label_timestamps: bool,
+    last_filter_focus: u64,
     roots: Vec<u64>,
     order: Vec<u64>,
     active_path: std::collections::BTreeSet<u64>,
     collapsed: std::collections::BTreeSet<u64>,
     visible: std::collections::BTreeSet<u64>,
-    head: u64,
 }
 
 struct TreeGutter {
@@ -1763,12 +1797,12 @@ impl TreeState {
             labels,
             label_timestamps: Default::default(),
             show_label_timestamps: false,
+            last_filter_focus: head,
             roots,
             order: vec![],
             active_path,
             collapsed: Default::default(),
             visible: Default::default(),
-            head,
         };
         let mut pending: Vec<_> = tree.roots.iter().rev().copied().collect();
         while let Some(id) = pending.pop() {
@@ -2718,6 +2752,67 @@ mod tests {
         assert!(
             picker.tree.as_ref().unwrap().collapsed.is_empty(),
             "editing search clears folds"
+        );
+    }
+
+    #[test]
+    fn tree_search_keeps_selection_through_empty_results_and_escape() {
+        let entries = [
+            (1, (None, TreeEntryKind::User)),
+            (2, (Some(1), TreeEntryKind::Message)),
+            (3, (Some(2), TreeEntryKind::User)),
+        ]
+        .into_iter()
+        .collect();
+        let items = ["shared alpha", "shared beta", "shared gamma"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, label)| Item {
+                label: label.into(),
+                selection: Selection::Checkout(index as u64 + 1),
+            })
+            .collect();
+        let labels = [(2, "checkpoint".into())].into_iter().collect();
+        let mut picker = Picker::tree(items, entries, labels, 3, TreeFilter::Default);
+        let keys = Keys::default();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let selected = |picker: &Picker| {
+            picker
+                .matches()
+                .get(picker.selected)
+                .map(|item| match item.selection {
+                    Selection::Checkout(id) => id,
+                    _ => unreachable!(),
+                })
+        };
+
+        picker.input(key(KeyCode::Up), &keys);
+        picker.paste("SHARED");
+        assert_eq!(selected(&picker), Some(2));
+        picker.input(key(KeyCode::Char('x')), &keys);
+        assert_eq!(selected(&picker), None);
+        picker.input(key(KeyCode::Backspace), &keys);
+        assert_eq!(selected(&picker), Some(2));
+        picker.paste(" checkpoint beta");
+        assert_eq!(selected(&picker), Some(2));
+        picker.paste(" absent");
+        assert_eq!(selected(&picker), None);
+        assert!(matches!(
+            picker.input(key(KeyCode::Esc), &keys),
+            Input::Continue
+        ));
+        assert_eq!(selected(&picker), Some(2));
+        assert!(matches!(
+            picker.input(key(KeyCode::Esc), &keys),
+            Input::Cancel
+        ));
+
+        picker.focus_record(3);
+        picker.paste("beta");
+        assert_eq!(
+            selected(&picker),
+            Some(2),
+            "fall back to the visible ancestor"
         );
     }
 

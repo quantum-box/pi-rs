@@ -5345,7 +5345,10 @@ atomic paste markers.
 
 Tree fold and jump keys now follow visible branch segments rather than folding
 or stepping through every record. Filtered-out intermediate records attach to
-nearest visible ancestors for navigation; changing the search clears folds.
+nearest visible ancestors for navigation. Search matches every whitespace-separated
+term regardless of order or case. Editing or clearing the search unfolds branches
+and retains the selected entry or its nearest visible ancestor, including when
+the search temporarily finds no entries.
 Focused selector tests cover linear chains, branches, hidden records, search,
 and fold/unfold behavior. Other tree layout and navigation differences remain.
 
