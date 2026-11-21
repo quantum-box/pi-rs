@@ -3976,7 +3976,9 @@ impl Agent<'_> {
                     )
                     .await;
                     reply.outcome = bound_tool_outcome(reply.outcome, max_output_bytes)?;
-                    if let Some(mut hooks) = message_hooks {
+                    if let Some(mut hooks) = message_hooks
+                        && !cancel.is_cancelled()
+                    {
                         reply.outcome = hooks
                             .tool(&invocation.call.id, reply.outcome, max_output_bytes)
                             .await;
