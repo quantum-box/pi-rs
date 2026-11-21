@@ -10,6 +10,86 @@
         "  b",
         "  c"
       ]
+    },
+    {
+      "source": "alpha beta gamma",
+      "width": 9,
+      "lines": [
+        "alpha",
+        "beta",
+        "gamma"
+      ]
+    },
+    {
+      "source": "alpha **beta** gamma",
+      "width": 9,
+      "lines": [
+        "alpha",
+        "beta",
+        "gamma"
+      ]
+    },
+    {
+      "source": "alpha beta\ngamma delta",
+      "width": 9,
+      "lines": [
+        "alpha",
+        "beta",
+        "gamma",
+        "delta"
+      ]
+    },
+    {
+      "source": "- alpha beta gamma",
+      "width": 11,
+      "lines": [
+        "- alpha",
+        "  beta",
+        "  gamma"
+      ]
+    },
+    {
+      "source": "- [x] alpha beta gamma",
+      "width": 14,
+      "lines": [
+        "- [x] alpha",
+        "      beta",
+        "      gamma"
+      ]
+    },
+    {
+      "source": "> alpha beta gamma",
+      "width": 11,
+      "lines": [
+        "│ alpha",
+        "│ beta",
+        "│ gamma"
+      ]
+    },
+    {
+      "source": "alpha chartreuse",
+      "width": 9,
+      "lines": [
+        "alpha",
+        "chartreus",
+        "e"
+      ]
+    },
+    {
+      "source": "abc 日本語 test",
+      "width": 8,
+      "lines": [
+        "abc 日本",
+        "語 test"
+      ]
+    },
+    {
+      "source": "paint 🧑‍💻 next",
+      "width": 8,
+      "lines": [
+        "paint 🧑‍💻",
+        "next"
+      ]
     }
   ],
   "cases": [

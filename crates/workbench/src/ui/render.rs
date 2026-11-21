@@ -760,6 +760,140 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
     lines
 }
 
+/// Wrap styled prose at word boundaries and at literal source breaks.
+pub(super) fn wrap_words(spans: &[Span], width: usize) -> Vec<Line> {
+    if spans.iter().any(|span| span.searchable() != span.text) {
+        return wrap(spans, width);
+    }
+    if !spans.iter().any(|span| span.text.contains('\n')) {
+        return wrap_word_row(spans, width);
+    }
+    let mut output = Vec::new();
+    let mut row = Vec::new();
+    for span in spans {
+        for (index, text) in span.text.split('\n').enumerate() {
+            if index > 0 {
+                output.extend(wrap_word_row(&row, width));
+                row.clear();
+            }
+            if !text.is_empty() {
+                let mut fragment = span.clone();
+                fragment.text = text.to_owned();
+                row.push(fragment);
+            }
+        }
+    }
+    output.extend(wrap_word_row(&row, width));
+    output
+}
+
+fn javascript_whitespace(ch: char) -> bool {
+    (ch.is_whitespace() && ch != '\u{0085}') || ch == '\u{feff}'
+}
+
+fn wrap_word_row(spans: &[Span], width: usize) -> Vec<Line> {
+    let text: String = spans.iter().map(|span| span.text.as_str()).collect();
+    // Preserve the existing source mapping for search-only controls and
+    // the existing behavior for raw rows that contain an embedded break.
+    if width < 2 || text.contains(['\n', '\r', '\t']) || text.width() <= width {
+        return wrap(spans, width);
+    }
+    let Some(ranges) = wrapped_ranges(&text, width) else {
+        return wrap(spans, width);
+    };
+    let mut span_start = 0;
+    let mut remaining = spans.iter().peekable();
+    ranges
+        .into_iter()
+        .map(|range| {
+            let mut line = Line::default();
+            while let Some(span) = remaining.peek() {
+                let span_end = span_start + span.text.len();
+                let start = range.start.max(span_start);
+                let end = range.end.min(span_end);
+                if start < end {
+                    let mut piece = (*span).clone();
+                    piece.text = span.text[start - span_start..end - span_start].into();
+                    line.spans.push(piece);
+                }
+                if span_end > range.end {
+                    break;
+                }
+                remaining.next();
+                span_start = span_end;
+            }
+            line
+        })
+        .collect()
+}
+
+// Pi's Text component wraps on spaces and CJK graphemes. Advance by
+// complete words first, then split a word wider than the available row.
+fn wrapped_ranges(text: &str, width: usize) -> Option<Vec<Range<usize>>> {
+    static CJK: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"[\p{scx:Han}\p{scx:Hiragana}\p{scx:Katakana}\p{scx:Hangul}\p{scx:Bopomofo}]",
+        )
+        .expect("valid CJK script classes")
+    });
+    let is_cjk = |grapheme: &str| !grapheme.is_ascii() && CJK.is_match(grapheme);
+    let trim = |start: usize, end: usize| {
+        start
+            ..start
+                + text[start..end]
+                    .trim_end_matches(javascript_whitespace)
+                    .len()
+    };
+    let mut glyphs = text.grapheme_indices(true).peekable();
+    let mut ranges = Vec::new();
+    let mut row_start = 0;
+    let mut used = 0;
+    while let Some((start, first)) = glyphs.next() {
+        let mut token_width = first.width();
+        if !is_cjk(first) {
+            let space = first == " ";
+            while let Some(&(_, next)) = glyphs.peek() {
+                if (next == " ") != space || is_cjk(next) {
+                    break;
+                }
+                token_width += next.width();
+                glyphs.next();
+            }
+        }
+        let end = glyphs.peek().map_or(text.len(), |&(index, _)| index);
+        let whitespace = text[start..end].chars().all(javascript_whitespace);
+        if used + token_width > width && used > 0 {
+            ranges.push(trim(row_start, start));
+            row_start = start;
+            used = 0;
+            if whitespace {
+                row_start = end;
+                continue;
+            }
+        }
+        if token_width > width && !whitespace {
+            for (offset, glyph) in text[start..end].grapheme_indices(true) {
+                let size = glyph.width();
+                if size > width {
+                    return None;
+                }
+                if used > 0 && used + size > width {
+                    ranges.push(row_start..start + offset);
+                    row_start = start + offset;
+                    used = 0;
+                }
+                used += size;
+            }
+        } else {
+            used += token_width;
+        }
+    }
+    if row_start < text.len() || ranges.is_empty() {
+        ranges.push(trim(row_start, text.len()));
+    }
+    Some(ranges)
+}
+
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 // Syntect's synthetic colors identify semantic roles; the active Pi theme is
 // applied afterwards so indexed terminal colors and dim styling survive.
@@ -2692,7 +2826,7 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
         } else {
             spans.as_slice()
         };
-        for (index, mut line) in wrap(body, width.saturating_sub(indent))
+        for (index, mut line) in wrap_words(body, width.saturating_sub(indent))
             .into_iter()
             .enumerate()
         {
@@ -2706,7 +2840,7 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
             lines.push(line);
         }
     } else {
-        lines.extend(wrap(spans, width));
+        lines.extend(wrap_words(spans, width));
     }
     spans.clear();
 }
