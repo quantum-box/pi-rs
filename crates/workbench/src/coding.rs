@@ -15,6 +15,7 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub use crate::shell_config::{ShellConfig, ShellContext, ShellSpawnContext, ShellSpawnHook};
+use crate::tool_output::js_number;
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ORIGINAL_IMAGE_BYTES: usize = 6 * 1024 * 1024;
@@ -842,7 +843,11 @@ impl<R: Seek> Seek for CancellableReader<R> {
 #[async_trait::async_trait]
 impl Tool for RemoteReadTool {
     fn spec(&self) -> ToolSpec {
-        self.tool.spec()
+        let mut spec = self.tool.spec();
+        for parameter in ["offset", "limit"] {
+            spec.parameters["properties"][parameter] = read_page_parameter(false);
+        }
+        spec
     }
     fn constrained_sampling(&self) -> Option<ToolConstraint> {
         self.tool.constrained_sampling()
@@ -2089,6 +2094,14 @@ struct CodingTool {
     kind: Kind,
 }
 
+fn read_page_parameter(pi_numeric: bool) -> Value {
+    if pi_numeric {
+        json!({"type":"number"})
+    } else {
+        json!({"type":"integer","minimum":1})
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for CodingTool {
     fn spec(&self) -> ToolSpec {
@@ -2097,7 +2110,7 @@ impl Tool for CodingTool {
             Kind::Read { .. } => (
                 "read",
                 "Read text with optional one-based line offset and line limit, or return a PNG/JPEG/GIF/WebP/BMP/TIFF image to the model.",
-                json!({"path":path,"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}}),
+                json!({"path":path,"offset":read_page_parameter(self.unrestricted),"limit":read_page_parameter(self.unrestricted)}),
                 vec!["path"],
             ),
             Kind::Write => (
@@ -2271,6 +2284,7 @@ impl Tool for CodingTool {
                         || message.starts_with("ENOTDIR: not a directory, access '")
                         || message.starts_with("EACCES: permission denied, access '")
                         || message == "EISDIR: illegal operation on a directory, read"
+                        || message == crate::text_page::PI_FRACTIONAL_OVERSIZE_LINE
                         || (message.starts_with("Offset ")
                             && message.contains(" is beyond end of file (")
                             && message.ends_with(" lines total)"))) =>
@@ -2468,10 +2482,6 @@ fn is_unix_access_denied(_error: &std::io::Error) -> bool {
 // Pi parses JSON numbers as JavaScript doubles and formats them using Number.toString.
 fn local_numeric_limit(args: &Value, default: f64) -> f64 {
     args.get("limit").and_then(Value::as_f64).unwrap_or(default)
-}
-
-fn js_number(value: f64) -> String {
-    ryu_js::Buffer::new().format(value).to_owned()
 }
 
 // fd receives String(limit), and its --max-results parser accepts usize. Zero
@@ -2832,6 +2842,15 @@ impl CodingTool {
                 data,
                 attachments: vec![],
             });
+        }
+        if self.unrestricted {
+            return crate::text_page::read_pi(
+                &path,
+                display_path,
+                args["offset"].as_f64().unwrap_or(1.0),
+                args["limit"].as_f64(),
+                cancellation,
+            );
         }
         let offset = usize::try_from(args["offset"].as_u64().unwrap_or(1).saturating_sub(1))
             .unwrap_or(usize::MAX);
@@ -6047,6 +6066,112 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "beta delta gamma");
         assert!(tool.edit(&json!({"path":"a.txt","edits":[{"oldText":"beta delta","newText":"x"},{"oldText":"delta","newText":"y"}]})).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "beta delta gamma");
+    }
+
+    #[tokio::test]
+    async fn unrestricted_read_accepts_pi_numeric_paging() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("page.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        std::fs::write(root.join("long.txt"), "x".repeat(MAX_OUTPUT_BYTES + 1)).unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                model_supports_images: None,
+            },
+        };
+        let validator = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool.clone()
+        };
+        let scoped_validator = jsonschema::validator_for(&scoped.spec().parameters).unwrap();
+        assert!(!scoped_validator.is_valid(&json!({"path": "page.txt", "offset": 2.7})));
+        assert!(!scoped_validator.is_valid(&json!({"path": "page.txt", "limit": -1})));
+        for (offset, limit, expected) in [
+            (0.0, 100.0, "a\nb\nc\nd\ne\n"),
+            (
+                -2.5,
+                1.5,
+                "a\n\n[4.5 more lines in file. Use offset=2.5 to continue.]",
+            ),
+            (
+                2.7,
+                1.5,
+                "b\nc\n\n[2.8 more lines in file. Use offset=4.2 to continue.]",
+            ),
+            (
+                1.0,
+                0.0,
+                "\n\n[6 more lines in file. Use offset=1 to continue.]",
+            ),
+            (
+                1.0,
+                -1.0,
+                "a\nb\nc\nd\ne\n\n[7 more lines in file. Use offset=0 to continue.]",
+            ),
+            (
+                2.2,
+                -2.5,
+                "b\nc\nd\ne\n\n[7.3 more lines in file. Use offset=-0.2999999999999998 to continue.]",
+            ),
+            (
+                4.1,
+                -1.0,
+                "\n\n[3.9000000000000004 more lines in file. Use offset=3.0999999999999996 to continue.]",
+            ),
+        ] {
+            let args = json!({"path":"page.txt", "offset":offset, "limit":limit});
+            assert!(validator.is_valid(&args), "{args}");
+            let result = tool
+                .invoke(
+                    args,
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(&result, Outcome::Succeeded(text) if text == expected),
+                "{result:?}"
+            );
+        }
+        for (path, offset, expected) in [
+            (
+                "page.txt",
+                7.2,
+                "Offset 7.2 is beyond end of file (6 lines total)",
+            ),
+            (
+                "page.txt",
+                1e30,
+                "Offset 1e+30 is beyond end of file (6 lines total)",
+            ),
+            (
+                "long.txt",
+                1.5,
+                crate::text_page::PI_FRACTIONAL_OVERSIZE_LINE,
+            ),
+        ] {
+            let result = tool
+                .invoke(
+                    json!({"path":path, "offset":offset}),
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(&result, Outcome::Failed(message) if message == expected),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]
