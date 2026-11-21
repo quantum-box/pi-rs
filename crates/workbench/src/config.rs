@@ -1119,7 +1119,7 @@ fn read_json_object(
                 let reason = if path.file_name().is_some_and(|name| name == "settings.json")
                     && let Ok(text) = std::str::from_utf8(input)
                 {
-                    super::rpc::json_syntax_diagnostic(text, &error)
+                    pi_rs::json_syntax_diagnostic(text, &error)
                 } else {
                     error.to_string()
                 };
