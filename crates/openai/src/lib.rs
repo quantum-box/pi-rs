@@ -1019,6 +1019,58 @@ impl Model for OpenAiResponses {
     }
 }
 
+fn limit_visible_output(
+    mut stream: pi_rs_core::EnrichedModelStream,
+    allowance: u32,
+) -> pi_rs_core::EnrichedModelStream {
+    use pi_rs_core::EnrichedModelEvent::{
+        Legacy, ReasoningDelta, ReasoningEnd, TextDelta, TextEnd,
+    };
+    Box::pin(async_stream::try_stream! {
+        let limit = u64::from(allowance);
+        let mut visible_units = 0_u64;
+        let mut text = BTreeMap::new();
+        let mut reasoning = BTreeMap::new();
+        while let Some(event) = stream.next().await {
+            let event = event?;
+            let units = |text: &str| text.encode_utf16().count() as u64;
+            let mut observe = |parts: &mut BTreeMap<u64, u64>, index, content: &str, final_block| {
+                let previous = parts.entry(index).or_default();
+                let observed = units(content);
+                let added = if final_block {
+                    observed.saturating_sub(*previous)
+                } else {
+                    observed
+                };
+                *previous = previous.saturating_add(added);
+                visible_units = visible_units.saturating_add(added);
+            };
+            match &event {
+                TextDelta { index, delta } => observe(&mut text, *index, delta, false),
+                TextEnd { index, content } => observe(&mut text, *index, content, true),
+                ReasoningDelta { index, delta } => observe(&mut reasoning, *index, delta, false),
+                ReasoningEnd { index, content } => observe(&mut reasoning, *index, content, true),
+                Legacy(ModelEvent::Text(delta) | ModelEvent::Reasoning(delta)) => {
+                    visible_units = visible_units.saturating_add(units(delta));
+                }
+                Legacy(ModelEvent::ToolCallDelta(delta)) => {
+                    visible_units = visible_units
+                        .saturating_add(units(&delta.name))
+                        .saturating_add(units(&delta.arguments));
+                }
+                Legacy(ModelEvent::Complete { usage: Some(usage), .. }) if usage.output_tokens > limit => {
+                    Err(Error::Budget)?;
+                }
+                _ => {}
+            }
+            if visible_units.div_ceil(4) > limit {
+                Err(Error::Budget)?;
+            }
+            yield event;
+        }
+    })
+}
+
 impl OpenAiResponses {
     fn stream_only_constrained_tools(
         &self,
@@ -1210,7 +1262,7 @@ impl OpenAiResponses {
             if !pending.is_empty() { yield Ok(pending); }
         };
         let mut source = Box::pin(bytes.eventsource());
-        Ok(Box::pin(async_stream::try_stream! {
+        let stream: pi_rs_core::EnrichedModelStream = Box::pin(async_stream::try_stream! {
             let mut started = false;
             let mut calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
             let mut reasoning: BTreeMap<u64, String> = BTreeMap::new();
@@ -1350,12 +1402,40 @@ impl OpenAiResponses {
             } else {
                 Err(Error::Model("invalid OpenAI event stream".into()))?;
             }
-        }))
+        });
+        if self.send_max_output_tokens {
+            Ok(stream)
+        } else {
+            Ok(limit_visible_output(stream, request.max_output_tokens))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn responses_without_a_wire_limit_enforce_the_visible_budget() {
+        use pi_rs_core::EnrichedModelEvent::{TextDelta, TextEnd};
+        let events = vec![
+            Ok(TextDelta {
+                index: 0,
+                delta: "four".into(),
+            }),
+            Ok(TextEnd {
+                index: 0,
+                content: "four".into(),
+            }),
+            Ok(TextDelta {
+                index: 1,
+                delta: "over!".into(),
+            }),
+        ];
+        let mut stream = limit_visible_output(Box::pin(futures_util::stream::iter(events)), 2);
+        assert!(matches!(stream.next().await, Some(Ok(TextDelta { .. }))));
+        assert!(matches!(stream.next().await, Some(Ok(TextEnd { .. }))));
+        assert!(matches!(stream.next().await, Some(Err(Error::Budget))));
+    }
+
     #[tokio::test]
     async fn interleaved_text_items_have_boundaries_and_legacy_projection() {
         use std::io::{Read, Write};

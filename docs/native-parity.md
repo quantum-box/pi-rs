@@ -4047,8 +4047,9 @@ support continue to omit it.
 
 Responses-compatible endpoints that reject `max_output_tokens` can set
 `compat.supportsMaxOutputTokens: false` at the provider or model level, or in
-`modelOverrides`. Dispatch then omits the field. The local output budget
-still applies.
+`modelOverrides`. Dispatch then omits the field and enforces the configured
+allowance against Pi's estimate of streamed output. Hidden reasoning may
+only be counted when the provider reports final usage.
 
 Grammar declarations on this SDK path currently fall back to function tools.
 Responses accepts initial and finalized argument fragments that extend the
