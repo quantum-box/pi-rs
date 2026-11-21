@@ -268,6 +268,8 @@ fn push_splice(result: &mut String, part: &str) {
 }
 
 fn line_ending_at(original: &str, offset: usize) -> &'static str {
+    // Pi uses lone CR for inserted breaks only when the file has no LF.
+    // Otherwise it selects the next LF (or the preceding one at EOF).
     let bytes = original.as_bytes();
     let line_feed = bytes[offset..]
         .iter()
