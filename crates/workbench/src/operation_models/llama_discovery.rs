@@ -1,11 +1,17 @@
 use super::{Api, Configured, Cost, Entry, RESPONSE_LIMIT, llama_cpp, operation_endpoints};
 use crate::model_auth::{Credential, Keys, valid_key};
 
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    time::Duration,
+};
 
 use reqwest::{Client, Url};
-use serde::Deserialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -54,7 +60,7 @@ impl Model {
             || (autoload && self.unloaded_preset() && !self.status.failed)
     }
 
-    fn context_window(&self) -> u32 {
+    fn context_window(&self, cached: Option<u32>) -> u32 {
         let positive = |value: Option<u32>| value.filter(|value| *value > 0);
         let meta = self.meta.as_ref();
         positive(meta.and_then(|meta| meta.n_ctx))
@@ -67,18 +73,36 @@ impl Model {
                     }
                 })
             })
+            .or_else(|| positive(cached))
             .or_else(|| positive(meta.and_then(|meta| meta.n_ctx_train)))
             .unwrap_or(128_000)
     }
 
-    fn entry(self, root: &Url) -> Option<Entry> {
-        let window = self.context_window();
-        let decision = self.architecture.is_some_and(|arch| {
+    fn classifier(self, cached_window: Option<u32>) -> Classifier {
+        let context_window = self.context_window(cached_window);
+        let decisions = self.architecture.is_some_and(|arch| {
             arch.output_modalities
                 .iter()
                 .any(|kind| kind == "decisions")
         });
-        let api = if decision {
+        Classifier {
+            id: self.id,
+            context_window,
+            decisions,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct Classifier {
+    id: String,
+    context_window: u32,
+    decisions: bool,
+}
+
+impl Classifier {
+    fn entry(self, root: &Url) -> Option<Entry> {
+        let api = if self.decisions {
             Api::SystemOne
         } else {
             Api::LlamaCppClassifier
@@ -94,7 +118,7 @@ impl Model {
                 input: None,
                 output: None,
                 input_limits: None,
-                context_window: Some(window),
+                context_window: Some(self.context_window),
                 cost: Cost::default(),
                 headers: Default::default(),
                 compat: Default::default(),
@@ -162,13 +186,71 @@ pub(super) fn configured_server(
     Some((environment_root?, environment_key()))
 }
 
-pub(super) async fn discover(client: &Client, root: &Url, key: Option<&str>) -> Vec<Entry> {
+pub(super) async fn catalogue(
+    client: Option<&Client>,
+    root: &Url,
+    key: Option<&str>,
+    cache: PathBuf,
+) -> Vec<Entry> {
     if key.is_some_and(|key| !valid_key(key)) {
         return Vec::new();
     }
-    let Some(models) = get_json::<Models>(client, root, "models", key).await else {
-        return Vec::new();
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(b"pi-rs llama classifier catalog v1\0");
+    fingerprint.update(root.as_str());
+    fingerprint.update([0]);
+    fingerprint.update(key.unwrap_or_default());
+    let scope = format!("{:x}", fingerprint.finalize());
+    let stored = cached(&cache, &scope).await.unwrap_or_default();
+    let refreshed = match client {
+        Some(client) => discover(client, root, key, &stored).await,
+        None => None,
     };
+    let classifiers = match refreshed {
+        Some(classifiers) => {
+            let value = json!({ "scope": scope, "models": classifiers });
+            let _ = tokio::task::spawn_blocking(move || crate::config::write_json(&cache, &value))
+                .await;
+            classifiers
+        }
+        None => stored,
+    };
+    let mut seen = BTreeSet::new();
+    classifiers
+        .into_iter()
+        .filter(|model| !model.id.trim().is_empty() && model.id.len() <= 256)
+        .filter(|model| model.context_window > 0)
+        .filter(|model| seen.insert(model.id.clone()))
+        .filter_map(|model| model.entry(root))
+        .collect()
+}
+
+async fn cached(cache: &std::path::Path, scope: &str) -> Option<Vec<Classifier>> {
+    #[derive(Deserialize)]
+    struct Snapshot {
+        scope: String,
+        models: Vec<Classifier>,
+    }
+    let file = tokio::fs::File::open(cache).await.ok()?;
+    let mut bytes = Vec::new();
+    file.take((RESPONSE_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .ok()?;
+    if bytes.len() > RESPONSE_LIMIT {
+        return None;
+    }
+    let snapshot = serde_json::from_slice::<Snapshot>(&bytes).ok()?;
+    (snapshot.scope == scope).then_some(snapshot.models)
+}
+
+async fn discover(
+    client: &Client,
+    root: &Url,
+    key: Option<&str>,
+    stored: &[Classifier],
+) -> Option<Vec<Classifier>> {
+    let models = get_json::<Models>(client, root, "models", key).await?;
     let autoload = if models.data.iter().any(Model::unloaded_preset) {
         get_json::<Value>(client, root, "props", key)
             .await
@@ -176,15 +258,21 @@ pub(super) async fn discover(client: &Client, root: &Url, key: Option<&str>) -> 
     } else {
         false
     };
-    let mut seen = BTreeSet::new();
-    models
-        .data
-        .into_iter()
-        .filter(|model| model.selectable(autoload))
-        .filter(|model| !model.id.trim().is_empty() && model.id.len() <= 256)
-        .filter(|model| seen.insert(model.id.clone()))
-        .filter_map(|model| model.entry(root))
-        .collect()
+    let cached_windows: BTreeMap<_, _> = stored
+        .iter()
+        .map(|model| (model.id.as_str(), model.context_window))
+        .collect();
+    Some(
+        models
+            .data
+            .into_iter()
+            .filter(|model| model.selectable(autoload))
+            .map(|model| {
+                let window = cached_windows.get(model.id.as_str()).copied();
+                model.classifier(window)
+            })
+            .collect(),
+    )
 }
 
 async fn get_json<T: serde::de::DeserializeOwned>(
@@ -258,7 +346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selects_router_models_and_routes_native_decisions() {
+    async fn selects_router_models_and_restores_the_matching_cached_catalog() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let models = json!({"data":[
@@ -270,9 +358,17 @@ mod tests {
             {"id":"loading","status":{"value":"loading"}},
         ]});
         let fixture = tokio::spawn(async move {
-            for (route, response) in [
-                ("/prefix/models", models),
-                ("/prefix/props", json!({"models_autoload":true})),
+            for (route, status, response) in [
+                ("/prefix/models", "200 OK", models),
+                ("/prefix/props", "200 OK", json!({"models_autoload":true})),
+                ("/prefix/models", "503 Unavailable", json!({})),
+                (
+                    "/prefix/models",
+                    "200 OK",
+                    json!({"data":[{"id":"chat","status":{"value":"sleeping"},
+                        "meta":{"n_ctx_train":4096}}]}),
+                ),
+                ("/prefix/models", "200 OK", json!({"data":[]})),
             ] {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut stream = BufReader::new(stream);
@@ -294,7 +390,7 @@ mod tests {
                 let response = response.to_string();
                 stream
                     .write_all(format!(
-                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
                         response.len()
                     ).as_bytes())
                     .await
@@ -302,12 +398,10 @@ mod tests {
             }
         });
         let client = Client::builder().no_proxy().build().unwrap();
-        let entries = discover(
-            &client,
-            &server_root(&format!("http://{address}/prefix/v1/")).unwrap(),
-            Some("fixture"),
-        )
-        .await;
+        let home = tempfile::tempdir().unwrap();
+        let cache = home.path().join("llama-classifiers.json");
+        let root = server_root(&format!("http://{address}/prefix/v1/")).unwrap();
+        let entries = catalogue(Some(&client), &root, Some("fixture"), cache.clone()).await;
         assert_eq!(
             entries
                 .iter()
@@ -321,6 +415,43 @@ mod tests {
         assert!(matches!(entries[1].api, Api::SystemOne));
         assert!(entries[1].allows_keyless());
         assert_eq!(entries[2].model.context_window, Some(2048));
+        let expected = entries.iter().map(Entry::descriptor).collect::<Vec<_>>();
+        for connection in [None, Some(&client)] {
+            let restored = catalogue(connection, &root, Some("fixture"), cache.clone()).await;
+            assert_eq!(
+                restored.iter().map(Entry::descriptor).collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(restored[1].endpoint, entries[1].endpoint);
+        }
+        let saved = tokio::fs::read_to_string(&cache).await.unwrap();
+        assert!(!saved.contains("fixture"));
+        assert!(!saved.contains(root.as_str()));
+        assert!(
+            catalogue(None, &root, Some("other"), cache.clone())
+                .await
+                .is_empty()
+        );
+        let different_root = server_root(&format!("http://{address}/other/v1/")).unwrap();
+        assert!(
+            catalogue(None, &different_root, Some("fixture"), cache.clone())
+                .await
+                .is_empty()
+        );
+        let updated = catalogue(Some(&client), &root, Some("fixture"), cache.clone()).await;
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].model.id, "chat");
+        assert_eq!(updated[0].model.context_window, Some(8192));
+        assert!(
+            catalogue(Some(&client), &root, Some("fixture"), cache.clone())
+                .await
+                .is_empty()
+        );
+        assert!(
+            catalogue(None, &root, Some("fixture"), cache)
+                .await
+                .is_empty()
+        );
         fixture.await.unwrap();
     }
 }

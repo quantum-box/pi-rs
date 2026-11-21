@@ -4610,7 +4610,13 @@ autoload, can appear as classifiers.
 Models advertising `decisions` output use `/v1/systemone`; other models use
 next-token classification. Explicit model entries take precedence and inherit
 the router key only when their operation endpoint matches the configured router.
-`--offline` skips discovery. This refresh is scoped to the native Codemode
+The last successful catalog is restored when the same router and credential
+are used offline or a refresh fails. The cache contains classifier metadata
+and a scope fingerprint. It stores no raw credential or endpoint.
+When a refresh omits the runtime and configured context windows, it reuses
+the cached model's context window.
+Offline discovery uses a configured literal key or a keyless router without
+resolving credential commands. This refresh is scoped to the native Codemode
 classifier catalog. Pi also refreshes its chat catalog. A llama-server 1.0.0
 router run discovered an unloaded preset and exercised autoload and
 classification via Codemode. An authenticated run verified saved endpoint and

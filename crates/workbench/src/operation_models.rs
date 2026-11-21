@@ -966,9 +966,6 @@ impl Operations {
     }
 
     pub async fn discover_llama(&mut self) {
-        if self.args.offline {
-            return;
-        }
         let keys = Keys::load_async().await.unwrap_or_default();
         let Some((root, key)) =
             llama_discovery::configured_server(&keys, |name| std::env::var(name).ok())
@@ -976,13 +973,19 @@ impl Operations {
             return;
         };
         let key = match key {
+            Some(key) if self.args.offline => match key.literal() {
+                Some(secret) => Some(secret.to_owned()),
+                None => return,
+            },
             Some(key) => match tokio::time::timeout(Duration::from_secs(2), key.resolve()).await {
                 Ok(Ok(secret)) => Some(secret),
                 _ => return,
             },
             None => None,
         };
-        let discovered = llama_discovery::discover(&self.client, &root, key.as_deref()).await;
+        let cache = super::config::agent_dir().join("llama-classifier-models.json");
+        let client = (!self.args.offline).then_some(&self.client);
+        let discovered = llama_discovery::catalogue(client, &root, key.as_deref(), cache).await;
         let configured = &mut self.args.model_profiles.operations_mut().0;
         for entry in discovered {
             if !configured.iter().any(|model| {
