@@ -818,7 +818,7 @@ mod tests {
                     mcp.register_mcp_server(declaration("active", "fixture"))
                         .await
                         .unwrap();
-                    *self.scope.lock().unwrap() = Some(mcp);
+                    *self.scope.lock().unwrap() = Some(mcp.clone());
                 }
                 if let crate::LifecycleEvent::McpServersChange { servers } = event {
                     self.changes.lock().unwrap().push(
