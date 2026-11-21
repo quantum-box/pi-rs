@@ -1417,6 +1417,20 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Opt in to assistant message starts, streaming updates, and final messages.
+    fn handles_message_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// A completed message may be replaced with a message of the same role.
+    async fn message_lifecycle(
+        &self,
+        _event: &crate::MessageLifecycleEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<crate::Message>> {
+        Ok(None)
+    }
+
     /// Opt in to observing tool execution start and end events.
     fn handles_tool_execution_lifecycle(&self) -> bool {
         false

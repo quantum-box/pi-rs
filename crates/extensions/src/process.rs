@@ -187,6 +187,10 @@ enum ProtocolRequest {
         state: Option<ExtensionState>,
         timeout_secs: Option<f64>,
     },
+    MessageLifecycle {
+        event: pi_rs_core::MessageLifecycleEvent,
+        state: Option<ExtensionState>,
+    },
     Lifecycle {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
@@ -364,6 +368,8 @@ struct Description {
     user_bash_operations_hook: bool,
     #[serde(default)]
     lifecycle_hook: bool,
+    #[serde(default)]
+    message_lifecycle_hook: bool,
     #[serde(default)]
     lifecycle_host_calls: bool,
     #[serde(default)]
@@ -1041,6 +1047,25 @@ impl Extension for ExecutableExtension {
             .await
             .map_err(|error| error.to_string())?
     }
+    fn handles_message_lifecycle(&self) -> bool {
+        self.description.message_lifecycle_hook
+    }
+
+    async fn message_lifecycle(
+        &self,
+        event: &pi_rs_core::MessageLifecycleEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<Message>> {
+        if !self.handles_message_lifecycle() {
+            return Ok(None);
+        }
+        self.request_async(ProtocolRequest::MessageLifecycle {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+
     fn handles_session_lifecycle(&self) -> bool {
         self.description.session_lifecycle_hook
     }
@@ -3593,6 +3618,7 @@ async fn dispatch_inner(
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
             lifecycle_hook: extension.handles_lifecycle(),
+            message_lifecycle_hook: extension.handles_message_lifecycle(),
             lifecycle_host_calls: true,
             tool_hook_host_calls: true,
             before_tool_host_calls: true,
@@ -3742,6 +3768,9 @@ async fn dispatch_inner(
                     }
                 }
             }
+        }
+        ProtocolRequest::MessageLifecycle { event, state } => {
+            encode(extension.message_lifecycle(&event, state.as_ref()).await)
         }
         ProtocolRequest::Lifecycle { event, state } => {
             if host.supports_custom_messages()
@@ -4331,6 +4360,64 @@ mod tests {
         assert!(!description.before_summary_compaction_v1);
         assert!(!description.compaction_overflow_reason_v1);
         assert!(!description.compaction_lifecycle_v1);
+    }
+
+    #[tokio::test]
+    async fn native_message_lifecycle_is_negotiated_and_returns_native_message() {
+        struct Rewrite;
+        #[async_trait::async_trait]
+        impl Extension for Rewrite {
+            fn id(&self) -> &str {
+                "rewrite"
+            }
+
+            fn handles_message_lifecycle(&self) -> bool {
+                true
+            }
+
+            async fn message_lifecycle(
+                &self,
+                event: &pi_rs_core::MessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Message>> {
+                let pi_rs_core::MessageLifecycleEvent::End {
+                    message: Message::Assistant { calls, content, .. },
+                    status: pi_rs_core::MessageStatus::Complete,
+                } = event
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(Message::Assistant {
+                    content: format!("{content}/edited"),
+                    calls: calls.clone(),
+                    replay: None,
+                }))
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Rewrite);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["message_lifecycle_hook"], true);
+        let output = dispatch(
+            extension,
+            ProtocolRequest::MessageLifecycle {
+                event: pi_rs_core::MessageLifecycleEvent::End {
+                    message: Message::Assistant {
+                        content: "raw".into(),
+                        calls: vec![],
+                        replay: None,
+                    },
+                    status: pi_rs_core::MessageStatus::Complete,
+                },
+                state: None,
+            },
+        )
+        .await
+        .unwrap();
+        let edited: Message = serde_json::from_value(output).unwrap();
+        assert!(matches!(edited, Message::Assistant { content, .. } if content == "raw/edited"));
     }
 
     #[tokio::test]

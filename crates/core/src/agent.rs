@@ -2932,7 +2932,24 @@ impl Agent<'_> {
         let mut reasoning_item_ids = HashSet::new();
         let mut observed_reasoning = std::collections::HashMap::<u64, String>::new();
         let mut reasoning_final_bytes = 0_usize;
+        use crate::AssistantMessageUpdate;
+        let mut message_hooks = retain_reply
+            .then(|| {
+                crate::message_hooks::MessageHooks::for_session(
+                    self.registry,
+                    session,
+                    self.limits.model_timeout,
+                )
+            })
+            .flatten();
         let collect = async {
+            macro_rules! message_update {
+                ($update:expr) => {
+                    if let Some(hooks) = &mut message_hooks {
+                        hooks.update(&text_parts, $update).await;
+                    }
+                };
+            }
             let session_id = session.session_id();
             let external_id = session.external_session_id();
             let opening = async {
@@ -2972,6 +2989,9 @@ impl Agent<'_> {
                     break;
                 };
                 let event = event?;
+                if let Some(hooks) = &mut message_hooks {
+                    hooks.start(false).await;
+                }
                 let redacted_start = event.is_redacted_start();
                 display_candidate.observe(&event.event);
                 match event.event {
@@ -2997,6 +3017,10 @@ impl Agent<'_> {
                         };
                         text_parts[slot].push_str(&delta);
                         text_len += delta.len();
+                        message_update!(AssistantMessageUpdate::TextDelta {
+                            content_index: None,
+                            delta: delta.clone()
+                        });
                         observer(Notification::Text(&delta));
                     }
                     EnrichedModelEvent::TextStart { index } => {
@@ -3008,6 +3032,9 @@ impl Agent<'_> {
                             text_item_ids.insert(index, text_parts.len());
                             text_parts.push(String::new());
                         }
+                        message_update!(AssistantMessageUpdate::TextStart {
+                            content_index: index
+                        });
                         with_text_event_metadata(TextEventMetadata::Start { index }, || {
                             observer(Notification::Text(""))
                         });
@@ -3035,6 +3062,10 @@ impl Agent<'_> {
                         }
                         text_parts[slot].push_str(&delta);
                         text_len += delta.len();
+                        message_update!(AssistantMessageUpdate::TextDelta {
+                            content_index: Some(index),
+                            delta: delta.clone(),
+                        });
                         with_text_event_metadata(TextEventMetadata::Delta { index }, || {
                             observer(Notification::Text(&delta))
                         });
@@ -3069,6 +3100,10 @@ impl Agent<'_> {
                         }
                         text_len = text_len - text_parts[slot].len() + final_content.len();
                         text_parts[slot] = final_content.clone();
+                        message_update!(AssistantMessageUpdate::TextEnd {
+                            content_index: index,
+                            content: final_content.clone(),
+                        });
                         with_text_event_metadata(
                             TextEventMetadata::End {
                                 index,
@@ -3080,6 +3115,10 @@ impl Agent<'_> {
                     EnrichedModelEvent::Legacy(ModelEvent::Reasoning(delta)) => {
                         reasoning_delta_bytes = reasoning_delta_bytes.saturating_add(delta.len());
                         if reasoning_delta_bytes <= MAX_RESPONSE_BYTES {
+                            message_update!(AssistantMessageUpdate::ThinkingDelta {
+                                content_index: None,
+                                delta: delta.clone()
+                            });
                             observer(Notification::Reasoning(&delta));
                         }
                     }
@@ -3094,6 +3133,10 @@ impl Agent<'_> {
                                 .entry(index)
                                 .or_default()
                                 .push_str(&delta);
+                            message_update!(AssistantMessageUpdate::ThinkingDelta {
+                                content_index: Some(index),
+                                delta: delta.clone(),
+                            });
                             with_reasoning_event_metadata(
                                 ReasoningEventMetadata::Delta { index },
                                 || observer(Notification::Reasoning(&delta)),
@@ -3105,6 +3148,10 @@ impl Agent<'_> {
                         if reasoning_item_ids.len() > MAX_ENRICHED_ITEMS {
                             return Err(Error::Model("too many reasoning items".into()));
                         }
+                        message_update!(AssistantMessageUpdate::ThinkingStart {
+                            content_index: index,
+                            redacted: redacted_start,
+                        });
                         with_redacted_reasoning_start(redacted_start, || {
                             with_reasoning_event_metadata(
                                 ReasoningEventMetadata::Start { index },
@@ -3126,6 +3173,10 @@ impl Agent<'_> {
                         } else {
                             observed
                         };
+                        message_update!(AssistantMessageUpdate::ThinkingEnd {
+                            content_index: index,
+                            content: content.clone(),
+                        });
                         with_reasoning_event_metadata(
                             ReasoningEventMetadata::End { index, content },
                             || observer(Notification::Reasoning("")),
@@ -3139,6 +3190,9 @@ impl Agent<'_> {
                                 + delta.arguments.len(),
                         );
                         if retain_reply && tool_delta_bytes <= MAX_RESPONSE_BYTES {
+                            message_update!(AssistantMessageUpdate::ToolCallDelta {
+                                tool_call: delta.clone()
+                            });
                             observer(Notification::ToolCallDelta(&delta));
                         }
                     }
@@ -3175,12 +3229,60 @@ impl Agent<'_> {
             }
             Err(Error::Model("stream ended before completion".into()))
         };
-        let result = tokio::select! {
+        let mut result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(Error::Cancelled),
             result = platform_time::timeout(self.limits.model_timeout, collect) =>
                 result.unwrap_or_else(|_| Err(Error::RetryableModel("request timed out".into()))),
         };
+        metadata.assistant_text_edited = false;
+        if let Some(mut hooks) = message_hooks {
+            match &mut result {
+                Ok(reply) => {
+                    let calls: Vec<_> = reply
+                        .invocations
+                        .iter()
+                        .map(|invocation| invocation.call.clone())
+                        .collect();
+                    // A complete provider response must be journaled consistently.
+                    // Finish the bounded edits even if cancellation arrived while observing.
+                    let edited = hooks
+                        .end(
+                            &reply.content,
+                            &calls,
+                            crate::MessageStatus::Complete,
+                            MAX_RESPONSE_BYTES,
+                        )
+                        .await;
+                    if let Some(content) = edited {
+                        reply.content = content;
+                        metadata.replay = crate::context_replay::replace_assistant_replay_text(
+                            &metadata,
+                            &reply.content,
+                        );
+                        metadata.assistant_text_edited = true;
+                    }
+                }
+                Err(error) => {
+                    let status = if matches!(error, Error::Cancelled) {
+                        crate::MessageStatus::Aborted
+                    } else {
+                        crate::MessageStatus::Failed
+                    };
+                    let partial = text_parts.concat();
+                    let settle = async {
+                        hooks.start(true).await;
+                        hooks.end(&partial, &[], status, MAX_RESPONSE_BYTES).await
+                    };
+                    let _ = platform_time::timeout(
+                        self.limits.model_timeout.min(Duration::from_secs(1)),
+                        settle,
+                    )
+                    .await;
+                }
+            }
+            hooks.report_errors(observer);
+        }
         let content = if result.is_ok() {
             String::new()
         } else {
@@ -3230,6 +3332,7 @@ impl Agent<'_> {
             )?;
         }
         let display_metadata = if retain_reply
+            && !metadata.assistant_text_edited
             && metadata.provider_api == Some(crate::ModelApi::AnthropicMessages)
             && metadata.reasoning.is_none()
             && metadata.replay.is_none()

@@ -4373,6 +4373,19 @@ extension callback finishes, including initial-prompt input hooks. Host scopes
 are bound to their session owner, so nested sessions cannot write to the
 caller’s journal. Ordinary control clones used by independently spawned tasks
 enter the normal FIFO queue.
+Native extensions can subscribe to assistant `message_start`,
+`message_update`, and `message_end` through the message lifecycle callback.
+The stream notifications use native text, thinking and tool-call fragments
+and arrive before the corresponding public notifications. A completed
+`message_end` may replace text within the response limit while retaining the
+assistant role and the provider's tool decisions. Edits are reflected in the
+model's retained reply, journal and final RPC message. Native provider replay
+retains opaque reasoning and tool data while replacing its visible text.
+Display layout is rebuilt after an edit, and context estimates use the
+edited text while billing retains measured usage. Failed and aborted
+attempts receive transient start and end notifications when needed. Executable extensions advertise
+`message_lifecycle_hook`. Summary requests stay outside the hook.
+
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
 and ordinary and truncated-tool execution events; settled `agent_end` and
