@@ -1917,15 +1917,21 @@ async fn execute(
                         codex_auth::Method::Browser
                     };
                     codex_auth::login(
-                        &args.settings,
-                        meta_auth::LoginControl::default(),
-                        method,
-                        |url, code| match code {
-                            Some(code) => eprintln!("Enter code {code} at {url}"),
-                            None => eprintln!("Continue in your browser: {url}"),
+                        &args.settings, meta_auth::LoginControl::default(), method,
+                        |notice| match notice {
+                            codex_auth::Notice::Device {url, code} => eprintln!("Enter code {code} at {url}"),
+                            codex_auth::Notice::Browser(url, sender) => {
+                                eprintln!("Continue in your browser: {url}");
+                                eprintln!("Paste the authorization code or redirect URL if the callback does not complete:");
+                                std::thread::spawn(move || {
+                                    let mut line = String::new();
+                                    if std::io::stdin().read_line(&mut line).is_ok_and(|count| count > 0) {
+                                        let _ = sender.send(line);
+                                    }
+                                });
+                            }
                         },
-                    )
-                    .await
+                    ).await
                 } else if provider == "xai" {
                     xai_auth::login(
                         &args.settings,

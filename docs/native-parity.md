@@ -4597,12 +4597,13 @@ their own adapters.
 Responses route. It supports native HTTP streaming, model-specific reasoning
 levels, image inputs, tool calls, and endpoint-bound response replay.
 `pi login openai-codex` uses browser PKCE, and `--device-code` selects
-device authorization. The terminal offers both methods. Existing Pi Codex
+device authorization. Browser sign-in also accepts a pasted code or redirect.
+The terminal offers both methods. Existing Pi Codex
 credentials can be read and refreshed in place. They stay bound to the
 official Codex endpoint and are independent of native `openai-chatgpt` accounts.
 
 Codex also accepts Pi's `transport` setting. `auto` and `websocket-cached`
-reuse a live connection and can send a transcript suffix when the request
+can reuse a direct connection and send a transcript suffix when the request
 matches the previous conversation. `websocket` sends the full history on
 the connection, and `sse` uses HTTP directly. An unavailable WebSocket
 upgrade falls back to HTTP SSE before any inference request is sent.
