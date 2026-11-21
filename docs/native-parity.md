@@ -132,7 +132,7 @@ without `defaultProvider` are still accepted.
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts with per-server resource pagination; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; automatic selection of configured hosted client metadata; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Live acceptance with a hosted pi-rs client identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and VT appearance notifications on Unix and Windows | Real Windows Terminal acceptance and remaining palette synchronization |
-| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, host-granted system prompt and explicit-directory context resource snapshots, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Complete resource/model/auth factories and remaining Pi SDK equivalents |
+| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, host-granted prompt, context, skill, template and theme resource snapshots, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Package and extension loading, model/auth factories and remaining Pi SDK equivalents |
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
@@ -5593,3 +5593,23 @@ comparing effective routes. Unconfigured and override-only models must resolve
 to the selected route. When they do, they retain provider-default or
 Gemini-version inference. Standalone Google SDK capability overrides remain
 endpoint-wide.
+
+### Combined native SDK resource snapshots
+
+`pi_rs_workbench::resource_factory::ResourceFactory` loads system prompts,
+context files, skill metadata, prompt templates, and themes together using the
+host's current file and directory grants. The returned snapshot preserves the
+paths exposed by the individual loaders, including skill diagnostics, and
+a failed load leaves the previous snapshot and session usable. Grants require
+absolute paths without parent components and include symlink targets. Hosts
+should run the synchronous load off the UI thread.
+
+`ResourceSnapshot::apply` sets the system prompt on a host-owned
+`SessionBuilder`. With a custom preamble, it follows Pi v1.5.0's order and
+format for the addendum, project context, skills, and working directory. The
+host supplies the default preamble with any tool and documentation sections,
+chooses the skill reader based on its tool loadout, and handles template
+invocation and theme selection. This factory uses explicit grants. Pi's default
+loader also discovers settings and packages, loads extensions, and rebuilds
+the structured prompt during a session. Native hosts can explicitly apply a
+fresh prompt to an idle session with `AgentSession::set_system_prompt`.
