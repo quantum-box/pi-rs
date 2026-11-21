@@ -5639,10 +5639,10 @@ credentials, and credential refresh. It also accepts `AWS_BEARER_TOKEN_BEDROCK`
 or a configured API key as a Bedrock bearer token. The optional library feature
 is `bedrock`.
 
-The bundled Pi 1.5.0 chat model catalog provides offline model selection and
-metadata, including pricing. It is a static snapshot, not an account-specific
-list of enabled models. The runtime uses the configured AWS region rather than
-pinning the catalog's default endpoint.
+The bundled Pi 1.6 catalog provides offline selection and metadata for 208
+chat models, including long-context pricing tiers where published. The runtime
+uses the configured AWS region, and the account determines which models can be
+invoked. Live access to the newly listed models was unverified.
 
 Text, user images, structured tool-result images, tool calls and results,
 streamed reasoning, stop reasons, and input/output/cache usage are supported.
