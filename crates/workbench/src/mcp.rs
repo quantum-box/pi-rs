@@ -176,25 +176,6 @@ impl rmcp::ClientHandler for NativeClient {
         self.catalog.changed();
     }
 
-    #[allow(deprecated)]
-    async fn on_logging_message(
-        &self,
-        params: rmcp::model::LoggingMessageNotificationParam,
-        _context: NotificationContext<RoleClient>,
-    ) {
-        let Some(name) = self.server_name.clone() else {
-            return;
-        };
-        let level = serde_json::to_value(params.level).unwrap_or_default();
-        crate::mcp_log::record(
-            name,
-            level.as_str().unwrap_or("info"),
-            params.logger,
-            params.data,
-        )
-        .await;
-    }
-
     async fn create_elicitation(
         &self,
         request: rmcp::model::ElicitRequestParams,
@@ -659,12 +640,24 @@ impl McpExtension {
                 let service = match owned_stdio {
                     Some(owner) => {
                         NativeClient::for_server(name)
-                            .serve_with_lifecycle(owned_stdio_transport(wrapped, owner)?, lifecycle)
+                            .serve_with_lifecycle(
+                                crate::mcp_log::LoggingTransport::new(
+                                    owned_stdio_transport(wrapped, owner)?,
+                                    Some(Arc::from(name)),
+                                ),
+                                lifecycle,
+                            )
                             .await
                     }
                     None => {
                         NativeClient::for_server(name)
-                            .serve_with_lifecycle(TokioChildProcess::new(wrapped)?, lifecycle)
+                            .serve_with_lifecycle(
+                                crate::mcp_log::LoggingTransport::new(
+                                    TokioChildProcess::new(wrapped)?,
+                                    Some(Arc::from(name)),
+                                ),
+                                lifecycle,
+                            )
                             .await
                     }
                 };
@@ -1273,7 +1266,10 @@ async fn start_http_service<C: StreamableHttpClient + Clone>(
     lifecycle: ClientLifecycleMode,
 ) -> std::result::Result<RunningService<RoleClient, NativeClient>, ClientInitializeError> {
     for delay in [Some(250), Some(1000), None] {
-        let transport = StreamableHttpClientTransport::with_client(client.clone(), config.clone());
+        let transport = crate::mcp_log::LoggingTransport::new(
+            StreamableHttpClientTransport::with_client(client.clone(), config.clone()),
+            native.server_name.clone(),
+        );
         let result = native
             .clone()
             .serve_with_lifecycle(transport, lifecycle.clone())
