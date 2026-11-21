@@ -78,11 +78,13 @@ fn owns(path: &Path, held: &Identity) -> bool {
     identity(path).is_ok_and(|current| same_dir(held, &current))
 }
 fn busy() -> Error {
-    Error::Config("auth.json lock is busy or compromised; if stale, stop all Pi and pi-rs processes before removing auth.json.lock from the agent directory".into())
+    Error::Config("auth.json lock is busy or compromised. If stale, stop all Pi and pi-rs processes before removing the lock directory beside the resolved credential file".into())
 }
 
 pub(super) struct Guard {
     path: PathBuf,
+    requested_auth: PathBuf,
+    resolved_auth: PathBuf,
     identity: Arc<Identity>,
     compromised: Arc<AtomicBool>,
     stop: Option<mpsc::Sender<()>>,
@@ -90,10 +92,26 @@ pub(super) struct Guard {
 }
 impl Guard {
     pub(super) fn check(&self) -> Result<()> {
-        if self.compromised.load(Ordering::SeqCst) || !owns(&self.path, &self.identity) {
+        if self.compromised.load(Ordering::SeqCst)
+            || !owns(&self.path, &self.identity)
+            || resolved_auth_path(&self.requested_auth)? != self.resolved_auth
+        {
             return Err(busy());
         }
         Ok(())
+    }
+
+    pub(super) fn auth_path(&self) -> Result<&Path> {
+        self.check()?;
+        Ok(&self.resolved_auth)
+    }
+
+    pub(super) fn auth_path_for(&self, path: &Path) -> Result<&Path> {
+        let target = self.auth_path()?;
+        if resolved_auth_path(path)? != target {
+            return Err(busy());
+        }
+        Ok(target)
     }
 }
 impl Drop for Guard {
@@ -116,12 +134,56 @@ impl Drop for Guard {
         }
     }
 }
-fn try_lock(path: &Path) -> Result<Option<Guard>> {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)?;
+fn auth_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Resolve existing links while allowing an auth file that has yet to be created.
+pub(super) fn resolved_auth_path(path: &Path) -> Result<PathBuf> {
+    use std::io::ErrorKind::NotFound;
+
+    let mut path = std::path::absolute(path)?;
+    for _ in 0..40 {
+        match path.canonicalize() {
+            Ok(resolved) => return Ok(resolved),
+            Err(error) if error.kind() == NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_symlink() => {
+                path = auth_parent(&path).join(std::fs::read_link(&path)?);
+            }
+            // The file appeared during resolution. Recheck its current destination.
+            Ok(_) => continue,
+            Err(error) if error.kind() == NotFound => {
+                let Some(name) = path.file_name() else {
+                    return Err(error.into());
+                };
+                return match auth_parent(&path).canonicalize() {
+                    Ok(parent) => Ok(parent.join(name)),
+                    Err(error) if error.kind() == NotFound => Ok(path),
+                    Err(error) => Err(error.into()),
+                };
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(Error::Config("could not resolve auth.json path".into()))
+}
+
+pub(super) fn lock_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".lock");
-    let lock_path = PathBuf::from(name);
+    PathBuf::from(name)
+}
+
+fn try_lock(path: &Path) -> Result<Option<Guard>> {
+    let requested_auth = std::path::absolute(path)?;
+    std::fs::create_dir_all(auth_parent(&requested_auth))?;
+    let resolved_auth = resolved_auth_path(&requested_auth)?;
+    let lock_path = lock_path(&resolved_auth);
     match std::fs::create_dir(&lock_path) {
         Ok(()) => {
             let identity = Arc::new(identity(&lock_path)?);
@@ -149,13 +211,17 @@ fn try_lock(path: &Path) -> Result<Option<Guard>> {
                     }
                 }
             });
-            Ok(Some(Guard {
+            let guard = Guard {
                 path: lock_path,
+                requested_auth,
+                resolved_auth,
                 identity,
                 compromised,
                 stop: Some(stop),
                 thread: Some(thread),
-            }))
+            };
+            guard.check()?;
+            Ok(Some(guard))
         }
         // Pi's proper-lockfile does not coordinate stale-lock reclamation
         // through a second lock. Checking identity and then removing by path
@@ -200,6 +266,27 @@ pub(super) async fn acquire_async(path: &Path) -> Result<Guard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_guard_rejects_an_alias_retargeted_after_locking() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("credentials.json");
+        let alias = dir.path().join("auth.json");
+        std::fs::write(&target, "{}").unwrap();
+        symlink("credentials.json", &alias).unwrap();
+        let guard = try_lock(&alias).unwrap().unwrap();
+        assert!(try_lock(&target).unwrap().is_none());
+
+        std::fs::remove_file(&alias).unwrap();
+        symlink("replacement.json", &alias).unwrap();
+        assert!(guard.auth_path().is_err());
+        drop(guard);
+        assert!(!lock_path(&target).exists());
+        assert!(try_lock(&alias).unwrap().is_some());
+    }
 
     #[test]
     fn pi_rs_does_not_reclaim_stale_or_remove_live_locks() {
