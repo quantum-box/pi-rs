@@ -1396,8 +1396,11 @@ async fn run_cli() -> i32 {
             return 0;
         }
     }
+    // Export can write a file before extension flags are resolved. Require
+    // complete built-in options on that path as part of parse validation.
+    let defer_missing_pi_options = export_plan.is_none() && literal_export.is_none();
     let (matches, extension_flags, extension_flag_order) =
-        match cli_compat::parse_ordered(argv.iter().cloned()) {
+        match cli_compat::parse_ordered(argv.iter().cloned(), defer_missing_pi_options) {
             Ok(parsed) => parsed,
             Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
                 let _ = error.print();
