@@ -2,7 +2,8 @@ use crate::{
     sessions,
     ui::picker::{Item, Picker, Selection, TreeDescription, TreeEntryKind, TreeFilter},
 };
-use pi_rs::{ContentBlock, ContextContent, Event, ModelFailure, Outcome, Record, Session};
+use pi_rs::{ContentBlock, ContextContent, Outcome};
+use pi_rs::{Event, ModelFailure, Record, Session};
 use serde_json::Value;
 
 pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
@@ -355,56 +356,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tree_search_matches_tool_result_text_within_the_pi_preview() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("pi.jsonl");
-        let output = format!("unique-result-sentinel {} tail-marker", "x".repeat(200));
-        let entries = [
-            json!({"type":"session","version":3}),
-            json!({"type":"message","id":"u","parentId":null,
-                "message":{"role":"user","content":"question"}}),
-            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant",
-                "content":[{"type":"toolCall","id":"call","name":"read","arguments":{"path":"fixture.txt"}}],
-                "stopReason":"toolUse"}}),
-            json!({"type":"message","id":"t","parentId":"a","message":{"role":"toolResult",
-                "toolCallId":"call","toolName":"read","content":[{"type":"text","text":output}]}}),
-        ];
-        let fixture = entries
-            .iter()
-            .map(|entry| format!("{entry}\n"))
-            .collect::<String>();
-        std::fs::write(&path, fixture).unwrap();
-        let session = crate::session_import::read(&path).unwrap();
-        let result = session
-            .records()
-            .iter()
-            .find(|record| matches!(record.event, Event::ToolFinished { .. }))
-            .unwrap();
-        let mut tool_search = picker(&session, TreeFilter::Default);
-        tool_search.paste("toolresult unique-result-sentinel");
-        assert!(matches!(tool_search.selected(), Some(Selection::Checkout(id)) if id == result.id));
-        let rendered = tool_search.render(&Theme::system(), 80, 20, &Keys::default());
-        let tool_row = rendered
-            .iter()
-            .find(|line| {
-                line.spans
-                    .iter()
-                    .any(|span| span.text == "[read: fixture.txt]")
-            })
-            .unwrap();
-        assert!(
-            tool_row
-                .spans
-                .iter()
-                .all(|span| !span.text.contains("unique-result-sentinel"))
-        );
-
-        let mut tail_search = picker(&session, TreeFilter::Default);
-        tail_search.paste("tail-marker");
-        assert!(tail_search.selected().is_none());
-    }
-
-    #[test]
     fn imported_tree_rows_use_pi_message_labels_and_theme_roles() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("pi.jsonl");
@@ -509,5 +460,55 @@ mod tests {
             }),
             "all entries include the newly committed label record"
         );
+    }
+
+    #[test]
+    fn tree_search_matches_tool_result_text_within_the_pi_preview() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pi.jsonl");
+        let output = format!("unique-result-sentinel {} tail-marker", "x".repeat(200));
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,
+                "message":{"role":"user","content":"question"}}),
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant",
+                "content":[{"type":"toolCall","id":"call","name":"read","arguments":{"path":"fixture.txt"}}],
+                "stopReason":"toolUse"}}),
+            json!({"type":"message","id":"t","parentId":"a","message":{"role":"toolResult",
+                "toolCallId":"call","toolName":"read","content":[{"type":"text","text":output}]}}),
+        ];
+        let fixture = entries
+            .iter()
+            .map(|entry| format!("{entry}\n"))
+            .collect::<String>();
+        std::fs::write(&path, fixture).unwrap();
+        let session = crate::session_import::read(&path).unwrap();
+        let result = session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::ToolFinished { .. }))
+            .unwrap();
+        let mut tool_search = picker(&session, TreeFilter::Default);
+        tool_search.paste("toolresult unique-result-sentinel");
+        assert!(matches!(tool_search.selected(), Some(Selection::Checkout(id)) if id == result.id));
+        let rendered = tool_search.render(&Theme::system(), 80, 20, &Keys::default());
+        let tool_row = rendered
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.text == "[read: fixture.txt]")
+            })
+            .unwrap();
+        assert!(
+            tool_row
+                .spans
+                .iter()
+                .all(|span| !span.text.contains("unique-result-sentinel"))
+        );
+
+        let mut tail_search = picker(&session, TreeFilter::Default);
+        tail_search.paste("tail-marker");
+        assert!(tail_search.selected().is_none());
     }
 }
