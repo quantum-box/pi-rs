@@ -8,7 +8,6 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use futures_util::FutureExt;
 use pi_rs_core::{
     Extension, ExtensionResult, ExtensionState, Outcome, RequestPurpose, Tool, ToolContext,
     ToolHost, ToolReply, ToolSpec,
@@ -622,7 +621,8 @@ async fn evaluate(
             // async_with polls host futures and drains QuickJS jobs before it
             // yields. This runtime belongs to this script, and a pending host
             // future keeps the scheduler nonempty even between I/O wakeups.
-            if runtime.is_job_pending().now_or_never() == Some(false) {
+            let mut pending_jobs = std::pin::pin!(runtime.is_job_pending());
+            if pending_jobs.as_mut().poll(cx) == Poll::Ready(false) {
                 Poll::Ready(Err("The script is waiting on a promise that can never settle: no tool call is pending, and timers do not exist here.".into()))
             } else {
                 Poll::Pending
