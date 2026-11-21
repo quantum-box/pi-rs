@@ -23,6 +23,11 @@ pub(super) enum Method {
     Device,
 }
 
+pub(super) enum Notice {
+    Browser(Url, tokio::sync::oneshot::Sender<String>),
+    Device { url: &'static str, code: String },
+}
+
 #[derive(Deserialize)]
 struct Credential {
     access: String,
@@ -103,7 +108,7 @@ pub(super) async fn login(
     settings: &super::config::Settings,
     control: super::meta_auth::LoginControl,
     method: Method,
-    announce: impl Fn(&str, Option<&str>),
+    announce: impl Fn(Notice),
 ) -> Result<()> {
     let path = super::config::agent_dir().join("auth.json");
     let previous = super::config::read_auth_object(&path)
@@ -112,17 +117,19 @@ pub(super) async fn login(
         .cloned();
     let client = http_client(settings)?;
     let (credential, callback) = match method {
-        Method::Browser => {
-            let (credential, callback) = browser_login(&client, &announce).await?;
-            (credential, Some(callback))
-        }
+        Method::Browser => browser_login(&client, &announce).await?,
         Method::Device => (
             device_login(
                 &client,
                 USER_CODE_ENDPOINT,
                 DEVICE_TOKEN_ENDPOINT,
                 TOKEN_ENDPOINT,
-                |url, code| announce(url, Some(code)),
+                |url, code| {
+                    announce(Notice::Device {
+                        url,
+                        code: code.to_owned(),
+                    })
+                },
             )
             .await?,
             None,
@@ -154,6 +161,49 @@ pub(super) async fn login(
     result
 }
 
+fn manual_code(input: &str, expected_state: &str) -> Option<String> {
+    let content = input.trim();
+    let query = |pairs: Vec<(String, String)>| {
+        let mut code = None;
+        let mut state = None;
+        for (key, value) in pairs {
+            match key.as_str() {
+                "code" if code.is_none() => code = Some(value),
+                "state" if state.is_none() => state = Some(value),
+                "code" | "state" | "error" => return None,
+                _ => {}
+            }
+        }
+        if state.is_some_and(|state| state != expected_state) {
+            return None;
+        }
+        code.filter(|code| super::model_auth::valid_key(code))
+    };
+    if let Ok(url) = Url::parse(content) {
+        let callback = Url::parse(BROWSER_REDIRECT).expect("official Codex callback URL");
+        if url.origin() != callback.origin()
+            || url.path() != callback.path()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return None;
+        }
+        query(url.query_pairs().into_owned().collect())
+    } else if let Some((code, state)) = content.split_once('#') {
+        (state == expected_state && super::model_auth::valid_key(code)).then(|| code.to_owned())
+    } else if content.contains("code=") {
+        let url = Url::parse(&format!(
+            "{BROWSER_REDIRECT}?{}",
+            content.trim_start_matches('?')
+        ))
+        .ok()?;
+        query(url.query_pairs().into_owned().collect())
+    } else {
+        super::model_auth::valid_key(content).then(|| content.to_owned())
+    }
+}
+
 fn browser_url(state: &str, verifier: &str) -> Url {
     let mut url = Url::parse(BROWSER_AUTHORIZE).expect("official Codex authorization URL");
     let challenge =
@@ -175,11 +225,14 @@ fn browser_url(state: &str, verifier: &str) -> Url {
 
 async fn browser_login(
     client: &Client,
-    announce: impl Fn(&str, Option<&str>),
-) -> Result<(Credential, pi_rs_workbench::oauth_callback::Callback)> {
+    announce: impl Fn(Notice),
+) -> Result<(
+    Credential,
+    Option<pi_rs_workbench::oauth_callback::Callback>,
+)> {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 1455))
         .await
-        .map_err(|_| error("could not listen on port 1455 for browser sign-in"))?;
+        .ok();
     let callback = Url::parse(BROWSER_REDIRECT).expect("official Codex callback URL");
     let state = uuid::Uuid::new_v4().simple().to_string();
     let verifier = format!(
@@ -188,27 +241,47 @@ async fn browser_login(
         uuid::Uuid::new_v4().simple()
     );
     let url = browser_url(&state, &verifier);
-    announce(url.as_str(), None);
+    let (send, receive) = tokio::sync::oneshot::channel();
+    announce(Notice::Browser(url.clone(), send));
     let _ = pi_rs_workbench::oauth_callback::open_browser(url.as_str()).await;
-    let incoming = tokio::time::timeout(
-        Duration::from_secs(300),
-        pi_rs_workbench::oauth_callback::receive(&listener, &callback, &state),
-    )
+    let (code, incoming) = tokio::time::timeout(Duration::from_secs(300), async {
+        let browser = async {
+            let Some(listener) = listener.as_ref() else {
+                return std::future::pending().await;
+            };
+            pi_rs_workbench::oauth_callback::receive(listener, &callback, &state).await
+        };
+        let manual = async {
+            match receive.await {
+                Ok(input) => input,
+                Err(_) => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            callback = browser => {
+                let incoming = callback?;
+                let code = incoming.code().filter(|code| super::model_auth::valid_key(code));
+                Ok::<_, Error>((code, Some(incoming)))
+            }
+            input = manual => Ok((manual_code(&input, &state), None)),
+        }
+    })
     .await
     .map_err(|_| error("browser sign-in timed out"))??;
-    let result = match incoming
-        .code()
-        .filter(|code| super::model_auth::valid_key(code))
-    {
+    let result = match code {
         Some(code) => {
             exchange_code(client, TOKEN_ENDPOINT, &code, &verifier, BROWSER_REDIRECT).await
         }
-        None => Err(error("browser sign-in was denied")),
+        None => Err(error(
+            "authorization was denied or the pasted callback is invalid",
+        )),
     };
     match result {
         Ok(credential) => Ok((credential, incoming)),
         Err(error) => {
-            incoming.reply(false).await;
+            if let Some(incoming) = incoming {
+                incoming.reply(false).await;
+            }
             Err(error)
         }
     }
@@ -248,7 +321,7 @@ async fn device_login(
     user_code_endpoint: &str,
     device_token_endpoint: &str,
     token_endpoint: &str,
-    announce: impl Fn(&str, &str),
+    announce: impl Fn(&'static str, &str),
 ) -> Result<Credential> {
     let response = client
         .post(user_code_endpoint)
@@ -529,6 +602,25 @@ mod tests {
             values["code_challenge"],
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
+        for input in [
+            "fixture-code",
+            "fixture-code#fixture-state",
+            "code=fixture-code&state=fixture-state",
+            "http://localhost:1455/auth/callback?code=fixture-code&state=fixture-state",
+        ] {
+            assert_eq!(
+                manual_code(input, "fixture-state").as_deref(),
+                Some("fixture-code")
+            );
+        }
+        for input in [
+            "fixture-code#wrong",
+            "http://localhost:1455/auth/callback?code=fixture-code&state=wrong",
+            "https://other.example/auth/callback?code=fixture-code&state=fixture-state",
+            "code=one&code=two&state=fixture-state",
+        ] {
+            assert!(manual_code(input, "fixture-state").is_none());
+        }
     }
 
     #[tokio::test]

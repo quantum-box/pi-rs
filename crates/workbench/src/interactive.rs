@@ -592,6 +592,7 @@ enum LocalEditor {
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
     AnthropicCode(Option<tokio::sync::oneshot::Sender<String>>),
+    CodexCode(Option<tokio::sync::oneshot::Sender<String>>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -649,6 +650,7 @@ enum RemoteEvent {
     DeviceCode { url: String, code: String },
     OpenRouterCode(tokio::sync::oneshot::Sender<String>),
     AnthropicCode(tokio::sync::oneshot::Sender<String>),
+    CodexCode(tokio::sync::oneshot::Sender<String>),
     ForgetModelKey(&'static str),
     RefreshModelKeys,
     Finished(Result<Vec<String>>),
@@ -4772,6 +4774,15 @@ pub(super) async fn run(
                     ));
                     dirty = true;
                 }
+                Ok(RemoteEvent::CodexCode(sender)) => {
+                    view.local_editor = Some((
+                        LocalEditor::CodexCode(Some(sender)),
+                        crate::ui::dialog::Dialog::secret(
+                            "OpenAI Codex code or redirect URL".into(),
+                        ),
+                    ));
+                    dirty = true;
+                }
                 Ok(RemoteEvent::AnthropicCode(sender)) => {
                     view.local_editor = Some((
                         LocalEditor::AnthropicCode(Some(sender)),
@@ -5308,7 +5319,7 @@ pub(super) async fn run(
                                         Err(Error::Config("Enter an OpenRouter authorization code or redirect URL".into()))
                                     }
                                 }
-                                LocalEditor::AnthropicCode(sender) => {
+                                LocalEditor::AnthropicCode(sender) | LocalEditor::CodexCode(sender) => {
                                     if let Some(sender) = sender.take() { let _ = sender.send(text); }
                                     Ok(())
                                 }
@@ -5351,7 +5362,10 @@ pub(super) async fn run(
                         Some(_) => {
                             if let LocalEditor::BranchSummary(id) = editor {
                                 confirm_tree(&mut view, id);
-                            } else if matches!(editor, LocalEditor::AnthropicCode(_)) {
+                            } else if matches!(
+                                editor,
+                                LocalEditor::AnthropicCode(_) | LocalEditor::CodexCode(_)
+                            ) {
                                 interrupt_remote_task(&mut view);
                             }
                         }
@@ -6530,15 +6544,19 @@ fn start_codex_login(
         "Signing in to OpenAI Codex",
         "OpenAI Codex login cancelled",
         move |sender| async move {
-            super::codex_auth::login(&settings, task_control, method, |url, code| {
-                let event = match code {
-                    Some(code) => RemoteEvent::DeviceCode {
+            super::codex_auth::login(&settings, task_control, method, |notice| match notice {
+                super::codex_auth::Notice::Device { url, code } => {
+                    let _ = sender.send(RemoteEvent::DeviceCode {
                         url: url.to_owned(),
-                        code: code.to_owned(),
-                    },
-                    None => RemoteEvent::Notice(format!("Continue in your browser: {url}")),
-                };
-                let _ = sender.send(event);
+                        code,
+                    });
+                }
+                super::codex_auth::Notice::Browser(url, input) => {
+                    let _ = sender.send(RemoteEvent::Notice(format!(
+                        "Continue in your browser: {url}"
+                    )));
+                    let _ = sender.send(RemoteEvent::CodexCode(input));
+                }
             })
             .await?;
             let _ = sender.send(RemoteEvent::RefreshModelKeys);
@@ -6715,7 +6733,9 @@ fn clear_openrouter_editor(view: &mut View) {
     if matches!(
         view.local_editor,
         Some((
-            LocalEditor::OpenRouterCode(_) | LocalEditor::AnthropicCode(_),
+            LocalEditor::OpenRouterCode(_)
+                | LocalEditor::AnthropicCode(_)
+                | LocalEditor::CodexCode(_),
             _
         ))
     ) {
