@@ -107,6 +107,10 @@ The list shows the session's selected mode when reopening an existing branch.
 TUI mode changes take effect immediately, including during streaming, without
 closing the settings list. Quiet startup, share destination, default project
 trust and fullscreen wheel speed can also be cycled directly in the list.
+The Settings search field supports cursor movement, insertion and deletion
+within the query. Cursor movement preserves the selected row. Editing the
+query resets selection to the first matching row.
+
 The theme submenu previews the highlighted theme, restores the original on
 cancel, and configures either a single theme or separate light/dark themes for
 automatic terminal-appearance switching.

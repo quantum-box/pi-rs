@@ -136,20 +136,25 @@ impl Editor {
         self.cursor = self.text.len();
     }
     pub fn insert(&mut self, text: &str) {
-        self.remember();
-        let text = super::render::clean(text);
-        self.text.insert_str(self.cursor, &text);
-        self.cursor += text.len();
+        self.insert_text(&super::render::clean(text));
     }
     // Only transcript search retains U+0085 internally. Rendering remains
     // sanitized by Span; all other control characters stay excluded.
     pub(super) fn insert_search(&mut self, text: &str) {
-        self.remember();
         let text: String = text
             .chars()
             .filter(|character| !character.is_control() || *character == '\u{85}')
             .collect();
-        self.text.insert_str(self.cursor, &text);
+        self.insert_text(&text);
+    }
+    pub(super) fn insert_settings_search(&mut self, text: &str) {
+        // Pi's single-line input removes CR/LF and expands tabs.
+        // Retain the other input characters for matching and sanitize at render.
+        self.insert_text(&text.replace(['\r', '\n'], "").replace('\t', "    "));
+    }
+    fn insert_text(&mut self, text: &str) {
+        self.remember();
+        self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
     }
     /// Insert a typed character, grouping consecutive typing as Pi does.
