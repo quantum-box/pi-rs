@@ -721,6 +721,10 @@ Imported Gemini conversations carry signed text, thought, and function parts
 into continued requests. Tests covered a live partial, a typed tool result,
 and a resumed signed Gemini tool conversation.
 
+Native tool failures and skipped calls projected from untyped outcomes include
+Pi's empty `details` object in result events and messages. Typed tool results
+retain the details supplied by the tool.
+
 ## Verification
 
 - Run `cargo test --locked --workspace --all-features`.
