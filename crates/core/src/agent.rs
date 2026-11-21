@@ -7116,6 +7116,18 @@ fn queue_input(
             }
             return reply_to_control(result, reply);
         }
+        AgentInput::SetSessionLabel {
+            target,
+            label,
+            reply,
+        } => {
+            let count = session.records().len();
+            let result = session.set_label(target, label);
+            for record in &session.records()[count..] {
+                observer(Notification::Committed(record));
+            }
+            return reply_to_control(result, reply);
+        }
     };
     queue_message(session, input, observer)
 }

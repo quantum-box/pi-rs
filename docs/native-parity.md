@@ -2518,8 +2518,9 @@ horizontally to keep the selected entry visible while retaining the selection
 gutter; clipping skips partially visible wide characters at either boundary
 while preserving theme styling.
 Searching includes records inside folded branches. Shift+L edits or removes a
-record label and returns to the current search, filter, and label-time setting. Direct `/checkout` releases its
-journal lock before restoring the view.
+record label and returns to the current search, filter, and label-time setting.
+Label edits made during a response are saved by the active session worker.
+Direct `/checkout` releases its journal lock before restoring the view.
 After tree navigation, the selected user message fills an empty editor. A draft
 already in the editor keeps its text and any native image attachments. While
 a response streams, `/tree` and its shortcut read the committed journal without

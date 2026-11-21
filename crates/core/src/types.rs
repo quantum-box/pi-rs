@@ -101,6 +101,12 @@ pub enum AgentInput {
         name: String,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
+    /// Persist a bookmark through the session owner during an active run.
+    SetSessionLabel {
+        target: u64,
+        label: Option<String>,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
 }
 impl<T: Into<QueuedMessage>> From<T> for AgentInput {
     fn from(message: T) -> Self {
