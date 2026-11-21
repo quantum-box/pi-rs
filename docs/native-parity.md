@@ -463,8 +463,12 @@ a Vercel account remains open.
 
 ### Mistral checkpoint
 
-Mistral exposes the 34 pinned chat models using `MISTRAL_API_KEY` and the
-`mistral-conversations` transport. It sends each model's reasoning control,
+Mistral exposes the 34 Pi 1.6.0 chat models using `MISTRAL_API_KEY` and the
+`mistral-conversations` transport. DeepSeek V4.1 Flash 1017 supports images
+with the catalog's resize limits. Ministral 3 3B has a 131,072-token output
+limit. Mistral Large (latest) uses the updated pricing and a 1,048,576-token
+context window with low, medium, and high reasoning effort. The transport
+sends each model's reasoning control,
 replays streamed thinking and text on the same route, and pads short tool ID
 hashes to nine characters for [Mistral's validator](https://github.com/mistralai/mistral-common/blob/main/src/mistral_common/protocol/instruct/validator.py).
 Tool errors and supported images are encoded in the tool message. In a
