@@ -4921,10 +4921,21 @@ next request and replaces the connection if the check fails.
 As in Pi v1.6.0, a socket can be reused for up to 45 minutes after connecting,
 with a five-minute idle timeout. An ongoing response can finish on its
 existing connection.
-The native HTTP fallback sends uncompressed JSON. Specialized Codex
-grammar tools and tool search remain open. Authentication was exercised with
-fixtures. Live sign-in and inference were unverified because no account was
-available for acceptance.
+The native HTTP fallback sends uncompressed JSON.
+
+OpenAI Responses
+and Codex models with `compat.supportsOpenAIGrammarTools` advertise grammar
+tools as custom tools. They choose a nonempty Lark definition before a regex
+definition and map streamed input onto the single required string argument.
+Replay uses the matching call and result item types for the tools advertised
+on the current request. Historical function arguments retain their full JSON
+when they cannot be represented as a single string. Models without the
+capability and the pi-rs ChatGPT plan namespace use function tools.
+
+Provider tool search remains open.
+Authentication and grammar tool streaming were exercised with fixtures.
+Live sign-in and inference were unverified because no account was available
+for acceptance.
 
 ### GitHub Copilot
 

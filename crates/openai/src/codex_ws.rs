@@ -525,6 +525,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_websocket_transmits_grammar_and_decodes_raw_input() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let body = read_request(&mut socket).await;
+            assert_eq!(body["tools"][0]["type"], "custom");
+            assert_eq!(body["tools"][0]["format"]["syntax"], "regex");
+            let item =
+                json!({"type":"custom_tool_call","call_id":"c1","name":"read","input":"hello"});
+            for event in [
+                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","call_id":"c1","name":"read","input":""}}),
+                json!({"type":"response.custom_tool_call_input.delta","output_index":0,"delta":"hello"}),
+                json!({"type":"response.done","response":{"status":"completed","output":[item]}}),
+            ] {
+                socket
+                    .send(Message::Text(event.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = client(
+            format!("http://{address}/backend-api/codex/responses"),
+            CodexTransport::WebSocket,
+        )
+        .with_grammar_tool_support(true);
+        let mut request = request(vec![prompt("read a file")]);
+        let tool = pi_rs_core::ToolSpec {
+            name: "read".into(),
+            description: "read".into(),
+            parameters: json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}),
+        };
+        request.tools.push(tool.clone());
+        let declaration = pi_rs_core::ToolDeclaration {
+            spec: tool,
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::Grammar {
+                variants: pi_rs_core::ToolGrammarVariants {
+                    openai_regex: Some(".+".into()),
+                    ..Default::default()
+                },
+            }),
+        };
+        let mut stream = client
+            .stream_with_tool_declarations(request, &[declaration], false)
+            .await
+            .unwrap();
+        let mut arguments = None;
+        while let Some(event) = stream.next().await {
+            if let ModelEvent::Complete { calls, .. } = event.unwrap() {
+                arguments = Some(calls[0].arguments.clone());
+            }
+        }
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments.unwrap()).unwrap(),
+            json!({"path":"hello"})
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn codex_websocket_reuses_transport_and_sends_the_compatible_input_suffix() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
