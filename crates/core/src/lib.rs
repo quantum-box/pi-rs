@@ -6,6 +6,7 @@ mod context;
 mod context_fingerprint;
 mod context_replay;
 mod extension;
+mod extension_boundary;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod host_auth;
 mod journal;
@@ -33,6 +34,9 @@ pub use context::*;
 pub use context_fingerprint::protected_model_fingerprint;
 pub use context_replay::endpoint_replay_scope;
 pub use extension::*;
+pub use extension_boundary::{
+    AgentActivityOutcome, AgentBeforeSettle, BoundaryContext, BoundaryDecision, BoundaryDraft,
+};
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use host_auth::*;
 pub use journal::*;

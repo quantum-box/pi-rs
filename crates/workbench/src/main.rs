@@ -2137,6 +2137,12 @@ async fn execute(
             "a managed session must be opened by its host".into(),
         ));
     }
+    if matches!(&command, Command::Run { .. }) && session.pending_extension_boundary_run().is_some()
+    {
+        return Err(Error::Session(
+            "resume the pending extension boundary before submitting a prompt".into(),
+        ));
+    }
     let requested_workspace = args.workspace.clone();
     if let Some(cwd) = session.working_directory() {
         args.workspace = PathBuf::from(cwd);
@@ -2537,7 +2543,11 @@ async fn execute(
             }
             }
         }
-        let run_id = if index == 0 { args.run_id } else { None }.unwrap_or_else(Uuid::new_v4);
+        let run_id = if index == 0 {
+            args.run_id.or_else(|| input.is_none().then(|| session.pending_extension_boundary_run()).flatten())
+        } else {
+            None
+        }.unwrap_or_else(Uuid::new_v4);
         let image_record = if images.is_empty() {
             None
         } else {
@@ -2737,6 +2747,9 @@ async fn run_pending_custom_trigger(
     runtime: &runtime::Runtime,
     session: &mut Session,
 ) -> Result<()> {
+    if session.pending_extension_boundary_run().is_some() {
+        return Ok(());
+    }
     let Some(run_id) = session.pending_custom_trigger() else {
         return Ok(());
     };

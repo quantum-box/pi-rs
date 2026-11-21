@@ -191,7 +191,7 @@ pub struct CustomEntryRecord {
     pub entry: CustomEntry,
 }
 
-fn deserialize_present_json<'de, D: serde::Deserializer<'de>>(
+pub(crate) fn deserialize_present_json<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<Value>, D::Error> {
     serde::Deserialize::deserialize(deserializer).map(Some)
@@ -1512,6 +1512,18 @@ pub trait Extension: Send + Sync {
 
     fn handles_cache_warming(&self) -> bool {
         false
+    }
+
+    fn handles_agent_before_settle(&self) -> bool {
+        false
+    }
+
+    async fn agent_before_settle(
+        &self,
+        _event: &crate::AgentBeforeSettle,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<crate::BoundaryDecision> {
+        Ok(crate::BoundaryDecision::default())
     }
 
     fn handles_tree_navigation(&self) -> bool {

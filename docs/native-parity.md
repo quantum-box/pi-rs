@@ -120,7 +120,10 @@ and discards that typeahead.
 Saving a default model writes Pi's `defaultProvider` and literal `defaultModel`
 together. If a saved model falls outside a nonempty model scope, it is added to
 that scope and to a configured `enabledModels` list. Legacy qualified defaults
-without `defaultProvider` are still accepted.
+without `defaultProvider` are still accepted. Cycling models shows the selected display
+name and the active thinking level for reasoning models. Consecutive notices
+reuse the trailing status in both fullscreen and regular mode, before it enters
+scrollback.
 Model scopes (`--models` and `enabledModels`) add all available providers that
 share an exact unqualified model ID and warn about the ambiguity. A literal ID
 containing glob characters takes precedence over glob expansion across providers,
@@ -4561,6 +4564,18 @@ or embedding UI. An ordered, bounded queue per run skips entire pairs when
 saturated so the UI can continue. The run drains queued observations for
 up to one second before settlement, cancels remaining dispatch, and reports
 observed callback failures.
+
+### Native actionable settlement
+
+Native in-process and executable hooks can propose structural changes after
+`agent_end` and before `agent_settled`. Later handlers see the preceding
+proposals and the latest valid preview. The native journal stores the
+validated plan before its entries so reopening can finish the uncommitted
+suffix under the original run ID. Edited entries affect future model context
+and retain their raw history. The native callback uses journal record IDs
+and the host's typed message projection. A requested continuation consumes
+the existing run budget. Cancellation during the hook commits any valid
+proposals and stops the continuation.
 
 ### Native modal components
 
