@@ -4785,7 +4785,8 @@ catalogues are projected from the published
 
 ### Cloudflare Workers AI chat checkpoint
 
-Cloudflare Workers AI exposes the 19 pinned chat models via Chat Completions.
+Cloudflare Workers AI exposes the 20 chat models from Pi AI v1.6.0 via Chat
+Completions, including Inkling 2 Small.
 `CLOUDFLARE_ACCOUNT_ID` selects the account and `CLOUDFLARE_API_KEY` authorizes
 requests. Pi-format saved credentials may declare an account through their
 `env` field. A stored account scopes the key to that account's chat route.
@@ -4796,7 +4797,9 @@ credentials also apply to chat. Live Workers AI inference has not been verified.
 
 ### Cloudflare AI Gateway
 
-Cloudflare AI Gateway includes the 59 pinned Pi AI chat models. It uses
+Cloudflare AI Gateway includes the 63 chat models from Pi AI v1.6.0. New
+entries route Claude Fable 5.2 to Messages, Inkling 2 Small to Chat
+Completions, and GPT-6.2 Astra and Sol to Responses. It uses
 the account and gateway identifiers in `CLOUDFLARE_ACCOUNT_ID` and
 `CLOUDFLARE_GATEWAY_ID`, or their equivalents in a Pi-format saved
 credential. `CLOUDFLARE_API_KEY` supplies the gateway token. The model's API
