@@ -4502,6 +4502,15 @@ registry refreshed for that turn.
 Rust hosts applying queued inputs outside a run can await
 `Agent::apply_queued_inputs_with_lifecycle` to dispatch these hooks.
 
+Model-facing tool results emit `message_start` and `message_end` after
+tool-result transformations and before the completed result is saved. The
+same record carries the edited text and the tool's state update. A text edit
+retains the call ID, error status, details and attachments, including non-text
+blocks in a structured result. Native `tool_execution_end` follows the
+journal commit. Callbacks run for scheduler results and terminal polls.
+Programmatic results, canceled cleanup, and administrative reconciliation
+keep their existing native journal paths.
+
 Native extensions can subscribe to `after_provider_response` to observe the
 HTTP status and normalized headers from an agent turn. The OpenAI Responses,
 OpenAI-compatible chat, Anthropic Messages, Google Gemini, and Ollama adapters

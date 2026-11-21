@@ -1417,7 +1417,7 @@ pub trait Extension: Send + Sync {
         false
     }
 
-    /// Opt in to user and assistant message boundaries and assistant streaming updates.
+    /// Opt in to user, assistant and model-facing tool result boundaries and assistant streaming updates.
     fn handles_message_lifecycle(&self) -> bool {
         false
     }
