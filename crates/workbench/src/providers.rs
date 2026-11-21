@@ -1314,7 +1314,7 @@ impl Client {
                         )
                     })
                     .unwrap_or_else(|| pi_rs::openai::thinking_levels(&args.model));
-                let thinking = if metadata
+                let mapped_thinking = if metadata
                     .as_ref()
                     .is_some_and(|model| model.reasoning == Some(false))
                     || levels.len() == 1 && levels[0] == "off"
@@ -1357,6 +1357,11 @@ impl Client {
                     client
                 };
                 let client = client
+                    .with_configuration_update_models(args.model_profiles.responses_effort_models(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
+                    ))
                     .with_developer_role(use_developer)
                     .with_cache_retention(cache_retention(supports_long), explicit_cache)
                     .with_strict_tool_support(
@@ -1367,7 +1372,7 @@ impl Client {
                         args.model_profiles
                             .responses_prompt_cache_key_enabled(&args.provider, metadata.as_ref()),
                     )
-                    .with_thinking(thinking)
+                    .with_mapped_thinking(thinking, mapped_thinking)
                     .with_sampling(sampling)
                     .map_err(|error| {
                         pi_rs::Error::Config(format!(
