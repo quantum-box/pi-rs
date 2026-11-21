@@ -787,7 +787,7 @@ pub(super) fn skill_invocation(text: &str) -> Option<(&str, &str, Option<&str>)>
     ))
 }
 
-fn is_prompt_space(character: char) -> bool {
+pub(super) fn is_prompt_space(character: char) -> bool {
     (character.is_whitespace() && character != '\u{0085}') || character == '\u{feff}'
 }
 

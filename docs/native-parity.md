@@ -778,6 +778,23 @@ failed renderers. Entry renderers share the native styled-row format. The
 terminal retains up to 4,000 custom-entry candidates separately from
 ordinary transcript history and gives already visible entries priority.
 
+### Native Markdown transformers
+
+Normal user Markdown, including user text that follows a skill block, and
+assistant text and visible thinking use the native extension chain in
+load order. Hooks see content width after transcript padding. Assistant
+text and thinking use the journal's aggregated blocks with outer whitespace
+trimmed for the callback. Restored messages provide the Rust journal record ID
+and timestamp, while live text
+reports its current streaming state. A failed hook leaves the preceding
+Markdown for later hooks. Asynchronous terminal callbacks let the original
+text render while a transformation is pending. Regular and fullscreen
+terminals use the same display path, and SDK hosts can apply the chain to
+their own views. The terminal allows one second per callback and skips inputs
+or replacements over 256 KiB. The terminal's Markdown renderer processes
+Mermaid blocks after the extension chain. The persisted message and model
+context retain their original content.
+
 ### Terminal and native-extension checkpoint
 
 The current implementation passed 41 workspace tests with all features, plus
