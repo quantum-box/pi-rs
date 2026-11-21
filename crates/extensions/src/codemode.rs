@@ -1169,6 +1169,40 @@ impl Output {
         }
     }
 
+    fn spill_report(
+        &self,
+        header: &str,
+        error: Option<&str>,
+        cancellation: &pi_rs_core::CancellationToken,
+    ) -> (String, Option<String>, Option<tempfile::NamedTempFile>) {
+        let mut file = tempfile::Builder::new()
+            .prefix("pi-output-")
+            .suffix(".txt")
+            .tempfile();
+        if file.is_ok() {
+            self.visit_report(Some(header), error, |part| {
+                visit_chunks(part, cancellation, |part| {
+                    if let Ok(output) = &mut file
+                        && let Err(error) = output.write_all(part.as_bytes())
+                    {
+                        file = Err(error);
+                    }
+                });
+            });
+        }
+        match file {
+            Ok(file) => {
+                let path = file.path().to_string_lossy().into_owned();
+                (format!("Full output: {path}"), Some(path), Some(file))
+            }
+            Err(error) => (
+                format!("Could not save the full output: {error}"),
+                None,
+                None,
+            ),
+        }
+    }
+
     fn finish_truncated(
         &self,
         success: bool,
@@ -1178,10 +1212,6 @@ impl Output {
         units: usize,
         cancellation: &pi_rs_core::CancellationToken,
     ) -> Option<FormattedOutput> {
-        let mut file = tempfile::Builder::new()
-            .prefix("pi-output-")
-            .suffix(".txt")
-            .tempfile();
         let mut head = String::new();
         let mut tail = String::new();
         let mut offset = 0usize;
@@ -1209,32 +1239,11 @@ impl Output {
             })
         });
         let header = Self::header(success, elapsed);
-        if file.is_ok() {
-            self.visit_report(Some(&header), error, |part| {
-                visit_chunks(part, cancellation, |part| {
-                    if let Ok(output) = &mut file
-                        && let Err(error) = output.write_all(part.as_bytes())
-                    {
-                        file = Err(error);
-                    }
-                });
-            });
-        }
+        let (location, path, transcript) = self.spill_report(&header, error, cancellation);
         if cancellation.is_cancelled() {
             return None;
         }
         let lines = newlines + 1;
-        let (location, path, transcript) = match file {
-            Ok(file) => {
-                let path = file.path().to_string_lossy().into_owned();
-                (format!("Full output: {path}"), Some(path), Some(file))
-            }
-            Err(error) => (
-                format!("Could not save the full output: {error}"),
-                None,
-                None,
-            ),
-        };
         let report = format!(
             "{header}Warning: truncated output (original token count: {})\nTotal output lines: {lines}\n\n{head}…{} tokens truncated…{tail}\n\n[{location}]",
             units.div_ceil(4),
@@ -1359,7 +1368,8 @@ impl Output {
         if units > maximum {
             return self.finish_truncated(success, elapsed, error, maximum, units, cancellation);
         }
-        let mut content = vec![json!({"type":"text","text":Self::header(success, elapsed)})];
+        let header = Self::header(success, elapsed);
+        let mut content = vec![json!({"type":"text","text":header})];
         let text_count = self
             .items
             .iter()
@@ -1434,13 +1444,23 @@ impl Output {
             true
         });
         Self::append_image_omissions(&mut content, omitted, omitted_locations);
-        let mut result = json!({"content":content,"isError":!success,"full_output_path":null,"wall_time_seconds":elapsed.as_secs_f64()});
+        let (path, transcript) = if omitted_locations == 0 {
+            (None, None)
+        } else {
+            let (location, path, transcript) = self.spill_report(&header, error, cancellation);
+            content.push(json!({"type":"text","text":format!("[{location}]")}));
+            (path, transcript)
+        };
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let mut result = json!({"content":content,"isError":!success,"full_output_path":path,"wall_time_seconds":elapsed.as_secs_f64()});
         if self.model_usage.measured() {
             result["usage"] = json!(self.model_usage);
         }
         Some(FormattedOutput {
             value: result,
-            transcript: None,
+            transcript,
         })
     }
 }
@@ -2919,15 +2939,16 @@ mod tests {
                 .unwrap()
                 .deliver();
             assert!(result.to_string().len() <= MAX_INLINE_BYTES);
-            assert!(
-                result["content"].as_array().unwrap().last().unwrap()["text"]
+            let content = result["content"].as_array().unwrap();
+            assert!(content.iter().any(|block| {
+                block["text"]
                     .as_str()
-                    .unwrap()
-                    .contains("and their locations omitted")
-            );
-            if let Some(path) = result["full_output_path"].as_str() {
-                std::fs::remove_file(path).unwrap();
-            }
+                    .is_some_and(|line| line.contains("and their locations omitted"))
+            }));
+            let transcript_path = result["full_output_path"].as_str().unwrap();
+            let transcript = std::fs::read_to_string(transcript_path).unwrap();
+            assert_eq!(transcript.matches(&path).count(), images);
+            std::fs::remove_file(transcript_path).unwrap();
         }
     }
 

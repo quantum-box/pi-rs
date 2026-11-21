@@ -1610,7 +1610,8 @@ in script output and keeps the status header and image locations outside
 the preview budget. When a head or tail boundary falls inside a supplementary
 character, the preview omits that whole character and the saved output keeps it.
 The native full transcript also records the status header and image locations.
-The native result size limit can omit inline images or their locations.
+If the native result size limit omits inline image locations, a transcript
+includes every location.
 
 MCP tools default to codemode exposure. `--exposure direct`, `deferred`,
 `codemode` and `hidden` select another mode when adding a server. The root
