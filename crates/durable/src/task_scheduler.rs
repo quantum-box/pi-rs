@@ -304,17 +304,58 @@ pub(crate) fn prepare_woken_conversation_cancel_claim(
     policy: crate::async_task_tool::ConversationCancelPolicy,
     boundary: u64,
 ) -> Result<(WokenConversationCancelClaim, Vec<durable_store::Check>), String> {
+    let TaskOwner::Conversation(conversation) = task.owner() else {
+        return Err("missing conversation owner".into());
+    };
+    prepare_woken_conversation_cancel_claim_inner(
+        store,
+        task,
+        *conversation,
+        cleanup_lease,
+        policy,
+        boundary,
+        false,
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn prepare_nested_woken_conversation_cancel_claim(
+    store: &durable_store::Store,
+    task: &Task,
+    conversation: Uuid,
+    cleanup_lease: Uuid,
+    policy: crate::async_task_tool::ConversationCancelPolicy,
+    boundary: u64,
+) -> Result<(WokenConversationCancelClaim, Vec<durable_store::Check>), String> {
+    prepare_woken_conversation_cancel_claim_inner(
+        store,
+        task,
+        conversation,
+        cleanup_lease,
+        policy,
+        boundary,
+        true,
+    )
+}
+
+fn prepare_woken_conversation_cancel_claim_inner(
+    store: &durable_store::Store,
+    task: &Task,
+    conversation: Uuid,
+    cleanup_lease: Uuid,
+    policy: crate::async_task_tool::ConversationCancelPolicy,
+    boundary: u64,
+    nested: bool,
+) -> Result<(WokenConversationCancelClaim, Vec<durable_store::Check>), String> {
     if task.state() != &TaskState::Running
         || !task.abort_requested()
         || task.replay_safe()
-        || !matches!(task.owner(), TaskOwner::Conversation(_))
+        || !(matches!(task.owner(), TaskOwner::Conversation(id) if *id == conversation)
+            || nested && matches!(task.owner(), TaskOwner::Task(_)))
         || cleanup_lease.is_nil()
     {
         return Err("invalid woken conversation cleanup attempt".into());
     }
-    let TaskOwner::Conversation(conversation) = task.owner() else {
-        return Err("missing conversation owner".into());
-    };
     if conversation.is_nil() || task.id().is_nil() || task.definition_version() == 0 {
         return Err("invalid conversation cleanup identity".into());
     }
@@ -335,7 +376,7 @@ pub(crate) fn prepare_woken_conversation_cancel_claim(
             version: 3,
             claim_id: Uuid::new_v4(),
             task: task.id(),
-            conversation: *conversation,
+            conversation,
             kind: task.kind().ok_or("missing definition")?.to_owned(),
             definition_version: task.definition_version(),
             cleanup_attempt,
@@ -364,12 +405,24 @@ pub(crate) fn woken_conversation_claim_checks(
     cleanup_lease: Uuid,
     boundary: u64,
 ) -> Result<Vec<durable_store::Check>, String> {
+    woken_conversation_claim_checks_inner(store, task, claim, cleanup_lease, boundary, false)
+}
+
+fn woken_conversation_claim_checks_inner(
+    store: &durable_store::Store,
+    task: &Task,
+    claim: &WokenConversationCancelClaim,
+    cleanup_lease: Uuid,
+    boundary: u64,
+    nested: bool,
+) -> Result<Vec<durable_store::Check>, String> {
     if claim.version != 3
         || claim.claim_id.is_nil()
         || claim.cleanup_lease != cleanup_lease
         || cleanup_lease.is_nil()
         || claim.task != task.id()
-        || task.owner() != &TaskOwner::Conversation(claim.conversation)
+        || !(task.owner() == &TaskOwner::Conversation(claim.conversation)
+            || nested && matches!(task.owner(), TaskOwner::Task(_)))
         || claim.conversation.is_nil()
         || claim.kind.is_empty()
         || task.kind() != Some(claim.kind.as_str())
@@ -396,6 +449,26 @@ pub(crate) fn woken_conversation_claim_checks(
     }
     let (mut checks, target) =
         crate::async_task_tool::unsafe_park_proof::woken_cleanup_checks(store, task, boundary)?;
+    if nested {
+        let (conversation, _, ancestry_checks, ancestry_version) =
+            task_store::read_nested_cancel_claim_ancestry(store, task.id(), claim.claim_id)
+                .map_err(|e| e.to_string())?;
+        if conversation != claim.conversation {
+            return Err("woken child conversation changed".into());
+        }
+        let ancestry_key =
+            format!("durable/task-callback-claim-ancestry/{}", task.id()).into_bytes();
+        let claim_commit = store
+            .commit_for_version(&key, entry.version)
+            .map_err(|e| e.to_string())?;
+        let ancestry_commit = store
+            .commit_for_version(&ancestry_key, ancestry_version)
+            .map_err(|e| e.to_string())?;
+        if claim_commit.is_none() || claim_commit != ancestry_commit {
+            return Err("woken child ancestry not committed with claim".into());
+        }
+        checks.extend(ancestry_checks);
+    }
     checks.push(durable_store::Check {
         key,
         expected: durable_store::Expected::Version(entry.version),
@@ -404,6 +477,17 @@ pub(crate) fn woken_conversation_claim_checks(
         return Err("woken conversation claim evidence changed".into());
     }
     Ok(checks)
+}
+
+#[cfg(test)]
+pub(crate) fn woken_nested_claim_checks_for_test(
+    store: &durable_store::Store,
+    task: &Task,
+    claim: &WokenConversationCancelClaim,
+    lease: Uuid,
+    boundary: u64,
+) -> Result<Vec<durable_store::Check>, String> {
+    woken_conversation_claim_checks_inner(store, task, claim, lease, boundary, true)
 }
 
 /// A callback receipt is cleanup evidence, not an execution outcome. In
@@ -4195,11 +4279,37 @@ impl AdmissionHandle<'_> {
         {
             return Err("conversation cancel registration changed".into());
         }
-        let mut checks = self
-            .validator
-            .ok_or("missing harness")?
-            .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
-            .map_err(|e| e.to_string())?;
+        let validator = self.validator.ok_or("missing harness")?;
+        let nested = matches!(current.task.owner(), TaskOwner::Task(_));
+        if nested {
+            #[cfg(test)]
+            let probe = std::env::var_os("PI_TEST_NESTED_WOKEN_PROBE").is_some();
+            #[cfg(not(test))]
+            let probe = false;
+            if !probe {
+                return Err(
+                    "woken child cancellation is not yet enabled; reconciliation required".into(),
+                );
+            }
+        }
+        let (conversation, mut checks) = if nested {
+            validator
+                .checkpointable_nested_cancel_conversation_checks(
+                    &current.task,
+                    &definitions.registry,
+                )
+                .map_err(|e| e.to_string())?
+        } else {
+            let TaskOwner::Conversation(id) = current.task.owner() else {
+                return Err("missing conversation owner".into());
+            };
+            (
+                *id,
+                validator
+                    .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
+                    .map_err(|e| e.to_string())?,
+            )
+        };
         // Until evidence traversal covers conversation ownership edges, refuse
         // to authorize cleanup through one, including after a live graph abort.
         let records = tasks.list().map_err(|e| e.to_string())?;
@@ -4238,32 +4348,40 @@ impl AdmissionHandle<'_> {
             return Err("unsafe descendant requires reconciliation".into());
         }
         checks.extend(descendant_checks);
-        let (record, wake_checks) = prepare_woken_conversation_cancel_claim(
-            owner.store(),
-            &current.task,
-            self.lease.token,
-            policy,
-            boundary,
-        )?;
-        checks.extend(wake_checks);
-        let TaskOwner::Conversation(conversation) = current.task.owner() else {
-            return Err("conversation cancel root owner changed".into());
+        let (record, wake_checks) = if nested {
+            prepare_nested_woken_conversation_cancel_claim(
+                owner.store(),
+                &current.task,
+                conversation,
+                self.lease.token,
+                policy,
+                boundary,
+            )?
+        } else {
+            prepare_woken_conversation_cancel_claim(
+                owner.store(),
+                &current.task,
+                self.lease.token,
+                policy,
+                boundary,
+            )?
         };
+        checks.extend(wake_checks);
         // Signal delivery may bypass the Harness gate. Fence both revisions in
         // the claim transaction itself; this alone does not authorize callback
         // dispatch after the claim commit.
         let conversation_entry = owner
             .store()
-            .get(&crate::runtime::Harness::key(*conversation))
+            .get(&crate::runtime::Harness::key(conversation))
             .map_err(|e| e.to_string())?
             .ok_or("missing claim conversation")?;
         checks.push(durable_store::Check {
-            key: crate::runtime::Harness::key(*conversation),
+            key: crate::runtime::Harness::key(conversation),
             expected: durable_store::Expected::Version(conversation_entry.version),
         });
         let conversation_revision = owner
             .store()
-            .get(&crate::conversation_signal::revision(*conversation))
+            .get(&crate::conversation_signal::revision(conversation))
             .map_err(|e| e.to_string())?
             .map(|entry| entry.version);
         let task_revision = owner
@@ -4273,7 +4391,7 @@ impl AdmissionHandle<'_> {
             .map(|entry| entry.version);
         for (key, version) in [
             (
-                crate::conversation_signal::revision(*conversation),
+                crate::conversation_signal::revision(conversation),
                 conversation_revision,
             ),
             (
@@ -4306,26 +4424,38 @@ impl AdmissionHandle<'_> {
         let signal_evidence = ConversationCancelSignalEvidence {
             version: 1,
             claim_id: record.claim_id,
-            conversation: *conversation,
+            conversation,
             task: current.task.id(),
             conversation_version: Some(conversation_entry.version),
             conversation_revision,
             task_revision,
         };
+        let mut mutations = vec![
+            durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&record).map_err(|e| e.to_string())?,
+            },
+            durable_store::Mutation::Put {
+                key: signal_evidence_key,
+                value: serde_json::to_vec(&signal_evidence).map_err(|e| e.to_string())?,
+            },
+        ];
+        if nested {
+            let ancestry = task_store::prepare_nested_cancel_claim_ancestry(
+                owner.store(),
+                current.task.id(),
+                conversation,
+                record.claim_id,
+            )
+            .map_err(|e| e.to_string())?;
+            checks.extend(ancestry.checks);
+            mutations.extend(ancestry.mutations);
+        }
         let commit = owner
             .store()
             .commit_with_prefix_put_fence(
                 &checks,
-                &[
-                    durable_store::Mutation::Put {
-                        key,
-                        value: serde_json::to_vec(&record).map_err(|e| e.to_string())?,
-                    },
-                    durable_store::Mutation::Put {
-                        key: signal_evidence_key,
-                        value: serde_json::to_vec(&signal_evidence).map_err(|e| e.to_string())?,
-                    },
-                ],
+                &mutations,
                 &[
                     task_store::PREFIX,
                     crate::ownership_edge::PREFIX,
@@ -4650,9 +4780,6 @@ impl AdmissionHandle<'_> {
         {
             return Err("stale start attempt or live child".into());
         }
-        let TaskOwner::Conversation(conversation) = current.task.owner() else {
-            return Err("start root owner changed".into());
-        };
         let definitions = self.definitions.read().map_err(|e| e.to_string())?;
         let kind = current.task.kind().ok_or("missing definition")?;
         let reg = definitions
@@ -4671,11 +4798,26 @@ impl AdmissionHandle<'_> {
         {
             return Err("conversation start registration changed".into());
         }
-        let mut checks = self
-            .validator
-            .ok_or("missing harness")?
-            .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
-            .map_err(|e| e.to_string())?;
+        let validator = self.validator.ok_or("missing harness")?;
+        let nested = matches!(current.task.owner(), TaskOwner::Task(_));
+        let (conversation, mut checks) = if nested {
+            validator
+                .checkpointable_nested_cancel_conversation_checks(
+                    &current.task,
+                    &definitions.registry,
+                )
+                .map_err(|e| e.to_string())?
+        } else {
+            let TaskOwner::Conversation(id) = current.task.owner() else {
+                return Err("missing conversation owner".into());
+            };
+            (
+                *id,
+                validator
+                    .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
+                    .map_err(|e| e.to_string())?,
+            )
+        };
         let (uncertain, descendant_checks, _nested_identity_leases) =
             authenticated_unsafe_descendant_reconciliation(
                 owner.store(),
@@ -4694,12 +4836,13 @@ impl AdmissionHandle<'_> {
         if claim.policy != policy {
             return Err("woken start policy changed".into());
         }
-        checks.extend(woken_conversation_claim_checks(
+        checks.extend(woken_conversation_claim_checks_inner(
             owner.store(),
             &current.task,
             claim,
             self.lease.token,
             boundary,
+            nested,
         )?);
         let evidence_key = conversation_cancel_signal_evidence_key(current.task.id());
         let evidence_entry = owner
@@ -4711,7 +4854,7 @@ impl AdmissionHandle<'_> {
             serde_json::from_slice(&evidence_entry.value).map_err(|_| "invalid signal evidence")?;
         if evidence.version != 1
             || evidence.claim_id != claim.claim_id
-            || evidence.conversation != *conversation
+            || evidence.conversation != conversation
             || evidence.task != current.task.id()
         {
             return Err("conversation start signal evidence mismatch".into());
@@ -4724,12 +4867,12 @@ impl AdmissionHandle<'_> {
             .conversation_version
             .ok_or("legacy claim lacks conversation version")?;
         checks.push(durable_store::Check {
-            key: crate::runtime::Harness::key(*conversation),
+            key: crate::runtime::Harness::key(conversation),
             expected: durable_store::Expected::Version(claim_conversation_version),
         });
         for (key, revision) in [
             (
-                crate::conversation_signal::revision(*conversation),
+                crate::conversation_signal::revision(conversation),
                 evidence.conversation_revision,
             ),
             (
@@ -4757,20 +4900,32 @@ impl AdmissionHandle<'_> {
         .map_err(|e| e.to_string())?;
         let conversation_start = crate::conversation_signal::prepare_callback_start_signal_fence(
             owner.store(),
-            *conversation,
+            conversation,
             &marker,
         )
         .map_err(|e| e.to_string())?;
-        let (ancestry, task_start) = task_store::prepare_callback_start_ancestry_fence(
-            owner.store(),
-            current.task.id(),
-            *conversation,
-            &marker,
-        )
-        .map_err(|e| e.to_string())?;
-        if ancestry.as_slice() != [current.task.id()] {
-            return Err("nested conversation cancel is not enabled".into());
+        let task_start = if nested {
+            task_store::prepare_nested_cancel_claimed_ancestry_start(
+                owner.store(),
+                current.task.id(),
+                conversation,
+                claim.claim_id,
+                &marker,
+            )
+        } else {
+            let (ancestry, batch) = task_store::prepare_callback_start_ancestry_fence(
+                owner.store(),
+                current.task.id(),
+                conversation,
+                &marker,
+            )
+            .map_err(|e| e.to_string())?;
+            if ancestry.as_slice() != [current.task.id()] {
+                return Err("root ancestry changed".into());
+            }
+            Ok(batch)
         }
+        .map_err(|e| e.to_string())?;
         checks.extend(conversation_start.checks);
         checks.extend(task_start.checks);
         let mut mutations = conversation_start.mutations;
@@ -5445,11 +5600,26 @@ impl AdmissionHandle<'_> {
         {
             return Err("conversation cancel registration changed".into());
         }
-        let mut checks = self
-            .validator
-            .ok_or("missing harness")?
-            .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
-            .map_err(|e| e.to_string())?;
+        let validator = self.validator.ok_or("missing harness")?;
+        let nested = matches!(current.task.owner(), TaskOwner::Task(_));
+        let (conversation, mut checks) = if nested {
+            validator
+                .checkpointable_nested_cancel_conversation_checks(
+                    &current.task,
+                    &definitions.registry,
+                )
+                .map_err(|e| e.to_string())?
+        } else {
+            let TaskOwner::Conversation(id) = current.task.owner() else {
+                return Err("missing conversation owner".into());
+            };
+            (
+                *id,
+                validator
+                    .checkpointable_cancel_conversation_checks(&current.task, &definitions.registry)
+                    .map_err(|e| e.to_string())?,
+            )
+        };
         let (uncertain, descendant_checks, _nested_identity_leases) =
             authenticated_unsafe_descendant_reconciliation(
                 owner.store(),
@@ -5490,12 +5660,13 @@ impl AdmissionHandle<'_> {
             checks.push(snapshot.clone());
         }
         let claim = &receipt.claim;
-        checks.extend(woken_conversation_claim_checks(
+        checks.extend(woken_conversation_claim_checks_inner(
             owner.store(),
             &current.task,
             claim,
             self.lease.token,
             boundary,
+            nested,
         )?);
         let key = format!(
             "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
@@ -5529,9 +5700,6 @@ impl AdmissionHandle<'_> {
             vec![]
         };
         {
-            let TaskOwner::Conversation(conversation) = current.task.owner() else {
-                return Err("receipt root owner changed".into());
-            };
             let expected_marker = serde_json::to_vec(&serde_json::json!({
                 "version": 3,
                 "claim_id": claim.claim_id,
@@ -5548,15 +5716,25 @@ impl AdmissionHandle<'_> {
             let conversation_finish =
                 crate::conversation_signal::prepare_callback_finish_signal_fence(
                     owner.store(),
-                    *conversation,
+                    conversation,
                     marker,
                 )
                 .map_err(|e| e.to_string())?;
-            let task_finish = task_store::prepare_callback_finish_ancestry_fence(
-                owner.store(),
-                &[current.task.id()],
-                marker,
-            )
+            let task_finish = if nested {
+                task_store::prepare_nested_woken_cancel_ancestry_finish(
+                    owner.store(),
+                    current.task.id(),
+                    conversation,
+                    claim.claim_id,
+                    marker,
+                )
+            } else {
+                task_store::prepare_callback_finish_ancestry_fence(
+                    owner.store(),
+                    &[current.task.id()],
+                    marker,
+                )
+            }
             .map_err(|e| e.to_string())?;
             checks.extend(conversation_finish.checks);
             checks.extend(task_finish.checks);
@@ -5835,8 +6013,20 @@ impl AdmissionHandle<'_> {
         {
             return Err("stale uncertain callback attempt".into());
         }
-        let TaskOwner::Conversation(conversation) = current.task.owner() else {
-            return Err("uncertain callback owner changed".into());
+        let nested = matches!(current.task.owner(), TaskOwner::Task(_));
+        let (conversation, ancestry_checks) = if nested {
+            let (conversation, _, checks, _) = task_store::read_nested_cancel_claim_ancestry(
+                owner.store(),
+                current.task.id(),
+                claim.claim_id,
+            )
+            .map_err(|e| e.to_string())?;
+            (conversation, checks)
+        } else {
+            let TaskOwner::Conversation(id) = current.task.owner() else {
+                return Err("uncertain callback owner changed".into());
+            };
+            (*id, Vec::new())
         };
         let claim_key = woken_conversation_claim_key(current.task.id());
         let entry = owner
@@ -5851,7 +6041,7 @@ impl AdmissionHandle<'_> {
             || claim.cleanup_attempt != attempt
             || current.task.woken_interrupted_attempt() != Some(claim.woken_attempt)
             || claim.task != current.task.id()
-            || claim.conversation != *conversation
+            || claim.conversation != conversation
         {
             return Err("uncertain callback claim mismatch".into());
         }
@@ -5869,15 +6059,25 @@ impl AdmissionHandle<'_> {
         }
         let conversation_finish = crate::conversation_signal::prepare_callback_finish_signal_fence(
             owner.store(),
-            *conversation,
+            conversation,
             marker,
         )
         .map_err(|e| e.to_string())?;
-        let task_finish = task_store::prepare_callback_finish_ancestry_fence(
-            owner.store(),
-            &[current.task.id()],
-            marker,
-        )
+        let task_finish = if nested {
+            task_store::prepare_nested_woken_cancel_ancestry_finish(
+                owner.store(),
+                current.task.id(),
+                conversation,
+                claim.claim_id,
+                marker,
+            )
+        } else {
+            task_store::prepare_callback_finish_ancestry_fence(
+                owner.store(),
+                &[current.task.id()],
+                marker,
+            )
+        }
         .map_err(|e| e.to_string())?;
         let key = format!(
             "durable/replay-safe-async/{}/conversation-woken-cancel-unknown-v1",
@@ -5895,6 +6095,7 @@ impl AdmissionHandle<'_> {
                 expected: durable_store::Expected::Missing,
             },
         ];
+        checks.extend(ancestry_checks);
         checks.extend(conversation_finish.checks);
         checks.extend(task_finish.checks);
         let mut mutations = conversation_finish.mutations;
@@ -12786,6 +12987,10 @@ impl Scheduler {
             let mut pending_roots = Vec::new();
             self.unbound_cancel_roots.clear();
             if self.validator.is_none() {
+                #[cfg(test)]
+                let nested_probe = std::env::var_os("PI_TEST_NESTED_WOKEN_PROBE").is_some();
+                #[cfg(not(test))]
+                let nested_probe = false;
                 for record in &records {
                     if !live.contains(&record.task.id())
                         && !record.task.replay_safe()
@@ -12795,7 +13000,11 @@ impl Scheduler {
                         && ((record.task.state() == &TaskState::Running
                             && (record.task.kind().is_some_and(|kind| {
                                 kind.starts_with("pi-rs.unsafe-park-async.v1.hook.woken.")
-                            }) || (matches!(record.task.owner(), TaskOwner::Conversation(_))
+                            }) || ((matches!(
+                                record.task.owner(),
+                                TaskOwner::Conversation(_)
+                            ) || nested_probe
+                                && matches!(record.task.owner(), TaskOwner::Task(_)))
                                 && self.registered(&record.task).is_ok_and(|reg| {
                                     reg.handler.conversation_woken_cancel_enabled()
                                 }))))
@@ -13950,9 +14159,14 @@ impl Scheduler {
                 }
                 // Unbound schedulers defer explicitly opted-in woken roots until
                 // the Harness can authenticate the complete admission boundary.
+                #[cfg(test)]
+                let nested_probe = std::env::var_os("PI_TEST_NESTED_WOKEN_PROBE").is_some();
+                #[cfg(not(test))]
+                let nested_probe = false;
                 if !item.task.replay_safe()
                     && !item.task.abort_requested()
-                    && matches!(item.task.owner(), TaskOwner::Conversation(_))
+                    && (matches!(item.task.owner(), TaskOwner::Conversation(_))
+                        || nested_probe && matches!(item.task.owner(), TaskOwner::Task(_)))
                     && item.task.checkpoint().phase == "replay-safe-async-wait"
                     && let (Some(harness), Ok(reg)) =
                         (self.validator.as_ref(), self.registered(&item.task))

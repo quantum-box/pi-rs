@@ -2229,6 +2229,44 @@ pub(crate) fn prepare_nested_cancel_ancestry_finish(
     claim: Uuid,
     marker: &[u8],
 ) -> Result<OwnedBatch, Error> {
+    let claim_key = format!("durable/replay-safe-async/{task}/conversation-park-cancel-claim");
+    prepare_nested_ancestry_finish_with_claim_key(
+        store,
+        task,
+        conversation,
+        claim,
+        marker,
+        claim_key.as_bytes(),
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn prepare_nested_woken_cancel_ancestry_finish(
+    store: &Store,
+    task: Uuid,
+    conversation: Uuid,
+    claim: Uuid,
+    marker: &[u8],
+) -> Result<OwnedBatch, Error> {
+    let claim_key = format!("durable/replay-safe-async/{task}/conversation-woken-cancel-claim-v3");
+    prepare_nested_ancestry_finish_with_claim_key(
+        store,
+        task,
+        conversation,
+        claim,
+        marker,
+        claim_key.as_bytes(),
+    )
+}
+
+fn prepare_nested_ancestry_finish_with_claim_key(
+    store: &Store,
+    task: Uuid,
+    conversation: Uuid,
+    claim: Uuid,
+    marker: &[u8],
+    claim_key: &[u8],
+) -> Result<OwnedBatch, Error> {
     let (saved_conversation, ancestry, ancestry_checks, ancestry_version) =
         read_nested_cancel_claim_ancestry(store, task, claim)?;
     if saved_conversation != conversation {
@@ -2245,8 +2283,7 @@ pub(crate) fn prepare_nested_cancel_ancestry_finish(
     {
         return Err(Error::InvalidKey);
     }
-    let claim_key =
-        format!("durable/replay-safe-async/{task}/conversation-park-cancel-claim").into_bytes();
+    let claim_key = claim_key.to_vec();
     let claim_entry = store.get(&claim_key)?.ok_or(Error::InvalidKey)?;
     let ancestry_key = nested_cancel_claim_ancestry_key(task);
     let claim_commit = store.commit_for_version(&claim_key, claim_entry.version)?;

@@ -8135,3 +8135,354 @@ async fn selected_woken_unsafe_child_keeps_after_through_settlement_and_reopen()
         scheduler.shutdown().await.unwrap();
     }
 }
+
+struct NestedWokenFixture {
+    name: &'static str,
+    directory: std::path::PathBuf,
+}
+#[async_trait]
+impl Tool for NestedWokenFixture {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+        panic!("durable path only")
+    }
+}
+#[async_trait]
+impl DurableAsyncTool for NestedWokenFixture {
+    async fn execute_durable(
+        &self,
+        _: Value,
+        _: ToolContext,
+        resume: DurableToolResume,
+        host: &dyn DurableTaskHost,
+    ) -> Result<DurableToolStep, String> {
+        match (self.name, resume.checkpoint) {
+            ("child", Some(_)) => {
+                std::fs::write(self.directory.join("nested-woken.tmp"), b"ready")
+                    .map_err(|e| e.to_string())?;
+                std::fs::rename(
+                    self.directory.join("nested-woken.tmp"),
+                    self.directory.join("nested-woken"),
+                )
+                .map_err(|e| e.to_string())?;
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+            ("root", None) | ("child", None) => {
+                let name = if self.name == "root" { "child" } else { "leaf" };
+                let child = host.start_child("key", name, json!({})).await?;
+                Ok(DurableToolStep::Park {
+                    checkpoint: serde_json::to_value(&child).map_err(|e| e.to_string())?,
+                    wait: DurableWait::All(vec![child]),
+                })
+            }
+            ("leaf", _) => Ok(DurableToolStep::Complete(Outcome::Succeeded("leaf".into()))),
+            _ => Err("unexpected fixture state".into()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn nested_woken_evidence_worker() {
+    let Some(dir) = std::env::var_os("PI_TEST_NESTED_WOKEN_DIR") else {
+        return;
+    };
+    struct Cancel(std::path::PathBuf);
+    #[async_trait]
+    impl crate::async_task_tool::DurableParkCancel for Cancel {
+        async fn cancel(&self, _: Value, _: Value, _: ToolContext) -> Result<(), String> {
+            std::fs::write(self.0.join("nested-cancelled"), b"called")
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    }
+    let dir = std::path::PathBuf::from(dir);
+    let mut registry = Registry::default();
+    let leaf = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(NestedWokenFixture {
+            name: "leaf",
+            directory: dir.clone(),
+        }),
+        "nested-leaf",
+        1,
+        vec![],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    let child_tool = Arc::new(NestedWokenFixture {
+        name: "child",
+        directory: dir.clone(),
+    });
+    let identity_tool: Arc<dyn Tool> = child_tool.clone();
+    let _identity =
+        crate::nested_identity::register(&identity_tool, Some("nested-woken-backend".into()))
+            .unwrap();
+    let child = crate::async_task_tool::register_conversation_unsafe_durable_tool_with_at_most_once_woken_cancel(&mut registry, child_tool, "nested-child", 1, vec![leaf.clone()], "nested-cancel", Arc::new(Cancel(dir.clone())), UnsafeDurableAuthorization::interruption_requires_reconciliation()).unwrap();
+    let root = register_conversation_replay_safe_durable_tool(
+        &mut registry,
+        Arc::new(NestedWokenFixture {
+            name: "root",
+            directory: dir.clone(),
+        }),
+        "nested-root",
+        1,
+        vec![child.clone()],
+        ReplaySafeAuthorization::host_attests_replay_safe(),
+    )
+    .unwrap();
+    let options = Options {
+        model: Arc::new(ModelStub {
+            arguments: "{}".into(),
+        }),
+        tools: vec![root.register(), child.register(), leaf.register()],
+        restart_limit: 4,
+        max_turns: 4,
+        uncertain_policy: UncertainPolicy::RequireReconciliation,
+    };
+    let mut scheduler = Scheduler::open(dir.join("db"), options).unwrap();
+    let _driver = scheduler.start_tasks(registry).unwrap();
+    if std::env::var_os("PI_TEST_NESTED_WOKEN_RESUME").is_some() {
+        std::future::pending::<()>().await;
+        return;
+    }
+    let conversation = scheduler
+        .create_conversation(Config {
+            model: "test".into(),
+            system_prompt: String::new(),
+            max_output_tokens: 100,
+        })
+        .unwrap();
+    scheduler.submit(conversation, None, "go".into()).unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nested_woken_claim_binds_original_attempt_and_late_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "conversation_claim_boundary_tests::nested_woken_evidence_worker",
+        ])
+        .env("PI_TEST_NESTED_WOKEN_DIR", dir.path())
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !dir.path().join("nested-woken").exists() {
+            assert!(
+                process.try_wait().unwrap().is_none(),
+                "worker exited before child wake"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    process.kill().unwrap();
+    process.wait().unwrap();
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let records = crate::task_store::TaskStore::new(&store).list().unwrap();
+    let root = records
+        .iter()
+        .find(|r| matches!(r.task.owner(), crate::task::TaskOwner::Conversation(_)))
+        .unwrap();
+    let crate::task::TaskOwner::Conversation(conversation) = root.task.owner() else {
+        unreachable!()
+    };
+    let child = records
+        .iter()
+        .find(|r| {
+            r.task.owner() == &crate::task::TaskOwner::Task(root.task.id())
+                && r.task.state() == &TaskState::Running
+        })
+        .unwrap();
+    let mut cleanup = child.task.clone();
+    let old_attempt = cleanup.attempt_id().unwrap();
+    cleanup.recover_interrupted_woken_for_cleanup().unwrap();
+    cleanup.start_attempt(uuid::Uuid::new_v4()).unwrap();
+    let lease = uuid::Uuid::new_v4();
+    let boundary = store.put_version().unwrap();
+    let (claim, checks) = crate::task_scheduler::prepare_nested_woken_conversation_cancel_claim(
+        &store,
+        &cleanup,
+        *conversation,
+        lease,
+        crate::async_task_tool::ConversationCancelPolicy::AtMostOnce,
+        boundary,
+    )
+    .unwrap();
+    assert_eq!(claim.woken_attempt, old_attempt);
+    let mut batch = crate::task_store::prepare_nested_cancel_claim_ancestry(
+        &store,
+        cleanup.id(),
+        *conversation,
+        claim.claim_id,
+    )
+    .unwrap();
+    batch.checks.extend(checks);
+    let key = crate::task_scheduler::woken_conversation_claim_key(cleanup.id());
+    batch.checks.push(durable_store::Check {
+        key: key.clone(),
+        expected: durable_store::Expected::Missing,
+    });
+    batch.mutations.push(durable_store::Mutation::Put {
+        key,
+        value: serde_json::to_vec(&claim).unwrap(),
+    });
+    store.commit(&batch.checks, &batch.mutations).unwrap();
+    let checks = crate::task_scheduler::woken_nested_claim_checks_for_test(
+        &store,
+        &cleanup,
+        &claim,
+        lease,
+        store.put_version().unwrap(),
+    )
+    .unwrap();
+    let key = format!(
+        "durable/unsafe-park-async/{}/{old_attempt}/intent/receipt",
+        cleanup.id()
+    )
+    .into_bytes();
+    let receipt = crate::async_task_tool::UnsafeDurableReceipt {
+        task_id: cleanup.id(),
+        attempt_id: old_attempt,
+        outcome: Outcome::Pending {
+            reference: "late-nested-wake".into(),
+        },
+    };
+    store
+        .commit(
+            &[durable_store::Check {
+                key: key.clone(),
+                expected: durable_store::Expected::Missing,
+            }],
+            &[durable_store::Mutation::Put {
+                key,
+                value: serde_json::to_vec(&receipt).unwrap(),
+            }],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.commit(&checks, &[]),
+        Err(durable_store::Error::Conflict { .. })
+    ));
+    assert!(
+        crate::task_scheduler::woken_nested_claim_checks_for_test(
+            &store,
+            &cleanup,
+            &claim,
+            lease,
+            store.put_version().unwrap()
+        )
+        .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nested_woken_driver_claim_marker_and_receipt_survive_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    let launch = |resume: bool| {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::nested_woken_evidence_worker",
+            ])
+            .env("PI_TEST_NESTED_WOKEN_DIR", dir.path());
+        if resume {
+            command
+                .env("PI_TEST_NESTED_WOKEN_RESUME", "1")
+                .env("PI_TEST_NESTED_WOKEN_PROBE", "1")
+                .env("PI_TEST_WOKEN_START_DIR", dir.path())
+                .env("PI_TEST_WOKEN_DISPATCH", "1");
+        }
+        command.spawn().unwrap()
+    };
+    let mut first = launch(false);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !dir.path().join("nested-woken").exists() {
+            assert!(first.try_wait().unwrap().is_none(), "initial worker exited");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    first.kill().unwrap();
+    first.wait().unwrap();
+    let mut resumed = launch(true);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !dir.path().join("woken-receipt").exists() {
+            assert!(
+                resumed.try_wait().unwrap().is_none(),
+                "recovery worker exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+        let states = crate::task_store::TaskStore::new(&store).list().unwrap();
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let _ = resumed.kill();
+        let _ = resumed.wait();
+        panic!("receipt did not appear; tasks={states:?}, files={files:?}");
+    });
+    resumed.kill().unwrap();
+    resumed.wait().unwrap();
+    assert!(dir.path().join("nested-cancelled").exists());
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let records = crate::task_store::TaskStore::new(&store).list().unwrap();
+    let root = records
+        .iter()
+        .find(|r| matches!(r.task.owner(), crate::task::TaskOwner::Conversation(_)))
+        .unwrap();
+    let child = records
+        .iter()
+        .find(|r| r.task.owner() == &crate::task::TaskOwner::Task(root.task.id()))
+        .unwrap();
+    for id in [root.task.id(), child.task.id()] {
+        assert!(
+            store
+                .get(format!("durable/task-callback-start/{id}").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(
+        store
+            .get(
+                format!(
+                    "durable/replay-safe-async/{}/conversation-woken-cancel-claim-v3",
+                    child.task.id()
+                )
+                .as_bytes()
+            )
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get(
+                format!(
+                    "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
+                    child.task.id()
+                )
+                .as_bytes()
+            )
+            .unwrap()
+            .is_some()
+    );
+}

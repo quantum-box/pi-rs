@@ -1866,7 +1866,16 @@ impl Handler for Executor {
                         expected,
                         cancel.conversation_cancel_policy(),
                     )?;
-                    let start = admission.conversation_callback_start_lease()?;
+                    let start = if matches!(task.owner(), crate::task::TaskOwner::Task(_)) {
+                        let (conversation, start) =
+                            admission.nested_conversation_callback_start_lease()?;
+                        if conversation != claim.conversation {
+                            return Err("nested conversation changed".into());
+                        }
+                        start
+                    } else {
+                        admission.conversation_callback_start_lease()?
+                    };
                     let marker = admission.record_woken_conversation_start_markers(
                         self,
                         &claim,
