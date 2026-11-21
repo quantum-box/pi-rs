@@ -784,11 +784,7 @@ fn read_event_content(outcome: &Outcome) -> Option<Value> {
     match outcome {
         Outcome::Succeeded(output)
         | Outcome::SucceededWithDetails { output, .. }
-        | Outcome::TextResult {
-            output,
-            is_error: false,
-            ..
-        } => Some(json!(output)),
+        | Outcome::TextResult { output, .. } => Some(json!(output)),
         Outcome::Structured { data, attachments }
         | Outcome::StructuredWithDetails {
             data, attachments, ..
