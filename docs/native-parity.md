@@ -2129,9 +2129,15 @@ Prompt-template and skill expansion retain draft images. Ctrl+C clears an idle
 draft, including its attachments. User keybindings can override the action.
 
 Tests cover pixel validation, alpha preservation, draft delivery and image-only
-input validation. The live clipboard check exercised the empty/unavailable
-clipboard error and clean terminal exit. A populated OS image clipboard has not
-yet been exercised in this environment.
+input validation. Native drafts hold the prepared image in memory. Pi v1.5.0
+writes the pasted image to a temporary file and inserts its path in the editor.
+
+On macOS, Ctrl+V read a populated system pasteboard and sent an image-only
+prompt to a loopback model in regular and fullscreen mode. The model received
+the original 320×480 PNG dimensions, both modes exited cleanly, and the pasteboard
+contents were restored after each run. PTY captures verified the cropped Kitty
+placements and the cropped PNG dimensions from the iTerm2 protocol in both
+modes. Visual clipping in a running terminal emulator still needs acceptance.
 
 ### Edit matching checkpoint
 
