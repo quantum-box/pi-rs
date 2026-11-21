@@ -1209,7 +1209,7 @@ struct View {
     request_started: Option<Instant>,
     phase: Option<&'static str>,
     shell_running: bool,
-    restoring_queue: bool,
+    queue_restores: std::collections::HashMap<uuid::Uuid, bool>,
 }
 fn append_indexed(
     items: &mut std::collections::BTreeMap<u64, String>,
@@ -1831,6 +1831,69 @@ impl View {
         )));
     }
 
+    fn request_queue_restore(&mut self, worker: &mut Option<Worker>, args: &Cli, report: bool) {
+        let id = uuid::Uuid::new_v4();
+        match Worker::control(worker, args, json!({"type":"clear_queue","id":id})) {
+            Ok(()) => {
+                self.queue_restores.insert(id, report);
+            }
+            Err(error) => self.append(&error.to_string()),
+        }
+    }
+
+    fn complete_queue_restore(&mut self, mut value: Value, mode: Option<TuiMode>) {
+        let Some(report) = value["id"]
+            .as_str()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .and_then(|id| self.queue_restores.remove(&id))
+        else {
+            return;
+        };
+        if value["success"] != true {
+            self.append(value["error"].as_str().unwrap_or("Queue restore failed"));
+            return;
+        }
+
+        let mut messages: Vec<pi_rs::QueuedMessage> =
+            match serde_json::from_value(value["data"]["messages"].take()) {
+                Ok(messages) => messages,
+                Err(_) => {
+                    self.append("Queue restore failed");
+                    return;
+                }
+            };
+        let count = messages.len();
+        if count > 0 {
+            messages.sort_by_key(|message| message.input.kind == pi_rs::InputKind::FollowUp);
+            let mut text: Vec<_> = messages
+                .iter()
+                .map(|message| message.input.content.as_str())
+                .filter(|text| !text.trim().is_empty())
+                .collect();
+            if !text.is_empty() {
+                if !self.editor.text.trim().is_empty() {
+                    text.push(&self.editor.text);
+                }
+                self.editor.replace(text.join("\n\n"));
+            }
+
+            let mut images: Vec<_> = messages
+                .into_iter()
+                .flat_map(|message| message.images)
+                .collect();
+            images.append(&mut self.draft_images);
+            self.draft_images = images;
+        }
+        if report {
+            let status = match count {
+                0 => "No queued messages to restore".to_owned(),
+                1 => "Restored 1 queued message to editor".to_owned(),
+                _ => format!("Restored {count} queued messages to editor"),
+            };
+            self.show_status(mode, status);
+        }
+    }
+
     fn receive_worker(&mut self, mut value: Value, args: &mut Cli) {
         if value["type"] == "response" && value["command"] == "set_session_label" {
             if let Ok(request) = serde_json::from_value(value["id"].take())
@@ -1876,6 +1939,10 @@ impl View {
             if value["session"] == json!(args.session) {
                 self.cache_warming_status = serde_json::from_value(value["status"].take()).ok();
             }
+            return;
+        }
+        if value["type"] == "response" && value["command"] == "clear_queue" {
+            self.complete_queue_restore(value, args.tui_mode);
             return;
         }
         self.receive(&value);
@@ -1960,7 +2027,7 @@ impl View {
         self.dialogs.clear();
         self.local_editor = None;
         self.tree_confirmation = None;
-        self.restoring_queue = false;
+        self.queue_restores.clear();
         self.ui_status.clear();
         self.widgets.clear();
         self.history.clear();
@@ -2273,12 +2340,6 @@ impl View {
 
     fn receive(&mut self, value: &Value) {
         match value["type"].as_str() {
-            Some("response") if value["command"] == "clear_queue" && self.restoring_queue => {
-                self.restoring_queue = false;
-                if let Err(error) = self.restore_queue(value) {
-                    self.append(&error.to_string());
-                }
-            }
             Some("bash_execution_start") => {
                 self.shell_running = true;
                 self.lines.push(Entry::Tool {
@@ -6296,23 +6357,14 @@ pub(super) async fn run(
                     }
                     "app.message.dequeue" | "app.interrupt" if view.tree_handoff.is_some() => {}
                     "app.message.dequeue" => {
-                        match Worker::control(&mut worker, &args, json!({"type":"clear_queue"})) {
-                            Ok(()) => view.restoring_queue = true,
-                            Err(error) => view.append(&error.to_string()),
-                        }
+                        view.request_queue_restore(&mut worker, &args, true);
                     }
                     "app.interrupt" if auth_reload.is_some() && !is_busy(&worker) => {
                         auth_reload = None;
                         view.append("Provider credential reload cancelled");
                     }
                     "app.interrupt" if worker.as_ref().is_some_and(|active| active.busy) => {
-                        if let Err(error) =
-                            Worker::control(&mut worker, &args, json!({"type":"clear_queue"}))
-                        {
-                            view.append(&error.to_string());
-                        } else {
-                            view.restoring_queue = true;
-                        }
+                        view.request_queue_restore(&mut worker, &args, false);
                         if let Some(active) = &mut worker {
                             let _ = active.send(json!({"type":"cancel"}));
                         }
@@ -11084,6 +11136,57 @@ exit {exit}
             super::next_thinking_level_input(&mut pending, false, true, false),
             None
         );
+    }
+
+    #[test]
+    fn explicit_dequeue_reports_empty_and_restored_queues_without_losing_draft() {
+        let mut view = View::default();
+        view.editor.replace("draft".to_owned());
+        view.editor.cursor = 2;
+
+        let empty = uuid::Uuid::new_v4();
+        let restored = uuid::Uuid::new_v4();
+        view.queue_restores.insert(empty, true);
+        view.queue_restores.insert(restored, true);
+        view.complete_queue_restore(
+            json!({"id":empty,"success":true,"data":{"messages":[]}}),
+            Some(TuiMode::Fullscreen),
+        );
+
+        assert_eq!(view.editor.text, "draft");
+        assert_eq!(view.editor.cursor, 2);
+        assert!(matches!(
+            view.lines.last(),
+            Some(Entry::Status(text)) if text == "No queued messages to restore"
+        ));
+
+        let image = pi_rs::ImageContent {
+            data: "AA==".into(),
+            mime_type: "image/png".into(),
+        };
+        let message = |kind, content: &str, images| pi_rs::QueuedMessage {
+            input: pi_rs::QueuedInput {
+                id: uuid::Uuid::new_v4(),
+                kind,
+                content: content.to_owned(),
+            },
+            images,
+        };
+        let messages = [
+            message(pi_rs::InputKind::FollowUp, "follow-up", vec![]),
+            message(pi_rs::InputKind::Steer, "steer", vec![image.clone()]),
+        ];
+        view.complete_queue_restore(
+            json!({"id":restored,"success":true,"data":{"messages":messages}}),
+            Some(TuiMode::Fullscreen),
+        );
+        assert_eq!(view.editor.text, "steer\n\nfollow-up\n\ndraft");
+        assert_eq!(view.draft_images, [image]);
+        assert!(view.queue_restores.is_empty());
+        assert!(matches!(
+            view.lines.as_slice(),
+            [Entry::Status(text)] if text == "Restored 2 queued messages to editor"
+        ));
     }
 
     #[test]
