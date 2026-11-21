@@ -972,6 +972,26 @@ impl Model for Ollama {
         }
     }
 
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        let head = self.compatibility.leading_system_message(&request.messages);
+        let mut base = request.clone();
+        base.messages.clear();
+        let messages =
+            head.iter()
+                .chain(
+                    request.messages.iter().filter(|message| {
+                        head.is_none() || !matches!(message, Message::System { .. })
+                    }),
+                )
+                .filter(
+                    |message| !matches!(message, Message::System { content } if content.is_empty()),
+                );
+        messages.fold(
+            pi_rs_core::estimate_request_tokens(&base),
+            |total, message| total.saturating_add(self.estimate_message_tokens(request, message)),
+        )
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
         let value = self.running_models().await?;
         running_context_window(&value, model)
@@ -1017,6 +1037,24 @@ impl Model for Ollama {
 }
 
 impl Ollama {
+    fn wire_messages(
+        &self,
+        messages: Vec<Message>,
+        identity: &ResolvedModelIdentity,
+    ) -> Vec<Value> {
+        let head = self.compatibility.leading_system_message(&messages);
+        let collapse_system = head.is_some();
+        head.into_iter()
+            .chain(
+                messages.into_iter().filter(|message| {
+                    !collapse_system || !matches!(message, Message::System { .. })
+                }),
+            )
+            .filter(|message| !matches!(message, Message::System { content } if content.is_empty()))
+            .flat_map(|message| self.compatible_message(message, identity))
+            .collect()
+    }
+
     async fn stream_with_wire_tools(
         &self,
         request: ModelRequest,
@@ -1043,11 +1081,7 @@ impl Ollama {
             &mut last_progress,
             ModelProgress::WaitingForModel,
         );
-        let messages: Vec<_> = request
-            .messages
-            .into_iter()
-            .flat_map(|message| self.compatible_message(message, &identity))
-            .collect();
+        let messages = self.wire_messages(request.messages, &identity);
         let tools: Vec<_> = wire_tools.unwrap_or_else(|| {
             request
                 .tools
@@ -1736,6 +1770,71 @@ mod content_tests {
         };
         let _stream = model.stream(request).await.unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn chat_system_messages_follow_model_capability_in_wire_and_estimates() {
+        let messages = vec![
+            Message::System {
+                content: "Initial instructions".into(),
+            },
+            Message::User {
+                content: "First question".into(),
+            },
+            Message::System {
+                content: "Additional instructions".into(),
+            },
+            Message::System {
+                content: String::new(),
+            },
+            Message::User {
+                content: "Second question".into(),
+            },
+        ];
+        let folded = vec![
+            Message::System {
+                content: "Initial instructions\n\nAdditional instructions".into(),
+            },
+            messages[1].clone(),
+            messages[4].clone(),
+        ];
+        for preserves in [false, true] {
+            let provider: ChatCompatibility =
+                serde_json::from_value(json!({"supportsMidConvoSystemMessages":!preserves}))
+                    .unwrap();
+            let override_value =
+                serde_json::from_value(json!({"supportsMidConvoSystemMessages":preserves}))
+                    .unwrap();
+            let model = Ollama::new("http://127.0.0.1:1/v1/chat/completions", None)
+                .unwrap()
+                .with_chat_compatibility(provider.overlay(override_value), Some(true), false, true);
+            let actual = model.wire_messages(messages.clone(), &model.replay_identity("fixture"));
+            let expected = if preserves {
+                vec![
+                    messages[0].clone(),
+                    messages[1].clone(),
+                    messages[2].clone(),
+                    messages[4].clone(),
+                ]
+            } else {
+                folded.clone()
+            };
+            let expected_wire: Vec<_> = expected.iter().cloned().flat_map(encode_message).collect();
+            assert_eq!(actual, expected_wire);
+            let request = ModelRequest {
+                model: "fixture".into(),
+                messages: messages.clone(),
+                tools: vec![],
+                max_output_tokens: 1024,
+            };
+            assert_eq!(
+                model.estimate_request_tokens(&request),
+                pi_rs_core::estimate_request_tokens(&ModelRequest {
+                    messages: expected,
+                    ..request
+                }),
+            );
+        }
     }
 
     #[tokio::test]
