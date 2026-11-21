@@ -251,6 +251,88 @@ fn terminal_appearance_notifications_follow_the_saved_theme_selection() {
 }
 
 #[test]
+fn reload_applies_saved_theme_changes_without_overriding_cli_selection() {
+    for explicit_theme in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let settings = home.join("settings.json");
+        std::fs::write(&settings, br#"{"theme":"dark"}"#).unwrap();
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let mut size = libc::winsize {
+            ws_row: 32,
+            ws_col: 110,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(size),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--tui-mode",
+                "fullscreen",
+            ]);
+        if explicit_theme {
+            command.args(["--use-theme", "dark"]);
+        }
+        let _process = Process(
+            command
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave))
+                .spawn()
+                .unwrap(),
+        );
+
+        output_until(&mut master, |text| {
+            assert!(!text.contains("\x1b[?2031h"));
+            text.contains("Enter to send") && text.contains("\x1b]11;?\x07")
+        });
+        std::fs::write(&settings, br#"{"theme":"system"}"#).unwrap();
+        master.write_all(b"\x1b[?1;2c/reload\r").unwrap();
+        output_until(&mut master, |text| {
+            if explicit_theme {
+                assert!(!text.contains("\x1b[?2031h"));
+            }
+            text.contains("Reloaded settings") && (explicit_theme || text.contains("\x1b[?2031h"))
+        });
+        master.write_all(b"/settings\r").unwrap();
+        output_until(&mut master, |text| text.contains("Auto-compact"));
+        master.write_all(b"Theme").unwrap();
+        let expected = if explicit_theme { "dark" } else { "system" };
+        output_until(&mut master, |text| {
+            settings_row_shows(text, "Theme", expected)
+        });
+    }
+}
+
+#[test]
 fn initial_appearance_report_keeps_late_color_replies() {
     let root = tempfile::tempdir().unwrap();
     let mut master_fd = -1;
