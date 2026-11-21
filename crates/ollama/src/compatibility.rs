@@ -1,5 +1,5 @@
 //! Wire differences for explicitly configured chat-completions providers.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -19,15 +19,62 @@ pub struct ChatCompatibility {
     max_tokens_field: Option<MaxTokensField>,
     thinking_format: Option<ThinkingFormat>,
     chat_template_args: Option<serde_json::Map<String, Value>>,
+    open_router_routing: Option<serde_json::Map<String, Value>>,
+    vercel_gateway_routing: Option<VercelGatewayRouting>,
     zai_tool_stream: Option<bool>,
     vllm_priority: Option<serde_json::Number>,
     supports_thinking_token_budget: Option<bool>,
     thinking_token_budget_field: Option<ThinkingBudgetField>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct VercelGatewayRouting {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    only: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    order: Option<Vec<String>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routing_preferences_use_the_gateway_wire_fields_and_model_overrides() {
+        let provider: ChatCompatibility = serde_json::from_value(json!({
+            "openRouterRouting":{"only":["first"],"zdr":true,"data_collection":"deny"},
+            "vercelGatewayRouting":{"only":["anthropic"],"order":["first"]}
+        }))
+        .unwrap();
+        let model = serde_json::from_value(json!({
+            "vercelGatewayRouting":{"order":["bedrock"],"only":[],"ignored":true}
+        }))
+        .unwrap();
+        let mut body = json!({});
+        provider
+            .clone()
+            .overlay(model)
+            .request_options(&mut body, 32, false);
+        assert_eq!(
+            body["provider"],
+            json!({"only":["first"],"zdr":true,"data_collection":"deny"})
+        );
+        assert_eq!(
+            body["providerOptions"],
+            json!({"gateway":{"order":["bedrock"],"only":[]}})
+        );
+
+        let model = serde_json::from_value(json!({
+            "openRouterRouting":{}, "vercelGatewayRouting":{}
+        }))
+        .unwrap();
+        let mut body = json!({});
+        provider
+            .overlay(model)
+            .request_options(&mut body, 32, false);
+        assert_eq!(body["provider"], json!({}));
+        assert!(body.get("providerOptions").is_none());
+    }
 
     #[test]
     fn overlay_merges_chat_template_arguments_by_key() {
@@ -255,6 +302,8 @@ impl ChatCompatibility {
             max_tokens_field: model.max_tokens_field.or(self.max_tokens_field),
             thinking_format: model.thinking_format.or(self.thinking_format),
             chat_template_args,
+            open_router_routing: model.open_router_routing.or(self.open_router_routing),
+            vercel_gateway_routing: model.vercel_gateway_routing.or(self.vercel_gateway_routing),
             zai_tool_stream: model.zai_tool_stream.or(self.zai_tool_stream),
             vllm_priority: model.vllm_priority.or(self.vllm_priority),
             supports_thinking_token_budget: model
@@ -276,6 +325,14 @@ impl ChatCompatibility {
             _ => "max_tokens",
         };
         body[tokens] = json!(max_tokens);
+        if let Some(routing) = &self.open_router_routing {
+            body["provider"] = json!(routing);
+        }
+        if let Some(routing) = &self.vercel_gateway_routing
+            && (routing.only.is_some() || routing.order.is_some())
+        {
+            body["providerOptions"] = json!({"gateway":routing});
+        }
         if self.supports_usage_in_streaming != Some(false) {
             body["stream_options"] = json!({"include_usage":true});
         }
