@@ -1403,7 +1403,7 @@ impl Ollama {
                             if id == "null" {
                                 id.clear();
                             }
-                            if !id.is_empty() && name == call.name {
+                            if name == call.name {
                                 name.clear();
                             }
                             if !call.id.is_empty() {

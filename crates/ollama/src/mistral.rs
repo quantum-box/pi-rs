@@ -515,7 +515,10 @@ mod tests {
                 {"function":{"name":"list","arguments":{}}}
             ]}}]});
             let third = json!({"choices":[{"index":0,"delta":{
-                "tool_calls":[{"index":0,"id":"late-call","function":{"name":"read","arguments":"\"file\":\"doc\"}"}}]
+                "tool_calls":[
+                    {"index":0,"id":"late-call","function":{"name":"read","arguments":"\"file\":\"doc\"}"}},
+                    {"index":1,"function":{"name":"list"}}
+                ]
             },"finish_reason":"tool_calls"}],
                 "usage":{"prompt_tokens":12,"completion_tokens":3,"num_cached_tokens":7}});
             let output = format!("data: {first}\n\ndata: {second}\n\ndata: {third}\n\n");
