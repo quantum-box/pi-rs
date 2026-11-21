@@ -2712,6 +2712,23 @@ impl View {
                 self.mouse.highlight(&mut lines, start..end);
             }
         }
+        let search_overlay = self.search.as_ref().filter(|_| !modal).map(|search| {
+            let search_width = (width * 2 / 5).max(32).min(width.saturating_sub(2).max(1));
+            let left = width.saturating_sub(search_width + 1);
+            let top = usize::from(body_height > 3);
+            let (mut lines, cursor_row, cursor_column) = search.overlay(theme, keys, search_width);
+            if !hardware_cursor && let Some(line) = lines.get_mut(cursor_row) {
+                line.mark_cursor(cursor_column);
+            }
+            lines.truncate(body_height);
+            (
+                top..top + lines.len(),
+                left..left + search_width,
+                lines,
+                cursor_row,
+                cursor_column,
+            )
+        });
         let stdout = std::io::stdout();
         let mut out = FrameWriter::new(
             stdout.lock(),
@@ -2758,12 +2775,19 @@ impl View {
         for (row, line) in lines[start..end].iter().enumerate() {
             queue!(out, MoveTo(0, (row + header_rows) as u16))?;
             line.draw(&mut out, if modal { width } else { body_width })?;
-            self.graphics.paint(
-                line,
-                &mut out,
-                row,
-                images::visible_rows(&lines[start + row..end]),
-            )?;
+            let covered = search_overlay.as_ref().is_some_and(|(rows, columns, ..)| {
+                line.image
+                    .as_ref()
+                    .is_some_and(|image| image.intersects(row, rows, columns))
+            });
+            if !covered {
+                self.graphics.paint(
+                    line,
+                    &mut out,
+                    row,
+                    images::visible_rows(&lines[start + row..end]),
+                )?;
+            }
         }
         if !modal
             && width > 1
@@ -2836,18 +2860,12 @@ impl View {
             "dim",
         )
         .draw(&mut out, width)?;
-        if !modal && let Some(search) = &self.search {
-            let search_width = (width * 2 / 5).max(32).min(width.saturating_sub(2).max(1));
-            let left = width.saturating_sub(search_width + 1);
-            let top = header_rows + usize::from(body_height > 3);
-            let (mut overlay, cursor_row, cursor_column) =
-                search.overlay(theme, keys, search_width);
-            if !hardware_cursor && let Some(line) = overlay.get_mut(cursor_row) {
-                line.mark_cursor(cursor_column);
-            }
-            for (row, line) in overlay.iter().take(body_height).enumerate() {
+        if let Some((rows, columns, overlay, cursor_row, cursor_column)) = search_overlay {
+            let left = columns.start;
+            let top = header_rows + rows.start;
+            for (row, line) in overlay.iter().enumerate() {
                 queue!(out, MoveTo(left as u16, (top + row) as u16))?;
-                line.draw(&mut out, search_width)?;
+                line.draw(&mut out, columns.len())?;
             }
             if cursor_row < body_height {
                 queue!(
