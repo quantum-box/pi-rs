@@ -188,6 +188,8 @@ pub(super) fn run(
                 match event["type"].as_str() {
                     Some("auto_retry_start") => active.retrying = true,
                     Some("auto_retry_end" | "agent_settled" | "request") => active.retrying = false,
+                    Some("compaction_start") => active.compacting = true,
+                    Some("compaction_end") => active.compacting = false,
                     Some("bash_execution_end") => active.bashing = false,
                     _ => {}
                 }

@@ -2545,13 +2545,15 @@ async fn execute(
                     observe_with_stream(event, args.trace, stream.is_some());
                 }
                 event => {
-                    let event = reasoning_event_json(event);
+                    let event = agent_stream_event_json(event);
                     if let Some(stream) = &mut stream {
                         let mut rpc_event = event.clone();
                         attach_redacted_reasoning(&mut rpc_event);
                         for output_event in stream.observe(&rpc_event, &args) { output(output_event); }
                     }
-                    if args.trace { output(trace_agent_event_json(event)); }
+                    if args.trace || (stream.is_some() && matches!(event["type"].as_str(), Some("compaction_start" | "compaction_end"))) {
+                        output(trace_agent_event_json(event));
+                    }
                 }
             }
         };
@@ -2695,8 +2697,11 @@ fn observe(event: Notification<'_>, trace: bool) {
     observe_with_stream(event, trace, false);
 }
 
-fn reasoning_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
+fn agent_stream_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
     match event {
+        pi_rs::AgentEvent::AutoCompaction { reason, update } => {
+            rpc_events::auto_compaction_value(reason, update)
+        }
         pi_rs::AgentEvent::TextStart { index } => json!({"type":"text_item_start","index":index}),
         pi_rs::AgentEvent::TextDelta { index, delta } => {
             json!({"type":"text_item_delta","index":index,"delta":delta})
@@ -2713,7 +2718,7 @@ fn reasoning_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
         pi_rs::AgentEvent::ReasoningEnd { index, content } => {
             json!({"type":"reasoning_item_end","index":index,"content":content})
         }
-        pi_rs::AgentEvent::Notification(_) => unreachable!("expected a reasoning item event"),
+        pi_rs::AgentEvent::Notification(_) => unreachable!("expected an enriched agent event"),
     }
 }
 
