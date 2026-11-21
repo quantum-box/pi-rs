@@ -6,7 +6,7 @@ use pi_rs::{Error, HostAuthBuilder, HostAuthSnapshot, HostCredential, HostCreden
 use regex::Regex;
 use serde_json::Value;
 
-const MAX_API_KEY_BYTES: usize = 4096;
+pub(crate) const MAX_API_KEY_BYTES: usize = 4096;
 
 /// The exact provider and endpoint the host authorizes to use a saved key.
 #[derive(Clone, Debug, PartialEq, Eq)]

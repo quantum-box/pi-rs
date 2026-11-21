@@ -1,12 +1,17 @@
 //! Read explicit Pi model declarations into a host-authorized native catalog.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::path::{Component, PathBuf};
+use std::sync::Arc;
 
-use pi_rs::{CatalogModelCost, CatalogModelInfo, Error, ModelCatalog, Result};
+use pi_rs::{
+    CatalogModelCost, CatalogModelInfo, Error, HostAuthBuilder, HostCredential, HostCredentialKind,
+    Model, ModelCatalog, ModelCatalogBuilder, Result,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::model_factory::{ModelClientFactory, NativeModelApi, NativeModelDefinition};
+use crate::auth_factory::{MAX_API_KEY_BYTES, expand_config_value, valid_api_key};
+use crate::model_factory::{ModelClientFactory, NativeModelApi};
 
 /// Authorize one model-file route. Route fields use exact, case-sensitive
 /// matches. The declared base URL identifies a file entry; only the host's
@@ -34,6 +39,20 @@ impl ModelFileReadGrants {
     /// supply credentials, request headers or provider compatibility options
     /// to clients. There is no built-in lookup or network discovery.
     pub fn load(&self, factory: &ModelClientFactory) -> Result<ModelCatalog> {
+        self.load_with_api_keys(factory, &[], |_, _| None)
+    }
+
+    /// Use a provider's configured API key as a fallback for the exact routes
+    /// separately granted in the key route list. Credentials bound in the
+    /// factory take precedence. The caller supplies variable values for each
+    /// route. Commands and unresolved variables do not produce a credential.
+    /// Run this synchronous file read off the frontend thread.
+    pub fn load_with_api_keys(
+        &self,
+        factory: &ModelClientFactory,
+        key_routes: &[ModelFileRoute],
+        mut lookup: impl FnMut(&ModelFileRoute, &str) -> Option<String>,
+    ) -> Result<ModelCatalog> {
         if !self.file.is_absolute()
             || self
                 .file
@@ -64,18 +83,39 @@ impl ModelFileReadGrants {
                 return Err(Error::Config("duplicate model file route".into()));
             }
         }
+        let mut file_key_routes = BTreeSet::new();
+        for grant in key_routes {
+            let key = (api_name(grant.api), grant.base_url.as_str());
+            if authorized
+                .get(grant.provider.as_str())
+                .and_then(|routes| routes.get(&key))
+                .is_none_or(|route| *route != grant)
+            {
+                return Err(Error::Config(
+                    "API key route is outside the models file grant".into(),
+                ));
+            }
+            if grant.api == NativeModelApi::ChatGptResponses {
+                return Err(Error::Config(
+                    "ChatGPT routes require host-provided OAuth credentials".into(),
+                ));
+            }
+            file_key_routes.insert((grant.provider.as_str(), key));
+        }
+
+        let mut catalog = ModelCatalogBuilder::new();
         if authorized.is_empty() {
-            return factory.catalog([]);
+            return Ok(catalog.build());
         }
         let Some(text) =
             crate::prompt_resources::read_optional_resource(&self.file, "models file")?
         else {
-            return factory.catalog([]);
+            return Ok(catalog.build());
         };
-        let config: ModelFile = serde_json::from_str(&text)
+        let config: ModelFile = serde_json::from_slice(&normalize_model_json(text))
             .map_err(|_| Error::Config("invalid models file JSON".into()))?;
-        let mut selected = Vec::new();
         for (provider, routes) in authorized {
+            let mut clients = BTreeMap::<_, Arc<dyn Model>>::new();
             let Some(value) = config.providers.get(provider) else {
                 continue;
             };
@@ -99,7 +139,10 @@ impl ModelFileReadGrants {
                 }
                 let api = route.api.or(declaration.api);
                 let base = route.base_url.or(declaration.base_url);
-                let Some(grant) = api.zip(base).and_then(|key| routes.get(&key)) else {
+                let Some(key) = api.zip(base) else {
+                    continue;
+                };
+                let Some(grant) = routes.get(&key) else {
                     continue;
                 };
                 let model =
@@ -115,17 +158,93 @@ impl ModelFileReadGrants {
                 if info.context_window == Some(0) || info.max_output_tokens == Some(0) {
                     return Err(invalid_provider(provider));
                 }
-                selected.push(NativeModelDefinition {
-                    api: grant.api,
-                    provider,
-                    endpoint: &grant.endpoint,
-                    model: id,
-                    info: Some(info),
-                });
+                let client = match clients.entry(key) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(client_for_route(
+                        factory,
+                        grant,
+                        file_key_routes.contains(&(provider, key)),
+                        value,
+                        &mut lookup,
+                    )?),
+                };
+                catalog.register_with_info(provider, id, client.clone(), info)?;
             }
         }
-        factory.catalog(selected)
+        Ok(catalog.build())
     }
+}
+
+fn client_for_route(
+    factory: &ModelClientFactory,
+    route: &ModelFileRoute,
+    allow_file_key: bool,
+    declaration: &Value,
+    lookup: &mut impl FnMut(&ModelFileRoute, &str) -> Option<String>,
+) -> Result<Arc<dyn Model>> {
+    let provider = &route.provider;
+    let endpoint = &route.endpoint;
+    if factory.has_credential(provider, endpoint) || !allow_file_key {
+        return factory.client(route.api, provider, endpoint);
+    }
+    let Some(value) = declaration.get("apiKey") else {
+        return factory.client(route.api, provider, endpoint);
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| Error::Config("configured model API key must be a string".into()))?;
+    let Some(key) = expand_config_value(value, MAX_API_KEY_BYTES, |name| lookup(route, name))?
+    else {
+        return factory.client(route.api, provider, endpoint);
+    };
+    if !valid_api_key(&key) {
+        return Err(Error::Config("invalid configured model API key".into()));
+    }
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        provider,
+        endpoint,
+        HostCredential::new(HostCredentialKind::ApiKey, key)?,
+    )?;
+    ModelClientFactory::new(auth.build()).client(route.api, provider, endpoint)
+}
+
+// Pi accepts line comments and trailing commas. Mask them without changing
+// string contents, then let serde_json validate the remaining syntax.
+fn normalize_model_json(text: String) -> Vec<u8> {
+    let mut bytes = text.into_bytes();
+    let mut index = 0;
+    let mut in_string = false;
+    let mut previous = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            match byte {
+                b'\\' => index += 1,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            let end = bytes[index + 2..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |offset| index + 2 + offset);
+            bytes[index..end].fill(b' ');
+            index = end;
+            continue;
+        } else if !matches!(byte, b' ' | b'\r' | b'\n' | b'\t') {
+            if matches!(byte, b']' | b'}')
+                && let Some(comma) = previous
+                && bytes[comma] == b','
+            {
+                bytes[comma] = b' ';
+            }
+            in_string = byte == b'"';
+            previous = Some(index);
+        }
+        index += 1;
+    }
+    bytes
 }
 
 fn api_name(api: NativeModelApi) -> &'static str {
