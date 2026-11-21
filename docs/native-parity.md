@@ -4807,7 +4807,8 @@ catalogues are projected from the published
 
 ### Cloudflare Workers AI chat checkpoint
 
-Cloudflare Workers AI exposes the 19 pinned chat models via Chat Completions.
+Cloudflare Workers AI exposes the 20 Pi 1.6 chat models via Chat Completions,
+including Inkling 2 Small with image input and the published thinking controls.
 `CLOUDFLARE_ACCOUNT_ID` selects the account and `CLOUDFLARE_API_KEY` authorizes
 requests. Terminal `/login cloudflare-workers-ai` prompts for a masked API
 key and the account ID for routes derived from login or environment settings. Pi-format saved credentials may declare an account through their
