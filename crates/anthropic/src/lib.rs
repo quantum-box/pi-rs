@@ -64,6 +64,8 @@ impl ThinkingDisplay {
 }
 
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+const EFFORT_BETA: &str = "mid-conversation-output-config-2026-07-01";
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 const OAUTH_BETAS: &str = "claude-code-20250219,oauth-2025-04-20";
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -95,6 +97,7 @@ pub struct Anthropic {
     thinking_budgets: Option<Value>,
     thinking_display: ThinkingDisplay,
     interleaved_thinking: bool,
+    managed_effort_models: Arc<BTreeMap<String, bool>>,
     configured_thinking: Option<CatalogEntry>,
     configured_thinking_is_fallback: bool,
     allow_empty_signature: bool,
@@ -202,6 +205,7 @@ impl Anthropic {
             thinking_budgets: None,
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
+            managed_effort_models: Arc::default(),
             configured_thinking: None,
             configured_thinking_is_fallback: false,
             allow_empty_signature: false,
@@ -354,6 +358,12 @@ impl Anthropic {
         self
     }
 
+    /// Enable per-reply effort for the listed models, with their ability to disable thinking.
+    pub fn with_managed_effort_models(mut self, models: BTreeMap<String, bool>) -> Self {
+        self.managed_effort_models = Arc::new(models);
+        self
+    }
+
     /// Use known thinking capabilities for a gateway that lacks a Models API.
     pub fn with_configured_thinking(mut self, level: &str, adaptive: bool, disable: bool) -> Self {
         self.thinking_level = Some(level.into());
@@ -414,7 +424,7 @@ impl Anthropic {
         url.path_segments_mut().ok()?.push(model);
         let details = tokio::time::timeout(Duration::from_secs(2), async {
             let response = send(
-                self.authenticate(self.client.get(url), false),
+                self.authenticate(self.client.get(url), false, false),
                 &self.error_secrets(),
             )
             .await
@@ -477,6 +487,7 @@ impl Anthropic {
         &self,
         mut request: reqwest::RequestBuilder,
         interleaved: bool,
+        supports_managed_effort: bool,
     ) -> reqwest::RequestBuilder {
         request = request
             .header("anthropic-version", API_VERSION)
@@ -488,18 +499,44 @@ impl Anthropic {
                 .header("user-agent", "claude-cli/2.1.280")
                 .header("x-app", "cli");
         }
-        if !self.headers.contains_key("anthropic-beta") {
-            request = match (self.oauth, interleaved) {
-                (true, true) => request.header(
-                    "anthropic-beta",
-                    format!("{OAUTH_BETAS},{INTERLEAVED_THINKING_BETA}"),
-                ),
-                (true, false) => request.header("anthropic-beta", OAUTH_BETAS),
-                (false, true) => request.header("anthropic-beta", INTERLEAVED_THINKING_BETA),
-                (false, false) => request,
-            };
+        let mut headers = self.headers.clone();
+        let beta = HeaderName::from_static("anthropic-beta");
+        if !headers.contains_key(&beta) {
+            let betas = [
+                self.oauth.then_some(OAUTH_BETAS),
+                interleaved.then_some(INTERLEAVED_THINKING_BETA),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            if !betas.is_empty() {
+                headers.insert(
+                    &beta,
+                    HeaderValue::from_str(&betas.join(",")).expect("static betas"),
+                );
+            }
         }
-        request.headers(self.headers.clone())
+        if supports_managed_effort {
+            let mut value = headers
+                .get(&beta)
+                .map_or_else(Vec::new, |value| value.as_bytes().to_vec());
+            for feature in [EFFORT_BETA, THINKING_BINDING_BETA] {
+                if !value
+                    .split(|byte| *byte == b',')
+                    .any(|entry| entry.trim_ascii() == feature.as_bytes())
+                {
+                    if !value.is_empty() {
+                        value.push(b',');
+                    }
+                    value.extend_from_slice(feature.as_bytes());
+                }
+            }
+            headers.insert(
+                &beta,
+                HeaderValue::from_bytes(&value).expect("validated beta header"),
+            );
+        }
+        request.headers(headers)
     }
 
     fn configure_request_thinking(
@@ -546,7 +583,7 @@ impl Anthropic {
                 url.query_pairs_mut().append_pair("after_id", cursor);
             }
             let response = send(
-                self.authenticate(self.client.get(url), false),
+                self.authenticate(self.client.get(url), false, false),
                 &self.error_secrets(),
             )
             .await?;
@@ -905,15 +942,21 @@ async fn read_json(mut response: Response) -> Result<Value> {
     serde_json::from_slice(&bytes).map_err(|_| Error::Model("invalid Anthropic response".into()))
 }
 
+fn effort_message(effort: &str) -> Value {
+    json!({"role":"system","content":[],"output_config":{"effort":effort}})
+}
+
 fn encode_request(
     request: ModelRequest,
     replay_scope: &str,
     edited_scope: &str,
     allow_empty_signature: bool,
+    replay_effort: bool,
 ) -> Result<Value> {
     let mut system = Vec::new();
-    let mut turns: Vec<(&str, Vec<Value>)> = Vec::new();
+    let mut turns: Vec<(&str, Vec<Value>, Option<&'static str>)> = Vec::new();
     for message in request.messages {
+        let mut prior_effort = None;
         let (role, blocks) = match message {
             Message::System { content } => {
                 system.push(content);
@@ -939,16 +982,23 @@ fn encode_request(
                     Some(replay)
                         if replay_matches(
                             &replay,
-                            if replay.is_context_edit() { edited_scope } else { replay_scope },
+                            if replay.is_context_edit() {
+                                edited_scope
+                            } else {
+                                replay_scope
+                            },
                             &request.model,
                             &content,
                             &calls,
                         ) =>
                     {
+                        if replay_effort && !replay.is_context_edit() {
+                            prior_effort = replay.anthropic_effort();
+                        }
                         replay
                             .blocks
                             .into_iter()
-                            .filter(|block| block.get("_pi_context_edit_api").is_none() && block["_pi_omitted_text"] != true)
+                            .filter(|block| block.get("_pi_context_edit_api").is_none() && block.get("_pi_anthropic_effort").is_none() && block["_pi_omitted_text"] != true)
                             .map(|mut block| {
                                 if block["_pi_thinking"] == true && allow_empty_signature {
                                     return json!({"type":"thinking","thinking":block["text"],"signature":""});
@@ -985,12 +1035,14 @@ fn encode_request(
         if blocks.is_empty() {
             continue;
         }
-        if let Some((previous, content)) = turns.last_mut()
+        if let Some((previous, content, previous_effort)) = turns.last_mut()
             && *previous == role
+            && previous_effort.is_none()
+            && prior_effort.is_none()
         {
             content.extend(blocks);
         } else {
-            turns.push((role, blocks));
+            turns.push((role, blocks, prior_effort));
         }
     }
     if turns.is_empty() {
@@ -1000,7 +1052,12 @@ fn encode_request(
     }
     let messages: Vec<_> = turns
         .into_iter()
-        .map(|(role, content)| json!({"role":role,"content":content}))
+        .flat_map(|(role, content, effort)| {
+            effort
+                .map(effort_message)
+                .into_iter()
+                .chain(std::iter::once(json!({"role":role,"content":content})))
+        })
         .collect();
     let mut body = json!({"model":request.model,"messages":messages,"max_tokens":request.max_output_tokens,"stream":true});
     if !system.is_empty() {
@@ -1630,6 +1687,15 @@ impl Model for Anthropic {
         } else {
             base
         };
+        let base = if self.managed_effort_models.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "managed-effort-v1",
+                self.managed_effort_models.as_ref(),
+            ))?
+        };
         match &self.strict_tool_models {
             // A map containing only unsupported models cannot change any
             // successful request's sampling compared with the default.
@@ -1827,11 +1893,44 @@ impl Anthropic {
         };
         let copilot = (self.provider.as_ref() == "github-copilot")
             .then(|| pi_rs_core::copilot_request_headers(&request.messages).collect::<Vec<_>>());
+        let mut thinking = json!({});
+        let managed_effort_model = self.managed_effort_models.get(&requested_model).copied();
+        let supports_managed_effort = managed_effort_model.is_some();
+        let active_effort = match (managed_effort_model, self.thinking_level.as_deref()) {
+            (Some(false), None | Some("off")) => Some("high"),
+            (Some(_), Some(level)) if level != "off" => Some(
+                ProviderReplay::valid_anthropic_effort(level).ok_or_else(|| {
+                    Error::Config(
+                        "selected Anthropic model does not advertise that effort level".into(),
+                    )
+                })?,
+            ),
+            _ => None,
+        };
+        let interleaved = if active_effort.is_some() {
+            thinking["thinking"] = json!({
+                "type":"adaptive", "display":self.thinking_display.as_str(),
+                "block_binding":{"prefix_mismatch_behavior":"drop_block"}
+            });
+            thinking["output_config"] = json!({"effort":"low"});
+            false
+        } else {
+            let interleaved = self.configure_request_thinking(
+                &mut thinking,
+                details.as_ref(),
+                max_output_tokens,
+            )?;
+            if supports_managed_effort && self.thinking_level.as_deref() == Some("off") {
+                thinking["thinking"] = json!({"type":"disabled"});
+            }
+            interleaved
+        };
         let mut body = encode_request(
             request,
             &replay_scope,
             &edited_scope,
             self.allow_empty_signature,
+            active_effort.is_some(),
         )?;
         if let Some(tools) = wire_tools
             && !tools.is_empty()
@@ -1842,8 +1941,15 @@ impl Anthropic {
         if self.oauth {
             prepare_oauth_request(&mut body, self.cache_retention);
         }
-        let interleaved =
-            self.configure_request_thinking(&mut body, details.as_ref(), max_output_tokens)?;
+        if let Some(effort) = active_effort {
+            body["messages"]
+                .as_array_mut()
+                .expect("encoded messages")
+                .push(effort_message(effort));
+        }
+        body.as_object_mut()
+            .expect("encoded request")
+            .append(thinking.as_object_mut().expect("thinking options object"));
         if let Some(progress) = &self.progress {
             progress(Progress::WaitingForModel);
         }
@@ -1862,7 +1968,9 @@ impl Anthropic {
                 }
             }
         }
-        let response = send_http(self.authenticate(request.json(&body), interleaved)).await?;
+        let response =
+            send_http(self.authenticate(request.json(&body), interleaved, supports_managed_effort))
+                .await?;
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
@@ -2099,9 +2207,9 @@ impl Anthropic {
                             Some("redacted_thinking") => Some("[Reasoning redacted]"),
                             _ => None,
                         }).collect();
-                        let signed = blocks.values().any(ResponseBlock::signed);
+                        let retain_replay = active_effort.is_some() || blocks.values().any(ResponseBlock::signed);
                         let mut replay = BTreeMap::new();
-                        if signed {
+                        if retain_replay {
                             for (index, block) in blocks {
                                 replay.insert(index, block.finish(allow_empty_signature)?);
                             }
@@ -2109,7 +2217,7 @@ impl Anthropic {
                         let mut completed_calls = Vec::new();
                         for (index, call) in calls {
                             let (call, raw) = call.finish()?;
-                            if signed {
+                            if retain_replay {
                                 replay.insert(index, raw);
                             }
                             completed_calls.push(call);
@@ -2122,11 +2230,15 @@ impl Anthropic {
                             let timestamp = i64::try_from(millis).unwrap_or(i64::MAX);
                             metadata.diagnostics.push(AssistantDiagnostic::AnthropicInputTransformations { timestamp, details });
                         }
-                        if signed {
-                            metadata.replay = Some(Box::new(ProviderReplay {
+                        if retain_replay {
+                            let mut replay = ProviderReplay {
                                 identity: ResolvedModelIdentity { provider: replay_scope.to_string(), model: requested_model },
                                 blocks: replay.into_values().collect(),
-                            }));
+                            };
+                            if let Some(effort) = active_effort {
+                                replay.record_anthropic_effort(effort);
+                            }
+                            metadata.replay = Some(Box::new(replay));
                         }
                         if metadata != previous {
                             yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata)));
@@ -2567,7 +2679,7 @@ mod tests {
             pi_rs_core::StrictToolPolicy::Prefer,
             json!({"type":"object","title":"dropped"}),
         );
-        let old = encode_request(request.clone(), &legacy.replay_scope, "", false).unwrap();
+        let old = encode_request(request.clone(), &legacy.replay_scope, "", false, false).unwrap();
         let (wire, _) = super::resolve_tools(&request, &[declaration], false).unwrap();
         assert_ne!(old["tools"][0]["input_schema"], wire[0]["input_schema"]);
         assert_eq!(
@@ -2739,8 +2851,9 @@ mod tests {
                 })),
             }],
         };
-        let same = encode_request(request.clone(), &api_key.replay_scope, "", false).unwrap();
-        let other = encode_request(request, &custom.replay_scope, "", false).unwrap();
+        let same =
+            encode_request(request.clone(), &api_key.replay_scope, "", false, false).unwrap();
+        let other = encode_request(request, &custom.replay_scope, "", false, false).unwrap();
         assert!(same.to_string().contains("secret"));
         assert!(!other.to_string().contains("secret"));
     }
@@ -2775,9 +2888,39 @@ mod tests {
         assert!(model.stream(request).await.is_err());
     }
 
+    fn read_fixture_request(socket: &mut std::net::TcpStream) -> (String, Value) {
+        use std::io::Read;
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let n = socket.read(&mut buffer).unwrap();
+            assert!(n > 0);
+            request.extend_from_slice(&buffer[..n]);
+            if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..pos]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(|n| n.parse().unwrap())
+                    })
+                    .unwrap();
+                if request.len() >= pos + 4 + length {
+                    break;
+                }
+            }
+        }
+        let pos = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        (
+            String::from_utf8_lossy(&request[..pos]).to_ascii_lowercase(),
+            serde_json::from_slice(&request[pos + 4..]).unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn oauth_round_trip_uses_canonical_wire_names_and_restores_local_tool() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let worker = std::thread::spawn(move || {
@@ -2785,34 +2928,11 @@ mod tests {
             socket
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0; 4096];
-            loop {
-                let n = socket.read(&mut buffer).unwrap();
-                assert!(n > 0);
-                request.extend_from_slice(&buffer[..n]);
-                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&request[..pos]);
-                    let length: usize = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length: ")
-                                .map(|n| n.parse().unwrap())
-                        })
-                        .unwrap();
-                    if request.len() >= pos + 4 + length {
-                        break;
-                    }
-                }
-            }
-            let pos = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
-            let headers = String::from_utf8_lossy(&request[..pos]).to_ascii_lowercase();
+            let (headers, body) = read_fixture_request(&mut socket);
             assert!(headers.contains("authorization: bearer fixture-oauth"));
             assert!(headers.lines().any(|line| {
                 line == "anthropic-beta: claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"
             }));
-            let body: Value = serde_json::from_slice(&request[pos + 4..]).unwrap();
             assert_eq!(body["tools"][0]["name"], "Read");
             assert_eq!(
                 body["thinking"],
@@ -3712,7 +3832,7 @@ mod tests {
             tools: vec![],
             max_output_tokens: 16,
         };
-        let body = encode_request(request, "anthropic", &scope, false).unwrap();
+        let body = encode_request(request, "anthropic", &scope, false, false).unwrap();
         assert_eq!(
             body["messages"][0]["content"],
             json!([{"type":"text","text":"first \n"},{"type":"text","text":"second"},{"type":"thinking","thinking":"secret","signature":"sig"}])
@@ -3747,9 +3867,9 @@ mod tests {
             tools: vec![],
             max_output_tokens: 16,
         };
-        let same = encode_request(request.clone(), "anthropic", &scope_a, false).unwrap();
+        let same = encode_request(request.clone(), "anthropic", &scope_a, false, false).unwrap();
         assert_eq!(same["messages"][1]["content"][0]["thinking"], "secret");
-        let other = encode_request(request, "anthropic", &scope_b, false).unwrap();
+        let other = encode_request(request, "anthropic", &scope_b, false, false).unwrap();
         assert_eq!(other["messages"].as_array().unwrap().len(), 1);
         assert!(!other.to_string().contains("secret"));
     }
@@ -3776,12 +3896,12 @@ mod tests {
                 })),
             }],
         };
-        let same = encode_request(make("claude"), "anthropic", "anthropic", false).unwrap();
+        let same = encode_request(make("claude"), "anthropic", "anthropic", false, false).unwrap();
         assert_eq!(
             same["messages"][0]["content"],
             json!([{"type":"thinking","thinking":"secret","signature":"signed"},{"type":"text","text":"answer"}])
         );
-        let other = encode_request(make("other"), "anthropic", "anthropic", false).unwrap();
+        let other = encode_request(make("other"), "anthropic", "anthropic", false, false).unwrap();
         assert_eq!(
             other["messages"][0]["content"],
             json!([{"type":"text","text":"answer"}])
@@ -3815,6 +3935,7 @@ mod tests {
             },
             "fixture",
             "fixture",
+            false,
             false,
         )
         .unwrap();
@@ -3856,6 +3977,133 @@ mod tests {
             })
         );
         assert!(AnthropicInputTransformations::from_value(&json!([])).is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_effort_round_trip_records_and_replays_the_reply_setting() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for (sent, previous) in [
+                (Some("low"), None),
+                (Some("xhigh"), Some("low")),
+                (Some("off"), None),
+                (None, None),
+                (Some("high"), None),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (headers, body) = read_fixture_request(&mut socket);
+                assert!(headers.lines().any(|line| line
+                    == format!(
+                        "anthropic-beta: custom-feature,{EFFORT_BETA},{THINKING_BINDING_BETA}"
+                    )));
+                assert!(!headers.contains(INTERLEAVED_THINKING_BETA));
+                let messages = body["messages"].as_array().unwrap();
+                assert!(!body.to_string().contains("_pi_anthropic_effort"));
+                let active = sent.and_then(ProviderReplay::valid_anthropic_effort);
+                if let Some(active) = active {
+                    assert_eq!(body["output_config"], json!({"effort":"low"}));
+                    assert_eq!(
+                        body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+                        "drop_block"
+                    );
+                    assert_eq!(messages.last().unwrap(), &effort_message(active));
+                } else {
+                    if sent == Some("off") {
+                        assert_eq!(body["thinking"], json!({"type":"disabled"}));
+                    } else {
+                        assert!(body.get("thinking").is_none());
+                    }
+                    assert!(body.get("output_config").is_none());
+                }
+                if let Some(previous) = previous {
+                    assert_eq!(messages[1], effort_message(previous));
+                    assert_eq!(messages[2]["content"][0]["text"], "reply");
+                } else {
+                    assert_eq!(
+                        messages.iter().filter(|m| m["role"] == "system").count(),
+                        usize::from(active.is_some())
+                    );
+                }
+                let events = [
+                    json!({"type":"message_start","message":{"id":"msg","model":"m","usage":{}}}),
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"reply"}}),
+                    json!({"type":"content_block_stop","index":0}),
+                    json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}),
+                    json!({"type":"message_stop"}),
+                ];
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let client = Anthropic::new(&format!("http://{address}/v1/messages"), "fixture")
+            .unwrap()
+            .with_context_probe(false)
+            .with_headers(
+                [(
+                    HeaderName::from_static("anthropic-beta"),
+                    HeaderValue::from_str(&format!("custom-feature,{EFFORT_BETA}")).unwrap(),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .with_managed_effort_models(BTreeMap::from([
+                ("m".into(), true),
+                ("always".into(), false),
+            ]));
+        let mut request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::User {
+                content: "prompt".into(),
+            }],
+            tools: Vec::new(),
+            max_output_tokens: 64,
+        };
+        for (model, level) in [
+            ("m", Some("low")),
+            ("m", Some("xhigh")),
+            ("m", Some("off")),
+            ("m", None),
+            ("always", None),
+        ] {
+            request.model = model.into();
+            let mut stream = client
+                .clone()
+                .with_thinking(level)
+                .stream(request.clone())
+                .await
+                .unwrap();
+            let mut replay = None;
+            while let Some(event) = stream.next().await {
+                if let ModelEvent::Metadata(metadata) = event.unwrap() {
+                    replay = metadata.replay.or(replay);
+                }
+            }
+            assert_eq!(
+                replay.as_deref().and_then(ProviderReplay::anthropic_effort),
+                level
+                    .and_then(ProviderReplay::valid_anthropic_effort)
+                    .or_else(|| (model == "always").then_some("high")),
+            );
+            if level == Some("low") {
+                request.messages.push(Message::Assistant {
+                    content: "reply".into(),
+                    calls: Vec::new(),
+                    replay,
+                });
+                request.messages.push(Message::User {
+                    content: "next".into(),
+                });
+            }
+        }
+        worker.join().unwrap();
     }
 
     #[test]
@@ -3906,7 +4154,7 @@ mod tests {
                 .unwrap();
             assert_eq!(body["thinking"], thinking);
             let request = client
-                .authenticate(client.client.post(DEFAULT_ENDPOINT), interleaved)
+                .authenticate(client.client.post(DEFAULT_ENDPOINT), interleaved, false)
                 .build()
                 .unwrap();
             assert_eq!(
