@@ -4094,16 +4094,16 @@ fn check_streaming_tree_navigation(mode: &str) {
     master.write_all(b"active prompt\r").unwrap();
     output_until(&mut master, |text| text.contains("live-stream-marker"));
     master.write_all(b"retained draft\r").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !pi_rs::Session::snapshot(&session_path).is_ok_and(|session| {
-        session
-            .queued_inputs()
-            .iter()
-            .any(|message| message.input.content == "retained draft")
-    }) {
-        assert!(Instant::now() < deadline, "queued prompt was not journaled");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // The terminal can redraw while the worker saves the input. Keep
+    // draining the PTY so a full output buffer cannot stall that redraw.
+    output_until(&mut master, |_| {
+        pi_rs::Session::snapshot(&session_path).is_ok_and(|session| {
+            session
+                .queued_inputs()
+                .iter()
+                .any(|message| message.input.content == "retained draft")
+        })
+    });
 
     master.write_all(b"/tree\r").unwrap();
     output_until(&mut master, |text| text.contains("Session tree"));
