@@ -4042,17 +4042,24 @@ mod estimation_tests {
     #[tokio::test]
     async fn opencode_prepared_requests_send_route_headers_for_every_api() {
         use clap::Parser;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
 
         let mut args = super::super::Cli::parse_from(["pi"]);
         for (provider, model, target, auth_header, override_session) in [
             (
                 "opencode",
-                "kimi-k2.7-code",
+                "hy4-flash-free",
                 "/relay/chat/completions",
                 "authorization: bearer fixture",
                 true,
+            ),
+            (
+                "opencode",
+                "claude-fable-5-2",
+                "/relay/messages?beta=true",
+                "x-api-key: fixture",
+                false,
             ),
             (
                 "opencode-go",
@@ -4063,14 +4070,14 @@ mod estimation_tests {
             ),
             (
                 "opencode",
-                "gemini-4-argon",
-                "/relay/models/gemini-4-argon:streamGenerateContent?alt=sse",
+                "gemini-4-carbon",
+                "/relay/models/gemini-4-carbon:streamGenerateContent?alt=sse",
                 "x-goog-api-key: fixture",
                 false,
             ),
             (
-                "opencode-go",
-                "gpt-6-luna",
+                "opencode",
+                "gpt-6.2-sol",
                 "/relay/responses",
                 "authorization: bearer fixture",
                 false,
@@ -4089,6 +4096,8 @@ mod estimation_tests {
             .unwrap();
             args.provider = args.model_profiles.provider(provider).unwrap();
             args.model = model.into();
+            let managed_effort = matches!(model, "claude-fable-5-2" | "claude-haiku-5-5");
+            args.thinking = managed_effort.then(|| "high".into());
             let endpoint = args.model_endpoint_for(&args.provider, Some(model));
             let client = args
                 .connect_provider(&args.provider, Some(model))
@@ -4112,16 +4121,24 @@ mod estimation_tests {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut socket = BufReader::new(socket);
                 let mut request = String::new();
+                let mut content_length = 0;
                 loop {
                     let mut line = String::new();
                     assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
                     if line == "\r\n" {
                         break;
                     }
+                    if let Some(length) = line.to_ascii_lowercase().strip_prefix("content-length:")
+                    {
+                        content_length = length.trim().parse().unwrap();
+                    }
                     request.push_str(&line);
                 }
+                let mut body = vec![0; content_length];
+                socket.read_exact(&mut body).await.unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 socket.get_mut().write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
-                request.to_ascii_lowercase()
+                (request.to_ascii_lowercase(), body)
             });
             let context = pi_rs::ToolDispatchContext {
                 request_id: uuid::Uuid::new_v4(),
@@ -4152,10 +4169,11 @@ mod estimation_tests {
                 dispatched.is_ok(),
                 "request timed out for {provider}/{model}"
             );
-            let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), server)
-                .await
-                .unwrap()
-                .unwrap();
+            let (dispatched, body) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert!(
                 dispatched.starts_with(&format!("post {} http/", target.to_ascii_lowercase())),
                 "{dispatched}"
@@ -4173,7 +4191,20 @@ mod estimation_tests {
                 dispatched.lines().any(|line| line == session_header),
                 "{dispatched}"
             );
-            if model == "gpt-6-luna" {
+            if managed_effort {
+                assert!(dispatched.contains("mid-conversation-output-config-2026-07-01"));
+                assert!(dispatched.contains("thinking-binding-controls-2026-08-01"));
+                assert_eq!(
+                    body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+                    "drop_block"
+                );
+                assert_eq!(body["output_config"]["effort"], "low");
+                assert_eq!(
+                    body["messages"].as_array().unwrap().last().unwrap()["output_config"]["effort"],
+                    "high"
+                );
+            }
+            if model == "gpt-6.2-sol" {
                 assert!(
                     dispatched
                         .lines()
