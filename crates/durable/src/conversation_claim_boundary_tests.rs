@@ -7951,6 +7951,12 @@ async fn owned_graph_evidence_cannot_be_erased_into_ordinary_root() {
 
 #[cfg(feature = "experimental-graph-revision")]
 #[tokio::test]
+async fn owned_graph_rejects_same_attempt_state_aba() {
+    exercise_woken_owned_graph_receipt(false, 15).await;
+}
+
+#[cfg(feature = "experimental-graph-revision")]
+#[tokio::test]
 async fn owned_graph_driver_commits_reservation_evidence() {
     exercise_woken_owned_graph_receipt(false, 6).await;
 }
@@ -8803,6 +8809,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             || graph_aba == 11
             || graph_aba == 12
             || graph_aba == 13
+            || graph_aba == 15
             || graph_aba == 16
         {
             let mut running = recovered.clone();
@@ -8822,6 +8829,51 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                 .replay_safe_woken_owned_cleanup_checks(&running, store.put_version().unwrap())
                 .unwrap();
             store.commit(&new_checks, &[]).unwrap();
+            if graph_aba == 15 {
+                let key = crate::task_store::key(root.task.id());
+                let original = store.get(&key).unwrap().unwrap();
+                let mut changed: Value = serde_json::from_slice(&original.value).unwrap();
+                changed["state"] = json!("Ready");
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(original.version),
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key: key.clone(),
+                            value: serde_json::to_vec(&changed).unwrap(),
+                        }],
+                    )
+                    .unwrap();
+                let changed_entry = store.get(&key).unwrap().unwrap();
+                store
+                    .commit(
+                        &[durable_store::Check {
+                            key: key.clone(),
+                            expected: durable_store::Expected::Version(changed_entry.version),
+                        }],
+                        &[durable_store::Mutation::Put {
+                            key,
+                            value: original.value,
+                        }],
+                    )
+                    .unwrap();
+                let current = tasks.load(root.task.id()).unwrap().unwrap();
+                assert!(matches!(
+                    store.commit(&new_checks, &[]),
+                    Err(durable_store::Error::Conflict { .. })
+                ));
+                assert!(
+                    harness
+                        .replay_safe_woken_owned_cleanup_checks(
+                            &current,
+                            store.put_version().unwrap()
+                        )
+                        .is_err()
+                );
+                return;
+            }
             if graph_aba == 11 {
                 let mut forged = serde_json::to_value(&running.task).unwrap();
                 forged["state"] = json!({"Failed":"interrupted"});

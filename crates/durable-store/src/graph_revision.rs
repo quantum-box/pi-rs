@@ -171,6 +171,18 @@ pub(crate) fn affected(
                                     == Some(&serde_json::Value::Bool(true))
                                     && next.get("abort_requested")
                                         != Some(&serde_json::Value::Bool(true)))
+                                || (old.get("abort_requested")
+                                    == Some(&serde_json::Value::Bool(true))
+                                    && old.get("state") == Some(&serde_json::json!("Running"))
+                                    && next.get("state") != Some(&serde_json::json!("Running"))
+                                    && next.get("state") != Some(&serde_json::json!("Cancelled"))
+                                    && !next
+                                        .get("state")
+                                        .and_then(|value| value.as_object())
+                                        .is_some_and(|state| {
+                                            state.contains_key("Succeeded")
+                                                || state.contains_key("Failed")
+                                        }))
                                 || (next.get("attempt_id").is_some_and(|v| !v.is_null())
                                     && old.get("attempt_id") != next.get("attempt_id"))
                                 || (matches!(old.get("state"), Some(serde_json::Value::String(state)) if state == "Cancelled")
