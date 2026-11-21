@@ -36,6 +36,7 @@ pub struct Ollama {
     prompt_cache_long: bool,
     session_cache_key: Option<String>,
     reasoning_effort: Option<String>,
+    reasoning_effort_is_mapped: bool,
     thinking_budget_level: Option<String>,
     thinking_budgets: Option<Value>,
     compatibility: ChatCompatibility,
@@ -223,6 +224,7 @@ impl Ollama {
                 && std::env::var("PI_CACHE_RETENTION").is_ok_and(|value| value == "long"),
             session_cache_key: None,
             reasoning_effort: None,
+            reasoning_effort_is_mapped: false,
             thinking_budget_level: None,
             thinking_budgets: None,
             compatibility: ChatCompatibility::default(),
@@ -323,6 +325,7 @@ impl Ollama {
     /// Override provider thinking effort. None preserves the model default.
     pub fn with_reasoning_effort(mut self, effort: Option<&str>) -> Self {
         let local_ollama = self.endpoint.port_or_known_default() == Some(11434);
+        self.reasoning_effort_is_mapped = false;
         self.reasoning_effort = effort.map(|effort| {
             match effort {
                 "off" => "none",
@@ -337,6 +340,7 @@ impl Ollama {
 
     /// Set an effort already resolved against the model's advertised controls.
     pub fn with_reported_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+        self.reasoning_effort_is_mapped = false;
         self.reasoning_effort =
             effort.map(|level| if level == "off" { "none" } else { level }.to_owned());
         self
@@ -344,8 +348,20 @@ impl Ollama {
 
     /// Apply the provider value from an explicit thinking-level map.
     pub fn with_mapped_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+        self.reasoning_effort_is_mapped = true;
         self.reasoning_effort = effort.map(str::to_owned);
         self
+    }
+
+    fn chat_reasoning_effort(&self) -> Option<&str> {
+        if self.compatibility.uses_chat_template()
+            && !self.reasoning_enabled
+            && !self.reasoning_effort_is_mapped
+        {
+            None
+        } else {
+            self.reasoning_effort.as_deref()
+        }
     }
 
     /// Set the selected Pi thinking level and optional budget overrides.
@@ -901,7 +917,7 @@ impl Model for Ollama {
             self.supports_reasoning,
             self.reasoning_enabled,
             self.allow_reasoning_off,
-            &self.reasoning_effort,
+            self.chat_reasoning_effort(),
             &self.thinking_budget_level,
             &self.thinking_budgets,
             &self.sampling,
@@ -1164,7 +1180,7 @@ impl Ollama {
                 &mut body,
                 self.supports_reasoning,
                 self.reasoning_enabled,
-                self.reasoning_effort.as_deref(),
+                self.chat_reasoning_effort(),
                 self.allow_reasoning_off,
                 thinking_budget,
             );
@@ -1919,6 +1935,34 @@ mod content_tests {
         };
         let _stream = model.stream(request).await.unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn chat_template_uses_only_explicitly_mapped_off_effort() {
+        let compat = serde_json::from_value(json!({"thinkingFormat":"chat-template"})).unwrap();
+        let model = Ollama::new("http://localhost", None)
+            .unwrap()
+            .with_chat_compatibility(compat, Some(true), false, true);
+        assert_eq!(
+            model
+                .clone()
+                .with_reasoning_effort(Some("off"))
+                .chat_reasoning_effort(),
+            None
+        );
+        assert_eq!(
+            model
+                .clone()
+                .with_reported_reasoning_effort(Some("off"))
+                .chat_reasoning_effort(),
+            None
+        );
+        assert_eq!(
+            model
+                .with_mapped_reasoning_effort(Some("none"))
+                .chat_reasoning_effort(),
+            Some("none")
+        );
     }
 
     #[tokio::test]

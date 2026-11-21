@@ -411,6 +411,10 @@ impl ChatCompatibility {
         Ok(Some(budget))
     }
 
+    pub(super) fn uses_chat_template(&self) -> bool {
+        matches!(self.thinking_format, Some(ThinkingFormat::ChatTemplate))
+    }
+
     fn thinking_template(&self) -> Option<(&'static str, &serde_json::Map<String, Value>)> {
         match self.thinking_format {
             Some(ThinkingFormat::Baseten) => self
