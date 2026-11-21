@@ -4589,7 +4589,8 @@ Chat Completions, Anthropic Messages, and OpenAI Responses.
 `pi login github-copilot` and `/login github-copilot` support GitHub.com's
 device authorization and store a Pi-compatible OAuth entry. pi-rs can also
 read an existing entry, refresh access, and filter the picker by the stored
-account catalog. Saved OAuth tokens can route to individual, business, or
+account catalog. If catalog discovery fails during refresh, inference uses the
+new token and the last saved catalog. Saved OAuth tokens can route to individual, business, or
 enterprise Copilot inference hosts. Requests carry the Copilot initiator and
 vision headers.
 

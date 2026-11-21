@@ -225,17 +225,20 @@ impl Service {
             .catalog_url
             .clone()
             .unwrap_or_else(|| format!("https://{host}/models"));
-        let catalog = read_json(
+        let available_model_ids = read_json(
             self.client
                 .get(catalog_url)
                 .bearer_auth(access)
                 .header("x-github-api-version", "2026-06-01"),
         )
-        .await?;
+        .await
+        .and_then(|catalog| available_models(&catalog, host == API))
+        .ok()
+        .or_else(|| credential.available_model_ids.clone());
         Ok(Credential {
             access: access.into(),
             expires,
-            available_model_ids: Some(available_models(&catalog, host == API)?),
+            available_model_ids,
             ..credential.clone()
         })
     }
@@ -506,6 +509,24 @@ mod tests {
         assert_eq!(credential["extra"], original[PROVIDER]["extra"]);
         assert_eq!(credential["availableModelIds"], json!(["gpt-6.1-sol"]));
         assert_eq!(saved["another"], original["another"]);
+    }
+
+    #[tokio::test]
+    async fn copilot_refresh_preserves_catalogue_when_discovery_fails() {
+        let mut exchanges = token_and_catalogue();
+        exchanges.last_mut().unwrap().response = json!({"invalid":"catalog"});
+        let (service, worker) = fixture(exchanges);
+        let saved = Credential {
+            access: "old".into(),
+            refresh: "long-lived-fixture".into(),
+            expires: 1,
+            available_model_ids: Some(vec!["cached-model".into()]),
+            enterprise_url: None,
+        };
+        let refreshed = service.refresh(&saved).await.unwrap();
+        worker.join().unwrap();
+        assert_ne!(refreshed.access, saved.access);
+        assert_eq!(refreshed.available_model_ids, saved.available_model_ids);
     }
 
     #[tokio::test]

@@ -6682,6 +6682,8 @@ fn interrupt_remote_task(view: &mut View) {
     } else if task.meta_login_control.is_some() {
         view.append(if task.status == "Signing in to xAI" {
             "xAI sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to GitHub Copilot" {
+            "GitHub Copilot sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to Anthropic" {
             "Anthropic sign-in is completing; waiting for the result"
         } else {
