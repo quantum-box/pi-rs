@@ -4599,7 +4599,8 @@ levels, image inputs, tool calls, and endpoint-bound response replay.
 `pi login openai-codex` uses browser PKCE, and `--device-code` selects
 device authorization. Browser sign-in also accepts a pasted code or redirect.
 The terminal offers both methods. Existing Pi Codex
-credentials can be read and refreshed in place. They stay bound to the
+credentials can be read and refreshed in place. A refresh in flight saves
+rotated credentials even when the requesting turn is cancelled. They stay bound to the
 official Codex endpoint and are independent of native `openai-chatgpt` accounts.
 
 The native transport sends uncompressed JSON over HTTP SSE. The upstream

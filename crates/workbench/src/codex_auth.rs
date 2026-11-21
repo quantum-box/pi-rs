@@ -444,17 +444,66 @@ async fn access_at(
         return Ok(saved(&super::config::read_auth_object(path).await?)?.access);
     }
     let guard = super::auth_lock::acquire_async(path).await?;
-    let stored = saved(&super::config::read_object_unlocked(path)?)?;
+    let auth = super::config::read_object_unlocked(path)?;
+    let stored = saved(&auth)?;
     guard.check()?;
     let minimum_ms = minimum.as_millis().min(u128::from(u64::MAX)) as u64;
     if stored.expires > now_ms().saturating_add(minimum_ms.max(30_000)) {
         return Ok(stored.access);
     }
+    let path = path.to_path_buf();
+    let previous = auth[PROVIDER].clone();
+    let client = client.clone();
+    let token_endpoint = token_endpoint.clone();
+    // Keep the exchange and disk write alive if the requesting turn is cancelled.
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| error("cannot start refresh runtime"))?;
+        let barrier = super::process::refresh_barrier()?;
+        let guard = super::process::guard_refresh_auth(barrier, guard);
+        let replacement =
+            runtime.block_on(refresh_token(&client, token_endpoint, &stored.refresh))?;
+        let Credential {
+            access,
+            refresh,
+            expires,
+        } = replacement;
+        let account = pi_rs::openai::codex_account_id(&access)
+            .ok_or_else(|| error("refreshed access token lacks an account ID"))?;
+        if Some(account.as_str()) != pi_rs::openai::codex_account_id(&stored.access).as_deref() {
+            return Err(error("refresh returned a different account"));
+        }
+        super::config::update_object_locked(&path, Some(&guard), |data| {
+            if data[PROVIDER] != previous {
+                return Err(error("saved credential changed during refresh"));
+            }
+            let entry = data
+                .get_mut(PROVIDER)
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| error("saved credential disappeared"))?;
+            entry.insert("access".into(), Value::String(access.clone()));
+            entry.insert("refresh".into(), Value::String(refresh));
+            entry.insert("accountId".into(), Value::String(account));
+            entry.insert("expires".into(), Value::from(expires));
+            Ok(())
+        })?;
+        if expires <= now_ms().saturating_add(minimum_ms) {
+            return Err(error("refreshed token expires too soon"));
+        }
+        Ok(access)
+    })
+    .await
+    .map_err(|_| error("refresh task failed"))?
+}
+
+async fn refresh_token(client: &Client, token_endpoint: Url, refresh: &str) -> Result<Credential> {
     let response = client
-        .post(token_endpoint.clone())
+        .post(token_endpoint)
         .form(&[
             ("grant_type", "refresh_token"),
-            ("refresh_token", &stored.refresh),
+            ("refresh_token", refresh),
             ("client_id", CLIENT_ID),
         ])
         .timeout(Duration::from_secs(30))
@@ -465,32 +514,7 @@ async fn access_at(
     if !status.is_success() {
         return Err(error(&format!("refresh returned {status}")));
     }
-    let replacement = tokens(&read_json(response).await?)?;
-    let Credential {
-        access,
-        refresh,
-        expires,
-    } = replacement;
-    let account = pi_rs::openai::codex_account_id(&access)
-        .ok_or_else(|| error("refreshed access token lacks an account ID"))?;
-    if Some(account.as_str()) != pi_rs::openai::codex_account_id(&stored.access).as_deref() {
-        return Err(error("refresh returned a different account"));
-    }
-    super::config::update_object_locked(path, Some(&guard), |data| {
-        let entry = data
-            .get_mut(PROVIDER)
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| error("saved credential disappeared"))?;
-        entry.insert("access".into(), Value::String(access.clone()));
-        entry.insert("refresh".into(), Value::String(refresh));
-        entry.insert("accountId".into(), Value::String(account));
-        entry.insert("expires".into(), Value::from(expires));
-        Ok(())
-    })?;
-    if expires <= now_ms().saturating_add(minimum_ms) {
-        return Err(error("refreshed token expires too soon"));
-    }
-    Ok(access)
+    tokens(&read_json(response).await?)
 }
 
 #[cfg(test)]
@@ -527,6 +551,8 @@ mod tests {
             listener.local_addr().unwrap()
         ))
         .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let (socket, _) = listener.accept().unwrap();
             socket
@@ -552,6 +578,8 @@ mod tests {
             let form = String::from_utf8(form).unwrap();
             assert!(form.contains("grant_type=refresh_token&refresh_token=old-fixture"));
             assert!(form.contains(CLIENT_ID));
+            started_tx.send(()).unwrap();
+            reply_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let response = json!({
                 "access_token": fresh, "refresh_token":"new-fixture", "expires_in":3600
             })
@@ -573,6 +601,25 @@ mod tests {
                 .unwrap(),
             old
         );
+        let (cancelled_path, cancelled_client, cancelled_endpoint) =
+            (path.clone(), client.clone(), endpoint.clone());
+        let cancelled = tokio::spawn(async move {
+            access_at(
+                &cancelled_path,
+                &cancelled_client,
+                &cancelled_endpoint,
+                Duration::ZERO,
+                false,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("refresh request did not reach the server")
+            .unwrap();
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        reply_tx.send(()).unwrap();
         let (first, second) = tokio::join!(
             access_at(&path, &client, &endpoint, Duration::ZERO, false),
             access_at(&path, &client, &endpoint, Duration::ZERO, false),
