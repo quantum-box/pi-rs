@@ -8788,7 +8788,20 @@ async fn nested_woken_real_callback_records_receipt_once() {
 #[cfg(unix)]
 #[tokio::test]
 async fn nested_woken_live_receipt_settles_without_restart() {
+    exercise_nested_woken_live_receipt(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn selected_nested_woken_live_receipt_settles_without_restart() {
+    exercise_nested_woken_live_receipt(true).await;
+}
+
+async fn exercise_nested_woken_live_receipt(selected: bool) {
     let dir = tempfile::tempdir().unwrap();
+    if selected {
+        std::fs::write(dir.path().join("selected-mode"), b"yes").unwrap();
+    }
     let launch = |resume: bool| {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
@@ -8830,7 +8843,7 @@ async fn nested_woken_live_receipt_settles_without_restart() {
         assert_eq!(child.task.state(), &crate::task::TaskState::Running);
     }
     let mut resumed = launch(true);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let (child_id, interrupted) = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             assert!(resumed.try_wait().unwrap().is_none());
             let store = durable_store::Store::open(dir.path().join("db")).unwrap();
@@ -8847,10 +8860,21 @@ async fn nested_woken_live_receipt_settles_without_restart() {
                     "durable/replay-safe-async/{}/conversation-woken-cancel-receipt-v1",
                     child.task.id()
                 );
-                if store.get(receipt.as_bytes()).unwrap().is_some()
+                if let Some(receipt) = store.get(receipt.as_bytes()).unwrap()
                     && matches!(child.task.state(), crate::task::TaskState::Failed(_))
+                    && root.is_some_and(|root| root.task.is_terminal())
                 {
-                    break;
+                    assert!(!matches!(
+                        root.unwrap().task.state(),
+                        crate::task::TaskState::Succeeded(_)
+                    ));
+                    let receipt: Value = serde_json::from_slice(&receipt.value).unwrap();
+                    assert_eq!(receipt["version"], if selected { 2 } else { 1 });
+                    assert_eq!(!receipt["after_result"].is_null(), selected);
+                    break (
+                        child.task.id(),
+                        child.task.woken_interrupted_attempt().unwrap(),
+                    );
                 }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -8870,6 +8894,59 @@ async fn nested_woken_live_receipt_settles_without_restart() {
     });
     resumed.kill().unwrap();
     resumed.wait().unwrap();
+    let store = durable_store::Store::open(dir.path().join("db")).unwrap();
+    let terminal = crate::task_store::TaskStore::new(&store)
+        .load(child_id)
+        .unwrap()
+        .unwrap();
+    let boundary = store.put_version().unwrap();
+    let wake_checks = crate::async_task_tool::unsafe_park_proof::woken_terminal_checks(
+        &store,
+        &terminal.task,
+        interrupted,
+        boundary,
+    )
+    .unwrap();
+    store.commit(&wake_checks, &[]).unwrap();
+    let late =
+        format!("durable/unsafe-park-async/{child_id}/{interrupted}/intent/receipt").into_bytes();
+    store
+        .commit(
+            &[durable_store::Check {
+                key: late.clone(),
+                expected: durable_store::Expected::Missing,
+            }],
+            &[durable_store::Mutation::Put {
+                key: late.clone(),
+                value: b"late".to_vec(),
+            }],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.commit(&wake_checks, &[]),
+        Err(durable_store::Error::Conflict { .. })
+    ));
+    assert!(
+        crate::async_task_tool::unsafe_park_proof::woken_terminal_checks(
+            &store,
+            &terminal.task,
+            interrupted,
+            store.put_version().unwrap()
+        )
+        .is_err()
+    );
+    drop(store);
+    let reopened = durable_store::Store::open(dir.path().join("db")).unwrap();
+    assert!(reopened.get(&late).unwrap().is_some());
+    assert!(matches!(
+        crate::task_store::TaskStore::new(&reopened)
+            .load(child_id)
+            .unwrap()
+            .unwrap()
+            .task
+            .state(),
+        crate::task::TaskState::Failed(_)
+    ));
     assert_eq!(
         std::fs::read_to_string(dir.path().join("nested-cancelled")).unwrap(),
         "called\n"
