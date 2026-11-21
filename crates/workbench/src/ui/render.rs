@@ -261,6 +261,7 @@ pub enum SummaryKind {
 #[derive(Clone)]
 pub enum Entry {
     Notice(String),
+    ModelCycleStatus(String),
     Warning(String),
     User(String),
     Skill {
@@ -273,8 +274,10 @@ pub enum Entry {
         expanded: Option<bool>,
     },
     CustomMessage {
+        id: u64,
         custom_type: String,
         text: String,
+        rendered: Option<pi_rs::RenderedCustomMessage>,
     },
     Summary {
         id: u64,
@@ -326,6 +329,17 @@ impl Entry {
         let inner = width.saturating_sub(2 * padding).max(1);
         let mut lines = match self {
             Self::Notice(text) => return wrap(&[Span::themed(text, theme, "muted")], width),
+            Self::ModelCycleStatus(text) => {
+                let mut lines = vec![Line::default()];
+                let inset = usize::from(width >= 3);
+                lines.extend(wrap(&[Span::themed(text, theme, "dim")], width - 2 * inset));
+                if inset != 0 {
+                    for line in &mut lines[1..] {
+                        line.spans.insert(0, Span::themed(" ", theme, "dim"));
+                    }
+                }
+                return lines;
+            }
             Self::Warning(text) => {
                 return wrap(&[Span::themed(text, theme, "warning")], width);
             }
@@ -384,7 +398,27 @@ impl Entry {
                 lines.push(Line::default());
                 lines
             }
-            Self::CustomMessage { custom_type, text } => {
+            Self::CustomMessage {
+                rendered: Some(rendered),
+                ..
+            } => {
+                let pad = rendered.padding.min(width.saturating_sub(1) / 2);
+                let inner = width.saturating_sub(2 * pad).max(1);
+                let mut lines = vec![Line::default()];
+                let padding = " ".repeat(pad);
+                let background = rendered.background.as_deref().map(|role| theme.color(role));
+                for mut row in component_lines(&rendered.lines, theme, inner) {
+                    if pad != 0 && !row.spans.is_empty() {
+                        row.spans.insert(0, Span::new(&padding, Color::Reset));
+                    }
+                    row.background = background;
+                    lines.push(row);
+                }
+                return lines;
+            }
+            Self::CustomMessage {
+                custom_type, text, ..
+            } => {
                 let mut label =
                     Span::themed(format!("[{custom_type}]"), theme, "customMessageLabel");
                 label.bold = true;
@@ -606,6 +640,31 @@ impl Entry {
         lines
     }
 }
+pub(super) fn component_lines(
+    lines: &[Vec<pi_rs::UiComponentSpan>],
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line> {
+    lines
+        .iter()
+        .flat_map(|line| {
+            let spans: Vec<_> = line
+                .iter()
+                .map(|span| {
+                    let mut rendered =
+                        Span::themed(&span.text, theme, span.color.as_deref().unwrap_or("text"));
+                    rendered.bold = span.bold;
+                    rendered.italic = span.italic;
+                    rendered.underline = span.underline;
+                    rendered.inverse = span.inverse;
+                    rendered
+                })
+                .collect();
+            wrap(&spans, width)
+        })
+        .collect()
+}
+
 fn custom_message_base_style(lines: &mut [Line], theme: &Theme) {
     for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
         if span.base_text {
@@ -4304,9 +4363,39 @@ mod tests {
     }
 
     #[test]
+    fn extension_message_renderer_controls_padding_colors_and_sanitized_rows() {
+        let theme = Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let entry = Entry::CustomMessage {
+            id: 1,
+            custom_type: "card".into(),
+            text: "fallback".into(),
+            rendered: Some(pi_rs::RenderedCustomMessage {
+                lines: vec![vec![pi_rs::UiComponentSpan {
+                    text: "status\u{7}".into(),
+                    color: Some("accent".into()),
+                    bold: true,
+                    ..Default::default()
+                }]],
+                background: Some("customMessageBg".into()),
+                padding: 2,
+            }),
+        };
+        let rows = entry.render(&theme, 40, false, true, TranscriptOptions::default());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].background, None);
+        assert_eq!(rows[1].background, Some(theme.color("customMessageBg")));
+        assert_eq!(rows[1].spans[0].text, "  ");
+        assert_eq!(rows[1].spans[1].text, "status");
+        assert_eq!(rows[1].spans[1].color, theme.color("accent"));
+        assert!(rows[1].spans[1].bold);
+    }
+
+    #[test]
     fn custom_message_uses_markdown_theme_and_safe_terminal_output() {
         let theme = Theme::system();
         let entry = Entry::CustomMessage {
+            id: 1,
+            rendered: None,
             custom_type: "fixture\x1b]bad".into(),
             text: "**bold**\n\nplain \x1b]0;bad\x07text".into(),
         };
@@ -4361,6 +4450,8 @@ mod tests {
         json["colors"]["customMessageText"] = serde_json::json!("#ff0000");
         let theme = Theme::parse(&json.to_string(), None).unwrap();
         let entry = Entry::CustomMessage {
+            id: 1,
+            rendered: None,
             custom_type: "x".into(),
             text: "plain `code`".into(),
         };

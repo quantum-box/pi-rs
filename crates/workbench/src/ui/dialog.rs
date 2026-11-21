@@ -374,27 +374,7 @@ impl Dialog {
                 ));
             }
             UiRequest::Custom { lines: body, .. } => {
-                let rows: Vec<_> = body
-                    .iter()
-                    .flat_map(|line| {
-                        let spans: Vec<_> = line
-                            .iter()
-                            .map(|span| {
-                                let mut rendered = Span::themed(
-                                    &span.text,
-                                    theme,
-                                    span.color.as_deref().unwrap_or("text"),
-                                );
-                                rendered.bold = span.bold;
-                                rendered.italic = span.italic;
-                                rendered.underline = span.underline;
-                                rendered.inverse = span.inverse;
-                                rendered
-                            })
-                            .collect();
-                        wrap(&spans, width)
-                    })
-                    .collect();
+                let rows = super::render::component_lines(body, theme, width);
                 let max = rows.len().saturating_sub(available);
                 self.scroll_max.set(max);
                 lines.extend(

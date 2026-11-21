@@ -88,6 +88,11 @@ pub async fn catalog(args: &Cli, provider: Provider, probe: bool) -> Result<Cata
     let mut models = args.model_profiles.model_ids(&provider);
     let mut probe_details = false;
     let bundled = provider.id() == "azure"
+        || (provider.id() == "cloudflare-workers-ai"
+            && super::model_profiles::cloudflare_workers_chat_account(
+                args.endpoint_for(&provider),
+            )
+            .is_some())
         || super::builtin_chat::find(provider.id())
             .is_some_and(|builtin| args.endpoint_for(&provider) == builtin.endpoint());
     let mut complete = false;
@@ -351,6 +356,146 @@ pub fn scoped_choices<'a>(
         }
     }
     (selected, warnings)
+}
+
+fn bedrock_environment_configured(present: impl Fn(&str) -> bool) -> bool {
+    [
+        "AWS_PROFILE",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+    ]
+    .into_iter()
+    .any(&present)
+        || (present("AWS_ACCESS_KEY_ID") && present("AWS_SECRET_ACCESS_KEY"))
+}
+
+/// Resolve a known CLI model before an inline key is bound to a provider.
+pub fn cli_catalog_model(args: &Cli, value: &str, inline: bool) -> Result<Option<ScopedChoice>> {
+    let ambient_bedrock = bedrock_environment_configured(|name| {
+        std::env::var_os(name).is_some_and(|value| !value.is_empty())
+    });
+    resolve_cli_catalog_model(args, value, inline, ambient_bedrock)
+}
+
+fn resolve_cli_catalog_model(
+    args: &Cli,
+    value: &str,
+    inline: bool,
+    ambient_bedrock: bool,
+) -> Result<Option<ScopedChoice>> {
+    struct Match {
+        choice: ScopedChoice,
+        named: bool,
+        authenticated: bool,
+        bedrock_chain: bool,
+    }
+
+    let profiles = &args.model_profiles;
+    let value = value.trim();
+    let suffix = thinking_suffix(value).map(|(id, level)| (id, Some(level)));
+    for (reference, thinking) in std::iter::once((value, None)).chain(suffix) {
+        let named = qualified_model(reference, profiles);
+        let mut matches = Vec::new();
+        for provider in profiles.providers() {
+            let models = profiles.model_ids(&provider);
+            let explicit = named.as_ref().filter(|(named, _)| &provider == named);
+            let known = models
+                .iter()
+                .find(|model| explicit.is_some_and(|(_, id)| model.eq_ignore_ascii_case(id)))
+                .or_else(|| {
+                    models
+                        .iter()
+                        .find(|model| model.eq_ignore_ascii_case(reference))
+                });
+            // Pi also treats the named provider's own full literal ID as a
+            // qualified match. A named partial match can compete with raw IDs.
+            let id = known.cloned().or_else(|| {
+                let (_, id) = explicit?;
+                let names = aliases(profiles, &provider, &models);
+                let candidates = search_ids(&models, &names);
+                exact(id, &candidates, provider.id())
+                    .or_else(|| partial(id, &candidates, provider.id()))
+                    .map(|model| canonical(model.clone(), &models, &names))
+            });
+            let Some(id) = id else {
+                continue;
+            };
+            let endpoint = profiles
+                .model_endpoint(&provider, &id)
+                .unwrap_or_else(|| profiles.endpoint(&provider));
+            let credential = args.configured_model_credential(&provider, endpoint);
+            let bedrock_chain = provider == Provider::Bedrock
+                && endpoint.is_empty()
+                && profiles.model_adapter(&provider, &id) == super::providers::Adapter::Bedrock
+                && credential.is_none();
+            let authenticated = !inline
+                && match credential {
+                    Some(credential) => {
+                        !matches!(credential, super::model_auth::Credential::Invalid)
+                    }
+                    None => provider == Provider::Ollama || (bedrock_chain && ambient_bedrock),
+                };
+            matches.push(Match {
+                choice: ScopedChoice {
+                    provider,
+                    model: id,
+                    thinking: thinking.map(str::to_owned),
+                },
+                named: explicit.is_some(),
+                authenticated,
+                bedrock_chain,
+            });
+        }
+        if matches.is_empty() {
+            continue;
+        }
+        let usable_count = matches.iter().filter(|model| model.authenticated).count();
+        if matches.len() == 1 {
+            return Ok(matches.pop().map(|model| model.choice));
+        }
+        if let Some(model) = matches
+            .iter()
+            .find(|model| model.named && (model.authenticated || usable_count == 0))
+            .or_else(|| {
+                matches
+                    .iter()
+                    .find(|model| model.authenticated && usable_count == 1)
+            })
+        {
+            return Ok(Some(model.choice.clone()));
+        }
+        // The native default may use the SDK chain even when no startup
+        // credential is visible. It cannot overrule evidence of usable auth.
+        if !inline
+            && usable_count == 0
+            && args
+                .settings
+                .string("defaultProvider")
+                .is_some_and(|id| id.eq_ignore_ascii_case(Provider::Bedrock.id()))
+            && let Some(model) = matches.iter().find(|model| model.bedrock_chain)
+        {
+            return Ok(Some(model.choice.clone()));
+        }
+        let mut names: Vec<_> = matches
+            .iter()
+            .map(|model| model.choice.qualified())
+            .collect();
+        names.sort_unstable();
+        let hint = if inline {
+            "--api-key does not choose a provider."
+        } else if usable_count == 0 {
+            "No matching provider is authenticated."
+        } else {
+            "More than one matching provider is authenticated."
+        };
+        return Err(Error::Config(format!(
+            "Model \"{value}\" is ambiguous across providers: {}. {hint} Use --provider or provider/model.",
+            names.join(", ")
+        )));
+    }
+    Ok(None)
 }
 
 pub fn split_with_profiles(
@@ -721,6 +866,165 @@ mod tests {
                 "anthropic/same"
             ]
         );
+    }
+
+    #[test]
+    fn cli_model_reference_prefers_the_only_authenticated_matching_gateway() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers":{
+                "direct": {"api":"anthropic-messages","baseUrl":"https://direct.example/v1",
+                    "models":[{"id":"other"},{"id":"named"},{"id":"direct/own"},
+                        {"id":"part-long"},{"id":"actual-id","name":"fast"},{"id":"fast-pro"}]},
+                "gateway-one": {"api":"openai-completions","baseUrl":"https://one.example/v1",
+                    "models":[{"id":"direct/model"},{"id":"direct/named"},{"id":"model:high"},{"id":"direct/own"}]},
+                "gateway-two": {"api":"openai-completions","baseUrl":"https://two.example/v1",
+                    "models":[{"id":"direct/model"},{"id":"direct/named"},{"id":"direct/part"}]}
+            }
+        }))
+        .unwrap();
+        args.model_keys = super::super::model_auth::Keys::parse(&json!({
+            "gateway-two":{"type":"api_key","key":"fixture","endpoint":"https://two.example/v1/chat/completions"}
+        }));
+
+        for (value, expected) in [
+            ("DIRECT/model", "gateway-two/direct/model"),
+            ("direct/model:high", "gateway-two/direct/model:high"),
+            ("direct/named", "gateway-two/direct/named"),
+            ("model:high", "gateway-one/model:high"),
+        ] {
+            let selected = super::cli_catalog_model(&args, value, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected.pattern(), expected);
+        }
+        let inline = super::cli_catalog_model(&args, "direct/model", true)
+            .err()
+            .expect("inline key cannot disambiguate");
+        assert!(
+            inline
+                .to_string()
+                .contains("--api-key does not choose a provider.")
+        );
+        let named = super::cli_catalog_model(&args, "direct/named", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(named.qualified(), "direct/named");
+
+        let own = super::cli_catalog_model(&args, "direct/own", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(own.qualified(), "direct/direct/own");
+        let partial = super::cli_catalog_model(&args, "direct/part", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(partial.qualified(), "direct/part-long");
+
+        let display_name = super::cli_catalog_model(&args, "direct/FAST", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(display_name.qualified(), "direct/actual-id");
+
+        args.model_keys = Default::default();
+        let unauthenticated = super::cli_catalog_model(&args, "direct/model", false)
+            .err()
+            .expect("no authenticated gateway");
+        assert!(unauthenticated.to_string().contains(
+            "gateway-one/direct/model, gateway-two/direct/model. No matching provider is authenticated."
+        ));
+        assert!(
+            super::cli_catalog_model(&args, "local-only:latest", false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cli_counts_ambient_bedrock_auth_when_a_gateway_lists_the_same_model() {
+        use clap::Parser;
+        use serde_json::json;
+
+        for configured in [
+            &["AWS_PROFILE"][..],
+            &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"][..],
+            &["AWS_BEARER_TOKEN_BEDROCK"][..],
+            &["AWS_CONTAINER_CREDENTIALS_FULL_URI"][..],
+            &["AWS_WEB_IDENTITY_TOKEN_FILE"][..],
+        ] {
+            assert!(super::bedrock_environment_configured(
+                |name| configured.contains(&name)
+            ));
+        }
+        assert!(!super::bedrock_environment_configured(
+            |name| name == "AWS_ACCESS_KEY_ID"
+        ));
+
+        let mut args = super::Cli::parse_from(["pi"]);
+        let model = "us.anthropic.claude-opus-4-6-v1";
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers":{"gateway":{"api":"openai-completions",
+                "baseUrl":"https://gateway.example/v1","models":[{"id":model}]}}
+        }))
+        .unwrap();
+        let bedrock = super::resolve_cli_catalog_model(&args, model, false, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bedrock.qualified(), format!("amazon-bedrock/{model}"));
+        assert!(super::resolve_cli_catalog_model(&args, model, true, true).is_err());
+        args.model_keys = super::super::model_auth::Keys::parse(&json!({
+            "gateway":{"type":"api_key","key":"fixture",
+                "endpoint":"https://gateway.example/v1/chat/completions"}
+        }));
+        assert!(super::resolve_cli_catalog_model(&args, model, false, true).is_err());
+        args.settings = serde_json::from_value(json!({
+            "value":{"defaultProvider":"amazon-bedrock"},
+            "resource_layers":[],
+            "diagnostics":[]
+        }))
+        .unwrap();
+        let gateway = super::resolve_cli_catalog_model(&args, model, false, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(gateway.qualified(), format!("gateway/{model}"));
+        args.model_keys = Default::default();
+        let default = super::resolve_cli_catalog_model(&args, model, false, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(default.qualified(), format!("amazon-bedrock/{model}"));
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers":{
+                "amazon-bedrock": {"models":[{"id":model,"api":"openai-completions",
+                    "baseUrl":"https://relay.example/v1"}]},
+                "gateway":{"api":"openai-completions",
+                    "baseUrl":"https://gateway.example/v1","models":[{"id":model}]}
+            }
+        }))
+        .unwrap();
+        assert!(super::resolve_cli_catalog_model(&args, model, false, true).is_err());
+    }
+
+    #[test]
+    fn cli_counts_a_configured_chatgpt_model_only_once() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers": {
+                "openai-chatgpt": {
+                    "api": "openai-responses",
+                    "models": [{"id": "chatgpt-custom"}]
+                }
+            }
+        }))
+        .unwrap();
+        let selected = super::cli_catalog_model(&args, "chatgpt-custom", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.qualified(), "openai-chatgpt/chatgpt-custom");
     }
 
     fn split(value: &str, available: &[String]) -> pi_rs::Result<Choice> {
