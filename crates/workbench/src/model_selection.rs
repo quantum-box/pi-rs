@@ -333,6 +333,95 @@ pub fn scoped_choices<'a>(
     (selected, warnings)
 }
 
+/// Resolve a known CLI model before an inline key is bound to a provider.
+pub fn cli_catalog_model(args: &Cli, value: &str, inline: bool) -> Result<Option<ScopedChoice>> {
+    let profiles = &args.model_profiles;
+    let value = value.trim();
+    let suffix = thinking_suffix(value).map(|(id, level)| (id, Some(level)));
+    for (reference, thinking) in std::iter::once((value, None)).chain(suffix) {
+        let named = qualified_model(reference, profiles);
+        let mut matches = Vec::new();
+        for provider in profiles.providers() {
+            let models = profiles.model_ids(&provider);
+            let explicit = named.as_ref().filter(|(named, _)| &provider == named);
+            let known = models
+                .iter()
+                .find(|model| explicit.is_some_and(|(_, id)| model.eq_ignore_ascii_case(id)))
+                .or_else(|| {
+                    models
+                        .iter()
+                        .find(|model| model.eq_ignore_ascii_case(reference))
+                });
+            // Pi also treats the named provider's own full literal ID as a
+            // qualified match. A named partial match can compete with raw IDs.
+            let id = known.cloned().or_else(|| {
+                let (_, id) = explicit?;
+                let names = aliases(profiles, &provider, &models);
+                let candidates = search_ids(&models, &names);
+                partial(id, &candidates, provider.id())
+                    .map(|model| canonical(model.clone(), &models, &names))
+            });
+            let Some(id) = id else {
+                continue;
+            };
+            let endpoint = profiles
+                .model_endpoint(&provider, &id)
+                .unwrap_or_else(|| profiles.endpoint(&provider));
+            let usable = !inline
+                && (provider == Provider::Ollama
+                    || args
+                        .configured_model_credential(&provider, endpoint)
+                        .is_some_and(|credential| {
+                            !matches!(credential, super::model_auth::Credential::Invalid)
+                        }));
+            matches.push((
+                ScopedChoice {
+                    provider,
+                    model: id,
+                    thinking: thinking.map(str::to_owned),
+                },
+                explicit.is_some(),
+                usable,
+            ));
+        }
+        if matches.is_empty() {
+            continue;
+        }
+        let usable_count = matches.iter().filter(|(_, _, usable)| *usable).count();
+        if matches.len() == 1 {
+            return Ok(matches.pop().map(|(model, _, _)| model));
+        }
+        if let Some((model, _, _)) = matches
+            .iter()
+            .find(|(_, named, usable)| *named && (*usable || usable_count == 0))
+            .or_else(|| {
+                matches
+                    .iter()
+                    .find(|(_, _, usable)| *usable && usable_count == 1)
+            })
+        {
+            return Ok(Some(model.clone()));
+        }
+        let mut names: Vec<_> = matches
+            .iter()
+            .map(|(model, _, _)| model.qualified())
+            .collect();
+        names.sort_unstable();
+        let hint = if inline {
+            "--api-key does not choose a provider."
+        } else if usable_count == 0 {
+            "No matching provider is authenticated."
+        } else {
+            "More than one matching provider is authenticated."
+        };
+        return Err(Error::Config(format!(
+            "Model \"{value}\" is ambiguous across providers: {}. {hint} Use --provider or provider/model.",
+            names.join(", ")
+        )));
+    }
+    Ok(None)
+}
+
 pub fn split_with_profiles(
     value: &str,
     available: &[String],
@@ -700,6 +789,74 @@ mod tests {
                 "anthropic/exact",
                 "anthropic/same"
             ]
+        );
+    }
+
+    #[test]
+    fn cli_model_reference_prefers_the_only_authenticated_matching_gateway() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers":{
+                "direct": {"api":"anthropic-messages","baseUrl":"https://direct.example/v1",
+                    "models":[{"id":"other"},{"id":"named"},{"id":"direct/own"},{"id":"part-long"}]},
+                "gateway-one": {"api":"openai-completions","baseUrl":"https://one.example/v1",
+                    "models":[{"id":"direct/model"},{"id":"direct/named"},{"id":"model:high"},{"id":"direct/own"}]},
+                "gateway-two": {"api":"openai-completions","baseUrl":"https://two.example/v1",
+                    "models":[{"id":"direct/model"},{"id":"direct/named"},{"id":"direct/part"}]}
+            }
+        }))
+        .unwrap();
+        args.model_keys = super::super::model_auth::Keys::parse(&json!({
+            "gateway-two":{"type":"api_key","key":"fixture","endpoint":"https://two.example/v1/chat/completions"}
+        }));
+
+        for (value, expected) in [
+            ("DIRECT/model", "gateway-two/direct/model"),
+            ("direct/model:high", "gateway-two/direct/model:high"),
+            ("direct/named", "gateway-two/direct/named"),
+            ("model:high", "gateway-one/model:high"),
+        ] {
+            let selected = super::cli_catalog_model(&args, value, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected.pattern(), expected);
+        }
+        let inline = super::cli_catalog_model(&args, "direct/model", true)
+            .err()
+            .expect("inline key cannot disambiguate");
+        assert!(
+            inline
+                .to_string()
+                .contains("--api-key does not choose a provider.")
+        );
+        let named = super::cli_catalog_model(&args, "direct/named", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(named.qualified(), "direct/named");
+
+        let own = super::cli_catalog_model(&args, "direct/own", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(own.qualified(), "direct/direct/own");
+        let partial = super::cli_catalog_model(&args, "direct/part", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(partial.qualified(), "direct/part-long");
+
+        args.model_keys = Default::default();
+        let unauthenticated = super::cli_catalog_model(&args, "direct/model", false)
+            .err()
+            .expect("no authenticated gateway");
+        assert!(unauthenticated.to_string().contains(
+            "gateway-one/direct/model, gateway-two/direct/model. No matching provider is authenticated."
+        ));
+        assert!(
+            super::cli_catalog_model(&args, "local-only:latest", false)
+                .unwrap()
+                .is_none()
         );
     }
 

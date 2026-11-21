@@ -113,7 +113,7 @@ struct Cli {
     #[arg(skip)]
     model_explicit: bool,
     #[arg(skip)]
-    model_from_settings: bool,
+    model_is_literal: bool,
     #[arg(skip)]
     thinking_explicit: bool,
     #[arg(skip)]
@@ -420,7 +420,7 @@ impl Cli {
             .as_ref()
             .is_some_and(|(provider, _)| provider == &self.provider)
         {
-            let qualified = if self.model_from_settings {
+            let qualified = if self.model_is_literal {
                 self.model.as_str()
             } else {
                 model_selection::qualified_model(&self.model, &self.model_profiles)
@@ -1506,27 +1506,46 @@ async fn run_cli() -> i32 {
             .clone()
             .or_else(|| configured_model.and_then(provider_prefix))
             .unwrap_or_default();
+        let explicit_endpoint =
+            matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine);
+        let resolved = if args.model_explicit
+            && args.provider_argument.is_none()
+            && !explicit_endpoint
+            && !matches!(args.command, Some(Command::Serve))
+        {
+            let inline = args.api_key.is_some() || std::env::var_os("PI_RS_MODEL_TOKEN").is_some();
+            model_selection::cli_catalog_model(&args, &args.model, inline)?
+        } else {
+            None
+        };
         args.provider = if let Some(name) = args.provider_argument.as_deref() {
             args.model_profiles
                 .provider(name)
                 .ok_or_else(|| Error::Config(format!("unknown model provider {name:?}")))?
+        } else if let Some(model) = &resolved {
+            model.provider.clone()
         } else if args.model_explicit {
             provider_prefix(&args.model).unwrap_or_else(|| configured_provider.clone())
         } else {
             configured_provider.clone()
         };
-        let explicit_endpoint =
-            matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine);
         args.endpoint_explicit = explicit_endpoint;
         args.connection_explicit = explicit_endpoint || args.provider_argument.is_some();
         if !explicit_endpoint {
             args.endpoint = args.model_profiles.endpoint(&args.provider).into();
         }
         args.initial_connection = Some((args.provider.clone(), args.endpoint.clone()));
-        if !args.model_explicit {
+        if let Some(model) = resolved {
+            args.model = model.model;
+            args.model_is_literal = true;
+            if !args.thinking_explicit && model.thinking.is_some() {
+                args.thinking = model.thinking;
+                args.thinking_explicit = true;
+            }
+        } else if !args.model_explicit {
             if let Some(model) = configured_model.filter(|_| args.provider == configured_provider) {
                 args.model = model.into();
-                args.model_from_settings = explicit_default_provider.is_some();
+                args.model_is_literal = explicit_default_provider.is_some();
             } else if args.provider != Provider::Ollama {
                 args.model.clear();
             }
@@ -1778,7 +1797,7 @@ async fn execute(
         .collect();
     // The hidden worker command receives an already-resolved, literal model ID.
     if !args.model.is_empty()
-        && !args.model_from_settings
+        && !args.model_is_literal
         && !matches!(args.command, Some(Command::Serve))
     {
         let selected = model_selection::split_with_profiles(
