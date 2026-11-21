@@ -4918,6 +4918,9 @@ transient upgrade failure suppresses new attempts for a minute. A server
 that loses the previous response ID receives the full transcript on retry.
 The client checks an idle connection with a WebSocket ping before sending the
 next request and replaces the connection if the check fails.
+As in Pi v1.6.0, a socket can be reused for up to 45 minutes after connecting,
+with a five-minute idle timeout. An ongoing response can finish on its
+existing connection.
 The native HTTP fallback sends uncompressed JSON. Specialized Codex
 grammar tools and tool search remain open. Authentication was exercised with
 fixtures. Live sign-in and inference were unverified because no account was

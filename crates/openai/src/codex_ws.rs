@@ -20,7 +20,8 @@ use tokio_tungstenite::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const IDLE_TTL: Duration = Duration::from_secs(5 * 60);
-const MAX_SOCKET_AGE: Duration = Duration::from_secs(55 * 60);
+// Leave room for a long response before the server's one-hour limit.
+const MAX_SOCKET_AGE: Duration = Duration::from_secs(45 * 60);
 const MAX_IDLE_CONNECTIONS: usize = 8;
 const MAX_FALLBACK_SESSIONS: usize = 64;
 const FALLBACK_COOLDOWN: Duration = Duration::from_secs(60);
@@ -131,7 +132,7 @@ fn take_connection(key: &str) -> Option<IdleConnection> {
     let mut pool = POOL.lock().ok()?;
     let now = Instant::now();
     pool.retain(|entry| {
-        let fresh = entry.expires > now && now.duration_since(entry.connected) < MAX_SOCKET_AGE;
+        let fresh = entry.expires > now;
         if !fresh {
             entry.expiry_task.abort();
         }
@@ -143,12 +144,21 @@ fn take_connection(key: &str) -> Option<IdleConnection> {
     Some(entry)
 }
 
+fn idle_expiry(connected: Instant, now: Instant) -> Option<Instant> {
+    let deadline = connected + MAX_SOCKET_AGE;
+    (now < deadline).then(|| deadline.min(now + IDLE_TTL))
+}
+
 fn return_connection(
     key: String,
     connected: Instant,
     socket: Socket,
     previous: Option<PreviousResponse>,
 ) {
+    let now = Instant::now();
+    let Some(expires) = idle_expiry(connected, now) else {
+        return;
+    };
     let Ok(mut pool) = POOL.lock() else { return };
     if let Some(index) = pool.iter().position(|entry| entry.key == key)
         && let Some(entry) = pool.remove(index)
@@ -161,8 +171,9 @@ fn return_connection(
         entry.expiry_task.abort();
     }
     let generation = uuid::Uuid::new_v4();
+    let idle_for = expires.saturating_duration_since(Instant::now());
     let expiry_task = tokio::spawn(async move {
-        tokio::time::sleep(IDLE_TTL).await;
+        tokio::time::sleep(idle_for).await;
         if let Ok(mut pool) = POOL.lock() {
             pool.retain(|entry| entry.generation != generation);
         }
@@ -171,7 +182,7 @@ fn return_connection(
     pool.push_back(IdleConnection {
         key,
         connected,
-        expires: Instant::now() + IDLE_TTL,
+        expires,
         expiry_task,
         generation,
         socket,
@@ -495,6 +506,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn idle_reuse_ends_after_five_idle_minutes_or_forty_five_total_minutes() {
+        let connected = Instant::now();
+        let idle_since = connected + Duration::from_secs(5 * 60);
+        let near_age_limit = connected + Duration::from_secs(44 * 60 + 59);
+        let age_limit = connected + Duration::from_secs(45 * 60);
+        assert_eq!(
+            idle_expiry(connected, idle_since),
+            Some(connected + Duration::from_secs(10 * 60))
+        );
+        assert_eq!(idle_expiry(connected, near_age_limit), Some(age_limit));
+        assert_eq!(idle_expiry(connected, age_limit), None);
+        assert_eq!(
+            idle_expiry(connected, age_limit + Duration::from_secs(1)),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn codex_websocket_reuses_transport_and_sends_the_compatible_input_suffix() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -643,6 +672,88 @@ mod tests {
             Some(Ok(ModelEvent::Complete { .. }))
         ));
         idle_closed.await.unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), async {
+            model
+                .stream(request(vec![prompt("first"), prompt("second")]))
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            second.last(),
+            Some(Ok(ModelEvent::Complete { .. }))
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_opens_a_new_connection_when_cached_context_expires() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let response_id = uuid::Uuid::new_v4().to_string();
+        let first_response_id = response_id.clone();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut original = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let first = read_request(&mut original).await;
+            assert_eq!(first["input"].as_array().unwrap().len(), 1);
+            let completion = |id: &str| {
+                Message::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":id,"status":"completed","output":[]}
+                    })
+                    .to_string()
+                    .into(),
+                )
+            };
+            original.send(completion(&first_response_id)).await.unwrap();
+
+            // Keep the first socket open until the client explicitly retires it.
+            let (tcp, _) = tokio::select! {
+                incoming = original.next() => {
+                    assert!(!matches!(incoming, Some(Ok(Message::Ping(_) | Message::Text(_)))));
+                    listener.accept().await.unwrap()
+                }
+                replacement = listener.accept() => replacement.unwrap(),
+            };
+            let mut replacement = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let body = read_request(&mut replacement).await;
+            assert!(body.get("previous_response_id").is_none());
+            assert_eq!(body["input"].as_array().unwrap().len(), 2);
+            replacement.send(completion("replacement")).await.unwrap();
+        });
+        let model = client(
+            format!("http://{address}/backend-api/codex/responses"),
+            CodexTransport::WebSocketCached,
+        )
+        .with_session_cache_key(&uuid::Uuid::new_v4().to_string());
+        let first = model
+            .stream(request(vec![prompt("first")]))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(
+            first.last(),
+            Some(Ok(ModelEvent::Complete { .. }))
+        ));
+        {
+            let mut pool = POOL.lock().unwrap();
+            let entry = pool
+                .iter_mut()
+                .find(|entry| {
+                    entry
+                        .previous
+                        .as_ref()
+                        .is_some_and(|previous| previous.id == response_id)
+                })
+                .expect("first session is cached");
+            entry.expires = Instant::now();
+        }
         let second = tokio::time::timeout(Duration::from_secs(5), async {
             model
                 .stream(request(vec![prompt("first"), prompt("second")]))
