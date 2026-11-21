@@ -14,6 +14,12 @@ pub(super) struct Builtin {
 
 pub(super) const PROVIDERS: &[Builtin] = &[
     Builtin {
+        id: "google-vertex",
+        endpoint: "https://aiplatform.googleapis.com/v1",
+        env: "GOOGLE_CLOUD_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "openai",
         endpoint: "https://api.openai.com/v1/responses",
         env: "OPENAI_API_KEY",
@@ -262,6 +268,7 @@ impl Builtin {
             id: Arc::from(self.id),
             adapter: match self.id {
                 "openai" | "xai" | "meta" => Adapter::OpenAiResponses,
+                "google-vertex" => Adapter::GoogleVertex,
                 "openai-codex" => Adapter::CodexResponses,
                 "minimax" | "minimax-cn" | "vercel-ai-gateway" => Adapter::Anthropic,
                 _ => Adapter::ChatCompletions,
@@ -275,7 +282,8 @@ impl Builtin {
 
     pub fn endpoint_for(&self, adapter: Adapter) -> Option<&'static str> {
         match (adapter, self.id) {
-            (Adapter::CodexResponses, "openai-codex") => Some(self.endpoint),
+            (Adapter::GoogleVertex, "google-vertex")
+            | (Adapter::CodexResponses, "openai-codex") => Some(self.endpoint),
             (Adapter::OpenAiResponses, "openai" | "xai" | "meta") => Some(self.endpoint),
             (Adapter::ChatCompletions, id)
                 if !matches!(
@@ -283,6 +291,7 @@ impl Builtin {
                     "openai"
                         | "xai"
                         | "meta"
+                        | "google-vertex"
                         | "openai-codex"
                         | "minimax"
                         | "minimax-cn"

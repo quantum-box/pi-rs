@@ -24,6 +24,7 @@ pub(super) enum Credential {
     Xai,
     BedrockProfile(String),
     BedrockChain,
+    VertexAdc(super::vertex_auth::Adc),
 }
 
 type CommandResult = std::result::Result<String, &'static str>;
@@ -63,14 +64,20 @@ impl Credential {
             | Self::Meta
             | Self::Xai
             | Self::BedrockProfile(_)
-            | Self::BedrockChain => None,
+            | Self::BedrockChain
+            | Self::VertexAdc(_) => None,
         }
     }
 
     pub fn is_bearer(&self) -> bool {
         matches!(
             self,
-            Self::Bearer(_) | Self::ChatGpt | Self::Copilot | Self::Kimi | Self::AnthropicOAuth
+            Self::Bearer(_)
+                | Self::ChatGpt
+                | Self::Copilot
+                | Self::Kimi
+                | Self::AnthropicOAuth
+                | Self::VertexAdc(_)
         )
     }
 
@@ -92,6 +99,7 @@ impl Credential {
                     | Self::Invalid
                     | Self::BedrockProfile(_)
                     | Self::BedrockChain
+                    | Self::VertexAdc(_)
             )
     }
 
@@ -110,6 +118,7 @@ impl Credential {
                     "AWS credential sources cannot be used as an API key".into(),
                 ));
             }
+            Self::VertexAdc(adc) => return adc.access().await,
             Self::Invalid => return Err(Error::Config("Invalid model credential".into())),
             Self::ChatGpt => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;

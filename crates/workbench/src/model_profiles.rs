@@ -585,6 +585,7 @@ impl ModelMetadata {
                 | Adapter::OpenAiResponses
                 | Adapter::CodexResponses
                 | Adapter::Google
+                | Adapter::GoogleVertex
                 | Adapter::Bedrock
         ) || self.thinking_level_map.is_empty()
         {
@@ -1605,6 +1606,29 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
         Adapter::OpenAiResponses => "/responses",
         Adapter::Anthropic | Adapter::PiMessages => "/messages",
         Adapter::Bedrock => return Ok(url.to_string()),
+        Adapter::GoogleVertex => {
+            let mut segments = base.trim_end_matches('/').rsplit('/');
+            let has_version = segments.any(|part| {
+                part.strip_prefix('v').is_some_and(|rest| {
+                    !rest.is_empty()
+                        && rest.split_once("beta").map_or(
+                            rest.bytes().all(|byte| byte.is_ascii_digit()),
+                            |(version, beta)| {
+                                !version.is_empty()
+                                    && version.bytes().all(|byte| byte.is_ascii_digit())
+                                    && beta.bytes().all(|byte| byte.is_ascii_digit())
+                            },
+                        )
+                })
+            });
+            if !has_version {
+                url.path_segments_mut()
+                    .map_err(|_| invalid())?
+                    .pop_if_empty()
+                    .push("v1");
+            }
+            return Ok(url.to_string());
+        }
         Adapter::Google => {
             if url.path() == "/" {
                 url.set_path("/v1beta");
@@ -1692,6 +1716,35 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::json;
+
+    #[test]
+    fn vertex_catalog_and_model_endpoints_match_upstream() {
+        let profiles = Profiles::parse(&json!({"providers":{"google-vertex":{
+            "baseUrl":"https://relay.example/forward",
+            "models":[{"id":"custom","baseUrl":"https://relay.example/v1beta1"}]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("google-vertex").unwrap();
+        assert_eq!(provider.adapter(), Adapter::GoogleVertex);
+        assert_eq!(
+            profiles.endpoint(&provider),
+            "https://relay.example/forward/v1"
+        );
+        assert_eq!(
+            profiles.model_endpoint(&provider, "custom"),
+            Some("https://relay.example/v1beta1")
+        );
+        assert_eq!(profiles.model_ids(&provider).len(), 14);
+        assert_eq!(
+            Profiles::default().model_ids(&provider)[0],
+            "gemini-3.1-pro-preview"
+        );
+        assert!(
+            profiles
+                .model_ids(&provider)
+                .contains(&"gemini-4-argon".to_owned())
+        );
+    }
 
     #[test]
     fn cloudflare_worker_chats_and_classifiers_keep_saved_account_scope() {

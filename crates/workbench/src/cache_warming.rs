@@ -175,6 +175,7 @@ impl Policy {
                 .ok_or("request disabled prompt caching")?,
             Adapter::PiMessages => true,
             Adapter::Google
+            | Adapter::GoogleVertex
             | Adapter::Bedrock
             | Adapter::OpenAiResponses
             | Adapter::CodexResponses => {
