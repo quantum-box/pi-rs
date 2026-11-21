@@ -89,9 +89,19 @@ impl ServerConfig {
 
 #[derive(Clone, Default)]
 struct NativeClient {
+    server_name: Option<Arc<str>>,
     interaction: Arc<std::sync::Mutex<Option<Interaction>>>,
     catalog: Arc<CatalogSignal>,
     dispatch_closed: Arc<std::sync::Mutex<crate::mcp_oauth_client::DispatchState>>,
+}
+
+impl NativeClient {
+    fn for_server(name: &str) -> Self {
+        Self {
+            server_name: Some(Arc::from(name)),
+            ..Self::default()
+        }
+    }
 }
 
 struct AbandonedCall {
@@ -164,6 +174,25 @@ impl rmcp::ClientHandler for NativeClient {
 
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
         self.catalog.changed();
+    }
+
+    #[allow(deprecated)]
+    async fn on_logging_message(
+        &self,
+        params: rmcp::model::LoggingMessageNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        let Some(name) = self.server_name.clone() else {
+            return;
+        };
+        let level = serde_json::to_value(params.level).unwrap_or_default();
+        crate::mcp_log::record(
+            name,
+            level.as_str().unwrap_or("info"),
+            params.logger,
+            params.data,
+        )
+        .await;
     }
 
     async fn create_elicitation(
@@ -629,12 +658,12 @@ impl McpExtension {
             let initialize = async {
                 let service = match owned_stdio {
                     Some(owner) => {
-                        NativeClient::default()
+                        NativeClient::for_server(name)
                             .serve_with_lifecycle(owned_stdio_transport(wrapped, owner)?, lifecycle)
                             .await
                     }
                     None => {
-                        NativeClient::default()
+                        NativeClient::for_server(name)
                             .serve_with_lifecycle(TokioChildProcess::new(wrapped)?, lifecycle)
                             .await
                     }
@@ -724,7 +753,7 @@ impl McpExtension {
                         })?);
                     let native = NativeClient {
                         dispatch_closed: client.dispatch_state.clone(),
-                        ..Default::default()
+                        ..NativeClient::for_server(name)
                     };
                     start_http_service(native, client, transport_config, lifecycle).await
                 } else if let Some(resolver) = provider_token.clone() {
@@ -733,11 +762,21 @@ impl McpExtension {
                         endpoint: Arc::from(url.as_str()),
                         resolver,
                     };
-                    start_http_service(NativeClient::default(), client, transport_config, lifecycle)
-                        .await
+                    start_http_service(
+                        NativeClient::for_server(name),
+                        client,
+                        transport_config,
+                        lifecycle,
+                    )
+                    .await
                 } else {
-                    start_http_service(NativeClient::default(), client, transport_config, lifecycle)
-                        .await
+                    start_http_service(
+                        NativeClient::for_server(name),
+                        client,
+                        transport_config,
+                        lifecycle,
+                    )
+                    .await
                 }
                 .map_err(|error| {
                     let challenge = error.auth_challenge().filter(|challenge| {
