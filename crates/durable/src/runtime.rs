@@ -13029,6 +13029,9 @@ impl Harness {
                     tasks.push((item.task.id(), true));
                 }
             }
+            if task != root.task.id() && !current.task.is_terminal() {
+                return Err(Error::Invalid("owned task cleanup incomplete".into()));
+            }
             if through_conversation {
                 let item = records
                     .iter()

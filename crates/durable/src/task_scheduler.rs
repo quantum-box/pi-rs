@@ -18358,6 +18358,50 @@ pub(crate) fn authenticated_woken_terminal_descendants(
     Ok((uncertain, checks, leases))
 }
 
+/// Pin all extension names selected by the parent and its owned child as one
+/// start lease. The caller must retain the registry and both identity leases,
+/// validate both conversation bindings and graph evidence, then carry this
+/// lease through the callback's first poll. This does not authorize dispatch.
+#[cfg(feature = "experimental-graph-revision")]
+#[allow(dead_code)]
+pub(crate) fn owned_child_cleanup_selection_lease(
+    registry: &Registry,
+    root: &Task,
+    child: &Task,
+    harness: &crate::runtime::Harness,
+) -> Result<crate::extension::SelectionStartLease, Error> {
+    let mut selections = Vec::new();
+    for (task, woken_root) in [(root, true), (child, false)] {
+        let registration = task
+            .kind()
+            .and_then(|kind| registry.entries.get(kind))
+            .ok_or(Error::Registration)?;
+        let checkpointable = registration
+            .conversation_checkpointable
+            .as_ref()
+            .ok_or(Error::Registration)?;
+        if task.replay_safe()
+            || !task.abort_requested()
+            || registration.replay_safe
+            || registration.version != task.definition_version()
+            || !registration.handler.conversation_cancel_dispatch_enabled()
+            || (woken_root && !registration.handler.conversation_woken_cancel_enabled())
+            || registration
+                .abort
+                .as_ref()
+                .is_none_or(|abort| !Arc::ptr_eq(abort, &registration.handler))
+        {
+            return Err(Error::Ownership);
+        }
+        if let Some(selection) = &checkpointable.2 {
+            selections.push(selection);
+        }
+    }
+    harness
+        .checkpointable_selection_start_many(selections)
+        .map_err(|_| Error::Busy)
+}
+
 /// Pin both registrations' live identities. The caller must hold the registry
 /// lease and selection gate, authenticate the graph/bindings and retain these
 /// leases through the checked operation. This does not authorize a callback.

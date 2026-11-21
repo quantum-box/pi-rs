@@ -8244,24 +8244,19 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
             tokio::sync::OwnedRwLockReadGuard::rwlock(&identity_leases[1])
         ));
         assert!(identity_lock.try_write().is_err());
-        let selection_lease = if graph_aba == 10 {
-            let parent_selection = registry
-                .checkpointable_selection_for_kind(marked_root.task.kind().unwrap())
-                .unwrap();
-            let child_selection = registry
-                .checkpointable_selection_for_kind(running.task.kind().unwrap())
-                .unwrap();
-            let lease = harness
-                .checkpointable_selection_start_many([parent_selection, child_selection])
-                .unwrap();
+        let selection_lease = crate::task_scheduler::owned_child_cleanup_selection_lease(
+            &registry,
+            &marked_root.task,
+            &running.task,
+            &harness,
+        )
+        .unwrap();
+        if graph_aba == 10 {
             assert!(matches!(
                 harness.uninstall_extension("policy"),
                 Err(crate::runtime::Error::TaskPublicationBusy)
             ));
-            Some(lease)
-        } else {
-            None
-        };
+        }
         let mut changed_identity = serde_json::to_value(&running.task).unwrap();
         changed_identity["kind"] = json!("different-registration");
         let changed_identity: crate::task::Task = serde_json::from_value(changed_identity).unwrap();
@@ -8270,6 +8265,15 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                 &registry,
                 &marked_root.task,
                 &changed_identity
+            )
+            .is_err()
+        );
+        assert!(
+            crate::task_scheduler::owned_child_cleanup_selection_lease(
+                &registry,
+                &marked_root.task,
+                &changed_identity,
+                &harness
             )
             .is_err()
         );
@@ -8675,6 +8679,13 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                     && !item.task.is_terminal()
             })
             .unwrap();
+        assert!(
+            matches!(
+                harness.replay_safe_woken_owned_cleanup_checks(&recovered, store.put_version().unwrap()),
+                Err(crate::runtime::Error::Invalid(reason)) if reason == "owned task cleanup incomplete"
+            ),
+            "a live direct task descendant must not be accepted as drained"
+        );
         tasks.update(&child, |task| task.cancel()).unwrap();
         let unrelated = harness
             .create_conversation(Config {
