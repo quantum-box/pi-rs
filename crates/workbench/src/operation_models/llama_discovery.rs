@@ -359,9 +359,11 @@ mod tests {
         ]});
         let fixture = tokio::spawn(async move {
             for (route, status, response) in [
-                ("/prefix/models", "200 OK", models),
+                ("/prefix/models", "200 OK", models.clone()),
                 ("/prefix/props", "200 OK", json!({"models_autoload":true})),
                 ("/prefix/models", "503 Unavailable", json!({})),
+                ("/prefix/models", "200 OK", models),
+                ("/prefix/props", "503 Unavailable", json!({})),
                 (
                     "/prefix/models",
                     "200 OK",
@@ -438,6 +440,16 @@ mod tests {
                 .await
                 .is_empty()
         );
+        for connection in [Some(&client), None] {
+            let restored = catalogue(connection, &root, Some("fixture"), cache.clone()).await;
+            assert_eq!(
+                restored
+                    .iter()
+                    .map(|entry| entry.model.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["chat", "decision"]
+            );
+        }
         let updated = catalogue(Some(&client), &root, Some("fixture"), cache.clone()).await;
         assert_eq!(updated.len(), 1);
         assert_eq!(updated[0].model.id, "chat");

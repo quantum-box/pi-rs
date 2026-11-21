@@ -4611,8 +4611,10 @@ Models advertising `decisions` output use `/v1/systemone`; other models use
 next-token classification. Explicit model entries take precedence and inherit
 the router key only when their operation endpoint matches the configured router.
 The last successful catalog is restored when the same router and credential
-are used offline or a refresh fails. The cache contains classifier metadata
-and a scope fingerprint. It stores no raw credential or endpoint.
+are used offline or the router's `/models` request fails. As in Pi, a
+successful model listing with an unavailable `/props` response is cached with
+autoload treated as disabled. The cache contains classifier metadata and
+a scope fingerprint. It stores no raw credential or endpoint.
 When a refresh omits the runtime and configured context windows, it reuses
 the cached model's context window.
 Offline discovery uses a configured literal key or a keyless router without
