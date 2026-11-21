@@ -984,7 +984,7 @@ mod jsonl_framing_tests {
             ("{\"n\":1.", "Unterminated fractional number in JSON"),
             ("[1,] -", "trailing comma"),
             ("{\"bad\":,\"n\":-", "expected value"),
-            ("[01,-", "invalid number"),
+            ("[01,-", "Unexpected number in JSON"),
             ("[1e400,-", "number out of range"),
             (r#"["\ud800",-"#, "unexpected end of hex escape"),
             ("{\"n\":\"-", "Unterminated string in JSON"),
@@ -1020,7 +1020,7 @@ mod jsonl_framing_tests {
         for (input, expected) in [
             ("[1,] 1.", "trailing comma"),
             ("{\"bad\":,\"n\":1.", "expected value"),
-            ("[01.", "invalid number"),
+            ("[01.", "Unexpected number in JSON"),
             ("[1e400,1.", "number out of range"),
             (r#"["\ud800",1."#, "unexpected end of hex escape"),
             ("{\"n\":\"1.", "Unterminated string in JSON"),
@@ -1114,6 +1114,54 @@ mod jsonl_framing_tests {
             (
                 r#""😀"🚧"#,
                 "Unexpected non-whitespace character after JSON at position 4 (line 1 column 5)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.ends_with(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_json_numbers_report_pi_diagnostics_at_the_first_invalid_character() {
+        for (input, expected) in [
+            (
+                "-x",
+                "No number after minus sign in JSON at position 1 (line 1 column 2)",
+            ),
+            (
+                "[-\n1]",
+                "No number after minus sign in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                r#"{"😀": -}"#,
+                "No number after minus sign in JSON at position 8 (line 1 column 9)",
+            ),
+            (
+                "1. ",
+                "Unterminated fractional number in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                r#"{"😀":1.💥}"#,
+                "Unterminated fractional number in JSON at position 8 (line 1 column 9)",
+            ),
+            (
+                "1e--1",
+                "Exponent part is missing a number in JSON at position 3 (line 1 column 4)",
+            ),
+            (
+                "[\r\n1e+]",
+                "Exponent part is missing a number in JSON at position 6 (line 2 column 4)",
+            ),
+            (
+                "-01",
+                "Unexpected number in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                r#"{"n":01}"#,
+                "Unexpected number in JSON at position 6 (line 1 column 7)",
             ),
         ] {
             let error = parse_request(input).unwrap_err().to_string();
@@ -1406,41 +1454,44 @@ fn parse_request(line: &str) -> Result<Value> {
     }
 }
 
+fn json_number_error(line: &str, error: &serde_json::Error, message: &str) -> Option<String> {
+    // EOF already points after the last byte. For an invalid number with a
+    // following character, serde points at that character in one-based columns.
+    let end = if error.is_eof() && message.starts_with("EOF while parsing a value") {
+        let offset = serde_error_offset(line, error)?;
+        (offset == line.len()).then_some(offset)?
+    } else if message.starts_with("invalid number") {
+        serde_error_offset(line, error)?.checked_sub(1)?
+    } else {
+        return None;
+    };
+    let prefix = line.get(..end)?;
+    let bytes = prefix.as_bytes();
+    let mantissa = if matches!(bytes.last(), Some(b'+' | b'-')) {
+        &bytes[..bytes.len() - 1]
+    } else {
+        bytes
+    };
+    let reason = match bytes {
+        [.., digit, b'.'] if digit.is_ascii_digit() => "Unterminated fractional number in JSON",
+        _ if matches!(mantissa, [.., digit, b'e' | b'E'] if digit.is_ascii_digit()) => {
+            "Exponent part is missing a number in JSON"
+        }
+        [.., b'-'] => "No number after minus sign in JSON",
+        [.., b'0'] if line.as_bytes().get(end).is_some_and(u8::is_ascii_digit) => {
+            "Unexpected number in JSON"
+        }
+        _ => return None,
+    };
+    Some(json_error_at(reason, prefix))
+}
+
 // Preserve Pi/V8 diagnostics for common incomplete JSONL records. Other
 // syntax errors retain serde's diagnostic until their V8 equivalents are mapped.
 fn rpc_json_error(line: &str, error: &serde_json::Error) -> String {
     let message = error.to_string();
-    // V8 distinguishes unfinished numbers at EOF. Only project these errors
-    // when serde reached the end while parsing a value, so earlier errors and
-    // number-like suffixes inside strings retain their own diagnostics.
-    if error.is_eof()
-        && message.starts_with("EOF while parsing a value")
-        && serde_error_offset(line, error) == Some(line.len())
-    {
-        let bytes = line.as_bytes();
-        let exponent_end = if matches!(bytes.last(), Some(b'+' | b'-')) {
-            bytes.len().saturating_sub(1)
-        } else {
-            bytes.len()
-        };
-        let reason = if bytes.len() >= 2
-            && bytes[bytes.len() - 1] == b'.'
-            && bytes[bytes.len() - 2].is_ascii_digit()
-        {
-            Some("Unterminated fractional number in JSON")
-        } else if exponent_end >= 2
-            && matches!(bytes[exponent_end - 1], b'e' | b'E')
-            && bytes[exponent_end - 2].is_ascii_digit()
-        {
-            Some("Exponent part is missing a number in JSON")
-        } else if bytes.last() == Some(&b'-') {
-            Some("No number after minus sign in JSON")
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            return json_error_at(reason, line);
-        }
+    if let Some(diagnostic) = json_number_error(line, error, &message) {
+        return diagnostic;
     }
     if let Some((offset, start)) = json_string_control_offset(line)
         && (message.starts_with("control character")

@@ -195,6 +195,10 @@ enum ProtocolRequest {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
     },
+    AgentBeforeSettle {
+        event: pi_rs_core::AgentBeforeSettle,
+        state: Option<ExtensionState>,
+    },
     CompactionLifecycleV1 {
         event: LifecycleEvent,
         trigger: pi_rs_core::CompactionTrigger,
@@ -370,6 +374,8 @@ struct Description {
     lifecycle_hook: bool,
     #[serde(default)]
     message_lifecycle_hook: bool,
+    #[serde(default)]
+    agent_before_settle_hook: bool,
     #[serde(default)]
     lifecycle_host_calls: bool,
     #[serde(default)]
@@ -798,6 +804,22 @@ impl ExecutableExtension {
 
 #[async_trait::async_trait]
 impl Extension for ExecutableExtension {
+    fn handles_agent_before_settle(&self) -> bool {
+        self.description.agent_before_settle_hook
+    }
+
+    async fn agent_before_settle(
+        &self,
+        event: &pi_rs_core::AgentBeforeSettle,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<pi_rs_core::BoundaryDecision> {
+        self.request_async(ProtocolRequest::AgentBeforeSettle {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+
     fn id(&self) -> &str {
         &self.description.id
     }
@@ -3619,6 +3641,7 @@ async fn dispatch_inner(
             user_bash_operations_hook: extension.handles_user_bash_operations(),
             lifecycle_hook: extension.handles_lifecycle(),
             message_lifecycle_hook: extension.handles_message_lifecycle(),
+            agent_before_settle_hook: extension.handles_agent_before_settle(),
             lifecycle_host_calls: true,
             tool_hook_host_calls: true,
             before_tool_host_calls: true,
@@ -3785,6 +3808,9 @@ async fn dispatch_inner(
             } else {
                 encode(extension.lifecycle(&event, state.as_ref()).await)
             }
+        }
+        ProtocolRequest::AgentBeforeSettle { event, state } => {
+            encode(extension.agent_before_settle(&event, state.as_ref()).await)
         }
         ProtocolRequest::CompactionLifecycleV1 {
             event,
@@ -4739,6 +4765,56 @@ mod tests {
         }))
         .unwrap();
         dispatch(extension, request).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_before_settle_capability_carries_structural_decisions() {
+        struct Hook;
+
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "boundary-hook"
+            }
+
+            fn handles_agent_before_settle(&self) -> bool {
+                true
+            }
+
+            async fn agent_before_settle(
+                &self,
+                event: &pi_rs_core::AgentBeforeSettle,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<pi_rs_core::BoundaryDecision> {
+                assert!(event.context.can_continue);
+                assert_eq!(event.context.context_messages[0].record_id, 4);
+                Ok(pi_rs_core::BoundaryDecision {
+                    entries: Some(event.entries.clone()),
+                    should_continue: Some(false),
+                })
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["agent_before_settle_hook"], true);
+        let entry = serde_json::json!({"type":"context_edit","targetId":4,"replacement":null});
+        let request = serde_json::from_value(serde_json::json!({
+            "type": "agent_before_settle",
+            "event": {
+                "outcome": "completed", "entries": [entry], "continue": true,
+                "context": {
+                    "contextMessages": [{"recordId":4,"message":{"role":"user","content":"hello"}}],
+                    "pendingMessages": [], "canContinue": true
+                }
+            }
+        }))
+        .unwrap();
+        let response = dispatch(extension, request).await.unwrap();
+        assert_eq!(response["entries"][0], entry);
+        assert_eq!(response["continue"], false);
     }
 
     #[tokio::test]

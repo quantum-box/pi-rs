@@ -347,6 +347,23 @@ fn dispatch_legacy_event(event: Notification<'_>, observer: &mut Observer<'_>) {
     observer(event);
 }
 
+struct DriveStart {
+    input: Option<(Uuid, String)>,
+    force_request: bool,
+    settled_previous_pass: bool,
+    in_process_continuation: bool,
+}
+
+fn run_state(result: &Result<String>) -> RunState {
+    match result {
+        Ok(_) => RunState::Completed,
+        Err(Error::Cancelled) => RunState::Cancelled,
+        Err(Error::Reconciliation(_)) => RunState::WaitingForReconciliation,
+        Err(Error::PendingOperation(_)) => RunState::WaitingForOperation,
+        Err(_) => RunState::Failed,
+    }
+}
+
 fn finish_tree_handoff(
     session: &mut Session,
     return_to: u64,
@@ -486,6 +503,15 @@ impl Agent<'_> {
     ) -> Result<String> {
         if input.as_ref().is_some_and(|text| text.trim().is_empty()) {
             return Err(Error::Config("empty user input".into()));
+        }
+        if session
+            .pending_extension_boundary_run()
+            .is_some_and(|pending| pending != run_id)
+        {
+            return Err(Error::Session(
+                "pending extension boundary recovery must be resumed before starting another run"
+                    .into(),
+            ));
         }
         if resumable_compaction_run(session)
             .is_some_and(|(pending_run, _, _)| pending_run != run_id)
@@ -753,6 +779,27 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
+        use crate::extension_boundary::{
+            RecoveredBoundary, activity_marker, continuation_is_runnable,
+            dispatch_agent_before_settle, has_activity_queue, recover_agent_before_settle,
+        };
+
+        let recovered = if session.pending_extension_boundary_run() == Some(run_id) {
+            recover_agent_before_settle(session, run_id, observer)?
+        } else {
+            None
+        };
+        let lifecycle = crate::lifecycle::enabled(self.registry);
+        if let Some(RecoveredBoundary::Stop(result)) = recovered {
+            self.finish_run(session, run_id, &result, lifecycle, true, observer)
+                .await?;
+            return result;
+        }
+        let boundary = self
+            .registry
+            .extensions
+            .iter()
+            .any(|ext| ext.handles_agent_before_settle());
         let branch = session.branch();
         let accepted = branch.iter().any(
             |record| matches!(record.event, Event::User { input_id: Some(id), .. } | Event::UserWithImages { input_id: Some(id), .. } if id == run_id),
@@ -765,7 +812,7 @@ impl Agent<'_> {
                 _ => None,
             })
         };
-        let effective_input = input
+        let mut effective_input = input
             .clone()
             .or(pending_initial)
             .map(|content| (run_id, content));
@@ -777,88 +824,178 @@ impl Agent<'_> {
             },
             observer,
         )?;
-        let prior_result = self
+        let mut prior_result = self
             .resolve_prior_turn_end(session, run_id, cancel, observer)
             .await;
         session.set_run_id(Some(run_id));
-        let lifecycle = crate::lifecycle::enabled(self.registry);
-        let start_result = if prior_result.is_err() {
-            prior_result
-        } else if lifecycle {
-            let states = session.extension_states();
-            self.observe_active_lifecycle_with_inputs(
-                session,
-                crate::LifecycleEvent::AgentStart {
-                    session_id: session.session_id(),
-                    run_id,
-                    model: self.model_name.into(),
-                },
-                &states,
-                cancel,
-                observer,
-                Some(followups),
-            )
-            .await
-        } else {
-            Ok(())
-        };
-        let mut retry_attempt = 0;
-        let mut retry_observer = |event: Notification<'_>| {
-            match &event {
-                Notification::Retry(crate::RetryEvent::Start { attempt, .. }) => {
-                    retry_attempt = *attempt
-                }
-                Notification::Retry(crate::RetryEvent::End { .. }) => retry_attempt = 0,
-                _ => {}
+        let mut force_request = matches!(recovered, Some(RecoveredBoundary::Continue { .. }));
+        let mut start_new_activity = matches!(
+            recovered,
+            Some(RecoveredBoundary::Continue {
+                activity_started: false
+            })
+        );
+        let mut settled_previous_pass = false;
+        let mut in_process_continuation = false;
+        loop {
+            if start_new_activity {
+                commit(session, activity_marker(), observer)?;
             }
-            observer(event);
-        };
-        let mut result = match start_result {
-            Ok(()) => {
-                let ui_events = crate::ui_prompt::RunEvents::default();
-                let result = ui_events
-                    .scope(self.drive(
-                        session,
+            let activity_head = session.head();
+            let start = if prior_result.is_ok() && lifecycle {
+                let states = session.extension_states();
+                self.observe_active_lifecycle_with_inputs(
+                    session,
+                    crate::LifecycleEvent::AgentStart {
+                        session_id: session.session_id(),
                         run_id,
-                        effective_input,
-                        followups,
-                        cancel,
-                        &mut retry_observer,
-                    ))
-                    .await;
-                ui_events.finish(&mut retry_observer).await;
-                result
+                        model: self.model_name.into(),
+                    },
+                    &states,
+                    cancel,
+                    observer,
+                    Some(followups),
+                )
+                .await
+            } else {
+                prior_result
+            };
+            prior_result = Ok(());
+
+            let started = start.is_ok();
+            let mut retry_attempt = 0;
+            let mut result = match start {
+                Ok(()) => {
+                    let mut retry_observer = |event: Notification<'_>| {
+                        match &event {
+                            Notification::Retry(crate::RetryEvent::Start { attempt, .. }) => {
+                                retry_attempt = *attempt
+                            }
+                            Notification::Retry(crate::RetryEvent::End { .. }) => retry_attempt = 0,
+                            _ => {}
+                        }
+                        observer(event);
+                    };
+                    let ui_events = crate::ui_prompt::RunEvents::default();
+                    let result = ui_events
+                        .scope(self.drive(
+                            session,
+                            run_id,
+                            DriveStart {
+                                input: effective_input.take(),
+                                force_request,
+                                settled_previous_pass,
+                                in_process_continuation,
+                            },
+                            followups,
+                            cancel,
+                            &mut retry_observer,
+                        ))
+                        .await;
+                    ui_events.finish(&mut retry_observer).await;
+                    result
+                }
+                Err(error) => Err(error),
+            };
+            if retry_attempt > 0 {
+                observer(Notification::Retry(crate::RetryEvent::End {
+                    success: result.is_ok(),
+                    attempt: retry_attempt,
+                    final_error: result.as_ref().err().map(|error| {
+                        if matches!(error, Error::Cancelled) {
+                            "Retry cancelled".into()
+                        } else {
+                            error.to_string()
+                        }
+                    }),
+                }));
             }
-            Err(error) => Err(error),
-        };
-        if retry_attempt > 0 {
-            observer(Notification::Retry(crate::RetryEvent::End {
-                success: result.is_ok(),
-                attempt: retry_attempt,
-                final_error: result.as_ref().err().map(|error| {
-                    if matches!(error, Error::Cancelled) {
-                        "Retry cancelled".into()
-                    } else {
-                        error.to_string()
-                    }
-                }),
-            }));
+            if let Err(error) = queue_inputs(session, followups, observer)
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+            let settled = ensure_settled(session.operations()).is_ok();
+            if settled {
+                apply_settled_after_turn(session, observer)?;
+            }
+            let mut ended = false;
+            if boundary
+                && started
+                && settled
+                && !cancel.is_cancelled()
+                && (!in_process_continuation
+                    || session.records()[activity_head as usize..]
+                        .iter()
+                        .any(|record| matches!(record.event, Event::ModelRequested { .. })))
+                && !matches!(
+                    result,
+                    Err(Error::Cancelled
+                        | Error::Budget
+                        | Error::PendingOperation(_)
+                        | Error::Reconciliation(_))
+                )
+            {
+                if lifecycle {
+                    let event = self.agent_end_event(session, run_id, run_state(&result));
+                    let states = session.extension_states();
+                    self.observe_active_lifecycle_with_inputs(
+                        session,
+                        event,
+                        &states,
+                        cancel,
+                        observer,
+                        Some(followups),
+                    )
+                    .await?;
+                    ended = true;
+                }
+                queue_inputs(session, followups, observer)?;
+                apply_settled_after_turn(session, observer)?;
+                let queued = has_activity_queue(session);
+                let should_continue = if cancel.is_cancelled() || queued {
+                    false
+                } else {
+                    dispatch_agent_before_settle(
+                        self.registry,
+                        session,
+                        &result,
+                        cancel,
+                        self.limits.model_timeout,
+                        observer,
+                    )
+                    .await?
+                };
+                queue_inputs(session, followups, observer)?;
+                apply_settled_after_turn(session, observer)?;
+                if cancel.is_cancelled() {
+                    result = Err(Error::Cancelled);
+                } else if has_activity_queue(session)
+                    || continuation_is_runnable(session, should_continue, observer)
+                {
+                    force_request = true;
+                    start_new_activity = true;
+                    in_process_continuation = true;
+                    settled_previous_pass = result.is_ok();
+                    continue;
+                }
+            }
+            self.finish_run(session, run_id, &result, lifecycle, ended, observer)
+                .await?;
+            return result;
         }
-        if let Err(error) = queue_inputs(session, followups, observer)
-            && result.is_ok()
-        {
-            result = Err(error);
-        }
-        if ensure_settled(session.operations()).is_ok() {
-            apply_settled_after_turn(session, observer)?;
-        }
-        let state = match &result {
-            Ok(_) => RunState::Completed,
-            Err(Error::Cancelled) => RunState::Cancelled,
-            Err(Error::Reconciliation(_)) => RunState::WaitingForReconciliation,
-            Err(Error::PendingOperation(_)) => RunState::WaitingForOperation,
-            Err(_) => RunState::Failed,
-        };
+    }
+
+    async fn finish_run(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        result: &Result<String>,
+        lifecycle: bool,
+        ended: bool,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        let state = run_state(result);
         commit(
             session,
             Event::Run {
@@ -868,30 +1005,9 @@ impl Agent<'_> {
             observer,
         )?;
         if lifecycle {
-            let messages = crate::lifecycle::messages(session, |id| {
-                session.records().get((id - 1) as usize).is_some_and(|record| {
-                    record.run_id == Some(run_id)
-                        || matches!(record.event, Event::UserWithImages { input_id: Some(id), .. } if id == run_id)
-                })
-            });
-            let end = crate::LifecycleEvent::AgentEnd {
-                session_id: session.session_id(),
-                run_id,
-                state,
-                messages,
-            };
-            if ensure_settled(session.operations()).is_ok() {
-                crate::lifecycle::notify_idle_with_host(
-                    self.registry,
-                    session,
-                    end,
-                    self.limits.model_timeout,
-                    observer,
-                )
-                .await?;
-            } else {
-                self.observe_lifecycle(end, &session.extension_states(), None, observer)
-                    .await;
+            if !ended {
+                self.notify_agent_end(session, run_id, state, observer)
+                    .await?;
             }
             if !matches!(
                 state,
@@ -901,7 +1017,7 @@ impl Agent<'_> {
                     self.registry,
                     session,
                     crate::LifecycleEvent::AgentSettled {
-                        aborted: matches!(state, RunState::Cancelled),
+                        aborted: state == RunState::Cancelled,
                     },
                     self.limits.model_timeout,
                     observer,
@@ -909,7 +1025,53 @@ impl Agent<'_> {
                 .await?;
             }
         }
-        result
+        Ok(())
+    }
+
+    fn agent_end_event(
+        &self,
+        session: &Session,
+        run_id: Uuid,
+        state: RunState,
+    ) -> crate::LifecycleEvent {
+        let activity = crate::extension_boundary::activity_marker_id(session, run_id);
+        let messages = crate::lifecycle::messages(session, |id| {
+            activity.is_none_or(|start| id > start)
+                && session.records().get((id - 1) as usize).is_some_and(|record| {
+                record.run_id == Some(run_id)
+                    || matches!(record.event, Event::UserWithImages { input_id: Some(id), .. } if id == run_id)
+            })
+        });
+        crate::LifecycleEvent::AgentEnd {
+            session_id: session.session_id(),
+            run_id,
+            state,
+            messages,
+        }
+    }
+
+    async fn notify_agent_end(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        state: RunState,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        let end = self.agent_end_event(session, run_id, state);
+        if ensure_settled(session.operations()).is_ok() {
+            crate::lifecycle::notify_idle_with_host(
+                self.registry,
+                session,
+                end,
+                self.limits.model_timeout,
+                observer,
+            )
+            .await
+        } else {
+            self.observe_lifecycle(end, &session.extension_states(), None, observer)
+                .await;
+            Ok(())
+        }
     }
 
     async fn observe_lifecycle(
@@ -963,7 +1125,12 @@ impl Agent<'_> {
         let (sender, mut incoming) = mpsc::channel(32);
         let host: Arc<dyn ToolHost> = match &event {
             crate::LifecycleEvent::AgentStart { run_id, .. } => {
-                callback_root_host(session, sender, *run_id, "agent_start")
+                let phase = crate::extension_boundary::activity_marker_id(session, *run_id)
+                    .map_or_else(
+                        || "agent_start".to_owned(),
+                        |activity| format!("agent_start:{activity}"),
+                    );
+                callback_root_host(session, sender, *run_id, phase)
             }
             crate::LifecycleEvent::TurnStart {
                 run_id, turn_index, ..
@@ -1215,13 +1382,20 @@ impl Agent<'_> {
         &self,
         session: &mut Session,
         run_id: Uuid,
-        input: Option<(Uuid, String)>,
+        start: DriveStart,
         followups: &mut mpsc::Receiver<T>,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
+        let DriveStart {
+            input,
+            force_request,
+            settled_previous_pass,
+            in_process_continuation,
+        } = start;
         let recovery = recover(session, observer);
         let mut states = match recovery {
+            Ok(()) if in_process_continuation => session.extension_states(),
             Ok(()) => self.migrate(session, observer)?,
             Err(Error::PendingOperation(_)) => {
                 if let Some((invocation, _)) =
@@ -1372,7 +1546,10 @@ impl Agent<'_> {
         let mut pending = pending_reply(session, run_id);
         queue_inputs(session, followups, observer)?;
         if pending.is_none() && !recovering_compaction {
-            apply_inputs(session, false, observer)?;
+            let accepted = apply_inputs(session, false, observer)?;
+            if force_request && !accepted {
+                apply_inputs(session, true, observer)?;
+            }
         }
         let current_entries: std::collections::HashSet<_> = session
             .current_message_entries()
@@ -1411,7 +1588,7 @@ impl Agent<'_> {
                 _ => None,
             })
             .flatten()
-            .filter(|_| !trigger_unanswered)
+            .filter(|_| !trigger_unanswered && !force_request)
         {
             if recovering_compaction {
                 self.compact_silent_overflow(session, run_id, &states, cancel, observer, followups).await?;
@@ -1441,9 +1618,11 @@ impl Agent<'_> {
         // replayed, so exclude them here to avoid charging them twice.
         let pending_id = pending.as_ref().map(|(id, ..)| *id);
         let mut settled = HashSet::new();
-        for (id, usage, metadata) in durable_recovery_usage(session, run_id) {
-            self.settle_usage(id, &usage, &metadata).await?;
-            settled.insert(id);
+        if !settled_previous_pass {
+            for (id, usage, metadata) in durable_recovery_usage(session, run_id) {
+                self.settle_usage(id, &usage, &metadata).await?;
+                settled.insert(id);
+            }
         }
         if let Some((id, metadata, usage, _)) = &pending
             && metadata.finish_reason.as_deref() == Some("length")
@@ -7301,7 +7480,10 @@ pub(crate) fn queue_custom_message(
     Ok(())
 }
 
-fn apply_settled_after_turn(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
+pub(crate) fn apply_settled_after_turn(
+    session: &mut Session,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
     for (queued_at, input) in session.queued_custom_messages() {
         let origin = session.records()[(queued_at - 1) as usize].run_id;
         if input.delivery == crate::CustomMessageDelivery::AfterTurn
