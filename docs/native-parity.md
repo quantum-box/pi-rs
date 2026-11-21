@@ -508,7 +508,8 @@ form, including multiple keys and explicitly unbound actions.
 
 RPC startup ignores ordinary positional messages and accepts prompts through
 stdin. The root CLI rejects `@file` arguments in RPC mode before loading
-settings and prints Pi's diagnostic to stderr.
+settings or displaying help and prints Pi's diagnostic to stderr.
+Version and session export still take precedence over the attachment check.
 
 Completed tool-call JSON parsing and incremental argument previews live in the
 portable `pi-rs-tool-arguments` crate, shared by the SDK and terminal/RPC
@@ -1485,6 +1486,16 @@ using OSC 10 and 11 and updates light/dark theme selection as replies arrive.
 Like Pi, the system theme and automatic light/dark pairs subscribe to
 terminal appearance notifications. Fixed themes still request the initial
 terminal colors, and switching back to an automatic theme refreshes them.
+
+Live Kitty 0.41.1 verification used a macOS fullscreen session through a PTY
+relay to an isolated Linux display. Changing Kitty's background from dark to
+light triggered a fresh foreground, background and 16-entry ANSI palette
+query in both the system theme and a light/dark pair. The updated colors
+changed the rendered header in each case. A fixed dark theme retained its
+header color and received only its initial query. A live Pi v1.5.0 comparison
+in the same terminal confirmed the subscription and query counts for the
+light/dark pair and fixed theme.
+
 System theme accent and syntax roles use Pi's fallback ANSI palette slots.
 Neutral fallback roles use terminal-default foreground with Pi's dim
 attribute. The terminal palette is queried with OSC 4 and applied after all 16 colors
@@ -1865,6 +1876,10 @@ Package resource filters distinguish glob patterns from exact `+path` and
 exclusions take precedence regardless of array order. Skill-directory paths
 resolve to their SKILL.md resource. Manifest directory roots still expand to
 their declared resources, and filters remain limited to that declared set.
+Settings filter globs require an explicit leading dot to match a hidden path
+component. A visible basename can still match independently of its hidden
+parent path. Native manifest discovery and brace combinations outside the
+bounded expansion retain native glob matching.
 
 ### Resource discovery checkpoint
 
