@@ -1,11 +1,14 @@
 //! A bounded QuickJS runner that reaches external effects only through ToolHost.
 #[cfg(test)]
 use pi_rs_core::ModelRequest;
+use std::future::{Future, poll_fn};
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use futures_util::FutureExt;
 use pi_rs_core::{
     Extension, ExtensionResult, ExtensionState, Outcome, RequestPurpose, Tool, ToolContext,
     ToolHost, ToolReply, ToolSpec,
@@ -611,6 +614,20 @@ async fn evaluate(
                 .unwrap_or_default();
             format!("{error} {detail}")
         })
+    });
+    let mut operation = std::pin::pin!(operation);
+    let operation = poll_fn(|cx| match operation.as_mut().poll(cx) {
+        Poll::Ready(result) => Poll::Ready(result),
+        Poll::Pending => {
+            // async_with polls host futures and drains QuickJS jobs before it
+            // yields. This runtime belongs to this script, and a pending host
+            // future keeps the scheduler nonempty even between I/O wakeups.
+            if runtime.is_job_pending().now_or_never() == Some(false) {
+                Poll::Ready(Err("The script is waiting on a promise that can never settle: no tool call is pending, and timers do not exist here.".into()))
+            } else {
+                Poll::Pending
+            }
+        }
     });
     let result = tokio::select! {
         _ = context.cancellation.cancelled() => return Err("Script cancelled".into()),
@@ -2385,6 +2402,63 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(1));
         }
     }
+    #[tokio::test]
+    async fn unresolved_promise_fails_without_a_deadline() {
+        struct DelayedHost;
+
+        #[async_trait::async_trait]
+        impl ToolHost for DelayedHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: "fixture".into(),
+                    description: "Wait for a fixture response".into(),
+                    parameters: json!({"type": "object"}),
+                }]
+            }
+
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Outcome::Succeeded("fixture returned".into())
+            }
+        }
+
+        for source in [
+            "text('before stall'); await new Promise(() => {});",
+            "text(await tools.fixture({})); await new Promise(() => {});",
+        ] {
+            let reply = tokio::time::timeout(
+                Duration::from_secs(5),
+                ScriptTool { timeout: None }.invoke_transaction(
+                    json!({"code":source}),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation: Default::default(),
+                    },
+                    None,
+                    Arc::new(DelayedHost),
+                ),
+            )
+            .await
+            .expect("an idle script must release its worker with no configured deadline");
+            let Outcome::Failed(error) = reply.outcome else {
+                panic!("unresolved script unexpectedly completed");
+            };
+            let output = if source.contains("tools.fixture") {
+                "fixture returned"
+            } else {
+                "before stall"
+            };
+            assert!(
+                error.contains(output) && error.contains("promise that can never settle"),
+                "{error}"
+            );
+        }
+    }
+
     #[test]
     fn metadata_helpers_and_output_truncation_are_available() {
         let reply = run(

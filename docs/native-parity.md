@@ -1523,7 +1523,9 @@ read `auth.json`; availability checks and model calls still load credentials
 and report authentication-file errors. Memory, stack and output have explicit
 bounds. Execution has no default deadline; a first-line `timeout_ms`, an
 explicit CLI/SDK tool timeout, or cancellation can stop it, including while
-waiting for a worker. Like Pi, worker admission waits at most 60 seconds even
+waiting for a worker. Like Pi, a script awaiting an unresolved promise fails
+as soon as it has no pending host calls or JavaScript jobs, even without a
+configured deadline. Worker admission waits at most 60 seconds even
 when execution has no deadline; a shorter script or host deadline and
 cancellation stop the wait sooner. `PI_CODEMODE_MAX_WORKERS` is re-read when
 admitting or releasing workers, allowing embedders to change the limit while
