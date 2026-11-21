@@ -132,7 +132,7 @@ pub(crate) enum RecoveredBoundary {
     Continue { activity_started: bool },
     TurnContinue,
     ProviderFailure(Error),
-    Stop { result: Result<String>, ended: bool },
+    Stop(Result<String>),
 }
 
 pub(crate) fn recover_agent_before_settle(
@@ -1187,6 +1187,38 @@ mod tests {
             Err(Error::Model(_))
         ));
         assert!(model.requests.lock().unwrap().is_empty());
+
+        let records = failed.records()[..failed.records().len() - 2].to_vec();
+        let metadata = records
+            .iter()
+            .filter_map(|record| {
+                failed
+                    .record_metadata(record.id)
+                    .cloned()
+                    .map(|value| (record.id, value))
+            })
+            .collect();
+        let mut overflow = Session::from_records_with_metadata(records, metadata).unwrap();
+        overflow.set_run_id(Some(run));
+        let mut event = response.event.clone();
+        let Event::ModelFinished {
+            metadata,
+            failure,
+            reply,
+            ..
+        } = &mut event
+        else {
+            unreachable!()
+        };
+        metadata.finish_reason = Some("pi-rs:context-overflow".into());
+        *failure = Some(crate::ModelFailure::Failed);
+        *reply = None;
+        overflow.append(event).unwrap();
+        assert!(crate::agent::resumable_compaction_run(&overflow).is_some());
+        assert!(matches!(
+            recover_agent_before_settle(&mut overflow, run, &mut |_| {}).unwrap(),
+            Some(RecoveredBoundary::TurnContinue)
+        ));
 
         journal.checkout(marker + 1).unwrap();
         assert_eq!(journal.pending_extension_boundary_run(), None);
