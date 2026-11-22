@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 mod compatibility;
+mod mistral;
 mod reasoning_details;
 pub use compatibility::ChatCompatibility;
 
@@ -43,6 +44,7 @@ pub struct Ollama {
     allow_reasoning_off: bool,
     sampling: BTreeMap<String, Value>,
     native_probes: bool,
+    mistral: Option<mistral::Options>,
     progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
 }
@@ -52,8 +54,14 @@ pub struct PreparedChatRequest {
     client: Ollama,
     request: ModelRequest,
     reservation_request: ModelRequest,
-    wire_tools: Vec<Value>,
+    wire_tools: ChatWireTools,
     effective_tools: Vec<pi_rs_core::EffectiveToolDeclaration>,
+}
+
+#[derive(Default)]
+struct ChatWireTools {
+    declarations: Vec<Value>,
+    grammar_inputs: BTreeMap<String, String>,
 }
 
 impl PreparedChatRequest {
@@ -145,10 +153,20 @@ impl Ollama {
             &request,
             declarations,
             self.compatibility.supports_strict_mode == Some(true),
+            self.mistral.is_none()
+                && self.compatibility.supports_openai_grammar_tools() == Some(true),
         )?;
         let mut reservation_request = request.clone();
-        for (spec, wire) in reservation_request.tools.iter_mut().zip(&wire_tools) {
-            spec.parameters = wire["function"]["parameters"].clone();
+        for (spec, wire) in reservation_request
+            .tools
+            .iter_mut()
+            .zip(&wire_tools.declarations)
+        {
+            spec.parameters = if wire["type"] == "custom" {
+                wire["custom"]["format"].clone()
+            } else {
+                wire["function"]["parameters"].clone()
+            };
         }
         Ok(PreparedChatRequest {
             client: self.clone(),
@@ -229,9 +247,27 @@ impl Ollama {
             allow_reasoning_off: true,
             sampling: BTreeMap::new(),
             native_probes: true,
+            mistral: None,
             progress: None,
             reasoning: None,
         })
+    }
+
+    /// Enable the Mistral wire protocol and its model-specific capabilities.
+    pub fn with_mistral(
+        mut self,
+        supports_images: bool,
+        prompt_mode: bool,
+        effort: Option<&str>,
+    ) -> Self {
+        self.mistral = Some(mistral::Options {
+            images: supports_images,
+            prompt_mode,
+            effort: effort.map(str::to_owned),
+        });
+        self.compatibility.supports_strict_mode.get_or_insert(true);
+        self.native_probes = false;
+        self
     }
 
     /// Set the per-read HTTP idle timeout; `None` disables it.
@@ -284,10 +320,12 @@ impl Ollama {
     }
 
     fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let request = if let Some(token) = &self.token {
-            request.bearer_auth(token)
-        } else {
-            request
+        let request = match (&self.token, self.provider.as_ref()) {
+            (Some(token), "cloudflare-ai-gateway") => {
+                request.header("cf-aig-authorization", format!("Bearer {token}"))
+            }
+            (Some(token), _) => request.bearer_auth(token),
+            (None, _) => request,
         };
         request.headers(self.headers.clone())
     }
@@ -380,6 +418,13 @@ impl Ollama {
     /// every model dispatched through this client.
     pub fn with_strict_tool_support(mut self, supported: bool) -> Self {
         self.compatibility.supports_strict_mode = Some(supported);
+        self
+    }
+
+    /// Set custom grammar tool support for the routed model.
+    pub fn with_grammar_tool_support(mut self, supported: bool) -> Self {
+        self.compatibility
+            .set_openai_grammar_tool_support(supported);
         self
     }
 
@@ -885,6 +930,13 @@ impl Model for Ollama {
             &self.sampling,
             self.cache_retention.anthropic_control(),
         ));
+        let base = if self.mistral.is_some() {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(base, format!("{:?}", self.mistral)))
+            })
+        } else {
+            base
+        };
         if self.prompt_cache_key_enabled || self.prompt_cache_long {
             base.and_then(|base| {
                 pi_rs_core::protected_model_fingerprint(&(
@@ -900,6 +952,27 @@ impl Model for Ollama {
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
         let base = pi_rs_core::estimate_message_tokens(message);
+        if self.mistral.is_some() {
+            return match message {
+                Message::Assistant {
+                    calls,
+                    replay: Some(replay),
+                    ..
+                } if replay.identity == self.replay_identity(&request.model)
+                    && replay.supports_api(ModelApi::MistralConversations) =>
+                {
+                    mistral::replay_parts(&replay.blocks).map_or(base, |parts| {
+                        let calls = calls
+                            .iter()
+                            .map(|call| json!({"name":call.name,"arguments":call.arguments}))
+                            .collect::<Vec<_>>();
+                        pi_rs_core::estimate_replay_tokens(&parts)
+                            .saturating_add(pi_rs_core::estimate_replay_tokens(&calls))
+                    })
+                }
+                _ => base,
+            };
+        }
         if matches!(message, Message::Assistant { .. }) {
             let encoded =
                 self.compatible_message(message.clone(), &self.replay_identity(&request.model));
@@ -973,7 +1046,11 @@ impl Model for Ollama {
     }
 
     fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
-        let head = self.compatibility.leading_system_message(&request.messages);
+        let head = self
+            .mistral
+            .is_none()
+            .then(|| self.compatibility.leading_system_message(&request.messages))
+            .flatten();
         let mut base = request.clone();
         base.messages.clear();
         let messages =
@@ -1058,7 +1135,7 @@ impl Ollama {
     async fn stream_with_wire_tools(
         &self,
         request: ModelRequest,
-        wire_tools: Option<Vec<Value>>,
+        wire_tools: Option<ChatWireTools>,
     ) -> Result<ModelStream> {
         if self.has_ambiguous_legacy_replay(&request) {
             return Err(Error::Model("Legacy chat-completions reasoning replay has no provider identity. Edit or remove the affected assistant context, or start a new session, before continuing.".into()));
@@ -1081,9 +1158,14 @@ impl Ollama {
             &mut last_progress,
             ModelProgress::WaitingForModel,
         );
-        let messages = self.wire_messages(request.messages, &identity);
-        let tools: Vec<_> = wire_tools.unwrap_or_else(|| {
-            request
+        let mistral = self.mistral.is_some();
+        let mut messages = if let Some(options) = &self.mistral {
+            mistral::messages(request.messages, &identity, options.images)?
+        } else {
+            self.wire_messages(request.messages, &identity)
+        };
+        let mut wire_tools = wire_tools.unwrap_or_else(|| ChatWireTools {
+            declarations: request
                 .tools
                 .into_iter()
                 .map(|function| {
@@ -1093,11 +1175,29 @@ impl Ollama {
                     }
                     json!({"type": "function", "function": function})
                 })
-                .collect()
+                .collect(),
+            ..Default::default()
         });
+        project_grammar_calls(&mut messages, &wire_tools.grammar_inputs);
+        let tools = std::mem::take(&mut wire_tools.declarations);
+        let declared_mistral_tools: Vec<String> = if mistral {
+            tools
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut body = json!({"model":request.model,"messages":messages,"stream":true});
-        self.compatibility
-            .request_options(&mut body, request.max_output_tokens, !tools.is_empty());
+        if mistral {
+            body["max_tokens"] = json!(request.max_output_tokens);
+        } else {
+            self.compatibility.request_options(
+                &mut body,
+                request.max_output_tokens,
+                !tools.is_empty(),
+            );
+        }
         if self.prompt_cache_key_enabled
             && let Some(key) = &self.session_cache_key
         {
@@ -1109,20 +1209,29 @@ impl Ollama {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
-        self.compatibility.thinking_budget_options(
-            &mut body,
-            self.thinking_budget_level.as_deref(),
-            self.thinking_budgets.as_ref(),
-            request.max_output_tokens,
-            self.supports_reasoning,
-        )?;
-        self.compatibility.reasoning_options(
-            &mut body,
-            self.supports_reasoning,
-            self.reasoning_enabled,
-            self.reasoning_effort.as_deref(),
-            self.allow_reasoning_off,
-        );
+        if let Some(options) = &self.mistral {
+            if options.prompt_mode {
+                body["prompt_mode"] = json!("reasoning");
+            }
+            if let Some(effort) = &options.effort {
+                body["reasoning_effort"] = json!(effort);
+            }
+        } else {
+            self.compatibility.thinking_budget_options(
+                &mut body,
+                self.thinking_budget_level.as_deref(),
+                self.thinking_budgets.as_ref(),
+                request.max_output_tokens,
+                self.supports_reasoning,
+            )?;
+            self.compatibility.reasoning_options(
+                &mut body,
+                self.supports_reasoning,
+                self.reasoning_enabled,
+                self.reasoning_effort.as_deref(),
+                self.allow_reasoning_off,
+            );
+        }
         body.as_object_mut().expect("chat request object").extend(
             self.sampling
                 .iter()
@@ -1145,6 +1254,11 @@ impl Ollama {
                 }
             }
         }
+        let request = if mistral && !self.headers.contains_key(reqwest::header::ACCEPT) {
+            request.header(reqwest::header::ACCEPT, "text/event-stream")
+        } else {
+            request
+        };
         let builder = self.authenticate(request).json(&body);
         let monitor_loading = self.progress.is_some()
             && !requested_model.ends_with(":cloud")
@@ -1233,12 +1347,14 @@ impl Ollama {
             let mut calls = BTreeMap::<usize, CallDelta>::new();
             let mut usage = None;
             let mut metadata = ModelMetadata {
-                provider_api: Some(ModelApi::OpenaiCompletions),
+                provider_api: Some(if mistral { ModelApi::MistralConversations } else { ModelApi::OpenaiCompletions }),
                 replay_identity: Some(identity.clone()),
                 ..ModelMetadata::default()
             };
             let mut reasoning_text = String::new();
             let mut replay_blocks = Vec::new();
+            let mut mistral_segments = Vec::new();
+            let mut mistral_after_tool = false;
             loop {
                 let event = tokio::select! {
                     event = events.next() => event,
@@ -1253,38 +1369,19 @@ impl Ollama {
                         continue;
                     }
                 };
-                let Some(event) = event else { break; };
+                let Some(event) = event else {
+                    if mistral && metadata.finish_reason.is_some() {
+                        break;
+                    }
+                    Err(Error::RetryableModel("SSE closed before the end marker".into()))?;
+                    unreachable!();
+                };
                 let event = event.map_err(|error| match error {
                     eventsource_stream::EventStreamError::Transport(error) => error,
                     _ => Error::RetryableModel("broken SSE stream".into()),
                 })?;
                 if event.data == "[DONE]" {
-                    if infer_finish && !matches!(metadata.finish_reason.as_deref(), Some("length" | "content_filter")) {
-                        metadata.finish_reason = Some(if calls.is_empty() { "stop" } else { "tool_calls" }.into());
-                        yield ModelEvent::Metadata(metadata.clone());
-                    }
-                    match metadata.finish_reason.as_deref() {
-                        Some("stop" | "length") if calls.is_empty() => {},
-                        Some("tool_calls") if !calls.is_empty() => {},
-                        _ => Err(Error::Model("model response did not finish successfully".into()))?,
-                    }
-                    let calls = calls.into_values().map(|call| ToolCall {
-                        id: call.id, name: call.name, arguments: call.arguments,
-                    }).collect();
-                    if preserve_reasoning && !reasoning_text.is_empty() {
-                        replay_blocks.push(json!({"type":"reasoning_content","text":reasoning_text}));
-                    }
-                    if !replay_blocks.is_empty() {
-                        metadata.replay = Some(Box::new(ProviderReplay { identity, blocks: replay_blocks }));
-                    }
-                    if !reasoning_text.is_empty() {
-                        metadata.reasoning = Some(reasoning_text);
-                    }
-                    if metadata.reasoning.is_some() || metadata.replay.is_some() || metadata.replay_identity.is_some() {
-                        yield ModelEvent::Metadata(metadata);
-                    }
-                    yield ModelEvent::Complete { calls, usage };
-                    return;
+                    break;
                 }
                 let chunk: Chunk = serde_json::from_str(&event.data)
                     .map_err(|_| Error::Model("malformed SSE chunk".into()))?;
@@ -1301,6 +1398,7 @@ impl Ollama {
                 }
                 let previous = metadata.clone();
                 if let Some(id) = chunk.id
+                    && (!mistral || (metadata.provider_request_id.is_none() && !id.is_empty()))
                     && id.len() <= 128 && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
                 {
                     metadata.provider_request_id = Some(id);
@@ -1311,6 +1409,12 @@ impl Ollama {
                     metadata.cached_input_tokens = details.cached_tokens
                         .or(stats.prompt_cache_hit_tokens)
                         .or(stats.cached_tokens);
+                    if mistral {
+                        metadata.cached_input_tokens = metadata.cached_input_tokens
+                            .or(stats.mistral_cached_tokens)
+                            .or_else(|| stats.mistral_prompt_details.and_then(|details| details.cached_tokens))
+                            .map(|cached| cached.min(stats.prompt_tokens));
+                    }
                     metadata.cache_creation_input_tokens = details.cache_write_tokens;
                     if let Some(cost) = stats.accounting.total() {
                         metadata.cost_usd = Some(cost);
@@ -1338,26 +1442,91 @@ impl Ollama {
                             reasoning_details::append(&mut replay_blocks, detail);
                         }
                     }
-                    if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
-                        report_progress(&progress, &mut last_progress, ModelProgress::Generating);
-                        yield ModelEvent::Text(content);
+                    if mistral {
+                        for segment in mistral::streamed_segments(choice.delta.content) {
+                            let event = match &segment {
+                                mistral::Segment::Text(text) => {
+                                    report_progress(&progress, &mut last_progress, ModelProgress::Generating);
+                                    ModelEvent::Text(text.clone())
+                                }
+                                mistral::Segment::Thinking(text) => {
+                                    report_progress(&progress, &mut last_progress, ModelProgress::Thinking);
+                                    reasoning_text.push_str(text);
+                                    if let Some(observer) = &reasoning { observer(text); }
+                                    ModelEvent::Reasoning(text.clone())
+                                }
+                            };
+                            mistral::record(&mut mistral_segments, segment, std::mem::take(&mut mistral_after_tool));
+                            yield event;
+                        }
+                    } else if let Some(content) = choice.delta.content {
+                        let Value::String(content) = content else {
+                            Err(Error::Model("malformed SSE content delta".into()))?;
+                            unreachable!();
+                        };
+                        if !content.is_empty() {
+                            report_progress(&progress, &mut last_progress, ModelProgress::Generating);
+                            yield ModelEvent::Text(content);
+                        }
                     }
-                    for delta in choice.delta.tool_calls.unwrap_or_default() {
+                    let had_calls = !calls.is_empty();
+                    for (position, delta) in choice.delta.tool_calls.unwrap_or_default().into_iter().enumerate() {
                         report_progress(&progress, &mut last_progress, ModelProgress::PreparingTool);
-                        if delta.index >= 64 {
+                        let index = if let Some(index) = delta.index {
+                            index
+                        } else if mistral {
+                            mistral::stream_call_index(
+                                delta.id.as_deref(), delta.function.as_ref(), position, had_calls, &calls,
+                                &declared_mistral_tools,
+                            )?
+                        } else {
+                            Err(Error::Model("missing tool call index".into()))?;
+                            unreachable!();
+                        };
+                        if index >= 64 {
                             Err(Error::Model("invalid tool call index".into()))?;
                         }
-                        let (name, arguments) = delta.function
-                            .map(|function| (function.name.unwrap_or_default(), function.arguments.unwrap_or_default()))
+                        if !mistral {
+                            let call = calls.entry(index).or_default();
+                            yield ModelEvent::ToolCallDelta(call.append(index, delta, &wire_tools.grammar_inputs)?);
+                            continue;
+                        }
+                        let (mut name, arguments) = delta.function
+                            .map(|function| (function.name.unwrap_or_default(), function.arguments))
                             .unwrap_or_default();
-                        let id = delta.id.unwrap_or_default();
-                        let call = calls.entry(delta.index).or_default();
+                        let arguments = match arguments {
+                            Some(Value::String(arguments)) => arguments,
+                            Some(value) if mistral => value.to_string(),
+                            Some(_) => Err(Error::Model("invalid tool call arguments".into()))?,
+                            None => String::new(),
+                        };
+                        let mut id = delta.id.unwrap_or_default();
+                        let call = calls.entry(index).or_default();
+                        if mistral {
+                            mistral_after_tool = true;
+                            if id == "null" {
+                                id.clear();
+                            }
+                            if mistral::repeats_declared_name(&declared_mistral_tools, &call.name, &name) {
+                                name.clear();
+                            }
+                            if !call.id.is_empty() {
+                                if id == call.id || delta.index.is_none() {
+                                    id.clear();
+                                } else if let Some(suffix) = id.strip_prefix(&call.id) {
+                                    id = suffix.to_owned();
+                                }
+                            }
+                        }
                         call.id.push_str(&id);
                         call.name.push_str(&name);
                         call.arguments.push_str(&arguments);
                         yield ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
-                            index: delta.index as u64, id, name, arguments,
+                            index: index as u64, id, name, arguments,
                         });
+                    }
+                    if mistral && choice.finish_reason.as_deref() == Some("error") {
+                        Err(Error::RetryableModel("Mistral reported a server error".into()))?;
                     }
                     metadata.finish_reason = choice.finish_reason.filter(|reason| {
                         !infer_finish || matches!(reason.as_str(), "length" | "content_filter")
@@ -1365,6 +1534,7 @@ impl Ollama {
                         match reason.as_str() {
                             "stop" | "tool_calls" | "length" | "content_filter" => reason,
                             "end" => "stop".into(),
+                            "model_length" if mistral => "length".into(),
                             "function_call" => "tool_calls".into(),
                             _ => "other".into(),
                         }
@@ -1374,7 +1544,54 @@ impl Ollama {
                     yield ModelEvent::Metadata(metadata.clone());
                 }
             }
-            Err(Error::RetryableModel("SSE closed before the end marker".into()))?;
+            if infer_finish && !matches!(metadata.finish_reason.as_deref(), Some("length" | "content_filter")) {
+                metadata.finish_reason = Some(if calls.is_empty() { "stop" } else { "tool_calls" }.into());
+                yield ModelEvent::Metadata(metadata.clone());
+            }
+            match metadata.finish_reason.as_deref() {
+                Some("stop" | "length") if calls.is_empty() => {},
+                Some("tool_calls") if !calls.is_empty() => {},
+                _ => Err(Error::Model("model response did not finish successfully".into()))?,
+            }
+            if !mistral_segments.is_empty() {
+                replay_blocks.push(mistral::replay_block(mistral_segments));
+            }
+            if mistral {
+                for (index, call) in &mut calls {
+                    if call.id.is_empty() {
+                        call.id = mistral::call_id(&format!("toolcall:{index}"), 0);
+                        yield ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
+                            index: *index as u64, id: call.id.clone(), name: String::new(), arguments: String::new(),
+                        });
+                    }
+                }
+            }
+            if !mistral {
+                for (index, call) in &mut calls {
+                    let arguments = call.finish(&wire_tools.grammar_inputs)?;
+                    if !arguments.is_empty() {
+                        yield ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
+                            index: *index as u64, id: String::new(), name: String::new(), arguments,
+                        });
+                    }
+                }
+            }
+            let calls = calls.into_values().map(|call| ToolCall {
+                id: call.id, name: call.name, arguments: if mistral && call.arguments.is_empty() { "{}".into() } else { call.arguments },
+            }).collect();
+            if preserve_reasoning && !reasoning_text.is_empty() {
+                replay_blocks.push(json!({"type":"reasoning_content","text":reasoning_text}));
+            }
+            if !replay_blocks.is_empty() {
+                metadata.replay = Some(Box::new(ProviderReplay { identity, blocks: replay_blocks }));
+            }
+            if !reasoning_text.is_empty() {
+                metadata.reasoning = Some(reasoning_text);
+            }
+            if metadata.reasoning.is_some() || metadata.replay.is_some() || metadata.replay_identity.is_some() {
+                yield ModelEvent::Metadata(metadata);
+            }
+            yield ModelEvent::Complete { calls, usage };
         }))
     }
 }
@@ -1395,7 +1612,8 @@ fn resolved_constrained_tools(
     request: &ModelRequest,
     declarations: &[pi_rs_core::ToolDeclaration],
     supports_strict: bool,
-) -> Result<(Vec<Value>, Vec<pi_rs_core::EffectiveToolDeclaration>)> {
+    supports_grammar: bool,
+) -> Result<(ChatWireTools, Vec<pi_rs_core::EffectiveToolDeclaration>)> {
     let mut names = std::collections::BTreeSet::new();
     if request.tools.len() != declarations.len()
         || request
@@ -1408,10 +1626,35 @@ fn resolved_constrained_tools(
             "tool declarations do not match the effective request".into(),
         ));
     }
-    let mut wire = Vec::with_capacity(declarations.len());
+    let mut wire = ChatWireTools {
+        declarations: Vec::with_capacity(declarations.len()),
+        ..Default::default()
+    };
     let mut effective = Vec::with_capacity(declarations.len());
     for declaration in declarations {
         let spec = &declaration.spec;
+        if supports_grammar
+            && let Some((syntax, definition, property)) =
+                pi_rs_core::resolve_openai_tool_grammar(declaration)
+                    .map_err(|error| Error::Config(error.to_string()))?
+        {
+            wire.declarations.push(json!({
+                "type":"custom", "custom":{
+                    "name":spec.name, "description":spec.description,
+                    "format":{"type":"grammar","grammar":{"syntax":syntax,"definition":definition}}
+                }
+            }));
+            wire.grammar_inputs
+                .insert(spec.name.clone(), property.to_owned());
+            effective.push(pi_rs_core::EffectiveToolDeclaration {
+                spec: spec.clone(),
+                sampling: pi_rs_core::EffectiveToolSampling::OpenAiGrammar {
+                    syntax,
+                    input_property: property.to_owned(),
+                },
+            });
+            continue;
+        }
         let strict = match &declaration.constrained_sampling {
             Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => {
                 pi_rs_core::resolve_strict_tool_schema(
@@ -1437,7 +1680,8 @@ fn resolved_constrained_tools(
         } else {
             pi_rs_core::EffectiveToolSampling::Unconstrained
         };
-        wire.push(json!({"type":"function", "function":function}));
+        wire.declarations
+            .push(json!({"type":"function", "function":function}));
         effective.push(pi_rs_core::EffectiveToolDeclaration {
             spec: spec.clone(),
             sampling,
@@ -1446,6 +1690,31 @@ fn resolved_constrained_tools(
     pi_rs_core::validate_effective_tool_declarations(request, declarations, &effective)
         .map_err(|error| Error::Config(error.to_string()))?;
     Ok((wire, effective))
+}
+
+fn project_grammar_calls(messages: &mut [Value], properties: &BTreeMap<String, String>) {
+    if properties.is_empty() {
+        return;
+    }
+    for message in messages {
+        if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            for call in calls {
+                let function = &call["function"];
+                let Some(name) = function["name"].as_str() else {
+                    continue;
+                };
+                let Some(property) = properties.get(name) else {
+                    continue;
+                };
+                let Some(args) = function["arguments"].as_str() else {
+                    continue;
+                };
+                if let Some(input) = pi_rs_core::lossless_openai_grammar_input(args, property) {
+                    *call = json!({"id":call["id"],"type":"custom","custom":{"name":name,"input":input}});
+                }
+            }
+        }
+    }
 }
 
 fn apply_anthropic_cache(body: &mut Value, control: &Value) {
@@ -1568,13 +1837,19 @@ struct WireUsage {
     completion_tokens: u64,
     prompt_cache_hit_tokens: Option<u64>,
     cached_tokens: Option<u64>,
+    #[serde(alias = "promptTokensDetails")]
     prompt_tokens_details: Option<PromptTokenDetails>,
+    #[serde(rename = "num_cached_tokens", alias = "numCachedTokens")]
+    mistral_cached_tokens: Option<u64>,
+    #[serde(rename = "prompt_token_details", alias = "promptTokenDetails")]
+    mistral_prompt_details: Option<PromptTokenDetails>,
     #[serde(flatten)]
     accounting: ReportedUsageCost,
 }
 
 #[derive(Default, Deserialize)]
 struct PromptTokenDetails {
+    #[serde(alias = "cachedTokens")]
     cached_tokens: Option<u64>,
     cache_write_tokens: Option<u64>,
 }
@@ -1588,7 +1863,7 @@ struct Choice {
 
 #[derive(Deserialize)]
 struct Delta {
-    content: Option<String>,
+    content: Option<Value>,
     reasoning: Option<String>,
     reasoning_content: Option<String>,
     reasoning_text: Option<String>,
@@ -1598,15 +1873,24 @@ struct Delta {
 
 #[derive(Deserialize)]
 struct WireCall {
-    index: usize,
+    index: Option<usize>,
     id: Option<String>,
     function: Option<WireFunction>,
+    custom: Option<WireCustom>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct WireCustom {
+    name: Option<String>,
+    input: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct WireFunction {
     name: Option<String>,
-    arguments: Option<String>,
+    arguments: Option<Value>,
 }
 
 #[derive(Default)]
@@ -1614,6 +1898,107 @@ struct CallDelta {
     id: String,
     name: String,
     arguments: String,
+    custom: Option<CustomInput>,
+    function: bool,
+}
+
+#[derive(Default)]
+struct CustomInput {
+    pending: String,
+    started: bool,
+}
+
+impl CustomInput {
+    fn flush(&mut self, property: &str) -> String {
+        let input = json!(std::mem::take(&mut self.pending)).to_string();
+        let encoded = &input[1..input.len() - 1];
+        if self.started {
+            encoded.to_owned()
+        } else {
+            self.started = true;
+            format!("{{{}:\"{encoded}", json!(property))
+        }
+    }
+}
+
+impl CallDelta {
+    fn append(
+        &mut self,
+        index: usize,
+        delta: WireCall,
+        properties: &BTreeMap<String, String>,
+    ) -> Result<pi_rs_core::ToolCallDelta> {
+        let id = delta.id.unwrap_or_default();
+        self.id.push_str(&id);
+        let (name, arguments) = if delta.custom.is_some() || delta.kind.as_deref() == Some("custom")
+        {
+            if self.function || delta.function.is_some() {
+                return Err(Error::Model("tool call changed kind during stream".into()));
+            }
+            let custom = self.custom.get_or_insert_with(CustomInput::default);
+            let delta = delta.custom.unwrap_or_default();
+            let name = delta.name.unwrap_or_default();
+            if custom.started && !name.is_empty() {
+                return Err(Error::Model(
+                    "grammar tool name changed during stream".into(),
+                ));
+            }
+            self.name.push_str(&name);
+            if let Some(input) = delta.input {
+                custom.pending.push_str(&input);
+            }
+            // A shorter advertised tool name may be the first fragment of a longer name.
+            let arguments = if let Some(property) = properties.get(&self.name)
+                && !custom.pending.is_empty()
+                && (custom.started
+                    || !properties.keys().any(|other| {
+                        other.len() > self.name.len() && other.starts_with(&self.name)
+                    })) {
+                custom.flush(property)
+            } else {
+                String::new()
+            };
+            (name, arguments)
+        } else if let Some(function) = delta.function {
+            if self.custom.is_some() {
+                return Err(Error::Model("tool call changed kind during stream".into()));
+            }
+            self.function = true;
+            let name = function.name.unwrap_or_default();
+            self.name.push_str(&name);
+            let arguments = match function.arguments {
+                Some(Value::String(arguments)) => arguments,
+                Some(_) => return Err(Error::Model("invalid tool call arguments".into())),
+                None => String::new(),
+            };
+            (name, arguments)
+        } else {
+            (String::new(), String::new())
+        };
+        self.arguments.push_str(&arguments);
+        Ok(pi_rs_core::ToolCallDelta {
+            index: index as u64,
+            id,
+            name,
+            arguments,
+        })
+    }
+
+    fn finish(&mut self, properties: &BTreeMap<String, String>) -> Result<String> {
+        match (self.custom.as_mut(), properties.get(&self.name)) {
+            (Some(custom), Some(property)) => {
+                let mut tail = custom.flush(property);
+                tail.push_str("\"}");
+                self.arguments.push_str(&tail);
+                Ok(tail)
+            }
+            (Some(_), None) => Err(Error::Model("unadvertised OpenAI grammar tool".into())),
+            (None, Some(_)) => Err(Error::Model(
+                "OpenAI grammar tool returned as a function".into(),
+            )),
+            (None, None) => Ok(String::new()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1835,6 +2220,40 @@ mod content_tests {
                 }),
             );
         }
+    }
+
+    #[test]
+    fn mistral_system_messages_keep_their_conversation_positions() {
+        let model = Ollama::new("http://127.0.0.1:1/v1/chat/completions", None)
+            .unwrap()
+            .with_mistral(false, false, None);
+        let request = ModelRequest {
+            model: "mistral".into(),
+            messages: vec![
+                Message::System {
+                    content: "Initial".into(),
+                },
+                Message::User {
+                    content: "Question".into(),
+                },
+                Message::System {
+                    content: "Update".into(),
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: 1024,
+        };
+        let messages = mistral::messages(
+            request.messages.clone(),
+            &model.replay_identity(&request.model),
+            false,
+        )
+        .unwrap();
+        assert_eq!(messages[2], json!({"role":"system","content":"Update"}));
+        assert_eq!(
+            model.estimate_request_tokens(&request),
+            pi_rs_core::estimate_request_tokens(&request)
+        );
     }
 
     #[tokio::test]
@@ -2809,16 +3228,17 @@ mod constrained_chat_tests {
                 &request,
                 std::slice::from_ref(&preferred),
                 support == Some(true),
+                false,
             )
             .unwrap();
             if support == Some(true) {
-                assert_eq!(wire[0]["function"]["strict"], true);
+                assert_eq!(wire.declarations[0]["function"]["strict"], true);
                 assert_eq!(
-                    wire[0]["function"]["parameters"]["required"],
+                    wire.declarations[0]["function"]["parameters"]["required"],
                     json!(["path", "limit"])
                 );
                 assert_eq!(
-                    wire[0]["function"]["parameters"]["properties"]["limit"],
+                    wire.declarations[0]["function"]["parameters"]["properties"]["limit"],
                     json!({"anyOf":[{"type":"integer"},{"type":"null"}]})
                 );
                 assert!(matches!(
@@ -2826,8 +3246,8 @@ mod constrained_chat_tests {
                     EffectiveToolSampling::StrictJsonSchema { .. }
                 ));
             } else {
-                assert!(wire[0]["function"].get("strict").is_none());
-                assert_eq!(wire[0]["function"]["parameters"], schema);
+                assert!(wire.declarations[0]["function"].get("strict").is_none());
+                assert_eq!(wire.declarations[0]["function"]["parameters"], schema);
                 assert!(matches!(
                     decisions[0].sampling,
                     EffectiveToolSampling::Unconstrained
@@ -2835,13 +3255,14 @@ mod constrained_chat_tests {
             }
         }
         let (request, required) = fixture(StrictToolPolicy::Require, schema);
-        assert!(resolved_constrained_tools(&request, &[required], false).is_err());
+        assert!(resolved_constrained_tools(&request, &[required], false, false).is_err());
         let (request, preferred) = fixture(
             StrictToolPolicy::Prefer,
             json!({"type":"object","$ref":"#/x"}),
         );
-        let (wire, decisions) = resolved_constrained_tools(&request, &[preferred], true).unwrap();
-        assert_eq!(wire[0]["function"]["strict"], false);
+        let (wire, decisions) =
+            resolved_constrained_tools(&request, &[preferred], true, false).unwrap();
+        assert_eq!(wire.declarations[0]["function"]["strict"], false);
         assert!(matches!(
             decisions[0].sampling,
             EffectiveToolSampling::Unconstrained
@@ -2850,9 +3271,163 @@ mod constrained_chat_tests {
             StrictToolPolicy::Require,
             json!({"type":"object","$ref":"#/x"}),
         );
-        assert!(resolved_constrained_tools(&request, &[required], true).is_err());
+        assert!(resolved_constrained_tools(&request, &[required], true, false).is_err());
         let (_, mismatch) = fixture(StrictToolPolicy::Prefer, json!({"type":"object"}));
-        assert!(resolved_constrained_tools(&request, &[mismatch], true).is_err());
+        assert!(resolved_constrained_tools(&request, &[mismatch], true, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_grammar_tools_use_custom_wire_calls_and_stream_json_arguments() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut content_length = None;
+            loop {
+                let mut line = String::new();
+                assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(length) = line.to_ascii_lowercase().strip_prefix("content-length: ") {
+                    content_length = Some(length.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut bytes = vec![0; content_length.unwrap()];
+            socket.read_exact(&mut bytes).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["tools"][0],
+                json!({"type":"custom","custom":{"name":"read","description":"Read","format":{
+                    "type":"grammar","grammar":{"syntax":"lark","definition":"start: /.+/"}
+                }}})
+            );
+            let historical = &body["messages"][0]["tool_calls"];
+            assert_eq!(
+                historical[0],
+                json!({"id":"replay","type":"custom","custom":{"name":"read","input":"old"}})
+            );
+            assert_eq!(
+                historical[1],
+                json!({"id":"legacy","type":"function","function":{"name":"read","arguments":r#"{"path":"old","line":3}"#}})
+            );
+            let events = [
+                json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"id":"c","type":"custom","custom":{"name":"read","input":"a\""}},
+                    {"index":1,"id":"d","type":"custom","custom":{"name":"read","input":""}}
+                ]}}]}),
+                json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"custom":{"name":"_file","input":"\\\n界"}}
+                ]},"finish_reason":"tool_calls"}]}),
+            ]
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>()
+                + "data: [DONE]\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}",
+                events.len()
+            );
+            socket
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let client = model(None, &endpoint).with_grammar_tool_support(true);
+        let (mut request, mut short) = fixture(
+            StrictToolPolicy::Prefer,
+            json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        );
+        short.constrained_sampling = Some(ToolConstraint::Grammar {
+            variants: pi_rs_core::ToolGrammarVariants {
+                openai_lark: Some("start: /.+/".into()),
+                openai_regex: Some(".+".into()),
+            },
+        });
+        let mut long = short.clone();
+        long.spec.name = "read_file".into();
+        request.tools.push(long.spec.clone());
+        request.messages.push(Message::Assistant {
+            content: String::new(),
+            calls: vec![
+                ToolCall {
+                    id: "replay".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"old"}"#.into(),
+                },
+                ToolCall {
+                    id: "legacy".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"old","line":3}"#.into(),
+                },
+            ],
+            replay: None,
+        });
+        for id in ["replay", "legacy"] {
+            request.messages.push(Message::Tool {
+                call_id: id.into(),
+                content: "ok".into(),
+                is_structured: Some(false),
+                is_error: false,
+            });
+        }
+        let declarations = [short, long];
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "fixture".into(),
+            summary: false,
+        };
+        let prepared = client
+            .prepare_bound_tool_dispatch(&request, &declarations, &context)
+            .unwrap();
+        assert!(matches!(
+            prepared.effective_tools()[0].sampling,
+            EffectiveToolSampling::OpenAiGrammar { .. }
+        ));
+        let mut stream = prepared.dispatch().await.unwrap();
+        let mut fragments: BTreeMap<u64, String> = BTreeMap::new();
+        let mut completed = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap().event {
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(delta)) => {
+                    fragments
+                        .entry(delta.index)
+                        .or_default()
+                        .push_str(&delta.arguments);
+                }
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls, .. }) => {
+                    completed = Some(calls);
+                }
+                _ => {}
+            }
+        }
+        let completed = completed.unwrap();
+        for (index, expected) in ["a\"\\\n界", ""].into_iter().enumerate() {
+            let call = &completed[index];
+            assert_eq!(fragments[&(index as u64)], call.arguments);
+            assert_eq!(
+                serde_json::from_str::<Value>(&call.arguments).unwrap(),
+                json!({"path":expected})
+            );
+        }
+        assert_eq!(completed[0].name, "read_file");
+        server.await.unwrap();
+
+        let fallback = client
+            .with_grammar_tool_support(false)
+            .prepare_tool_request(request, &declarations)
+            .unwrap();
+        assert_eq!(fallback.wire_tools.declarations[0]["type"], "function");
+        assert!(matches!(
+            fallback.effective_tools()[0].sampling,
+            EffectiveToolSampling::Unconstrained
+        ));
     }
 
     #[tokio::test]
