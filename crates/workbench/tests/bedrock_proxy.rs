@@ -458,8 +458,10 @@ fn sso_profile_credentials_and_refresh_use_https_proxy() {
             .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
             .env("AWS_EC2_METADATA_DISABLED", "true")
             .env("AWS_MAX_ATTEMPTS", "1")
-            .env("HTTPS_PROXY", proxy_url)
+            // Windows environment keys are case-insensitive. Remove the inherited
+            // spelling before setting the fixture proxy.
             .env_remove("https_proxy")
+            .env("HTTPS_PROXY", proxy_url)
             .env_remove("NO_PROXY")
             .env_remove("no_proxy")
             .env_remove("AWS_ACCESS_KEY_ID")
