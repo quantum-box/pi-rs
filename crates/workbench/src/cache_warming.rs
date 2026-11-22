@@ -837,18 +837,36 @@ mod tests {
     #[tokio::test]
     async fn cache_warming_disables_provider_retries_for_its_request_only() {
         use clap::Parser;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            let (socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
                 .await
                 .expect("the cache refresh never reached its endpoint")
                 .unwrap();
-            let mut request = [0; 1024];
-            assert!(socket.read(&mut request).await.unwrap() > 0);
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("POST /v1/messages "), "{line:?}");
+            let mut length = None;
+            loop {
+                line.clear();
+                assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut body = vec![0; length.expect("missing request content length")];
+            socket.read_exact(&mut body).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["max_tokens"], 1);
             socket
+                .get_mut()
                 .write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After-Ms: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .await
                 .unwrap();
