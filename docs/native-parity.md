@@ -1161,6 +1161,10 @@ is a known Pi-fidelity limitation rather than exact profile matching. Native
 resource tools remain namespaced per server and aggregate that server's pages.
 If a resource or template omits its name, native uses its URI or URI template
 in full and paged listings, matching Pi. Explicit empty names are preserved.
+Tool and resource discovery treat an empty next cursor as the end of the list.
+Full listings stop with an error on a repeated cursor or a continuation beyond
+1,000 pages, matching Pi. Native also applies the bound to its prompt listings
+and omits opaque cursor values from duplicate-cursor errors.
 Within the existing initialization deadline, HTTP connections retry after
 250 ms and 1 second on transient network errors, HTTP 408, 429, and 5xx
 other than 501. Remote resource reads and listings, including paged listings
