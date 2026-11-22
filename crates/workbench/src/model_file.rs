@@ -95,9 +95,12 @@ impl ModelFileReadGrants {
                     "API key route is outside the models file grant".into(),
                 ));
             }
-            if grant.api == NativeModelApi::ChatGptResponses {
+            if matches!(
+                grant.api,
+                NativeModelApi::ChatGptResponses | NativeModelApi::OpenAiCodexResponses
+            ) {
                 return Err(Error::Config(
-                    "ChatGPT routes require host-provided OAuth credentials".into(),
+                    "ChatGPT and Codex routes require host-provided OAuth credentials".into(),
                 ));
             }
             file_key_routes.insert((grant.provider.as_str(), key));

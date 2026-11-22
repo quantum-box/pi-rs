@@ -825,6 +825,28 @@ async fn granted_model_file_composes_saved_auth_with_exact_api_and_base_routes()
     assert_eq!(grants.load(&factory).unwrap().identities().len(), 0);
 }
 
+#[test]
+fn configured_model_key_grants_reject_codex_oauth_routes() {
+    use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
+
+    let directory = tempfile::tempdir().unwrap();
+    let route = ModelFileRoute {
+        provider: "openai-codex".into(),
+        api: NativeModelApi::OpenAiCodexResponses,
+        base_url: "https://chatgpt.com/backend-api/codex".into(),
+        endpoint: "https://chatgpt.com/backend-api/codex/responses".into(),
+    };
+    let models = ModelFileReadGrants {
+        file: directory.path().join("models.json"),
+        routes: vec![route.clone()],
+    };
+    let error = models
+        .load_with_api_keys(&ModelClientFactory::default(), &[route], |_, _| None)
+        .err()
+        .expect("configured API key grant must not authorize Codex OAuth");
+    assert!(error.to_string().contains("host-provided OAuth"));
+}
+
 #[tokio::test]
 async fn configured_model_key_requires_exact_opt_in_and_yields_to_saved_auth() {
     use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
