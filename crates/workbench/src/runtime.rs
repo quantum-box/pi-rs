@@ -383,7 +383,7 @@ impl Runtime {
     pub fn mcp_status(&self, args: &Cli) -> Result<()> {
         let servers = self.catalog.servers.lock().expect("MCP catalogs");
         for (name, value) in
-            mcp_config::registered_configurations(args, self.registry.registered_mcp_servers())?
+            mcp_config::registered_configurations(args, &self.registry.registered_mcp_servers())?
         {
             if let Some(server) = servers.iter().find(|server| server.server_name == name) {
                 output(
@@ -553,7 +553,7 @@ impl Runtime {
         config: &pi_rs_workbench::mcp::ServerConfig,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let registered = self.registry.registered_mcp_servers().to_vec();
+        let registered = self.registry.registered_mcp_servers();
         let check_config = || mcp_config::check_manager_connection(args, &registered, name, config);
         let catalog = self.catalog.clone();
         let _mutation = catalog.mutation.lock().await;
@@ -633,7 +633,7 @@ impl Runtime {
             .ok_or_else(|| pi_rs::Error::Config("MCP server no longer needs sign-in".into()))?;
         mcp_config::check_manager_connection(
             args,
-            self.registry.registered_mcp_servers(),
+            &self.registry.registered_mcp_servers(),
             name,
             config,
         )?;
@@ -658,7 +658,7 @@ impl Runtime {
         }
         mcp_config::manager_login(
             args,
-            self.registry.registered_mcp_servers(),
+            &self.registry.registered_mcp_servers(),
             &pending,
             ui,
             cancel,
@@ -677,7 +677,7 @@ impl Runtime {
     ) -> Result<()> {
         mcp_config::check_manager_connection(
             args,
-            self.registry.registered_mcp_servers(),
+            &self.registry.registered_mcp_servers(),
             name,
             config,
         )?;
@@ -725,7 +725,7 @@ impl Runtime {
             };
             if mcp_config::check_manager_connection(
                 args,
-                self.registry.registered_mcp_servers(),
+                &self.registry.registered_mcp_servers(),
                 &name,
                 &pending.config,
             )
@@ -1311,7 +1311,7 @@ async fn configure_after(
         ))?;
         let extra = mcp_config::discover_registered(
             args,
-            registry.registered_mcp_servers(),
+            &registry.registered_mcp_servers(),
             &discovered.configured_namespaces,
             interactive_mcp,
             share_services,

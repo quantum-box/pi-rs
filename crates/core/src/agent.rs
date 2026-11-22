@@ -402,6 +402,7 @@ struct DriveStart {
     force_request: bool,
     settled_previous_pass: bool,
     in_process_continuation: bool,
+    check_turn_continuation: bool,
 }
 
 fn run_state(result: &Result<String>) -> RunState {
@@ -458,7 +459,15 @@ impl Agent<'_> {
         session: &Session,
         run_id: Uuid,
     ) -> Result<()> {
-        for (id, usage, metadata) in durable_recovery_usage(session, run_id) {
+        self.settle_recorded_recovery(durable_recovery_usage(session, run_id))
+            .await
+    }
+
+    async fn settle_recorded_recovery(
+        &self,
+        records: Vec<(Uuid, UsageReport, ModelMetadata)>,
+    ) -> Result<()> {
+        for (id, usage, metadata) in records {
             self.settle_usage(id, &usage, &metadata).await?;
         }
         Ok(())
@@ -878,6 +887,8 @@ impl Agent<'_> {
             .resolve_prior_turn_end(session, run_id, cancel, observer)
             .await;
         session.set_run_id(Some(run_id));
+        let mut check_turn_continuation =
+            matches!(recovered, Some(RecoveredBoundary::TurnContinue));
         let mut force_request = matches!(recovered, Some(RecoveredBoundary::Continue { .. }));
         let mut start_new_activity = matches!(
             recovered,
@@ -885,6 +896,10 @@ impl Agent<'_> {
                 activity_started: false
             })
         );
+        let mut recovered_failure = match recovered {
+            Some(RecoveredBoundary::ProviderFailure(error)) => Some(error),
+            _ => None,
+        };
         let mut settled_previous_pass = false;
         let mut in_process_continuation = false;
         loop {
@@ -892,7 +907,11 @@ impl Agent<'_> {
                 commit(session, activity_marker(), observer)?;
             }
             let activity_head = session.head();
-            let start = if prior_result.is_ok() && lifecycle {
+            let resuming_failed_activity = recovered_failure.is_some();
+            let start = if let Some(error) = recovered_failure.take() {
+                let records = durable_recovery_usage(session, run_id);
+                self.settle_recorded_recovery(records).await.and(Err(error))
+            } else if prior_result.is_ok() && lifecycle {
                 let states = session.extension_states();
                 self.observe_active_lifecycle_with_inputs(
                     session,
@@ -912,7 +931,7 @@ impl Agent<'_> {
             };
             prior_result = Ok(());
 
-            let started = start.is_ok();
+            let started = resuming_failed_activity || start.is_ok();
             let mut retry_attempt = 0;
             let mut result = match start {
                 Ok(()) => {
@@ -936,6 +955,9 @@ impl Agent<'_> {
                                 force_request,
                                 settled_previous_pass,
                                 in_process_continuation,
+                                check_turn_continuation: std::mem::take(
+                                    &mut check_turn_continuation,
+                                ),
                             },
                             followups,
                             cancel,
@@ -1324,6 +1346,7 @@ impl Agent<'_> {
                     run_id,
                     assistant_record,
                     version,
+                    false,
                     &states,
                     cancel,
                     observer,
@@ -1344,15 +1367,38 @@ impl Agent<'_> {
         run_id: Uuid,
         assistant_record: u64,
         version: u32,
+        actionable: bool,
         states: &ExtensionStates,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let mut requested = false;
         let completed = session.branch().iter().any(|record| {
             matches!(record.event,
             Event::TurnEndCallbacksCompleted { assistant_record: id } if id == assistant_record)
         });
         if !completed && version >= crate::journal::TURN_END_JOURNAL_VERSION {
+            let turn_index = session
+                .branch()
+                .iter()
+                .filter(|record| {
+                    record.id <= assistant_record
+                        && record.run_id == Some(run_id)
+                        && matches!(record.event, Event::Assistant { .. })
+                })
+                .count()
+                .saturating_sub(1) as u32;
+            if actionable {
+                requested = crate::extension_boundary::dispatch_turn_end(
+                    self.registry,
+                    session,
+                    (run_id, turn_index, assistant_record),
+                    cancel,
+                    self.limits.model_timeout,
+                    observer,
+                )
+                .await?;
+            }
             if crate::lifecycle::enabled(self.registry) {
                 let next_assistant = session.branch().iter().find_map(|record| {
                     (record.id > assistant_record
@@ -1370,14 +1416,19 @@ impl Agent<'_> {
                     })
                     .count()
                     .saturating_sub(1) as u32;
-                let messages = crate::lifecycle::messages(session, |id| {
-                    id >= assistant_record
-                        && next_assistant.is_none_or(|end| id < end)
-                        && session
-                            .records()
-                            .get((id - 1) as usize)
-                            .is_some_and(|record| record.run_id == Some(run_id))
-                });
+                let messages = crate::extension_boundary::recovered_turn_observation(
+                    session,
+                    run_id,
+                    assistant_record,
+                    |id| {
+                        id >= assistant_record
+                            && next_assistant.is_none_or(|end| id < end)
+                            && session
+                                .records()
+                                .get((id - 1) as usize)
+                                .is_some_and(|record| record.run_id == Some(run_id))
+                    },
+                );
                 self.observe_active_lifecycle(
                     session,
                     crate::LifecycleEvent::TurnEnd {
@@ -1425,7 +1476,8 @@ impl Agent<'_> {
             session,
             Event::TurnEndBoundaryApplied { assistant_record },
             observer,
-        )
+        )?;
+        Ok(requested)
     }
 
     async fn drive<T: Into<AgentInput> + Send>(
@@ -1442,6 +1494,7 @@ impl Agent<'_> {
             force_request,
             settled_previous_pass,
             in_process_continuation,
+            mut check_turn_continuation,
         } = start;
         let recovery = recover(session, observer);
         let mut states = match recovery {
@@ -1479,8 +1532,19 @@ impl Agent<'_> {
             && !session.branch().iter().any(|record| matches!(record.event,
                 Event::TurnEndBoundaryApplied { assistant_record: applied } if applied == assistant_record))
         {
-            self.finish_recovered_turn_end(session, run_id, assistant_record, version, &states, cancel, observer).await?;
+            let actionable = !session.records().iter().any(|record| record.run_id == Some(run_id)
+                && matches!(record.event, Event::Run { state: RunState::Completed | RunState::Failed | RunState::Cancelled, .. }));
+            check_turn_continuation |= self.finish_recovered_turn_end(
+                session, run_id, assistant_record, version, actionable, &states, cancel, observer,
+            ).await?;
         }
+        let force_request = force_request
+            || (!cancel.is_cancelled()
+                && crate::extension_boundary::turn_continuation_is_runnable(
+                    session,
+                    check_turn_continuation,
+                    observer,
+                ));
         let recovering_compaction =
             resumable_compaction_run(session).is_some_and(|(id, _, _)| id == run_id);
         if !recovering_compaction {
@@ -2361,8 +2425,19 @@ impl Agent<'_> {
                 return Err(err);
             }
 
-            if lifecycle {
-                let messages = crate::lifecycle::messages(session, |id| id >= assistant_record);
+            let turn_messages =
+                lifecycle.then(|| crate::lifecycle::messages(session, |id| id >= assistant_record));
+            let requested = crate::extension_boundary::dispatch_turn_end(
+                dispatcher.registry,
+                session,
+                (run_id, turn_index, assistant_record),
+                cancel,
+                self.limits.model_timeout,
+                observer,
+            )
+            .await?;
+
+            if let Some(messages) = turn_messages {
                 dispatcher
                     .observe_active_lifecycle_with_inputs(
                         session,
@@ -2412,7 +2487,11 @@ impl Agent<'_> {
                 if apply_inputs(session, false, observer)? {
                     continue;
                 }
-                if !apply_inputs(session, true, observer)? {
+                if !apply_inputs(session, true, observer)?
+                    && !crate::extension_boundary::turn_continuation_is_runnable(
+                        session, requested, observer,
+                    )
+                {
                     let compact_agent = Agent {
                         registry: &runtime_registry,
                         system_prompt: &runtime_prompt,
