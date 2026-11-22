@@ -37,6 +37,7 @@ mod mcp_login_config_lock;
 pub use mcp_login_config_lock::lock_edit as mcp_config_edit_lock;
 #[doc(hidden)]
 pub mod mcp_oauth_client;
+mod mcp_progress;
 mod mcp_provider_auth;
 #[doc(hidden)]
 pub mod mcp_refresh;

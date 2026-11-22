@@ -1158,7 +1158,9 @@ impl Cli {
                 catalogs
                     .iter()
                     .find(|catalog| catalog.provider == provider)
-                    .and_then(|catalog| catalog.models.first())
+                    .and_then(|catalog| {
+                        model_selection::default_for_provider(&provider, &catalog.models)
+                    })
                     .cloned()
             });
         let (provider, model) = model.map_or_else(
@@ -1223,7 +1225,7 @@ enum Command {
         #[command(subcommand)]
         command: Box<mcp_config::McpCommand>,
     },
-    /// Check or print a configured provider credential.
+    /// Manage configured provider credentials.
     Auth {
         #[command(subcommand)]
         command: auth_cli::AuthCommand,
@@ -1965,9 +1967,13 @@ async fn execute(
         }
     }
     if needs_default_model && args.model.is_empty() {
-        args.model = available.first().cloned().ok_or_else(|| {
-            Error::Config("no model is available for the selected provider; pass --model".into())
-        })?;
+        args.model = model_selection::default_for_provider(&args.provider, available)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Config(
+                    "no model is available for the selected provider; pass --model".into(),
+                )
+            })?;
     }
 
     args.bind_initial_model_endpoint();
@@ -2513,7 +2519,7 @@ async fn execute(
             if !trigger { return Ok(()); }
             if args.model.is_empty() {
                 let catalog = model_selection::catalog(&args, args.provider.clone(), args.allow_model_probes()).await?;
-                args.model = catalog.models.first().cloned().ok_or_else(|| Error::Config("no model is available for the selected provider; pass --model".into()))?;
+                args.model = model_selection::default_for_provider(&args.provider, &catalog.models).cloned().ok_or_else(|| Error::Config("no model is available for the selected provider; pass --model".into()))?;
                 args.bind_initial_model_endpoint();
                 if !args.thinking_explicit { args.apply_model_thinking_defaults(); }
                 thinking::adjust(&mut args);
