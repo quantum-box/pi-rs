@@ -750,6 +750,30 @@ fn payload(
     )
 }
 
+fn accepts_responses_replay(replay: &ProviderReplay, api: pi_rs_core::ModelApi) -> bool {
+    replay.supports_api(api)
+        && replay.blocks.iter().all(|block| {
+            // Older journals key replay by provider/model only. Keep known
+            // non-Responses block formats out of this adapter when routes change.
+            match block["type"].as_str() {
+                Some(
+                    "thinking"
+                    | "redacted_thinking"
+                    | "text"
+                    | "tool_use"
+                    | "reasoning_content"
+                    | "pi-rs:pi-messages-origin",
+                ) => false,
+                Some("reasoning") => {
+                    block.get("signature").is_none()
+                        && block.get("text").is_none()
+                        && block.get("redacted").is_none()
+                }
+                _ => block.get("mistral_content").is_none(),
+            }
+        })
+}
+
 fn responses_payload(
     request: &ModelRequest,
     provider: &str,
@@ -790,7 +814,7 @@ fn responses_payload(
                             provider
                         }
                         && r.identity.model == request.model
-                        && r.supports_api(api)
+                        && accepts_responses_replay(r, api)
                 });
                 let before = input.len();
                 let wire_blocks = matched_replay
@@ -1159,7 +1183,7 @@ impl Model for OpenAiResponses {
                     self.provider.clone()
                 }
                 && replay.identity.model == request.model
-                && replay.supports_api(self.api()) =>
+                && accepts_responses_replay(replay, self.api()) =>
             {
                 pi_rs_core::estimate_replay_tokens(&replay.blocks)
                     .max(pi_rs_core::estimate_message_tokens(message))
@@ -4302,7 +4326,9 @@ mod tests {
         let mut request = request();
         let signed = json!({"type":"thinking","thinking":"hidden","signature":"signed"});
         let effort = json!({"_pi_anthropic_effort":"xhigh"});
-        for private_block in [signed, effort] {
+        let bedrock = json!({"type":"reasoning","text":"hidden","signature":"signed"});
+        let pi_messages = json!({"type":"pi-rs:pi-messages-origin"});
+        for private_block in [signed, effort, bedrock, pi_messages] {
             request.messages = vec![
                 Message::User {
                     content: "question".into(),
@@ -4315,10 +4341,7 @@ mod tests {
                             provider: "fixture".into(),
                             model: request.model.clone(),
                         },
-                        blocks: vec![
-                            private_block,
-                            json!({"type":"text","text":"portable reply"}),
-                        ],
+                        blocks: vec![private_block],
                     })),
                 },
             ];

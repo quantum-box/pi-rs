@@ -704,28 +704,15 @@ impl ProviderReplay {
         {
             return name == api.as_str();
         }
+        // These metadata keys identify the producing adapter even when a
+        // legacy journal does not have a context-edit API marker.
         self.blocks.iter().all(|block| {
-            let kind = block["type"].as_str();
-            if block.get("_pi_anthropic_effort").is_some()
-                || matches!(kind, Some("redacted_thinking" | "tool_use"))
-                || (kind == Some("thinking") && block["thinking"].is_string())
-            {
-                api == ModelApi::AnthropicMessages
-            } else if block.get("mistral_content").is_some() {
-                api == ModelApi::MistralConversations
-            } else if block.get("_pi_openai_effort").is_some()
-                || matches!(
-                    kind,
-                    Some("reasoning" | "function_call" | "custom_tool_call")
-                )
-            {
-                matches!(
-                    api,
-                    ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses
-                )
-            } else {
-                true
-            }
+            (block.get("_pi_anthropic_effort").is_none() || api == ModelApi::AnthropicMessages)
+                && (block.get("_pi_openai_effort").is_none()
+                    || matches!(
+                        api,
+                        ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses
+                    ))
         })
     }
 }
