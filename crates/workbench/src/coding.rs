@@ -2635,21 +2635,14 @@ fn local_numeric_limit(args: &Value, default: f64) -> f64 {
     args.get("limit").and_then(Value::as_f64).unwrap_or(default)
 }
 
-// fd receives String(limit), and its --max-results parser accepts usize. Zero
-// is fd's unlimited sentinel; the original number remains relevant to notices.
+// Pi passes String(limit + 1) to fd to detect when the result set exceeds the displayed limit.
 fn fd_numeric_limit(value: f64) -> std::result::Result<usize, String> {
     let text = js_number(value);
-    let reason = if text.starts_with('-') {
-        return Err("error: a value is required for '--max-results <count>' but none was supplied\n\nFor more information, try '--help'.".into());
-    } else {
-        match text.parse::<usize>() {
-            Ok(limit) => return Ok(limit),
-            Err(error) => error.to_string(),
-        }
-    };
-    Err(format!(
-        "error: invalid value '{text}' for '--max-results <count>': {reason}\n\nFor more information, try '--help'."
-    ))
+    text.parse::<usize>().map_err(|reason| {
+        format!(
+            "error: invalid value '{text}' for '--max-results <count>': {reason}\n\nFor more information, try '--help'."
+        )
+    })
 }
 
 fn grep_glob_overrides(
@@ -3179,7 +3172,7 @@ impl CodingTool {
             &crate::coding_paths::normalize(requested_path)?,
         );
         let path = self.path(requested_path)?;
-        let numeric_limit = local_numeric_limit(args, 500.0);
+        let numeric_limit = local_numeric_limit(args, 500.0).floor().max(1.0);
         let limit = args["limit"].as_u64().unwrap_or(500).min(100_000) as usize;
         if !path.is_dir() {
             return Err(Error::Config(format!(
@@ -3254,10 +3247,10 @@ impl CodingTool {
             return Err(Error::Cancelled);
         }
         let is_find = matches!(self.kind, Kind::Find);
-        let numeric_find_limit = local_numeric_limit(args, 1000.0);
+        let numeric_find_limit = local_numeric_limit(args, 1000.0).floor().max(1.0);
         // fd parses its arguments before checking the search path.
         let unrestricted_find_limit = if is_find && self.unrestricted {
-            match fd_numeric_limit(numeric_find_limit) {
+            match fd_numeric_limit(numeric_find_limit + 1.0) {
                 Ok(limit) => Some(limit),
                 Err(output) => return Ok(pi_tool_failure(output)),
             }
@@ -3303,8 +3296,20 @@ impl CodingTool {
         });
         let limit = if is_find { limit } else { limit.max(1) };
         let pattern = string(args, "pattern")?;
+        let windows_pattern =
+            (is_find && self.unrestricted && cfg!(windows)).then(|| pattern.replace('\\', "/"));
+        let pattern = windows_pattern.as_deref().unwrap_or(pattern);
+        let pattern = if is_find && self.unrestricted {
+            pattern.trim_start_matches("./")
+        } else {
+            pattern
+        };
+        let is_path_pattern = pattern.contains('/');
+        let relative_find_pattern =
+            self.unrestricted && is_path_pattern && !Path::new(pattern).has_root();
         let glob = if is_find {
-            let pattern = if pattern.contains('/')
+            let pattern = if !self.unrestricted
+                && is_path_pattern
                 && !pattern.starts_with('/')
                 && !pattern.starts_with("**/")
             {
@@ -3376,6 +3381,7 @@ impl CodingTool {
         let mut find_count = 0usize;
         let mut find_listing = crate::tool_output::Listing::new();
         let mut find_line_count = 0usize;
+        let mut find_limit_exceeded = false;
         let mut walker = ignore::WalkBuilder::new(&base);
         walker.hidden(false);
         if is_find {
@@ -3408,7 +3414,7 @@ impl CodingTool {
             walker.overrides(grep_glob_overrides(&self.root, glob, false)?);
         }
         let mut find_error = None;
-        for entry in walker.build() {
+        'entries: for entry in walker.build() {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
@@ -3433,7 +3439,9 @@ impl CodingTool {
                 .ok()
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new(entry.file_name()));
-            let match_path = if pattern.contains('/') {
+            let match_path = if relative_find_pattern {
+                relative
+            } else if is_path_pattern {
                 entry.path()
             } else {
                 Path::new(entry.file_name())
@@ -3462,6 +3470,10 @@ impl CodingTool {
                 let is_directory = entry.file_type().is_some_and(|kind| kind.is_dir());
                 if self.unrestricted {
                     for line in find_pi_lines(&base, entry.path(), is_directory) {
+                        if find_line_count as f64 >= numeric_find_limit {
+                            find_limit_exceeded = true;
+                            break 'entries;
+                        }
                         find_listing.push(&line);
                         find_line_count += 1;
                     }
@@ -3475,7 +3487,7 @@ impl CodingTool {
                     results.push(path);
                 }
                 find_count += 1;
-                if find_count >= limit && !(self.unrestricted && limit == 0) {
+                if find_count >= limit {
                     break;
                 }
             }
@@ -3492,7 +3504,7 @@ impl CodingTool {
             }
             let mut details = Map::new();
             let mut notices = Vec::new();
-            if (find_line_count as f64) >= numeric_find_limit {
+            if find_limit_exceeded {
                 details.insert("resultLimitReached".into(), json!(numeric_find_limit));
                 notices.push(format!(
                     "{} results limit reached. Use limit={} for more, or refine pattern",
@@ -7339,27 +7351,25 @@ mod tests {
         let token = pi_rs::CancellationToken::new();
         let outcome = tool.list(&json!({"limit": 1.5}), &token).unwrap();
         assert!(
-            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["entryLimitReached"] == json!(1.5))
+            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["entryLimitReached"] == json!(1.0))
         );
         tool.kind = Kind::Find;
         let outcome = tool
             .search(&json!({"pattern":"*", "limit": 0.0}), &token)
             .unwrap();
         assert!(
-            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["resultLimitReached"] == json!(0.0))
+            matches!(&outcome, Outcome::SucceededWithDetails { details, .. } if details["resultLimitReached"] == json!(1.0))
         );
-        let failed = tool
+        let rounded = tool
             .search(&json!({"pattern":"*", "limit":1.5}), &token)
             .unwrap();
-        assert!(failed.is_error());
-        assert_eq!(
-            failed.tool_content(),
-            "error: invalid value '1.5' for '--max-results <count>': invalid digit found in string\n\nFor more information, try '--help'."
-        );
+        assert_eq!(rounded.tool_content(), outcome.tool_content());
         let missing = json!({"pattern":"*", "path":"missing", "limit":1.5});
-        let missing_outcome = tool.search(&missing, &token).unwrap();
-        assert!(missing_outcome.is_error());
-        assert_eq!(missing_outcome.tool_content(), failed.tool_content());
+        let missing_error = tool.search(&missing, &token).unwrap_err().to_string();
+        assert!(
+            missing_error.contains("is not a directory."),
+            "{missing_error}"
+        );
         tool.unrestricted = false;
         assert!(tool.search(&missing, &token).is_err());
         assert_eq!(js_number(9007199254740993_u64 as f64), "9007199254740992");
@@ -7422,21 +7432,20 @@ mod tests {
             shell: ShellConfig::default(),
             kind: Kind::Find,
         };
-        for limit in [1, 2] {
-            let output = tool
+        for (limit, expected) in [
+            (
+                1,
+                "foo\n\n[1 results limit reached. Use limit=2 for more, or refine pattern]",
+            ),
+            (2, "foo\nbar"),
+        ] {
+            let outcome = tool
                 .search(
                     &json!({"pattern":"*","limit":limit}),
                     &pi_rs::CancellationToken::new(),
                 )
-                .unwrap()
-                .tool_content();
-            assert_eq!(
-                output,
-                format!(
-                    "foo\nbar\n\n[{limit} results limit reached. Use limit={} for more, or refine pattern]",
-                    limit * 2
-                )
-            );
+                .unwrap();
+            assert_eq!(outcome.tool_content(), expected);
         }
     }
 
@@ -7524,6 +7533,52 @@ mod tests {
                 &pi_rs::CancellationToken::new()
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn unrestricted_find_anchors_relative_globs_at_search_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for path in ["src/a.ts", "pkg/src/b.ts", "CaseDir/mixed.ts"] {
+            let target = root.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, "").unwrap();
+        }
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root,
+            kind: Kind::Find,
+        };
+        let token = pi_rs::CancellationToken::new();
+        for (pattern, expected) in [
+            ("src/*.ts", "src/a.ts"),
+            ("./src/*.ts", "src/a.ts"),
+            ("././src/*.ts", "src/a.ts"),
+            ("**/src/*.ts", "pkg/src/b.ts\nsrc/a.ts"),
+            ("casedir/*.ts", "CaseDir/mixed.ts"),
+        ] {
+            assert_eq!(
+                tool.search(&json!({"pattern": pattern}), &token)
+                    .unwrap()
+                    .tool_content(),
+                expected,
+                "{pattern}"
+            );
+        }
+        assert_eq!(
+            tool.search(&json!({"pattern":"src/*.ts", "path":"pkg"}), &token)
+                .unwrap()
+                .tool_content(),
+            "src/b.ts"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            tool.search(&json!({"pattern":r"src\*.ts"}), &token)
+                .unwrap()
+                .tool_content(),
+            "src/a.ts"
         );
     }
 

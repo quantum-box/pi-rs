@@ -915,6 +915,11 @@ pub fn validate_prepared_tool_dispatch<'a>(
 
 #[async_trait::async_trait]
 pub trait Model: Send + Sync {
+    /// Whether the effective route can represent system instructions in conversation order.
+    fn supports_mid_conversation_system_messages(&self, _model: &str) -> bool {
+        false
+    }
+
     /// Resolve a request-specific adapter once for estimation and dispatch.
     async fn prepare_context<'a>(
         &'a self,

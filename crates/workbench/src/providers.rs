@@ -1607,7 +1607,15 @@ impl Client {
                 } else {
                     client
                 };
+                let (system_default, system_models) = args
+                    .model_profiles
+                    .responses_mid_conversation_system_policy(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
+                    );
                 let client = client
+                    .with_mid_conversation_system_policy(system_default, system_models)
                     .with_configuration_update_models(args.model_profiles.responses_effort_models(
                         &args.provider,
                         &args.model,
@@ -1790,6 +1798,18 @@ pub(super) async fn stream_with_declarations(
 
 #[async_trait::async_trait]
 impl Model for Client {
+    fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
+        match self {
+            Self::Ollama(client) => client.supports_mid_conversation_system_messages(model),
+            Self::OpenAi(client) => client.supports_mid_conversation_system_messages(model),
+            Self::Anthropic(client) => client.supports_mid_conversation_system_messages(model),
+            Self::Deferred(client) => client
+                .estimation_client()
+                .is_some_and(|client| client.supports_mid_conversation_system_messages(model)),
+            _ => false,
+        }
+    }
+
     fn minimum_output_tokens(&self) -> u32 {
         match self {
             Self::OpenAi(client) => client.minimum_output_tokens(),
