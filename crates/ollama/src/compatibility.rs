@@ -1,5 +1,5 @@
 //! Wire differences for explicitly configured chat-completions providers.
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Value, json};
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -20,6 +20,7 @@ pub struct ChatCompatibility {
     max_tokens_field: Option<MaxTokensField>,
     thinking_format: Option<ThinkingFormat>,
     chat_template_args: Option<serde_json::Map<String, Value>>,
+    #[serde(deserialize_with = "deserialize_chat_template_kwargs")]
     chat_template_kwargs: Option<serde_json::Map<String, Value>>,
     open_router_routing: Option<serde_json::Map<String, Value>>,
     vercel_gateway_routing: Option<VercelGatewayRouting>,
@@ -27,6 +28,33 @@ pub struct ChatCompatibility {
     vllm_priority: Option<serde_json::Number>,
     supports_thinking_token_budget: Option<bool>,
     thinking_token_budget_field: Option<ThinkingBudgetField>,
+}
+
+fn deserialize_chat_template_kwargs<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Map<String, Value>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+    for (key, value) in &values {
+        let valid = match value {
+            Value::Array(_) => false,
+            Value::Object(spec) => {
+                matches!(
+                    spec.get("$var").and_then(Value::as_str),
+                    Some("thinking.enabled" | "thinking.effort" | "thinking.budget")
+                ) && spec.get("omitWhenOff").is_none_or(Value::is_boolean)
+            }
+            _ => true,
+        };
+        if !valid {
+            return Err(de::Error::custom(format!(
+                "chatTemplateKwargs.{key} must be a scalar, null, or a supported thinking variable"
+            )));
+        }
+    }
+    Ok(Some(values))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -107,6 +135,22 @@ mod tests {
             body["providerOptions"],
             json!({"gateway":{"order":["first"],"only":[]}})
         );
+    }
+
+    #[test]
+    fn chat_template_kwargs_validate_upstream_value_types() {
+        for unsupported in [
+            json!({"nested": true}),
+            json!(["array"]),
+            json!({"$var": "unknown"}),
+            json!({"$var": "thinking.budget", "omitWhenOff": "true"}),
+        ] {
+            let error = serde_json::from_value::<ChatCompatibility>(
+                json!({"chatTemplateKwargs": {"setting": unsupported}}),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("chatTemplateKwargs.setting"));
+        }
     }
 
     #[test]
