@@ -2691,8 +2691,9 @@ The tree centers the selected row when possible. It shows up to half the
 terminal height, with a five-row minimum when space allows, and uses the
 visible row capacity for page movement.
 Searching includes records inside folded branches. Shift+L edits or removes a
-record label and returns to the current search, filter, and label-time setting. Direct `/checkout` releases its
-journal lock before restoring the view.
+record label and returns to the current search, filter, and label-time setting.
+Label edits made during a response are saved by the active session worker.
+Direct `/checkout` releases its journal lock before restoring the view.
 After tree navigation, the selected user message fills an empty editor. A draft
 already in the editor keeps its text and any native image attachments. While
 a response streams, `/tree` and its shortcut read the committed journal without
