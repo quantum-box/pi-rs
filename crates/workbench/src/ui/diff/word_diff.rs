@@ -1,31 +1,16 @@
 //! Word diff compatible with jsdiff 8.0.4's default diffWords behavior.
 //! Keep this bounded: an unfinished comparison falls back to line-level color.
 //! Derived from jsdiff by Kevin Decker and contributors; see JSDIFF-LICENSE.txt.
-use std::{collections::HashMap, rc::Rc, time::Instant};
+use std::time::Instant;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Tag {
-    Equal,
-    Delete,
-    Insert,
-}
+use pi_rs_workbench::diff_sequence;
+pub(super) use pi_rs_workbench::diff_sequence::Tag;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Change {
     pub tag: Tag,
     pub text: String,
 }
-#[derive(Clone)]
-struct Component {
-    tag: Tag,
-    count: usize,
-    prev: Option<Rc<Component>>,
-}
-#[derive(Clone)]
-struct Path {
-    old: isize,
-    last: Option<Rc<Component>>,
-}
-
 // ECMAScript WhiteSpace and LineTerminator, used by jsdiff's /\s/ and trim.
 pub(super) fn ws(c: char) -> bool {
     matches!(c, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
@@ -88,41 +73,6 @@ fn tokenize(s: &str, deadline: Instant) -> Option<Vec<String>> {
     }
     Some(tokens)
 }
-fn add(path: &Path, tag: Tag, count: usize, old_inc: isize) -> Path {
-    let (count, prev) = match &path.last {
-        Some(last) if last.tag == tag => (count + last.count, last.prev.clone()),
-        _ => (count, path.last.clone()),
-    };
-    Path {
-        old: path.old + old_inc,
-        last: Some(Rc::new(Component { tag, count, prev })),
-    }
-}
-fn common(
-    path: &mut Path,
-    diagonal: isize,
-    old: &[String],
-    new: &[String],
-    deadline: Instant,
-) -> Option<isize> {
-    let mut n = path.old - diagonal;
-    let mut count = 0;
-    while (path.old + 1) < old.len() as isize
-        && n + 1 < new.len() as isize
-        && old[(path.old + 1) as usize].trim_matches(ws) == new[(n + 1) as usize].trim_matches(ws)
-    {
-        if Instant::now() >= deadline {
-            return None;
-        }
-        path.old += 1;
-        n += 1;
-        count += 1;
-    }
-    if count > 0 {
-        *path = add(path, Tag::Equal, count, 0);
-    }
-    Some(n)
-}
 fn joined(tokens: &[String]) -> String {
     let mut out = String::new();
     for (i, t) in tokens.iter().enumerate() {
@@ -130,14 +80,7 @@ fn joined(tokens: &[String]) -> String {
     }
     out
 }
-fn make_changes(path: Path, old: &[String], new: &[String]) -> Vec<Change> {
-    let mut comps = Vec::new();
-    let mut node = path.last;
-    while let Some(c) = node {
-        comps.push((c.tag, c.count));
-        node = c.prev.clone();
-    }
-    comps.reverse();
+fn make_changes(comps: Vec<(Tag, usize)>, old: &[String], new: &[String]) -> Vec<Change> {
     let (mut o, mut n) = (0, 0);
     let mut result = Vec::new();
     for (tag, count) in comps {
@@ -307,63 +250,16 @@ pub(super) fn diff(old_text: &str, new_text: &str, deadline: Instant) -> Option<
     }
     let old = tokenize(old_text, deadline)?;
     let new = tokenize(new_text, deadline)?;
-    let mut best: HashMap<isize, Path> = HashMap::new();
-    let mut initial = Path {
-        old: -1,
-        last: None,
-    };
-    let n = common(&mut initial, 0, &old, &new, deadline)?;
-    if initial.old + 1 >= old.len() as isize && n + 1 >= new.len() as isize {
-        return Some(make_changes(initial, &old, &new));
-    }
-    best.insert(0, initial);
-    let (mut min, mut max) = (isize::MIN, isize::MAX);
-    for length in 1..=old.len() + new.len() {
-        let length = length as isize;
-        let mut diagonal = (-length).max(min);
-        let end = length.min(max);
-        while diagonal <= end {
-            if Instant::now() >= deadline {
-                return None;
-            }
-            let remove = best.remove(&(diagonal - 1));
-            let add_path = best.get(&(diagonal + 1)).cloned();
-            let can_add = add_path.as_ref().is_some_and(|p| {
-                let pos = p.old - diagonal;
-                pos >= 0 && pos < new.len() as isize
-            });
-            let can_remove = remove
-                .as_ref()
-                .is_some_and(|p| p.old + 1 < old.len() as isize);
-            if !can_add && !can_remove {
-                best.remove(&diagonal);
-                diagonal += 2;
-                continue;
-            }
-            let mut path = if !can_remove
-                || (can_add && remove.as_ref().unwrap().old < add_path.as_ref().unwrap().old)
-            {
-                add(add_path.as_ref().unwrap(), Tag::Insert, 1, 0)
-            } else {
-                add(remove.as_ref().unwrap(), Tag::Delete, 1, 1)
-            };
-            let n = common(&mut path, diagonal, &old, &new, deadline)?;
-            if path.old + 1 >= old.len() as isize && n + 1 >= new.len() as isize {
-                let mut result = make_changes(path, &old, &new);
-                clean(&mut result);
-                return Some(result);
-            }
-            if path.old + 1 >= old.len() as isize {
-                max = max.min(diagonal - 1);
-            }
-            if n + 1 >= new.len() as isize {
-                min = min.max(diagonal + 1);
-            }
-            best.insert(diagonal, path);
-            diagonal += 2;
-        }
-    }
-    None
+    let components = diff_sequence::align(
+        &old,
+        &new,
+        |old, new| old.trim_matches(ws) == new.trim_matches(ws),
+        usize::MAX,
+        || Instant::now() < deadline,
+    )?;
+    let mut result = make_changes(components, &old, &new);
+    clean(&mut result);
+    Some(result)
 }
 
 #[cfg(test)]

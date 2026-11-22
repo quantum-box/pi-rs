@@ -101,6 +101,12 @@ pub enum AgentInput {
         name: String,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
+    /// Persist a bookmark through the session owner during an active run.
+    SetSessionLabel {
+        target: u64,
+        label: Option<String>,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
 }
 impl<T: Into<QueuedMessage>> From<T> for AgentInput {
     fn from(message: T) -> Self {
@@ -517,6 +523,9 @@ pub struct ModelMetadata {
     pub cost_breakdown: Option<UsageCostBreakdown>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_from_provider: Option<bool>,
+    /// Service tier multiplier applied to catalog estimates for this reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_cost_multiplier: Option<serde_json::Number>,
     pub provider_request_id: Option<String>,
     pub cached_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -640,6 +649,33 @@ pub struct ProviderReplay {
 }
 
 impl ProviderReplay {
+    /// Preserve the recorded Anthropic effort without placing private data on the wire.
+    pub fn record_anthropic_effort(&mut self, effort: &str) {
+        if let Some(effort) = Self::valid_anthropic_effort(effort) {
+            self.blocks
+                .retain(|block| block.get("_pi_anthropic_effort").is_none());
+            self.blocks
+                .push(serde_json::json!({"_pi_anthropic_effort":effort}));
+        }
+    }
+
+    pub fn anthropic_effort(&self) -> Option<&'static str> {
+        self.blocks.iter().find_map(|block| {
+            Self::valid_anthropic_effort(block.get("_pi_anthropic_effort")?.as_str()?)
+        })
+    }
+
+    pub fn valid_anthropic_effort(effort: &str) -> Option<&'static str> {
+        match effort {
+            "low" => Some("low"),
+            "medium" => Some("medium"),
+            "high" => Some("high"),
+            "xhigh" => Some("xhigh"),
+            "max" => Some("max"),
+            _ => None,
+        }
+    }
+
     pub fn is_context_edit(&self) -> bool {
         self.blocks
             .iter()

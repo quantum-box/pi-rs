@@ -206,6 +206,7 @@ struct ModelCompatibility {
     allow_empty_signature: Option<bool>,
     supports_strict_tools: Option<bool>,
     supports_max_output_tokens: Option<bool>,
+    supports_mid_convo_effort: Option<bool>,
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
     session_affinity_format: Option<AffinityFormat>,
@@ -226,6 +227,9 @@ impl ModelCompatibility {
             supports_max_output_tokens: newer
                 .supports_max_output_tokens
                 .or(self.supports_max_output_tokens),
+            supports_mid_convo_effort: newer
+                .supports_mid_convo_effort
+                .or(self.supports_mid_convo_effort),
             force_adaptive_thinking: newer
                 .force_adaptive_thinking
                 .or(self.force_adaptive_thinking),
@@ -368,13 +372,22 @@ impl ChatPrice {
             .cache_write_1h_tokens
             .unwrap_or_default()
             .min(writes);
+        let multiplier = metadata
+            .catalog_cost_multiplier
+            .as_ref()
+            .and_then(serde_json::Number::as_f64)
+            .filter(|multiplier| multiplier.is_finite() && *multiplier > 0.0)
+            .unwrap_or(1.0);
         let input_rate = rates.input.unwrap_or_default();
         pi_rs::UsageCostBreakdown::new(
-            (input_rate / 1_000_000.0) * (other_input - writes) as f64,
-            (rates.output.unwrap_or_default() / 1_000_000.0) * usage.output_tokens as f64,
-            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64,
-            (rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
-                + (input_rate / 500_000.0) * long as f64,
+            (input_rate / 1_000_000.0) * (other_input - writes) as f64 * multiplier,
+            (rates.output.unwrap_or_default() / 1_000_000.0)
+                * usage.output_tokens as f64
+                * multiplier,
+            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64 * multiplier,
+            ((rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
+                + (input_rate / 500_000.0) * long as f64)
+                * multiplier,
         )
     }
 }
@@ -1351,6 +1364,28 @@ impl Profiles {
         })
     }
 
+    pub fn anthropic_managed_effort_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> BTreeMap<String, bool> {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+            self.cache_compatibility(provider, metadata)
+                .supports_mid_convo_effort
+                .unwrap_or(false)
+        })
+        .into_iter()
+        .filter(|(_, supported)| *supported)
+        .map(|(id, _)| {
+            let can_disable = self
+                .model(provider, &id)
+                .is_none_or(|metadata| metadata.mapped_effort("off") != Some(None));
+            (id, can_disable)
+        })
+        .collect()
+    }
+
     fn anthropic_route_models(
         &self,
         provider: &Provider,
@@ -1837,6 +1872,35 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn service_tier_scales_all_catalog_cost_components() {
+        let price: ChatPrice = serde_json::from_value(json!({
+            "input":10, "output":20, "cacheRead":2, "cacheWrite":4
+        }))
+        .unwrap();
+        let usage = pi_rs::Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+        };
+        for (tier, multiplier) in [(None, 1.0), (Some(0.5), 0.5), (Some(2.5), 2.5)] {
+            let metadata = pi_rs::ModelMetadata {
+                cached_input_tokens: Some(200_000),
+                cache_creation_input_tokens: Some(300_000),
+                catalog_cost_multiplier: tier.and_then(serde_json::Number::from_f64),
+                ..Default::default()
+            };
+            let cost = price.estimate(usage, &metadata).unwrap();
+            for (actual, base) in [
+                (cost.input, 5.0),
+                (cost.output, 2.0),
+                (cost.cache_read, 0.4),
+                (cost.cache_write, 1.2),
+            ] {
+                assert!((actual.as_f64().unwrap() - base * multiplier).abs() < 1e-10);
+            }
+        }
+    }
+
+    #[test]
     fn cloudflare_worker_chats_and_classifiers_keep_saved_account_scope() {
         let keys = super::super::model_auth::Keys::parse(&json!({
             "cloudflare-workers-ai":{
@@ -1852,8 +1916,23 @@ mod tests {
             endpoint,
             "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
         );
-        assert_eq!(profiles.model_ids(&provider).len(), 19);
+        assert_eq!(profiles.model_ids(&provider).len(), 20);
         assert_eq!(profiles.model_ids(&provider)[0], "@cf/moonshotai/kimi-k2.6");
+        let inkling = "@cf/thinkingmachines/inkling-2-small";
+        assert!(
+            profiles
+                .model_ids(&provider)
+                .iter()
+                .any(|model| model == inkling)
+        );
+        assert_eq!(
+            profiles.model_adapter(&provider, inkling),
+            Adapter::ChatCompletions
+        );
+        let model = profiles.model(&provider, inkling).unwrap();
+        assert_eq!(model.context_window, Some(1_048_576));
+        assert_eq!(model.max_tokens, Some(1_048_576));
+        assert_eq!(model.supports_images(), Some(true));
         assert_eq!(
             keys.custom_credential(&provider, endpoint, &profiles)
                 .and_then(|key| key.literal()),
@@ -1905,7 +1984,7 @@ mod tests {
             "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
         );
         assert!(profiles.credential(&provider, endpoint).is_none());
-        assert_eq!(profiles.model_ids(&provider).len(), 19);
+        assert_eq!(profiles.model_ids(&provider).len(), 20);
     }
 
     #[test]
@@ -2069,6 +2148,39 @@ mod tests {
                 "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
             );
         }
+    }
+
+    #[test]
+    fn anthropic_managed_effort_uses_catalog_and_effective_model_route() {
+        let profiles = Profiles::default();
+        let native =
+            profiles.anthropic_managed_effort_models(&Provider::Anthropic, "claude-opus-5", None);
+        assert_eq!(native.len(), 5);
+        assert_eq!(native.get("claude-opus-5"), Some(&true));
+        assert_eq!(native.get("claude-opus-5-5"), Some(&false));
+        assert!(!native.contains_key("claude-opus-4-8"));
+        let openrouter = Provider::named("openrouter").unwrap();
+        let gateway = profiles.anthropic_managed_effort_models(
+            &openrouter,
+            "anthropic/claude-opus-5.5",
+            None,
+        );
+        assert_eq!(gateway.len(), 4);
+        let profiles = Profiles::parse(&json!({"providers":{"custom":{
+            "api":"anthropic-messages","baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMidConvoEffort":true},
+            "models":[
+                {"id":"selected","compat":{"supportsMidConvoEffort":false}},
+                {"id":"rewritten"},
+                {"id":"other-route","baseUrl":"http://localhost:2/v1"}
+            ]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("custom").unwrap();
+        assert_eq!(
+            profiles.anthropic_managed_effort_models(&provider, "selected", None),
+            BTreeMap::from([("rewritten".into(), true)])
+        );
     }
 
     #[test]
