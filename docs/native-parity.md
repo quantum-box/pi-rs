@@ -5153,8 +5153,10 @@ with prompt-cache retention disabled. With no session key, the cooldown
 applies to the route. An interrupted response returns its error without
 issuing another inference request for that attempt. A server that loses the previous response
 ID receives the full transcript on retry.
-The client checks an idle connection with a WebSocket ping before sending the
-next request and replaces the connection if the check fails.
+Explicit `session-id` and `x-client-request-id` headers take precedence in
+native WebSocket handshakes. These values also scope connection reuse and SSE
+cooldown. The client checks an idle connection with a WebSocket ping before
+sending the next request and replaces the connection if the check fails.
 As in Pi v1.6.0, a socket can be reused for up to 45 minutes after connecting,
 with a five-minute idle timeout. An ongoing response can finish on its
 existing connection.

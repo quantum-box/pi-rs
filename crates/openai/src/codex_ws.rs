@@ -228,14 +228,18 @@ impl Handshake {
             "sec-websocket-version",
             "sec-websocket-protocol",
             "sec-websocket-extensions",
-            "session-id",
-            "x-client-request-id",
         ] {
             headers.remove(name);
         }
         headers
             .entry("originator")
             .or_insert(HeaderValue::from_static("pi"));
+        for name in ["session-id", "x-client-request-id"] {
+            if !headers.contains_key(name) {
+                let session = HeaderValue::from_str(&self.session).map_err(|_| unavailable())?;
+                headers.insert(name, session);
+            }
+        }
         let response = self
             .client
             .get(self.endpoint.clone())
@@ -244,8 +248,6 @@ impl Handshake {
             .bearer_auth(&self.token)
             .header("chatgpt-account-id", &self.account)
             .header("openai-beta", "responses_websockets=2026-02-06")
-            .header("session-id", &self.session)
-            .header("x-client-request-id", &self.session)
             .header(header::CONNECTION, "Upgrade")
             .header(header::UPGRADE, "websocket")
             .header("sec-websocket-version", "13")
@@ -366,7 +368,6 @@ pub(super) async fn open(
         let mut headers: Vec<_> = options
             .headers
             .iter()
-            .filter(|(name, _)| *name != "x-client-request-id" && *name != "session-id")
             .map(|(name, value)| (name.as_str(), value.as_bytes()))
             .collect();
         headers.sort_unstable();
@@ -1050,12 +1051,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_websocket_without_affinity_opens_fresh_connections() {
+    async fn codex_websocket_opens_fresh_connections_without_matching_affinity() {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
-        for (cache, has_session) in [
-            (pi_rs_core::CacheRetention::None, true),
-            (pi_rs_core::CacheRetention::Short, false),
+        for (cache, has_session, explicit_routing) in [
+            (pi_rs_core::CacheRetention::None, true, false),
+            (pi_rs_core::CacheRetention::Short, false, false),
+            (pi_rs_core::CacheRetention::Short, true, true),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -1086,7 +1088,29 @@ mod tests {
                         tcp,
                         |request: &Request, response: Response| {
                             let sent = request.headers()["session-id"].to_str().unwrap();
-                            assert!(uuid::Uuid::parse_str(sent).is_ok());
+                            let request_id = &request.headers()["x-client-request-id"];
+                            if explicit_routing {
+                                assert_eq!(sent, format!("route-{expected}"));
+                                assert_eq!(
+                                    request_id.to_str().unwrap(),
+                                    format!("request-{expected}")
+                                );
+                                assert_eq!(
+                                    request.headers().get_all("session-id").iter().count(),
+                                    1
+                                );
+                                assert_eq!(
+                                    request
+                                        .headers()
+                                        .get_all("x-client-request-id")
+                                        .iter()
+                                        .count(),
+                                    1
+                                );
+                            } else {
+                                assert!(uuid::Uuid::parse_str(sent).is_ok());
+                                assert_eq!(request_id, sent);
+                            }
                             assert_ne!(sent, previous);
                             previous = sent.to_owned();
                             Ok(response)
@@ -1120,7 +1144,17 @@ mod tests {
             };
             tokio::time::timeout(Duration::from_secs(5), async {
                 for text in ["first", "second"] {
-                    let events = model
+                    let mut client = model.clone();
+                    if explicit_routing {
+                        let mut headers = HeaderMap::new();
+                        headers.insert("session-id", format!("route-{text}").parse().unwrap());
+                        headers.insert(
+                            "x-client-request-id",
+                            format!("request-{text}").parse().unwrap(),
+                        );
+                        client = client.with_headers(headers);
+                    }
+                    let events = client
                         .stream(request(vec![prompt(text)]))
                         .await
                         .unwrap()
