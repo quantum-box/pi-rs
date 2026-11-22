@@ -1,8 +1,11 @@
 use aws_smithy_eventstream::frame::write_message_to;
 use aws_smithy_types::event_stream::{Header, HeaderValue, Message as Frame};
 use futures_util::StreamExt;
-use pi_rs_bedrock::{Bedrock, ThinkingBudgets, ThinkingDisplay};
-use pi_rs_core::{CacheRetention, Message, Model, ModelEvent, ModelRequest, ToolSpec};
+use pi_rs_bedrock::{Bedrock, ThinkingBudgets, ThinkingDisplay, ToolChoice};
+use pi_rs_core::{
+    CacheRetention, EffectiveToolSampling, EnrichedModelEvent, Message, Model, ModelEvent,
+    ModelRequest, StrictToolPolicy, ToolConstraint, ToolDeclaration, ToolDispatchContext, ToolSpec,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
@@ -30,6 +33,19 @@ async fn capture<F>(
     setup: F,
     request: ModelRequest,
     summary: bool,
+) -> (Value, Vec<ModelEvent>)
+where
+    F: FnOnce(Bedrock) -> Bedrock,
+{
+    capture_request(region, setup, request, summary, None).await
+}
+
+async fn capture_request<F>(
+    region: &str,
+    setup: F,
+    request: ModelRequest,
+    summary: bool,
+    declaration: Option<ToolDeclaration>,
 ) -> (Value, Vec<ModelEvent>)
 where
     F: FnOnce(Bedrock) -> Bedrock,
@@ -83,6 +99,20 @@ where
         .await
         .unwrap()
         .unwrap();
+    if let Some(declaration) = declaration {
+        let context = dispatch_context(summary);
+        let prepared = model
+            .prepare_bound_tool_dispatch(&request, &[declaration], &context)
+            .unwrap();
+        let mut stream = prepared.dispatch().await.unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let EnrichedModelEvent::Legacy(event) = event.unwrap().event {
+                events.push(event);
+            }
+        }
+        return (server.await.unwrap(), events);
+    }
     let stream = if summary {
         model
             .stream_for_summary(Uuid::nil(), Uuid::nil(), request)
@@ -117,6 +147,56 @@ fn request(model: &str, max: u32) -> ModelRequest {
             },
         ],
     }
+}
+
+#[tokio::test]
+async fn temperature_and_request_metadata_match_pi_payloads() {
+    let (default, _) = capture("us-east-1", |model| model, request("fixture", 128), false).await;
+    assert_eq!(default["inferenceConfig"], json!({"maxTokens": 128}));
+    assert!(default.get("requestMetadata").is_none());
+
+    let (configured, _) = capture(
+        "us-east-1",
+        |model| {
+            model.with_temperature(0.0).unwrap().with_request_metadata(
+                [
+                    ("team".into(), "fixture".into()),
+                    ("run".into(), "42".into()),
+                ]
+                .into(),
+            )
+        },
+        request("fixture", 128),
+        false,
+    )
+    .await;
+    assert_eq!(
+        configured["inferenceConfig"],
+        json!({"maxTokens": 128, "temperature": 0.0})
+    );
+    assert_eq!(
+        configured["requestMetadata"],
+        json!({"team": "fixture", "run": "42"})
+    );
+    assert!(configured.get("additionalModelRequestFields").is_none());
+
+    let (empty_tags, _) = capture(
+        "us-east-1",
+        |model| {
+            model
+                .with_temperature(1.0)
+                .unwrap()
+                .with_request_metadata(Default::default())
+        },
+        request("fixture", 128),
+        true,
+    )
+    .await;
+    assert_eq!(
+        empty_tags["inferenceConfig"],
+        json!({"maxTokens": 128, "temperature": 1.0})
+    );
+    assert_eq!(empty_tags["requestMetadata"], json!({}));
 }
 
 #[tokio::test]
@@ -686,4 +766,245 @@ async fn checkpoints_skip_blank_system_and_assistant_tail() {
     assert_eq!(body["messages"][1]["role"], "assistant");
     assert_eq!(body["messages"][1]["content"], json!([{"text":"answer"}]));
     assert_eq!(body["messages"][0]["content"], json!([{"text":"hi"}]));
+}
+
+#[tokio::test]
+async fn tool_choice_matches_pi_converse_stream_payload() {
+    for (choice, wire) in [
+        (None, None),
+        (Some(ToolChoice::Auto), Some(json!({"auto":{}}))),
+        (Some(ToolChoice::Any), Some(json!({"any":{}}))),
+        (
+            Some(ToolChoice::Tool {
+                name: "lookup".into(),
+            }),
+            Some(json!({"tool":{"name":"lookup"}})),
+        ),
+        (Some(ToolChoice::None), None),
+    ] {
+        let disabled = choice == Some(ToolChoice::None);
+        let (body, _) = capture(
+            "us-east-1",
+            |client| match choice {
+                Some(choice) => client.with_tool_choice(choice),
+                None => client,
+            },
+            request("test-model", 128),
+            false,
+        )
+        .await;
+        assert_eq!(body.get("toolConfig").is_none(), disabled);
+        assert_eq!(body["toolConfig"].get("toolChoice"), wire.as_ref());
+        if !disabled {
+            assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "lookup");
+        }
+    }
+
+    let mut tool_free = request("test-model", 128);
+    tool_free.tools.clear();
+    let (body, _) = capture(
+        "us-east-1",
+        |client| client.with_tool_choice(ToolChoice::Any),
+        tool_free,
+        false,
+    )
+    .await;
+    assert!(body.get("toolConfig").is_none());
+}
+
+#[tokio::test]
+async fn disabled_tool_choice_keeps_tool_history_as_text() {
+    let mut request = request("anthropic.claude-sonnet-5-5", 4096);
+    request.messages.extend([
+        Message::Assistant {
+            content: String::new(),
+            calls: vec![pi_rs_core::ToolCall {
+                id: "call".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            }],
+            replay: None,
+        },
+        Message::Tool {
+            call_id: "call".into(),
+            content: "found".into(),
+            is_error: false,
+            is_structured: Some(false),
+        },
+    ]);
+    let (body, _) = capture(
+        "us-east-1",
+        |client| {
+            client
+                .with_tool_choice(ToolChoice::None)
+                .with_reasoning(Some("off"), None)
+                .unwrap()
+        },
+        request.clone(),
+        false,
+    )
+    .await;
+    assert!(body.get("toolConfig").is_none());
+    assert_eq!(
+        body["additionalModelRequestFields"]["thinking"]["type"],
+        "between_tools"
+    );
+    assert!(
+        body["messages"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Historical tool call")
+    );
+    assert!(
+        body["messages"][2]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Historical tool result")
+    );
+
+    let client = Bedrock::from_env();
+    let estimate = client
+        .clone()
+        .with_tool_choice(ToolChoice::None)
+        .estimate_request_tokens(&request);
+    request.tools.clear();
+    assert_eq!(estimate, client.estimate_request_tokens(&request));
+}
+
+#[tokio::test]
+async fn bedrock_rejects_forced_tool_choice_with_budgeted_claude_thinking() {
+    let config = aws_sdk_bedrockruntime::Config::builder()
+        .behavior_version_latest()
+        .region(aws_types::region::Region::new("us-east-1"))
+        .build();
+    let client = Bedrock::new(aws_sdk_bedrockruntime::Client::from_conf(config))
+        .with_reasoning(Some("low"), None)
+        .unwrap();
+    for choice in [
+        ToolChoice::Any,
+        ToolChoice::Tool {
+            name: "lookup".into(),
+        },
+    ] {
+        let result = client
+            .clone()
+            .with_tool_choice(choice)
+            .stream(request("anthropic.claude-sonnet-4-5", 4096))
+            .await;
+        assert!(
+            matches!(result, Err(pi_rs_core::Error::Config(message)) if message.contains("extended thinking"))
+        );
+    }
+}
+
+fn dispatch_context(summary: bool) -> ToolDispatchContext {
+    ToolDispatchContext {
+        request_id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        external_id: "fixture".into(),
+        summary,
+    }
+}
+
+fn constrained_request(policy: StrictToolPolicy) -> (ModelRequest, ToolDeclaration) {
+    let mut request = request("test-model", 128);
+    request.tools[0].parameters = json!({
+        "type":"object", "properties":{"path":{"type":"string"},"limit":{"type":"integer"}},
+        "required":["path"]
+    });
+    let declaration = ToolDeclaration {
+        spec: request.tools[0].clone(),
+        constrained_sampling: Some(ToolConstraint::JsonSchema { strict: policy }),
+    };
+    (request, declaration)
+}
+
+#[tokio::test]
+async fn prepared_bedrock_tools_bind_wire_schema_and_preferred_fallback() {
+    for (supported, summary) in [(true, false), (true, true), (false, false)] {
+        let (request, declaration) = constrained_request(StrictToolPolicy::Prefer);
+        let client = Bedrock::from_env().with_strict_tool_support(supported);
+        let prepared = client
+            .prepare_bound_tool_dispatch(
+                &request,
+                std::slice::from_ref(&declaration),
+                &dispatch_context(summary),
+            )
+            .unwrap();
+        assert_eq!(
+            matches!(
+                prepared.effective_tools()[0].sampling,
+                EffectiveToolSampling::StrictJsonSchema { .. }
+            ),
+            supported,
+        );
+        let reservation = prepared.reservation_request().tools[0].parameters.clone();
+        if supported {
+            let mut required: Vec<_> = reservation["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|name| name.as_str().unwrap())
+                .collect();
+            required.sort_unstable();
+            assert_eq!(required, ["limit", "path"]);
+            assert_eq!(
+                reservation["properties"]["limit"]["anyOf"][1],
+                json!({"type":"null"})
+            );
+            assert_eq!(reservation["additionalProperties"], false);
+        } else {
+            assert_eq!(reservation, request.tools[0].parameters);
+        }
+
+        let (body, _) = capture_request(
+            "us-east-1",
+            |client| client.with_strict_tool_support(supported),
+            request,
+            summary,
+            Some(declaration),
+        )
+        .await;
+        let tool = &body["toolConfig"]["tools"][0]["toolSpec"];
+        assert_eq!(tool["inputSchema"]["json"], reservation);
+        assert_eq!(tool.get("strict"), supported.then_some(&Value::Bool(true)));
+    }
+}
+
+#[test]
+fn required_bedrock_constraint_fails_if_unsupported_or_tools_are_disabled() {
+    let (request, declaration) = constrained_request(StrictToolPolicy::Require);
+    let unsupported = Bedrock::from_env();
+    let disabled = unsupported
+        .clone()
+        .with_strict_tool_support(true)
+        .with_tool_choice(ToolChoice::None);
+    for client in [unsupported, disabled] {
+        let result = client.prepare_bound_tool_dispatch(
+            &request,
+            std::slice::from_ref(&declaration),
+            &dispatch_context(false),
+        );
+        assert!(
+            matches!(result, Err(pi_rs_core::Error::Config(message)) if message.contains("strict"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn bedrock_declaration_stream_requires_preparation_for_strict_tools() {
+    let (request, declaration) = constrained_request(StrictToolPolicy::Prefer);
+    let client = Bedrock::from_env().with_strict_tool_support(true);
+    let result = client
+        .stream_detailed_with_tool_declarations(
+            Uuid::nil(),
+            Uuid::nil(),
+            "fixture",
+            request,
+            &[declaration],
+        )
+        .await;
+    assert!(
+        matches!(result, Err(pi_rs_core::Error::Config(message)) if message.contains("requires prepared dispatch"))
+    );
 }
