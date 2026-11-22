@@ -4,7 +4,7 @@ use pi_rs::{
     Agent, CancellationToken, Extension, ExtensionUi, Limits, ProjectResources, Registry, Result,
     Session, UiRequest, UiResponse,
 };
-use pi_rs_workbench::coding::{CodingTools, LiveReadImagePolicy, ShellConfig, ShellContext};
+use pi_rs_workbench::coding::{CodingTools, ReadImageModel, ShellConfig, ShellContext};
 use pi_rs_workbench::{CommandPolicy, ProjectInstructions, Tools, WorkbenchContext};
 use serde_json::json;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ pub struct Runtime {
     pub registry: Registry,
     pub extension_sources: std::collections::BTreeMap<String, std::path::PathBuf>,
     shell: ShellConfig,
-    read_image_policy: Arc<LiveReadImagePolicy>,
+    read_image_model: ReadImageModel,
     system_prompt: String,
     pub resources: resources::Resources,
     resource_origins: ResourceOrigins,
@@ -374,7 +374,7 @@ impl Runtime {
     }
     pub(super) fn refresh_read_image_policy(&self, args: &Cli) {
         set_read_image_policy(
-            &self.read_image_policy,
+            &self.read_image_model,
             &args.model_profiles,
             &args.provider,
             &args.model,
@@ -387,7 +387,7 @@ impl Runtime {
         session: &Session,
     ) -> impl FnMut(&pi_rs::Record) + use<'a> {
         let shell = self.shell.clone();
-        let policy = self.read_image_policy.clone();
+        let policy = self.read_image_model.clone();
         let profiles = &args.model_profiles;
         let mut context = shell_session_context(args, session);
         let external_id = session.external_session_id();
@@ -1073,18 +1073,12 @@ async fn configure_after(
             .map(|url| (url, std::env::var("PI_RS_ORDERS_TOKEN").ok()));
         registry.register(Arc::new(Tools::new(&args.workspace, order_config)?))?;
         let shell = shell_config(args);
-        let read_image_policy = Arc::new(LiveReadImagePolicy::default());
-        set_read_image_policy(
-            &read_image_policy,
-            &args.model_profiles,
-            &args.provider,
-            &args.model,
-        );
+        let read_image_model = ReadImageModel::default();
         registry.register(Arc::new(
             CodingTools::local(&args.workspace)?
                 .with_shell_config(shell.clone())
                 .with_image_resize(args.settings.resize_model_images())
-                .with_live_read_image_policy(read_image_policy.clone()),
+                .with_read_image_model(read_image_model.clone()),
         ))?;
         let extra = mcp_config::discover_registered(
             args,
@@ -1123,6 +1117,12 @@ async fn configure_after(
         });
         registry.set_refresher(catalog.clone());
         let provider = model_client(args, super::thinking::reported(args).is_some(), true)?;
+        set_read_image_policy(
+            &read_image_model,
+            &args.model_profiles,
+            &args.provider,
+            &args.model,
+        );
 
         // Subprocesses must inherit the frontend's live controls rather than
         // re-resolving them from project settings when a worker is replaced.
@@ -1149,10 +1149,10 @@ async fn configure_after(
                     .unwrap_or_else(|| args.settings.auto_compaction_enabled()),
             ),
             provider,
+            read_image_model,
             registry,
             extension_sources,
             shell,
-            read_image_policy,
             system_prompt,
             resources: local_resources,
             resource_origins: ResourceOrigins::default(),
@@ -1170,15 +1170,16 @@ async fn configure_after(
 }
 
 fn set_read_image_policy(
-    policy: &LiveReadImagePolicy,
+    policy: &ReadImageModel,
     profiles: &super::model_profiles::Profiles,
     provider: &super::providers::Provider,
     model: &str,
 ) {
-    let model = profiles.model(provider, model);
-    policy.set(
-        model.as_ref().and_then(|model| model.image_resize()),
-        model.as_ref().and_then(|model| model.supports_images()),
+    let profile = profiles.model(provider, model);
+    policy.set_profile(
+        model,
+        profile.as_ref().and_then(|model| model.supports_images()),
+        profile.as_ref().and_then(|model| model.image_resize()),
     );
 }
 

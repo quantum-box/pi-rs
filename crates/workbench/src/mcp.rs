@@ -31,6 +31,7 @@ use uuid::Uuid;
 
 use crate::mcp_provider_auth::ProviderClient;
 pub use crate::mcp_provider_auth::TokenResolver;
+use crate::mcp_resource_compat::ResourceCompatibility;
 use crate::process_cleanup::Children;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -57,8 +58,35 @@ pub struct ServerConfig {
     pub oauth: Option<crate::mcp_auth::OAuthSetting>,
     pub auth: Option<ProviderAuth>,
     #[serde(default)]
-    pub tool_exposure: BTreeMap<String, String>,
+    pub tool_exposure: ToolExposure,
 }
+
+/// Tool exposure overrides in configuration order.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(transparent)]
+pub struct ToolExposure(indexmap::IndexMap<String, String>);
+
+impl std::ops::Deref for ToolExposure {
+    type Target = indexmap::IndexMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ToolExposure {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl PartialEq for ToolExposure {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.iter().eq(other.0.iter())
+    }
+}
+
+impl Eq for ToolExposure {}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct ProviderAuth {
@@ -683,10 +711,10 @@ impl McpExtension {
                         NativeClient::for_server(name, workspace)
                             .await
                             .serve_with_lifecycle(
-                                crate::mcp_log::LoggingTransport::new(
+                                ResourceCompatibility(crate::mcp_log::LoggingTransport::new(
                                     owned_stdio_transport(wrapped, owner)?,
                                     Some(Arc::from(name)),
-                                ),
+                                )),
                                 lifecycle,
                             )
                             .await
@@ -695,10 +723,10 @@ impl McpExtension {
                         NativeClient::for_server(name, workspace)
                             .await
                             .serve_with_lifecycle(
-                                crate::mcp_log::LoggingTransport::new(
+                                ResourceCompatibility(crate::mcp_log::LoggingTransport::new(
                                     TokioChildProcess::new(wrapped)?,
                                     Some(Arc::from(name)),
-                                ),
+                                )),
                                 lifecycle,
                             )
                             .await
@@ -1319,7 +1347,7 @@ async fn start_http_service<C: StreamableHttpClient + Clone>(
         );
         let result = native
             .clone()
-            .serve_with_lifecycle(transport, lifecycle.clone())
+            .serve_with_lifecycle(ResourceCompatibility(transport), lifecycle.clone())
             .await;
         match (result, delay) {
             (Err(error), Some(delay)) if transient_http_initialization(&error) => {
@@ -2815,6 +2843,25 @@ mod tests {
         assert_eq!(tool_exposure(&config, "read_one"), "direct");
         assert!(is_deferred(&config, "read_many"));
         assert!(!tool_enabled(&config, "write"));
+    }
+    #[test]
+    fn tool_exposure_prefers_exact_names_then_the_first_matching_pattern() {
+        let config: ServerConfig = serde_json::from_value(json!({
+            "command":"server",
+            "toolExposure":{"read*":"direct","*":"deferred","read_secret":"hidden"}
+        }))
+        .unwrap();
+        assert_eq!(tool_exposure(&config, "read_secret"), "hidden");
+        assert_eq!(tool_exposure(&config, "read_public"), "direct");
+        assert_eq!(tool_exposure(&config, "write"), "deferred");
+
+        let reordered: ServerConfig = serde_json::from_value(json!({
+            "command":"server",
+            "toolExposure":{"*":"deferred","read*":"direct","read_secret":"hidden"}
+        }))
+        .unwrap();
+        assert_eq!(tool_exposure(&reordered, "read_public"), "deferred");
+        assert_ne!(config, reordered);
     }
     #[test]
     fn task_identity_uses_canonical_workspace_across_resume() {

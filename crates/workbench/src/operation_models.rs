@@ -417,7 +417,7 @@ pub(super) struct Catalogue(Vec<Entry>);
 impl Catalogue {
     pub fn parse(providers: &Map<String, Value>) -> Result<Self> {
         let mut combined: Map<String, Value> =
-            serde_json::from_str(include_str!("../assets/operation-models-v1.5.0.json"))
+            serde_json::from_str(include_str!("../assets/operation-models-v1.6.0.json"))
                 .expect("pinned Pi model operation catalogue");
         for (provider, configured) in providers {
             let name = provider.to_ascii_lowercase();
@@ -1646,7 +1646,7 @@ mod tests {
             .iter()
             .filter(|entry| entry.provider == "vercel-ai-gateway")
             .collect();
-        assert_eq!(models.len(), 14);
+        assert_eq!(models.len(), 27);
         let ids: BTreeSet<_> = models.iter().map(|entry| entry.model.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1655,12 +1655,25 @@ mod tests {
                 "baseten/joey-1",
                 "baseten/mammoth-1",
                 "convaiinnovations/laya",
+                "google/gemini-decision-1",
+                "heygen/heygen-decision-1",
+                "heygen/heygen-decision-1-turbo",
                 "liquid/d1",
                 "liquid/d1-ultra",
+                "liquid/d1.2",
+                "liquid/d1.2-ultra",
+                "microsoft/decision-1.1",
                 "microsoft/microsoft-decision-1",
+                "modaic/mo",
+                "nace-ai/drex-max-finance",
+                "nace-ai/drex-max-v1.1",
+                "nace-ai/drex-v2.0",
                 "openai/gpt-6-luna-decisions",
+                "parallel/parallel-decisions-fast",
                 "perplexity/pplx-decider-flash-v1.2",
+                "perplexity/pplx-decider-flash-v1.3",
                 "perplexity/pplx-decider-v1.2",
+                "perplexity/pplx-decider-v1.3",
                 "scaledown/scaledown-classify-1",
                 "typesafe-ai/jev",
                 "typesafe-ai/jev-1.13.0",
@@ -1731,7 +1744,7 @@ mod tests {
                 &keys,
             )
             .await;
-        assert_eq!(available.len(), 14);
+        assert_eq!(available.len(), 27);
         assert!(available.iter().all(|entry| entry["type"] == "classifier"));
     }
 
@@ -3079,6 +3092,56 @@ mod tests {
     }
 
     #[test]
+    fn pinned_openrouter_and_vercel_catalogues_match_pi_v160() {
+        let catalogue = Catalogue::parse(&Map::new()).unwrap();
+        for (provider, kind, expected) in [
+            ("openrouter", Kind::Classifier, 44),
+            ("openrouter", Kind::Image, 74),
+        ] {
+            let entries = catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == provider && entry.api.kind() == kind);
+            assert_eq!(entries.count(), expected);
+        }
+        for (provider, id, api) in [
+            (
+                "openrouter",
+                "google/gemini-decision-1",
+                "typesafe-system-one",
+            ),
+            (
+                "openrouter",
+                "openai/gpt-image-2.6-sunburst",
+                "openrouter-images",
+            ),
+            (
+                "vercel-ai-gateway",
+                "liquid/d1.2-ultra",
+                "typesafe-system-one",
+            ),
+        ] {
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| entry.provider == provider && entry.model.id == id)
+                .expect("model from Pi's catalog");
+            assert_eq!(entry.descriptor()["api"], api);
+            assert!(entry.is_official());
+        }
+        assert!(
+            !catalogue
+                .0
+                .iter()
+                .any(|entry| entry.provider == "openrouter"
+                    && matches!(
+                        entry.model.id.as_str(),
+                        "inception/mercury-decide" | "x-ai/grok-imagine-image-quality"
+                    ))
+        );
+    }
+
+    #[test]
     fn operation_catalogue_exposes_image_limits_and_classifier_compatibility() {
         let catalog = Catalogue::parse(&Map::new()).unwrap();
         let images: Vec<_> = catalog
@@ -3091,7 +3154,7 @@ mod tests {
                 .iter()
                 .filter(|entry| entry.descriptor().get("inputLimits").is_some())
                 .count(),
-            63
+            70
         );
         let flux = images
             .iter()

@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::{Cli, TuiMode, process::Worker, radius_auth, sessions};
+use super::{Cli, Provider, TuiMode, process::Worker, radius_auth, sessions};
 
 // Shell output is displayed separately from the model-facing context framing.
 fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
@@ -689,12 +689,27 @@ enum LocalEditor {
     Setting(String),
     BranchSummary(u64),
     ProviderKey(super::Provider),
+    VertexLogin(VertexLoginField),
     CloudflareLogin(CloudflareLoginField),
     BedrockProfile,
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
     AnthropicCode(Option<tokio::sync::oneshot::Sender<String>>),
     CodexCode(Option<tokio::sync::oneshot::Sender<String>>),
+}
+
+enum VertexLoginField {
+    Project {
+        service_account: bool,
+    },
+    Location {
+        project: String,
+        service_account: bool,
+    },
+    CredentialsPath {
+        project: String,
+        location: String,
+    },
 }
 
 enum CloudflareLoginField {
@@ -1168,6 +1183,8 @@ struct View {
     theme_settings: Option<ThemeSettings>,
     theme_refresh_requested: bool,
     thinking_settings: Option<ThinkingSettings>,
+    warning_settings_parent: Option<Picker>,
+    anthropic_subscription_warning_shown: bool,
     pending_thinking: Option<PendingThinking>,
     session_name: Option<String>,
     resources: super::resources::Resources,
@@ -1552,6 +1569,36 @@ impl View {
                 }
             }
             self.regular.committed = self.regular.committed.saturating_sub(removed);
+        }
+    }
+    fn maybe_warn_about_anthropic_subscription(&mut self, args: &Cli) {
+        if self.anthropic_subscription_warning_shown
+            || !args.settings.warn_anthropic_extra_usage()
+            || args.provider != Provider::Anthropic
+            || args
+                .model_profiles
+                .model_adapter(&args.provider, &args.model)
+                != super::providers::Adapter::Anthropic
+        {
+            return;
+        }
+        let endpoint = args.model_endpoint_for(&args.provider, Some(&args.model));
+        if endpoint != Provider::Anthropic.default_endpoint() {
+            return;
+        }
+        let credential = args.model_credential_for(&args.provider, endpoint);
+        let uses_subscription = match credential {
+            Some(super::model_auth::Credential::AnthropicOAuth) => true,
+            Some(credential) => credential
+                .literal()
+                .is_some_and(|token| token.starts_with("sk-ant-oat")),
+            None => false,
+        };
+        if uses_subscription {
+            self.anthropic_subscription_warning_shown = true;
+            self.append_entry(Entry::Warning(
+                "Anthropic subscription auth is active. Requests may use paid extra usage. Manage extra usage at https://claude.ai/settings/usage. Disable this warning in /settings.".into(),
+            ));
         }
     }
     fn show_custom_message(&mut self, id: u64, message: &pi_rs::CustomMessage) {
@@ -2355,7 +2402,7 @@ impl View {
             }
             return;
         }
-        let rendered_parts = if self.graphics.enabled() {
+        let mut rendered_parts = if self.graphics.enabled() {
             match outcome {
                 pi_rs::Outcome::Structured { data, .. }
                 | pi_rs::Outcome::StructuredWithDetails { data, .. } => data["content"]
@@ -2399,6 +2446,14 @@ impl View {
             .rev()
             .find(|entry| matches!(entry, Entry::Tool { id, .. } if id == operation))
         {
+            if name == "read"
+                && let pi_rs::Outcome::StructuredWithDetails { details, .. } = outcome
+                && let Some(model) = details["imageUnsupportedByModel"].as_str()
+            {
+                rendered_parts.push(ToolPart::Warning(format!(
+                    "[{model} does not support images; it saw a placeholder instead]"
+                )));
+            }
             *parts = rendered_parts;
             let diff = match outcome {
                 pi_rs::Outcome::SucceededWithDetails { details, .. }
@@ -3939,6 +3994,11 @@ fn slash(
         "/login" if rest.eq_ignore_ascii_case("meta api-key") => {
             edit_provider_key(super::Provider::named("meta").expect("Meta provider"), view)
         }
+        "/login" if rest.eq_ignore_ascii_case("google-vertex") => show_vertex_methods(view),
+        "/login" if rest.eq_ignore_ascii_case("google-vertex api-key") => edit_provider_key(
+            super::Provider::named("google-vertex").expect("Vertex provider"),
+            view,
+        ),
         "/login" if rest.eq_ignore_ascii_case("kimi-coding") => {
             start_kimi_login(view, &args.settings)
         }
@@ -5447,6 +5507,9 @@ pub(super) async fn run(
                     && worker.as_ref().is_some_and(|worker| worker.busy),
             )?;
         }
+        if dirty {
+            view.maybe_warn_about_anthropic_subscription(&args);
+        }
         if !args.trust_pending
             && view.picker.is_none()
             && view.pending_transition.is_none()
@@ -5936,6 +5999,9 @@ pub(super) async fn run(
                                             view.append("AWS profile saved for amazon-bedrock");
                                         })
                                 }
+                                LocalEditor::VertexLogin(field) => {
+                                    advance_vertex_login(field, text.trim(), &mut args, &mut view)
+                                }
                                 LocalEditor::CloudflareLogin(field) => {
                                     advance_cloudflare_login(field, text.trim(), &mut args, &mut view)
                                 }
@@ -6009,6 +6075,17 @@ pub(super) async fn run(
                             view.picker = Some(picker);
                         }
                         Input::Cancel => {
+                            if picker.title == "Warnings"
+                                && let Some(mut parent) = view.warning_settings_parent.take()
+                            {
+                                parent.refresh_settings(settings_items(
+                                    &args,
+                                    &view,
+                                    worker.as_ref(),
+                                ));
+                                view.picker = Some(parent);
+                                continue;
+                            }
                             if let Some(mut state) = view.thinking_settings.take() {
                                 if let Some(model_picker) = state.model_picker.take() {
                                     state.levels = None;
@@ -6151,6 +6228,14 @@ pub(super) async fn run(
                                 && matches!(&selection, Selection::Completion { range, .. }
                                     if range.start == 0 && view.editor.text.starts_with('/'));
                             let settings = picker.title == "Settings";
+                            if settings
+                                && matches!(&selection, Selection::EditSetting(name) if name == "warnings")
+                            {
+                                view.warning_settings_parent = Some(picker);
+                                view.picker =
+                                    Some(Picker::new("Warnings", warning_settings_items(&args)));
+                                continue;
+                            }
                             if settings
                                 && matches!(&selection, Selection::EditSetting(name) if name == "theme")
                             {
@@ -6381,12 +6466,13 @@ pub(super) async fn run(
                             }
                             let result =
                                 select(selection, &mut args, &mut view, &mut theme, &mut worker);
-                            if settings {
-                                picker.refresh_settings(settings_items(
-                                    &args,
-                                    &view,
-                                    worker.as_ref(),
-                                ));
+                            if settings || picker.title == "Warnings" {
+                                let items = if settings {
+                                    settings_items(&args, &view, worker.as_ref())
+                                } else {
+                                    warning_settings_items(&args)
+                                };
+                                picker.refresh_settings(items);
                                 if let Err(error) = result {
                                     picker.show_feedback(Err(error.to_string()));
                                 }
@@ -6965,6 +7051,107 @@ fn start_request(args: &Cli, request: Value, worker: &mut Option<Worker>) -> Res
 fn edit_provider_key(provider: super::Provider, view: &mut View) {
     let dialog = crate::ui::dialog::Dialog::secret(format!("{} API key", provider.id()));
     view.local_editor = Some((LocalEditor::ProviderKey(provider), dialog));
+}
+
+fn show_vertex_methods(view: &mut View) {
+    view.picker = Some(Picker::new(
+        "Google Vertex AI authentication",
+        vec![
+            Item {
+                label: "Google Cloud API key".into(),
+                selection: Selection::VertexApiKey,
+            },
+            Item {
+                label: "Application Default Credentials".into(),
+                selection: Selection::VertexAdc {
+                    service_account: false,
+                },
+            },
+            Item {
+                label: "Service account credentials file".into(),
+                selection: Selection::VertexAdc {
+                    service_account: true,
+                },
+            },
+        ],
+    ));
+}
+
+fn edit_vertex_login(view: &mut View, field: VertexLoginField) {
+    let title = match field {
+        VertexLoginField::Project { .. } => "Enter Google Cloud project ID",
+        VertexLoginField::Location { .. } => "Enter Google Cloud location",
+        VertexLoginField::CredentialsPath { .. } => "Enter service account credentials file path",
+    };
+    let dialog = crate::ui::dialog::Dialog::new(
+        uuid::Uuid::new_v4(),
+        pi_rs::UiRequest::Input {
+            title: title.into(),
+            placeholder: None,
+            initial_value: None,
+            timeout: None,
+        },
+    );
+    view.local_editor = Some((LocalEditor::VertexLogin(field), dialog));
+}
+
+fn advance_vertex_login(
+    field: &VertexLoginField,
+    text: &str,
+    args: &mut Cli,
+    view: &mut View,
+) -> Result<()> {
+    use super::vertex_auth::{save_login, validate_identifier};
+    match field {
+        VertexLoginField::Project { service_account } => {
+            validate_identifier(text, "project ID")?;
+            edit_vertex_login(
+                view,
+                VertexLoginField::Location {
+                    project: text.into(),
+                    service_account: *service_account,
+                },
+            );
+            return Ok(());
+        }
+        VertexLoginField::Location {
+            project,
+            service_account: true,
+        } => {
+            validate_identifier(text, "location")?;
+            edit_vertex_login(
+                view,
+                VertexLoginField::CredentialsPath {
+                    project: project.clone(),
+                    location: text.into(),
+                },
+            );
+            return Ok(());
+        }
+        VertexLoginField::Location {
+            project,
+            service_account: false,
+        } => {
+            save_login(project, text, None)?;
+        }
+        VertexLoginField::CredentialsPath { project, location } => {
+            let path = if let Some(relative) = text.strip_prefix("~/") {
+                std::env::home_dir()
+                    .ok_or_else(|| Error::Config("Home directory is unavailable".into()))?
+                    .join(relative)
+            } else {
+                args.workspace.join(text)
+            };
+            save_login(project, location, Some(&path))?;
+        }
+    }
+    args.replace_model_keys(super::model_auth::Keys::load()?)?;
+    view.invalidate_model_catalog();
+    view.append("Google Vertex AI credentials saved");
+    if std::env::var("GOOGLE_CLOUD_API_KEY").is_ok_and(|key| !key.trim().is_empty()) {
+        view.append("GOOGLE_CLOUD_API_KEY takes precedence over ADC.");
+    }
+    Ok(())
 }
 
 fn uses_cloudflare_login(provider: &super::Provider, args: &Cli) -> bool {
@@ -7976,6 +8163,14 @@ fn start_thinking_levels(
     Ok(receiver)
 }
 
+fn warning_settings_items(args: &Cli) -> Vec<Item> {
+    let enabled = args.settings.warn_anthropic_extra_usage();
+    vec![Item {
+        label: format!("Anthropic extra usage · {enabled}"),
+        selection: Selection::Setting("warnings.anthropicExtraUsage".into(), json!(!enabled)),
+    }]
+}
+
 fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item> {
     let cache_mode = args.settings.cache_warming_mode();
     let next_cache_mode = match cache_mode {
@@ -8264,6 +8459,10 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
             ),
         },
         Item {
+            label: "Warnings · configure".into(),
+            selection: Selection::EditSetting("warnings".into()),
+        },
+        Item {
             label: format!("Default thinking level per model · {thinking_summary}"),
             selection: Selection::EditSetting("modelThinkingLevels".into()),
         },
@@ -8497,10 +8696,29 @@ fn select(
         Selection::LoginProvider(provider) if provider.id() == "amazon-bedrock" => {
             show_bedrock_methods(view)
         }
+        Selection::LoginProvider(provider) if provider.id() == "google-vertex" => {
+            show_vertex_methods(view)
+        }
         Selection::LoginProvider(provider) if uses_cloudflare_login(&provider, args) => {
             edit_cloudflare_login(view, CloudflareLoginField::Key(provider));
         }
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
+        Selection::VertexApiKey => edit_provider_key(
+            super::Provider::named("google-vertex").expect("Vertex provider"),
+            view,
+        ),
+        Selection::VertexAdc { service_account } => {
+            if !service_account {
+                if std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS")
+                    .is_some_and(|path| !path.is_empty())
+                {
+                    view.append("ADC uses the file set by GOOGLE_APPLICATION_CREDENTIALS.");
+                } else {
+                    view.append("Run gcloud auth application-default login, then enter your project and location.");
+                }
+            }
+            edit_vertex_login(view, VertexLoginField::Project { service_account });
+        }
         Selection::BedrockBearer => edit_provider_key(super::Provider::Bedrock, view),
         Selection::BedrockProfile => {
             let dialog = crate::ui::dialog::Dialog::new(
@@ -8654,6 +8872,9 @@ fn select(
             } else if let Some(member) = key.strip_prefix("markdown.") {
                 args.settings
                     .set_user_member("markdown", member, value.clone())?;
+            } else if let Some(member) = key.strip_prefix("warnings.") {
+                args.settings
+                    .set_user_member("warnings", member, value.clone())?;
             } else if key == "theme" {
                 let next = load_resolved_theme(
                     value
@@ -9598,6 +9819,44 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn subscription_warning_respects_settings_and_only_appears_once() {
+        use clap::Parser;
+
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.provider = super::Provider::Anthropic;
+        args.model = "claude-sonnet-4-6".into();
+        args.endpoint = args.provider.default_endpoint().into();
+        args.settings = super::super::config::Settings::default();
+        args.model_keys = super::super::model_auth::Keys::parse(&serde_json::json!({
+            "anthropic": {"type": "api_key", "key": "sk-ant-api-fixture"}
+        }));
+        let mut view = super::View::default();
+        view.maybe_warn_about_anthropic_subscription(&args);
+        assert!(view.lines.is_empty());
+
+        args.model_keys = super::super::model_auth::Keys::parse(&serde_json::json!({
+            "anthropic": {"type": "oauth", "access": "sk-ant-oat-fixture", "refresh": "fixture", "expires": 123}
+        }));
+        view.maybe_warn_about_anthropic_subscription(&args);
+        view.maybe_warn_about_anthropic_subscription(&args);
+        assert!(matches!(&view.lines[..], [super::Entry::Warning(text)]
+            if text.contains("paid extra usage") && !text.contains("sk-ant-oat")));
+
+        let workspace = tempfile::tempdir().unwrap();
+        let settings_dir = workspace.path().join(".pi");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        std::fs::write(
+            settings_dir.join("settings.json"),
+            r#"{"warnings":{"anthropicExtraUsage":false}}"#,
+        )
+        .unwrap();
+        args.settings = super::super::config::Settings::load(workspace.path(), true).unwrap();
+        let mut view = super::View::default();
+        view.maybe_warn_about_anthropic_subscription(&args);
+        assert!(view.lines.is_empty());
+    }
+
+    #[test]
     fn cloudflare_login_validates_fixed_identifiers_in_gateway_templates() {
         let base = "https://gateway.ai.cloudflare.com/v1/fixed/{CLOUDFLARE_GATEWAY_ID}/compat";
         assert!(cloudflare_login_matches_gateway_base(
@@ -10304,6 +10563,45 @@ mod tests {
             dialog.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &keys),
             Some(pi_rs::UiResponse::Cancelled)
         );
+    }
+
+    #[test]
+    fn read_image_model_warning_renders_when_collapsed_or_expanded() {
+        use super::{Theme, View, json};
+        let operation_id = uuid::Uuid::new_v4();
+        let mut view = View::default();
+        view.add_tool(&pi_rs::Invocation {
+            operation_id,
+            call: pi_rs::ToolCall {
+                id: "fixture".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"image.png"}"#.into(),
+            },
+        });
+        view.finish_tool(
+            &operation_id.to_string(),
+            &pi_rs::Outcome::StructuredWithDetails {
+                attachments: vec![],
+                data: json!({"content":[{"type":"text", "text":"Read image file [image/png]"}]}),
+                details: json!({"imageUnsupportedByModel":"text-only"}),
+            },
+        );
+        let theme = Theme::system();
+        let entry = view.lines.last().unwrap();
+        for expanded in [false, true] {
+            let lines = entry.render(&theme, 96, expanded, true, Default::default());
+            assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+                span.text == "[text-only does not support images; it saw a placeholder instead]"
+                    && span.color == theme.color("warning")
+            }));
+            assert_eq!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.text.contains("Read image file")),
+                expanded
+            );
+        }
     }
 
     #[test]
