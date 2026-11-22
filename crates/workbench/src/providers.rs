@@ -1414,6 +1414,7 @@ impl Client {
                         .unwrap_or(level)
                         .to_ascii_lowercase();
                     let xhigh = mapped == "xhigh"
+                        && !matches!(args.provider.id(), "google" | "google-vertex")
                         && pi_rs::google::model_thinking_levels(&args.model)
                             .iter()
                             .any(|level| level == "xhigh");
