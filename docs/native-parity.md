@@ -5637,6 +5637,8 @@ The standard Anthropic Messages endpoint accepts an explicitly supplied
 `ANTHROPIC_AUTH_TOKEN` as an Authorization bearer credential. Stored and
 configured keys retain precedence. The header token takes priority over
 `ANTHROPIC_OAUTH_TOKEN`, which takes priority over `ANTHROPIC_API_KEY`.
+The explicit header token keeps ordinary bearer authentication even when
+its value has the subscription token format.
 The OAuth variable uses the existing subscription request path for
 `sk-ant-oat` tokens. Custom URLs and ports inherit none of these
 environment credentials. Auth status remains masked and uses Pi's API

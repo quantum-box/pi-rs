@@ -568,11 +568,8 @@ impl Cli {
             .and_then(model_auth::Credential::literal)
             .map(str::to_owned);
         let headers = settings.static_headers(provider, token.as_deref())?;
-        let bearer = credential
-            .as_ref()
-            .is_some_and(model_auth::Credential::is_bearer);
         provider
-            .connect(adapter, endpoint, token, bearer)?
+            .connect_for_credential(adapter, endpoint, token, credential.as_ref())?
             .with_headers(headers)
             .with_http_settings_and_env(&self.settings, settings.environment())
     }
