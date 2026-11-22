@@ -5,7 +5,7 @@ use std::time::Duration;
 
 #[cfg(test)]
 use pi_rs::JSON_DIAGNOSTIC_RETRY_LIMIT;
-use pi_rs::{Error, Result, Session, json_syntax_diagnostic as rpc_json_error};
+use pi_rs::{Error, Result, Session, json_syntax_diagnostic};
 use serde_json::{Value, json};
 
 use super::{Cli, interactive, process::Worker, sessions};
@@ -1326,7 +1326,7 @@ mod jsonl_framing_tests {
         let input = "[false,] \"x\\u1";
         let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
         assert_eq!(
-            super::rpc_json_error(input, &error),
+            super::json_syntax_diagnostic(input, &error),
             format!("Unexpected token ']', \"{input}\" is not valid JSON")
         );
     }
@@ -1372,13 +1372,13 @@ mod jsonl_framing_tests {
         let input = "[false,] \"x\\q\"";
         let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
         assert_eq!(
-            super::rpc_json_error(input, &error),
+            super::json_syntax_diagnostic(input, &error),
             format!("Unexpected token ']', \"{input}\" is not valid JSON")
         );
 
         let input = r#""\uDC00\x""#;
         let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
-        assert_eq!(super::rpc_json_error(input, &error), error.to_string());
+        assert_eq!(super::json_syntax_diagnostic(input, &error), error.to_string());
     }
 
     #[test]
