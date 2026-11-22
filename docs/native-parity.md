@@ -1092,7 +1092,6 @@ configuration as a whole, preserving pi-rs's existing override validation.
 Unlike Pi, JSON transport descriptions omit stdio arguments and URL paths,
 credentials, queries and fragments; failure messages are generic so these
 reports do not expose configured credentials through connection errors.
-Wildcard exposure matches follow pi-rs's existing sorted-pattern priority.
 
 `pi mcp login NAME` uses the effective HTTP server and OAuth settings from
 the user configuration and the trusted project. `--local` requires a full
@@ -1780,7 +1779,8 @@ array indices, empty keys and encoded separators. The declaration retains
 supported input types stated alongside a reference. A depth bound limits
 reference chains while allowing independent fields to reuse a definition.
 Selection state follows the journal branch and survives reopening.
-Exact exposure overrides and wildcard matching are supported. CLI allowlists
+An exact `toolExposure` name takes precedence over wildcard patterns. Among
+matching patterns, the first in the configuration wins. CLI allowlists
 without MCP names keep MCP discovery available without declaring all schemas.
 Tools receive only their owning extension state through an optional invocation
 hook; existing implementations continue through the original hook.

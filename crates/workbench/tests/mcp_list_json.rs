@@ -97,7 +97,7 @@ async fn list_json_reports_servers_tools_sources_and_failures() {
     std::fs::write(
         project.join("mcp.json"),
         json!({"mcpServers":{
-            "fixture":{"toolExposure":{"Private":"hidden"}},
+            "fixture":{"toolExposure":{"P*":"direct","*":"deferred","Private":"hidden"}},
             "local":{"command":"ignored","enabled":false}
         }})
         .to_string(),
@@ -163,7 +163,10 @@ async fn list_json_reports_servers_tools_sources_and_failures() {
             .as_ref()
     );
     assert_eq!(fixture["tools"], json!(["Public", "Private"]));
-    assert_eq!(fixture["toolExposure"], json!({"Private":"hidden"}));
+    assert_eq!(
+        fixture["toolExposure"],
+        json!({"Public":"direct","Private":"hidden"})
+    );
     assert_eq!(fixture["resources"], true);
     assert_eq!(find("disabled")["state"], "disabled");
     assert_eq!(find("local")["scope"], "project");
