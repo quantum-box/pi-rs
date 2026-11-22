@@ -211,25 +211,6 @@ impl rmcp::ClientHandler for NativeClient {
         self.catalog.changed();
     }
 
-    #[allow(deprecated)]
-    async fn on_logging_message(
-        &self,
-        params: rmcp::model::LoggingMessageNotificationParam,
-        _context: NotificationContext<RoleClient>,
-    ) {
-        let Some(name) = self.server_name.clone() else {
-            return;
-        };
-        let level = serde_json::to_value(params.level).unwrap_or_default();
-        crate::mcp_log::record(
-            name,
-            level.as_str().unwrap_or("info"),
-            params.logger,
-            params.data,
-        )
-        .await;
-    }
-
     async fn create_elicitation(
         &self,
         request: rmcp::model::ElicitRequestParams,
@@ -695,13 +676,25 @@ impl McpExtension {
                     Some(owner) => {
                         NativeClient::for_server(name, workspace)
                             .await
-                            .serve_with_lifecycle(owned_stdio_transport(wrapped, owner)?, lifecycle)
+                            .serve_with_lifecycle(
+                                crate::mcp_log::LoggingTransport::new(
+                                    owned_stdio_transport(wrapped, owner)?,
+                                    Some(Arc::from(name)),
+                                ),
+                                lifecycle,
+                            )
                             .await
                     }
                     None => {
                         NativeClient::for_server(name, workspace)
                             .await
-                            .serve_with_lifecycle(TokioChildProcess::new(wrapped)?, lifecycle)
+                            .serve_with_lifecycle(
+                                crate::mcp_log::LoggingTransport::new(
+                                    TokioChildProcess::new(wrapped)?,
+                                    Some(Arc::from(name)),
+                                ),
+                                lifecycle,
+                            )
                             .await
                     }
                 };
@@ -1106,6 +1099,10 @@ impl McpExtension {
         &self.server_tool_names
     }
 
+    pub fn remote_tool_exposure(&self, name: &str) -> &str {
+        tool_exposure(&self.connection.config, name)
+    }
+
     /// Whether the server advertised the resources capability at discovery.
     pub fn offers_resources(&self) -> bool {
         self.has_resources
@@ -1310,7 +1307,10 @@ async fn start_http_service<C: StreamableHttpClient + Clone>(
     lifecycle: ClientLifecycleMode,
 ) -> std::result::Result<RunningService<RoleClient, NativeClient>, ClientInitializeError> {
     for delay in [Some(250), Some(1000), None] {
-        let transport = StreamableHttpClientTransport::with_client(client.clone(), config.clone());
+        let transport = crate::mcp_log::LoggingTransport::new(
+            StreamableHttpClientTransport::with_client(client.clone(), config.clone()),
+            native.server_name.clone(),
+        );
         let result = native
             .clone()
             .serve_with_lifecycle(transport, lifecycle.clone())
@@ -1719,10 +1719,7 @@ impl McpTool {
                 Ok(json!({"resources": visible_resource_listing(serde_json::to_value(resources)?)}))
             }
             "list_resource_templates" => {
-                let templates = service
-                    .list_all_resource_templates()
-                    .await
-                    .map_err(call_error)?;
+                let templates = templates_or_empty(service.list_all_resource_templates().await)?;
                 Ok(
                     json!({"resourceTemplates": visible_resource_listing(serde_json::to_value(templates)?)}),
                 )
@@ -1740,10 +1737,11 @@ impl McpTool {
                 ))
             }
             "list_resource_templates_page" => {
-                let result = service
-                    .list_resource_templates(Some(resource_page_params(arguments)?))
-                    .await
-                    .map_err(call_error)?;
+                let result = templates_or_empty(
+                    service
+                        .list_resource_templates(Some(resource_page_params(arguments)?))
+                        .await,
+                )?;
                 Ok(resource_page(
                     &self.connection.name,
                     "resourceTemplates",
@@ -1779,6 +1777,20 @@ impl McpTool {
             }
             _ => Err(Error::Config("unknown MCP resource operation".into()).into()),
         }
+    }
+}
+
+// Servers can provide resources without implementing resource templates.
+fn templates_or_empty<T: Default>(
+    result: std::result::Result<T, ServiceError>,
+) -> std::result::Result<T, CallError> {
+    match result {
+        Err(ServiceError::McpError(error))
+            if error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
+        {
+            Ok(T::default())
+        }
+        other => other.map_err(call_error),
     }
 }
 

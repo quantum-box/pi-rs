@@ -1,12 +1,19 @@
 //! Private, best-effort log of MCP server message notifications.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use rmcp::{
+    RoleClient,
+    model::{ClientJsonRpcMessage, ServerJsonRpcMessage, ServerNotification},
+    transport::Transport,
+};
 use serde_json::Value;
 
 const ROTATE_AFTER: u64 = 5 * 1024 * 1024;
@@ -15,6 +22,72 @@ const TRUNCATED: &str = " [truncated]\n";
 const WRITE_BUDGET: Duration = Duration::from_millis(50);
 static WRITERS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(4)));
+
+pub(super) struct LoggingTransport<T> {
+    inner: T,
+    server: Option<Arc<str>>,
+    pending: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+}
+
+impl<T> LoggingTransport<T> {
+    pub(super) fn new(inner: T, server: Option<Arc<str>>) -> Self {
+        Self {
+            inner,
+            server,
+            pending: None,
+        }
+    }
+}
+
+impl<T: Transport<RoleClient>> Transport<RoleClient> for LoggingTransport<T> {
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        message: ClientJsonRpcMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(message)
+    }
+
+    #[allow(deprecated)]
+    async fn receive(&mut self) -> Option<ServerJsonRpcMessage> {
+        loop {
+            // rmcp selects over receive and outbound work. Keep the write
+            // future here so that selecting a different branch cannot drop
+            // a received log or expose a later reply before the write.
+            if let Some(pending) = self.pending.as_mut() {
+                pending.await;
+                self.pending = None;
+            }
+            let message = self.inner.receive().await?;
+            let Some(name) = &self.server else {
+                return Some(message);
+            };
+            let ServerJsonRpcMessage::Notification(notification) = message else {
+                return Some(message);
+            };
+            let ServerNotification::LoggingMessageNotification(log) = notification.notification
+            else {
+                return Some(ServerJsonRpcMessage::Notification(notification));
+            };
+            let level = serde_json::to_value(log.params.level).unwrap_or_default();
+            let level = level.as_str().unwrap_or("info").to_owned();
+            self.pending = Some(Box::pin(record(
+                name.clone(),
+                level,
+                log.params.logger,
+                log.params.data,
+            )));
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        if let Some(pending) = self.pending.take() {
+            pending.await;
+        }
+        self.inner.close().await
+    }
+}
 
 fn push_safe(output: &mut String, input: &str) {
     for value in input.chars() {
@@ -143,12 +216,11 @@ fn append_record(directory: &Path, line: &str, deadline: Instant) -> io::Result<
     file.write_all(line.as_bytes())
 }
 
-pub(super) async fn record(server: Arc<str>, level: &str, logger: Option<String>, data: Value) {
+async fn record(server: Arc<str>, level: String, logger: Option<String>, data: Value) {
     let Ok(permit) = WRITERS.clone().try_acquire_owned() else {
         return;
     };
     let now = Utc::now();
-    let level = level.to_owned();
     let deadline = Instant::now() + WRITE_BUDGET;
     let task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -163,6 +235,50 @@ pub(super) async fn record(server: Arc<str>, level: &str, logger: Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_log_survives_a_cancelled_receive() {
+        struct Queue(Option<ServerJsonRpcMessage>);
+
+        impl Transport<RoleClient> for Queue {
+            type Error = io::Error;
+
+            fn send(
+                &mut self,
+                _message: ClientJsonRpcMessage,
+            ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+                std::future::ready(Ok(()))
+            }
+
+            async fn receive(&mut self) -> Option<ServerJsonRpcMessage> {
+                self.0.take()
+            }
+
+            async fn close(&mut self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        let response = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": {}
+        }))
+        .unwrap();
+        let (release, pending) = tokio::sync::oneshot::channel();
+        let mut transport = LoggingTransport::new(Queue(Some(response)), None);
+        transport.pending = Some(Box::pin(async move { pending.await.unwrap() }));
+
+        tokio::select! {
+            biased;
+            _ = transport.receive() => panic!("reply overtook the log write"),
+            _ = std::future::ready(()) => {}
+        }
+        release.send(()).unwrap();
+        assert!(matches!(
+            transport.receive().await,
+            Some(ServerJsonRpcMessage::Response(_))
+        ));
+        assert!(transport.pending.is_none());
+    }
 
     #[test]
     fn formats_multiline_messages_and_bounds_payloads() {

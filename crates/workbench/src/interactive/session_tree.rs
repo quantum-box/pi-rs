@@ -2,16 +2,17 @@ use crate::{
     sessions,
     ui::picker::{Item, Picker, Selection, TreeDescription, TreeEntryKind, TreeFilter},
 };
-use pi_rs::{Event, ModelFailure, Record, Session};
+use pi_rs::{ContentBlock, ContextContent, Event, ModelFailure, Outcome, Session};
 use serde_json::Value;
 
 pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
+    let thinking = thinking_rows(session);
     let mut calls = std::collections::HashMap::new();
     let mut assistant_completions = std::collections::HashSet::new();
     for record in session.records() {
         match &record.event {
             Event::Assistant { invocations, .. } => {
-                if let Some(completion) = preceding_completion(session, record) {
+                if let Some(completion) = sessions::tree_assistant_completion(session, record) {
                     assistant_completions.insert(completion.id);
                 }
                 calls.extend(
@@ -34,26 +35,26 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
     for record in session.records() {
         let (kind, description) = match &record.event {
             Event::Checkout { .. } => continue,
+            _ if thinking.contains_key(&record.id) => (
+                TreeEntryKind::Bookkeeping,
+                tree_description(
+                    format!("[thinking: {}]", thinking[&record.id]),
+                    "dim",
+                    String::new(),
+                ),
+            ),
             Event::User { content, .. } | Event::UserWithImages { content, .. } => (
                 TreeEntryKind::User,
                 tree_description("user: ", "accent", tree_preview(content, 200)),
             ),
             Event::Assistant { content, .. } => {
-                let completion = preceding_completion(session, record);
+                let completion = sessions::tree_assistant_completion(session, record);
                 let failure = completion.and_then(|record| match record.event {
                     Event::ModelFinished { failure, .. } => failure,
                     _ => None,
                 });
-                let source_error = completion
-                    .and_then(|record| preceding_record(session, record))
-                    .and_then(|record| match &record.event {
-                        Event::SourceEntry { format, entry }
-                            if format == "pi" && entry["message"]["role"] == "assistant" =>
-                        {
-                            entry["message"]["errorMessage"].as_str()
-                        }
-                        _ => None,
-                    });
+                let source_error =
+                    completion.and_then(|record| sessions::tree_completion_error(session, record));
                 let kind = if content.trim().is_empty() && failure.is_none() && record.id != head {
                     TreeEntryKind::Hidden
                 } else {
@@ -70,7 +71,11 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
                 ..
             } if !assistant_completions.contains(&record.id) => (
                 TreeEntryKind::Message,
-                tree_assistant_description(partial, Some(*failure), None),
+                tree_assistant_description(
+                    partial,
+                    Some(*failure),
+                    sessions::tree_completion_error(session, record),
+                ),
             ),
             Event::ToolFinished { operation_id, .. }
             | Event::ToolReconciled { operation_id, .. } => (
@@ -156,17 +161,13 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
                 )
             }
         };
+        let mut label = format!("{} {}{}", record.id, description.heading, description.body);
+        if let Some(preview) = tree_tool_result_preview(&record.event) {
+            label.push_str(" toolResult ");
+            label.push_str(&preview);
+        }
         items.push(Item {
-            label: format!(
-                "{} {} {}{}",
-                record.id,
-                labels
-                    .get(&record.id)
-                    .map(String::as_str)
-                    .unwrap_or_default(),
-                description.heading,
-                description.body
-            ),
+            label: tree_search_label(label, &record.event),
             selection: Selection::Checkout(record.id),
         });
         entries.insert(record.id, (record.parent, kind));
@@ -178,23 +179,47 @@ pub(super) fn picker(session: &Session, filter: TreeFilter) -> Picker {
     picker
 }
 
-fn preceding_record<'a>(session: &'a Session, record: &Record) -> Option<&'a Record> {
-    session
-        .records()
-        .get(record.parent?.checked_sub(1)? as usize)
+fn thinking_rows(session: &Session) -> std::collections::HashMap<u64, &str> {
+    let mut imported = Vec::new();
+    let mut rows = std::collections::HashMap::new();
+    for record in session.records() {
+        match &record.event {
+            Event::SourceEntry { format, entry }
+                if format == "pi" && entry["type"] == "thinking_level_change" =>
+            {
+                if let Some(level) = entry["thinkingLevel"].as_str() {
+                    imported.push((record.id, level));
+                }
+            }
+            Event::ModelSelected { thinking, .. }
+                if tree_parent_is_native_thinking_marker(session, record.parent) =>
+            {
+                rows.insert(record.id, thinking.as_deref().unwrap_or("off"));
+            }
+            _ => {}
+        }
+    }
+    if !imported.is_empty()
+        && let Ok(counts) = session.validated_pi_conversion_counts()
+    {
+        for (source, level) in imported {
+            // A thinking entry before model selection has no conversion.
+            // Otherwise use the converted record, which also holds its label.
+            if let Some(count) = counts.get(&source) {
+                rows.insert(source + u64::from(*count > 0), level);
+            }
+        }
+    }
+    rows
 }
 
-fn preceding_completion<'a>(session: &'a Session, assistant: &Record) -> Option<&'a Record> {
-    let Event::Assistant {
-        request_id: Some(request_id),
-        ..
-    } = &assistant.event
-    else {
-        return None;
-    };
-    let parent = preceding_record(session, assistant)?;
-    matches!(parent.event, Event::ModelFinished { request_id: id, .. } if id == *request_id)
-        .then_some(parent)
+fn tree_parent_is_native_thinking_marker(session: &Session, parent: Option<u64>) -> bool {
+    parent
+        .and_then(|id| id.checked_sub(1))
+        .and_then(|index| session.records().get(index as usize))
+        .is_some_and(|parent| {
+            matches!(&parent.event, Event::SourceEntry { format, .. } if format == "pi-rs:thinking-selection")
+        })
 }
 
 fn tree_description(
@@ -211,11 +236,15 @@ fn tree_description(
 }
 
 fn tree_preview(text: &str, limit: usize) -> String {
+    tree_preview_chunks(std::iter::once(text), limit)
+}
+
+fn tree_preview_chunks<'a>(chunks: impl Iterator<Item = &'a str>, limit: usize) -> String {
     // Pi's previews are measured in UTF-16 code units. Keep Rust strings
     // valid when the preview boundary falls in the middle of a surrogate pair.
     let mut units = 0;
-    let preview: String = text
-        .chars()
+    let preview: String = chunks
+        .flat_map(str::chars)
         .take_while(|character| {
             units += character.len_utf16();
             units <= limit
@@ -226,6 +255,72 @@ fn tree_preview(text: &str, limit: usize) -> String {
         })
         .collect();
     preview.trim().to_owned()
+}
+
+fn tree_tool_result_preview(event: &Event) -> Option<String> {
+    let outcome = match event {
+        Event::ToolFinished { outcome, .. } | Event::ToolReconciled { outcome, .. } => outcome,
+        Event::ImportedUnattributedToolResult { content, .. } => {
+            return Some(match content {
+                ContextContent::Text(text) => tree_preview(text, 200),
+                ContextContent::Blocks(blocks) => tree_preview_chunks(
+                    blocks.iter().filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    }),
+                    200,
+                ),
+            });
+        }
+        _ => return None,
+    };
+    Some(match outcome {
+        Outcome::Succeeded(output)
+        | Outcome::SucceededWithDetails { output, .. }
+        | Outcome::TextResult { output, .. }
+        | Outcome::TextResultWithStructuredContent { output, .. }
+        | Outcome::Failed(output)
+        | Outcome::Skipped(output)
+        | Outcome::Unknown(output) => tree_preview(output, 200),
+        Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } => {
+            if let Some(blocks) = data["content"].as_array() {
+                tree_preview_chunks(
+                    blocks
+                        .iter()
+                        .filter(|block| block["type"] == "text")
+                        .filter_map(|block| block["text"].as_str()),
+                    200,
+                )
+            } else {
+                tree_preview(data["output"].as_str().unwrap_or_default(), 200)
+            }
+        }
+        Outcome::Truncated { .. } | Outcome::Pending { .. } => {
+            tree_preview(&outcome.tool_content(), 200)
+        }
+    })
+}
+
+fn tree_search_label(mut label: String, event: &Event) -> String {
+    let full_text = match event {
+        Event::BashExecution { execution } => {
+            label.push_str(" bashExecution");
+            Some(execution.command.as_str())
+        }
+        Event::BranchSummary { summary, .. } => Some(summary.as_str()),
+        Event::CustomMessage { message } | Event::CustomMessageDelivered { message, .. } => {
+            match &message.content {
+                pi_rs::ContextContent::Text(text) => Some(text.as_str()),
+                pi_rs::ContextContent::Blocks(_) => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some(text) = full_text.filter(|text| text.encode_utf16().nth(200).is_some()) {
+        label.push(' ');
+        label.push_str(text);
+    }
+    label
 }
 
 fn tree_assistant_description(
@@ -311,6 +406,98 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn tree_search_finds_text_beyond_the_display_preview() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pi.jsonl");
+        let prefix = "x".repeat(220);
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"user","parentId":null,
+                "message":{"role":"user","content":"search fixture"}}),
+            json!({"type":"message","id":"bash","parentId":"user","message":{
+                "role":"bashExecution","command":format!("{prefix} shell-tail-marker"),
+                "exitCode":0}}),
+            json!({"type":"branch_summary","id":"summary","parentId":"bash","fromId":"user",
+                "summary":format!("{prefix} summary-tail-marker")}),
+            json!({"type":"custom_message","id":"text","parentId":"summary","customType":"plain-custom",
+                "content":format!("{prefix} custom-tail-marker"),"display":false}),
+            json!({"type":"custom_message","id":"blocks","parentId":"text","customType":"blocks-custom",
+                "content":[{"type":"text","text":format!("{prefix} blocks-tail-marker")}],"display":false}),
+        ];
+        let fixture = entries
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, fixture).unwrap();
+        let session = crate::session_import::read(&path).unwrap();
+        let theme = Theme::system();
+        let keys = Keys::default();
+
+        for (query, heading) in [
+            ("bashExecution shell-tail-marker", "[bash]"),
+            ("summary-tail-marker", "[branch summary]"),
+            ("custom-tail-marker", "[plain-custom]"),
+        ] {
+            let mut search = picker(&session, TreeFilter::Default);
+            search.paste(query);
+            assert!(
+                matches!(search.selected(), Some(Selection::Checkout(_))),
+                "{query}"
+            );
+            let rows = search.render(&theme, 80, 20, &keys);
+            assert!(
+                rows.iter()
+                    .any(|row| row.spans.iter().any(|span| span.text.contains(heading))),
+                "{query} should select {heading}"
+            );
+        }
+        let mut blocks_search = picker(&session, TreeFilter::Default);
+        blocks_search.paste("blocks-tail-marker");
+        assert!(blocks_search.selected().is_none());
+    }
+
+    #[test]
+    fn tree_distinguishes_thinking_changes_from_model_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pi.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"thinking_level_change","id":"high","parentId":null,"thinkingLevel":"high"}),
+            json!({"type":"model_change","id":"model","parentId":"high","provider":"ollama","modelId":"fixture-a"}),
+            json!({"type":"thinking_level_change","id":"low","parentId":"model","thinkingLevel":"low"}),
+            json!({"type":"message","id":"user","parentId":"low","message":{"role":"user","content":"question"}}),
+        ];
+        let fixture = entries
+            .iter()
+            .map(|entry| format!("{entry}\n"))
+            .collect::<String>();
+        std::fs::write(&path, fixture).unwrap();
+        let mut session = crate::session_import::read(&path).unwrap();
+        session
+            .select_thinking_level(Some("ollama"), "fixture-a", "medium")
+            .unwrap();
+
+        let theme = Theme::system();
+        let keys = Keys::default();
+        for (filter, expected) in [(TreeFilter::Default, 0), (TreeFilter::All, 1)] {
+            let lines = picker(&session, filter).render(&theme, 100, 28, &keys);
+            for heading in [
+                "[thinking: high]",
+                "[model: fixture-a]",
+                "[thinking: low]",
+                "[thinking: medium]",
+            ] {
+                let matching = lines
+                    .iter()
+                    .filter(|line| line.spans.iter().any(|span| span.text == heading))
+                    .count();
+                assert_eq!(matching, expected, "{heading}");
+            }
+        }
+    }
+
+    #[test]
     fn imported_tree_rows_use_pi_message_labels_and_theme_roles() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("pi.jsonl");
@@ -320,7 +507,7 @@ mod tests {
             json!({"type":"message","id":"user","parentId":null,"timestamp":timestamp,
                 "message":{"role":"user","content":"user\ntext"}}),
             json!({"type":"message","id":"error","parentId":"user","timestamp":timestamp,
-                "message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"fixture error"}}),
+                "message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"fixture\nerror"}}),
             json!({"type":"custom_message","id":"custom","parentId":"error","timestamp":timestamp,
                 "customType":"checkpoint","content":[{"type":"text","text":"first\t"},{"type":"text","text":"second"}],"display":false}),
             json!({"type":"label","id":"label","parentId":"custom","timestamp":timestamp,"targetId":"custom","label":"milestone"}),
@@ -331,7 +518,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(&path, fixture).unwrap();
-        let session = crate::session_import::read(&path).unwrap();
+        let mut session = crate::session_import::read(&path).unwrap();
         let mut picker = picker(&session, TreeFilter::Default);
         let keys = Keys::default();
         let theme = Theme::load("dark", &[], root.path(), false, false).unwrap();
@@ -385,6 +572,15 @@ mod tests {
             sessions::tree_record_text(&session, id).unwrap(),
             "first\tsecond"
         );
+        let failed = session
+            .records()
+            .iter()
+            .find(|record| matches!(&record.event, Event::Assistant { content, .. } if content.is_empty()))
+            .unwrap();
+        assert_eq!(
+            sessions::tree_record_text(&session, failed.id).unwrap(),
+            "fixture\nerror"
+        );
         picker.input(
             crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Char('T'),
@@ -397,5 +593,73 @@ mod tests {
                 .iter()
                 .any(|span| span.text.starts_with("25/") && span.color == theme.color("muted"))
         }));
+        session.set_label(id, Some("updated label".into())).unwrap();
+        let updated = super::picker(&session, TreeFilter::Default);
+        picker.refresh_tree(updated, id);
+        picker.input(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('a'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+            &keys,
+        );
+        assert!(
+            picker.render(&theme, 100, 22, &keys).iter().any(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.text == "[label: updated label]")
+            }),
+            "all entries include the newly committed label record"
+        );
+    }
+
+    #[test]
+    fn tree_search_matches_tool_result_text_within_the_pi_preview() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pi.jsonl");
+        let output = format!("unique-result-sentinel {} tail-marker", "x".repeat(200));
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,
+                "message":{"role":"user","content":"question"}}),
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant",
+                "content":[{"type":"toolCall","id":"call","name":"read","arguments":{"path":"fixture.txt"}}],
+                "stopReason":"toolUse"}}),
+            json!({"type":"message","id":"t","parentId":"a","message":{"role":"toolResult",
+                "toolCallId":"call","toolName":"read","content":[{"type":"text","text":output}]}}),
+        ];
+        let fixture = entries
+            .iter()
+            .map(|entry| format!("{entry}\n"))
+            .collect::<String>();
+        std::fs::write(&path, fixture).unwrap();
+        let session = crate::session_import::read(&path).unwrap();
+        let result = session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::ToolFinished { .. }))
+            .unwrap();
+        let mut tool_search = picker(&session, TreeFilter::Default);
+        tool_search.paste("toolresult unique-result-sentinel");
+        assert!(matches!(tool_search.selected(), Some(Selection::Checkout(id)) if id == result.id));
+        let rendered = tool_search.render(&Theme::system(), 80, 20, &Keys::default());
+        let tool_row = rendered
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.text == "[read: fixture.txt]")
+            })
+            .unwrap();
+        assert!(
+            tool_row
+                .spans
+                .iter()
+                .all(|span| !span.text.contains("unique-result-sentinel"))
+        );
+
+        let mut tail_search = picker(&session, TreeFilter::Default);
+        tail_search.paste("tail-marker");
+        assert!(tail_search.selected().is_none());
     }
 }

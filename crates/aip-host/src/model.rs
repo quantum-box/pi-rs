@@ -66,6 +66,10 @@ impl pi_rs_core::PreparedToolDispatch for PreparedBudgetDispatch<'_> {
 
 #[async_trait::async_trait]
 impl Model for BudgetedModel<'_> {
+    fn minimum_output_tokens(&self) -> u32 {
+        self.inner.minimum_output_tokens()
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,
@@ -275,6 +279,10 @@ struct PreparedBudgetedModel<'a, 'b> {
 
 #[async_trait::async_trait]
 impl Model for PreparedBudgetedModel<'_, '_> {
+    fn minimum_output_tokens(&self) -> u32 {
+        self.inner.minimum_output_tokens()
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,

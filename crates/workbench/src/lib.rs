@@ -24,6 +24,8 @@ pub use coding_paths::normalize_plain as normalize_path;
 #[cfg(windows)]
 #[doc(hidden)]
 pub use coding_paths::windows_shell_path;
+#[doc(hidden)]
+pub mod diff_sequence;
 mod file_search;
 pub mod image_profile;
 pub mod mcp;
