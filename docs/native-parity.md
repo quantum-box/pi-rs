@@ -2337,10 +2337,11 @@ indentation for code and quotes. A pinned Pi fixture checks these layouts,
 including duplicate definitions and narrow quotes. Inventory and rendering
 have native work limits; inputs that exceed them use the existing bounded
 renderer and can differ in spacing from Pi.
-Nested list spacing follows source block boundaries. Source soft breaks
-produce separate rows in paragraphs, quotes, and list items, with list
-continuation prefixes, matching Pi. Prose wraps at words and CJK graphemes
-and preserves inline styles across the wrap. Thematic breaks within an item
+Nested list spacing follows source block boundaries. The indentation of a
+heading, quote, or thematic break within an item does not add a blank row.
+Source soft breaks produce separate rows in paragraphs, quotes, and list items,
+with list continuation prefixes, matching Pi. Prose wraps at words and CJK
+graphemes and preserves inline styles across the wrap. Thematic breaks within an item
 use its continuation indentation and available width. List continuation rows
 retain extra source spaces after stripping the applicable marker indents.
 Numbered child lists can interrupt item text at any valid starting number.
