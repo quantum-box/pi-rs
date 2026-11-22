@@ -206,6 +206,7 @@ struct ModelCompatibility {
     allow_empty_signature: Option<bool>,
     supports_strict_tools: Option<bool>,
     supports_max_output_tokens: Option<bool>,
+    supports_mid_convo_effort: Option<bool>,
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
     session_affinity_format: Option<AffinityFormat>,
@@ -213,6 +214,7 @@ struct ModelCompatibility {
     supports_long_cache_retention: Option<bool>,
     supports_explicit_prompt_cache_mode: Option<bool>,
     supports_cache_control_on_tools: Option<bool>,
+    supports_eager_tool_input_streaming: Option<bool>,
     cache_control_format: Option<CacheControlFormat>,
 }
 
@@ -225,6 +227,9 @@ impl ModelCompatibility {
             supports_max_output_tokens: newer
                 .supports_max_output_tokens
                 .or(self.supports_max_output_tokens),
+            supports_mid_convo_effort: newer
+                .supports_mid_convo_effort
+                .or(self.supports_mid_convo_effort),
             force_adaptive_thinking: newer
                 .force_adaptive_thinking
                 .or(self.force_adaptive_thinking),
@@ -244,6 +249,9 @@ impl ModelCompatibility {
             supports_cache_control_on_tools: newer
                 .supports_cache_control_on_tools
                 .or(self.supports_cache_control_on_tools),
+            supports_eager_tool_input_streaming: newer
+                .supports_eager_tool_input_streaming
+                .or(self.supports_eager_tool_input_streaming),
             cache_control_format: newer.cache_control_format.or(self.cache_control_format),
         }
     }
@@ -364,13 +372,22 @@ impl ChatPrice {
             .cache_write_1h_tokens
             .unwrap_or_default()
             .min(writes);
+        let multiplier = metadata
+            .catalog_cost_multiplier
+            .as_ref()
+            .and_then(serde_json::Number::as_f64)
+            .filter(|multiplier| multiplier.is_finite() && *multiplier > 0.0)
+            .unwrap_or(1.0);
         let input_rate = rates.input.unwrap_or_default();
         pi_rs::UsageCostBreakdown::new(
-            (input_rate / 1_000_000.0) * (other_input - writes) as f64,
-            (rates.output.unwrap_or_default() / 1_000_000.0) * usage.output_tokens as f64,
-            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64,
-            (rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
-                + (input_rate / 500_000.0) * long as f64,
+            (input_rate / 1_000_000.0) * (other_input - writes) as f64 * multiplier,
+            (rates.output.unwrap_or_default() / 1_000_000.0)
+                * usage.output_tokens as f64
+                * multiplier,
+            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64 * multiplier,
+            ((rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
+                + (input_rate / 500_000.0) * long as f64)
+                * multiplier,
         )
     }
 }
@@ -1343,6 +1360,40 @@ impl Profiles {
         selected: &str,
         explicit_endpoint: Option<&str>,
     ) -> BTreeMap<String, bool> {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+            self.anthropic_strict_tool_support(provider, metadata)
+        })
+    }
+
+    pub fn anthropic_managed_effort_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> BTreeMap<String, bool> {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+            self.cache_compatibility(provider, metadata)
+                .supports_mid_convo_effort
+                .unwrap_or(false)
+        })
+        .into_iter()
+        .filter(|(_, supported)| *supported)
+        .map(|(id, _)| {
+            let can_disable = self
+                .model(provider, &id)
+                .is_none_or(|metadata| metadata.mapped_effort("off") != Some(None));
+            (id, can_disable)
+        })
+        .collect()
+    }
+
+    fn anthropic_route_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+        capability: impl Fn(Option<&ModelMetadata>) -> bool,
+    ) -> BTreeMap<String, bool> {
         let endpoint = explicit_endpoint
             .or_else(|| self.model_endpoint(provider, selected))
             .unwrap_or_else(|| self.endpoint(provider));
@@ -1360,7 +1411,7 @@ impl Profiles {
                     return None;
                 }
                 let metadata = self.model(provider, &id)?;
-                let supported = self.anthropic_strict_tool_support(provider, Some(&metadata));
+                let supported = capability(Some(&metadata));
                 Some((id, supported))
             })
             .collect();
@@ -1368,9 +1419,27 @@ impl Profiles {
         // capability (or the default false) still applies to that selection.
         models.entry(selected.to_owned()).or_insert_with(|| {
             let metadata = self.model(provider, selected);
-            self.anthropic_strict_tool_support(provider, metadata.as_ref())
+            capability(metadata.as_ref())
         });
         models
+    }
+
+    pub fn anthropic_eager_tool_input_policy(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> (bool, BTreeMap<String, bool>) {
+        let capability = |model: Option<&ModelMetadata>| {
+            self.cache_compatibility(provider, model)
+                .supports_eager_tool_input_streaming
+                .unwrap_or(true)
+        };
+        let default = capability(None);
+        let mut models =
+            self.anthropic_route_models(provider, selected, explicit_endpoint, capability);
+        models.retain(|_, supported| *supported != default);
+        (default, models)
     }
 
     pub fn messages_cache_support(
@@ -1856,6 +1925,35 @@ mod tests {
     }
 
     #[test]
+    fn service_tier_scales_all_catalog_cost_components() {
+        let price: ChatPrice = serde_json::from_value(json!({
+            "input":10, "output":20, "cacheRead":2, "cacheWrite":4
+        }))
+        .unwrap();
+        let usage = pi_rs::Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+        };
+        for (tier, multiplier) in [(None, 1.0), (Some(0.5), 0.5), (Some(2.5), 2.5)] {
+            let metadata = pi_rs::ModelMetadata {
+                cached_input_tokens: Some(200_000),
+                cache_creation_input_tokens: Some(300_000),
+                catalog_cost_multiplier: tier.and_then(serde_json::Number::from_f64),
+                ..Default::default()
+            };
+            let cost = price.estimate(usage, &metadata).unwrap();
+            for (actual, base) in [
+                (cost.input, 5.0),
+                (cost.output, 2.0),
+                (cost.cache_read, 0.4),
+                (cost.cache_write, 1.2),
+            ] {
+                assert!((actual.as_f64().unwrap() - base * multiplier).abs() < 1e-10);
+            }
+        }
+    }
+
+    #[test]
     fn cloudflare_worker_chats_and_classifiers_keep_saved_account_scope() {
         let keys = super::super::model_auth::Keys::parse(&json!({
             "cloudflare-workers-ai":{
@@ -1871,8 +1969,23 @@ mod tests {
             endpoint,
             "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
         );
-        assert_eq!(profiles.model_ids(&provider).len(), 19);
+        assert_eq!(profiles.model_ids(&provider).len(), 20);
         assert_eq!(profiles.model_ids(&provider)[0], "@cf/moonshotai/kimi-k2.6");
+        let inkling = "@cf/thinkingmachines/inkling-2-small";
+        assert!(
+            profiles
+                .model_ids(&provider)
+                .iter()
+                .any(|model| model == inkling)
+        );
+        assert_eq!(
+            profiles.model_adapter(&provider, inkling),
+            Adapter::ChatCompletions
+        );
+        let model = profiles.model(&provider, inkling).unwrap();
+        assert_eq!(model.context_window, Some(1_048_576));
+        assert_eq!(model.max_tokens, Some(1_048_576));
+        assert_eq!(model.supports_images(), Some(true));
         assert_eq!(
             keys.custom_credential(&provider, endpoint, &profiles)
                 .and_then(|key| key.literal()),
@@ -1924,7 +2037,7 @@ mod tests {
             "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
         );
         assert!(profiles.credential(&provider, endpoint).is_none());
-        assert_eq!(profiles.model_ids(&provider).len(), 19);
+        assert_eq!(profiles.model_ids(&provider).len(), 20);
     }
 
     #[test]
@@ -2091,6 +2204,39 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_managed_effort_uses_catalog_and_effective_model_route() {
+        let profiles = Profiles::default();
+        let native =
+            profiles.anthropic_managed_effort_models(&Provider::Anthropic, "claude-opus-5", None);
+        assert_eq!(native.len(), 5);
+        assert_eq!(native.get("claude-opus-5"), Some(&true));
+        assert_eq!(native.get("claude-opus-5-5"), Some(&false));
+        assert!(!native.contains_key("claude-opus-4-8"));
+        let openrouter = Provider::named("openrouter").unwrap();
+        let gateway = profiles.anthropic_managed_effort_models(
+            &openrouter,
+            "anthropic/claude-opus-5.5",
+            None,
+        );
+        assert_eq!(gateway.len(), 4);
+        let profiles = Profiles::parse(&json!({"providers":{"custom":{
+            "api":"anthropic-messages","baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMidConvoEffort":true},
+            "models":[
+                {"id":"selected","compat":{"supportsMidConvoEffort":false}},
+                {"id":"rewritten"},
+                {"id":"other-route","baseUrl":"http://localhost:2/v1"}
+            ]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("custom").unwrap();
+        assert_eq!(
+            profiles.anthropic_managed_effort_models(&provider, "selected", None),
+            BTreeMap::from([("rewritten".into(), true)])
+        );
+    }
+
+    #[test]
     fn anthropic_explicit_endpoint_overrides_model_endpoints() {
         let profiles = Profiles::parse(&json!({"providers":{"proxy":{
             "api":"anthropic-messages", "baseUrl":"http://localhost:1/v1",
@@ -2220,6 +2366,34 @@ mod tests {
         let model = profiles.model(&provider, "amazon.nova-lite-v1:0").unwrap();
         assert_eq!(model.context_window, Some(300_000));
         assert_eq!(model.max_tokens, Some(10_000));
+        let nova_cost = model.cost.unwrap().value();
+        assert_eq!(nova_cost["cacheWrite"], 0.06);
+        assert_eq!(profiles.model_ids(&provider).len(), 208);
+        let sol = profiles
+            .model(&provider, "global.openai.gpt-6.2-sol")
+            .unwrap();
+        assert_eq!(sol.context_window, Some(1_050_000));
+        assert_eq!(sol.max_tokens, Some(128_000));
+        let cost = sol.cost.unwrap().value();
+        assert_eq!(cost["tiers"][0]["inputTokensAbove"], 272_000);
+        assert_eq!(cost["tiers"][0]["output"], 15.0);
+    }
+
+    #[test]
+    fn anthropic_tool_input_streaming_uses_the_selected_model_configuration() {
+        let profiles = Profiles::parse(&json!({"providers":{"fireworks":{"modelOverrides":{
+            "accounts/fireworks/models/deepseek-v4p1-flash":{"compat":{"supportsEagerToolInputStreaming":true}}
+        }}}})).unwrap();
+        let provider = profiles.provider("fireworks").unwrap();
+        let forced_eager = "accounts/fireworks/models/deepseek-v4p1-flash";
+        let (default, models) =
+            profiles.anthropic_eager_tool_input_policy(&provider, forced_eager, None);
+        assert!(default);
+        assert_eq!(models.get(forced_eager), None);
+        assert_eq!(
+            models.get("accounts/fireworks/models/gpt-oss-120b"),
+            Some(&false)
+        );
     }
 
     #[test]
@@ -3007,7 +3181,7 @@ mod tests {
         let profiles = Profiles::parse(&json!({})).unwrap();
         let baseten = profiles.provider("baseten").unwrap();
         let nvidia = profiles.provider("nvidia").unwrap();
-        assert_eq!(profiles.model_ids(&baseten).len(), 14);
+        assert_eq!(profiles.model_ids(&baseten).len(), 15);
         assert_eq!(profiles.model_ids(&nvidia).len(), 12);
         assert!(
             !profiles
@@ -3063,6 +3237,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(relay["x-relay-secret"], "private");
+    }
+
+    #[test]
+    fn kimi_k31_pro_catalog_keeps_host_specific_limits_and_compatibility() {
+        let profiles = Profiles::default();
+        let model_id = "moonshotai/Kimi-K3.1-Pro";
+        for (provider_id, total, max_output) in
+            [("baseten", 15, 262_144), ("together", 16, 1_048_576)]
+        {
+            let provider = profiles.provider(provider_id).unwrap();
+            assert_eq!(profiles.model_ids(&provider).len(), total);
+            assert_eq!(
+                profiles.model_adapter(&provider, model_id),
+                Adapter::ChatCompletions
+            );
+            let model = profiles.model(&provider, model_id).unwrap();
+            assert_eq!(model.context_window, Some(1_048_576));
+            assert_eq!(model.max_tokens, Some(max_output));
+            assert_eq!(model.supports_images(), Some(true));
+            assert_eq!(model.image_resize().unwrap().max_width, Some(2000));
+            assert_ne!(
+                profiles
+                    .chat_compatibility(&provider, Some(&model))
+                    .supports_developer_role(),
+                Some(true)
+            );
+        }
+        let together = profiles.provider("together").unwrap();
+        let previous = profiles.model(&together, "moonshotai/Kimi-K3").unwrap();
+        assert_eq!(previous.max_tokens, Some(1_048_576));
+        let latest = profiles.model(&together, model_id).unwrap();
+        assert_eq!(latest.mapped_effort("medium"), Some(None));
     }
 
     #[test]
