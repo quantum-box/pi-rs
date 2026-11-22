@@ -762,6 +762,14 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn update_codex_transport(&mut self, settings: &super::config::Settings) {
+        if let super::providers::Client::OpenAi(client) = &mut self.provider.client {
+            *client = client
+                .clone()
+                .with_codex_transport(settings.codex_transport());
+        }
+    }
+
     pub fn configure_model_options(&mut self, args: &Cli, reported: bool) -> Result<()> {
         let provider = model_client(args, reported, true)?;
         self.read_image_model

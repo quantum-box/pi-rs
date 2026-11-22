@@ -37,6 +37,7 @@ enum Request {
         session: PathBuf,
     },
     CacheWarmingChanged,
+    TransportChanged,
     RenderCustomMessage {
         id: Uuid,
         record_id: u64,
@@ -986,6 +987,20 @@ async fn run_worker(
             break;
         }
         if matches!(request, Request::CacheWarmingChanged) {
+            continue;
+        }
+        if matches!(request, Request::TransportChanged) {
+            match args
+                .settings
+                .reload_with_fallback(&args.workspace, args.trusted, &args.settings)
+            {
+                Ok(settings) => {
+                    args.settings
+                        .apply_worker_settings(&settings, &["transport"]);
+                    runtime.update_codex_transport(&args.settings);
+                }
+                Err(error) => output(json!({"type":"error","message":error.to_string()})),
+            }
             continue;
         }
         if let Request::CheckSessionTransition { id, event } = request {
@@ -2188,6 +2203,7 @@ fn read_requests(
                         request,
                         Request::Configure { .. }
                             | Request::CacheWarmingChanged
+                            | Request::TransportChanged
                             | Request::CheckSessionTransition { .. }
                             | Request::SessionInfoChanged { .. }
                             | Request::SelectionChanged { .. }

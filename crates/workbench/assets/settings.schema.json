@@ -83,6 +83,9 @@
     "showCacheMissNotices": {
       "type": "boolean"
     },
+    "transport": {
+      "enum": ["sse", "websocket", "websocket-cached", "auto"]
+    },
     "cacheWarming": {
       "enum": ["off", "streaming", "idle"]
     },

@@ -1342,6 +1342,7 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
             settings_row_shows(text, "Auto-compact", "true")
         });
         for (setting, first, second) in [
+            ("Transport", "sse", Some("websocket")),
             ("HTTP idle timeout", "disabled", Some("30 sec")),
             ("Steering mode", "all", None),
             ("Follow-up mode", "all", None),
@@ -1422,6 +1423,7 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
         let settings: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
                 .unwrap();
+        assert_eq!(settings["transport"], "websocket");
         assert_eq!(settings["httpIdleTimeoutMs"], 30_000);
         assert_eq!(settings["steeringMode"], "all");
         assert_eq!(settings["followUpMode"], "all");
