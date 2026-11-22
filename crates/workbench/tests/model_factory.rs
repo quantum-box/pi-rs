@@ -163,7 +163,8 @@ async fn capture_model_headers(
             let count = socket.read(&mut chunk).await.unwrap();
             assert_ne!(count, 0);
             bytes.extend_from_slice(&chunk[..count]);
-            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                bytes.truncate(end + 4);
                 break;
             }
         }
@@ -624,7 +625,7 @@ async fn granted_codex_model_routes_use_the_codex_bearer_protocol() {
     auth.register(
         "openai-codex",
         &endpoint,
-        HostCredential::new(HostCredentialKind::Bearer, token).unwrap(),
+        HostCredential::new(HostCredentialKind::Bearer, token.clone()).unwrap(),
     )
     .unwrap();
     let factory = ModelClientFactory::new(auth.build());
@@ -649,6 +650,12 @@ async fn granted_codex_model_routes_use_the_codex_bearer_protocol() {
     )
     .await;
     assert!(captured.starts_with("POST /backend-api/codex/responses HTTP/1.1\r\n"));
+    let bearer = format!("Bearer {token}");
+    assert!(captured.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value.trim() == bearer
+        })
+    }));
     assert!(
         captured
             .to_ascii_lowercase()
