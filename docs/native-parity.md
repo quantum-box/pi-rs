@@ -5709,13 +5709,16 @@ remain.
 
 ### Streaming prompt cache refresh checkpoint
 
-Persistent terminal and RPC workers default to warming eligible caches
-while the agent is waiting for the model or running tools. The worker
+Persistent terminal and RPC workers default to Pi 1.6's `idle` mode.
+This warms eligible caches while the agent is waiting for the model or
+running tools and can continue after the run settles. The worker
 records measured refresh usage against the current model request through
 the agent's journal writer. It cancels stale refreshes when context or
-the request changes. In idle mode the same timer or in-flight refresh
-can continue after the run settles. The terminal settings picker cycles
-through streaming, idle, and off.
+the request changes. An explicit `streaming` setting stops warming after
+the run settles. The terminal settings picker cycles through streaming,
+idle, and off. The worker, settings picker and session status all use
+the idle default when the user setting is absent. The native settings
+loader still reports an invalid mode as a configuration error.
 
 Anthropic models with published adaptive thinking can reuse their exact
 thinking options. Budgeted thinking is skipped because the one-token
