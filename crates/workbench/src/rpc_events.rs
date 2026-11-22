@@ -1041,6 +1041,9 @@ pub(super) fn usage_value(usage: Usage, metadata: &ModelMetadata) -> Value {
             "total":metadata.cost_usd.as_ref().and_then(serde_json::Number::as_f64).unwrap_or_default()
         },
     });
+    if let Some(reasoning) = metadata.reasoning_output_tokens {
+        value["reasoning"] = json!(reasoning);
+    }
     if let Some(long) = metadata.cache_write_1h_tokens {
         value["cacheWrite1h"] = json!(long);
     }
@@ -1060,6 +1063,28 @@ fn timestamp() -> u64 {
 #[cfg(test)]
 mod streaming_tool_tests {
     use super::*;
+
+    #[test]
+    fn portable_usage_reports_reasoning_without_counting_it_twice() {
+        let usage = Usage {
+            input_tokens: 12,
+            output_tokens: 9,
+        };
+        let metadata = ModelMetadata {
+            reasoning_output_tokens: Some(4),
+            ..Default::default()
+        };
+        let value = usage_value(usage, &metadata);
+        assert_eq!(value["reasoning"], 4);
+        assert_eq!(value["output"], 9);
+        assert_eq!(value["totalTokens"], 21);
+        assert!(
+            usage_value(usage, &ModelMetadata::default())
+                .get("reasoning")
+                .is_none()
+        );
+    }
+
     use clap::Parser;
 
     #[test]

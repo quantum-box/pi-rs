@@ -3291,10 +3291,11 @@ prefix-specific character estimates rather than borrowing usage for the whole
 conversation. The compaction record and RPC response report Pi-compatible
 `tokensBefore`, independently of the native retention budget.
 
-Native request budgeting uses adapter-specific message estimates. Anthropic tool
-results count their original text envelope; Bedrock and other adapters that
-extract tool images use a fixed image allowance instead of counting encoded
-image bytes. Bedrock also accepts user images. Matching provider replay blocks,
+Native request budgeting uses adapter-specific message estimates. Anthropic,
+Bedrock, and other adapters that extract tool images use a fixed image
+allowance. Anthropic counts the remaining text envelope and any error-image
+caption. Its request fingerprint changed so old measurements use a fresh
+estimate. Matching provider replay blocks,
 including reasoning and signatures, are included only when the adapter actually
 replays them. Bedrock freezes inspectable SDK credentials or bearer tokens,
 region and endpoint before reusing a measured baseline; opaque SDK clients or
@@ -4145,6 +4146,15 @@ and cache-aware token usage. It translates request and stream errors into
 the existing agent error categories. The journal records the selected
 provider separately from the model ID and accepts older records.
 
+Structured Anthropic tool results send images as Messages API image blocks.
+For errors, the result remains text and the captioned images follow all tool
+results in that user turn. The native tool-result text envelope is retained,
+with attached image data represented by a placeholder. Plain-text results
+and results with invalid supported image data keep their original bytes.
+Request fixtures covered successful and
+failed results, system-update ordering, and image budgets. Live authenticated
+tool-image requests were unverified.
+
 A loopback fixture verified pagination, authentication, image input, a real
 native read tool round trip, usage and RPC. Live account sign-in and provider switching within a running session remain open.
 
@@ -4407,7 +4417,8 @@ another route fails closed. A partial model override alone does not establish a
 routable model for a rewrite. Direct Anthropic declaration-aware streams reject
 strict decisions that only prepared dispatch can retain; preferred fallback
 streams use their resolved unconstrained wire schema. A model capability
-map with no strict-capable entries keeps the legacy Anthropic model fingerprint.
+map with no strict-capable entries keeps the same Anthropic model fingerprint
+as a client without a capability map.
 Existing usage anchors for constrained Anthropic requests can still be invalidated:
 the native agent records a separate prepared-tool configuration hash, and the
 new fallback projection can change the wire schema even with strict disabled
@@ -5098,8 +5109,14 @@ Pi's default or configured `thinkingBudgets`, capped to leave 1,024 tokens for
 the answer within the host's output limit. Off and non-reasoning models omit the
 field. Discovered Ollama reasoning capability is carried through the RPC and
 interactive worker to the request, even when discovery omits explicit thinking
-levels. Chat-template `thinking.budget` variables remain unsupported. The request
-field is covered by loopback tests; no live compatible server was used.
+levels. Both `chatTemplateArgs` for Baseten and `chatTemplateKwargs` for
+`chat-template` can resolve `thinking.budget` using the same cap.
+`chatTemplateKwargs` accepts scalar literals, null, and Pi's three thinking
+variables. An explicitly configured template can use a selected budget for a
+pi-rs custom model with unspecified reasoning capability. The variable is omitted when thinking is off
+or no budget fits. Loopback tests cover the
+top-level field and a Baseten template argument. Live compatible-server
+verification remains open.
 
 Loopback RPC checks exercised model and endpoint switching, header and key
 isolation, reasoning replay, stream completion and reported usage and cost.
@@ -5568,6 +5585,13 @@ summary requests omit automatic keys and retention. Explicit sampling fields
 retain precedence. Native Ollama keeps long retention disabled by default as a
 pi-rs extension; its explicit compatibility setting can enable it.
 
+### Reported reasoning tokens
+
+OpenAI Responses and Chat Completions, Anthropic Messages, Gemini and Pi
+Messages retain provider-reported reasoning token counts. Pi JSON, RPC and
+session imports preserve the `usage.reasoning` field when available. Reasoning
+is part of total output and is counted once for budgets and cost estimates.
+
 ### Responses instruction role
 
 Responses requests use `developer` for models marked as reasoning-capable
@@ -5972,8 +5996,18 @@ named tool choices locally. The option is covered by signed loopback requests
 and a comparison with published Pi payloads. Live Bedrock tool selection with
 account credentials was unverified.
 
+Prepared ConverseStream dispatch supports Pi's strict JSON Schema tool
+sampling. Workbench resolves `compat.supportsStrictMode` against the final
+Bedrock model and its overrides. Supported constraints send `strict: true`
+with the normalized schema. Unsupported required constraints fail before
+dispatch and preferred constraints fall back to the original schema. The
+adapter retains the prepared decision if AWS rejects a request. Pi can retry
+some preferred constraints without strict mode after a service rejection.
+Signed loopback requests verified the wire and reservation schemas. Live
+strict tool sampling with an authenticated AWS account was unverified.
+
 Not yet supported: non-image multimodal inputs, workbench-specific thinking
-display controls, strict tool sampling, guardrails, prompt management ARNs, live account-specific
+display controls, guardrails, prompt management ARNs, live account-specific
 model discovery, and workbench proxy/idle-timeout settings. Custom model endpoints in workbench configuration are rejected;
 callers embedding the adapter can pass a configured AWS SDK client, including a
 test endpoint, through `Bedrock::new`.

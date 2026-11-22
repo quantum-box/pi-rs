@@ -1,6 +1,7 @@
 //! Amazon Bedrock ConverseStream adapter.
 mod headers;
 mod options;
+mod tool_sampling;
 use aws_sdk_bedrockruntime::{
     Client,
     types::{
@@ -56,6 +57,7 @@ pub struct Bedrock {
     thinking_display: ThinkingDisplay,
     interleaved_thinking: bool,
     tool_choice: Option<ToolChoice>,
+    strict_tool_support: bool,
     cache_retention: CacheRetention,
     long_cache_support: Option<bool>,
     force_cache: bool,
@@ -84,6 +86,7 @@ impl Bedrock {
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
             tool_choice: None,
+            strict_tool_support: false,
             cache_retention: default_cache_retention(),
             long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
@@ -112,6 +115,7 @@ impl Bedrock {
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
             tool_choice: None,
+            strict_tool_support: false,
             cache_retention: default_cache_retention(),
             long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
@@ -144,6 +148,7 @@ impl Bedrock {
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
             tool_choice: None,
+            strict_tool_support: false,
             cache_retention: default_cache_retention(),
             long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
@@ -363,6 +368,13 @@ impl Bedrock {
         } else {
             identity
         };
+        let identity = if self.strict_tool_support {
+            identity.and_then(|id| {
+                pi_rs_core::protected_model_fingerprint(&(id, "bedrock-strict-tools-v1"))
+            })
+        } else {
+            identity
+        };
         let mut builder = aws_sdk_bedrockruntime::config::Builder::from(&frozen)
             .identity_cache(aws_sdk_bedrockruntime::config::IdentityCache::no_cache());
         // Freeze the endpoint selected above instead of consulting service
@@ -432,6 +444,55 @@ impl Bedrock {
         self.prepared_identity = None;
         self
     }
+    /// Enable strict JSON Schema sampling when the selected route supports it.
+    pub fn with_strict_tool_support(mut self, supported: bool) -> Self {
+        self.strict_tool_support = supported;
+        self.prepared_identity = None;
+        self
+    }
+
+    /// Freeze the effective sampling decisions together with the AWS tool declarations.
+    pub fn prepare_bound_tool_dispatch(
+        &self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Box<dyn pi_rs_core::PreparedToolDispatch>> {
+        let supports_strict = self.strict_tool_support && self.has_tools(request);
+        let client = if context.summary {
+            self.clone().for_summary()
+        } else {
+            self.clone()
+        };
+        Ok(Box::new(tool_sampling::Prepared::new(
+            client,
+            request,
+            declarations,
+            context,
+            supports_strict,
+        )?))
+    }
+
+    async fn stream_without_retained_decisions(
+        &self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let prepared = self.prepare_bound_tool_dispatch(request, declarations, context)?;
+        if prepared.effective_tools().iter().any(|tool| {
+            matches!(
+                tool.sampling,
+                pi_rs_core::EffectiveToolSampling::StrictJsonSchema { .. }
+            )
+        }) {
+            return Err(Error::Config(
+                "strict tool sampling requires prepared dispatch so its effective decisions can be retained".into(),
+            ));
+        }
+        prepared.dispatch().await
+    }
+
     /// Set explicit cache retention. Use `None` for compaction and other one-off requests.
     pub fn with_cache_retention(mut self, retention: CacheRetention) -> Self {
         self.cache_retention = retention;
@@ -1073,6 +1134,54 @@ impl Model for Bedrock {
         }
     }
 
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs_core::PreparedToolDispatch + 'a>>> {
+        Ok(Some(self.prepare_bound_tool_dispatch(
+            request,
+            declarations,
+            context,
+        )?))
+    }
+
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id,
+            session_id,
+            external_id: external_id.into(),
+            summary: false,
+        };
+        self.stream_without_retained_decisions(&request, declarations, &context)
+            .await
+    }
+
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id,
+            session_id,
+            external_id: session_id.to_string(),
+            summary: true,
+        };
+        self.stream_without_retained_decisions(&request, declarations, &context)
+            .await
+    }
+
     async fn stream_for_summary(
         &self,
         _request_id: uuid::Uuid,
@@ -1082,6 +1191,16 @@ impl Model for Bedrock {
         self.clone().for_summary().stream(request).await
     }
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+        self.stream_with_tools(request, None).await
+    }
+}
+
+impl Bedrock {
+    async fn stream_with_tools(
+        &self,
+        request: ModelRequest,
+        prepared_tools: Option<Vec<types::Tool>>,
+    ) -> Result<ModelStream> {
         if let Some(reason) = &self.unsupported {
             return Err(Error::Config(reason.clone()));
         }
@@ -1275,20 +1394,15 @@ impl Model for Bedrock {
         let tool_config = if tool_free {
             None
         } else {
-            let tools = request
-                .tools
-                .into_iter()
-                .map(|tool| {
-                    Ok(types::Tool::ToolSpec(
-                        types::ToolSpecification::builder()
-                            .name(tool.name)
-                            .description(tool.description)
-                            .input_schema(types::ToolInputSchema::Json(doc(tool.parameters)))
-                            .build()
-                            .map_err(build_error)?,
-                    ))
-                })
-                .collect::<Result<_>>()?;
+            let tools = if let Some(prepared) = prepared_tools {
+                prepared
+            } else {
+                request
+                    .tools
+                    .iter()
+                    .map(|spec| tool_sampling::wire_tool(spec, None))
+                    .collect::<Result<_>>()?
+            };
             let choice = match &self.tool_choice {
                 Some(ToolChoice::Auto) => Some(types::ToolChoice::Auto(
                     types::AutoToolChoice::builder().build(),
