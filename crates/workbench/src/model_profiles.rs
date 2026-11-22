@@ -2289,6 +2289,60 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_chat_catalog_uses_pi_model_routes_and_instruction_defaults() {
+        let profiles = Profiles::default();
+        let provider = Provider::named("openrouter").unwrap();
+        let models = profiles.model_ids(&provider);
+        assert_eq!(models.len(), 417);
+        assert_eq!(
+            models
+                .iter()
+                .filter(|id| profiles.model_adapter(&provider, id) == Adapter::Anthropic)
+                .count(),
+            20
+        );
+        assert!(models.iter().any(|id| id == "openai/gpt-6.2-sol"));
+        assert!(!models.iter().any(|id| id == "inception/mercury-2"));
+        let messages = "anthropic/claude-fable-5.2";
+        assert_eq!(
+            profiles.model_endpoint(&provider, messages),
+            Some("https://openrouter.ai/api/v1/messages")
+        );
+        assert_eq!(
+            profiles.model_adapter(&provider, messages),
+            Adapter::Anthropic
+        );
+        let chat = "openai/gpt-5.6-sol";
+        let metadata = profiles.model(&provider, chat).unwrap();
+        assert_eq!(
+            profiles
+                .chat_compatibility(&provider, Some(&metadata))
+                .supports_developer_role(),
+            None
+        );
+        assert_eq!(
+            profiles.session_affinity(&provider, chat, profiles.endpoint(&provider)),
+            ["x-session-id"]
+        );
+        let overridden = Profiles::parse(&json!({"providers":{"openrouter":{
+            "compat":{"supportsDeveloperRole":true,"sendSessionAffinityHeaders":false}
+        }}}))
+        .unwrap();
+        let metadata = overridden.model(&provider, chat).unwrap();
+        assert_eq!(
+            overridden
+                .chat_compatibility(&provider, Some(&metadata))
+                .supports_developer_role(),
+            Some(true)
+        );
+        assert!(
+            overridden
+                .session_affinity(&provider, chat, overridden.endpoint(&provider))
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn anthropic_fable_5_2_catalog_exposes_pi_limits_and_capabilities() {
         let profiles = Profiles::default();
         let provider = Provider::Anthropic;
@@ -2339,7 +2393,10 @@ mod tests {
             "anthropic/claude-opus-5.5",
             None,
         );
-        assert_eq!(gateway.len(), 4);
+        assert_eq!(gateway.len(), 5);
+        assert_eq!(gateway.get("anthropic/claude-fable-5.2"), Some(&false));
+        assert_eq!(gateway.get("anthropic/claude-haiku-5.5"), Some(&true));
+        assert!(!gateway.contains_key("anthropic/claude-opus-5"));
         let profiles = Profiles::parse(&json!({"providers":{"custom":{
             "api":"anthropic-messages","baseUrl":"http://localhost:1/v1",
             "compat":{"supportsMidConvoEffort":true},

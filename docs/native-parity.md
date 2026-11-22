@@ -4157,9 +4157,9 @@ Embedders can opt out of interleaving or request omitted thinking text while
 retaining its replay signature. Loopback requests verified the header and
 payload. Live authenticated interleaved thinking was unverified.
 
-Anthropic Messages uses per-reply effort for the six direct Anthropic and four
-OpenRouter catalog models marked `supportsMidConvoEffort`. The top-level
-effort stays low while system messages set the historical and active reply
+Anthropic Messages uses per-reply effort for Anthropic and OpenRouter catalog
+models marked `supportsMidConvoEffort`. The top-level effort stays low while
+system messages set the historical and active reply
 levels. Adaptive thinking drops signed blocks whose cached prefix no longer
 matches. Explicit off omits effort messages and block binding on models that
 can disable thinking. For models with an explicit null off mapping, an unset
@@ -5382,10 +5382,13 @@ The offline Fireworks catalog matches the Pi 1.6.0 release. It includes
 16 Messages models and 11 Chat Completions models. DeepSeek V4.1 Flash
 1017 Ultra-fast uses adaptive thinking and image input on the Messages
 route. Kimi K3.1 Pro uses Chat Completions with model-specific reasoning
-and image support. The offline OpenRouter catalog includes 19 Messages
-models alongside Chat Completions. The official Messages routes use
-bearer authentication. Environment credentials and
-imported provider-wide keys or OpenRouter OAuth work on the official routes.
+and image support. The OpenRouter catalog follows Pi AI v1.6.0 and includes
+20 Messages models and 397 Chat Completions models. OpenRouter Chat Completions
+uses the system instruction role by default. Profiles can override the role or
+disable session affinity. OpenRouter Fable 5.2 uses Messages with per-reply
+effort. The official Messages routes use bearer authentication. Environment
+credentials, imported provider-wide keys, and OpenRouter OAuth work on those
+routes.
 Explicitly stored keys remain bound to their saved endpoints. Loopback tests
 covered adaptive thinking, effort mapping and replay with Fireworks empty
 signatures and OpenRouter signed blocks. Fireworks Kimi models retain
