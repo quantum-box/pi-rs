@@ -324,6 +324,8 @@ async fn send(socket: &mut Socket, mut body: Value, timeout: Option<Duration>) -
     .map_err(|_| disconnected())
 }
 
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
+
 async fn next_response_frame(socket: &mut Socket, timeout: Option<Duration>) -> Result<Message> {
     let next = async {
         while let Some(frame) = socket.next().await {
@@ -331,7 +333,7 @@ async fn next_response_frame(socket: &mut Socket, timeout: Option<Duration>) -> 
             match &frame {
                 Message::Ping(_) | Message::Pong(_) => {}
                 Message::Text(payload) if payload.is_empty() => {}
-                Message::Binary(payload) if payload.is_empty() => {}
+                Message::Binary(payload) if payload.is_empty() || payload.as_ref() == UTF8_BOM => {}
                 _ => return Ok(frame),
             }
         }
@@ -477,6 +479,13 @@ pub(super) async fn open(
             if seen > super::MAX_STREAM {
                 Err(Error::Model("OpenAI stream exceeds 32 MiB".into()))?;
             }
+            // Pi uses TextDecoder for binary frames, including leading BOM
+            // removal and replacement of malformed UTF-8 sequences.
+            let payload = if matches!(&frame, Message::Binary(_)) {
+                payload.strip_prefix(UTF8_BOM).unwrap_or(payload)
+            } else {
+                payload
+            };
             let event: Value = serde_json::from_str(&String::from_utf8_lossy(payload))
                 .map_err(|_| Error::Model("invalid Codex WebSocket event".into()))?;
             let kind = event["type"].as_str().unwrap_or_default();
@@ -1319,6 +1328,15 @@ mod tests {
                 .send(Message::Binary(Vec::new().into()))
                 .await
                 .unwrap();
+            socket.send(Message::Binary(UTF8_BOM.into())).await.unwrap();
+            socket
+                .send(Message::Binary(
+                    b"\xef\xbb\xbf{\"type\":\"response.output_text.delta\",\"delta\":\"\xff\"}"
+                        .as_slice()
+                        .into(),
+                ))
+                .await
+                .unwrap();
             socket
                 .send(Message::Binary(
                     serde_json::to_vec(&json!({
@@ -1344,7 +1362,12 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(result.is_ok(), "{result:?}");
+        let events = result.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ModelEvent::Text(text) if text == "\u{fffd}"))
+        );
         server.await.unwrap();
     }
 
