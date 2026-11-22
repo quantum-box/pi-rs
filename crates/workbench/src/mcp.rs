@@ -32,7 +32,26 @@ use uuid::Uuid;
 use crate::mcp_progress::{self, ProgressTransport, ToolProgress};
 use crate::mcp_provider_auth::ProviderClient;
 pub use crate::mcp_provider_auth::TokenResolver;
+use crate::mcp_resource_compat::ResourceCompatibility;
 use crate::process_cleanup::Children;
+
+/// Validate the URL before storing or connecting to a streamable HTTP server.
+pub fn validate_server_url(url: &str) -> Result<()> {
+    let parsed = reqwest_mcp::Url::parse(url)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .ok_or_else(|| Error::Config("MCP URL must be an HTTP or HTTPS URL".into()))?;
+    let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if (parsed.scheme() == "http" && !loopback)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(Error::Config(
+            "MCP URL requires HTTPS or loopback HTTP and no embedded credentials".into(),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -58,8 +77,35 @@ pub struct ServerConfig {
     pub oauth: Option<crate::mcp_auth::OAuthSetting>,
     pub auth: Option<ProviderAuth>,
     #[serde(default)]
-    pub tool_exposure: BTreeMap<String, String>,
+    pub tool_exposure: ToolExposure,
 }
+
+/// Tool exposure overrides in configuration order.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(transparent)]
+pub struct ToolExposure(indexmap::IndexMap<String, String>);
+
+impl std::ops::Deref for ToolExposure {
+    type Target = indexmap::IndexMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ToolExposure {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl PartialEq for ToolExposure {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.iter().eq(other.0.iter())
+    }
+}
+
+impl Eq for ToolExposure {}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct ProviderAuth {
@@ -691,7 +737,7 @@ impl McpExtension {
                             owned_stdio_transport(wrapped, owner)?,
                             Some(Arc::from(name)),
                         );
-                        let transport = native.progress_transport(transport);
+                        let transport = native.progress_transport(ResourceCompatibility(transport));
                         native.serve_with_lifecycle(transport, lifecycle).await
                     }
                     None => {
@@ -700,7 +746,7 @@ impl McpExtension {
                             TokioChildProcess::new(wrapped)?,
                             Some(Arc::from(name)),
                         );
-                        let transport = native.progress_transport(transport);
+                        let transport = native.progress_transport(ResourceCompatibility(transport));
                         native.serve_with_lifecycle(transport, lifecycle).await
                     }
                 };
@@ -719,17 +765,7 @@ impl McpExtension {
             {
                 return Err(Error::Config("MCP URL requires streamable HTTP".into()));
             }
-            let parsed = reqwest_mcp::Url::parse(url)
-                .map_err(|_| Error::Config("invalid MCP URL".into()))?;
-            let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-            if !(parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback))
-                || !parsed.username().is_empty()
-                || parsed.password().is_some()
-            {
-                return Err(Error::Config(
-                    "MCP URL requires HTTPS or loopback HTTP and no embedded credentials".into(),
-                ));
-            }
+            validate_server_url(url)?;
             let mut headers = HashMap::new();
             for (name, value) in &config.headers {
                 let name: reqwest_mcp::header::HeaderName = name
@@ -1254,6 +1290,16 @@ fn publish_page_output(
     Ok(())
 }
 
+fn mcp_tool_outcome(mut data: Value) -> Outcome {
+    if let Some(fields) = data.as_object_mut() {
+        fields.shift_remove("_meta");
+    }
+    Outcome::Structured {
+        data,
+        attachments: vec![],
+    }
+}
+
 enum CallError {
     Other(String),
     TransientHttp(String),
@@ -1319,7 +1365,10 @@ async fn start_http_service<C: StreamableHttpClient + Clone>(
         );
         let result = native
             .clone()
-            .serve_with_lifecycle(native.progress_transport(transport), lifecycle.clone())
+            .serve_with_lifecycle(
+                native.progress_transport(ResourceCompatibility(transport)),
+                lifecycle.clone(),
+            )
             .await;
         match (result, delay) {
             (Err(error), Some(delay)) if transient_http_initialization(&error) => {
@@ -1470,6 +1519,7 @@ impl McpTool {
             }
         };
         match result {
+            Ok(CallResult::Data(data)) if !self.resource => mcp_tool_outcome(data),
             Ok(CallResult::Data(data)) if data["isError"] == true => {
                 Outcome::Failed(data.to_string())
             }
@@ -1965,15 +2015,7 @@ impl Tool for McpTool {
             };
             match response.task.payload {
                 rmcp::model::TaskPayload::Completed { result } => {
-                    let data = Value::Object(result);
-                    return Some(if data["isError"] == true {
-                        Outcome::Failed(data.to_string())
-                    } else {
-                        Outcome::Structured {
-                            data,
-                            attachments: vec![],
-                        }
-                    });
+                    return Some(mcp_tool_outcome(Value::Object(result)));
                 }
                 rmcp::model::TaskPayload::Failed { error } => {
                     return Some(Outcome::Failed(Value::Object(error).to_string()));
@@ -3007,6 +3049,25 @@ mod tests {
         assert!(!tool_enabled(&config, "write"));
     }
     #[test]
+    fn tool_exposure_prefers_exact_names_then_the_first_matching_pattern() {
+        let config: ServerConfig = serde_json::from_value(json!({
+            "command":"server",
+            "toolExposure":{"read*":"direct","*":"deferred","read_secret":"hidden"}
+        }))
+        .unwrap();
+        assert_eq!(tool_exposure(&config, "read_secret"), "hidden");
+        assert_eq!(tool_exposure(&config, "read_public"), "direct");
+        assert_eq!(tool_exposure(&config, "write"), "deferred");
+
+        let reordered: ServerConfig = serde_json::from_value(json!({
+            "command":"server",
+            "toolExposure":{"*":"deferred","read*":"direct","read_secret":"hidden"}
+        }))
+        .unwrap();
+        assert_eq!(tool_exposure(&reordered, "read_public"), "deferred");
+        assert_ne!(config, reordered);
+    }
+    #[test]
     fn task_identity_uses_canonical_workspace_across_resume() {
         let config: ServerConfig =
             serde_json::from_value(json!({"url":"http://127.0.0.1:8000/mcp"})).unwrap();
@@ -3018,6 +3079,32 @@ mod tests {
             .finalize();
         assert_eq!(relative, absolute);
     }
+    #[test]
+    fn mcp_tool_results_keep_structured_errors_and_drop_private_metadata() {
+        let result = json!({
+            "isError":true,
+            "content":[{"type":"text","text":"not available"}],
+            "structuredContent":{"reason":"not_ready","_meta":"tool data"},
+            "_meta":{"secret":"private server metadata"}
+        });
+        let outcome = mcp_tool_outcome(result.clone());
+        assert!(outcome.is_error());
+        assert!(outcome.tool_content().contains("not available"));
+        assert!(!outcome.tool_content().contains("private server metadata"));
+        let Outcome::Structured { data, .. } = outcome else {
+            panic!("MCP error result was discarded");
+        };
+        assert_eq!(data["structuredContent"], result["structuredContent"]);
+        assert!(data.get("_meta").is_none());
+        assert_eq!(data["isError"], true);
+
+        let success = mcp_tool_outcome(json!({"content":[],"_meta":{"secret":"private"}}));
+        assert!(!success.is_error());
+        assert!(
+            matches!(success, Outcome::Structured { data, .. } if data == json!({"content":[]}))
+        );
+    }
+
     #[test]
     fn resource_and_prompt_exposure_respects_server_and_tool_overrides() {
         let config: ServerConfig = serde_json::from_value(
