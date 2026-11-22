@@ -399,7 +399,8 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
         AuthCommand::Check { .. } => unreachable!("check already returned"),
     };
     let mut matches = Vec::new();
-    for candidate in &candidates(&args)? {
+    let candidates = candidates(&args)?;
+    for candidate in &candidates {
         if let Some(credential) = resolve(&args, candidate, false, minimum, Some(kind)).await?
             && let Some(value) = credential.value
         {
