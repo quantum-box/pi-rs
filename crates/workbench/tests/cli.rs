@@ -7789,7 +7789,8 @@ fn bare_model_patterns_search_provider_catalogs_before_local_model_fallback() {
     let root = tempfile::tempdir().unwrap();
     let models = json!({"providers":{
         "relay-one":{"api":"openai-completions","baseUrl":"https://one.example/v1","apiKey":"fixture",
-            "models":[{"id":"widget-a","name":"Widget Alpha"},{"id":"widget-z-20260101","name":"Widget Snapshot"}]},
+            "models":[{"id":"widget-a","name":"Widget Alpha"},{"id":"widget-z-20260101","name":"Widget Snapshot"},
+                {"id":"crystal-a","name":"Crystal"},{"id":"crystal-z","name":"Crystal Next"}]},
         "relay-two":{"api":"openai-completions","baseUrl":"https://two.example/v1",
             "models":[{"id":"widget-z","name":"Widget Pro"},{"id":"widget-a","name":"Widget Alpha"}]}
     }});
@@ -7830,6 +7831,8 @@ fn bare_model_patterns_search_provider_catalogs_before_local_model_fallback() {
         ("Widget", true, "relay-two", "widget-z"),
         ("widget-z-20260101", false, "relay-one", "widget-z-20260101"),
         ("Widget Pro", false, "relay-two", "widget-z"),
+        ("Crystal", false, "relay-one", "crystal-z"),
+        ("relay-one/Crystal", false, "relay-one", "crystal-a"),
     ] {
         let result = run(query, inline);
         assert!(

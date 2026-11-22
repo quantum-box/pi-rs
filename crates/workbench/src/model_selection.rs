@@ -463,6 +463,8 @@ fn resolve_cli_catalog_model(
             if query.is_empty() {
                 continue;
             }
+            // Pi treats display names as fuzzy matches, even when the whole
+            // name matches. Only literal IDs receive exact precedence here.
             let mut fuzzy = Vec::new();
             for (provider, models) in &catalogs {
                 fuzzy.extend(models.iter().filter_map(|id| {
