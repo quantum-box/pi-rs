@@ -1057,6 +1057,7 @@ mod tests {
             socket.close(None).await.unwrap();
 
             tokio::select! {
+                biased;
                 result = next_attempt => result.unwrap(),
                 attempt = listener.accept() => panic!("interrupted request was dispatched again: {attempt:?}"),
             }
