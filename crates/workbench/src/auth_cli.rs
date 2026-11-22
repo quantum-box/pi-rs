@@ -423,6 +423,9 @@ async fn logout(settings: &super::config::Settings, reference: &str) -> Result<i
         Some(AuthType::ApiKey) => emit(&format!(
             "Removed stored API key for {name}. Environment variables and models.json config are unchanged."
         ))?,
+        Some(AuthType::UnresolvedAuthorization) => {
+            emit(&format!("Removed stored credentials for {name}."))?;
+        }
         None => emit(&format!(
             "No stored credentials for {name}. Environment variables and models.json config are unchanged."
         ))?,
