@@ -4061,8 +4061,9 @@ The direct Anthropic catalog includes Claude Fable 5.2 from Pi v1.6.0.
 The model accepts text and images, has a one-million-token context window
 and a 128,000-token model output limit, and adds xhigh and max to its standard
 effort levels.
-The catalog retains Pi 1.6.0's mid-conversation system and tool-change
-capability flags for the direct Messages route.
+The catalog records Pi 1.6.0's mid-conversation system and tool-change
+capability flags for the direct Messages route. Using both capabilities in
+direct Messages requests still requires separate adapter support.
 The catalog includes Pi's model-specific pricing, prompt-cache lifetimes,
 and image limits. Provider-side model fallback requests and fallback pricing
 remain open. Live Fable 5.2 inference was unverified.
