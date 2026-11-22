@@ -232,6 +232,12 @@ fn terminal_appearance_notifications_follow_the_saved_theme_selection() {
         assert!(!text.contains("\x1b[?996n"));
         text.contains("\x1b]11;?\x07") && text.contains("Enter to send")
     });
+    master.write_all(b"\x1b[?1;2c/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        assert!(!text.contains("\x1b[?2031h"));
+        assert!(!text.contains("\x1b[?996n"));
+        text.contains("Reloaded settings") && text.contains("\x1b]11;?\x07")
+    });
     master.write_all(b"\x1b[?1;2c/theme light/dark\r").unwrap();
     output_until(&mut master, |text| {
         text.contains("\x1b[?2031h\x1b[?996n") && text.contains("\x1b]11;?\x07")
