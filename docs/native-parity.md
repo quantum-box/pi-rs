@@ -705,6 +705,18 @@ surrogate in the same string. For records up to 1 MiB, a diagnostic-only retry
 also recognizes controls after a surrogate in another string when it is the
 next parser error. Larger records, retry depth or number-range failures, and
 other unmapped errors retain the Rust JSON parser's wording.
+JSON and RPC use Pi 1.6.0's shared `compaction_start` and `compaction_end`
+events for both manual and automatic compaction. For automatic compaction,
+`reason` is `"threshold"` or `"overflow"`.
+Native threshold compaction can run before a model request, so its events
+can precede `agent_end`. Pi 1.6.0 runs threshold compaction after the
+agent attempt ends. Native completion follows the compaction hooks and
+carries the committed summary, context token estimates and any recorded
+usage or details. Failed or cancelled attempts
+also close the pair. Recovering a completed overflow summary after reopening
+emits the pair around its durable commit. An optional extension-only attempt
+that produces no compaction emits no pair. RPC state reports `isCompacting` during the attempt.
+
 Model-list discovery runs independently of the RPC input loop, so a slow model
 endpoint does not block cancellation or other commands. Concurrent discovery
 requests are bounded and retain their individual response IDs.
