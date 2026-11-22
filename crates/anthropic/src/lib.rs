@@ -2716,7 +2716,9 @@ impl Anthropic {
                         let mut replay = BTreeMap::new();
                         if retain_replay {
                             for (index, block) in blocks {
-                                replay.insert(index, block.finish(allow_empty_signature)?);
+                                if matches!(block.raw["type"].as_str(), Some("text" | "thinking" | "redacted_thinking")) {
+                                    replay.insert(index, block.finish(allow_empty_signature)?);
+                                }
                             }
                         }
                         let mut completed_calls = Vec::new();
@@ -2744,9 +2746,7 @@ impl Anthropic {
                                 && let Some(id) = metadata.provider_request_id.as_ref().filter(|id| !id.is_empty())
                                 && let Some(thread_request) = thread_request.as_ref()
                             {
-                                let mut thread_blocks: Vec<_> = replay.values()
-                                    .filter(|block| matches!(block["type"].as_str(), Some("text" | "thinking" | "redacted_thinking" | "tool_use")))
-                                    .cloned().collect();
+                                let mut thread_blocks: Vec<_> = replay.values().cloned().collect();
                                 if oauth {
                                     normalize_oauth_tool_use_names(&mut thread_blocks);
                                 }
@@ -3902,6 +3902,8 @@ mod tests {
                         json!({"type":"message_start","message":{"id":reply,"model":"claude-20261001","usage":{"input_tokens":1}}}),
                         json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":reply}}),
                         json!({"type":"content_block_stop","index":0}),
+                        json!({"type":"content_block_start","index":1,"content_block":{"type":"future_response_block","data":"not replayable"}}),
+                        json!({"type":"content_block_stop","index":1}),
                         json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
                         json!({"type":"message_stop"}),
                     ];
@@ -3957,6 +3959,11 @@ mod tests {
             }
             let metadata = last.unwrap();
             assert_eq!(metadata.provider_request_id.as_deref(), Some(expected));
+            if expected == "msg_a" {
+                let replay = metadata.replay.as_ref().unwrap();
+                assert_eq!(replay.blocks.len(), 1);
+                assert_eq!(replay.blocks[0]["type"], "text");
+            }
             assert_eq!(
                 metadata
                     .diagnostics
