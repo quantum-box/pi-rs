@@ -28,6 +28,7 @@ pub(super) struct Profiles {
 #[derive(Clone)]
 struct Profile {
     provider: Provider,
+    name: Option<String>,
     endpoint: String,
     base_url: Option<String>,
     configured_cloudflare_base: Option<String>,
@@ -141,6 +142,7 @@ impl RequestHeaders {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfiguredProfile {
+    name: Option<String>,
     base_url: Option<String>,
     api: Option<String>,
     api_key: Option<String>,
@@ -1077,6 +1079,7 @@ impl Profiles {
                     id.clone(),
                     Profile {
                         provider,
+                        name: profile.name,
                         endpoint,
                         base_url: profile.base_url,
                         configured_cloudflare_base,
@@ -1138,6 +1141,34 @@ impl Profiles {
             .get(&name.to_ascii_lowercase())
             .map(|profile| profile.provider.clone())
             .or_else(|| Provider::named(name))
+    }
+
+    pub fn provider_display_name<'a>(&'a self, provider: &'a Provider) -> &'a str {
+        self.entries
+            .get(provider.id())
+            .and_then(|profile| profile.name.as_deref())
+            .unwrap_or_else(|| provider.display_name())
+    }
+
+    pub fn auth_provider(&self, reference: &str) -> Result<Option<Provider>> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Ok(None);
+        }
+        if let Some(provider) = self.provider(reference) {
+            return Ok(Some(provider));
+        }
+        let normalized = reference.to_lowercase();
+        let mut matches = self
+            .providers()
+            .filter(|provider| self.provider_display_name(provider).to_lowercase() == normalized);
+        let provider = matches.next();
+        if matches.next().is_some() {
+            return Err(Error::Config(
+                "More than one provider uses that name. Specify its provider ID.".into(),
+            ));
+        }
+        Ok(provider)
     }
 
     pub fn providers(&self) -> impl Iterator<Item = Provider> + '_ {

@@ -1,15 +1,17 @@
-//! Check or explicitly print credentials using the normal endpoint-bound auth sources.
+//! Manage credentials using the normal endpoint-bound auth sources.
 use std::io::{self, Write};
 use std::time::Duration;
 
 use clap::Subcommand;
 use pi_rs::{Error, Result};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{Cli, Provider, model_selection, radius_auth};
 
 #[derive(Clone, Subcommand)]
 pub(super) enum AuthCommand {
+    /// Remove a saved credential for a provider.
+    Logout { provider: String },
     /// Check whether a provider has usable credentials.
     Check {
         #[arg(long)]
@@ -252,6 +254,101 @@ fn emit(line: &str) -> Result<()> {
     Ok(())
 }
 
+fn auth_type(entry: &Value) -> Option<AuthType> {
+    match entry["type"].as_str() {
+        Some("api_key") => Some(AuthType::ApiKey),
+        Some("oauth") => Some(AuthType::OAuth),
+        _ => None,
+    }
+}
+
+fn radius_refresh_pending(entry: &Value) -> bool {
+    entry
+        .get(radius_auth::REFRESH_PENDING)
+        .is_some_and(|pending| pending != false)
+}
+
+async fn logout(settings: &super::config::Settings, reference: &str) -> Result<i32> {
+    use super::{auth_lock, config, model_auth, model_profiles};
+
+    let printable = |value: &str| -> String {
+        value
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect()
+    };
+    let path = config::agent_dir().join("auth.json");
+    let data = config::read_auth_object(&path).await?;
+    let profiles = model_profiles::Profiles::load(&model_auth::Keys::parse(&data))?;
+    let provider = profiles.auth_provider(reference)?;
+    let id = provider.as_ref().map_or(reference, Provider::id);
+    let name = printable(provider.as_ref().map_or(reference, |provider| {
+        profiles.provider_display_name(provider)
+    }));
+    let stored = auth_type(&data[id]);
+    if provider.is_none() && stored.is_none() {
+        let mut ids: Vec<_> = data
+            .as_object()
+            .expect("auth object")
+            .iter()
+            .filter(|(_, entry)| auth_type(entry).is_some())
+            .map(|(id, _)| printable(id))
+            .collect();
+        ids.sort_unstable();
+        eprintln!("Unknown provider \"{name}\".");
+        let saved = if ids.is_empty() {
+            "none".into()
+        } else {
+            ids.join(", ")
+        };
+        eprintln!("Stored credentials: {saved}");
+        return Ok(1);
+    }
+
+    let removed = match id {
+        "openai-chatgpt" if stored != Some(AuthType::ApiKey) => {
+            super::chatgpt_auth::logout(settings)
+                .await?
+                .then_some(AuthType::OAuth)
+        }
+        "radius" if stored == Some(AuthType::OAuth) || radius_refresh_pending(&data[id]) => {
+            radius_auth::Gateway::configured_with_settings(settings)?
+                .logout()
+                .await?
+                .then_some(AuthType::OAuth)
+        }
+        _ if stored.is_some() => {
+            let guard = auth_lock::acquire_async(&path).await?;
+            let data = config::read_auth_object_locked(&guard)?;
+            let current = auth_type(&data[id]);
+            if current.is_some()
+                && (id != "radius"
+                    || (current == Some(AuthType::ApiKey) && !radius_refresh_pending(&data[id])))
+                && (id != "openai-chatgpt" || current == Some(AuthType::ApiKey))
+            {
+                config::update_object_locked(&path, Some(&guard), |entries| {
+                    entries.remove(id);
+                    Ok(())
+                })?;
+                current
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    match removed {
+        Some(AuthType::OAuth) => emit(&format!("Logged out of {name}."))?,
+        Some(AuthType::ApiKey) => emit(&format!(
+            "Removed stored API key for {name}. Environment variables and models.json config are unchanged."
+        ))?,
+        None => emit(&format!(
+            "No stored credentials for {name}. Environment variables and models.json config are unchanged."
+        ))?,
+    }
+    Ok(0)
+}
+
 pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
     // Auth commands are dispatched before normal interactive configuration is loaded.
     // Honor existing trust decisions without prompting in this noninteractive command.
@@ -271,6 +368,9 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
         return Err(Error::Config(
             "omit --api-key when resolving configured credentials".into(),
         ));
+    }
+    if let AuthCommand::Logout { provider } = command {
+        return logout(&args.settings, &provider).await;
     }
     let name = args
         .provider_argument
@@ -375,7 +475,9 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
             min_expiry.unwrap_or(Duration::from_secs(30 * 60)),
             "OAuth bearer token",
         ),
-        AuthCommand::Check { .. } => unreachable!("check already returned"),
+        AuthCommand::Check { .. } | AuthCommand::Logout { .. } => {
+            unreachable!("credential management already returned")
+        }
     };
     let mut matches = Vec::new();
     for candidate in &candidates {

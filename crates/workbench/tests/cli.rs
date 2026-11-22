@@ -9225,6 +9225,112 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
 }
 
 #[test]
+fn auth_logout_resolves_provider_names_and_preserves_other_credential_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("models.json");
+    let models = json!({"providers":{"example-lab":{
+        "name":"Example Lab", "api":"openai-completions",
+        "baseUrl":"https://example.test/v1", "apiKey":"configured-fixture",
+        "models":[{"id":"chat"}]
+    }}})
+    .to_string();
+    std::fs::write(&config, &models).unwrap();
+    let auth = root.path().join("auth.json");
+    let oauth =
+        json!({"type":"oauth", "access":"test-access", "refresh":"test-refresh", "expires":1});
+    let original = json!({
+        "example-lab":{"type":"api_key", "key":"saved-fixture", "endpoint":"https://example.test/v1/chat/completions"},
+        "extension-oauth":oauth,
+        "unrelated":{"type":"api_key", "key":"retained-fixture"}
+    });
+    std::fs::write(&auth, original.to_string()).unwrap();
+    let logout = |provider: &str| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["auth", "logout", provider])
+            .output()
+            .unwrap()
+    };
+    let output = logout("  eXaMpLe LAB  ");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Removed stored API key for Example Lab. Environment variables and models.json config are unchanged."
+    );
+    let output = logout("extension-oauth");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Logged out of extension-oauth."
+    );
+    let after = std::fs::read_to_string(&auth).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&after).unwrap(),
+        json!({"unrelated":original["unrelated"]})
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), models);
+
+    let output = logout("Google Vertex AI");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .starts_with("No stored credentials for Google Vertex AI.")
+    );
+    let output = logout("missing");
+    assert_eq!(output.status.code(), Some(1));
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostic.contains("Unknown provider \"missing\".\n"));
+    assert!(diagnostic.contains("Stored credentials: unrelated"));
+    assert_eq!(std::fs::read_to_string(&auth).unwrap(), after);
+}
+
+#[test]
+fn auth_logout_keeps_radius_credentials_for_a_different_gateway() {
+    let root = tempfile::tempdir().unwrap();
+    let auth = root.path().join("auth.json");
+    let original = json!({"radius":{
+        "type":"oauth", "access":"test-access", "refresh":"test-refresh", "expires":1,
+        "gateway":"https://other-gateway.example.test/"
+    }});
+    std::fs::write(&auth, original.to_string()).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .env(
+            "PI_RADIUS_GATEWAY",
+            "https://configured-gateway.example.test/",
+        )
+        .args(["auth", "logout", "radius"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).starts_with("No stored credentials for Radius.")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&auth).unwrap()).unwrap(),
+        original
+    );
+}
+
+#[test]
 fn chatgpt_auth_check_no_refresh_uses_saved_credential() {
     let root = tempfile::tempdir().unwrap();
     let credential = json!({"client_id":"client","subject":"subject","email":null,"id_token":"id","access_token":"cached","refresh_token":"refresh","expires_at":1,"scopes":["chatgpt.tokens.use.direct"]});
