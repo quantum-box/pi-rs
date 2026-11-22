@@ -33,8 +33,42 @@ fn now() -> u64 {
         .as_millis() as u64
 }
 
+pub(super) fn enterprise_domain(input: Option<&str>) -> Result<Option<String>> {
+    let Some(input) = input.map(str::trim).filter(|input| !input.is_empty()) else {
+        return Ok(None);
+    };
+    let url = if input.contains("://") {
+        Url::parse(input)
+    } else {
+        Url::parse(&format!("https://{input}"))
+    }
+    .map_err(|_| error("invalid GitHub Enterprise domain"))?;
+    let Some(host) = url.domain() else {
+        return Err(error("invalid GitHub Enterprise domain"));
+    };
+    if url.scheme() != "https"
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !host.contains('.')
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(error("invalid GitHub Enterprise domain"));
+    }
+    Ok((host != "github.com").then(|| host.to_owned()))
+}
+
 pub(super) fn read_entry(entry: &Value) -> Result<Credential> {
-    let credential: Credential =
+    let mut credential: Credential =
         serde_json::from_value(entry.clone()).map_err(|_| error("invalid saved credential"))?;
     if !super::model_auth::valid_key(&credential.access)
         || !super::model_auth::valid_key(&credential.refresh)
@@ -42,28 +76,43 @@ pub(super) fn read_entry(entry: &Value) -> Result<Credential> {
     {
         return Err(error("invalid saved credential"));
     }
+    credential.enterprise_url = enterprise_domain(credential.enterprise_url.as_deref())?;
     Ok(credential)
 }
 
-fn endpoint_host(token: &str) -> Result<&'static str> {
+fn endpoint_host(token: &str, enterprise: Option<&str>) -> Result<String> {
     let proxy = token
         .split(';')
         .find_map(|field| field.strip_prefix("proxy-ep="));
     match proxy {
-        None | Some("proxy.individual.githubcopilot.com" | "api.individual.githubcopilot.com") => {
-            Ok(API)
+        None => Ok(enterprise.map_or_else(|| API.into(), |domain| format!("copilot-api.{domain}"))),
+        Some("proxy.individual.githubcopilot.com" | "api.individual.githubcopilot.com") => {
+            Ok(API.into())
         }
         Some("proxy.business.githubcopilot.com" | "api.business.githubcopilot.com") => {
-            Ok("api.business.githubcopilot.com")
+            Ok("api.business.githubcopilot.com".into())
         }
         Some("proxy.enterprise.githubcopilot.com" | "api.enterprise.githubcopilot.com") => {
-            Ok("api.enterprise.githubcopilot.com")
+            Ok("api.enterprise.githubcopilot.com".into())
         }
-        Some(_) => Err(error("unrecognized token routing host")),
+        Some(host) => {
+            let api = host
+                .strip_prefix("proxy.")
+                .map(|host| format!("api.{host}"));
+            let host = api.as_deref().unwrap_or(host);
+            if let Some(domain) = enterprise
+                && [format!("api.{domain}"), format!("copilot-api.{domain}")]
+                    .iter()
+                    .any(|allowed| allowed == host)
+            {
+                return Ok(host.to_owned());
+            }
+            Err(error("unrecognized token routing host"))
+        }
     }
 }
 
-pub(super) fn routed_endpoint(endpoint: &str, token: &str) -> Result<String> {
+pub(super) fn routed_endpoint(endpoint: &str, credential: &Credential) -> Result<String> {
     if !super::builtin_chat::find(PROVIDER)
         .is_some_and(|builtin| builtin.is_official_endpoint(endpoint))
     {
@@ -77,8 +126,11 @@ pub(super) fn routed_endpoint(endpoint: &str, token: &str) -> Result<String> {
             "saved credentials require an official Copilot API route",
         ));
     }
-    url.set_host(Some(endpoint_host(token)?))
-        .map_err(|_| error("invalid API endpoint"))?;
+    url.set_host(Some(&endpoint_host(
+        &credential.access,
+        credential.enterprise_url.as_deref(),
+    )?))
+    .map_err(|_| error("invalid API endpoint"))?;
     Ok(url.to_string())
 }
 
@@ -96,6 +148,7 @@ struct Service {
     github_access_url: String,
     token_url: String,
     catalog_url: Option<String>,
+    enterprise: Option<String>,
 }
 
 impl Service {
@@ -119,7 +172,19 @@ impl Service {
             github_access_url: GITHUB_ACCESS_URL.into(),
             token_url: TOKEN_URL.into(),
             catalog_url: None,
+            enterprise: None,
         })
+    }
+
+    fn with_enterprise(mut self, enterprise: Option<String>) -> Self {
+        if self.enterprise != enterprise {
+            let domain = enterprise.as_deref().unwrap_or("github.com");
+            self.device_code_url = format!("https://{domain}/login/device/code");
+            self.github_access_url = format!("https://{domain}/login/oauth/access_token");
+            self.token_url = format!("https://api.{domain}/copilot_internal/v2/token");
+        }
+        self.enterprise = enterprise;
+        self
     }
 
     async fn device_login(&self, announce: impl Fn(&Url, &str)) -> Result<Credential> {
@@ -146,7 +211,7 @@ impl Service {
             .ok()
             .filter(|url| {
                 url.scheme() == "https"
-                    && url.host_str() == Some("github.com")
+                    && url.host_str() == Some(self.enterprise.as_deref().unwrap_or("github.com"))
                     && url.port().is_none()
                     && url.username().is_empty()
                     && url.password().is_none()
@@ -183,7 +248,7 @@ impl Service {
                         refresh: refresh.into(),
                         expires: 0,
                         available_model_ids: None,
-                        enterprise_url: None,
+                        enterprise_url: self.enterprise.clone(),
                     })
                     .await;
             }
@@ -201,15 +266,6 @@ impl Service {
     }
 
     async fn refresh(&self, credential: &Credential) -> Result<Credential> {
-        if credential
-            .enterprise_url
-            .as_deref()
-            .is_some_and(|domain| !domain.is_empty() && domain != "github.com")
-        {
-            return Err(error(
-                "a private GitHub Enterprise authentication host is unsupported",
-            ));
-        }
         let token = read_json(
             self.client
                 .get(&self.token_url)
@@ -226,7 +282,7 @@ impl Service {
             .filter(|deadline| *deadline > now())
             .ok_or_else(|| error("invalid token expiry"))?
             .saturating_sub(300_000);
-        let host = endpoint_host(access)?;
+        let host = endpoint_host(access, credential.enterprise_url.as_deref())?;
         let catalog_url = self
             .catalog_url
             .clone()
@@ -309,6 +365,7 @@ fn available_models(value: &Value, policy_fallback: bool) -> Result<Vec<String>>
 
 pub(super) async fn login(
     settings: &super::config::Settings,
+    enterprise: Option<&str>,
     control: super::meta_auth::LoginControl,
     announce: impl Fn(&Url, &str),
 ) -> Result<()> {
@@ -317,7 +374,10 @@ pub(super) async fn login(
         .await?
         .get(PROVIDER)
         .cloned();
-    let credential = Service::new(settings)?.device_login(announce).await?;
+    let credential = Service::new(settings)?
+        .with_enterprise(enterprise_domain(enterprise)?)
+        .device_login(announce)
+        .await?;
     let guard = super::auth_lock::acquire_async(&path).await?;
     control.begin_commit()?;
     super::config::update_object_locked(&path, Some(&guard), |data| {
@@ -336,21 +396,22 @@ pub(super) async fn access(
     minimum: Option<Duration>,
     no_refresh: bool,
 ) -> Result<String> {
-    access_for_path(
+    credential_for_path(
         &super::config::agent_dir().join("auth.json"),
         settings,
         minimum,
         no_refresh,
     )
     .await
+    .map(|credential| credential.access)
 }
 
-pub(super) async fn access_for_path(
+pub(super) async fn credential_for_path(
     path: &std::path::Path,
     settings: &super::config::Settings,
     minimum: Option<Duration>,
     no_refresh: bool,
-) -> Result<String> {
+) -> Result<Credential> {
     access_at(path, Service::new(settings)?, minimum, no_refresh).await
 }
 
@@ -359,7 +420,7 @@ async fn access_at(
     service: Service,
     minimum: Option<Duration>,
     no_refresh: bool,
-) -> Result<String> {
+) -> Result<Credential> {
     let read = |data: &Value| {
         if data[PROVIDER]["type"] != "oauth" {
             return Err(error("no saved GitHub Copilot subscription credential"));
@@ -367,7 +428,7 @@ async fn access_at(
         read_entry(&data[PROVIDER])
     };
     if no_refresh {
-        return Ok(read(&super::config::read_auth_object(path).await?)?.access);
+        return read(&super::config::read_auth_object(path).await?);
     }
     let window_ms = minimum
         .unwrap_or_default()
@@ -380,7 +441,7 @@ async fn access_at(
         Err(lock_error) => {
             let credential = read(&super::config::read_readonly_auth(path, lock_error)?)?;
             if fresh(credential.expires) {
-                return Ok(credential.access);
+                return Ok(credential);
             }
             return Err(error("cannot refresh credentials in a read-only store"));
         }
@@ -389,7 +450,7 @@ async fn access_at(
     let credential = read(&stored)?;
     guard.check()?;
     if fresh(credential.expires) {
-        return Ok(credential.access);
+        return Ok(credential);
     }
 
     let path = path.to_owned();
@@ -402,6 +463,7 @@ async fn access_at(
             .map_err(|_| error("cannot start refresh runtime"))?;
         let barrier = super::process::refresh_barrier()?;
         let guard = super::process::guard_refresh_auth(barrier, guard);
+        let service = service.with_enterprise(credential.enterprise_url.clone());
         let credential = runtime.block_on(service.refresh(&credential))?;
         super::config::update_object_locked(&path, Some(&guard), |data| {
             let entry = data
@@ -418,7 +480,7 @@ async fn access_at(
         if minimum.is_some() && !fresh(credential.expires) {
             return Err(error("refreshed token expires too soon"));
         }
-        Ok(credential.access)
+        Ok(credential)
     })
     .await
     .map_err(|_| error("refresh task failed"))?
@@ -491,6 +553,7 @@ mod tests {
             github_access_url: format!("{base}/access"),
             token_url: format!("{base}/token"),
             catalog_url: Some(format!("{base}/models")),
+            enterprise: None,
         };
         (service, handle)
     }
@@ -532,10 +595,10 @@ mod tests {
         let (service, worker) = fixture(token_and_catalogue());
         let token = access_at(&auth, service, None, false).await.unwrap();
         worker.join().unwrap();
-        assert_eq!(endpoint_host(&token).unwrap(), API);
+        assert_eq!(endpoint_host(&token.access, None).unwrap(), API);
         let saved = super::super::config::read_auth_object(&auth).await.unwrap();
         let credential = &saved[PROVIDER];
-        assert_eq!(credential["access"], token.as_str());
+        assert_eq!(credential["access"], token.access);
         assert_eq!(credential["refresh"], "long-lived-fixture");
         assert_eq!(credential["extra"], original[PROVIDER]["extra"]);
         assert_eq!(credential["availableModelIds"], json!(["gpt-6.1-sol"]));
@@ -565,6 +628,7 @@ mod tests {
             github_access_url: format!("{base}/access"),
             token_url: format!("{base}/token"),
             catalog_url: Some(format!("{base}/models")),
+            enterprise: None,
         };
         let (started, started_rx) = tokio::sync::oneshot::channel();
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
@@ -608,7 +672,7 @@ mod tests {
             .unwrap()
             .unwrap();
         pending.abort();
-        assert!(pending.await.unwrap_err().is_cancelled());
+        assert!(pending.await.err().unwrap().is_cancelled());
         let mut read = tokio::spawn(async move { crate::config::read_auth_object(&auth).await });
         assert!(
             tokio::time::timeout(Duration::from_millis(100), &mut read)
@@ -645,9 +709,15 @@ mod tests {
             let (service, worker) = fixture(exchanges);
             let result = access_at(&path, service, minimum, false).await;
             if minimum.is_some() {
-                assert!(result.unwrap_err().to_string().contains("expires too soon"));
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("expires too soon")
+                );
             } else {
-                assert_eq!(endpoint_host(&result.unwrap()).unwrap(), API);
+                assert_eq!(endpoint_host(&result.unwrap().access, None).unwrap(), API);
             }
             worker.join().unwrap();
             let saved = crate::config::read_auth_object(&path).await.unwrap();
@@ -676,6 +746,15 @@ mod tests {
 
     #[tokio::test]
     async fn copilot_device_flow_polls_then_exchanges_github_token() {
+        assert_copilot_device_flow(None).await;
+        assert_copilot_device_flow(Some("example.ghe.com")).await;
+    }
+
+    async fn assert_copilot_device_flow(enterprise: Option<&str>) {
+        let verification_url = format!(
+            "https://{}/login/device",
+            enterprise.unwrap_or("github.com")
+        );
         let mut exchanges = vec![
             Exchange {
                 request: "POST /device ",
@@ -683,7 +762,7 @@ mod tests {
                 form: Some("scope=read%3Auser"),
                 response: json!({
                     "device_code":"fixture-device","user_code":"AB12-CD34",
-                    "verification_uri":"https://github.com/login/device","interval":1,"expires_in":7,
+                    "verification_uri":verification_url,"interval":1,"expires_in":7,
                 }),
             },
             Exchange {
@@ -706,11 +785,12 @@ mod tests {
             },
         ];
         exchanges.extend(token_and_catalogue());
-        let (service, worker) = fixture(exchanges);
+        let (mut service, worker) = fixture(exchanges);
+        service.enterprise = enterprise.map(str::to_owned);
         let observed = std::cell::Cell::new(false);
         let credential = service
             .device_login(|url, code| {
-                assert_eq!(url.as_str(), "https://github.com/login/device");
+                assert_eq!(url.as_str(), verification_url);
                 assert_eq!(code, "AB12-CD34");
                 observed.set(true);
             })
@@ -719,7 +799,85 @@ mod tests {
         worker.join().unwrap();
         assert!(observed.get());
         assert_eq!(credential.refresh, "long-lived-fixture");
+        assert_eq!(credential.enterprise_url.as_deref(), enterprise);
         assert_eq!(credential.available_model_ids.unwrap(), ["gpt-6.1-sol"]);
+    }
+
+    #[test]
+    fn enterprise_copilot_binds_refresh_and_routing_to_the_saved_domain() {
+        let enterprise =
+            enterprise_domain(Some("https://Example.ghe.com/enterprises/team")).unwrap();
+        assert_eq!(enterprise.as_deref(), Some("example.ghe.com"));
+        assert_eq!(enterprise_domain(Some("github.com")).unwrap(), None);
+        for invalid in [
+            "http://example.ghe.com",
+            "https://example.ghe.com:444",
+            "https://user@example.ghe.com",
+            "https://127.0.0.1",
+            "https://example.ghe.com?next=elsewhere.test",
+        ] {
+            assert!(enterprise_domain(Some(invalid)).is_err(), "{invalid}");
+        }
+        let service = Service::new(&super::super::config::Settings::default())
+            .unwrap()
+            .with_enterprise(enterprise.clone());
+        assert_eq!(
+            service.device_code_url,
+            "https://example.ghe.com/login/device/code"
+        );
+        assert_eq!(
+            service.github_access_url,
+            "https://example.ghe.com/login/oauth/access_token"
+        );
+        assert_eq!(
+            service.token_url,
+            "https://api.example.ghe.com/copilot_internal/v2/token"
+        );
+        let route = format!("https://{API}/responses");
+        let credential = |token: &str| Credential {
+            access: token.into(),
+            refresh: "fixture-refresh".into(),
+            expires: 1,
+            available_model_ids: None,
+            enterprise_url: enterprise.clone(),
+        };
+        assert_eq!(
+            routed_endpoint(&route, &credential("fixture")).unwrap(),
+            "https://copilot-api.example.ghe.com/responses"
+        );
+        assert_eq!(
+            routed_endpoint(&route, &credential("proxy-ep=proxy.example.ghe.com")).unwrap(),
+            "https://api.example.ghe.com/responses"
+        );
+        assert!(routed_endpoint(&route, &credential("proxy-ep=proxy.other.ghe.com")).is_err());
+    }
+
+    #[tokio::test]
+    async fn saved_enterprise_refresh_retains_its_domain_and_catalogue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let original = json!({PROVIDER:{
+            "type":"oauth","access":"expired","refresh":"long-lived-fixture","expires":1,
+            "enterpriseUrl":"https://example.ghe.com"
+        }});
+        std::fs::write(&path, original.to_string()).unwrap();
+        let mut exchanges = token_and_catalogue();
+        exchanges[0].response["token"] = json!("enterprise-access-fixture");
+        let (mut service, worker) = fixture(exchanges);
+        service.enterprise = Some("example.ghe.com".into());
+        let credential = access_at(&path, service, None, false).await.unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            credential.enterprise_url.as_deref(),
+            Some("example.ghe.com")
+        );
+        assert_eq!(credential.available_model_ids.unwrap(), ["gpt-6.1-sol"]);
+        let saved = super::super::config::read_auth_object(&path).await.unwrap();
+        assert_eq!(
+            saved[PROVIDER]["enterpriseUrl"],
+            original[PROVIDER]["enterpriseUrl"]
+        );
+        assert_eq!(saved[PROVIDER]["access"], "enterprise-access-fixture");
     }
 
     #[test]
@@ -751,16 +909,32 @@ mod tests {
         let keys = Keys::parse(&json!({"github-copilot": {
             "type":"oauth","access":"fixture","refresh":"refresh-fixture","expires":1,
         }}));
+        let credential = |token: &str| {
+            read_entry(&json!({
+                "type":"oauth", "access":token, "refresh":"fixture", "expires":1,
+            }))
+            .unwrap()
+        };
         for route in ["/chat/completions", "/v1/messages", "/responses"] {
             let endpoint = format!("https://{API}{route}");
             assert!(keys.oauth(&provider, &endpoint));
             assert_eq!(
-                routed_endpoint(&endpoint, "proxy-ep=proxy.business.githubcopilot.com").unwrap(),
+                routed_endpoint(
+                    &endpoint,
+                    &credential("proxy-ep=proxy.business.githubcopilot.com")
+                )
+                .unwrap(),
                 format!("https://api.business.githubcopilot.com{route}")
             );
-            assert!(routed_endpoint(&endpoint, "proxy-ep=external.example").is_err());
+            assert!(routed_endpoint(&endpoint, &credential("proxy-ep=external.example")).is_err());
         }
         assert!(!keys.oauth(&provider, "https://external.example/v1/messages"));
-        assert!(routed_endpoint("https://external.example/v1/messages", "fixture").is_err());
+        assert!(
+            routed_endpoint(
+                "https://external.example/v1/messages",
+                &credential("fixture")
+            )
+            .is_err()
+        );
     }
 }
