@@ -11,6 +11,7 @@ mod extension_boundary;
 mod host_auth;
 mod journal;
 mod lifecycle;
+mod mcp_registration;
 mod message_hooks;
 mod model_catalog;
 mod model_price;
@@ -49,6 +50,7 @@ pub use lifecycle::{
     notify as notify_extension_lifecycle, notify_filtered as notify_extension_lifecycle_filtered,
     notify_in_session as notify_extension_lifecycle_in_session,
 };
+pub use mcp_registration::{McpServerDeclaration, RegisteredMcpServer};
 pub use message_hooks::{AssistantMessageUpdate, MessageLifecycleEvent, MessageStatus};
 pub use model_catalog::*;
 pub use model_price::ChatPrice;
