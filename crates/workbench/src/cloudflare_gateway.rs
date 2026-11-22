@@ -63,6 +63,11 @@ impl Route {
         Self::from_endpoint(&format!("{PREFIX}{account}/{gateway}/{path}"))
     }
 
+    pub fn matches_configured(base: &str, account: &str, gateway: &str) -> bool {
+        Self::new(account, gateway)
+            .is_some_and(|route| Self::from_configured(base, Some(&route)) == Some(route))
+    }
+
     pub fn endpoint(&self, adapter: Adapter) -> Option<String> {
         let path = match adapter {
             Adapter::ChatCompletions => "compat/chat/completions",
@@ -121,6 +126,13 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::time::Duration;
+
+    #[test]
+    fn cloudflare_login_validates_fixed_identifiers_in_gateway_templates() {
+        let base = "https://gateway.ai.cloudflare.com/v1/fixed/{CLOUDFLARE_GATEWAY_ID}/compat";
+        assert!(Route::matches_configured(base, "fixed", "other-gateway"));
+        assert!(!Route::matches_configured(base, "wrong", "other-gateway"));
+    }
 
     #[test]
     fn official_routes_use_their_api_and_keep_scoped_keys_private() {

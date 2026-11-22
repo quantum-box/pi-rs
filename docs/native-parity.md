@@ -4851,6 +4851,29 @@ A loopback server held the final argument fragment until the RPC client
 observed the first one. The fixture covered stable indexes after
 reasoning, final arguments and tool output, and abort before completion.
 
+### Provider sign-in from the CLI
+
+`pi auth login <provider>` requires a terminal and uses provider IDs or
+display names. It prefers account authorization where supported.
+`--api-key` prompts without echoing the credential, and saves it for the
+configured endpoint. Bedrock also offers an AWS profile or the existing
+credential chain. Vertex also offers ADC or a service account file.
+Cloudflare routes with account or gateway placeholders prompt for the
+identifiers and reject values that conflict with a configured gateway route.
+Fixed Cloudflare endpoints prompt for the API key only.
+`--no-browser` selects copy-code or device authorization for Anthropic,
+Codex and Radius respectively. Other account flows print their sign-in
+instructions without opening a browser. GitHub Copilot asks for an Enterprise
+domain before starting device authorization. An empty answer uses github.com.
+The OpenAI subscription continues to
+use pi-rs's separate `openai-chatgpt` provider identity. Its CLI sign-in
+also accepts the full redirect URL from a browser on another device after
+checking the same callback URL, state, and client ID as loopback sign-in.
+Saved credentials are applied when the next command loads the model configuration.
+Local terminal and CLI fixtures cover masked key input, command parsing, and
+cancelling a pending browser sign-in with Ctrl-C.
+Real OAuth sign-in and inference were unverified.
+
 ### Provider credential logout
 
 `pi auth logout <provider>` removes the saved key or OAuth entry from

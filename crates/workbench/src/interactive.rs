@@ -7139,12 +7139,6 @@ fn edit_cloudflare_login(view: &mut View, field: CloudflareLoginField) {
     view.local_editor = Some((LocalEditor::CloudflareLogin(field), dialog));
 }
 
-fn cloudflare_login_matches_gateway_base(base: &str, account: &str, gateway: &str) -> bool {
-    super::cloudflare_gateway::Route::new(account, gateway).is_some_and(|route| {
-        super::cloudflare_gateway::Route::from_configured(base, Some(&route)) == Some(route)
-    })
-}
-
 fn advance_cloudflare_login(
     field: &CloudflareLoginField,
     text: &str,
@@ -7193,7 +7187,7 @@ fn advance_cloudflare_login(
             provider,
             (provider == &args.provider).then_some(args.model.as_str()),
         )
-        && !cloudflare_login_matches_gateway_base(base, account, gateway)
+        && !super::cloudflare_gateway::Route::matches_configured(base, account, gateway)
     {
         return Err(Error::Config(
             "Enter identifiers that match the configured Cloudflare route".into(),
@@ -9815,21 +9809,6 @@ mod tests {
         let mut view = super::View::default();
         view.maybe_warn_about_anthropic_subscription(&args);
         assert!(view.lines.is_empty());
-    }
-
-    #[test]
-    fn cloudflare_login_validates_fixed_identifiers_in_gateway_templates() {
-        let base = "https://gateway.ai.cloudflare.com/v1/fixed/{CLOUDFLARE_GATEWAY_ID}/compat";
-        assert!(cloudflare_login_matches_gateway_base(
-            base,
-            "fixed",
-            "other-gateway"
-        ));
-        assert!(!cloudflare_login_matches_gateway_base(
-            base,
-            "wrong",
-            "other-gateway"
-        ));
     }
 
     #[test]
