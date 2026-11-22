@@ -471,13 +471,14 @@ async fn access_at(
     let client = client.clone();
     let token_endpoint = token_endpoint.clone();
     // Keep the exchange and disk write alive if the requesting turn is cancelled.
-    tokio::task::spawn_blocking(move || {
+    super::model_auth::await_admitted_oauth_refresh(Some(PROVIDER), move |admitted| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| error("cannot start refresh runtime"))?;
         let barrier = super::process::refresh_barrier()?;
         let guard = super::process::guard_refresh_auth(barrier, guard);
+        let _ = admitted.send(());
         let replacement =
             runtime.block_on(refresh_token(&client, token_endpoint, &stored.refresh))?;
         let Credential {
@@ -510,7 +511,6 @@ async fn access_at(
         Ok(access)
     })
     .await
-    .map_err(|_| error("refresh task failed"))?
 }
 
 async fn refresh_token(client: &Client, token_endpoint: Url, refresh: &str) -> Result<Credential> {

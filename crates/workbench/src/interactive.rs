@@ -137,6 +137,56 @@ struct Terminal {
     appearance_notifications: bool,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
+    #[cfg(unix)]
+    _suspend_signal: Option<SuspendSignal>,
+}
+
+#[cfg(unix)]
+static SUSPEND_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+static TERMINAL_SIGNAL_WRITER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(unix)]
+extern "C" fn request_terminal_suspend(_: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    SUSPEND_REQUESTED.store(true, Ordering::Relaxed);
+    let fd = TERMINAL_SIGNAL_WRITER.load(Ordering::Relaxed);
+    // The signal registry keeps the nonblocking writer alive for the process.
+    if fd >= 0 {
+        let wake = [b'S'];
+        unsafe { libc::write(fd, wake.as_ptr().cast(), wake.len()) };
+    }
+}
+
+#[cfg(unix)]
+struct SuspendSignal(libc::sigaction);
+
+#[cfg(unix)]
+impl SuspendSignal {
+    fn install() -> std::io::Result<Self> {
+        // Restore the previous disposition when relinquishing the terminal.
+        // In particular, the editor and Ctrl+Z must still stop the job.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = request_terminal_suspend as *const () as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            let mut previous = std::mem::MaybeUninit::uninit();
+            if libc::sigaction(libc::SIGTSTP, &action, previous.as_mut_ptr()) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self(previous.assume_init()))
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SuspendSignal {
+    fn drop(&mut self) {
+        unsafe { libc::sigaction(libc::SIGTSTP, &self.0, std::ptr::null_mut()) };
+        SUSPEND_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(unix)]
@@ -157,6 +207,13 @@ struct ColorQuery {
 }
 
 #[cfg(any(unix, windows))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppearanceProbe {
+    WaitingForColors,
+    WaitingForMarker,
+}
+
+#[cfg(any(unix, windows))]
 #[derive(Default)]
 struct ColorQueries {
     initial_started: Option<Instant>,
@@ -165,6 +222,7 @@ struct ColorQueries {
     disabled: bool,
     last_appearance_report: Option<bool>,
     refresh_after_subscription: bool,
+    appearance_probe: Option<AppearanceProbe>,
 }
 
 impl Terminal {
@@ -174,6 +232,8 @@ impl Terminal {
         #[cfg(any(unix, windows))] previous_colors: Option<ColorQueries>,
         #[cfg(any(unix, windows))] auto_appearance: bool,
     ) -> Result<Self> {
+        #[cfg(unix)]
+        let suspend_signal = SuspendSignal::install()?;
         terminal::enable_raw_mode()?;
         #[cfg(any(unix, windows))]
         let initial_colors = previous_colors.is_none();
@@ -187,6 +247,8 @@ impl Terminal {
             appearance_notifications: false,
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
+            #[cfg(unix)]
+            _suspend_signal: Some(suspend_signal),
         };
         if guard.alternate {
             execute!(
@@ -226,6 +288,8 @@ impl Terminal {
             return Ok(false);
         }
         self.appearance_notifications = enabled;
+        self.colors.appearance_probe =
+            (enabled && !self.colors.disabled).then_some(AppearanceProbe::WaitingForColors);
         let command = if enabled {
             "\x1b[?2031h\x1b[?996n"
         } else {
@@ -362,6 +426,9 @@ impl ColorQueries {
             quarantined: false,
             batch: crate::ui::terminal_color_batch::ColorBatch::new(started),
         });
+        if self.appearance_probe == Some(AppearanceProbe::WaitingForColors) {
+            self.appearance_probe = Some(AppearanceProbe::WaitingForMarker);
+        }
         let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
         for index in 0..16 {
             query.push_str(&format!("\x1b]4;{index};?\x07"));
@@ -381,14 +448,9 @@ impl ColorQueries {
 
     fn appearance_report(&mut self, dark: bool, output: &mut dyn Write) -> Result<bool> {
         let previous = self.last_appearance_report.replace(dark);
-        // The first report may be the response to ?996n sent at startup.
-        // It cannot be distinguished from a simultaneous notification.
-        let initial_report = previous.is_none()
-            && self
-                .color_queries
-                .front()
-                .is_some_and(|query| Some(query.started) == self.initial_started);
-        if !initial_report {
+        // The first report before the matching color query's DA1 may answer
+        // the explicit appearance probe. That query already refreshes colors.
+        if self.appearance_probe.take().is_none() {
             self.query_terminal_colors(output)?;
         }
         Ok(std::mem::take(&mut self.refresh_after_subscription)
@@ -450,6 +512,9 @@ impl ColorQueries {
 
     fn finish_color_query(&mut self, output: &mut dyn Write) -> Result<()> {
         self.color_queries.pop_front();
+        if self.appearance_probe == Some(AppearanceProbe::WaitingForMarker) {
+            self.appearance_probe = None;
+        }
         if std::mem::take(&mut self.color_requery) {
             self.query_terminal_colors(output)?;
         }
@@ -480,6 +545,7 @@ impl ColorQueries {
         // Neither can be attributed reliably once ownership has changed.
         self.color_queries.clear();
         self.color_requery = false;
+        self.appearance_probe = None;
         self.disabled = true;
     }
 
@@ -768,13 +834,14 @@ fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Resul
 
     let (mut reader, writer) = std::os::unix::net::UnixStream::pair()?;
     writer.set_nonblocking(true)?;
+    let signal_fd = writer.as_raw_fd();
     // Capture the editor state in the signal handler, not later on the reader
     // thread. write(2) is async-signal-safe and the stream stays registered
     // for the lifetime of the process.
     let id = unsafe {
         signal_hook_registry::register(libc::SIGINT, move || {
             if !EXTERNAL_EDITOR_ACTIVE.load(Ordering::SeqCst) {
-                let byte = [1_u8];
+                let byte = [b'I'];
                 libc::write(writer.as_raw_fd(), byte.as_ptr().cast(), byte.len());
             }
             #[cfg(test)]
@@ -792,8 +859,10 @@ fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Resul
                 }
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
-                    Ok(_) => {
-                        super::process::TERMINAL_INTERRUPTED.store(true, Ordering::SeqCst);
+                    Ok(count) => {
+                        if buffer[..count].contains(&b'I') {
+                            super::process::TERMINAL_INTERRUPTED.store(true, Ordering::SeqCst);
+                        }
                         notify.notify_one();
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -805,6 +874,7 @@ fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Resul
         signal_hook_registry::unregister(id);
         return Err(error.into());
     }
+    TERMINAL_SIGNAL_WRITER.store(signal_fd, Ordering::Relaxed);
     super::process::TERMINAL_SIGNAL_ENABLED.store(true, Ordering::SeqCst);
     Ok(())
 }
@@ -1088,6 +1158,7 @@ struct View {
     custom_render_redraw_at: Option<Instant>,
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
+    theme_refresh_requested: bool,
     thinking_settings: Option<ThinkingSettings>,
     pending_thinking: Option<PendingThinking>,
     session_name: Option<String>,
@@ -1453,6 +1524,16 @@ impl View {
             .collect();
         self.append_entry(Entry::Notice(text));
     }
+    fn show_status(&mut self, mode: Option<TuiMode>, status: String) {
+        if (mode != Some(TuiMode::Regular) || self.regular.committed < self.lines.len())
+            && let Some(Entry::Status(previous)) = self.lines.last_mut()
+        {
+            *previous = status;
+        } else {
+            self.append_entry(Entry::Status(status));
+        }
+    }
+
     fn append_entry(&mut self, entry: Entry) {
         self.lines.push(entry);
         if self.lines.len() > 4000 {
@@ -1751,6 +1832,32 @@ impl View {
     }
 
     fn receive_worker(&mut self, mut value: Value, args: &mut Cli) {
+        if value["type"] == "response" && value["command"] == "set_session_label" {
+            if let Ok(request) = serde_json::from_value(value["id"].take())
+                && let Some(picker) = &mut self.picker
+                && let Some(target) = picker.take_tree_label(request)
+            {
+                if value["success"] == true {
+                    let focus = match picker.selected() {
+                        Some(Selection::Checkout(record)) => record,
+                        _ => target,
+                    };
+                    match Session::snapshot(&args.session) {
+                        Ok(session) => picker.refresh_tree(
+                            session_tree::picker(&session, TreeFilter::Default),
+                            focus,
+                        ),
+                        Err(error) => picker.show_feedback(Err(error.to_string())),
+                    }
+                } else {
+                    let message = value["error"]
+                        .as_str()
+                        .unwrap_or("Could not save the label");
+                    picker.show_feedback(Err(message.into()));
+                }
+            }
+            return;
+        }
         if value["type"] == "resources_discovered" {
             match serde_json::from_value::<pi_rs::DiscoveredResources>(value["resources"].take())
                 .map_err(Error::from)
@@ -2761,6 +2868,23 @@ impl View {
                 self.mouse.highlight(&mut lines, start..end);
             }
         }
+        let search_overlay = self.search.as_ref().filter(|_| !modal).map(|search| {
+            let search_width = (width * 2 / 5).max(32).min(width.saturating_sub(2).max(1));
+            let left = width.saturating_sub(search_width + 1);
+            let top = usize::from(body_height > 3);
+            let (mut lines, cursor_row, cursor_column) = search.overlay(theme, keys, search_width);
+            if !hardware_cursor && let Some(line) = lines.get_mut(cursor_row) {
+                line.mark_cursor(cursor_column);
+            }
+            lines.truncate(body_height);
+            (
+                top..top + lines.len(),
+                left..left + search_width,
+                lines,
+                cursor_row,
+                cursor_column,
+            )
+        });
         let stdout = std::io::stdout();
         let mut out = FrameWriter::new(
             stdout.lock(),
@@ -2807,12 +2931,19 @@ impl View {
         for (row, line) in lines[start..end].iter().enumerate() {
             queue!(out, MoveTo(0, (row + header_rows) as u16))?;
             line.draw(&mut out, if modal { width } else { body_width })?;
-            self.graphics.paint(
-                line,
-                &mut out,
-                row,
-                images::visible_rows(&lines[start + row..end]),
-            )?;
+            let covered = search_overlay.as_ref().is_some_and(|(rows, columns, ..)| {
+                line.image
+                    .as_ref()
+                    .is_some_and(|image| image.intersects(row, rows, columns))
+            });
+            if !covered {
+                self.graphics.paint(
+                    line,
+                    &mut out,
+                    row,
+                    images::visible_rows(&lines[start + row..end]),
+                )?;
+            }
         }
         if !modal
             && width > 1
@@ -2885,18 +3016,12 @@ impl View {
             "dim",
         )
         .draw(&mut out, width)?;
-        if !modal && let Some(search) = &self.search {
-            let search_width = (width * 2 / 5).max(32).min(width.saturating_sub(2).max(1));
-            let left = width.saturating_sub(search_width + 1);
-            let top = header_rows + usize::from(body_height > 3);
-            let (mut overlay, cursor_row, cursor_column) =
-                search.overlay(theme, keys, search_width);
-            if !hardware_cursor && let Some(line) = overlay.get_mut(cursor_row) {
-                line.mark_cursor(cursor_column);
-            }
-            for (row, line) in overlay.iter().take(body_height).enumerate() {
+        if let Some((rows, columns, overlay, cursor_row, cursor_column)) = search_overlay {
+            let left = columns.start;
+            let top = header_rows + rows.start;
+            for (row, line) in overlay.iter().enumerate() {
                 queue!(out, MoveTo(left as u16, (top + row) as u16))?;
-                line.draw(&mut out, search_width)?;
+                line.draw(&mut out, columns.len())?;
             }
             if cursor_row < body_height {
                 queue!(
@@ -2938,6 +3063,27 @@ impl View {
             )?;
             self.regular.started = false;
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn suspend_terminal(
+        &mut self,
+        terminal: &mut Option<Terminal>,
+        mode: Option<TuiMode>,
+    ) -> Result<()> {
+        if mode == Some(TuiMode::Regular) {
+            self.finish_regular()?;
+        }
+        if let Err(error) = Terminal::suspend(terminal, mode, self.graphics.cleanup()) {
+            self.append(&error.to_string());
+        }
+        if self.graphics.enabled() {
+            images::query_cell_size()?;
+        }
+        self.graphics.reset();
+        self.regular.redraw = true;
+        self.regular.started = false;
         Ok(())
     }
 
@@ -3128,8 +3274,8 @@ impl View {
         };
         let modal = self.picker.is_some() || self.dialog().is_some();
         let committing = !busy && !modal;
-        // A trailing cycle notice can still be replaced by another cycle.
-        let trailing_status = matches!(self.lines.last(), Some(Entry::ModelCycleStatus(_)));
+        // A trailing status can still be replaced by another status.
+        let trailing_status = matches!(self.lines.last(), Some(Entry::Status(_)));
         let commit_end = if committing {
             (self.lines.len() - usize::from(trailing_status)).max(self.regular.committed)
         } else {
@@ -4503,14 +4649,24 @@ pub(super) async fn run(
             interrupted = true;
             break 'interactive;
         }
+        #[cfg(unix)]
+        if SUSPEND_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
+            && _terminal.is_some()
+        {
+            view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+            dirty = true;
+        }
         #[cfg(any(unix, windows))]
         if let Some(terminal) = &mut _terminal {
             let enabled = follows_terminal_appearance(args.use_theme.as_deref());
+            let refresh_requested = std::mem::take(&mut view.theme_refresh_requested);
             let mut output = std::io::stdout();
             if terminal.set_appearance_notifications(enabled, &mut output)? && enabled {
                 terminal
                     .colors
                     .refresh_after_appearance_subscription(&mut output)?;
+            } else if refresh_requested {
+                terminal.colors.query_terminal_colors(&mut output)?;
             }
         }
         if let Some(task) = &auth_reload {
@@ -4953,6 +5109,9 @@ pub(super) async fn run(
                 view.dialogs.clear();
                 if view.tree_handoff.take().is_some() {
                     view.append("Branch navigation stopped when the active worker exited");
+                }
+                if let Some(picker) = &mut view.picker {
+                    picker.cancel_pending_tree_label();
                 }
                 if let Some((id, _)) = view.tree_navigation.take()
                     && let Err(error) = reopen_tree(&mut args, &mut view, id)
@@ -5660,6 +5819,7 @@ pub(super) async fn run(
                     }
                     continue;
                 }
+                let mut submit_completion = false;
                 if let Some(mut picker) = view.picker.take() {
                     let input = if mouse_activate {
                         picker.activate_mouse_selection(&keys)
@@ -5744,14 +5904,24 @@ pub(super) async fn run(
                             view.picker = Some(picker);
                         }
                         Input::SetTreeLabel(id, label) => {
-                            let result = Session::open(&args.session).and_then(|mut session| {
-                                session.set_label(id, (!label.is_empty()).then_some(label))?;
-                                picker.refresh_tree(
-                                    session_tree::picker(&session, TreeFilter::Default),
-                                    id,
-                                );
-                                Ok(())
-                            });
+                            let label = (!label.is_empty()).then_some(label);
+                            let result = if let Some(active) =
+                                worker.as_mut().filter(|worker| worker.busy)
+                            {
+                                let request = uuid::Uuid::new_v4();
+                                active.send(json!({
+                                    "type":"set_session_label","target":id,"label":label,"id":request,
+                                })).map(|()| picker.track_tree_label(request, id))
+                            } else {
+                                Session::open(&args.session).and_then(|mut session| {
+                                    session.set_label(id, label)?;
+                                    picker.refresh_tree(
+                                        session_tree::picker(&session, TreeFilter::Default),
+                                        id,
+                                    );
+                                    Ok(())
+                                })
+                            };
                             if let Err(error) = result {
                                 picker.show_feedback(Err(error.to_string()));
                             }
@@ -5801,6 +5971,13 @@ pub(super) async fn run(
                         }
                         Input::Select(selection) => {
                             view.tree_confirmation = None;
+                            // A leading slash word opens the command-name menu.
+                            // File completions elsewhere can also start with "/".
+                            submit_completion = !mouse_activate
+                                && keys.matches("tui.select.confirm", key)
+                                && !keys.matches("tui.input.tab", key)
+                                && matches!(&selection, Selection::Completion { range, .. }
+                                    if range.start == 0 && view.editor.text.starts_with('/'));
                             let settings = picker.title == "Settings";
                             if settings
                                 && matches!(&selection, Selection::EditSetting(name) if name == "theme")
@@ -6047,9 +6224,11 @@ pub(super) async fn run(
                             }
                         }
                     }
-                    continue;
+                    if !submit_completion {
+                        continue;
+                    }
                 }
-                if args.tui_mode != Some(TuiMode::Regular) {
+                if !submit_completion && args.tui_mode != Some(TuiMode::Regular) {
                     if keys.matches("tui.altScreen.search", key) {
                         last_idle_interrupt = None;
                         view.mouse.clear();
@@ -6080,48 +6259,38 @@ pub(super) async fn run(
                         continue;
                     }
                 }
-                if view.keyboard_copies_selection(
-                    keys.matches("tui.input.copy", key),
-                    keys.matches("app.message.copy", key),
-                    args.settings.boolean("fullscreenCopyOnSelect") != Some(false),
-                ) && view.copy_selection()
+                if !submit_completion
+                    && view.keyboard_copies_selection(
+                        keys.matches("tui.input.copy", key),
+                        keys.matches("app.message.copy", key),
+                        args.settings.boolean("fullscreenCopyOnSelect") != Some(false),
+                    )
+                    && view.copy_selection()
                 {
                     continue;
                 }
                 view.mouse.clear();
-                let action = keys
-                    .action(
+                let action = if submit_completion {
+                    "tui.input.submit"
+                } else {
+                    keys.action(
                         key,
                         view.editor.text.is_empty() && view.draft_images.is_empty(),
                     )
-                    .unwrap_or("");
+                    .unwrap_or("")
+                };
                 if action != "app.interrupt" || is_busy(&worker) {
                     last_idle_interrupt = None;
                 }
-                if view.editor.jump_key(action, key) || view.editor.action(action) {
+                if !submit_completion
+                    && (view.editor.jump_key(action, key) || view.editor.action(action))
+                {
                     continue;
                 }
                 match action {
                     "app.suspend" => {
                         #[cfg(unix)]
-                        {
-                            if args.tui_mode == Some(TuiMode::Regular) {
-                                view.finish_regular()?;
-                            }
-                            if let Err(error) = Terminal::suspend(
-                                &mut _terminal,
-                                args.tui_mode,
-                                view.graphics.cleanup(),
-                            ) {
-                                view.append(&error.to_string());
-                            }
-                            if view.graphics.enabled() {
-                                images::query_cell_size()?;
-                            }
-                            view.graphics.reset();
-                            view.regular.redraw = true;
-                            view.regular.started = false;
-                        }
+                        view.suspend_terminal(&mut _terminal, args.tui_mode)?;
                         #[cfg(not(unix))]
                         view.append("Suspending the terminal is unavailable on this platform");
                     }
@@ -6216,19 +6385,37 @@ pub(super) async fn run(
                     }
                     "app.thinking.cycle" if !is_busy(&worker) => {
                         match super::thinking::cycle(&mut args) {
-                            Ok(Some(level)) => view.append(&format!("Thinking level: {level}")),
-                            Ok(None) => view.append("Current model does not support thinking"),
+                            Ok(Some(level)) => {
+                                view.show_status(args.tui_mode, format!("Thinking level: {level}"));
+                            }
+                            Ok(None) => view.show_status(
+                                args.tui_mode,
+                                "Current model does not support thinking".into(),
+                            ),
                             Err(error) => view.append(&error.to_string()),
                         }
                     }
-                    "app.tools.expand" => view.set_expand_tools(!view.expand_tools),
+                    "app.tools.expand" => {
+                        view.set_expand_tools(!view.expand_tools);
+                        let state = if view.expand_tools {
+                            "expanded"
+                        } else {
+                            "collapsed"
+                        };
+                        view.show_status(args.tui_mode, format!("Tool output: {state}"));
+                    }
                     "app.thinking.toggle" => {
                         let hidden = !view.hide_thinking;
                         view.set_hide_thinking(hidden);
-                        if let Err(error) =
-                            args.settings.set_user("hideThinkingBlock", json!(hidden))
-                        {
-                            view.append(&error.to_string());
+                        match args.settings.set_user("hideThinkingBlock", json!(hidden)) {
+                            Ok(()) => {
+                                let state = if hidden { "hidden" } else { "visible" };
+                                view.show_status(
+                                    args.tui_mode,
+                                    format!("Thinking blocks: {state}"),
+                                );
+                            }
+                            Err(error) => view.append(&error.to_string()),
                         }
                     }
                     "app.clipboard.pasteImage" => view.paste_clipboard(&args),
@@ -6316,6 +6503,7 @@ pub(super) async fn run(
                                     args.settings.set_user("theme", json!(name.trim()))?;
                                     args.use_theme = Some(name.trim().into());
                                     theme = next;
+                                    view.theme_refresh_requested = true;
                                 }
                                 Err(error) => view.append(&error.to_string()),
                             }
@@ -6382,9 +6570,24 @@ pub(super) async fn run(
                                 Some(AuthReload::start(args.model_keys.revision().to_owned()));
                             view.append("Reloading provider credentials (Esc to cancel)");
                             args.reload_model_profiles()?;
-                            tokio::select! {
-                                result = super::packages::prepare(&args) => result?,
-                                _ = terminal_signal.notified() => { interrupted = true; break 'interactive; },
+                            {
+                                let preparation = super::packages::prepare(&args);
+                                tokio::pin!(preparation);
+                                loop {
+                                    tokio::select! {
+                                        result = &mut preparation => break result?,
+                                        _ = terminal_signal.notified() => {
+                                            if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+                                                interrupted = true;
+                                                break 'interactive;
+                                            }
+                                            #[cfg(unix)]
+                                            if SUSPEND_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                                                view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+                                            }
+                                        },
+                                    }
+                                }
                             }
                             view.resources = super::resources::Resources::load(&args)?;
                             args.theme_paths = view.resources.themes.clone();
@@ -6400,6 +6603,12 @@ pub(super) async fn run(
                             ) {
                                 Ok(next) => theme = next,
                                 Err(error) => view.append(&error.to_string()),
+                            }
+                            #[cfg(any(unix, windows))]
+                            if let Some(terminal) = &mut _terminal {
+                                terminal
+                                    .colors
+                                    .query_terminal_colors(&mut std::io::stdout())?;
                             }
                             view.append("Reloaded settings, context, skills, prompts, native extensions, MCP, keybindings and theme");
                             args.session_transition = Some(pi_rs::SessionStartReason::Reload);
@@ -6824,14 +7033,7 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     } else {
         "Only one model in scope".into()
     };
-    // A normal terminal has already printed committed rows to its scrollback.
-    if (args.tui_mode != Some(TuiMode::Regular) || view.regular.committed < view.lines.len())
-        && let Some(Entry::ModelCycleStatus(previous)) = view.lines.last_mut()
-    {
-        *previous = status;
-    } else {
-        view.append_entry(Entry::ModelCycleStatus(status));
-    }
+    view.show_status(args.tui_mode, status);
     Ok(())
 }
 
@@ -8263,6 +8465,7 @@ fn select(
                 args.settings.set_user(&key, value.clone())?;
                 args.use_theme = value.as_str().map(str::to_owned);
                 *theme = next;
+                view.theme_refresh_requested = true;
             } else {
                 args.settings.set_user(&key, value.clone())?;
             }
@@ -8305,6 +8508,7 @@ fn select(
             args.settings.set_user("theme", json!(name))?;
             args.use_theme = Some(name);
             *theme = next;
+            view.theme_refresh_requested = true;
         }
         Selection::ThemeSettings(_) => {
             return Err(Error::Config(
@@ -12966,10 +13170,7 @@ exit {exit}
                 quarantined: false,
                 batch: crate::ui::terminal_color_batch::ColorBatch::new(std::time::Instant::now()),
             }]),
-            color_requery: false,
-            disabled: false,
-            last_appearance_report: None,
-            refresh_after_subscription: false,
+            ..Default::default()
         };
         assert!(!super::expire_initial_terminal_colors(
             &terminal, &mut theme
@@ -13006,6 +13207,8 @@ exit {exit}
             appearance_notifications: false,
             #[cfg(unix)]
             keyboard: super::KeyboardProtocol::Disabled,
+            #[cfg(unix)]
+            _suspend_signal: None,
         };
         drop(guard);
         theme = super::Theme::system();
@@ -13087,6 +13290,7 @@ exit {exit}
     fn initial_appearance_report_does_not_discard_initial_colors() {
         let mut colors = super::ColorQueries::default();
         let mut output = Vec::new();
+        colors.appearance_probe = Some(super::AppearanceProbe::WaitingForColors);
         colors.query_terminal_colors(&mut output).unwrap();
         let initial_len = output.len();
         // A late initial appearance response may follow an OSC reply.
@@ -13102,6 +13306,39 @@ exit {exit}
         assert!(colors.appearance_report(false, &mut output).unwrap());
         assert!(colors.color_requery);
         assert!(!colors.accepts_color_reply(1, &mut output).unwrap());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn appearance_subscription_probe_does_not_repeat_the_color_query() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+
+        // The old color query is still in flight when notifications turn on.
+        // Its marker cannot expire the probe for the next query.
+        colors.appearance_probe = Some(super::AppearanceProbe::WaitingForColors);
+        colors
+            .refresh_after_appearance_subscription(&mut output)
+            .unwrap();
+        assert!(colors.color_requery);
+        colors.receive_color_marker(&mut output).unwrap();
+        assert!(!colors.color_requery);
+        let subscription_len = output.len();
+        assert!(!colors.appearance_report(false, &mut output).unwrap());
+        assert_eq!(output.len(), subscription_len);
+        assert!(!colors.color_requery);
+        colors.receive_color_marker(&mut output).unwrap();
+
+        // A terminal can ignore the explicit probe and still notify later.
+        colors.appearance_probe = Some(super::AppearanceProbe::WaitingForColors);
+        colors
+            .refresh_after_appearance_subscription(&mut output)
+            .unwrap();
+        colors.receive_color_marker(&mut output).unwrap();
+        let before_change = output.len();
+        assert!(colors.appearance_report(true, &mut output).unwrap());
+        assert!(output.len() > before_change);
     }
 
     #[cfg(any(unix, windows))]

@@ -8,8 +8,8 @@ use base64::Engine;
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::StreamExt;
 use pi_rs_core::{
-    CacheRetention, Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
-    ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
+    CacheRetention, Error, Message, Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest,
+    ModelStream, ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
 };
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
@@ -587,6 +587,37 @@ impl OpenAiResponses {
                 .map(str::to_owned)
             })
             .collect())
+    }
+}
+
+fn response_usage_metadata(
+    api: ModelApi,
+    model: &str,
+    requested_tier: Option<&str>,
+    response: &Value,
+) -> ModelMetadata {
+    let returned_tier = response["service_tier"].as_str();
+    let codex = api == ModelApi::OpenaiCodexResponses;
+    let tier = if codex
+        && returned_tier == Some("default")
+        && matches!(requested_tier, Some("flex" | "priority"))
+    {
+        requested_tier
+    } else {
+        returned_tier.or(requested_tier)
+    };
+    let multiplier = match tier {
+        Some("flex") => Some(0.5),
+        Some("priority") => Some(if model == "gpt-5.5" { 2.5 } else { 2.0 }),
+        Some("fast") if !codex => Some(if model == "gpt-5.5" { 2.5 } else { 2.0 }),
+        _ => None,
+    };
+    let counts = &response["usage"]["input_tokens_details"];
+    ModelMetadata {
+        cached_input_tokens: counts["cached_tokens"].as_u64(),
+        cache_creation_input_tokens: counts["cache_write_tokens"].as_u64(),
+        catalog_cost_multiplier: multiplier.and_then(serde_json::Number::from_f64),
+        ..Default::default()
     }
 }
 
@@ -1382,6 +1413,7 @@ impl OpenAiResponses {
                 .remove("max_output_tokens");
         }
         self.apply_cache(&mut body);
+        let requested_service_tier = body["service_tier"].as_str().map(str::to_owned);
         let error_secrets = pi_rs_core::provider_error_secrets(
             Some(self.token.as_str()),
             self.headers.iter().filter_map(|(name, value)| {
@@ -1652,12 +1684,12 @@ impl OpenAiResponses {
                         let usage = response["usage"]["input_tokens"].as_u64().zip(response["usage"]["output_tokens"].as_u64()).map(|(input_tokens,output_tokens)| Usage { input_tokens, output_tokens });
                         let identity = ResolvedModelIdentity { provider:provider.clone(), model:model.clone() };
                         let reasoning: String = reasoning.into_values().collect();
-                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(api), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay {
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(api), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay {
                             identity: if api == pi_rs_core::ModelApi::OpenaiCodexResponses {
                                 ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }
                             } else { identity },
                             blocks:output.clone()
-                        })), ..Default::default() }));
+                        })), ..response_usage_metadata(api, &model, requested_service_tier.as_deref(), response) }));
                         yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls:calls.into_values().collect(), usage });
                         return;
                     }
@@ -4185,6 +4217,70 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn responses_stream_applies_service_tier_and_records_cache_writes() {
+        for (codex, model, requested, returned, expected) in [
+            (false, "gpt-5.5", "priority", Some("default"), None),
+            (false, "gpt-5.5", "priority", None, Some(2.5)),
+            (false, "gpt-6-luna", "priority", Some("fast"), Some(2.0)),
+            (false, "gpt-5.5", "priority", Some("flex"), Some(0.5)),
+            (true, "gpt-5.5", "priority", Some("default"), Some(2.5)),
+            (true, "gpt-5.5", "flex", Some("default"), Some(0.5)),
+            (true, "gpt-5.5", "priority", Some("fast"), None),
+            (true, "gpt-5.5", "flex", None, Some(0.5)),
+        ] {
+            let payload = json!({"type":"response.completed", "response":{
+                "status":"completed", "output":[], "service_tier": returned,
+                "usage":{"input_tokens":100, "output_tokens":10,
+                    "input_tokens_details":{"cached_tokens":20, "cache_write_tokens":30}}
+            }});
+            let (mut client, server) = fixture(&format!("data: {payload}\n\n")).await;
+            if codex {
+                client.provider = "openai-codex".into();
+                client.codex_account = Some("fixture-account".into());
+            } else {
+                client.provider = "openai".into();
+            }
+            let client = client
+                .with_sampling(BTreeMap::from([("service_tier".into(), json!(requested))]))
+                .unwrap();
+            let mut request = request();
+            request.model = model.into();
+            let mut stream = client.stream(request).await.unwrap();
+            let mut saw_metadata = false;
+            let mut saw_usage = false;
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    ModelEvent::Metadata(metadata) => {
+                        assert_eq!(metadata.cached_input_tokens, Some(20));
+                        assert_eq!(metadata.cache_creation_input_tokens, Some(30));
+                        assert_eq!(
+                            metadata
+                                .catalog_cost_multiplier
+                                .as_ref()
+                                .and_then(serde_json::Number::as_f64),
+                            expected
+                        );
+                        saw_metadata = true;
+                    }
+                    ModelEvent::Complete { usage, .. } => {
+                        assert_eq!(
+                            usage,
+                            Some(Usage {
+                                input_tokens: 100,
+                                output_tokens: 10
+                            })
+                        );
+                        saw_usage = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_metadata && saw_usage);
+            server.await.unwrap();
+        }
+    }
+
     async fn fixture(events: &str) -> (OpenAiResponses, tokio::task::JoinHandle<()>) {
         fixture_with_content_type(events, Some("text/event-stream")).await
     }
@@ -4202,19 +4298,28 @@ mod tests {
         let body = events.to_owned();
         let content_type = content_type.map(str::to_owned);
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            loop {
-                let mut chunk = [0; 4096];
-                let n = socket.read(&mut chunk).await.unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&chunk[..n]);
-                if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+            let mut socket = loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
                 }
-            }
-            let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-            assert!(headers.contains("authorization: bearer fixture"));
+                let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                assert!(headers.contains("authorization: bearer fixture"));
+                // A Codex client with auto transport can try an upgrade before SSE.
+                if headers.starts_with("get ") && headers.contains("upgrade: websocket") {
+                    socket.write_all(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
+                assert!(headers.starts_with("post "));
+                break socket;
+            };
             let header =
                 content_type.map_or_else(String::new, |value| format!("Content-Type: {value}\r\n"));
             let response = format!(

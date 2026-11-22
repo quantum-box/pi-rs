@@ -123,7 +123,8 @@ that scope and to a configured `enabledModels` list. Legacy qualified defaults
 without `defaultProvider` are still accepted. Cycling models shows the selected display
 name and the active thinking level for reasoning models. Consecutive notices
 reuse the trailing status in both fullscreen and regular mode, before it enters
-scrollback.
+scrollback. The tool-output, thinking-visibility, and thinking-level shortcuts
+report the new state using the same status row, as in Pi.
 Model scopes (`--models` and `enabledModels`) add all available providers that
 share an exact unqualified model ID and warn about the ambiguity. A literal ID
 containing glob characters takes precedence over glob expansion across providers,
@@ -209,8 +210,10 @@ filters accept Git Bash/MSYS, Cygwin, and WSL drive spellings such as `/c/...`,
 Package resource filters expand home-relative paths and local `file://` URLs
 before matching, including exact `+` and `-` overrides, as in upstream Pi.
 Positive extglobs such as `prompts/@(review|triage).md` work in package filters
-for bounded ASCII patterns and paths without dot-prefixed components. Filters
-continue to support the existing exact path and force-inclusion rules.
+for bounded ASCII patterns and paths without dot-prefixed components. Package
+settings filters also support a single negated group with literal alternatives
+and a supported suffix, such as `prompts/!(review|triage).md`. Exact path and
+force-inclusion rules still apply.
 
 An invalid file URL in a package settings filter reports an error when
 reached against an available native or Pi manifest diagnostic candidate. For a local directory
@@ -499,9 +502,11 @@ and the six Pi 1.6 Kimi chat models. K3, K3.1 Pro and K3.1 Pro HighSpeed
 advertise a 1,048,576-token output limit, and K3 256K advertises 262,144.
 Image limits, prices, context windows and reasoning settings remain
 model-specific. The high-speed coding model uses its DeepSeek-style thinking
-switch. Subscription OAuth supports device
-login, refresh, and Pi-compatible credential storage. Live Kimi acceptance
-remains open.
+switch. Subscription OAuth supports device login, refresh, and Pi-compatible
+credential storage. A caller can wait for refresh for up to Pi's 15-second
+deadline. After the deadline the worker cannot start a new attempt. An admitted
+request can still persist a rotated credential after timeout or cancellation. Live Kimi acceptance remains
+open.
 
 On terminals without OSC 8 support, Markdown links use the reference's text
 fallback: link text is underlined and destinations appear in parentheses only
@@ -587,8 +592,15 @@ classified callback.
 RPC validates images before command dispatch. An idle command that triggers a
 model turn reports `handled` before that turn completes, as in Pi. Commands
 submitted while a turn is active cannot yet execute immediately. A normal model turn returns
-`started` before completion. Wait for `agent_end` or `agent_settled` for that
-turn. The interface emits native journal events alongside Pi-style
+`started` before completion. Wait for `agent_settled` to know the run is idle.
+In JSON and RPC, a failed model attempt that will be retried emits
+`agent_end` with `willRetry: true` before `auto_retry_start`. The next
+attempt emits its own `agent_start`. Each `agent_end` carries the messages
+from that attempt. Cancelling the retry wait settles the run after
+`auto_retry_end` without starting another attempt. pi-rs acknowledges
+`abort_retry` when the backend handles the command and marks the cancelled
+run with `agent_settled.aborted: true`. The interface emits native journal events
+alongside Pi-style
 message start, update and end events, including indexed text and reasoning
 blocks, tool calls, tool results and turn boundaries.
 `toolcall_start` includes the ID and tool name available at that point.
@@ -698,6 +710,18 @@ surrogate in the same string. For records up to 1 MiB, a diagnostic-only retry
 also recognizes controls after a surrogate in another string when it is the
 next parser error. Larger records, retry depth or number-range failures, and
 other unmapped errors retain the Rust JSON parser's wording.
+JSON and RPC use Pi 1.6.0's shared `compaction_start` and `compaction_end`
+events for both manual and automatic compaction. For automatic compaction,
+`reason` is `"threshold"` or `"overflow"`.
+Native threshold compaction can run before a model request, so its events
+can precede `agent_end`. Pi 1.6.0 runs threshold compaction after the
+agent attempt ends. Native completion follows the compaction hooks and
+carries the committed summary, context token estimates and any recorded
+usage or details. Failed or cancelled attempts
+also close the pair. Recovering a completed overflow summary after reopening
+emits the pair around its durable commit. An optional extension-only attempt
+that produces no compaction emits no pair. RPC state reports `isCompacting` during the attempt.
+
 Model-list discovery runs independently of the RPC input loop, so a slow model
 endpoint does not block cancellation or other commands. Concurrent discovery
 requests are bounded and retain their individual response IDs.
@@ -748,10 +772,13 @@ journals without a turn marker retain their prior history projection. Native
 history retains text only, so interrupted thinking and incomplete tool-call
 blocks are not reconstructed after reopen.
 
-`get_last_assistant_text` and `/copy` use the active transcript. Both skip
-empty aborted assistant messages, concatenate the selected message's text
-blocks, and trim the result. The RPC response omits `text` when the selected
-message has no text or the transcript has no eligible assistant message.
+`get_last_assistant_text` and the terminal copy actions use the active
+transcript. They skip assistant replies without visible text after an
+interruption, error, tool call, or token limit. A partial reply with visible
+text remains eligible. A normally completed reply remains the latest reply even
+when it has no text, matching Pi v1.6.0. The selected message's text blocks are
+concatenated and trimmed. The RPC response omits `text` when the result is empty
+or the transcript has no eligible assistant message.
 
 `clone` requires a visible session leaf and returns `cancelled` on success.
 `fork` also returns the selected user text. Pass `includeNative: true` on
@@ -832,6 +859,9 @@ layout cases still need comparison.
 Markdown links use OSC 8 on terminals that advertise support, with a text-and-URL
 fallback on unknown terminals and screen. `PI_HYPERLINKS=1` or `0` overrides
 automatic detection; tmux is probed for its `hyperlinks` terminal feature.
+Alacritty can advertise OSC 8 using an `alacritty` prefix in `TERM` or a
+nonempty `ALACRITTY_WINDOW_ID` when it uses `TERM=xterm-256color`, matching Pi
+v1.6.0 even when `TERM_PROGRAM` is unset.
 Empty terminal-identification environment variables do not advertise OSC 8
 support or indicate a tmux session.
 Bare HTTP, HTTPS and FTP URLs, `www.` links and email addresses receive link
@@ -973,6 +1003,15 @@ PTY check covered granting project trust, advertising a discovered skill and
 expanding a quoted prompt argument before the model request.
 
 ### Local MCP checkpoint
+
+MCP server `notifications/message` entries append to `mcp.log` in the agent
+directory with the timestamp, configured server name, severity and logger.
+Multiline continuation lines are indented. The log rotates to `mcp.log.1`
+after 5 MiB, as in Pi. Native writers serialize appends and rotation across
+processes, escape control characters, and bound each record to 256 KiB. On
+Unix, the client restricts existing log files to the current user before
+appending. The client bounds the time spent waiting for a log write so a
+busy or unavailable log does not hold up server requests.
 
 `pi mcp list --json` emits one JSON document with server state, source,
 transport, tool names, per-tool exposure overrides, and resource capability.
@@ -1519,6 +1558,9 @@ Skill discovery keeps the selected symlink path for the skill name, displayed
 location and relative references. Canonical paths are still used to deduplicate
 aliases to the same file.
 
+Confirming a theme from settings requests fresh terminal colors, including
+when reselecting a fixed theme. A preview uses the last reported colors.
+
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one
 diagnostic per changed file contents. A PTY check covers live updates and
@@ -1550,17 +1592,22 @@ keeps stale responses out of a later query but means a terminal that never sends
 DA1 cannot refresh colors during that session. After an external editor or
 suspend hands terminal ownership away, further color queries are disabled for
 the session: another owner may consume the old DA1 or leave an unrelated one.
-If a later appearance report changes, or automatic mode is enabled after
-running with a fixed theme, the next applicable report clears stale colors and
-uses the reported light/dark mode with the ANSI fallback. A repeated report in
-continuous automatic mode retains the colors: a terminal's colors can
-intentionally differ from the OS appearance.
+When a terminal handoff has disabled queries, a changed appearance report
+clears the old colors and uses the reported light/dark mode with the ANSI
+fallback. The first report after switching back to automatic mode does the
+same in that state. Repeated reports in continuous automatic mode retain the
+colors because a terminal's colors can intentionally differ from the OS
+appearance.
 The first appearance report received during the initial color query is treated as
 the startup status report, not a color change; the protocol
 does not distinguish this report from a simultaneous notification.
 These restrictions differ from Pi's behavior. The boundary assumes the terminal sends each query's color responses before its
 DA1; arbitrary reordering or unrelated DA1 replies cannot be disambiguated,
 because these protocols contain no request identifiers.
+When appearance notifications are enabled again, the first report before the
+associated color query's DA1 can answer the explicit appearance probe. The
+already requested color query handles that report. Later notifications can
+request fresh colors, including on terminals that ignore the probe.
 On an appearance notification, the last reported foreground, background, and
 complete palette remain in effect until replacement replies arrive, as in Pi.
 The reported appearance is used when no background is known.
@@ -1577,6 +1624,9 @@ In interactive mode, foreground, background and complete palettes are collected
 per query. A 100 ms timeout applies the partial snapshot; a later DA1 or the
 final color response applies the cumulative snapshot once, matching Pi's color
 aggregation while retaining the serialized DA1 safety policy described above.
+Explicit `/reload` requests fresh terminal colors for the active theme,
+including fixed themes. The same serialization and terminal handoff rules
+apply.
 Custom
 OKHSL and OKLCH colors accept Pi's case-insensitive syntax and hue units,
 validate component ranges, and gamut-map OKLCH colors.
@@ -1712,7 +1762,9 @@ its default `Duration::MAX` means no deadline, while other values set a limit.
 to `SessionBuilder::limits` enforces that timeout for Codemode too. Direct
 `Agent` users retain their configured timeout unless they explicitly opt out
 through the registry. Nested tools retain their own limits. Large text output
-is saved to a local file.
+is saved to a local file. The preview counts UTF-16 code units, as in Pi
+1.6.0. When a head or tail boundary falls inside a supplementary character,
+the preview omits that whole character and the saved output keeps it.
 
 MCP tools default to codemode exposure. `--exposure direct`, `deferred`,
 `codemode` and `hidden` select another mode when adding a server. The root
@@ -2277,7 +2329,8 @@ Horizontal rules use the reference 80-column maximum.
 Top-level horizontal rules separate following blocks with one blank line and
 do not add a trailing blank line at the end of the rendered message.
 Consecutive paragraphs retain a single separating blank line, including inside
-block quotes; hard line breaks do not add paragraph spacing.
+block quotes. Paragraphs preserve source indentation on their first line and
+after soft and hard line breaks.
 Source-level blank blocks are retained after visible blocks and between link
 reference definitions. List items retain block separators and continuation
 indentation for code and quotes. A pinned Pi fixture checks these layouts,
@@ -2290,8 +2343,12 @@ continuation prefixes, matching Pi. Prose wraps at words and CJK graphemes
 and preserves inline styles across the wrap. Thematic breaks within an item
 use its continuation indentation and available width. List continuation rows
 retain extra source spaces after stripping the applicable marker indents.
-Tab-indented continuations, some numbered nested lists, and ambiguous list
-marker and rule syntax can still differ.
+Numbered child lists can interrupt item text at any valid starting number.
+The renderer keeps original user-message markers and counts assistant lists
+from the first marker. The parser repair preserves byte offsets and falls
+back to its standard list parsing when it exhausts the scan budget.
+Tab-indented continuations and ambiguous list marker and rule syntax can
+still differ.
 If nested-math scanning exceeds its resource limit, reference links may remain
 unresolved rather than use a definition from unverified math content.
 Top-level tables are separated from a preceding rendered block by a blank line.
@@ -2316,6 +2373,9 @@ and word comparison follows Pi's `diffWords` token grouping and whitespace
 deduplication, including the first changed fragment's indentation treatment.
 Numbered diff gutters use JavaScript's whitespace and line-terminator rules,
 including its treatment of BOM and U+0085.
+Completed edits show the full bounded numbered diff in the call panel,
+separated from the title by a blank row. Tool expansion leaves this diff
+layout intact, as in Pi v1.5.0.
 Comparison has a shared 100 ms budget per render; oversized or unfinished
 comparisons retain line-level highlighting. The Rust word-diff implementation
 derives from jsdiff 8.0.4; its BSD license is in
@@ -2533,6 +2593,11 @@ pinned Pi renderer. Image data remains cached across scroll and resize, and
 placements are cleared independently of cached uploads. iTerm2 retains its
 whole-image rendering behavior.
 
+Fullscreen transcript search temporarily hides Kitty and iTerm2 placements that
+overlap the search box in both rows and columns, matching Pi v1.6.0. Images
+beside the box stay visible. Closing the box redraws the hidden placements,
+reusing cached Kitty uploads.
+
 Unit tests and a PTY fixture cover upper/lower clipping, scrolling, cached resize
 and terminal restoration. The existing Kitty/iTerm2 fixture passed both modes.
 Regular-mode active-region images and iTerm2 partial-image behavior remain open.
@@ -2571,6 +2636,11 @@ session restoration and model switching. Settings-editor regressions pass.
 On Unix, Ctrl+Z restores normal terminal settings before suspending the
 foreground process group. Continuing the job restores the TUI, draft and image
 rendering. The previous SIGINT disposition is restored after continuation.
+An external SIGTSTP uses the same restore and resume path while the TUI owns
+the terminal, matching Pi v1.6.0. The previous SIGTSTP disposition is restored
+when another program takes over the terminal.
+Suspension can interrupt the terminal's wait during `/reload`. Package
+preparation resumes with the foreground job.
 Windows and WSL use Pi's Ctrl+Q follow-up, Alt+P reverse-model and Alt+V paste
 bindings. Unix suspension remains available on WSL.
 Windows uses Ctrl+Z for undo; WSL uses Alt+Z so Ctrl+Z remains suspend.
@@ -2596,8 +2666,10 @@ characters and oversized lists are rejected before insertion. Windows uses
 PowerShell quoting, and Unix uses POSIX shell quoting.
 
 Tests cover file-list insertion, surrounding text, shell quoting, validation and
-existing image/text draft behavior. A populated system file-list clipboard has
-not been exercised in this environment.
+existing image/text draft behavior. In both regular and fullscreen modes, a
+macOS pasteboard containing two file URLs, PNG data and plain text inserted the
+two paths in order, with spaces around adjacent draft text. Pi v1.5.0 chose the
+same paths from the same fixture. Each run restored the original pasteboard.
 
 ### Durable queue controls checkpoint
 
@@ -2672,8 +2744,9 @@ The tree centers the selected row when possible. It shows up to half the
 terminal height, with a five-row minimum when space allows, and uses the
 visible row capacity for page movement.
 Searching includes records inside folded branches. Shift+L edits or removes a
-record label and returns to the current search, filter, and label-time setting. Direct `/checkout` releases its
-journal lock before restoring the view.
+record label and returns to the current search, filter, and label-time setting.
+Label edits made during a response are saved by the active session worker.
+Direct `/checkout` releases its journal lock before restoring the view.
 After tree navigation, the selected user message fills an empty editor. A draft
 already in the editor keeps its text and any native image attachments. While
 a response streams, `/tree` and its shortcut read the committed journal without
@@ -2918,6 +2991,12 @@ modes, scrolling, resize and terminal restoration. Existing Kitty crop, active
 image and inline-image fixtures also passed, along with workspace tests and
 all-target Clippy on Rust 1.89. Further cell-metric and aspect-ratio fidelity
 work remains in the terminal surface.
+
+Konsole 25.04.2 also displayed the iTerm2 OSC 1337 protocol in both modes.
+Screenshots of the macOS pi-rs process relayed to Konsole in an isolated Linux
+display matched the visible bands of the 320×480 pasteboard PNG. Fullscreen
+sent a 320×208 crop and regular mode sent the full image for viewport
+clipping. Visual acceptance in the iTerm2 application remains open.
 
 ### Image cell-sizing checkpoint
 
@@ -3781,7 +3860,10 @@ Workspace tests, the imported-details regression and all-target Clippy pass.
 
 Native edit results preserve a numbered display diff alongside the unified
 patch. Unified hunk headers use Pi's explicit line counts, including for a
-single line and zero-length ranges. The display diff uses old-file numbers for
+single line and zero-length ranges. Both edit diff formats use Pi's line
+alignment, including its choice between repeated lines. Large or difficult edit
+comparisons that exceed the alignment search budget use the existing native
+diff algorithm. The display diff uses old-file numbers for
 deletions and context, new-file numbers for insertions, and four context lines
 on either side of a change. Omitted ranges appear as ellipses. The terminal prefers the numbered
 diff, preserves each line’s original gutter (including empty line numbers),
@@ -4062,7 +4144,8 @@ The model accepts text and images, has a one-million-token context window
 and a 128,000-token model output limit, and adds xhigh and max to its standard
 effort levels.
 The catalog retains Pi 1.6.0's mid-conversation system and tool-change
-capability flags for the direct Messages route.
+capability flags for the direct Messages route. Using both capabilities in
+direct Messages requests still requires separate adapter support.
 The catalog includes Pi's model-specific pricing, prompt-cache lifetimes,
 and image limits. The direct Anthropic catalog uses Pi v1.6.0's ordered
 server-side fallback targets for Fable 5 and Fable 5.2. Models can set or clear
@@ -4398,6 +4481,13 @@ the model picker and replaces its worker when the profile changes.
 Loopback checks exercised native and custom authentication headers, model
 override order, endpoint isolation, redacted errors and a live terminal
 worker reload.
+
+For Chat Completions routes, `compat.openRouterRouting` becomes the
+request's `provider` object. This includes data-collection and zero-retention
+preferences. `compat.vercelGatewayRouting` sends the configured `only` and
+`order` lists in `providerOptions.gateway`. Model settings override the
+provider defaults for each routing field they specify. Local fixtures verify the request fields.
+Live gateway routing was unverified.
 
 ### Session sharing destinations
 
@@ -4875,7 +4965,8 @@ catalogues are projected from the published
 
 ### Cloudflare Workers AI chat checkpoint
 
-Cloudflare Workers AI exposes the 19 pinned chat models via Chat Completions.
+Cloudflare Workers AI exposes the 20 chat models from Pi AI v1.6.0 via Chat
+Completions, including Inkling 2 Small.
 `CLOUDFLARE_ACCOUNT_ID` selects the account and `CLOUDFLARE_API_KEY` authorizes
 requests. Terminal `/login cloudflare-workers-ai` prompts for a masked API
 key and the account ID for routes derived from login or environment settings. Pi-format saved credentials may declare an account through their
@@ -4887,7 +4978,9 @@ credentials also apply to chat. Live Workers AI inference has not been verified.
 
 ### Cloudflare AI Gateway
 
-Cloudflare AI Gateway includes the 59 pinned Pi AI chat models. It uses
+Cloudflare AI Gateway includes the 63 chat models from Pi AI v1.6.0. New
+entries route Claude Fable 5.2 to Messages, Inkling 2 Small to Chat
+Completions, and GPT-6.2 Astra and Sol to Responses. It uses
 the account and gateway identifiers in `CLOUDFLARE_ACCOUNT_ID` and
 `CLOUDFLARE_GATEWAY_ID`, or their equivalents in a Pi-format saved
 credential. `CLOUDFLARE_API_KEY` supplies the gateway token. The model's API
@@ -4979,20 +5072,27 @@ field is covered by loopback tests; no live compatible server was used.
 Loopback RPC checks exercised model and endpoint switching, header and key
 isolation, reasoning replay, stream completion and reported usage and cost.
 
-The bundled chat catalog includes 506 chat-completions entries for Cerebras,
+Chat Completions combines system instructions at the start of the request by
+default. Models that declare `compat.supportsMidConvoSystemMessages` keep
+later system instructions in place. The catalog preserves this capability
+from Pi for applicable models, and provider or model configuration can override it.
+
+The bundled chat catalog includes chat-completions entries for Cerebras,
 DeepSeek, Fireworks, Groq, Hugging Face, Moonshot AI and Moonshot AI CN,
 OpenRouter, Together, Z.AI, and Z.AI Coding CN. It preserves their context,
 output, image and thinking capabilities from the pinned Pi AI release.
 User models and overrides take precedence. The CLI lists available providers
 together, and `--provider` can restrict the list to one. Built-in environment
 keys and endpoint-bound saved credentials stay off user-configured relays.
-Baseten and NVIDIA's pinned chat-completions catalogs are also available,
-including model-specific compatibility, NVIDIA polling headers and Baseten's
-thinking template. Pi 1.6.0 supplies 12 bundled NVIDIA NIM models and 87
-Hugging Face Router models. Hugging Face still uses the system instruction
-role. Users can configure additional NVIDIA deployments by ID. Catalog
-entries that use other upstream APIs still need their own adapters. Live
-inference on the updated catalogs was unverified.
+Baseten and NVIDIA's pinned chat-completions catalogs include model-specific
+compatibility, NVIDIA polling headers and Baseten's thinking template. Pi
+1.6.0 supplies 15 Baseten, 16 Together, 12 NVIDIA NIM and 87 Hugging Face
+Router entries. Baseten and Together expose Kimi K3.1 Pro with image input.
+Baseten lists a 262,144-token output maximum, and Together lists 1,048,576 for
+both Kimi K3 and K3.1 Pro. Hugging Face uses the system instruction role.
+Users can configure additional NVIDIA deployments by ID. Catalog entries that
+use other upstream APIs still need their own adapters. Live inference on the
+updated catalogs was unverified.
 
 ### OpenAI Codex
 
@@ -5096,7 +5196,9 @@ width changes, and existing user and tool images.
 
 Tab opens a selectable list when more than one file or command matches. The
 selection replaces only the current word, preserving text to the right of
-the cursor. Tab and Enter confirm, and Escape keeps the original draft.
+the cursor. Enter in the slash command-name menu submits the completed
+command, matching Pi v1.6.0. Tab and file completion keep the input in the
+editor, and Escape keeps the original draft.
 `autocompleteMaxVisible` sets the row limit. `enableSkillCommands` controls
 skill suggestions while preserving manual skill invocation and discovery.
 
@@ -5142,6 +5244,17 @@ exports follow the pinned Pi resolver: after refresh, an explicit minimum is
 checked with a five-minute floor, even when a shorter minimum was requested.
 The rotated credential is saved before that check. The default
 check output contains only status and metadata.
+
+Pi sets a 15-second OAuth refresh deadline after acquiring the credential
+lock. Radius applies it to the provider exchange and keeps its recovery marker
+when an admitted exchange has an unknown outcome. Kimi Code, Anthropic, Codex,
+xAI and imported Pi ChatGPT credentials apply the deadline to the caller's
+wait. Their native workers can persist a successful rotation that arrives
+after the caller times out. Copilot gives its
+short-lived token request 15 seconds and handles its best-effort model
+discovery separately. Native ChatGPT enrollment and Meta key minting retain
+their own timeouts. Fixtures cover renewal and cancellation. Live credential
+renewal for this change was unverified.
 
 As in Pi v1.6.0, a symbolic link to an auth file shares the target's lock.
 Credential updates keep the link and atomically replace the target file.
@@ -5422,6 +5535,16 @@ Responses model compatibility accepts `promptCacheKeyMode` as `auto`,
 `disabled` omits the automatic key. An explicit sampling field can still
 supply a key, matching the upstream request merge order. The setting does not
 disable session routing headers or prompt caching itself.
+
+### Responses service tier and cache usage
+
+Responses and Codex SSE keep the cached-read and cache-write counts reported
+by the service. Estimated costs use the service tier returned by Responses, or
+the configured `samplingParams.service_tier` when the response omits it. Like
+Pi 1.6, Codex uses a requested `flex` or `priority` tier when the service echoes
+`default`. The multiplier applies to input, output, cache reads and cache
+writes. Loopback SSE fixtures cover both APIs. Live pricing and
+account acceptance were unverified.
 
 ### Responses cache retention checkpoint
 
@@ -5715,10 +5838,16 @@ credentials, and credential refresh. It also accepts `AWS_BEARER_TOKEN_BEDROCK`
 or a configured API key as a Bedrock bearer token. The optional library feature
 is `bedrock`.
 
-The bundled Pi 1.5.0 chat model catalog provides offline model selection and
-metadata, including pricing. It is a static snapshot, not an account-specific
-list of enabled models. The runtime uses the configured AWS region rather than
-pinning the catalog's default endpoint.
+The bundled Pi 1.6 catalog provides offline selection and metadata for 208
+chat models, including long-context pricing tiers where published. The runtime
+uses the configured AWS region, and the account determines which models can be
+invoked. Live access to the newly listed models was unverified.
+
+The native estimator retains its existing input-rate charge for Nova cache
+writes. Cache tokens reported by Converse are counted separately from fresh
+input tokens, and AWS describes Nova cache writes as having no price premium.
+[Amazon Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html)
+[AWS Nova prompt caching announcement](https://aws.amazon.com/blogs/aws/reduce-costs-and-latency-with-amazon-bedrock-intelligent-prompt-routing-and-prompt-caching-preview/)
 
 Text, user images, structured tool-result images, tool calls and results,
 streamed reasoning, stop reasons, and input/output/cache usage are supported.
@@ -5784,8 +5913,17 @@ During requests and stream reads with custom values, SDK and HTTP transport
 events are suppressed because signing and error traces can contain unredacted
 headers or echoed response frames; application tracing remains enabled.
 
-Not yet supported: non-image multimodal inputs, workbench-specific thinking display controls, tool
-choice/strict sampling, guardrails, prompt management ARNs, live account-specific
+The Rust adapter exposes Pi's optional ConverseStream tool choice through
+`Bedrock::with_tool_choice`. It supports automatic, required and named tool
+selection on compatible models. Disabling tools omits tool configuration and
+keeps historical calls and results as text, using the existing tool-free
+request behavior. Budget-based Claude extended thinking rejects required and
+named tool choices locally. The option is covered by signed loopback requests
+and a comparison with published Pi payloads. Live Bedrock tool selection with
+account credentials was unverified.
+
+Not yet supported: non-image multimodal inputs, workbench-specific thinking
+display controls, strict tool sampling, guardrails, prompt management ARNs, live account-specific
 model discovery, and workbench proxy/idle-timeout settings. Custom model endpoints in workbench configuration are rejected;
 callers embedding the adapter can pass a configured AWS SDK client, including a
 test endpoint, through `Bedrock::new`.
@@ -5843,6 +5981,10 @@ punctuation graphemes. Native editing retains literal pasted text rather than Pi
 atomic paste markers.
 
 ### Session tree branch navigation checkpoint
+
+Session tree search matches the full shell command, branch summary, and
+plain-string custom message content, even beyond the row preview. Text
+blocks in custom messages retain Pi's 200 UTF-16 unit search limit.
 
 Tree fold and jump keys now follow visible branch segments rather than folding
 or stepping through every record. Filtered-out intermediate records attach to
