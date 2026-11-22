@@ -2362,7 +2362,8 @@ fenced code.
 Terminal Markdown hides HTML comments in prose, quotes, and lists, matching Pi
 v1.6.0. Comment-only blocks do not leave extra blank rows. Visible text after a
 block comment keeps its row and any preceding blank line inside a list. Other
-literal HTML and comment markers inside code remain visible.
+literal HTML and comment markers inside code remain visible. Indented comments
+that continue a paragraph retain its indentation and inline formatting.
 
 Level-one headings use underlining, lower-level headings retain their markers,
 and code blocks show language-labelled fences with indented syntax highlighting.

@@ -1757,6 +1757,8 @@ fn markdown_at_depth_with_refs(
     hyperlinks: bool,
     preserve_source: bool,
 ) -> Vec<Line> {
+    let parsed = super::markdown_spaces::inline_indented_comments(parsed);
+    let parsed = parsed.as_ref();
     if let Some(lines) = markdown_with_block_spacing(
         (text, parsed, reference_source),
         theme,
@@ -3118,6 +3120,41 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_preserves_indentation_around_html_comments() {
+        let theme = Theme::system();
+        for (source, expected) in [
+            ("one\n  <!-- hidden --> text", vec!["one", "  text"]),
+            ("one\n  <!-- hidden --> **text**", vec!["one", "  text"]),
+            ("one\n  <!-- hidden -->\nnext", vec!["one", "", "next"]),
+            ("one\n\n  <!-- hidden --> text", vec!["one", "", "text"]),
+            ("  <!-- hidden --> text", vec!["text"]),
+            (
+                "> - one\n\n>   <!-- hidden --> text",
+                vec!["│ - one", "", "│ text"],
+            ),
+        ] {
+            let rendered: Vec<String> = markdown(source, &theme, 36)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                        .trim_end()
+                        .into()
+                })
+                .collect();
+            assert_eq!(rendered, expected, "{source:?}");
+        }
+        assert!(
+            markdown("one\n  <!-- c --> **text**", &theme, 36)[1]
+                .spans
+                .iter()
+                .any(|span| span.bold && span.text == "text")
+        );
+    }
 
     #[test]
     fn markdown_hides_html_comments_without_hiding_literal_code() {

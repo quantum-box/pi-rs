@@ -1,7 +1,8 @@
 //! Work-in-progress source-gap classification for Markdown block spacing.
 //! The caller must provide normalized LF source and already identified
 //! reference-definition ranges; no rendered output is changed by this module.
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use std::borrow::Cow;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -118,6 +119,55 @@ pub(super) fn include_line_indent(source: &str, start: usize) -> usize {
     }
 }
 
+// Pulldown lets an indented comment interrupt a paragraph. Marked treats it
+// as inline HTML. Give the continuation a text prefix in the parser input
+// while retaining source offsets for indentation and rendered spans.
+pub(super) fn inline_indented_comments(source: &str) -> Cow<'_, str> {
+    if source.len() > 256 * 1024 || !source.contains("<!--") || !source.contains("\n ") {
+        return Cow::Borrowed(source);
+    }
+    let mut rewritten = None;
+    let mut depth = 0;
+    let mut paragraph_end = None;
+    let options = Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+    for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+        if super::strike::frame_expired() {
+            return Cow::Borrowed(source);
+        }
+        match event {
+            Event::Start(tag) => {
+                if depth == 0
+                    && let Some(end) = paragraph_end.take()
+                {
+                    if matches!(tag, Tag::HtmlBlock)
+                        && end < range.start
+                        && source.as_bytes()[end..range.start]
+                            .iter()
+                            .all(|&byte| byte == b' ')
+                        && source[range.start..].starts_with("<!--")
+                    {
+                        rewritten.get_or_insert_with(|| source.as_bytes().to_vec())[end] = b'x';
+                        paragraph_end = Some(range.end);
+                    }
+                }
+                depth += 1;
+            }
+            Event::End(tag) => {
+                depth -= 1;
+                if depth == 0 && tag == TagEnd::Paragraph {
+                    paragraph_end = Some(range.end);
+                }
+            }
+            _ if depth == 0 => paragraph_end = None,
+            _ => {}
+        }
+    }
+    match rewritten {
+        Some(bytes) => Cow::Owned(String::from_utf8(bytes).expect("only ASCII spaces changed")),
+        None => Cow::Borrowed(source),
+    }
+}
+
 fn parse_blocks(
     source: &str,
     base: usize,
@@ -141,6 +191,7 @@ fn parse_blocks(
                             | Tag::Heading { .. }
                             | Tag::BlockQuote(_)
                             | Tag::CodeBlock(_)
+                            | Tag::HtmlBlock
                     ) {
                         include_line_indent(source, local.start)
                     } else {
