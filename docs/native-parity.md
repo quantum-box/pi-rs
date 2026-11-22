@@ -1550,6 +1550,9 @@ Skill discovery keeps the selected symlink path for the skill name, displayed
 location and relative references. Canonical paths are still used to deduplicate
 aliases to the same file.
 
+Confirming a theme from settings requests fresh terminal colors, including
+when reselecting a fixed theme. A preview uses the last reported colors.
+
 Custom theme files are now watched while the terminal is running. Valid edits
 redraw the active view. Invalid edits retain the last valid colors and show one
 diagnostic per changed file contents. A PTY check covers live updates and
