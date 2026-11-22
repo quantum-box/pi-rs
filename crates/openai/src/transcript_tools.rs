@@ -1,93 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use pi_rs_core::{Message, ToolDeclaration, ToolTranscriptChange as Checkpoint};
+use pi_rs_core::{Message, ToolDeclaration};
+pub(super) use pi_rs_core::{
+    ToolTranscriptMode as Mode, ToolTranscriptPlan as Plan, plan_tool_transcript as plan,
+};
 use serde_json::{Value, json};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Mode {
-    TopLevel,
-    Search,
-    Changes,
-}
-
-impl Mode {
-    pub(super) fn from_capabilities(
-        mid_conversation_system: bool,
-        additional_tools: bool,
-        tool_search: bool,
-    ) -> Self {
-        if mid_conversation_system && additional_tools {
-            Self::Changes
-        } else if tool_search {
-            Self::Search
-        } else {
-            Self::TopLevel
-        }
-    }
-}
-
-pub(super) struct Plan<'a> {
-    pub(super) top_level: Vec<&'a ToolDeclaration>,
-    pub(super) anchored: &'a [Checkpoint],
-}
-
-/// The tool declarations reflected in top-level tools can precede the active
-/// loadout only if every remaining historical change is append-only.
-pub(super) fn plan<'a>(
-    mode: Mode,
-    checkpoints: &'a [Checkpoint],
-    active: &'a [ToolDeclaration],
-) -> Plan<'a> {
-    if checkpoints.is_empty() || mode == Mode::TopLevel {
-        return Plan {
-            top_level: active.iter().collect(),
-            anchored: &[],
-        };
-    }
-
-    let folded = if mode == Mode::Changes {
-        0
-    } else {
-        folded_search_checkpoints(checkpoints)
-    };
-
-    let mut top_level: Vec<&ToolDeclaration> = Vec::new();
-    for checkpoint in &checkpoints[..folded] {
-        top_level.retain(|tool| !checkpoint.removed.contains(&tool.spec.name));
-        for tool in &checkpoint.added {
-            if let Some(existing) = top_level
-                .iter_mut()
-                .find(|item| item.spec.name == tool.spec.name)
-            {
-                *existing = tool;
-            } else {
-                top_level.push(tool);
-            }
-        }
-    }
-
-    Plan {
-        top_level,
-        anchored: &checkpoints[folded..],
-    }
-}
-
-fn folded_search_checkpoints(checkpoints: &[Checkpoint]) -> usize {
-    let mut declared = BTreeSet::new();
-    let mut folded = usize::from(checkpoints[0].message_index == 0);
-    for (index, checkpoint) in checkpoints.iter().enumerate() {
-        if !checkpoint.removed.is_empty() {
-            folded = index + 1;
-        }
-        for tool in &checkpoint.added {
-            if !declared.insert(tool.spec.name.as_str()) {
-                folded = index + 1;
-            }
-        }
-    }
-    folded
-}
-
 pub(super) struct WireProjection {
     pub(super) top_level: Vec<Value>,
     pub(super) by_message: BTreeMap<usize, AnchoredItems>,
@@ -186,7 +103,7 @@ pub(super) fn wire_projection(
                         .before
                         .push(json!({"type":"additional_tools","role":"developer","tools":tools}));
                 }
-                Mode::Search => {
+                Mode::Additions => {
                     let message = checkpoint
                         .message_index
                         .saturating_sub(usize::from(leading_system));
@@ -279,6 +196,7 @@ fn base36(mut value: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_rs_core::ToolTranscriptChange as Checkpoint;
 
     fn tool(name: &str, revision: &str) -> ToolDeclaration {
         ToolDeclaration {
@@ -457,8 +375,8 @@ mod tests {
                 .ends_with("Still unavailable: removed.")
         );
         let search = wire_projection(
-            plan(Mode::Search, &checkpoints, &active),
-            Mode::Search,
+            plan(Mode::Additions, &checkpoints, &active),
+            Mode::Additions,
             "developer",
             true,
             encode,
@@ -1013,7 +931,7 @@ mod tests {
             },
         ];
         let active = [tool("repeat", "new")];
-        let search = plan(Mode::Search, &checkpoints, &active);
+        let search = plan(Mode::Additions, &checkpoints, &active);
         assert_eq!(search.top_level, [&active[0]]);
         assert!(search.anchored.is_empty());
     }

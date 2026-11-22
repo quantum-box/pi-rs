@@ -139,27 +139,7 @@ pub struct OpenAiResponses {
     mid_conversation_system_default: bool,
     transcript_tools_default: (bool, bool),
     transcript_tools_models: BTreeMap<String, (bool, bool)>,
-    tool_transcript: Option<BoundToolTranscript>,
-}
-
-#[derive(Clone)]
-struct BoundToolTranscript {
-    request: String,
-    changes: Vec<pi_rs_core::ToolTranscriptChange>,
-}
-
-fn tool_transcript_request_identity(request: &ModelRequest) -> Option<String> {
-    let tool_names: Vec<&str> = request
-        .tools
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect();
-    pi_rs_core::protected_model_fingerprint(&(
-        "responses-tool-transcript-request-v1",
-        &request.model,
-        &request.messages,
-        tool_names,
-    ))
+    tool_transcript: Option<pi_rs_core::BoundToolTranscript>,
 }
 
 /// A Responses request whose wire tools and effective sampling are fixed.
@@ -482,10 +462,7 @@ impl OpenAiResponses {
             if changes.is_empty() || !self.supports_tool_transcript(&request.model) {
                 None
             } else {
-                tool_transcript_request_identity(request).map(|request| BoundToolTranscript {
-                    request,
-                    changes: changes.to_vec(),
-                })
+                pi_rs_core::BoundToolTranscript::bind(request, changes)
             };
         self
     }
@@ -510,10 +487,8 @@ impl OpenAiResponses {
         instruction_role: &str,
     ) -> Option<transcript_tools::WireProjection> {
         let mode = self.transcript_tool_mode(&request.model);
-        let transcript = self.tool_transcript.as_ref()?;
-        if mode == transcript_tools::Mode::TopLevel
-            || tool_transcript_request_identity(request).as_deref() != Some(&transcript.request)
-        {
+        let changes = self.tool_transcript.as_ref()?.changes_for(request)?;
+        if mode == transcript_tools::Mode::TopLevel {
             return None;
         }
         let encode = |declaration: &pi_rs_core::ToolDeclaration| {
@@ -553,7 +528,7 @@ impl OpenAiResponses {
             (wire, property)
         };
         Some(transcript_tools::wire_projection(
-            transcript_tools::plan(mode, &transcript.changes, &traits.source),
+            transcript_tools::plan(mode, changes, &traits.source),
             mode,
             instruction_role,
             matches!(request.messages.first(), Some(Message::System { .. })),

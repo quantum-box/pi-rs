@@ -1,5 +1,5 @@
 //! Replay model-facing tool loadouts without changing the public message shape.
-use crate::{Event, Record, ToolDeclaration, ToolSpec, ToolTranscriptChange};
+use crate::{Event, ModelRequest, Record, ToolDeclaration, ToolSpec, ToolTranscriptChange};
 use std::collections::{BTreeMap, BTreeSet};
 
 const LOADOUT: &str = "pi-rs:tool-loadout-v1";
@@ -203,6 +203,126 @@ pub(crate) fn replay(
             })
         })
         .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolTranscriptMode {
+    TopLevel,
+    Additions,
+    Changes,
+}
+
+impl ToolTranscriptMode {
+    pub fn from_capabilities(
+        mid_conversation_system: bool,
+        additional_tools: bool,
+        tool_search: bool,
+    ) -> Self {
+        if mid_conversation_system && additional_tools {
+            Self::Changes
+        } else if tool_search {
+            Self::Additions
+        } else {
+            Self::TopLevel
+        }
+    }
+}
+
+pub struct ToolTranscriptPlan<'a> {
+    pub top_level: Vec<&'a ToolDeclaration>,
+    pub anchored: &'a [ToolTranscriptChange],
+}
+
+/// The tool declarations reflected in top-level tools can precede the active
+/// loadout only if every remaining historical change is append-only.
+pub fn plan_tool_transcript<'a>(
+    mode: ToolTranscriptMode,
+    checkpoints: &'a [ToolTranscriptChange],
+    active: &'a [ToolDeclaration],
+) -> ToolTranscriptPlan<'a> {
+    if checkpoints.is_empty() || mode == ToolTranscriptMode::TopLevel {
+        return ToolTranscriptPlan {
+            top_level: active.iter().collect(),
+            anchored: &[],
+        };
+    }
+
+    let folded = if mode == ToolTranscriptMode::Changes {
+        0
+    } else {
+        folded_addition_checkpoints(checkpoints)
+    };
+
+    let mut top_level: Vec<&ToolDeclaration> = Vec::new();
+    for checkpoint in &checkpoints[..folded] {
+        top_level.retain(|tool| !checkpoint.removed.contains(&tool.spec.name));
+        for tool in &checkpoint.added {
+            if let Some(existing) = top_level
+                .iter_mut()
+                .find(|item| item.spec.name == tool.spec.name)
+            {
+                *existing = tool;
+            } else {
+                top_level.push(tool);
+            }
+        }
+    }
+
+    ToolTranscriptPlan {
+        top_level,
+        anchored: &checkpoints[folded..],
+    }
+}
+
+fn folded_addition_checkpoints(checkpoints: &[ToolTranscriptChange]) -> usize {
+    let mut declared = BTreeSet::new();
+    let mut folded = usize::from(checkpoints[0].message_index == 0);
+    for (index, checkpoint) in checkpoints.iter().enumerate() {
+        if !checkpoint.removed.is_empty() {
+            folded = index + 1;
+        }
+        for tool in &checkpoint.added {
+            if !declared.insert(tool.spec.name.as_str()) {
+                folded = index + 1;
+            }
+        }
+    }
+    folded
+}
+
+/// A model transcript bound to the messages and tool names of one prepared request.
+#[derive(Clone)]
+pub struct BoundToolTranscript {
+    request: String,
+    changes: Vec<ToolTranscriptChange>,
+}
+
+fn tool_transcript_request_identity(request: &ModelRequest) -> Option<String> {
+    let tool_names: Vec<&str> = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    crate::protected_model_fingerprint(&(
+        "tool-transcript-request-v1",
+        &request.model,
+        &request.messages,
+        tool_names,
+    ))
+}
+
+impl BoundToolTranscript {
+    pub fn bind(request: &ModelRequest, changes: &[ToolTranscriptChange]) -> Option<Self> {
+        Some(Self {
+            request: tool_transcript_request_identity(request)?,
+            changes: changes.to_vec(),
+        })
+    }
+
+    pub fn changes_for(&self, request: &ModelRequest) -> Option<&[ToolTranscriptChange]> {
+        (tool_transcript_request_identity(request).as_deref() == Some(&self.request))
+            .then_some(self.changes.as_slice())
+    }
 }
 
 fn imported_declarations(source: Option<&serde_json::Value>, path: &str) -> Vec<ToolDeclaration> {

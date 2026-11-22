@@ -76,6 +76,9 @@ pub use tokens::{
 pub use tokio_util::sync::CancellationToken;
 pub use tool_execution_snapshot::{ToolExecutionSnapshot, ValidatedToolExecutionSnapshot};
 pub use tool_render::*;
+pub use tool_transcript::{
+    BoundToolTranscript, ToolTranscriptMode, ToolTranscriptPlan, plan_tool_transcript,
+};
 pub use types::*;
 pub use ui::*;
 pub use ui_prompt::{UiPromptKind, UiPromptReason};

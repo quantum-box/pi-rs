@@ -5395,6 +5395,17 @@ Authentication and grammar tool streaming were exercised with fixtures.
 Live sign-in and inference were unverified because no account was available
 for acceptance.
 
+Chat Completions models that advertise both `supportsMidConvoSystemMessages`
+and `supportsMidConvoToolAdditions` replay append-only tool loadout changes
+as system messages with a `tools` array. Removals and redefinitions fold into
+the top-level declarations, and later additions keep their conversation
+position. Like Pi, this route uses the latest definition of a redeclared
+grammar tool for replay. Calls with incompatible historical arguments keep
+their full JSON. This covers compatible Kimi routes in the bundled catalog. Routes
+without both flags send the active top-level declarations. Compared the
+published Pi Moonshot request payloads and exercised native request projection
+with fixtures. Live Kimi tool additions were unverified.
+
 ### GitHub Copilot
 
 The native catalog includes Pi AI v1.6.0's 35 Copilot chat models across

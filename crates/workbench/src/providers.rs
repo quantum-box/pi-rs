@@ -757,6 +757,7 @@ impl Client {
 
     pub(super) fn uses_tool_transcript(&self, model: &str) -> bool {
         match self {
+            Self::Ollama(client) => client.uses_tool_transcript(model),
             Self::OpenAi(client) => client.supports_tool_transcript(model),
             Self::Deferred(client) => client
                 .estimation_client()
@@ -771,6 +772,9 @@ impl Client {
         tool_transcript: &[pi_rs::ToolTranscriptChange],
     ) -> Self {
         match self {
+            Self::Ollama(client) => {
+                Self::Ollama(client.with_tool_transcript(request, tool_transcript))
+            }
             Self::OpenAi(client) => {
                 Self::OpenAi(client.with_tool_transcript(request, tool_transcript))
             }
