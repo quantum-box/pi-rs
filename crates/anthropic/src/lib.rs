@@ -1638,6 +1638,10 @@ fn resolve_tools(
 
 #[async_trait::async_trait]
 impl Model for Anthropic {
+    fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
+        self.mid_conversation_system_models.contains(model)
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,
@@ -2007,8 +2011,7 @@ impl Anthropic {
             &replay_scope,
             &edited_scope,
             self.allow_empty_signature,
-            self.mid_conversation_system_models
-                .contains(&requested_model),
+            self.supports_mid_conversation_system_messages(&requested_model),
             active_effort.is_some(),
         )?;
         if let Some(tools) = wire_tools

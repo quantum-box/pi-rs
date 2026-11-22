@@ -5377,6 +5377,16 @@ fn resumed_pi_system_updates_follow_the_selected_provider_capability() {
             "/v1/chat/completions",
             "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
         ),
+        (
+            "anthropic-messages",
+            "messages",
+            "/v1/messages",
+            concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"fixture-model\"}}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            ),
+        ),
     ] {
         for supports_updates in [true, false] {
             let directory = tempfile::tempdir().unwrap();
@@ -5469,7 +5479,29 @@ fn resumed_pi_system_updates_follow_the_selected_provider_capability() {
                 .iter()
                 .map(|message| message["role"].as_str().unwrap())
                 .collect();
-            if supports_updates {
+            if api == "anthropic-messages" {
+                let system = body["system"]
+                    .as_str()
+                    .or_else(|| body["system"][0]["text"].as_str())
+                    .unwrap();
+                if supports_updates {
+                    assert_eq!(system, "Original\n\nKeep\n\nOld state");
+                    assert_eq!(roles, ["user", "system"]);
+                    assert_eq!(
+                        messages[1]["content"][0]["text"],
+                        "Additional\n\nUpdated system prompt section \"state\":\n\nNew state\n\nRemoved system prompt section \"keep\"."
+                    );
+                } else {
+                    assert_eq!(system, "Original\n\nAdditional\n\nNew state");
+                    assert_eq!(roles, ["user"]);
+                }
+                for (index, text) in ["Before update", "After update", "Continue"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    assert_eq!(messages[0]["content"][index]["text"], text);
+                }
+            } else if supports_updates {
                 assert_eq!(roles, ["system", "user", "system", "user", "user"], "{api}");
                 assert_eq!(messages[0]["content"], "Original\n\nKeep\n\nOld state");
                 assert_eq!(

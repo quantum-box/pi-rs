@@ -1641,6 +1641,7 @@ pub(super) async fn stream_with_declarations(
 impl Model for Client {
     fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
         match self {
+            Self::Anthropic(client) => client.supports_mid_conversation_system_messages(model),
             Self::Ollama(client) => client.supports_mid_conversation_system_messages(model),
             Self::OpenAi(client) => client.supports_mid_conversation_system_messages(model),
             Self::Deferred(client) => client
