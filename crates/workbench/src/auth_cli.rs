@@ -119,6 +119,47 @@ async fn resolve(
         .and_then(|id| args.model_profiles.model_endpoint(provider, id))
         .unwrap_or_else(|| args.model_profiles.endpoint(provider));
     if let Some(credential) = args.configured_model_credential(provider, endpoint) {
+        if let super::model_auth::Credential::AnthropicFederation(federation) = &credential {
+            if wanted == Some(AuthType::ApiKey)
+                || model.is_some_and(|id| {
+                    args.model_profiles.model_adapter(provider, id)
+                        != super::providers::Adapter::Anthropic
+                })
+            {
+                return Ok(None);
+            }
+            if wanted.is_none()
+                && args
+                    .model_profiles
+                    .header_settings(provider, endpoint, model)
+                    .with_environment(args.model_keys.environment(
+                        provider,
+                        endpoint,
+                        &args.model_profiles,
+                    ))
+                    .has_anthropic_auth(no_refresh)
+                    .await?
+            {
+                return Ok(Some(Resolved {
+                    kind: AuthType::ApiKey,
+                    value: None,
+                }));
+            }
+            let value = if no_refresh {
+                federation.check_identity_file().await?;
+                None
+            } else {
+                Some(
+                    federation
+                        .access_with_minimum(&args.settings, minimum)
+                        .await?,
+                )
+            };
+            return Ok(Some(Resolved {
+                kind: AuthType::OAuth,
+                value,
+            }));
+        }
         if matches!(credential, super::model_auth::Credential::BedrockChain) {
             return Ok(
                 (wanted.is_none() && bedrock_ambient_configured(false)).then_some(Resolved {

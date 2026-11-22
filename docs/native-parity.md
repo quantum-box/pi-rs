@@ -5915,6 +5915,25 @@ credential classification. Offline and loopback checks covered priority,
 endpoint isolation, and explicit proxy keys. A live request with an OAuth
 environment token remains unverified.
 
+When the official Anthropic Messages route has no other credential,
+native supports workload identity federation with
+`ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, and
+`ANTHROPIC_IDENTITY_TOKEN_FILE`. Optional `ANTHROPIC_SERVICE_ACCOUNT_ID`
+and `ANTHROPIC_WORKSPACE_ID` scope the exchange. Explicit authentication
+headers take precedence in Messages requests and credential checks.
+Native exchanges at the official Anthropic endpoint
+and shares the access token in memory. It rereads the identity file on
+exchange, starts a background exchange within 120 seconds of expiry,
+waits for a fresh token within 30 seconds, and invalidates a rejected
+token for the next request. `pi auth check --no-refresh` checks the identity
+file locally or reports a configured authentication header without running
+its command. A regular check exchanges the assertion when needed, and
+`print-bearer-token` can export the access token with a requested minimum
+lifetime. The identity assertion is never returned by the auth commands.
+Loopback tests cover the exchange, concurrent access, and file rotation.
+A live federation
+exchange and Messages request remain unverified.
+
 ### Published input limits and cache lifetimes checkpoint
 
 The bundled Anthropic and Gemini catalogs retain Pi's declared request

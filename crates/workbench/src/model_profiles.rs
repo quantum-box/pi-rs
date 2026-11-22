@@ -48,6 +48,12 @@ pub(super) struct RequestHeaders {
     env: Option<serde_json::Map<String, Value>>,
 }
 
+const ANTHROPIC_AUTH_HEADERS: [HeaderName; 3] = [
+    AUTHORIZATION,
+    HeaderName::from_static("x-api-key"),
+    HeaderName::from_static("cf-aig-authorization"),
+];
+
 impl RequestHeaders {
     #[cfg(test)]
     pub(super) fn for_test(name: &str, value: &str) -> Self {
@@ -85,21 +91,70 @@ impl RequestHeaders {
     }
 
     pub async fn resolve(&self, provider: &Provider, token: Option<&str>) -> Result<HeaderMap> {
+        self.authenticate(self.resolve_values().await?, provider, token)
+    }
+
+    pub(super) async fn resolve_anthropic_auth(&self) -> Result<(HeaderMap, Option<HeaderName>)> {
+        let mut headers = self.resolve_values().await?;
+        for name in ANTHROPIC_AUTH_HEADERS {
+            if let Some(value) = headers
+                .get(&name)
+                .filter(|value| !value.as_bytes().trim_ascii().is_empty())
+            {
+                value
+                    .to_str()
+                    .map_err(|_| Error::Config("invalid Anthropic authentication header".into()))?;
+                return Ok((headers, Some(name)));
+            }
+            headers.remove(name);
+        }
+        Ok((headers, None))
+    }
+
+    pub(super) async fn has_anthropic_auth(&self, no_refresh: bool) -> Result<bool> {
+        if !no_refresh {
+            return Ok(self.resolve_anthropic_auth().await?.1.is_some());
+        }
+        for name in ANTHROPIC_AUTH_HEADERS {
+            let Some(value) = self.values.get(name.as_str()) else {
+                continue;
+            };
+            if let Some(command) = value.strip_prefix('!') {
+                if !command.trim().is_empty() {
+                    return Ok(true);
+                }
+                continue;
+            }
+            let value = self.resolve_value(name.as_str(), value).await?;
+            if !value.trim().is_empty() {
+                sensitive_header(name.as_str(), &value)?
+                    .to_str()
+                    .map_err(|_| Error::Config("invalid Anthropic authentication header".into()))?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn resolve_values(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::with_capacity(self.values.len());
         for (name, value) in &self.values {
-            let resolved = if value.starts_with('!') {
-                pi_rs_workbench::mcp::resolve_value(value)
-                    .await
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-            } else {
-                expand_value_with_env(value, self.env.as_ref())
-            };
-            let value = resolved
-                .ok_or_else(|| Error::Config(format!("could not resolve model header {name}")))?;
+            let value = self.resolve_value(name, value).await?;
             Self::insert(&mut headers, name, &value)?;
         }
-        self.authenticate(headers, provider, token)
+        Ok(headers)
+    }
+
+    async fn resolve_value(&self, name: &str, value: &str) -> Result<String> {
+        let resolved = if value.starts_with('!') {
+            pi_rs_workbench::mcp::resolve_value(value)
+                .await
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        } else {
+            expand_value_with_env(value, self.env.as_ref())
+        };
+        resolved.ok_or_else(|| Error::Config(format!("could not resolve model header {name}")))
     }
 
     fn insert(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {
@@ -110,7 +165,7 @@ impl RequestHeaders {
         Ok(())
     }
 
-    fn authenticate(
+    pub(super) fn authenticate(
         &self,
         mut headers: HeaderMap,
         provider: &Provider,

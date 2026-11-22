@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 mod anthropic_auth;
+mod anthropic_federation;
 mod attachments;
 mod auth_cli;
 mod auth_lock;
@@ -534,7 +535,11 @@ impl Cli {
                     return None;
                 }
                 if provider == &Provider::Anthropic {
-                    return model_auth::anthropic_env_credential(|name| std::env::var(name).ok());
+                    let env = |name: &str| std::env::var(name).ok();
+                    return model_auth::anthropic_env_credential(env).or_else(|| {
+                        anthropic_federation::Federation::from_env(env)
+                            .map(model_auth::Credential::AnthropicFederation)
+                    });
                 }
                 let variable = match provider {
                     Provider::Google => "GEMINI_API_KEY",

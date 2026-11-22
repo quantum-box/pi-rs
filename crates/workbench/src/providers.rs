@@ -456,6 +456,81 @@ impl Deferred {
         &self,
         auth_path: &std::path::Path,
     ) -> Result<(Client, HeaderMap)> {
+        let (client, headers) = match &self.credential {
+            Some(Credential::AnthropicFederation(federation)) => {
+                self.connect_anthropic_federation(federation).await?
+            }
+            _ => self.connect_at(auth_path).await?,
+        };
+        let mut client = client
+            .with_headers(headers.clone())
+            .with_context_probes(self.probe_context);
+        match (&self.credential, &mut client) {
+            (Some(Credential::BedrockProfile(profile)), Client::Bedrock(bedrock)) => {
+                *bedrock = bedrock.clone().with_profile(profile.clone());
+            }
+            (Some(Credential::BedrockChain), Client::Bedrock(bedrock)) => {
+                *bedrock = bedrock.clone().with_credential_chain();
+            }
+            _ => {}
+        }
+        if let Some(settings) = &self.http_settings {
+            client = client.with_http_settings_and_env(settings, self.headers.environment())?;
+        }
+        if let Some((args, reported)) = &self.options {
+            client = client.with_model_options(args, *reported)?;
+        }
+        Ok((
+            if self.observed {
+                client.observe()
+            } else {
+                client
+            },
+            headers,
+        ))
+    }
+
+    async fn connect_anthropic_federation(
+        &self,
+        federation: &Arc<super::anthropic_federation::Federation>,
+    ) -> Result<(Client, HeaderMap)> {
+        if self.provider != Provider::Anthropic
+            || self.adapter != Adapter::Anthropic
+            || self.endpoint != Provider::Anthropic.default_endpoint()
+        {
+            return Err(Error::Config(
+                "Anthropic workload identity requires the official Messages endpoint".into(),
+            ));
+        }
+        let (headers, explicit) = self.headers.resolve_anthropic_auth().await?;
+        if let Some(name) = explicit {
+            let client = Anthropic::with_authentication_header(
+                &self.endpoint,
+                name.clone(),
+                &headers[&name],
+            )?;
+            return Ok((Client::Anthropic(client), headers));
+        }
+        let fallback;
+        let settings = if let Some(settings) = &self.http_settings {
+            settings
+        } else {
+            fallback = super::config::Settings::load(&std::env::current_dir()?, false)?;
+            &fallback
+        };
+        let token = federation.access(settings).await?;
+        let headers = self
+            .headers
+            .authenticate(headers, &self.provider, Some(&token))?;
+        let federation = Arc::clone(federation);
+        let submitted = token.clone();
+        let client = Anthropic::with_federated_token(&self.endpoint, &token, move || {
+            federation.invalidate(&submitted);
+        })?;
+        Ok((Client::Anthropic(client), headers))
+    }
+
+    async fn connect_at(&self, auth_path: &std::path::Path) -> Result<(Client, HeaderMap)> {
         let token = match &self.credential {
             Some(Credential::BedrockProfile(_) | Credential::BedrockChain) => None,
             Some(Credential::AnthropicOAuth) if self.http_settings.is_some() => Some(
@@ -547,34 +622,14 @@ impl Deferred {
             )?,
             _ => self.endpoint.clone(),
         };
-        let mut client = self
-            .provider
-            .connect_prechecked(self.adapter, &endpoint, token, auth, radius_checked)?
-            .with_headers(headers.clone())
-            .with_context_probes(self.probe_context);
-        match (&self.credential, &mut client) {
-            (Some(Credential::BedrockProfile(profile)), Client::Bedrock(bedrock)) => {
-                *bedrock = bedrock.clone().with_profile(profile.clone());
-            }
-            (Some(Credential::BedrockChain), Client::Bedrock(bedrock)) => {
-                *bedrock = bedrock.clone().with_credential_chain();
-            }
-            _ => {}
-        }
-        if let Some(settings) = &self.http_settings {
-            client = client.with_http_settings_and_env(settings, self.headers.environment())?;
-        }
-        if let Some((args, reported)) = &self.options {
-            client = client.with_model_options(args, *reported)?;
-        }
-        Ok((
-            if self.observed {
-                client.observe()
-            } else {
-                client
-            },
-            headers,
-        ))
+        let client = self.provider.connect_prechecked(
+            self.adapter,
+            &endpoint,
+            token,
+            auth,
+            radius_checked,
+        )?;
+        Ok((client, headers))
     }
 }
 
@@ -3878,6 +3933,51 @@ mod contention_tests {
                 !summary && path != 0
             );
         }
+    }
+
+    #[tokio::test]
+    async fn anthropic_federation_requires_official_messages_and_yields_to_explicit_auth() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing_file = directory.path().join("identity");
+        let federation =
+            super::super::anthropic_federation::Federation::from_env(|name| match name {
+                "ANTHROPIC_FEDERATION_RULE_ID" | "ANTHROPIC_ORGANIZATION_ID" => {
+                    Some("fixture".into())
+                }
+                "ANTHROPIC_IDENTITY_TOKEN_FILE" => {
+                    Some(missing_file.to_string_lossy().into_owned())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let client = |endpoint, headers| {
+            Client::deferred(
+                Provider::Anthropic,
+                Adapter::Anthropic,
+                endpoint,
+                Some(Credential::AnthropicFederation(Arc::clone(&federation))),
+                headers,
+            )
+        };
+        let (resolved, headers) = client(
+            Provider::Anthropic.default_endpoint(),
+            RequestHeaders::for_test("authorization", "Bearer fixture"),
+        )
+        .resolve_affinity_headers()
+        .await
+        .unwrap();
+        assert!(matches!(resolved, Client::Anthropic(_)));
+        assert_eq!(headers["authorization"], "Bearer fixture");
+
+        let result = client(
+            "https://elsewhere.example/v1/messages",
+            RequestHeaders::default(),
+        )
+        .resolve_affinity_headers()
+        .await;
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message.contains("official Messages"))
+        );
     }
 
     #[tokio::test]

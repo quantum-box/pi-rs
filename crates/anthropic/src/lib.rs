@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 
 pub const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
+pub const OAUTH_API_BETA: &str = "oauth-2025-04-20";
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
@@ -111,6 +112,7 @@ pub struct Anthropic {
     endpoint: Url,
     auth: (HeaderName, HeaderValue),
     oauth: bool,
+    federation_rejected: Option<Arc<dyn Fn() + Send + Sync>>,
     provider: Arc<str>,
     replay_scope: Arc<str>,
     headers: HeaderMap,
@@ -150,6 +152,34 @@ impl Anthropic {
             ));
         }
         Self::connect(endpoint, AUTHORIZATION, &format!("Bearer {token}"))
+    }
+
+    /// Authenticate using a short-lived Anthropic workload identity access token.
+    pub fn with_federated_token(
+        endpoint: &str,
+        token: &str,
+        on_rejection: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self> {
+        let mut client = Self::with_bearer_token(endpoint, token)?;
+        if client.endpoint.as_str() != DEFAULT_ENDPOINT {
+            return Err(Error::Config(
+                "Anthropic workload identity requires the official endpoint".into(),
+            ));
+        }
+        client.federation_rejected = Some(Arc::new(on_rejection));
+        Ok(client)
+    }
+
+    /// Use an explicitly configured authentication header as the request credential.
+    pub fn with_authentication_header(
+        endpoint: &str,
+        name: HeaderName,
+        value: &HeaderValue,
+    ) -> Result<Self> {
+        let credential = value
+            .to_str()
+            .map_err(|_| Error::Config("invalid Anthropic authentication header".into()))?;
+        Self::connect(endpoint, name, credential)
     }
 
     /// Authenticate to Cloudflare AI Gateway without an origin API key.
@@ -225,6 +255,7 @@ impl Anthropic {
             endpoint,
             auth: (name, value),
             oauth: false,
+            federation_rejected: None,
             provider: Arc::from("anthropic"),
             replay_scope,
             headers: HeaderMap::new(),
@@ -598,12 +629,13 @@ impl Anthropic {
                 );
             }
         }
-        if has_fallbacks || supports_managed_effort {
+        if has_fallbacks || supports_managed_effort || self.federation_rejected.is_some() {
             let mut value = headers
                 .get(&beta)
                 .map_or_else(Vec::new, |value| value.as_bytes().to_vec());
             for feature in [
                 has_fallbacks.then_some(FALLBACK_BETA),
+                self.federation_rejected.is_some().then_some(OAUTH_API_BETA),
                 supports_managed_effort.then_some(EFFORT_BETA),
                 supports_managed_effort.then_some(THINKING_BINDING_BETA),
             ]
@@ -2255,6 +2287,11 @@ impl Anthropic {
                 |response| (response.status().as_u16(), response.headers()),
             )
             .await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(rejected) = &self.federation_rejected
+        {
+            rejected();
+        }
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
