@@ -721,8 +721,12 @@ may behave differently. Other JavaScript date parsing edge cases
 remain open. Entries whose parent is missing or points to themselves appear as
 roots.
 
-During manual compaction, an RPC `abort` response waits for the compaction
-command to finish, even if an internal agent-settled event arrives first.
+RPC manual compaction emits `compaction_start` and `compaction_end` before
+the command response. Failures use Pi's event diagnostic, and cancellation
+reports `aborted: true` without `errorMessage`. A pending `abort` response
+follows the compaction response. Successful results include native before
+and after context token estimates, with provider usage and compaction details
+when recorded.
 
 Unknown RPC commands return `Unknown command: <type>` and preserve the
 request ID and original type when present. Object, array and numeric types use
@@ -861,6 +865,18 @@ retain the details supplied by the tool.
   notes persistence, cancellation, and restoring the terminal on exit.
 - Compare each remaining surface against the pinned reference before marking
   that row complete. Existing core acceptance is recorded in [acceptance.md](acceptance.md).
+
+### Native SDK tool renderers
+
+Rust embedding hosts can resolve call and result renderers for owned,
+built-in, and historical tools with `AgentSession::tool_renderers`.
+Extension resolvers wrap the next renderer in registration order. The base
+combines the registered tool's callbacks with host defaults. A callback receives
+arguments and tool presentation state and returns styled rows that the host
+can theme. Missing or failed sections fall back independently. Pi returns
+live TUI components with local state and invalidation callbacks. Native
+hosts own framing, image handling, component state and redraws. Terminal
+integration and executable renderer registration remain pending.
 
 ### Native extension header and footer
 
@@ -2172,7 +2188,11 @@ count lines and rewind the same file while keeping memory bounded. Scoped and
 injected read tools retain positive integer paging parameters.
 
 Text reads now scan files with bounded memory, including files larger than
-4 MiB. Pages retain complete lines and UTF-8 boundaries, report the next
+4 MiB. Unrestricted local reads with integer offsets and nonnegative integer
+limits scan regular files up to the size observed when opened, as in Pi. Files
+that report a size of zero are read to EOF. The snapshot bound also applies to
+the total lines used in continuation notices. Pages retain complete lines and
+UTF-8 boundaries, report the next
 `offset`, reject offsets beyond the file, and explain when a single line
 exceeds the byte limit. Explicit line limits report remaining lines. Image
 normalization and the separate write-size limit retain their existing bounds.
@@ -2253,14 +2273,15 @@ buffer, it indexes matches on disk and streams the selected context from the
 same open file.
 
 Unrestricted local `find` and `ls` accept Pi's numeric limit schema and interpret
-JSON numbers as JavaScript doubles. `ls` compares the number directly, including
-zero, negative and fractional values. Local `find` reproduces fd's numeric
-argument parsing: zero means unlimited, while negative, fractional, and values
-outside fd's host-sized integer range produce fd-style errors before checking
-the search path. These diagnostics retain error status and reach the model
-without an added failure prefix. Generated local tool errors carry Pi's empty
-`details` object in JSON and RPC. Notices and details retain the JavaScript
-numeric value. Scoped tools retain their positive
+JSON numbers as JavaScript doubles. As in Pi 1.6.0, `ls` rounds its limit down
+to a whole number and uses at least one entry. Notices and details use the
+effective limit. Local `find` applies the same rounding, passes the
+effective limit plus one through fd-style numeric parsing, and reports a limit
+only when an extra result exists. Values outside fd's host-sized integer range
+produce fd-style errors before checking the search path. These diagnostics
+retain error status and reach the model without an added failure prefix.
+Generated local tool errors carry Pi's empty `details` object in JSON and RPC.
+Scoped tools retain their positive
 integer schema and 100,000-entry cap. Their incremental output formatter retains at most 50 KiB
 plus one byte while counting the complete output. Directory enumeration and
 locale sorting still retain all directory entries in memory. `find` uses the
@@ -2974,9 +2995,22 @@ object order is preserved during import so named sections retain their declared
 order. Tool declarations resolve to current enabled native implementations and
 schemas. An imported declaration cannot enable an unavailable or disabled tool.
 
+On ordinary turns, models that support mid-conversation instructions receive
+the original system prompt followed by checkpoint updates at their conversation
+positions, with named sections rendered as replacements or removals. An imported
+compaction snapshot supplies the leading prompt. Native compaction preserves
+checkpoint positions among retained messages when it has no prompt snapshot.
+A checkpoint inside a tool batch follows its results to preserve provider
+tool-call pairing. Models
+without that capability receive the fully resolved leading prompt. Extension
+message hooks see the ordered checkpoints. Edits to other messages preserve
+checkpoint placement. If a hook edits system messages on a route that needs
+one prompt, the adapter joins the hook's current system text in order.
+
 Tests cover branch restoration, section order, replacement/removal, current tool
-schemas and permission boundaries. A CLI import-and-resume fixture verified the
-actual model request and retained the original source file. Workspace tests and
+schemas and permission boundaries. A CLI import-and-resume fixture checked
+Anthropic Messages, Responses, and Chat Completions requests, and retained
+the original source file. Workspace tests and
 all-target Clippy passed on Rust 1.89, along with direct/deferred live MCP updates
 and form elicitation after the serialization change. A local qwen3.5:4b CLI call
 also returned the requested `OK` response.
@@ -3457,9 +3491,12 @@ implementation applies the same fail-closed rule to direct callers.
 
 For a byte-truncated final shell line, the displayed line size follows Pi's
 streaming accumulator: a trailing newline resets the current-line byte count
-to zero, while an unterminated line retains its UTF-8 byte count. The retained
-tail and truncation metadata are unchanged. A regression covers both cases
-with chunked multibyte output; other local-tool parity gaps remain open.
+to zero, while an unterminated line retains its UTF-8 byte count. A long line followed only
+by blank lines keeps its final UTF-8 characters and any blank lines that fit
+in the display limit. The notice gives the number of the first displayed line.
+Regressions cover chunked multibyte output, trailing whitespace, and both
+progress snapshots and completed results, using upstream
+`780bf31fcaeb252fa9b68df3964c735eae75bde3` as the reference.
 
 ### Grep context and line-limit checkpoint
 
@@ -3490,8 +3527,11 @@ Native `find` now includes directory matches (with a trailing slash), hidden
 entries and symlinks without following symlink targets. It follows the reference
 CLI's ignore-file behavior instead of unconditionally excluding `node_modules`
 and `.git`. Git ignore rules also apply outside repositories. Basename patterns
-use smart case; patterns containing a slash match full paths with the reference's
-implicit `**/` prefix. Results use forward slashes and sorted output.
+use smart case. Unrestricted local `find` anchors relative path patterns at the
+search root, strips leading `./` segments and uses explicit `**/` to match
+nested paths, as in Pi 1.6.0. Windows patterns accept backslash separators.
+Scoped `find` retains its implicit `**/` prefix. Native results use forward
+slashes and deterministic traversal order.
 Unrestricted local `find` uses fd's diagnostics for missing or non-directory
 search roots and invalid glob patterns. Search-root validation comes first.
 
@@ -3556,8 +3596,19 @@ their control state is cleared when the waiting future is dropped.
 
 RPC supports `set_auto_retry` and `abort_retry`, with `auto_retry_start` and
 `auto_retry_end` events. The terminal displays the retry wait, attempt count and
-error. Provider-internal retries and Retry-After handling, summary-specific retry
-policy remain open.
+error. The initial OpenAI Responses (including Azure), OpenAI-compatible Chat
+Completions, and Anthropic Messages HTTP requests honor `retry.provider.maxRetries`
+(default 0), `maxRetryDelayMs` (default 60000, 0 disables the ceiling), and
+`timeoutMs` (to receive response headers on each attempt). They honor `x-should-retry`, `Retry-After-Ms`, and
+`Retry-After` before accepting a response stream. As in Pi 1.6, this opt-in
+policy uses HTTP retry hints and status before processing the error body. The
+agent still uses the final provider error to distinguish quota exhaustion and
+other permanent failures. A server delay above the ceiling stops the provider
+retry and can trigger the agent's separately configured retry. Native reports
+the requested delay and ceiling without echoing the provider body. This policy
+also loads legacy
+`retry.maxDelayMs` when the replacement is unset. Google Gemini and Codex-specific
+provider retries and summary-specific retry policy remain open.
 
 Tests cover recovery, request and retry caps, queued input, wait cancellation,
 dropped-wait cleanup and usage-settlement failures. Loopback RPC checks verify
@@ -5260,8 +5311,13 @@ file when it supplies one. Vertex SDK clients scope signed replay to their
 Vertex endpoint by default. Explicit provider replay scopes remain available.
 
 Native ADC discovery checks the explicitly configured file or the local gcloud
-credentials file. The Vertex sign-in wizard and metadata-only ambient credentials
-remain unsupported. Loopback tests cover Express and project-scoped routes. No real
+credentials file. Terminal `/login google-vertex` offers a masked API key,
+ADC, or a service account file. The last two save the project and location
+in a Pi-compatible credential entry. Both file-based methods check that a
+credentials file exists before replacing the saved credential. An environment API key still
+takes precedence over ADC, and ADC uses `GOOGLE_APPLICATION_CREDENTIALS` when
+it has no saved credentials file, following Pi. Metadata-only ambient credentials remain
+unsupported. Loopback tests cover Express and project-scoped routes. No real
 Google Cloud credential was available for acceptance testing.
 
 ### OpenAI Codex
@@ -5746,6 +5802,16 @@ and model overrides merge for that compatibility setting. When capabilities
 are unavailable, the standalone adapter defaults to `system`; SDK hosts can
 explicitly select the developer role. This is also the fallback for unknown
 workbench models, whose upstream capabilities cannot be inferred.
+
+Responses and Codex honor Pi's `supportsMidConvoSystemMessages` catalog
+setting and resolve overrides for the final request model. Compatible models
+keep later system instructions in place. Other models send one combined initial instruction.
+As in Pi v1.6.0, Codex sends the initial instruction in the input transcript,
+using the same selected role as later instructions. This keeps the initial
+instruction at the start of the prompt for cache reuse. Token estimates use
+the outgoing instruction text. Request fixtures covered
+both projections and the Codex wire payload. Live authenticated requests
+with later system instructions were unverified.
 
 ### Responses effort history
 
@@ -6311,8 +6377,9 @@ conservative estimate. Other token-estimator differences remain open.
 
 `--list-models` searches provider and model IDs with Pi's tokenized fuzzy
 matching, including the ASCII letter/number swap (for example `p2` matches
-`nova-2p`). Display names alone do not match. The native JSON listing remains
-available; model scope and picker selection retain their existing behavior.
+`nova-2p`). Display names alone do not match. The text table sorts provider
+names and model IDs using locale collation and uses Pi's UTF-16 padding and
+token-count rounding. The native JSON listing remains available.
 
 ### Messages quota retry classification
 

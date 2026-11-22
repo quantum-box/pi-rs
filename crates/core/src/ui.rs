@@ -48,8 +48,11 @@ pub struct RenderedCustomMessage {
     pub background: Option<String>,
 }
 
+/// Styled rows shared by the native extension renderers.
+pub type RenderedExtensionRows = RenderedCustomMessage;
+
 impl RenderedCustomMessage {
-    fn within_limits(&self) -> bool {
+    pub(crate) fn within_limits(&self) -> bool {
         component_lines_within_limits(&self.lines)
             && self
                 .background

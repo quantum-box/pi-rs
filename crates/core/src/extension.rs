@@ -678,6 +678,10 @@ pub trait ToolHost: Send + Sync {
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+    /// Optional owner-supplied presentation for this tool.
+    fn tool_renderers(&self) -> Option<crate::ToolRenderers> {
+        None
+    }
     /// Requested model-side sampling constraint, captured when the tool is registered.
     /// The provider's effective decision may differ when fallback is allowed.
     /// Required JSON Schema constraints use prepared dispatch so the agent can
@@ -1427,6 +1431,16 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Override or wrap the tool's presentation, including for a tool owned by
+    /// another extension. Delegate to `next` for tool names left alone.
+    fn resolve_tool_renderers(
+        &self,
+        _tool_name: &str,
+        next: &dyn Fn() -> Option<crate::ToolRenderers>,
+    ) -> Option<crate::ToolRenderers> {
+        next()
+    }
+
     /// Custom message types this extension can render in a native host.
     fn custom_message_renderer_types(&self) -> Vec<&str> {
         Vec::new()
@@ -1964,6 +1978,14 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Snapshot resolution order and registered tool ownership for presentation.
+    pub fn tool_renderers(&self) -> crate::ToolRendererRegistry {
+        crate::ToolRendererRegistry {
+            extensions: self.extensions.clone(),
+            tools: self.tools.clone(),
+        }
+    }
+
     /// MCP server declarations in registration order.
     pub fn registered_mcp_servers(&self) -> &[crate::RegisteredMcpServer] {
         self.mcp_servers.servers()
