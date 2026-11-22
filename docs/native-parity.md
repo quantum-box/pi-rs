@@ -5075,8 +5075,8 @@ One classifiers with `models.classify` and OpenRouter image models with
 `models.generateImages`. Model credentials remain in the native host and
 provider responses enter the same journal as other nested tool calls.
 Codemode also lists and runs GitHub Copilot's `microsoft-decision-1` classifier
-from Pi 1.6.0 via `/v1/systemone`. A saved Copilot subscription or
-`COPILOT_GITHUB_TOKEN` makes it available. Discovery does not refresh the
+from Pi 1.6.0 via `/v1/systemone`. A saved Copilot subscription, a key saved
+for the official Copilot chat endpoint, or `COPILOT_GITHUB_TOKEN` makes it available. Discovery does not refresh the
 subscription or filter this classifier by the subscription's chat model list.
 Requests with a saved subscription use the token's official individual,
 business or enterprise Copilot host. Custom endpoints need their own scoped

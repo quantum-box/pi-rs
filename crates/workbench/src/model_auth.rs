@@ -679,17 +679,26 @@ impl Keys {
                 return same_operation_endpoint(endpoint, &expected).then_some(entry);
             }
         }
-        // The provider-key UI binds a Vercel key to its official chat route.
-        // Pi uses that same key for the gateway's separate classifier route.
-        let vercel_classifier = provider == "vercel-ai-gateway"
-            && official
-            && entry.endpoint.as_deref() == Some("https://ai-gateway.vercel.sh/v1/messages")
-            && endpoint == "https://ai-gateway.vercel.sh/typesafe/v1/systemone";
+        // The provider-key UI binds keys to their official chat routes.
+        // Pi also uses those keys for the corresponding official classifiers.
+        let official_classifier = official
+            && matches!(
+                (provider, entry.endpoint.as_deref(), endpoint),
+                (
+                    "vercel-ai-gateway",
+                    Some("https://ai-gateway.vercel.sh/v1/messages"),
+                    "https://ai-gateway.vercel.sh/typesafe/v1/systemone",
+                ) | (
+                    "github-copilot",
+                    Some("https://api.individual.githubcopilot.com/chat/completions"),
+                    super::copilot_auth::CLASSIFIER_ENDPOINT,
+                )
+            );
         (entry
             .endpoint
             .as_deref()
             .is_some_and(|saved| same_operation_endpoint(saved, endpoint))
-            || vercel_classifier
+            || official_classifier
             || (official
                 && ((entry
                     .endpoint
@@ -1059,6 +1068,46 @@ mod tests {
                 .is_none()
         );
     }
+    #[test]
+    fn copilot_ui_saved_key_only_bridges_exact_official_classifier_route() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        let provider = super::Provider::named("github-copilot").unwrap();
+        let chat = provider.default_endpoint();
+        let classifier = super::super::copilot_auth::CLASSIFIER_ENDPOINT;
+        assert_eq!(
+            chat,
+            "https://api.individual.githubcopilot.com/chat/completions"
+        );
+        super::save_at(&path, &provider, chat, "fixture-key").unwrap();
+        let keys = super::Keys::load_path(&path).unwrap();
+        assert_eq!(
+            keys.operation_credential(provider.id(), classifier, true)
+                .and_then(super::Credential::literal),
+            Some("fixture-key")
+        );
+        assert!(
+            keys.operation_credential(provider.id(), classifier, false)
+                .is_none()
+        );
+        assert!(
+            keys.operation_credential(provider.id(), "https://example.test/v1/systemone", true)
+                .is_none()
+        );
+        super::save_at(
+            &path,
+            &provider,
+            "https://example.test/chat/completions",
+            "custom-key",
+        )
+        .unwrap();
+        let keys = super::Keys::load_path(&path).unwrap();
+        assert!(
+            keys.operation_credential(provider.id(), classifier, true)
+                .is_none()
+        );
+    }
+
     #[test]
     fn bedrock_profile_and_chain_restore_in_pi_format() {
         use super::*;
