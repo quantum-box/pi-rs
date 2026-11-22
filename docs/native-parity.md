@@ -275,8 +275,12 @@ still fail validation before submission.
 Known text-only chat models receive Pi's image-omission placeholders for user
 and tool images. Unknown model capabilities leave image handling to the
 provider, and the explicit image-blocking setting retains precedence.
-Local image reads also report when the selected model cannot receive images;
-the saved tool result retains the image for later use with a compatible model.
+Local image reads report `details.imageUnsupportedByModel` in JSON and RPC
+when the selected model cannot receive an image. The terminal displays the
+warning in collapsed and expanded results, as in Pi 1.6.0. The saved result
+retains the image for a later vision model, and the warning stays out of
+model-facing text. The SDK's boolean image-support option retains its text-note
+behavior for existing callers.
 
 OpenAI Responses `max_output_tokens` incomplete events preserve the streamed
 partial response and report the `length` finish reason. Across model providers,
@@ -1088,7 +1092,6 @@ configuration as a whole, preserving pi-rs's existing override validation.
 Unlike Pi, JSON transport descriptions omit stdio arguments and URL paths,
 credentials, queries and fragments; failure messages are generic so these
 reports do not expose configured credentials through connection errors.
-Wildcard exposure matches follow pi-rs's existing sorted-pattern priority.
 
 `pi mcp login NAME` uses the effective HTTP server and OAuth settings from
 the user configuration and the trusted project. `--local` requires a full
@@ -1142,6 +1145,8 @@ pinned Pi's prefix regex. This also hides non-App profiles such as
 `mcp-app-extra`; the MCP Apps specification identifies `mcp-app` itself, so this
 is a known Pi-fidelity limitation rather than exact profile matching. Native
 resource tools remain namespaced per server and aggregate that server's pages.
+If a resource or template omits its name, native uses its URI or URI template
+in full and paged listings, matching Pi. Explicit empty names are preserved.
 Within the existing initialization deadline, HTTP connections retry after
 250 ms and 1 second on transient network errors, HTTP 408, 429, and 5xx
 other than 501. Remote resource reads and listings, including paged listings
@@ -1151,6 +1156,11 @@ resource retry wait, and ordinary tool calls are sent once on these failures.
 Loopback fixtures verified stdio discovery and tool execution, HTTP bearer
 headers, resource reading, and the model/tool/model round trip. Credentials
 were absent from captured CLI output.
+
+As in Pi 1.6.0, HTTP 404 on a tool request carrying an MCP session ID triggers
+one new handshake and one retry. Loopback checks cover reusing the original
+arguments and native operation ID, stopping after a second 404, and sending
+only one tool request on HTTP 503.
 
 For servers implementing the 2026-07-28 protocol, set
 `"protocolVersion": "2026-07-28"` on the server entry in `mcp.json` to use
@@ -1776,7 +1786,8 @@ array indices, empty keys and encoded separators. The declaration retains
 supported input types stated alongside a reference. A depth bound limits
 reference chains while allowing independent fields to reuse a definition.
 Selection state follows the journal branch and survives reopening.
-Exact exposure overrides and wildcard matching are supported. CLI allowlists
+An exact `toolExposure` name takes precedence over wildcard patterns. Among
+matching patterns, the first in the configuration wins. CLI allowlists
 without MCP names keep MCP discovery available without declaring all schemas.
 Tools receive only their owning extension state through an optional invocation
 hook; existing implementations continue through the original hook.
@@ -2634,7 +2645,11 @@ input is queued. Tests cover schema diagnostics and dialog error layout.
 The terminal lists shared settings in Pi's order and uses Pi's labels and
 boolean values for those rows. Native controls and JSON editors remain
 available after the shared settings. The transport, changelog, installation
-telemetry and warnings controls are still open.
+telemetry controls are still open. The Warnings submenu includes the default-on
+Anthropic extra-usage warning. The terminal shows it once when the active model
+uses Anthropic subscription OAuth or a configured subscription token on the
+official endpoint. The warning check uses configured credentials without
+executing credential commands or refreshing tokens.
 Unlike upstream's permissive settings loading, pi-rs validates implemented
 settings. When several values in a file are invalid, the diagnostic lists the
 settings file and affected JSON paths, including nested package fields and
@@ -4313,6 +4328,26 @@ fails as in Pi. Loopback tests covered the beta header, target order, and
 fallback billing. Live Fable 5.2 inference and server-side fallback were
 unverified.
 
+Anthropic Messages threads are used for cached session requests on the official
+endpoint. Profiles can override support with `compat.supportsMessageThreads`.
+The native adapter scopes an in-memory continuation to the session,
+authenticated route, fixed request settings and replayed message prefix. A
+continuation sends the new messages and keeps the server's system prompt and
+tools. A missing, already continued, or mismatched thread retries once with
+the full transcript in a new thread. A server that rejects threading receives
+the full transcript without the thread field and keeps the threads beta.
+After a successful resend, later requests on that session and route keep the
+beta and omit the thread field. An endpoint that explicitly rejects the beta
+also omits the automatically added beta on that route and session. Each
+rejection gets at most one resend and records its reason before resending. Cache warming uses a full request
+with the same cache and beta options without reading or updating the thread.
+Summary requests use the full transcript. Replies from a fallback model do not supply continuation
+state. An alias resolving to its dated release can still be continued. OAuth
+continuations compare the canonical wire names for tools while keeping local
+tool names in session replay. Loopback exercised creation, continuation after
+an OAuth tool call, and both forms of retry. Live authenticated Anthropic
+threads were unverified.
+
 Native Anthropic streams expose individual text and thinking block boundaries,
 and show redacted thinking as `[Reasoning redacted]` while retaining its opaque
 payload for provider replay. Live Pi RPC thinking-start partial messages include
@@ -5135,7 +5170,9 @@ validated after JSON serialization, so sparse array slots are rejected as null.
 Classifier and image usage is included in the script result, terminal token
 total, and RPC session statistics. The TypeSafe and OpenRouter non-chat
 catalogues are projected from the published
-[Pi AI v1.5.0 package](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.5.0).
+[Pi AI v1.6.0 package](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.6.0).
+The GitHub Copilot classifier in that release still requires support for
+Copilot's authenticated System One route.
 
 ### Cloudflare Workers AI chat checkpoint
 
@@ -5317,7 +5354,15 @@ Google Cloud credential was available for acceptance testing.
 
 ### OpenAI Codex
 
-`openai-codex` exposes the eight pinned models through the ChatGPT Codex
+The direct OpenAI and Codex catalogs include the Pi v1.6.0 entries.
+Codex models advertising mid-conversation effort use configuration updates
+before earlier replies and for the current reply. This includes switching
+thinking off when the model maps that setting to `none`. The request keeps
+its top-level reasoning effort stable for prompt-cache reuse. System text is
+sent at the beginning of the ordered input, using the model's instruction
+role. This keeps the system prefix stable as turns are appended on GPT-6.2.
+
+`openai-codex` exposes ten pinned models through the ChatGPT Codex
 Responses route. It supports native HTTP streaming, model-specific reasoning
 levels, image inputs, tool calls, and endpoint-bound response replay.
 Codex's provider-side output limit starts at 16 tokens. With that limit enabled,
@@ -5512,30 +5557,22 @@ renewal for this change was unverified.
 As in Pi v1.6.0, a symbolic link to an auth file shares the target's lock.
 Credential updates keep the link and atomically replace the target file.
 pi-rs does not automatically remove stale `auth.json.lock` directories.
-After a worker admits a protected OAuth refresh, pi-rs retains its worker
-refresh barrier until the auth lock is released, including on errors. A worker
-terminated while holding the auth lock but waiting to enter that barrier can
-still leave a stale directory, as can a crash or external termination.
-To recover one safely, stop **all** Pi and pi-rs processes that can access
-that credential store, including background or waiting processes on other
-hosts sharing the filesystem. Once they have exited, either remove the stale
-directory or run a single Pi process to recover it; wait for recovery to
-finish before restarting any other process.
+On macOS, Linux, and Windows filesystems that support exclusive directory
+renames, pi-rs publishes the lock with a marker already inside it. Pi still
+recognizes the same lock directory and heartbeat. Its delayed stale-lock
+cleanup cannot remove a nonempty live pi-rs lock. On release, pi-rs takes the
+directory off the shared path before removing its marker. Filesystems without
+exclusive directory renames retain the previous empty-directory behavior,
+where a delayed Pi reclaimer can remove a replacement lock.
 
-This restriction matters even when no process currently holds the lock. Pi's
-`proper-lockfile` can observe a stale directory, pause, and later remove by
-path after another process has replaced it with a live pi-rs lock. Concurrent
-Pi stale recovery can therefore still compromise a pi-rs credential refresh
-and lose a rotated token. pi-rs cannot serialize an already-running Pi
-reclaimer with a separate lock or a path identity check; a complete fix
-must prevent Pi's delayed removal from deleting a live lock. The current
-protocol provides no such guarantee.
-
-One possible defense to investigate is publishing a prepopulated lock
-directory with an atomic no-replace operation, so a delayed `rmdir` fails while
-the directory is held. That approach would change crash recovery and depends
-on operating-system and filesystem behavior; it has not been implemented or
-validated and is not protection in the current release.
+The worker keeps its refresh barrier until it releases the auth lock, including
+on errors. A crash or forced termination can still leave a stale lock and a
+staging directory. Before removing a stale lock, stop all Pi and pi-rs
+processes that can access the credential store, including processes on other
+hosts sharing it. Remove the stale lock directory and its marker if present.
+For an empty legacy lock, a single Pi process can also recover it. Wait for
+recovery to finish before restarting other processes. The marker does not
+change the OAuth exchange or its recovery rules.
 
 Loopback checks covered expired and refreshed Radius credentials,
 model-specific key selection, OpenRouter's OAuth key type, and invalid
@@ -5817,19 +5854,21 @@ with later system instructions were unverified.
 
 ### Responses effort history
 
-The five OpenAI API-key models marked `supportsMidConvoEffort` in Pi v1.5.0
-keep their top-level reasoning effort at `medium` when a thinking level is
-active. Configuration updates apply the stored level before each recorded
-reply and the current level at the end of the request, including after a
-tool result. Pi session imports retain the recorded effort and replay the
+The OpenAI API-key and Codex models marked `supportsMidConvoEffort` in
+Pi v1.6.0 keep their top-level reasoning effort at `medium` while sending
+the selected effort in configuration updates. A configuration update applies
+the stored effort before each recorded reply and the current effort at the
+end of the request, including after a tool result. Compatible Codex models
+that map off to `none` also use an update for that setting. API-key requests
+with thinking off and the pi-rs ChatGPT plan adapter keep their usual
+reasoning options. Pi session imports retain the recorded effort and replay
 portable assistant history. Compatible custom profiles retain their own
 effort mappings. RPC exposes the recorded level. With API-key Responses,
 `off` uses top-level reasoning and leaves no configuration update to replay
 when thinking resumes, as in Pi 1.5.0 and 1.6.0. For example, switching from
 `low` through `off` to `high` sends only `low` and `high` configuration updates
-on the final request. ChatGPT and Codex subscriptions
-use their existing reasoning options. Local request fixtures covered the
-payload and replay. Live authenticated configuration updates were unverified.
+on the final request. Local request fixtures covered the payload and replay.
+Live authenticated configuration updates were unverified.
 
 ### Responses prompt cache key configuration
 
