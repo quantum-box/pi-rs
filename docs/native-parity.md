@@ -4793,8 +4793,10 @@ credential chain. Vertex also offers ADC or a service account file.
 `--no-browser` selects copy-code or device authorization for Anthropic,
 Codex and Radius respectively. Other account flows print their sign-in
 instructions without opening a browser. The OpenAI subscription continues to
-use pi-rs's separate `openai-chatgpt` provider identity. Saved credentials
-are applied when the next command loads the model configuration.
+use pi-rs's separate `openai-chatgpt` provider identity. Its CLI sign-in
+also accepts the full redirect URL from a browser on another device after
+checking the same callback URL, state, and client ID as loopback sign-in.
+Saved credentials are applied when the next command loads the model configuration.
 Local terminal and CLI fixtures cover masked key input and command parsing.
 Real OAuth sign-in and inference were unverified.
 

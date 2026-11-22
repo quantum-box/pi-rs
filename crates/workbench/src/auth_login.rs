@@ -43,6 +43,10 @@ impl<'a> OAuthOptions<'a> {
 fn announce_code(url: &Url, sender: oneshot::Sender<String>, is_openrouter: bool) {
     eprintln!("Continue in your browser: {url}");
     eprintln!("Paste the authorization code or redirect URL if the callback does not complete:");
+    read_authorization_line(sender, is_openrouter);
+}
+
+fn read_authorization_line(sender: oneshot::Sender<String>, is_openrouter: bool) {
     std::thread::spawn(move || {
         let mut line = String::new();
         if std::io::stdin()
@@ -104,7 +108,17 @@ pub(super) async fn oauth(
             options.new_account,
             options.account,
             options.open_browser,
-            |url| eprintln!("Continue with ChatGPT in your browser: {url}"),
+            |url| {
+                eprintln!("Continue with ChatGPT in your browser: {url}");
+                if options.interactive {
+                    eprintln!("Paste the full redirect URL if the callback does not complete:");
+                    let (sender, receiver) = oneshot::channel();
+                    read_authorization_line(sender, false);
+                    Some(receiver)
+                } else {
+                    None
+                }
+            },
         )
         .await
     } else if provider == "openai-codex" {
