@@ -1,5 +1,6 @@
 //! The mkdir/mtime lock used by Pi's proper-lockfile auth storage.
 use pi_rs::{Error, Result};
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -83,6 +84,7 @@ fn busy() -> Error {
 
 pub(super) struct Guard {
     path: PathBuf,
+    staging: Option<tempfile::TempDir>,
     requested_auth: PathBuf,
     resolved_auth: PathBuf,
     identity: Arc<Identity>,
@@ -130,7 +132,13 @@ impl Drop for Guard {
             let _ = thread.join();
         }
         if owns(&self.path, &self.identity) {
-            let _ = std::fs::remove_dir(&self.path);
+            if let Some(staging) = &self.staging {
+                // Keep the marker in place until the directory is off the shared path.
+                // A delayed Pi rmdir cannot remove a new holder during cleanup.
+                let _ = std::fs::rename(&self.path, staging.path().join("retired"));
+            } else {
+                let _ = std::fs::remove_dir(&self.path);
+            }
         }
     }
 }
@@ -179,13 +187,99 @@ pub(super) fn lock_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+// Pi only removes lock directories with rmdir. Publish the marked directory
+// atomically so even a stale Pi observation cannot remove a live holder.
+fn publish_lock(path: &Path) -> io::Result<Option<tempfile::TempDir>> {
+    let staging = tempfile::Builder::new()
+        .prefix(".pi-rs-auth-lock-")
+        .tempdir_in(auth_parent(path))?;
+    let prepared = staging.path().join("prepared");
+    std::fs::create_dir(&prepared)?;
+    std::fs::File::create_new(prepared.join("held-by-pi-rs"))?;
+    match rename_no_replace(&prepared, path) {
+        Ok(()) => Ok(Some(staging)),
+        Err(error) if error.kind() == ErrorKind::Unsupported => {
+            std::fs::create_dir(path)?;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(io::Error::from)?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(io::Error::from)?;
+    // The two C strings remain valid during the call. The rename must fail if
+    // the destination already exists, including an empty Pi lock directory.
+    #[cfg(target_os = "macos")]
+    let result =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENOSYS | libc::ENOTSUP | libc::EINVAL) => {
+            Err(io::Error::new(ErrorKind::Unsupported, error))
+        }
+        _ => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let to_wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
+    let source = to_wide(source);
+    let destination_wide = to_wide(destination);
+    // Both paths are wide NUL-terminated strings. Zero flags forbids replacement.
+    if unsafe { MoveFileExW(source.as_ptr(), destination_wide.as_ptr(), 0) } != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == ErrorKind::PermissionDenied && destination.is_dir() {
+        return Err(io::Error::new(ErrorKind::AlreadyExists, error));
+    }
+    Err(error)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn rename_no_replace(_: &Path, _: &Path) -> io::Result<()> {
+    Err(ErrorKind::Unsupported.into())
+}
+
 fn try_lock(path: &Path) -> Result<Option<Guard>> {
     let requested_auth = std::path::absolute(path)?;
     std::fs::create_dir_all(auth_parent(&requested_auth))?;
     let resolved_auth = resolved_auth_path(&requested_auth)?;
     let lock_path = lock_path(&resolved_auth);
-    match std::fs::create_dir(&lock_path) {
-        Ok(()) => {
+    if lock_path.try_exists()? {
+        return Ok(None);
+    }
+    match publish_lock(&lock_path) {
+        Ok(staging) => {
             let identity = Arc::new(identity(&lock_path)?);
             let thread_identity = identity.clone();
             let thread_path = lock_path.clone();
@@ -213,6 +307,7 @@ fn try_lock(path: &Path) -> Result<Option<Guard>> {
             });
             let guard = Guard {
                 path: lock_path,
+                staging,
                 requested_auth,
                 resolved_auth,
                 identity,
@@ -223,12 +318,7 @@ fn try_lock(path: &Path) -> Result<Option<Guard>> {
             guard.check()?;
             Ok(Some(guard))
         }
-        // Pi's proper-lockfile does not coordinate stale-lock reclamation
-        // through a second lock. Checking identity and then removing by path
-        // can therefore remove a replacement Pi already acquired. Leave stale
-        // locks in place rather than initiating that race. A delayed Pi
-        // reclaimer can still remove a replacement; safe recovery requires
-        // all Pi and pi-rs processes using this store to be stopped first.
+        // Neither acquisition path can replace an existing Pi lock.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -329,46 +419,33 @@ mod tests {
         assert!(owns(&lock, &live), "a live replacement was removed");
     }
 
-    // Model proper-lockfile's stat-then-rmdir sequence: an old observation can
-    // outlive the directory it described and remove a later pi-rs holder.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
-    fn delayed_pi_stale_observer_can_remove_a_fresh_pi_rs_lock() {
+    fn live_auth_lock_stays_nonempty_until_it_leaves_the_shared_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
+        let lock = lock_path(&path);
+        let guard = try_lock(&path).unwrap().unwrap();
+        assert!(guard.staging.is_some());
+        assert!(std::fs::remove_dir(&lock).is_err());
+        guard.check().unwrap();
+        drop(guard);
+        assert!(!lock.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn publishing_a_marked_lock_cannot_replace_an_empty_pi_lock() {
+        let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("auth.json.lock");
         std::fs::create_dir(&lock).unwrap();
-        filetime::set_file_mtime(
-            &lock,
-            filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(120)),
-        )
-        .unwrap();
-        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let delayed = std::thread::spawn({
-            let lock = lock.clone();
-            move || {
-                let age = std::fs::metadata(&lock)
-                    .unwrap()
-                    .modified()
-                    .unwrap()
-                    .elapsed()
-                    .unwrap();
-                assert!(age > Duration::from_secs(30));
-                observed_tx.send(()).unwrap();
-                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                std::fs::remove_dir(&lock).unwrap();
-            }
-        });
-        observed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        // Another actor clears the old directory before the delayed Pi resumes.
-        std::fs::remove_dir(&lock).unwrap();
-        let guard = try_lock(&path).unwrap().unwrap();
-        guard.check().unwrap();
-        release_tx.send(()).unwrap();
-        delayed.join().unwrap();
-        assert!(guard.check().is_err(), "the replacement was compromised");
-        assert!(!lock.exists(), "the delayed Pi rmdir removed the new lock");
+        let existing = identity(&lock).unwrap();
+        let error = publish_lock(&lock).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+        assert!(owns(&lock, &existing));
+        assert_eq!(std::fs::read_dir(&lock).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

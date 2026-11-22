@@ -5511,30 +5511,22 @@ renewal for this change was unverified.
 As in Pi v1.6.0, a symbolic link to an auth file shares the target's lock.
 Credential updates keep the link and atomically replace the target file.
 pi-rs does not automatically remove stale `auth.json.lock` directories.
-After a worker admits a protected OAuth refresh, pi-rs retains its worker
-refresh barrier until the auth lock is released, including on errors. A worker
-terminated while holding the auth lock but waiting to enter that barrier can
-still leave a stale directory, as can a crash or external termination.
-To recover one safely, stop **all** Pi and pi-rs processes that can access
-that credential store, including background or waiting processes on other
-hosts sharing the filesystem. Once they have exited, either remove the stale
-directory or run a single Pi process to recover it; wait for recovery to
-finish before restarting any other process.
+On macOS, Linux, and Windows filesystems that support exclusive directory
+renames, pi-rs publishes the lock with a marker already inside it. Pi still
+recognizes the same lock directory and heartbeat. Its delayed stale-lock
+cleanup cannot remove a nonempty live pi-rs lock. On release, pi-rs takes the
+directory off the shared path before removing its marker. Filesystems without
+exclusive directory renames retain the previous empty-directory behavior,
+where a delayed Pi reclaimer can remove a replacement lock.
 
-This restriction matters even when no process currently holds the lock. Pi's
-`proper-lockfile` can observe a stale directory, pause, and later remove by
-path after another process has replaced it with a live pi-rs lock. Concurrent
-Pi stale recovery can therefore still compromise a pi-rs credential refresh
-and lose a rotated token. pi-rs cannot serialize an already-running Pi
-reclaimer with a separate lock or a path identity check; a complete fix
-must prevent Pi's delayed removal from deleting a live lock. The current
-protocol provides no such guarantee.
-
-One possible defense to investigate is publishing a prepopulated lock
-directory with an atomic no-replace operation, so a delayed `rmdir` fails while
-the directory is held. That approach would change crash recovery and depends
-on operating-system and filesystem behavior; it has not been implemented or
-validated and is not protection in the current release.
+The worker keeps its refresh barrier until it releases the auth lock, including
+on errors. A crash or forced termination can still leave a stale lock and a
+staging directory. Before removing a stale lock, stop all Pi and pi-rs
+processes that can access the credential store, including processes on other
+hosts sharing it. Remove the stale lock directory and its marker if present.
+For an empty legacy lock, a single Pi process can also recover it. Wait for
+recovery to finish before restarting other processes. The marker does not
+change the OAuth exchange or its recovery rules.
 
 Loopback checks covered expired and refreshed Radius credentials,
 model-specific key selection, OpenRouter's OAuth key type, and invalid
