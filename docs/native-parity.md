@@ -5948,9 +5948,10 @@ before dispatch, uses the original affinity and tool definitions, and
 stops on a changed context or the 30-minute limit. A completed cache miss
 retains its billed usage and schedules another decision on the normal cadence,
 measured from the refresh request's start to protect the cache lifetime.
-Failed refreshes and local model timeouts stop warming without
-recording usage because the provider may still be processing the request. Pi
-waits for the refresh to settle and also retries errors.
+Like Pi, each cache refresh disables provider HTTP retries while preserving
+the configured HTTP attempt timeout. Failed refreshes and local model timeouts
+stop native warming without recording usage because the provider may still be
+processing the request. Pi can schedule another refresh after the first settles.
 Refresh usage is journaled and projected as a Pi usage entry. Response
 content stays out of the conversation. This checkpoint covers idle
 requests with thinking off. Streaming warming and extension decisions

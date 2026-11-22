@@ -398,6 +398,13 @@ impl Settings {
             timeout: number("timeoutMs").map(std::time::Duration::from_millis),
         }
     }
+    /// Suppress retries for a request-only settings copy.
+    pub fn disable_provider_retries(&mut self) {
+        if let Some(provider) = self.value["retry"]["provider"].as_object_mut() {
+            provider.insert("maxRetries".into(), Value::from(0));
+        }
+    }
+
     pub fn set_auto_retry_enabled(&mut self, enabled: bool) -> Result<()> {
         self.set_user_member("retry", "enabled", Value::Bool(enabled))?;
         self.live_auto_retry = Some(enabled);

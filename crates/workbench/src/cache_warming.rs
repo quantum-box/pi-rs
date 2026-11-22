@@ -262,6 +262,12 @@ impl Policy {
     }
 }
 
+fn cache_warming_model(args: &Cli) -> pi_rs::Result<WorkbenchModel> {
+    let mut replay = args.clone();
+    replay.settings.disable_provider_retries();
+    runtime::model_client(&replay, super::thinking::reported(args).is_some(), false)
+}
+
 impl<'a> Capture<'a> {
     pub fn new(args: &'a Cli, prompt: bool, controller: Controller) -> Self {
         let policy = if prompt {
@@ -269,11 +275,11 @@ impl<'a> Capture<'a> {
         } else {
             Err("waiting for first request")
         };
-        let model = policy.as_ref().ok().and_then(|_| {
-            runtime::model_client(args, super::thinking::reported(args).is_some(), false)
-                .ok()
-                .map(Arc::new)
-        });
+        let model = policy
+            .as_ref()
+            .ok()
+            .and_then(|_| cache_warming_model(args).ok())
+            .map(Arc::new);
         Self {
             args,
             controller,
@@ -826,6 +832,78 @@ mod tests {
         }))
         .unwrap();
         assert!(Mode::from_loaded(&settings).is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_warming_disables_provider_retries_for_its_request_only() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("the cache refresh never reached its endpoint")
+                .unwrap();
+            let mut request = [0; 1024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After-Ms: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            drop(socket);
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_err()
+        });
+        let endpoint = format!("http://{address}/v1/messages");
+        let mut args = Cli::parse_from([
+            "pi",
+            "--offline",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-opus-4-8",
+            "--endpoint",
+            &endpoint,
+            "--api-key",
+            "fixture",
+        ]);
+        args.provider = crate::providers::Provider::Anthropic;
+        args.endpoint_explicit = true;
+        args.initial_connection = Some((args.provider.clone(), endpoint));
+        args.settings = serde_json::from_value(serde_json::json!({
+            "value":{"retry":{"provider":{"maxRetries":2,"timeoutMs":1000}}},
+            "resource_layers":[], "diagnostics":[],
+            "live_auto_retry":null, "live_auto_compaction":null
+        }))
+        .unwrap();
+        let model = cache_warming_model(&args).unwrap();
+        let request = ModelRequest {
+            model: args.model.clone(),
+            messages: vec![pi_rs::Message::User {
+                content: "hello".into(),
+            }],
+            tools: Vec::new(),
+            max_output_tokens: 1,
+        };
+
+        assert!(
+            model
+                .stream_in_session_with_identity(Uuid::new_v4(), Uuid::new_v4(), "fixture", request)
+                .await
+                .is_err()
+        );
+        assert!(
+            server.await.unwrap(),
+            "cache warming retried an HTTP failure"
+        );
+        assert_eq!(args.settings.provider_retry().max_retries, 2);
+        assert_eq!(
+            args.settings.provider_retry().timeout,
+            Some(Duration::from_secs(1))
+        );
     }
 
     struct FlakyRefresh {
