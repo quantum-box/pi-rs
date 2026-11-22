@@ -39,6 +39,7 @@ pub(super) struct Request<'a> {
     pub account: &'a str,
     pub error_secrets: &'a [String],
     pub session: Option<&'a str>,
+    pub affinity_session: Option<&'a str>,
     pub timeout: Option<Duration>,
     pub cache_context: bool,
     pub reuse_connection: bool,
@@ -361,7 +362,7 @@ pub(super) async fn open(
     options: Request<'_>,
     body: &Value,
 ) -> Result<Option<super::ResponseEvents>> {
-    let pool_key = options.session.and_then(|session| {
+    let transport_key = {
         let mut headers: Vec<_> = options
             .headers
             .iter()
@@ -375,10 +376,10 @@ pub(super) async fn open(
             options.endpoint.as_str(),
             options.account,
             options.token,
-            session,
+            options.session,
             headers,
         ))
-    });
+    };
     let handshake = Handshake {
         client: options.client.clone(),
         endpoint: options.endpoint.clone(),
@@ -392,14 +393,14 @@ pub(super) async fn open(
             .chain(std::iter::once(options.account.to_owned()))
             .collect(),
         session: options
-            .session
+            .affinity_session
             .map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
     };
-    if pool_key.as_deref().is_some_and(falls_back) {
+    if transport_key.as_deref().is_some_and(falls_back) {
         return Ok(None);
     }
-    let cached = pool_key
+    let cached = transport_key
         .as_deref()
         .filter(|_| options.reuse_connection)
         .and_then(take_connection);
@@ -417,7 +418,7 @@ pub(super) async fn open(
             Ok(socket) => (socket, Instant::now(), None),
             // No inference request was sent. The caller can try SSE safely.
             Err(_) => {
-                if let Some(key) = pool_key {
+                if let Some(key) = transport_key {
                     remember_fallback(key);
                 }
                 return Ok(None);
@@ -440,7 +441,7 @@ pub(super) async fn open(
         timeout,
     )
     .await
-    .map_err(|error| interrupted_transport(pool_key.as_deref(), error))?;
+    .map_err(|error| interrupted_transport(transport_key.as_deref(), error))?;
 
     Ok(Some(Box::pin(async_stream::try_stream! {
         let mut seen = 0usize;
@@ -449,11 +450,11 @@ pub(super) async fn open(
         loop {
             let event = match next(&mut socket, timeout)
                 .await
-                .map_err(|error| interrupted_transport(pool_key.as_deref(), error))?
+                .map_err(|error| interrupted_transport(transport_key.as_deref(), error))?
             {
                 Message::Text(text) => text,
                 Message::Ping(_) | Message::Pong(_) => continue,
-                Message::Close(_) => Err(interrupted_transport(pool_key.as_deref(), disconnected()))?,
+                Message::Close(_) => Err(interrupted_transport(transport_key.as_deref(), disconnected()))?,
                 _ => Err(Error::Model("unexpected Codex WebSocket message".into()))?,
             };
             seen = seen.saturating_add(event.len());
@@ -476,10 +477,10 @@ pub(super) async fn open(
                 // Release the rejected connection before asking the service for another slot.
                 drop(socket);
                 socket = handshake.connect().await
-                    .map_err(|error| interrupted_transport(pool_key.as_deref(), error))?;
+                    .map_err(|error| interrupted_transport(transport_key.as_deref(), error))?;
                 connected = Instant::now();
                 send(&mut socket, body.clone(), timeout).await
-                    .map_err(|error| interrupted_transport(pool_key.as_deref(), error))?;
+                    .map_err(|error| interrupted_transport(transport_key.as_deref(), error))?;
                 sent_continuation = false;
                 continue;
             }
@@ -488,7 +489,7 @@ pub(super) async fn open(
             if matches!(kind, "response.done" | "response.completed" | "response.incomplete") {
                 let response = &event["response"];
                 if response["status"] == "completed" && reuse_connection
-                    && let Some(key) = pool_key
+                    && let Some(key) = transport_key
                 {
                     let previous = cache_context.then(|| PreviousResponse::from_completed(&body, response)).flatten();
                     return_connection(key, connected, socket, previous);
@@ -1039,13 +1040,41 @@ mod tests {
 
     #[tokio::test]
     async fn codex_websocket_interruption_uses_sse_only_on_the_next_attempt() {
+        for (cache, has_session) in [
+            (pi_rs_core::CacheRetention::Short, true),
+            (pi_rs_core::CacheRetention::None, true),
+            (pi_rs_core::CacheRetention::None, false),
+        ] {
+            assert_next_attempt_uses_sse_after_interruption(cache, has_session).await;
+        }
+    }
+
+    async fn assert_next_attempt_uses_sse_after_interruption(
+        cache: pi_rs_core::CacheRetention,
+        has_session: bool,
+    ) {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (retry, next_attempt) = tokio::sync::oneshot::channel();
+        let session = uuid::Uuid::new_v4().to_string();
+        let expected_session =
+            (has_session && cache != pi_rs_core::CacheRetention::None).then(|| session.clone());
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+            let mut socket =
+                tokio_tungstenite::accept_hdr_async(tcp, move |req: &Request, resp: Response| {
+                    let sent = req.headers().get("session-id").unwrap().to_str().unwrap();
+                    if let Some(expected) = expected_session {
+                        assert_eq!(sent, expected);
+                    } else {
+                        assert!(uuid::Uuid::parse_str(sent).is_ok());
+                    }
+                    Ok(resp)
+                })
+                .await
+                .unwrap();
             let body = read_request(&mut socket).await;
             assert_eq!(body["input"][0]["content"], "first");
             socket
@@ -1094,7 +1123,12 @@ mod tests {
             format!("http://{address}/backend-api/codex/responses"),
             CodexTransport::Auto,
         )
-        .with_session_cache_key(&uuid::Uuid::new_v4().to_string());
+        .with_cache_retention(cache, false);
+        let model = if has_session {
+            model.with_session_cache_key(&session)
+        } else {
+            model
+        };
         let exchange = async {
             let events = model
                 .stream(request(vec![prompt("first")]))

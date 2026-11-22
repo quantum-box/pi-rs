@@ -5024,9 +5024,10 @@ An unavailable WebSocket
 upgrade falls back to HTTP SSE before any inference request is sent. Native
 provider-response hooks receive the sanitized HTTP handshake status and
 headers when a connection is opened. An upgrade failure or interrupted
-WebSocket response makes the next attempt in that session use SSE for up to a
-minute. An interrupted response returns its error without issuing another
-inference request for that attempt. A server that loses the previous response
+WebSocket response makes later attempts use SSE for up to a minute, including
+with prompt-cache retention disabled. With no session key, the cooldown
+applies to the route. An interrupted response returns its error without
+issuing another inference request for that attempt. A server that loses the previous response
 ID receives the full transcript on retry.
 The client checks an idle connection with a WebSocket ping before sending the
 next request and replaces the connection if the check fails.

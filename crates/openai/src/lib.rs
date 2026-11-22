@@ -1607,9 +1607,8 @@ impl OpenAiResponses {
         let ws = if self.codex_transport != CodexTransport::Sse
             && let Some(account) = &self.codex_account
         {
-            let session = (self.cache_retention != CacheRetention::None)
-                .then_some(self.session_cache_key.as_deref())
-                .flatten();
+            let session = self.session_cache_key.as_deref();
+            let affinity_session = session.filter(|_| self.cache_retention != CacheRetention::None);
             codex_ws::open(
                 codex_ws::Request {
                     client: &self.client,
@@ -1619,8 +1618,9 @@ impl OpenAiResponses {
                     account,
                     error_secrets: &error_secrets,
                     session,
+                    affinity_session,
                     timeout: self.idle_timeout,
-                    reuse_connection: self.identity_safe_transport,
+                    reuse_connection: self.identity_safe_transport && affinity_session.is_some(),
                     cache_context: matches!(
                         self.codex_transport,
                         CodexTransport::Auto | CodexTransport::WebSocketCached
