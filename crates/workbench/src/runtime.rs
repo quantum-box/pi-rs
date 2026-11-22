@@ -381,7 +381,9 @@ impl Runtime {
     }
     pub fn mcp_status(&self, args: &Cli) -> Result<()> {
         let servers = self.catalog.servers.lock().expect("MCP catalogs");
-        for (name, value) in mcp_config::configurations(args)? {
+        for (name, value) in
+            mcp_config::registered_configurations(args, self.registry.registered_mcp_servers())?
+        {
             if let Some(server) = servers.iter().find(|server| server.server_name == name) {
                 output(
                     json!({"type":"mcp_server","name":name,"status":"connected","tools":server.tool_count(),"description":server.description}),
@@ -550,7 +552,8 @@ impl Runtime {
         config: &pi_rs_workbench::mcp::ServerConfig,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let check_config = || mcp_config::check_manager_connection(args, name, config);
+        let registered = self.registry.registered_mcp_servers().to_vec();
+        let check_config = || mcp_config::check_manager_connection(args, &registered, name, config);
         let catalog = self.catalog.clone();
         let _mutation = catalog.mutation.lock().await;
         check_config()?;
@@ -627,7 +630,12 @@ impl Runtime {
             .filter(|pending| &pending.config == config)
             .cloned()
             .ok_or_else(|| pi_rs::Error::Config("MCP server no longer needs sign-in".into()))?;
-        mcp_config::check_manager_connection(args, name, config)?;
+        mcp_config::check_manager_connection(
+            args,
+            self.registry.registered_mcp_servers(),
+            name,
+            config,
+        )?;
         if pending.challenge.is_none() {
             // Explicit OAuth can report missing credentials before making an
             // HTTP request. Ask the server directly for its challenge when no
@@ -647,7 +655,14 @@ impl Runtime {
                 Err(_) => {}
             }
         }
-        mcp_config::manager_login(args, &pending, ui, cancel).await?;
+        mcp_config::manager_login(
+            args,
+            self.registry.registered_mcp_servers(),
+            &pending,
+            ui,
+            cancel,
+        )
+        .await?;
         self.mcp_auth_required.remove(name);
         self.reconnect_mcp(args, name, config, cancel).await
     }
@@ -659,7 +674,12 @@ impl Runtime {
         config: &pi_rs_workbench::mcp::ServerConfig,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        mcp_config::check_manager_connection(args, name, config)?;
+        mcp_config::check_manager_connection(
+            args,
+            self.registry.registered_mcp_servers(),
+            name,
+            config,
+        )?;
         let catalog = self.catalog.clone();
         let _mutation = catalog.mutation.lock().await;
         let connected_oauth = catalog
@@ -702,7 +722,14 @@ impl Runtime {
                 self.mcp_sign_in.pop_front();
                 continue;
             };
-            if mcp_config::check_manager_connection(args, &name, &pending.config).is_err() {
+            if mcp_config::check_manager_connection(
+                args,
+                self.registry.registered_mcp_servers(),
+                &name,
+                &pending.config,
+            )
+            .is_err()
+            {
                 self.mcp_sign_in.pop_front();
                 continue;
             }
@@ -1011,6 +1038,7 @@ fn resolve_discovered_path(
 
 struct LiveMcpCatalog {
     args: Cli,
+    builtin_tool_search: bool,
     resources: std::sync::Mutex<resources::Resources>,
     servers: std::sync::Mutex<Vec<Arc<pi_rs_workbench::mcp::McpExtension>>>,
     mutation: tokio::sync::Mutex<()>,
@@ -1068,6 +1096,70 @@ pub async fn configure(args: &Cli, interactive_mcp: bool) -> Result<Runtime> {
     configure_after(args, interactive_mcp, std::future::ready(()), None).await
 }
 
+async fn load_configured_extensions(
+    args: &Cli,
+    resources: &resources::Resources,
+) -> Result<Vec<Arc<dyn pi_rs::Extension>>> {
+    let mut extensions: Vec<Arc<dyn pi_rs::Extension>> = Vec::new();
+    let mut extension_names: Vec<_> = args
+        .extensions
+        .iter()
+        .filter(|entry| super::resource_paths::named_extension(entry))
+        .cloned()
+        .collect();
+    if !args.no_extensions {
+        extension_names.extend(
+            args.settings
+                .strings("extensions")
+                .into_iter()
+                .filter(|entry| super::resource_paths::named_extension(entry)),
+        );
+    }
+    extension_names.extend(
+        resources
+            .extensions
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned()),
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    let mut flags = args.extension_flags.clone();
+    let mut flag_names = super::cli_compat::reserved_flag_names();
+    for name in extension_names
+        .iter()
+        .filter(|name| seen.insert((*name).clone()))
+    {
+        match name.as_str() {
+            "builtin:mcp" | "builtin:codemode" | "builtin:tool-search" => {}
+            "notes" => extensions.push(Arc::new(pi_rs_extensions::Notes)),
+            "todo" => extensions.push(Arc::new(pi_rs_extensions::TodoList)),
+            name if name.starts_with("builtin:") => {
+                return Err(pi_rs::Error::Config(format!(
+                    "unsupported native built-in extension {name}"
+                )));
+            }
+            _ => {
+                let mut extension = pi_rs_extensions::ExecutableExtension::load_async(name).await?;
+                if !args.disable_extension.iter().any(|id| id == extension.id()) {
+                    for flag in extension.cli_flags() {
+                        if !flag_names.insert(flag.name.clone()) {
+                            return Err(pi_rs::Error::Config(format!(
+                                "extension flag --{} is already registered",
+                                flag.name
+                            )));
+                        }
+                    }
+                    extension.apply_flags(&mut flags)?;
+                }
+                extensions.push(Arc::new(extension));
+            }
+        }
+    }
+    if let Some(name) = flags.keys().next() {
+        return Err(pi_rs::Error::Config(format!("unknown option --{name}")));
+    }
+    Ok(extensions)
+}
+
 async fn configure_after(
     args: &Cli,
     interactive_mcp: bool,
@@ -1081,10 +1173,11 @@ async fn configure_after(
     for warning in &local_resources.warnings {
         eprintln!("{warning}");
     }
-    let discovered = mcp_config::discover(args, false, interactive_mcp, share_services).await?;
-    let mcp_connections = discovered.connected;
+    let configured_extensions = load_configured_extensions(args, &local_resources).await?;
+    let mcp_enabled = mcp_config::mcp_enabled(args)?;
+    let mut discovered = mcp_config::discover(args, false, interactive_mcp, share_services).await?;
+    let mut mcp_connections = std::mem::take(&mut discovered.connected);
     let result = async {
-        let (selection, documents, hidden) = tool_discovery(args, &mcp_connections)?;
         let only_code = match args.settings.value()["codemode"]["mode"]
             .as_str()
             .unwrap_or("on")
@@ -1099,13 +1192,16 @@ async fn configure_after(
         };
         let enabled = |name: &str| super::resource_paths::builtin_enabled(args, name);
         let mut extensions: Vec<Arc<dyn pi_rs::Extension>> = Vec::new();
-        if enabled("builtin:tool-search")? {
+        let builtin_tool_search = enabled("builtin:tool-search")?;
+        if builtin_tool_search {
             extensions.push(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
-                documents,
+                Vec::new(),
             )));
         }
         if enabled("builtin:codemode")? {
-            extensions.push(Arc::new(super::operation_models::Operations::new(args)?));
+            let mut operations = super::operation_models::Operations::new(args)?;
+            operations.discover_llama().await;
+            extensions.push(Arc::new(operations));
             extensions.push(Arc::new(pi_rs_extensions::codemode::Codemode {
                 only: only_code,
                 inline_budget: args.settings.value()["codemode"]["inlineBudget"]
@@ -1137,63 +1233,7 @@ async fn configure_after(
             )));
             extensions.push(Arc::new(pi_rs_review::ReviewContext));
         }
-        let mut extension_names: Vec<_> = args
-            .extensions
-            .iter()
-            .filter(|entry| super::resource_paths::named_extension(entry))
-            .cloned()
-            .collect();
-        if !args.no_extensions {
-            extension_names.extend(
-                args.settings
-                    .strings("extensions")
-                    .into_iter()
-                    .filter(|entry| super::resource_paths::named_extension(entry)),
-            );
-        }
-        extension_names.extend(
-            local_resources
-                .extensions
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned()),
-        );
-        let mut seen = std::collections::BTreeSet::new();
-        let mut flags = args.extension_flags.clone();
-        let mut flag_names = super::cli_compat::reserved_flag_names();
-        for name in extension_names
-            .iter()
-            .filter(|name| seen.insert((*name).clone()))
-        {
-            match name.as_str() {
-                "builtin:mcp" | "builtin:codemode" | "builtin:tool-search" => {}
-                "notes" => extensions.push(Arc::new(pi_rs_extensions::Notes)),
-                "todo" => extensions.push(Arc::new(pi_rs_extensions::TodoList)),
-                name if name.starts_with("builtin:") => {
-                    return Err(pi_rs::Error::Config(format!(
-                        "unsupported native built-in extension {name}"
-                    )));
-                }
-                _ => {
-                    let mut extension =
-                        pi_rs_extensions::ExecutableExtension::load_async(name).await?;
-                    if !args.disable_extension.iter().any(|id| id == extension.id()) {
-                        for flag in extension.cli_flags() {
-                            if !flag_names.insert(flag.name.clone()) {
-                                return Err(pi_rs::Error::Config(format!(
-                                    "extension flag --{} is already registered",
-                                    flag.name
-                                )));
-                            }
-                        }
-                        extension.apply_flags(&mut flags)?;
-                    }
-                    extensions.push(Arc::new(extension));
-                }
-            }
-        }
-        if let Some(name) = flags.keys().next() {
-            return Err(pi_rs::Error::Config(format!("unknown option --{name}")));
-        }
+        extensions.extend(configured_extensions);
         #[cfg(feature = "evaluation-fixtures")]
         if let Some(endpoint) = args.fixtures.as_deref() {
             extensions.push(Arc::new(pi_rs_fixture_tools::Fixtures::new(endpoint)?));
@@ -1210,19 +1250,35 @@ async fn configure_after(
                     .map(|path| (extension.id().to_owned(), path.to_owned()))
             })
             .collect();
+        let mut disabled_servers = discovered.skipped_disabled.clone();
+        if mcp_enabled {
+            for extension in extensions
+                .iter()
+                .filter(|extension| !args.disable_extension.iter().any(|id| id == extension.id()))
+            {
+                for server in extension.mcp_server_declarations() {
+                    disabled_servers.insert(format!("mcp-{}", server.name.replace('-', "_")));
+                }
+            }
+        }
         let disabled = args
             .disable_extension
             .iter()
             .filter(|id| {
-                !discovered.skipped_disabled.contains(*id)
+                !disabled_servers.contains(*id)
                     || extensions
                         .iter()
                         .any(|extension| extension.id() == id.as_str())
             })
             .cloned()
             .collect();
-        let mut registry = Registry::compose(extensions, &disabled)?;
+        let mut registry =
+            Registry::compose_with_mcp_declarations(extensions, &disabled, mcp_enabled)?;
         registry.omit_default_tool_timeout(args.tool_timeout_secs.is_none());
+        registry.publish_tool_attempts(matches!(
+            args.mode,
+            Some(super::OutputMode::Json | super::OutputMode::Rpc)
+        ));
         registry.register(Arc::new(LocalCommandPolicy(CommandPolicy {
             allow_commands: args.allow_commands,
         })))?;
@@ -1243,6 +1299,27 @@ async fn configure_after(
                         .and_then(|model| model.supports_images()),
                 ),
         ))?;
+        let extra = mcp_config::discover_registered(
+            args,
+            registry.registered_mcp_servers(),
+            &discovered.configured_namespaces,
+            interactive_mcp,
+            share_services,
+        )
+        .await?;
+        let configured_count = mcp_connections.len();
+        mcp_connections.extend(extra.connected);
+        discovered.sign_in.extend(extra.sign_in);
+        discovered.inspection.extend(extra.inspection);
+        for connection in &mcp_connections[configured_count..] {
+            registry.register(connection.clone())?;
+        }
+        let (selection, documents, hidden) = tool_discovery(args, &mcp_connections)?;
+        if builtin_tool_search {
+            registry.replace(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
+                documents,
+            )))?;
+        }
         let system_prompt = select_tools(
             &mut registry,
             &selection,
@@ -1253,6 +1330,7 @@ async fn configure_after(
         )?;
         let catalog = Arc::new(LiveMcpCatalog {
             args: args.clone(),
+            builtin_tool_search,
             resources: std::sync::Mutex::new(local_resources.clone()),
             servers: std::sync::Mutex::new(mcp_connections.clone()),
             mutation: tokio::sync::Mutex::new(()),
@@ -1770,7 +1848,7 @@ mod resource_origin_tests {
     use super::*;
 
     #[test]
-    fn runtime_final_strict_policy_is_limited_to_openai_adapters() {
+    fn runtime_final_strict_policy_tracks_adapter_support() {
         use clap::Parser;
         for (api, path, expected) in [
             ("openai-responses", "v1", true),
@@ -1792,6 +1870,17 @@ mod resource_origin_tests {
             let model = model_client(&args, false, false).unwrap();
             assert_eq!(model.strict_policy.is_some(), expected, "{api}");
         }
+
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.provider = args.model_profiles.provider("amazon-bedrock").unwrap();
+        args.model = "anthropic.claude-fable-5-2".into();
+        args.endpoint.clear();
+        assert!(
+            model_client(&args, false, false)
+                .unwrap()
+                .strict_policy
+                .is_some()
+        );
     }
 
     struct InlineCommand;

@@ -285,25 +285,35 @@ pub fn rank(query: &str, documents: &[SearchDocument], limit: usize) -> Vec<(usi
         .map(|(index, score, _, _)| (index, score))
         .collect()
 }
-fn schema_text(value: &Value, text: &mut String) {
-    if let Some(description) = value["description"].as_str() {
-        text.push(' ');
-        text.push_str(description);
-    }
-    if let Some(properties) = value["properties"].as_object() {
-        for (name, property) in properties {
-            text.push(' ');
-            text.push_str(name);
-            schema_text(property, text);
+fn schema_text(root: &Value, text: &mut String) {
+    let mut pending = vec![root];
+    let mut referenced = BTreeSet::from([std::ptr::from_ref(root)]);
+    while let Some(value) = pending.pop() {
+        if let Some(target) = value["$ref"]
+            .as_str()
+            .and_then(|reference| crate::schema_ref::resolve(root, reference))
+            && target.is_object()
+            && referenced.insert(std::ptr::from_ref(target))
+        {
+            pending.push(target);
         }
-    }
-    if let Some(items) = value.get("items") {
-        schema_text(items, text);
-    }
-    for key in ["anyOf", "oneOf", "allOf"] {
-        if let Some(variants) = value[key].as_array() {
-            for variant in variants {
-                schema_text(variant, text);
+        if let Some(description) = value["description"].as_str() {
+            text.push(' ');
+            text.push_str(description);
+        }
+        if let Some(properties) = value["properties"].as_object() {
+            for (name, property) in properties {
+                text.push(' ');
+                text.push_str(name);
+                pending.push(property);
+            }
+        }
+        if let Some(items) = value.get("items") {
+            pending.push(items);
+        }
+        for key in ["anyOf", "oneOf", "allOf"] {
+            if let Some(variants) = value[key].as_array() {
+                pending.extend(variants);
             }
         }
     }
@@ -373,6 +383,32 @@ mod tests {
             namespace: "Desktop operations".into(),
         }
     }
+    #[test]
+    fn indexes_referenced_schema_fields_once_and_skips_unreachable_definitions() {
+        let mut tool = document("mcp__ledger__read", "Read ledger");
+        tool.tool.parameters = json!({
+            "type": "object",
+            "properties": {
+                "option": {"$ref": "#/$defs/ledger~1entry"},
+                "alias": {"$ref": "#/$defs/%6Cedger~1entry"},
+                "elsewhere": {"$ref": "https://example.com/#/$defs/unused"}
+            },
+            "$defs": {
+                "ledger/entry": {
+                    "description": "Reconciliation",
+                    "properties": {"parent": {"$ref": "#"}}
+                },
+                "unused": {"description": "Inaccessible"}
+            }
+        });
+        let mut indexed = String::new();
+        schema_text(&tool.tool.parameters, &mut indexed);
+        assert_eq!(indexed.matches("Reconciliation").count(), 1);
+        assert!(!indexed.contains("Inaccessible"));
+        assert_eq!(rank("reconciliation", &[tool.clone()], 1)[0].0, 0);
+        assert!(rank("inaccessible", &[tool], 1).is_empty());
+    }
+
     #[test]
     fn ranking_prefers_coverage_then_exact_names_and_normalizes_identifiers() {
         let documents = [

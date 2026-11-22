@@ -16,6 +16,9 @@ pub(super) fn blocks(
     let mut thought = String::new();
     let mut calls = calls.iter();
     for block in &replay.blocks {
+        if block.get("_pi_anthropic_effort").is_some() {
+            continue;
+        }
         match block["type"].as_str()? {
             "text" if block["_pi_thinking"] != true => {
                 let value = block["text"].as_str()?;
@@ -139,6 +142,7 @@ mod tests {
                 json!({"type":"text","text":"b"}),
             ],
         };
+        replay.record_anthropic_effort("xhigh");
         let result = blocks(&replay, "b", Some("a[Reasoning redacted]"), &[]).unwrap();
         assert_eq!(
             result,
