@@ -1223,7 +1223,7 @@ enum Command {
         #[command(subcommand)]
         command: Box<mcp_config::McpCommand>,
     },
-    /// Check or print a configured provider credential.
+    /// Manage configured provider credentials.
     Auth {
         #[command(subcommand)]
         command: auth_cli::AuthCommand,
