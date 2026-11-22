@@ -4867,7 +4867,8 @@ catalogues are projected from the published
 
 ### Cloudflare Workers AI chat checkpoint
 
-Cloudflare Workers AI exposes the 19 pinned chat models via Chat Completions.
+Cloudflare Workers AI exposes the 20 chat models from Pi AI v1.6.0 via Chat
+Completions, including Inkling 2 Small.
 `CLOUDFLARE_ACCOUNT_ID` selects the account and `CLOUDFLARE_API_KEY` authorizes
 requests. Terminal `/login cloudflare-workers-ai` prompts for a masked API
 key and the account ID for routes derived from login or environment settings. Pi-format saved credentials may declare an account through their
@@ -4879,7 +4880,9 @@ credentials also apply to chat. Live Workers AI inference has not been verified.
 
 ### Cloudflare AI Gateway
 
-Cloudflare AI Gateway includes the 59 pinned Pi AI chat models. It uses
+Cloudflare AI Gateway includes the 63 chat models from Pi AI v1.6.0. New
+entries route Claude Fable 5.2 to Messages, Inkling 2 Small to Chat
+Completions, and GPT-6.2 Astra and Sol to Responses. It uses
 the account and gateway identifiers in `CLOUDFLARE_ACCOUNT_ID` and
 `CLOUDFLARE_GATEWAY_ID`, or their equivalents in a Pi-format saved
 credential. `CLOUDFLARE_API_KEY` supplies the gateway token. The model's API
@@ -4971,20 +4974,22 @@ field is covered by loopback tests; no live compatible server was used.
 Loopback RPC checks exercised model and endpoint switching, header and key
 isolation, reasoning replay, stream completion and reported usage and cost.
 
-The bundled chat catalog includes 506 chat-completions entries for Cerebras,
+The bundled chat catalog includes chat-completions entries for Cerebras,
 DeepSeek, Fireworks, Groq, Hugging Face, Moonshot AI and Moonshot AI CN,
 OpenRouter, Together, Z.AI, and Z.AI Coding CN. It preserves their context,
 output, image and thinking capabilities from the pinned Pi AI release.
 User models and overrides take precedence. The CLI lists available providers
 together, and `--provider` can restrict the list to one. Built-in environment
 keys and endpoint-bound saved credentials stay off user-configured relays.
-Baseten and NVIDIA's pinned chat-completions catalogs are also available,
-including model-specific compatibility, NVIDIA polling headers and Baseten's
-thinking template. Pi 1.6.0 supplies 12 bundled NVIDIA NIM models and 87
-Hugging Face Router models. Hugging Face still uses the system instruction
-role. Users can configure additional NVIDIA deployments by ID. Catalog
-entries that use other upstream APIs still need their own adapters. Live
-inference on the updated catalogs was unverified.
+Baseten and NVIDIA's pinned chat-completions catalogs include model-specific
+compatibility, NVIDIA polling headers and Baseten's thinking template. Pi
+1.6.0 supplies 15 Baseten, 16 Together, 12 NVIDIA NIM and 87 Hugging Face
+Router entries. Baseten and Together expose Kimi K3.1 Pro with image input.
+Baseten lists a 262,144-token output maximum, and Together lists 1,048,576 for
+both Kimi K3 and K3.1 Pro. Hugging Face uses the system instruction role.
+Users can configure additional NVIDIA deployments by ID. Catalog entries that
+use other upstream APIs still need their own adapters. Live inference on the
+updated catalogs was unverified.
 
 ### OpenAI Codex
 
@@ -5707,10 +5712,16 @@ credentials, and credential refresh. It also accepts `AWS_BEARER_TOKEN_BEDROCK`
 or a configured API key as a Bedrock bearer token. The optional library feature
 is `bedrock`.
 
-The bundled Pi 1.5.0 chat model catalog provides offline model selection and
-metadata, including pricing. It is a static snapshot, not an account-specific
-list of enabled models. The runtime uses the configured AWS region rather than
-pinning the catalog's default endpoint.
+The bundled Pi 1.6 catalog provides offline selection and metadata for 208
+chat models, including long-context pricing tiers where published. The runtime
+uses the configured AWS region, and the account determines which models can be
+invoked. Live access to the newly listed models was unverified.
+
+The native estimator retains its existing input-rate charge for Nova cache
+writes. Cache tokens reported by Converse are counted separately from fresh
+input tokens, and AWS describes Nova cache writes as having no price premium.
+[Amazon Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html)
+[AWS Nova prompt caching announcement](https://aws.amazon.com/blogs/aws/reduce-costs-and-latency-with-amazon-bedrock-intelligent-prompt-routing-and-prompt-caching-preview/)
 
 Text, user images, structured tool-result images, tool calls and results,
 streamed reasoning, stop reasons, and input/output/cache usage are supported.

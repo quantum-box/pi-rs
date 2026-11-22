@@ -1878,8 +1878,23 @@ mod tests {
             endpoint,
             "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
         );
-        assert_eq!(profiles.model_ids(&provider).len(), 19);
+        assert_eq!(profiles.model_ids(&provider).len(), 20);
         assert_eq!(profiles.model_ids(&provider)[0], "@cf/moonshotai/kimi-k2.6");
+        let inkling = "@cf/thinkingmachines/inkling-2-small";
+        assert!(
+            profiles
+                .model_ids(&provider)
+                .iter()
+                .any(|model| model == inkling)
+        );
+        assert_eq!(
+            profiles.model_adapter(&provider, inkling),
+            Adapter::ChatCompletions
+        );
+        let model = profiles.model(&provider, inkling).unwrap();
+        assert_eq!(model.context_window, Some(1_048_576));
+        assert_eq!(model.max_tokens, Some(1_048_576));
+        assert_eq!(model.supports_images(), Some(true));
         assert_eq!(
             keys.custom_credential(&provider, endpoint, &profiles)
                 .and_then(|key| key.literal()),
@@ -1931,7 +1946,7 @@ mod tests {
             "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
         );
         assert!(profiles.credential(&provider, endpoint).is_none());
-        assert_eq!(profiles.model_ids(&provider).len(), 19);
+        assert_eq!(profiles.model_ids(&provider).len(), 20);
     }
 
     #[test]
@@ -2296,6 +2311,17 @@ mod tests {
         let model = profiles.model(&provider, "amazon.nova-lite-v1:0").unwrap();
         assert_eq!(model.context_window, Some(300_000));
         assert_eq!(model.max_tokens, Some(10_000));
+        let nova_cost = model.cost.unwrap().value();
+        assert_eq!(nova_cost["cacheWrite"], 0.06);
+        assert_eq!(profiles.model_ids(&provider).len(), 208);
+        let sol = profiles
+            .model(&provider, "global.openai.gpt-6.2-sol")
+            .unwrap();
+        assert_eq!(sol.context_window, Some(1_050_000));
+        assert_eq!(sol.max_tokens, Some(128_000));
+        let cost = sol.cost.unwrap().value();
+        assert_eq!(cost["tiers"][0]["inputTokensAbove"], 272_000);
+        assert_eq!(cost["tiers"][0]["output"], 15.0);
     }
 
     #[test]
@@ -3100,7 +3126,7 @@ mod tests {
         let profiles = Profiles::parse(&json!({})).unwrap();
         let baseten = profiles.provider("baseten").unwrap();
         let nvidia = profiles.provider("nvidia").unwrap();
-        assert_eq!(profiles.model_ids(&baseten).len(), 14);
+        assert_eq!(profiles.model_ids(&baseten).len(), 15);
         assert_eq!(profiles.model_ids(&nvidia).len(), 12);
         assert!(
             !profiles
@@ -3156,6 +3182,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(relay["x-relay-secret"], "private");
+    }
+
+    #[test]
+    fn kimi_k31_pro_catalog_keeps_host_specific_limits_and_compatibility() {
+        let profiles = Profiles::default();
+        let model_id = "moonshotai/Kimi-K3.1-Pro";
+        for (provider_id, total, max_output) in
+            [("baseten", 15, 262_144), ("together", 16, 1_048_576)]
+        {
+            let provider = profiles.provider(provider_id).unwrap();
+            assert_eq!(profiles.model_ids(&provider).len(), total);
+            assert_eq!(
+                profiles.model_adapter(&provider, model_id),
+                Adapter::ChatCompletions
+            );
+            let model = profiles.model(&provider, model_id).unwrap();
+            assert_eq!(model.context_window, Some(1_048_576));
+            assert_eq!(model.max_tokens, Some(max_output));
+            assert_eq!(model.supports_images(), Some(true));
+            assert_eq!(model.image_resize().unwrap().max_width, Some(2000));
+            assert_ne!(
+                profiles
+                    .chat_compatibility(&provider, Some(&model))
+                    .supports_developer_role(),
+                Some(true)
+            );
+        }
+        let together = profiles.provider("together").unwrap();
+        let previous = profiles.model(&together, "moonshotai/Kimi-K3").unwrap();
+        assert_eq!(previous.max_tokens, Some(1_048_576));
+        let latest = profiles.model(&together, model_id).unwrap();
+        assert_eq!(latest.mapped_effort("medium"), Some(None));
     }
 
     #[test]
