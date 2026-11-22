@@ -3557,7 +3557,7 @@ fn slash(
             ))?);
             view.append(&super::cache_warming::status::describe(
                 view.cache_warming_status.as_ref(),
-                args.settings.string("cacheWarming").unwrap_or("streaming"),
+                args.settings.cache_warming_mode(),
                 session.head(),
             ));
             let stats = &view.cache_stats;
@@ -7776,7 +7776,7 @@ fn start_thinking_levels(
 }
 
 fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item> {
-    let cache_mode = args.settings.string("cacheWarming").unwrap_or("streaming");
+    let cache_mode = args.settings.cache_warming_mode();
     let next_cache_mode = match cache_mode {
         "streaming" => "idle",
         "idle" => "off",

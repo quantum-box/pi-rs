@@ -291,6 +291,13 @@ impl Settings {
     pub fn string(&self, key: &str) -> Option<&str> {
         self.value.get(key)?.as_str()
     }
+    pub fn cache_warming_mode(&self) -> &'static str {
+        match self.string("cacheWarming") {
+            Some("off") => "off",
+            Some("streaming") => "streaming",
+            _ => "idle",
+        }
+    }
     pub fn thinking_for_model(&self, provider: &str, model: &str) -> Option<&str> {
         self.value
             .get("modelThinkingLevels")
@@ -1151,6 +1158,27 @@ fn merge(base: &mut Value, overlay: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cache_warming_uses_pi_default_and_user_setting() {
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("user.json");
+        let project = root.path().join(".pi");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("settings.json"), r#"{"cacheWarming":"off"}"#).unwrap();
+        for (settings, expected) in [
+            ("{}", "idle"),
+            (r#"{"cacheWarming":"streaming"}"#, "streaming"),
+            (r#"{"cacheWarming":"idle"}"#, "idle"),
+            (r#"{"cacheWarming":"off"}"#, "off"),
+        ] {
+            std::fs::write(&user, settings).unwrap();
+            let settings = super::Settings::load_from_paths(root.path(), true, &user).unwrap();
+            assert_eq!(settings.cache_warming_mode(), expected);
+        }
+        std::fs::write(&user, r#"{"cacheWarming":"unknown"}"#).unwrap();
+        assert!(super::Settings::load_from_paths(root.path(), true, &user).is_err());
+    }
+
     #[test]
     fn legacy_settings_migrate_per_layer_without_rewriting_files() {
         use clap::Parser;
