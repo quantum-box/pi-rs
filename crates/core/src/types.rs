@@ -695,12 +695,35 @@ impl ProviderReplay {
             .any(|b| b.get("_pi_context_edit_api").is_some())
     }
 
-    /// Edited replay is scoped to the originating transport as well as the model.
+    /// Replay with a known wire format must use the originating API family.
     pub fn supports_api(&self, api: ModelApi) -> bool {
-        self.blocks
+        if let Some(name) = self
+            .blocks
             .iter()
-            .find_map(|b| b.get("_pi_context_edit_api").and_then(Value::as_str))
-            .is_none_or(|name| name == api.as_str())
+            .find_map(|block| block.get("_pi_context_edit_api").and_then(Value::as_str))
+        {
+            return name == api.as_str();
+        }
+        self.blocks.iter().all(|block| {
+            let kind = block["type"].as_str();
+            if block.get("_pi_anthropic_effort").is_some()
+                || matches!(kind, Some("thinking" | "redacted_thinking" | "tool_use"))
+            {
+                api == ModelApi::AnthropicMessages
+            } else if block.get("_pi_openai_effort").is_some()
+                || matches!(
+                    kind,
+                    Some("reasoning" | "function_call" | "custom_tool_call")
+                )
+            {
+                matches!(
+                    api,
+                    ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses
+                )
+            } else {
+                true
+            }
+        })
     }
 }
 

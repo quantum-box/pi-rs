@@ -205,7 +205,6 @@ struct ModelCompatibility {
     chat: ChatCompatibility,
     allow_empty_signature: Option<bool>,
     supports_strict_tools: Option<bool>,
-    supports_mid_convo_effort: Option<bool>,
     supports_max_output_tokens: Option<bool>,
     supports_mid_convo_effort: Option<bool>,
     force_adaptive_thinking: Option<bool>,
@@ -225,9 +224,6 @@ impl ModelCompatibility {
             chat: self.chat.overlay(newer.chat),
             allow_empty_signature: newer.allow_empty_signature.or(self.allow_empty_signature),
             supports_strict_tools: newer.supports_strict_tools.or(self.supports_strict_tools),
-            supports_mid_convo_effort: newer
-                .supports_mid_convo_effort
-                .or(self.supports_mid_convo_effort),
             supports_max_output_tokens: newer
                 .supports_max_output_tokens
                 .or(self.supports_max_output_tokens),

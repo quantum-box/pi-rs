@@ -4297,6 +4297,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn responses_reencode_anthropic_replies_when_provider_and_model_are_reused() {
+        let mut request = request();
+        let signed = json!({"type":"thinking","thinking":"hidden","signature":"signed"});
+        let effort = json!({"_pi_anthropic_effort":"xhigh"});
+        for private_block in [signed, effort] {
+            request.messages = vec![
+                Message::User {
+                    content: "question".into(),
+                },
+                Message::Assistant {
+                    content: "portable reply".into(),
+                    calls: vec![],
+                    replay: Some(Box::new(ProviderReplay {
+                        identity: ResolvedModelIdentity {
+                            provider: "fixture".into(),
+                            model: request.model.clone(),
+                        },
+                        blocks: vec![
+                            private_block,
+                            json!({"type":"text","text":"portable reply"}),
+                        ],
+                    })),
+                },
+            ];
+            let body = responses_payload(
+                &request,
+                "fixture",
+                "fixture",
+                "system",
+                pi_rs_core::ModelApi::OpenaiResponses,
+                Some("low"),
+            );
+            assert_eq!(
+                body["input"],
+                json!([
+                    {"role":"user","content":"question"},
+                    {"role":"assistant","content":"portable reply"},
+                    configuration_update("low"),
+                ])
+            );
+        }
+    }
+
     #[tokio::test]
     async fn responses_configuration_updates_preserve_effort_across_replies() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
