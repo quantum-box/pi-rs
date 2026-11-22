@@ -94,7 +94,8 @@ fn worker_limit() -> usize {
 }
 
 fn parse_worker_limit(value: &str) -> Option<usize> {
-    let value = value.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let value =
+        value.trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}');
     let radix_number = |digits: &str, radix| {
         (!digits.is_empty() && digits.chars().all(|c| c.is_ascii() && c.is_digit(radix)))
             .then(|| u64::from_str_radix(digits, radix).ok().map(|n| n as f64))
@@ -123,14 +124,46 @@ fn parse_worker_limit(value: &str) -> Option<usize> {
         .then_some(number as usize)
 }
 
+#[derive(Debug)]
+enum WorkerAdmissionError {
+    Cancelled,
+    Deadline,
+    Busy,
+    Closed,
+}
+
+impl WorkerAdmissionError {
+    fn reply(self, elapsed: Duration, timeout: Option<Duration>, worker_count: usize) -> ToolReply {
+        let reason = match self {
+            Self::Cancelled => "Script aborted: Execution aborted".into(),
+            Self::Deadline => format!(
+                "Script timed out: Execution timed out after {} ms while waiting for a free codemode worker",
+                timeout
+                    .expect("admission deadline requires a timeout")
+                    .as_millis()
+            ),
+            Self::Busy => format!(
+                "No codemode worker became free within {} seconds. All {worker_count} workers, shared by every session in this process, are held by other scripts. Retry after they finish.",
+                WORKER_WAIT_LIMIT.as_secs()
+            ),
+            Self::Closed => "Codemode worker pool closed".into(),
+        };
+        Outcome::Failed(format!(
+            "Script failed\nWall time {:.1} seconds\nOutput:\n\nScript error:\n{reason}\n\nThe script did not start.",
+            elapsed.as_secs_f64()
+        ))
+        .into()
+    }
+}
+
 async fn acquire_worker(
     workers: &Arc<WorkerPool>,
     cancellation: &pi_rs_core::CancellationToken,
     deadline: Option<Duration>,
     wait_limit: Duration,
-) -> Result<WorkerPermit, &'static str> {
+) -> Result<WorkerPermit, WorkerAdmissionError> {
     if cancellation.is_cancelled() {
-        return Err("Script cancelled while waiting for a worker");
+        return Err(WorkerAdmissionError::Cancelled);
     }
     workers.resize();
     let wait = deadline.map_or(wait_limit, |limit| limit.min(wait_limit));
@@ -155,12 +188,12 @@ async fn acquire_worker(
     };
     tokio::select! {
         biased;
-        _ = cancellation.cancelled() => Err("Script cancelled while waiting for a worker"),
+        _ = cancellation.cancelled() => Err(WorkerAdmissionError::Cancelled),
         result = tokio::time::timeout(wait, acquire) => match result {
             Ok(Ok(permit)) => Ok(permit),
-            Ok(Err(_)) => Err("Codemode worker pool closed"),
-            Err(_) if deadline.is_some_and(|limit| limit <= wait_limit) => Err("Script timed out while waiting for a codemode worker"),
-            Err(_) => Err("No codemode worker became free within 60 seconds; retry after other scripts finish"),
+            Ok(Err(_)) => Err(WorkerAdmissionError::Closed),
+            Err(_) if deadline.is_some_and(|limit| limit <= wait_limit) => Err(WorkerAdmissionError::Deadline),
+            Err(_) => Err(WorkerAdmissionError::Busy),
         },
     }
 }
@@ -307,10 +340,11 @@ impl Tool for ScriptTool {
             {
                 Some(remaining) => Some(remaining),
                 None => {
-                    return Outcome::Failed(
-                        "Script timed out while waiting for a codemode worker".into(),
-                    )
-                    .into();
+                    return WorkerAdmissionError::Deadline.reply(
+                        started.elapsed(),
+                        options.timeout,
+                        (workers.limit)(),
+                    );
                 }
             },
             None => None,
@@ -324,7 +358,9 @@ impl Tool for ScriptTool {
         .await
         {
             Ok(permit) => permit,
-            Err(error) => return Outcome::Failed(error.into()).into(),
+            Err(error) => {
+                return error.reply(started.elapsed(), options.timeout, (workers.limit)());
+            }
         };
         let store = previous
             .map(|state| state.data.clone())
@@ -1573,11 +1609,31 @@ mod tests {
 
     #[test]
     fn worker_limit_accepts_pi_numeric_forms_with_native_ceiling() {
-        for value in ["3", " 3 ", "3.0", "3e0", "+3", "0x3", "0o3", "0b11"] {
+        for value in [
+            "3",
+            " 3 ",
+            "\u{feff}3\u{00a0}",
+            "3.0",
+            "3e0",
+            "+3",
+            "0x3",
+            "0o3",
+            "0b11",
+        ] {
             assert_eq!(parse_worker_limit(value), Some(3), "{value:?}");
         }
         for value in [
-            "", "0", "-1", "1.5", "NaN", "Infinity", "1025", "3workers", "+0x3", "0x+3",
+            "",
+            "0",
+            "-1",
+            "1.5",
+            "NaN",
+            "Infinity",
+            "1025",
+            "3workers",
+            "+0x3",
+            "0x+3",
+            "\u{0085}3",
         ] {
             assert_eq!(parse_worker_limit(value), None, "{value:?}");
         }
@@ -1598,21 +1654,41 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(result, Err(error) if error.contains("No codemode worker")));
+        let Err(error @ WorkerAdmissionError::Busy) = result else {
+            panic!("expected the worker wait limit");
+        };
+        let elapsed = WORKER_WAIT_LIMIT;
+        let reply = error.reply(elapsed, None, 1);
+        assert!(matches!(reply.outcome, Outcome::Failed(message) if message
+                == "Script failed\nWall time 60.0 seconds\nOutput:\n\nScript error:\nNo codemode worker became free within 60 seconds. All 1 workers, shared by every session in this process, are held by other scripts. Retry after they finish.\n\nThe script did not start."));
+        assert!(reply.state.is_none());
         let result = tokio::time::timeout(
             overall,
             acquire_worker(&workers, &cancellation, Some(short), Duration::from_secs(1)),
         )
         .await
         .unwrap();
-        assert!(matches!(result, Err(error) if error.contains("Script timed out")));
+        let Err(error @ WorkerAdmissionError::Deadline) = result else {
+            panic!("expected the script deadline");
+        };
+        let timeout = Duration::from_millis(37);
+        let reply = error.reply(timeout, Some(timeout), 1);
+        assert!(matches!(reply.outcome, Outcome::Failed(message) if message
+                == "Script failed\nWall time 0.0 seconds\nOutput:\n\nScript error:\nScript timed out: Execution timed out after 37 ms while waiting for a free codemode worker\n\nThe script did not start."));
+        assert!(reply.state.is_none());
 
         let waiting = acquire_worker(&workers, &cancellation, None, overall);
         tokio::pin!(waiting);
         assert!(tokio::time::timeout(short, &mut waiting).await.is_err());
         cancellation.cancel();
         let result = tokio::time::timeout(overall, waiting).await.unwrap();
-        assert!(matches!(result, Err(error) if error.contains("cancelled")));
+        let Err(error @ WorkerAdmissionError::Cancelled) = result else {
+            panic!("expected cancellation");
+        };
+        let reply = error.reply(short, None, 1);
+        assert!(matches!(reply.outcome, Outcome::Failed(message) if message
+                == "Script failed\nWall time 0.0 seconds\nOutput:\n\nScript error:\nScript aborted: Execution aborted\n\nThe script did not start."));
+        assert!(reply.state.is_none());
         drop(held);
         assert_eq!(workers.semaphore.available_permits(), 1);
         let fresh = pi_rs_core::CancellationToken::new();

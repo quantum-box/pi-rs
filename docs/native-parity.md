@@ -1797,10 +1797,13 @@ waiting for a worker. Like Pi, a script awaiting an unresolved promise fails
 as soon as it has no pending host calls or JavaScript jobs, even without a
 configured deadline. Worker admission waits at most 60 seconds even
 when execution has no deadline; a shorter script or host deadline and
-cancellation stop the wait sooner. `PI_CODEMODE_MAX_WORKERS` is re-read when
+cancellation stop the wait sooner. An admission failure reports the wall time
+and that the script did not start. As in Pi 1.6.0, it reports the configured
+deadline when a script times out or the shared worker count when the pool
+stays busy for 60 seconds. `PI_CODEMODE_MAX_WORKERS` is re-read when
 admitting or releasing workers, allowing embedders to change the limit while
-running. Positive integer values accept Pi's numeric forms, including whitespace,
-decimal notation and radix prefixes. Reducing the limit does not interrupt
+running. Positive integer values accept Pi's numeric forms, including
+JavaScript whitespace, decimal notation and radix prefixes. Reducing the limit does not interrupt
 existing workers; native retains its 1,024-worker ceiling and uses the default
 of two for invalid or larger values. Waiting counts toward the script deadline,
 and a cancelled waiter does not release another script's worker. In the Rust
