@@ -14,6 +14,7 @@ pub struct Runtime {
     pub auto_compaction: pi_rs::AutoCompactionControl,
     pub retry: pi_rs::RetryControl,
     provider: super::image_policy::WorkbenchModel,
+    read_image_model: pi_rs_workbench::coding::ReadImageModel,
     pub registry: Registry,
     pub extension_sources: std::collections::BTreeMap<String, std::path::PathBuf>,
     shell: ShellConfig,
@@ -381,7 +382,7 @@ impl Runtime {
     pub fn mcp_status(&self, args: &Cli) -> Result<()> {
         let servers = self.catalog.servers.lock().expect("MCP catalogs");
         for (name, value) in
-            mcp_config::registered_configurations(args, self.registry.registered_mcp_servers())?
+            mcp_config::registered_configurations(args, &self.registry.registered_mcp_servers())?
         {
             if let Some(server) = servers.iter().find(|server| server.server_name == name) {
                 output(
@@ -429,11 +430,14 @@ impl Runtime {
         }) = self.mcp_sign_in.front().cloned()
         {
             let current = || {
-                mcp_config::registered_configurations(args, self.registry.registered_mcp_servers())?
-                    .remove(&name)
-                    .map(serde_json::from_value::<pi_rs_workbench::mcp::ServerConfig>)
-                    .transpose()
-                    .map_err(pi_rs::Error::from)
+                mcp_config::registered_configurations(
+                    args,
+                    &self.registry.registered_mcp_servers(),
+                )?
+                .remove(&name)
+                .map(serde_json::from_value::<pi_rs_workbench::mcp::ServerConfig>)
+                .transpose()
+                .map_err(pi_rs::Error::from)
             };
             if args
                 .disable_extension
@@ -515,7 +519,10 @@ impl Runtime {
     }
 
     pub fn configure_model_options(&mut self, args: &Cli, reported: bool) -> Result<()> {
-        self.provider = model_client(args, reported, true)?;
+        let provider = model_client(args, reported, true)?;
+        self.read_image_model
+            .set(&args.model, provider.supports_images);
+        self.provider = provider;
         Ok(())
     }
     pub async fn session_lifecycle(
@@ -920,8 +927,15 @@ async fn load_configured_extensions(
             }
         }
     }
-    if let Some(name) = flags.keys().next() {
-        return Err(pi_rs::Error::Config(format!("unknown option --{name}")));
+    let unknown: Vec<_> = args
+        .ordered_extension_flags()
+        .filter(|(name, _)| flags.contains_key(*name))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !unknown.is_empty() {
+        return Err(pi_rs::Error::Config(
+            super::cli_compat::unknown_extension_options(&unknown),
+        ));
     }
     Ok(extensions)
 }
@@ -1054,20 +1068,17 @@ async fn configure_after(
             .map(|url| (url, std::env::var("PI_RS_ORDERS_TOKEN").ok()));
         registry.register(Arc::new(Tools::new(&args.workspace, order_config)?))?;
         let shell = shell_config(args);
+        let read_image_model = pi_rs_workbench::coding::ReadImageModel::default();
         registry.register(Arc::new(
             CodingTools::local(&args.workspace)?
                 .with_shell_config(shell.clone())
                 .with_image_resize(args.settings.resize_model_images())
                 .with_image_profile(args.model_image_resize())
-                .with_model_image_support(
-                    args.model_profiles
-                        .model(&args.provider, &args.model)
-                        .and_then(|model| model.supports_images()),
-                ),
+                .with_read_image_model(read_image_model.clone()),
         ))?;
         let extra = mcp_config::discover_registered(
             args,
-            registry.registered_mcp_servers(),
+            &registry.registered_mcp_servers(),
             &discovered.configured_namespaces,
             interactive_mcp,
             share_services,
@@ -1102,6 +1113,7 @@ async fn configure_after(
         });
         registry.set_refresher(catalog.clone());
         let provider = model_client(args, super::thinking::reported(args).is_some(), true)?;
+        read_image_model.set(&args.model, provider.supports_images);
 
         // Subprocesses must inherit the frontend's live controls rather than
         // re-resolving them from project settings when a worker is replaced.
@@ -1128,6 +1140,7 @@ async fn configure_after(
                     .unwrap_or_else(|| args.settings.auto_compaction_enabled()),
             ),
             provider,
+            read_image_model,
             registry,
             extension_sources,
             shell,
