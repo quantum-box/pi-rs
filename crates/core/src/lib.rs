@@ -18,6 +18,7 @@ mod persistent_map;
 #[doc(hidden)]
 pub mod pi_import;
 mod provider_hooks;
+mod provider_retry;
 mod resource;
 mod retry;
 mod runtime;
@@ -26,6 +27,7 @@ mod statistics;
 mod strict_tool_schema;
 mod tokens;
 mod tool_execution_snapshot;
+mod tool_render;
 mod types;
 mod ui;
 mod ui_prompt;
@@ -38,6 +40,7 @@ pub use context_replay::endpoint_replay_scope;
 pub use extension::*;
 pub use extension_boundary::{
     AgentActivityOutcome, AgentBeforeSettle, BoundaryContext, BoundaryDecision, BoundaryDraft,
+    TurnEndBoundary,
 };
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use host_auth::*;
@@ -49,7 +52,7 @@ pub use lifecycle::{
     notify as notify_extension_lifecycle, notify_filtered as notify_extension_lifecycle_filtered,
     notify_in_session as notify_extension_lifecycle_in_session,
 };
-pub use mcp_registration::{McpServerDeclaration, RegisteredMcpServer};
+pub use mcp_registration::{McpRegistryHost, McpServerDeclaration, RegisteredMcpServer};
 pub use model_catalog::*;
 pub use model_price::ChatPrice;
 pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};
@@ -58,6 +61,7 @@ pub use provider_hooks::{
     observe_provider_stream, observes_provider_response, observes_provider_stream,
     prepare_provider_headers, provider_header_session_id,
 };
+pub use provider_retry::ProviderRetry;
 pub use resource::Resource;
 pub use retry::*;
 pub use sdk::*;
@@ -75,6 +79,7 @@ pub use tokens::{
 };
 pub use tokio_util::sync::CancellationToken;
 pub use tool_execution_snapshot::{ToolExecutionSnapshot, ValidatedToolExecutionSnapshot};
+pub use tool_render::*;
 pub use types::*;
 pub use ui::*;
 pub use ui_prompt::{UiPromptKind, UiPromptReason};

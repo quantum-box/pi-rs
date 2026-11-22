@@ -7,9 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use pi_rs_core::{
-    AnthropicInputTransformations, AssistantDiagnostic, ChatPrice, Error, ImageContent, Message,
-    Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
-    ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, Usage,
+    AnthropicInputTransformations, AnthropicThreadFallbackDetails, AssistantDiagnostic, ChatPrice,
+    Error, ImageContent, Message, Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest,
+    ModelStream, ProviderReplay, ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, Usage,
 };
 use reqwest::{
     Client, Response, Url,
@@ -17,6 +17,8 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+mod thread;
 
 pub const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
@@ -65,6 +67,7 @@ impl ThinkingDisplay {
 }
 
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+const MESSAGE_THREADS_BETA: &str = "message-threads-2026-08-12";
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const EFFORT_BETA: &str = "mid-conversation-output-config-2026-07-01";
 const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
@@ -106,6 +109,7 @@ impl AnthropicFallbackModel {
 #[derive(Clone)]
 pub struct Anthropic {
     client: Client,
+    provider_retry: pi_rs_core::ProviderRetry,
     http_proxies: Vec<reqwest::Proxy>,
     endpoint: Url,
     auth: (HeaderName, HeaderValue),
@@ -117,10 +121,14 @@ pub struct Anthropic {
     probe_context: bool,
     thinking_level: Option<String>,
     thinking_budgets: Option<Value>,
+    temperatures: Arc<BTreeMap<String, f64>>,
     thinking_display: ThinkingDisplay,
     interleaved_thinking: bool,
     managed_effort_models: Arc<BTreeMap<String, bool>>,
     fallback_models: Arc<BTreeMap<String, Vec<AnthropicFallbackModel>>>,
+    disable_message_thread_continuation: bool,
+    message_thread_default: Option<bool>,
+    message_thread_support: Arc<BTreeMap<String, bool>>,
     eager_tool_input_streaming: bool,
     eager_tool_input_models: Arc<BTreeMap<String, bool>>,
     configured_thinking: Option<CatalogEntry>,
@@ -219,6 +227,7 @@ impl Anthropic {
         Ok(Self {
             client,
             http_proxies: Vec::new(),
+            provider_retry: pi_rs_core::ProviderRetry::default(),
             endpoint,
             auth: (name, value),
             oauth: false,
@@ -229,10 +238,14 @@ impl Anthropic {
             probe_context: true,
             thinking_level: None,
             thinking_budgets: None,
+            temperatures: Arc::default(),
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
             managed_effort_models: Arc::default(),
             fallback_models: Arc::default(),
+            disable_message_thread_continuation: false,
+            message_thread_default: None,
+            message_thread_support: Arc::default(),
             eager_tool_input_streaming: true,
             eager_tool_input_models: Arc::default(),
             configured_thinking: None,
@@ -319,6 +332,7 @@ impl Anthropic {
             wire_tools,
             effective,
             snapshot,
+            context: context.clone(),
         }))
     }
 
@@ -329,6 +343,12 @@ impl Anthropic {
     }
 
     /// Configure the per-read deadline and explicit HTTP proxies.
+    /// Configure provider-level retries before a response stream starts.
+    pub fn with_provider_retry(mut self, policy: pi_rs_core::ProviderRetry) -> Self {
+        self.provider_retry = policy;
+        self
+    }
+
     pub fn with_http_options(
         mut self,
         timeout: Option<Duration>,
@@ -401,6 +421,12 @@ impl Anthropic {
         self
     }
 
+    /// Supply temperatures for models on the active Messages route.
+    pub fn with_model_temperatures(mut self, temperatures: BTreeMap<String, f64>) -> Self {
+        self.temperatures = Arc::new(temperatures);
+        self
+    }
+
     pub fn with_thinking_budget_settings(mut self, budgets: Option<Value>) -> Self {
         self.thinking_budgets = budgets;
         self
@@ -438,6 +464,56 @@ impl Anthropic {
         models.retain(|_, targets| !targets.is_empty());
         self.fallback_models = Arc::new(models);
         Ok(self)
+    }
+
+    /// Set the route default and final-model overrides for Messages threads.
+    pub fn with_message_thread_support(
+        mut self,
+        default: Option<bool>,
+        models: BTreeMap<String, bool>,
+    ) -> Self {
+        self.message_thread_default = default;
+        self.message_thread_support = Arc::new(models);
+        self
+    }
+
+    /// Keep the route's beta and cache options without reading or updating a thread.
+    pub fn without_message_thread_continuation(mut self) -> Self {
+        self.disable_message_thread_continuation = true;
+        self
+    }
+
+    fn thread_key(&self, model: &str, session: Option<(uuid::Uuid, &str)>) -> Option<String> {
+        let (session_id, external_id) = session?;
+        if self.cache_retention == CacheRetention::None
+            || external_id.is_empty()
+            || !self
+                .message_thread_support
+                .get(model)
+                .copied()
+                .or(self.message_thread_default)
+                .unwrap_or(self.endpoint.host_str() == Some("api.anthropic.com"))
+        {
+            return None;
+        }
+        let mut headers: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort_unstable();
+        pi_rs_core::protected_model_fingerprint(&(
+            "anthropic-message-thread-v1",
+            session_id,
+            external_id,
+            self.endpoint.as_str(),
+            self.provider.as_ref(),
+            self.replay_scope.as_ref(),
+            self.auth.0.as_str(),
+            self.auth.1.as_bytes(),
+            self.oauth,
+            headers,
+        ))
     }
 
     /// Use known thinking capabilities for a gateway that lacks a Models API.
@@ -500,7 +576,7 @@ impl Anthropic {
         url.path_segments_mut().ok()?.push(model);
         let details = tokio::time::timeout(Duration::from_secs(2), async {
             let response = send(
-                self.authenticate(self.client.get(url), false, false, false, false),
+                self.authenticate(self.client.get(url), false, false, false, false, false),
                 &self.error_secrets(),
             )
             .await
@@ -566,6 +642,7 @@ impl Anthropic {
         legacy_tool_streaming: bool,
         supports_managed_effort: bool,
         has_fallbacks: bool,
+        session_threads: bool,
     ) -> reqwest::RequestBuilder {
         request = request
             .header("anthropic-version", API_VERSION)
@@ -595,7 +672,7 @@ impl Anthropic {
                 );
             }
         }
-        if has_fallbacks || supports_managed_effort {
+        if has_fallbacks || supports_managed_effort || session_threads {
             let mut value = headers
                 .get(&beta)
                 .map_or_else(Vec::new, |value| value.as_bytes().to_vec());
@@ -603,6 +680,7 @@ impl Anthropic {
                 has_fallbacks.then_some(FALLBACK_BETA),
                 supports_managed_effort.then_some(EFFORT_BETA),
                 supports_managed_effort.then_some(THINKING_BINDING_BETA),
+                session_threads.then_some(MESSAGE_THREADS_BETA),
             ]
             .into_iter()
             .flatten()
@@ -688,7 +766,7 @@ impl Anthropic {
                 url.query_pairs_mut().append_pair("after_id", cursor);
             }
             let response = send(
-                self.authenticate(self.client.get(url), false, false, false, false),
+                self.authenticate(self.client.get(url), false, false, false, false, false),
                 &self.error_secrets(),
             )
             .await?;
@@ -984,6 +1062,19 @@ async fn is_permanent_quota(mut response: Response, secrets: &[String]) -> bool 
 
 async fn send(request: reqwest::RequestBuilder, secrets: &[String]) -> Result<Response> {
     check_status(send_http(request).await?, secrets).await
+}
+
+fn thread_fallback_diagnostic(reason: &str) -> AssistantDiagnostic {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    AssistantDiagnostic::AnthropicThreadFallback {
+        timestamp: i64::try_from(millis).unwrap_or(i64::MAX),
+        details: AnthropicThreadFallbackDetails {
+            reason: reason.into(),
+        },
+    }
 }
 
 async fn send_http(request: reqwest::RequestBuilder) -> Result<Response> {
@@ -1302,6 +1393,16 @@ fn oauth_tool_name(name: &str) -> &str {
         .unwrap_or(name)
 }
 
+fn normalize_oauth_tool_use_names(blocks: &mut [Value]) {
+    for block in blocks {
+        if block["type"] == "tool_use"
+            && let Some(name) = block["name"].as_str()
+        {
+            block["name"] = json!(oauth_tool_name(name));
+        }
+    }
+}
+
 fn prepare_oauth_request(body: &mut Value, retention: CacheRetention) {
     let mut identity =
         json!({"type":"text", "text":"You are Claude Code, Anthropic's official CLI for Claude."});
@@ -1325,13 +1426,7 @@ fn prepare_oauth_request(body: &mut Value, retention: CacheRetention) {
     if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages {
             if let Some(blocks) = message["content"].as_array_mut() {
-                for block in blocks {
-                    if block["type"] == "tool_use"
-                        && let Some(name) = block["name"].as_str()
-                    {
-                        block["name"] = json!(oauth_tool_name(name));
-                    }
-                }
+                normalize_oauth_tool_use_names(blocks);
             }
         }
     }
@@ -1609,6 +1704,7 @@ struct PreparedAnthropicDispatch {
     wire_tools: Vec<Value>,
     effective: Vec<pi_rs_core::EffectiveToolDeclaration>,
     snapshot: pi_rs_core::ToolDecisionSnapshot,
+    context: pi_rs_core::ToolDispatchContext,
 }
 
 #[async_trait::async_trait]
@@ -1627,7 +1723,12 @@ impl pi_rs_core::PreparedToolDispatch for PreparedAnthropicDispatch {
     }
     async fn dispatch(self: Box<Self>) -> Result<pi_rs_core::DetailedModelStream> {
         self.client
-            .stream_detailed_with_tools(self.request, Some(self.wire_tools))
+            .stream_detailed_with_tools(
+                self.request,
+                Some(self.wire_tools),
+                (!self.context.summary)
+                    .then_some((self.context.session_id, self.context.external_id.as_str())),
+            )
             .await
     }
 }
@@ -1766,6 +1867,10 @@ impl Model for Anthropic {
             }))
     }
 
+    fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
+        self.mid_conversation_system_models.contains(model)
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,
@@ -1883,6 +1988,15 @@ impl Model for Anthropic {
         } else {
             base
         };
+        let base = if self.temperatures.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "messages-temperature-v1",
+                self.temperatures.as_ref(),
+            ))?
+        };
         let base = if self.managed_effort_models.is_empty() {
             base
         } else {
@@ -1909,6 +2023,22 @@ impl Model for Anthropic {
                 "anthropic-fallback-v1",
                 self.fallback_models.as_ref(),
             ))?
+        };
+        let base =
+            if self.message_thread_default.is_none() && self.message_thread_support.is_empty() {
+                base
+            } else {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    "message-threads-v1",
+                    self.message_thread_default,
+                    self.message_thread_support.as_ref(),
+                ))?
+            };
+        let base = if self.disable_message_thread_continuation {
+            pi_rs_core::protected_model_fingerprint(&(base, "disable-thread-continuation"))?
+        } else {
+            base
         };
         match &self.strict_tool_models {
             // A map containing only unsupported models cannot change any
@@ -2003,11 +2133,14 @@ impl Model for Anthropic {
     async fn stream_enriched_in_session_with_identity(
         &self,
         _request_id: uuid::Uuid,
-        _session_id: uuid::Uuid,
-        _external_id: &str,
+        session_id: uuid::Uuid,
+        external_id: &str,
         request: ModelRequest,
     ) -> Result<pi_rs_core::EnrichedModelStream> {
-        self.stream_enriched(request).await
+        let stream = self
+            .stream_detailed_with_tools(request, None, Some((session_id, external_id)))
+            .await?;
+        Ok(Box::pin(stream.map(|event| event.map(|event| event.event))))
     }
     async fn stream_enriched_for_summary(
         &self,
@@ -2020,11 +2153,12 @@ impl Model for Anthropic {
     async fn stream_detailed_in_session_with_identity(
         &self,
         _request_id: uuid::Uuid,
-        _session_id: uuid::Uuid,
-        _external_id: &str,
+        session_id: uuid::Uuid,
+        external_id: &str,
         request: ModelRequest,
     ) -> Result<pi_rs_core::DetailedModelStream> {
-        self.stream_detailed(request).await
+        self.stream_detailed_with_tools(request, None, Some((session_id, external_id)))
+            .await
     }
     async fn stream_detailed_for_summary(
         &self,
@@ -2076,13 +2210,41 @@ impl Anthropic {
         &self,
         request: ModelRequest,
     ) -> Result<pi_rs_core::DetailedModelStream> {
-        self.stream_detailed_with_tools(request, None).await
+        self.stream_detailed_with_tools(request, None, None).await
+    }
+
+    async fn send_observed(
+        &self,
+        request: reqwest::RequestBuilder,
+        error_secrets: &[String],
+    ) -> Result<Response> {
+        let response = self
+            .provider_retry
+            .send(
+                || {
+                    let request = request.try_clone().ok_or_else(|| {
+                        Error::Config("Anthropic request cannot be replayed".into())
+                    });
+                    async { send_http(request?).await }
+                },
+                |response| (response.status().as_u16(), response.headers()),
+            )
+            .await?;
+        pi_rs_core::observe_provider_response(
+            response.status(),
+            response.headers(),
+            error_secrets,
+            &self.headers,
+        )
+        .await;
+        Ok(response)
     }
 
     async fn stream_detailed_with_tools(
         &self,
         mut request: ModelRequest,
         wire_tools: Option<Vec<Value>>,
+        session: Option<(uuid::Uuid, &str)>,
     ) -> Result<pi_rs_core::DetailedModelStream> {
         let discovered = if self.thinking_level.is_some() {
             self.model(&request.model).await
@@ -2209,10 +2371,21 @@ impl Anthropic {
         body.as_object_mut()
             .expect("encoded request")
             .append(thinking.as_object_mut().expect("thinking options object"));
+        if !supports_managed_effort
+            && matches!(body["thinking"]["type"].as_str(), None | Some("disabled"))
+            && let Some(temperature) = self.temperatures.get(&requested_model)
+        {
+            body["temperature"] = json!(temperature);
+        }
         if let Some(progress) = &self.progress {
             progress(Progress::WaitingForModel);
         }
         let error_secrets = self.error_secrets();
+        let thread_key = self.thread_key(&requested_model, session);
+        let thread_beta = thread_key.as_deref().is_some_and(thread::allows_beta);
+        let mut thread = thread_key
+            .filter(|_| !self.disable_message_thread_continuation)
+            .and_then(|key| thread::Attempt::begin(key, &body));
         let mut request = self.client.post(self.endpoint.clone());
         if self.auth.0 == "cf-aig-authorization"
             || copilot.is_some()
@@ -2227,33 +2400,112 @@ impl Anthropic {
                 }
             }
         }
-        let response = send_http(self.authenticate(
-            request.json(&body),
-            interleaved,
-            legacy_tool_streaming,
-            supports_managed_effort,
-            !fallbacks.is_empty(),
-        ))
-        .await?;
-        pi_rs_core::observe_provider_response(
-            response.status(),
-            response.headers(),
-            &error_secrets,
-            &self.headers,
+        let send = |request: reqwest::RequestBuilder, session_threads| {
+            self.send_observed(
+                self.authenticate(
+                    request,
+                    interleaved,
+                    legacy_tool_streaming,
+                    supports_managed_effort,
+                    !fallbacks.is_empty(),
+                    session_threads,
+                ),
+                &error_secrets,
+            )
+        };
+        let first = request
+            .try_clone()
+            .ok_or_else(|| Error::Model("cannot prepare Anthropic request".into()))?;
+        let response = send(
+            first.json(thread.as_ref().map_or(&body, |attempt| &attempt.body)),
+            thread_beta,
         )
-        .await;
-        let response = check_status(response, &error_secrets).await?;
-        if !response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("text/event-stream"))
-        {
-            return Err(Error::Model("expected an Anthropic SSE response".into()));
+        .await?;
+        let mut thread_fallback = None;
+        let response =
+            if thread.is_some() && matches!(response.status().as_u16(), 400 | 404 | 409 | 422) {
+                let status = response.status();
+                let (error, complete) = thread::read_error(response).await;
+                match complete
+                    .then(|| thread::rejection(status, &error))
+                    .flatten()
+                {
+                    Some(thread::Rejection::Restart(reason)) => {
+                        thread_fallback = Some(thread_fallback_diagnostic(reason));
+                        send(request.json(&thread::create(&body)), true).await
+                    }
+                    Some(thread::Rejection::Unsupported { reason, keep_beta }) => {
+                        thread_fallback = Some(thread_fallback_diagnostic(reason));
+                        let response = send(request.json(&body), keep_beta).await;
+                        if response
+                            .as_ref()
+                            .is_ok_and(|response| response.status().is_success())
+                            && let Some(attempt) = thread.take()
+                        {
+                            attempt.disable(keep_beta);
+                        }
+                        response
+                    }
+                    None => {
+                        let overflow = matches!(status.as_u16(), 400 | 422)
+                            && pi_rs_core::provider_context_overflow_from_bytes(
+                                &error,
+                                complete,
+                                &error_secrets,
+                            );
+                        return Err(Error::Model(if overflow {
+                            "context window exceeded".into()
+                        } else {
+                            format!("Anthropic returned HTTP {status}")
+                        }));
+                    }
+                }
+            } else {
+                Ok(response)
+            };
+        let response = match response {
+            Ok(response) => check_status(response, &error_secrets).await,
+            Err(error) => Err(error),
         }
+        .and_then(|response| {
+            if response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+            {
+                Ok(response)
+            } else {
+                Err(Error::Model("expected an Anthropic SSE response".into()))
+            }
+        });
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let Some(diagnostic) = thread_fallback else {
+                    return Err(error);
+                };
+                return Ok(Box::pin(futures_util::stream::iter([
+                    Ok(pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(
+                        ModelMetadata {
+                            provider_api: Some(ModelApi::AnthropicMessages),
+                            diagnostics: vec![diagnostic],
+                            ..ModelMetadata::default()
+                        },
+                    ))
+                    .into()),
+                    Err(error),
+                ])));
+            }
+        };
+        let thread_request = thread.as_mut().map(|attempt| {
+            attempt.body = Value::Null;
+            body
+        });
         let progress = self.progress.clone();
         let allow_empty_signature = self.allow_empty_signature;
         let reasoning = self.reasoning.clone();
+        let oauth = self.oauth;
         let observation_headers =
             pi_rs_core::observes_provider_stream().then(|| self.headers.clone());
         Ok(Box::pin(async_stream::try_stream! {
@@ -2283,7 +2535,14 @@ impl Anthropic {
                 ..ModelMetadata::default()
             };
             let mut input_transformations = None;
+            if let Some(diagnostic) = thread_fallback {
+                metadata.diagnostics.push(diagnostic);
+                yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::Legacy(
+                    ModelEvent::Metadata(metadata.clone()),
+                ));
+            }
             let mut started = false;
+            let mut fallback_observed = false;
             while let Some(event) = events.next().await {
                 let event = event.map_err(|error| match error {
                     eventsource_stream::EventStreamError::Transport(error) => error,
@@ -2320,6 +2579,7 @@ impl Anthropic {
                     Some("content_block_start") if started => {
                         let block = &value["content_block"];
                         if block["type"] == "fallback" {
+                            fallback_observed = true;
                             if !calls.is_empty() || blocks.values().any(|block| matches!(block.raw["type"].as_str(), Some("text" | "thinking" | "redacted_thinking"))) {
                                 Err(Error::Model("Anthropic performed an unsupported mid-output model fallback".into()))?;
                             }
@@ -2485,11 +2745,13 @@ impl Anthropic {
                             Some("redacted_thinking") => Some("[Reasoning redacted]"),
                             _ => None,
                         }).collect();
-                        let retain_replay = active_effort.is_some() || blocks.values().any(ResponseBlock::signed);
+                        let retain_replay = thread.is_some() || active_effort.is_some() || blocks.values().any(ResponseBlock::signed);
                         let mut replay = BTreeMap::new();
                         if retain_replay {
                             for (index, block) in blocks {
-                                replay.insert(index, block.finish(allow_empty_signature)?);
+                                if matches!(block.raw["type"].as_str(), Some("text" | "thinking" | "redacted_thinking")) {
+                                    replay.insert(index, block.finish(allow_empty_signature)?);
+                                }
                             }
                         }
                         let mut completed_calls = Vec::new();
@@ -2509,6 +2771,20 @@ impl Anthropic {
                             metadata.diagnostics.push(AssistantDiagnostic::AnthropicInputTransformations { timestamp, details });
                         }
                         if retain_replay {
+                            if let Some(attempt) = thread.take()
+                                && !fallback_observed
+                                && fallback_price.is_none()
+                                && metadata.resolved_model.as_ref().is_some_and(|identity|
+                                    thread::reply_matches_model(&requested_model, &identity.model))
+                                && let Some(id) = metadata.provider_request_id.as_ref().filter(|id| !id.is_empty())
+                                && let Some(thread_request) = thread_request.as_ref()
+                            {
+                                let mut thread_blocks: Vec<_> = replay.values().cloned().collect();
+                                if oauth {
+                                    normalize_oauth_tool_use_names(&mut thread_blocks);
+                                }
+                                attempt.record(thread_request, id.clone(), thread_blocks);
+                            }
                             let mut replay = ProviderReplay {
                                 identity: ResolvedModelIdentity { provider: replay_scope.to_string(), model: requested_model },
                                 blocks: replay.into_values().collect(),
@@ -3229,6 +3505,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn temperature_is_sent_only_when_thinking_and_managed_effort_are_inactive() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for expected in [Some(0.35), None, None, None] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (_, body) = read_fixture_request(&mut socket);
+                assert_eq!(body["temperature"].as_f64(), expected);
+                socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+            }
+        });
+        let client = Anthropic::new(&format!("http://{address}/v1/messages"), "fixture")
+            .unwrap()
+            .with_context_probe(false)
+            .with_model_temperatures(BTreeMap::from([("m".into(), 0.35)]));
+        for (client, model) in [
+            (client.clone(), "m"),
+            (client.clone(), "another-model"),
+            (
+                client.clone().with_configured_thinking("low", true, true),
+                "m",
+            ),
+            (
+                client
+                    .clone()
+                    .with_managed_effort_models(BTreeMap::from([("m".into(), true)])),
+                "m",
+            ),
+        ] {
+            let result = client
+                .stream(ModelRequest {
+                    model: model.into(),
+                    messages: vec![Message::User {
+                        content: "hello".into(),
+                    }],
+                    tools: vec![],
+                    max_output_tokens: 2048,
+                })
+                .await;
+            assert!(result.is_err());
+        }
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn oauth_round_trip_uses_canonical_wire_names_and_restores_local_tool() {
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3456,6 +3782,372 @@ mod tests {
         assert!(legacy.iter().any(
             |event| matches!(event, ModelEvent::Reasoning(text) if text == "[Reasoning redacted]")
         ));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn thread_route_default_is_used_when_the_final_model_has_no_override() {
+        let session = Some((uuid::Uuid::new_v4(), "fixture"));
+        for (endpoint, explicit, inferred) in [
+            (DEFAULT_ENDPOINT, false, true),
+            ("http://127.0.0.1:1/v1/messages", true, false),
+        ] {
+            let native = Anthropic::new(endpoint, "fixture")
+                .unwrap()
+                .with_cache_retention(CacheRetention::Short, true);
+            assert_eq!(native.thread_key("unlisted", session).is_some(), inferred);
+            let client = native.with_message_thread_support(
+                Some(explicit),
+                BTreeMap::from([("model-override".into(), !explicit)]),
+            );
+            assert_eq!(client.thread_key("unlisted", session).is_some(), explicit);
+            assert_eq!(
+                client.thread_key("model-override", session).is_some(),
+                !explicit
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_thread_beta_resend_keeps_the_fallback_diagnostic() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for (threaded, error) in [
+                (
+                    true,
+                    r#"{"message":"unknown beta message-threads-2026-08-12"}"#,
+                ),
+                (
+                    false,
+                    r#"{"error":{"message":"fixture rejected the resend"}}"#,
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (headers, body) = read_fixture_request(&mut socket);
+                assert_eq!(headers.contains(MESSAGE_THREADS_BETA), threaded);
+                assert_eq!(body.get("thread").is_some(), threaded);
+                write!(
+                    socket,
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}",
+                    error.len(),
+                ).unwrap();
+            }
+        });
+        let (request, mut declaration) = constrained_fixture(
+            pi_rs_core::StrictToolPolicy::Prefer,
+            json!({"type":"object","properties":{}}),
+        );
+        declaration.constrained_sampling = None;
+        let client = Anthropic::new(&format!("http://{address}/v1/messages"), "fixture")
+            .unwrap()
+            .with_message_thread_support(None, BTreeMap::from([("claude".into(), true)]))
+            .with_cache_retention(CacheRetention::Short, true);
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "session".into(),
+            summary: false,
+        };
+        let stream = client
+            .prepare_bound_tool_dispatch(&request, &[declaration], &context)
+            .unwrap()
+            .dispatch()
+            .await
+            .unwrap();
+        let events = stream.collect::<Vec<_>>().await;
+        assert!(matches!(events.as_slice(), [
+            Ok(pi_rs_core::DetailedModelEvent {
+                event: pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { diagnostics, .. })),
+                ..
+            }),
+            Err(Error::Model(_)),
+        ] if matches!(diagnostics.as_slice(), [
+            AssistantDiagnostic::AnthropicThreadFallback { details, .. },
+        ] if details.reason == "thread_beta_unsupported")));
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_message_threads_send_suffixes_and_recover_from_rejections() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for (attempt, expected, count, reply) in [
+                (0, json!({"type":"create"}), 1, "msg_a"),
+                (1, Value::Null, 1, "msg_warm"),
+                (
+                    2,
+                    json!({"type":"continue","previous_message_id":"msg_a"}),
+                    1,
+                    "",
+                ),
+                (3, json!({"type":"create"}), 3, "msg_b"),
+                (
+                    4,
+                    json!({"type":"continue","previous_message_id":"msg_b"}),
+                    1,
+                    "",
+                ),
+                (5, Value::Null, 5, "msg_c"),
+                (6, Value::Null, 7, "msg_d"),
+                (7, Value::Null, 9, "msg_summary"),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (headers, body) = read_fixture_request(&mut socket);
+                assert_eq!(
+                    headers.contains(MESSAGE_THREADS_BETA),
+                    reply != "msg_summary",
+                    "attempt {attempt}"
+                );
+                assert_eq!(body["thread"], expected, "attempt {attempt}");
+                assert_eq!(
+                    body["messages"].as_array().unwrap().len(),
+                    count,
+                    "attempt {attempt}"
+                );
+                let continuation = expected["type"] == "continue";
+                assert_eq!(body.get("system").is_none(), continuation);
+                assert_eq!(body.get("tools").is_none(), continuation);
+                if reply == "msg_warm" {
+                    assert_eq!(body["max_tokens"], 1);
+                }
+                if reply.is_empty() {
+                    let (status, error_code) = if attempt == 2 {
+                        ("404 Not Found", "thread_not_found")
+                    } else {
+                        ("400 Bad Request", "thread_unsupported_request")
+                    };
+                    let error =
+                        json!({"error":{"details":{"error_code":error_code},"message":"fixture"}})
+                            .to_string();
+                    write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}", error.len()).unwrap();
+                } else {
+                    let events = [
+                        json!({"type":"message_start","message":{"id":reply,"model":"claude-20261001","usage":{"input_tokens":1}}}),
+                        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":reply}}),
+                        json!({"type":"content_block_stop","index":0}),
+                        json!({"type":"content_block_start","index":1,"content_block":{"type":"future_response_block","data":"not replayable"}}),
+                        json!({"type":"content_block_stop","index":1}),
+                        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+                        json!({"type":"message_stop"}),
+                    ];
+                    let body: String = events
+                        .iter()
+                        .map(|event| format!("data: {event}\n\n"))
+                        .collect();
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            }
+        });
+        let session_id = uuid::Uuid::new_v4();
+        let (mut request, mut declaration) = constrained_fixture(
+            pi_rs_core::StrictToolPolicy::Prefer,
+            json!({"type":"object","properties":{}}),
+        );
+        declaration.constrained_sampling = None;
+        request.messages.insert(
+            0,
+            Message::System {
+                content: "system".into(),
+            },
+        );
+        for (expected, fallback, summary) in [
+            ("msg_a", None, false),
+            ("msg_b", Some("thread_not_found"), false),
+            ("msg_c", Some("thread_unsupported_request"), false),
+            ("msg_d", None, false),
+            ("msg_summary", None, true),
+        ] {
+            // Workbench may rebuild the client from the same route between requests.
+            let client = Anthropic::new(&format!("http://{address}/v1/messages"), "fixture")
+                .unwrap()
+                .with_message_thread_support(None, BTreeMap::from([("claude".into(), true)]))
+                .with_cache_retention(CacheRetention::Short, true);
+            let context = pi_rs_core::ToolDispatchContext {
+                request_id: uuid::Uuid::new_v4(),
+                session_id,
+                external_id: "session".into(),
+                summary,
+            };
+            let prepared = client
+                .prepare_bound_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+                .unwrap();
+            let mut stream = prepared.dispatch().await.unwrap();
+            let mut last = None;
+            while let Some(event) = stream.next().await {
+                if let pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata)) =
+                    event.unwrap().event
+                {
+                    last = Some(metadata);
+                }
+            }
+            let metadata = last.unwrap();
+            assert_eq!(metadata.provider_request_id.as_deref(), Some(expected));
+            if expected == "msg_a" {
+                let replay = metadata.replay.as_ref().unwrap();
+                assert_eq!(replay.blocks.len(), 1);
+                assert_eq!(replay.blocks[0]["type"], "text");
+            }
+            assert_eq!(
+                metadata
+                    .diagnostics
+                    .iter()
+                    .find_map(|diagnostic| match diagnostic {
+                        AssistantDiagnostic::AnthropicThreadFallback { details, .. } =>
+                            Some(details.reason.as_str()),
+                        _ => None,
+                    }),
+                fallback
+            );
+            if expected == "msg_a" {
+                let mut warming = request.clone();
+                warming.max_output_tokens = 1;
+                let replay = client
+                    .clone()
+                    .without_message_thread_continuation()
+                    .prepare_bound_tool_dispatch(
+                        &warming,
+                        std::slice::from_ref(&declaration),
+                        &context,
+                    )
+                    .unwrap();
+                let mut events = replay.dispatch().await.unwrap();
+                while let Some(event) = events.next().await {
+                    event.unwrap();
+                }
+            }
+            request.messages.push(Message::Assistant {
+                content: expected.into(),
+                calls: vec![],
+                replay: metadata.replay,
+            });
+            request.messages.push(Message::User {
+                content: "next".into(),
+            });
+        }
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_message_thread_continues_after_lowercase_local_tool() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for continuation in [false, true] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (_, body) = read_fixture_request(&mut socket);
+                if continuation {
+                    assert_eq!(
+                        body["thread"],
+                        json!({"type":"continue","previous_message_id":"msg_a"})
+                    );
+                    assert!(body.get("tools").is_none());
+                    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+                    assert_eq!(body["messages"][0]["content"][0]["tool_use_id"], "call_a");
+                } else {
+                    assert_eq!(body["thread"], json!({"type":"create"}));
+                    assert_eq!(body["tools"][0]["name"], "Read");
+                }
+
+                let (id, content, reason) = if continuation {
+                    ("msg_b", json!({"type":"text","text":"done"}), "end_turn")
+                } else {
+                    (
+                        "msg_a",
+                        json!({"type":"tool_use","id":"call_a","name":"Read","input":{}}),
+                        "tool_use",
+                    )
+                };
+                let events = [
+                    json!({"type":"message_start","message":{"id":id,"model":"claude","usage":{}}}),
+                    json!({"type":"content_block_start","index":0,"content_block":content}),
+                    json!({"type":"content_block_stop","index":0}),
+                    json!({"type":"message_delta","delta":{"stop_reason":reason},"usage":{}}),
+                    json!({"type":"message_stop"}),
+                ];
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+
+        let (mut request, mut declaration) = constrained_fixture(
+            pi_rs_core::StrictToolPolicy::Prefer,
+            json!({"type":"object","properties":{}}),
+        );
+        request.tools[0].name = "read".into();
+        declaration.spec = request.tools[0].clone();
+        declaration.constrained_sampling = None;
+        let client =
+            Anthropic::with_oauth_token(&format!("http://{address}/v1/messages"), "fixture-oauth")
+                .unwrap()
+                .with_message_thread_support(None, BTreeMap::from([("claude".into(), true)]))
+                .with_cache_retention(CacheRetention::Short, true);
+        let mut context = pi_rs_core::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "oauth-thread".into(),
+            summary: false,
+        };
+        let prepared = client
+            .prepare_bound_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+            .unwrap();
+        let mut stream = prepared.dispatch().await.unwrap();
+        let mut replay = None;
+        let mut calls = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap().event {
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata)) => {
+                    replay = metadata.replay;
+                }
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete {
+                    calls: call_list,
+                    ..
+                }) => {
+                    calls = Some(call_list);
+                }
+                _ => {}
+            }
+        }
+        let replay = replay.unwrap();
+        let calls = calls.unwrap();
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(replay.blocks[0]["name"], "read");
+        request.messages.push(Message::Assistant {
+            content: String::new(),
+            calls,
+            replay: Some(replay),
+        });
+        request.messages.push(Message::Tool {
+            call_id: "call_a".into(),
+            content: "found".into(),
+            is_error: false,
+            is_structured: Some(false),
+        });
+
+        context.request_id = uuid::Uuid::new_v4();
+        let prepared = client
+            .prepare_bound_tool_dispatch(&request, &[declaration], &context)
+            .unwrap();
+        let mut stream = prepared.dispatch().await.unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
         worker.join().unwrap();
     }
 
@@ -4810,6 +5502,7 @@ mod tests {
                     legacy_streaming,
                     false,
                     false,
+                    false,
                 )
                 .build()
                 .unwrap();
@@ -4875,6 +5568,7 @@ mod tests {
                 .authenticate(
                     client.client.post(DEFAULT_ENDPOINT),
                     interleaved,
+                    false,
                     false,
                     false,
                     false,
