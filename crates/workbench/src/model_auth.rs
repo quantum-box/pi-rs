@@ -658,6 +658,15 @@ impl Keys {
         })
     }
 
+    pub(super) fn llama_server(&self) -> Option<(&str, Option<&str>, Option<&Credential>)> {
+        let entry = self.entries.get("llama.cpp")?;
+        let server = entry.env.as_ref()?.get("LLAMA_BASE_URL")?.as_str()?.trim();
+        if server.is_empty() {
+            return None;
+        }
+        Some((server, entry.endpoint.as_deref(), entry.key.as_ref()))
+    }
+
     fn operation_entry(&self, provider: &str, endpoint: &str, official: bool) -> Option<&SavedKey> {
         let entry = self.entries.get(provider)?;
         if provider == "cloudflare-workers-ai" && official {
