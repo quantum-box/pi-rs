@@ -4832,7 +4832,7 @@ mod tests {
             ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
-                let offset = loop {
+                let (offset, compressed) = loop {
                     let mut chunk = [0; 4096];
                     let read = socket.read(&mut chunk).await.unwrap();
                     assert!(read > 0);
@@ -4846,11 +4846,20 @@ mod tests {
                             })
                             .unwrap();
                         if bytes.len() >= pos + 4 + length {
-                            break pos + 4;
+                            break (
+                                pos + 4,
+                                headers.lines().any(|line| line == "content-encoding: zstd"),
+                            );
                         }
                     }
                 };
-                let body: Value = serde_json::from_slice(&bytes[offset..]).unwrap();
+                assert_eq!(compressed, codex);
+                let body: Value = if compressed {
+                    let decoded = zstd::bulk::decompress(&bytes[offset..], 65536).unwrap();
+                    serde_json::from_slice(&decoded).unwrap()
+                } else {
+                    serde_json::from_slice(&bytes[offset..]).unwrap()
+                };
                 let input = body["input"].as_array().unwrap();
                 assert_eq!(input[0]["role"], "user");
                 assert!(!body.to_string().contains("_pi_openai_effort"));
