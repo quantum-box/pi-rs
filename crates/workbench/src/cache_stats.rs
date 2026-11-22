@@ -82,6 +82,7 @@ impl Measurement {
                         usage,
                         &ModelMetadata {
                             cached_input_tokens: Some(prompt_tokens),
+                            catalog_cost_multiplier: metadata.catalog_cost_multiplier.clone(),
                             ..Default::default()
                         },
                     )
@@ -313,5 +314,41 @@ pub(super) fn format_tokens(tokens: u64) -> String {
         10_000..=999_999 => format!("{}k", tokens.saturating_add(500) / 1_000),
         1_000_000..=9_999_999 => format!("{:.1}M", tokens as f64 / 1_000_000.0),
         _ => format!("{}M", tokens.saturating_add(500_000) / 1_000_000),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn complete_cache_miss_uses_the_same_service_tier_for_both_rates() {
+        let profiles = Profiles::parse(&json!({"providers":{"proxy":{
+            "api":"openai-responses", "baseUrl":"https://example.com/v1",
+            "models":[{"id":"m", "cost":{"input":10, "cacheRead":2}}]
+        }}}))
+        .unwrap();
+        let metadata = ModelMetadata {
+            cached_input_tokens: Some(0),
+            catalog_cost_multiplier: serde_json::Number::from_f64(2.5),
+            ..Default::default()
+        };
+        let measurement = Measurement::new(
+            Usage {
+                input_tokens: 1_000_000,
+                output_tokens: 0,
+            },
+            &metadata,
+            Some(ResolvedModelIdentity {
+                provider: "proxy".into(),
+                model: "m".into(),
+            }),
+            None,
+            None,
+            &profiles,
+        );
+        assert!((measurement.paid_per_token * 1_000_000.0 - 25.0).abs() < 1e-10);
+        assert!((measurement.read_per_token * 1_000_000.0 - 5.0).abs() < 1e-10);
     }
 }
