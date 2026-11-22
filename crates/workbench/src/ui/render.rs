@@ -289,6 +289,7 @@ pub enum Entry {
     Image(std::sync::Arc<super::images::InlineImage>),
     Tool {
         id: String,
+        call_id: Option<String>,
         name: String,
         arguments: String,
         output: String,
@@ -5144,6 +5145,7 @@ mod tests {
             .join("\n");
         let entry = Entry::Tool {
             id: "edit-14".into(),
+            call_id: None,
             name: "edit".into(),
             arguments: r#"{"file_path":"sample.txt"}"#.into(),
             output,
@@ -5202,6 +5204,7 @@ mod tests {
         .unwrap();
         let entry = Entry::Tool {
             id: "test".into(),
+            call_id: None,
             name: "codemode".into(),
             arguments: "{}".into(),
             output: "before\n[image]\nafter".into(),
