@@ -210,6 +210,8 @@ struct ModelCompatibility {
     supports_strict_tools: Option<bool>,
     supports_max_output_tokens: Option<bool>,
     supports_mid_convo_effort: Option<bool>,
+    supports_temperature: Option<bool>,
+    supports_message_threads: Option<bool>,
     allowed_fallback_models: Option<Vec<AnthropicFallbackModel>>,
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
@@ -240,6 +242,10 @@ impl ModelCompatibility {
             supports_mid_convo_effort: newer
                 .supports_mid_convo_effort
                 .or(self.supports_mid_convo_effort),
+            supports_temperature: newer.supports_temperature.or(self.supports_temperature),
+            supports_message_threads: newer
+                .supports_message_threads
+                .or(self.supports_message_threads),
             allowed_fallback_models: newer
                 .allowed_fallback_models
                 .or(self.allowed_fallback_models),
@@ -1386,13 +1392,20 @@ impl Profiles {
                 .unwrap_or_else(|| self.endpoint(provider))
         };
         let selected_endpoint = endpoint(selected);
+        let selected_adapter = self.model_adapter(provider, selected);
+        if !matches!(
+            selected_adapter,
+            Adapter::OpenAiResponses | Adapter::CodexResponses
+        ) {
+            return BTreeSet::new();
+        }
         let mut ids = self.model_ids(provider);
         if !ids.iter().any(|id| id == selected) {
             ids.push(selected.into());
         }
         ids.into_iter()
             .filter(|id| {
-                if self.model_adapter(provider, id) != Adapter::OpenAiResponses
+                if self.model_adapter(provider, id) != selected_adapter
                     || endpoint(id) != selected_endpoint
                 {
                     return false;
@@ -1446,6 +1459,26 @@ impl Profiles {
         .collect()
     }
 
+    pub fn anthropic_thread_support(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> (Option<bool>, BTreeMap<String, bool>) {
+        let default = self
+            .cache_compatibility(provider, None)
+            .supports_message_threads;
+        let models = self
+            .anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+                self.cache_compatibility(provider, metadata)
+                    .supports_message_threads
+            })
+            .into_iter()
+            .filter_map(|(id, support)| support.map(|support| (id, support)))
+            .collect();
+        (default, models)
+    }
+
     pub fn anthropic_fallback_models(
         &self,
         provider: &Provider,
@@ -1459,6 +1492,31 @@ impl Profiles {
         })
         .into_iter()
         .filter(|(_, targets)| !targets.is_empty())
+        .collect()
+    }
+
+    pub fn anthropic_model_temperatures(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+        thinking: Option<&str>,
+    ) -> BTreeMap<String, f64> {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+            if self
+                .cache_compatibility(provider, metadata)
+                .supports_temperature
+                == Some(false)
+            {
+                return None;
+            }
+            metadata?
+                .sampling(thinking.unwrap_or("off"))
+                .get("temperature")?
+                .as_f64()
+        })
+        .into_iter()
+        .filter_map(|(model, value)| value.map(|temperature| (model, temperature)))
         .collect()
     }
 
@@ -2368,6 +2426,29 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_thread_support_follows_the_effective_model_route() {
+        let profiles = Profiles::parse(&json!({"providers":{"proxy":{
+            "api":"anthropic-messages",
+            "baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMessageThreads":true},
+            "models":[
+                {"id":"selected","compat":{"supportsMessageThreads":false}},
+                {"id":"rewritten"},
+                {"id":"other-route","baseUrl":"http://localhost:2/v1"}
+            ]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("proxy").unwrap();
+        assert_eq!(
+            profiles.anthropic_thread_support(&provider, "selected", None),
+            (
+                Some(true),
+                BTreeMap::from([("selected".into(), false), ("rewritten".into(), true)])
+            )
+        );
+    }
+
+    #[test]
     fn anthropic_fallback_targets_match_pi_and_respect_model_overrides() {
         let profiles = Profiles::default();
         let provider = Provider::Anthropic;
@@ -2713,6 +2794,60 @@ mod tests {
     }
 
     #[test]
+    fn direct_anthropic_models_honor_temperature_capability() {
+        let unsupported = [
+            "claude-haiku-5-5",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+        ];
+        let overrides: serde_json::Map<String, Value> = unsupported
+            .into_iter()
+            .chain(["claude-haiku-4-5"])
+            .map(|id| (id.into(), json!({"samplingParams":{"temperature":0.25}})))
+            .collect();
+        let profiles = Profiles::parse(&json!({"providers":{"anthropic":{
+            "modelOverrides": overrides
+        }}}))
+        .unwrap();
+        let provider = Provider::Anthropic;
+        let temperatures =
+            profiles.anthropic_model_temperatures(&provider, "claude-haiku-4-5", None, None);
+        assert_eq!(
+            temperatures,
+            BTreeMap::from([("claude-haiku-4-5".into(), 0.25)])
+        );
+    }
+
+    #[test]
+    fn vercel_gateway_temperatures_respect_model_capability_and_thinking_overrides() {
+        let profiles = Profiles::parse(&json!({"providers":{"vercel-ai-gateway":{
+            "modelOverrides":{
+                "anthropic/claude-sonnet-5":{"samplingParams":{"temperature":0.4}},
+                "anthropic/claude-sonnet-4.6":{
+                    "samplingParams":{"temperature":0.3},
+                    "samplingParamsByThinkingLevel":{"off":{"temperature":0.2}}
+                }
+            }
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("vercel-ai-gateway").unwrap();
+        let temperatures = profiles.anthropic_model_temperatures(
+            &provider,
+            "anthropic/claude-sonnet-4.6",
+            None,
+            Some("off"),
+        );
+        assert_eq!(
+            temperatures,
+            BTreeMap::from([("anthropic/claude-sonnet-4.6".into(), 0.2)])
+        );
+    }
+
+    #[test]
     fn anthropic_tool_input_streaming_uses_the_selected_model_configuration() {
         let profiles = Profiles::parse(&json!({"providers":{"fireworks":{"modelOverrides":{
             "accounts/fireworks/models/deepseek-v4p1-flash":{"compat":{"supportsEagerToolInputStreaming":true}}
@@ -2778,7 +2913,13 @@ mod tests {
             builtin_chat::find(provider.id()).unwrap().env(),
             "AI_GATEWAY_API_KEY"
         );
-        assert_eq!(profiles.model_ids(&provider).len(), 303);
+        assert_eq!(profiles.model_ids(&provider).len(), 305);
+        assert!(profiles.model(&provider, "alibaba/qwen-3-235b").is_none());
+        let model = profiles
+            .model(&provider, "anthropic/claude-fable-5.2")
+            .unwrap();
+        assert_eq!(model.adaptive_thinking(), Some(true));
+        assert_eq!(model.mapped_effort("off"), Some(None));
         let model = profiles
             .model(&provider, "anthropic/claude-sonnet-4.6")
             .unwrap();
@@ -3154,7 +3295,16 @@ mod tests {
         let provider = Provider::named("openai-codex").unwrap();
         let (_, codex) =
             profiles.responses_mid_conversation_system_policy(&provider, "gpt-6.1-sol", None);
-        assert_eq!(codex.len(), 8);
+        assert_eq!(codex.get("gpt-6.2-astra"), Some(&true));
+        assert_eq!(codex.get("gpt-6.2-sol"), Some(&true));
+        assert_eq!(
+            codex,
+            profiles
+                .model_ids(&provider)
+                .into_iter()
+                .map(|id| (id, true))
+                .collect::<BTreeMap<_, _>>()
+        );
 
         let profiles = Profiles::parse(&json!({"providers":{"fixture":{
             "api":"openai-responses","baseUrl":"http://localhost:1/v1",
@@ -3188,9 +3338,17 @@ mod tests {
         let profiles = Profiles::default();
         let openai = Provider::named("openai").unwrap();
         let native = profiles.responses_effort_models(&openai, "gpt-6-luna", None);
-        assert_eq!(native.len(), 5);
+        assert_eq!(native.len(), 7);
         assert!(native.contains("gpt-6-luna"));
+        assert!(native.contains("gpt-6.2-sol"));
         assert!(!native.contains("gpt-5.4"));
+        let codex = Provider::named("openai-codex").unwrap();
+        let native = profiles.responses_effort_models(&codex, "gpt-6-luna", None);
+        assert_eq!(native.len(), 7);
+        assert!(native.contains("gpt-6.2-astra"));
+        assert!(!native.contains("gpt-5.6-sol"));
+        assert_eq!(profiles.model_ids(&codex).len(), 10);
+        assert_eq!(profiles.model_ids(&openai).len(), 47);
 
         let profiles = Profiles::parse(&json!({"providers":{"fixture":{
             "api":"openai-responses","baseUrl":"http://localhost:1/v1",
