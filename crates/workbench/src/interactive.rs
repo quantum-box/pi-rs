@@ -137,6 +137,56 @@ struct Terminal {
     appearance_notifications: bool,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
+    #[cfg(unix)]
+    _suspend_signal: Option<SuspendSignal>,
+}
+
+#[cfg(unix)]
+static SUSPEND_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+static TERMINAL_SIGNAL_WRITER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(unix)]
+extern "C" fn request_terminal_suspend(_: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    SUSPEND_REQUESTED.store(true, Ordering::Relaxed);
+    let fd = TERMINAL_SIGNAL_WRITER.load(Ordering::Relaxed);
+    // The signal registry keeps the nonblocking writer alive for the process.
+    if fd >= 0 {
+        let wake = [b'S'];
+        unsafe { libc::write(fd, wake.as_ptr().cast(), wake.len()) };
+    }
+}
+
+#[cfg(unix)]
+struct SuspendSignal(libc::sigaction);
+
+#[cfg(unix)]
+impl SuspendSignal {
+    fn install() -> std::io::Result<Self> {
+        // Restore the previous disposition when relinquishing the terminal.
+        // In particular, the editor and Ctrl+Z must still stop the job.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = request_terminal_suspend as *const () as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            let mut previous = std::mem::MaybeUninit::uninit();
+            if libc::sigaction(libc::SIGTSTP, &action, previous.as_mut_ptr()) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self(previous.assume_init()))
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SuspendSignal {
+    fn drop(&mut self) {
+        unsafe { libc::sigaction(libc::SIGTSTP, &self.0, std::ptr::null_mut()) };
+        SUSPEND_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(unix)]
@@ -182,6 +232,8 @@ impl Terminal {
         #[cfg(any(unix, windows))] previous_colors: Option<ColorQueries>,
         #[cfg(any(unix, windows))] auto_appearance: bool,
     ) -> Result<Self> {
+        #[cfg(unix)]
+        let suspend_signal = SuspendSignal::install()?;
         terminal::enable_raw_mode()?;
         #[cfg(any(unix, windows))]
         let initial_colors = previous_colors.is_none();
@@ -195,6 +247,8 @@ impl Terminal {
             appearance_notifications: false,
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
+            #[cfg(unix)]
+            _suspend_signal: Some(suspend_signal),
         };
         if guard.alternate {
             execute!(
@@ -780,13 +834,14 @@ fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Resul
 
     let (mut reader, writer) = std::os::unix::net::UnixStream::pair()?;
     writer.set_nonblocking(true)?;
+    let signal_fd = writer.as_raw_fd();
     // Capture the editor state in the signal handler, not later on the reader
     // thread. write(2) is async-signal-safe and the stream stays registered
     // for the lifetime of the process.
     let id = unsafe {
         signal_hook_registry::register(libc::SIGINT, move || {
             if !EXTERNAL_EDITOR_ACTIVE.load(Ordering::SeqCst) {
-                let byte = [1_u8];
+                let byte = [b'I'];
                 libc::write(writer.as_raw_fd(), byte.as_ptr().cast(), byte.len());
             }
             #[cfg(test)]
@@ -804,8 +859,10 @@ fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Resul
                 }
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
-                    Ok(_) => {
-                        super::process::TERMINAL_INTERRUPTED.store(true, Ordering::SeqCst);
+                    Ok(count) => {
+                        if buffer[..count].contains(&b'I') {
+                            super::process::TERMINAL_INTERRUPTED.store(true, Ordering::SeqCst);
+                        }
                         notify.notify_one();
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -817,6 +874,7 @@ fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Resul
         signal_hook_registry::unregister(id);
         return Err(error.into());
     }
+    TERMINAL_SIGNAL_WRITER.store(signal_fd, Ordering::Relaxed);
     super::process::TERMINAL_SIGNAL_ENABLED.store(true, Ordering::SeqCst);
     Ok(())
 }
@@ -3008,6 +3066,27 @@ impl View {
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn suspend_terminal(
+        &mut self,
+        terminal: &mut Option<Terminal>,
+        mode: Option<TuiMode>,
+    ) -> Result<()> {
+        if mode == Some(TuiMode::Regular) {
+            self.finish_regular()?;
+        }
+        if let Err(error) = Terminal::suspend(terminal, mode, self.graphics.cleanup()) {
+            self.append(&error.to_string());
+        }
+        if self.graphics.enabled() {
+            images::query_cell_size()?;
+        }
+        self.graphics.reset();
+        self.regular.redraw = true;
+        self.regular.started = false;
+        Ok(())
+    }
+
     fn transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions {
         TranscriptOptions {
             image_width: (self.graphics.enabled() && args.settings.show_terminal_images())
@@ -4569,6 +4648,13 @@ pub(super) async fn run(
         if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
             interrupted = true;
             break 'interactive;
+        }
+        #[cfg(unix)]
+        if SUSPEND_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
+            && _terminal.is_some()
+        {
+            view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+            dirty = true;
         }
         #[cfg(any(unix, windows))]
         if let Some(terminal) = &mut _terminal {
@@ -6187,24 +6273,7 @@ pub(super) async fn run(
                 match action {
                     "app.suspend" => {
                         #[cfg(unix)]
-                        {
-                            if args.tui_mode == Some(TuiMode::Regular) {
-                                view.finish_regular()?;
-                            }
-                            if let Err(error) = Terminal::suspend(
-                                &mut _terminal,
-                                args.tui_mode,
-                                view.graphics.cleanup(),
-                            ) {
-                                view.append(&error.to_string());
-                            }
-                            if view.graphics.enabled() {
-                                images::query_cell_size()?;
-                            }
-                            view.graphics.reset();
-                            view.regular.redraw = true;
-                            view.regular.started = false;
-                        }
+                        view.suspend_terminal(&mut _terminal, args.tui_mode)?;
                         #[cfg(not(unix))]
                         view.append("Suspending the terminal is unavailable on this platform");
                     }
@@ -6484,9 +6553,24 @@ pub(super) async fn run(
                                 Some(AuthReload::start(args.model_keys.revision().to_owned()));
                             view.append("Reloading provider credentials (Esc to cancel)");
                             args.reload_model_profiles()?;
-                            tokio::select! {
-                                result = super::packages::prepare(&args) => result?,
-                                _ = terminal_signal.notified() => { interrupted = true; break 'interactive; },
+                            {
+                                let preparation = super::packages::prepare(&args);
+                                tokio::pin!(preparation);
+                                loop {
+                                    tokio::select! {
+                                        result = &mut preparation => break result?,
+                                        _ = terminal_signal.notified() => {
+                                            if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+                                                interrupted = true;
+                                                break 'interactive;
+                                            }
+                                            #[cfg(unix)]
+                                            if SUSPEND_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                                                view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+                                            }
+                                        },
+                                    }
+                                }
                             }
                             view.resources = super::resources::Resources::load(&args)?;
                             args.theme_paths = view.resources.themes.clone();
@@ -13106,6 +13190,8 @@ exit {exit}
             appearance_notifications: false,
             #[cfg(unix)]
             keyboard: super::KeyboardProtocol::Disabled,
+            #[cfg(unix)]
+            _suspend_signal: None,
         };
         drop(guard);
         theme = super::Theme::system();
