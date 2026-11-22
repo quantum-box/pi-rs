@@ -961,6 +961,12 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
 
 #[test]
 fn autocomplete_settings_cycle_starts_at_first_preset_for_custom_value() {
+    for mode in ["regular", "fullscreen"] {
+        exercise_autocomplete_and_settings(mode);
+    }
+}
+
+fn exercise_autocomplete_and_settings(mode: &str) {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -1011,7 +1017,7 @@ fn autocomplete_settings_cycle_starts_at_first_preset_for_custom_value() {
                 "--model",
                 "fixture",
                 "--tui-mode",
-                "fullscreen",
+                mode,
             ])
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
@@ -1020,7 +1026,29 @@ fn autocomplete_settings_cycle_starts_at_first_preset_for_custom_value() {
             .unwrap(),
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
-    master.write_all(b"/settings\r").unwrap();
+    for name in ["sample-a", "sample-b"] {
+        std::fs::File::create(root.path().join(name)).unwrap();
+    }
+    let file_draft = format!("look at {}/sample-\t", root.path().display());
+    master.write_all(file_draft.as_bytes()).unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Autocomplete") && text.contains("sample-b")
+    });
+    master.write_all(b"\r-draft").unwrap();
+    output_until(&mut master, |text| text.contains("sample-a-draft"));
+
+    master.write_all(b"\x15/se\t").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Autocomplete") && text.contains("/settings")
+    });
+    master.write_all(b"\x1b[B\t suffix").unwrap();
+    output_until(&mut master, |text| text.contains("/settings suffix"));
+
+    master.write_all(b"\x15/se\t").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Autocomplete") && text.contains("/settings")
+    });
+    master.write_all(b"\x1b[B\r").unwrap();
     output_until(&mut master, |text| text.contains("Auto-compact"));
     master.write_all(b"Autocomplete max items\r").unwrap();
     output_until(&mut master, |text| {
