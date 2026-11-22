@@ -56,7 +56,9 @@ pub use mcp_registration::{McpRegistryHost, McpServerDeclaration, RegisteredMcpS
 pub use model_catalog::*;
 pub use model_price::ChatPrice;
 pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};
-pub use provider_response::{ProviderResponseEvent, observe_provider_response};
+pub use provider_response::{
+    ProviderResponseEvent, observe_provider_response, observes_provider_response,
+};
 pub use provider_retry::ProviderRetry;
 pub use resource::Resource;
 pub use retry::*;
