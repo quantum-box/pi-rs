@@ -1465,6 +1465,21 @@ impl Profiles {
         })
     }
 
+    pub fn anthropic_mid_conversation_system_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> BTreeSet<String> {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+            self.chat_compatibility(provider, metadata)
+                .supports_mid_conversation_system_messages()
+        })
+        .into_iter()
+        .filter_map(|(id, supported)| supported.then_some(id))
+        .collect()
+    }
+
     pub fn anthropic_managed_effort_models(
         &self,
         provider: &Provider,
@@ -2436,6 +2451,52 @@ mod tests {
             assert_eq!(explicit.get(rewritten), Some(&expected));
             assert!(!explicit.contains_key("other-api"));
         }
+    }
+
+    #[test]
+    fn anthropic_system_update_policy_follows_the_final_model_on_the_selected_route() {
+        let profiles = Profiles::parse(&json!({"providers":{"proxy":{
+            "api":"anthropic-messages", "baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMidConvoSystemMessages":true},
+            "models":[
+                {"id":"enabled"},
+                {"id":"disabled","compat":{"supportsMidConvoSystemMessages":false}},
+                {"id":"other-endpoint","baseUrl":"http://localhost:2/v1"},
+                {"id":"other-api","api":"openai-completions"}
+            ]
+        }}}))
+        .unwrap();
+        let proxy = profiles.provider("proxy").unwrap();
+        assert_eq!(
+            profiles.anthropic_mid_conversation_system_models(&proxy, "selected", None),
+            BTreeSet::from(["enabled".into(), "selected".into()])
+        );
+        assert_eq!(
+            profiles.anthropic_mid_conversation_system_models(
+                &proxy,
+                "selected",
+                Some("http://localhost:3/v1/messages"),
+            ),
+            BTreeSet::from(["enabled".into(), "other-endpoint".into(), "selected".into()])
+        );
+
+        let provider = Provider::Anthropic;
+        let default = Profiles::default();
+        let native =
+            default.anthropic_mid_conversation_system_models(&provider, "claude-opus-4-8", None);
+        assert_eq!(
+            native,
+            BTreeSet::from([
+                "claude-fable-5".into(),
+                "claude-fable-5-1".into(),
+                "claude-fable-5-2".into(),
+                "claude-haiku-5-5".into(),
+                "claude-opus-4-8".into(),
+                "claude-opus-5".into(),
+                "claude-opus-5-5".into(),
+                "claude-sonnet-5-5".into(),
+            ])
+        );
     }
 
     #[test]

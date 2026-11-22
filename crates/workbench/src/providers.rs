@@ -1260,6 +1260,14 @@ impl Client {
                         &args.model,
                         args.explicit_endpoint_for(&args.provider),
                     ))
+                    .with_mid_conversation_system_models(
+                        args.model_profiles
+                            .anthropic_mid_conversation_system_models(
+                                &args.provider,
+                                &args.model,
+                                args.explicit_endpoint_for(&args.provider),
+                            ),
+                    )
                     .with_managed_effort_models(
                         args.model_profiles.anthropic_managed_effort_models(
                             &args.provider,
