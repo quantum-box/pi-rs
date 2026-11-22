@@ -566,6 +566,78 @@ fn mcp_add_saves_stdio_and_http_options() {
 }
 
 #[test]
+fn mcp_config_writes_validate_urls_and_report_the_removal_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("agent");
+    let global = home.join("mcp.json");
+    let project = root.path().join(".pi/mcp.json");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &[
+            "mcp",
+            "add",
+            "global",
+            "--url",
+            "https://example.invalid/mcp?tenant=fixture",
+        ][..],
+        &[
+            "mcp",
+            "add",
+            "local",
+            "--url",
+            "http://127.0.0.1:1/mcp",
+            "--local",
+        ][..],
+    ] {
+        let output = run(args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let old_global = std::fs::read(&global).unwrap();
+    let old_project = std::fs::read(&project).unwrap();
+    for url in [
+        "not a URL",
+        "ftp://example.invalid/mcp",
+        "http://example.invalid/mcp",
+        "https://account:fixture-secret@example.invalid/mcp",
+    ] {
+        let result = run(&["mcp", "add", "global", "--url", url]);
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success());
+        assert!(error.contains("MCP URL"), "{error}");
+        assert!(!error.contains("fixture-secret"));
+    }
+    let result = run(&["mcp", "remove", "local"]);
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(
+        error.contains("No global MCP server named \"local\"") && error.contains("use --local"),
+        "{error}"
+    );
+    let result = run(&["mcp", "remove", "--local", "global"]);
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(
+        error.contains("No project MCP server named \"global\"") && error.contains("omit --local"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&global).unwrap(), old_global);
+    assert_eq!(std::fs::read(&project).unwrap(), old_project);
+    assert!(run(&["mcp", "remove", "--local", "local"]).status.success());
+    assert!(run(&["mcp", "remove", "global"]).status.success());
+}
+
+#[test]
 fn startup_fork_preserves_inert_sibling_history() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source.jsonl");
@@ -7785,6 +7857,82 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
 }
 
 #[test]
+fn bare_model_patterns_search_provider_catalogs_before_local_model_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    let models = json!({"providers":{
+        "relay-one":{"api":"openai-completions","baseUrl":"https://one.example/v1","apiKey":"fixture",
+            "models":[{"id":"widget-a","name":"Widget Alpha"},{"id":"widget-z-20260101","name":"Widget Snapshot"},
+                {"id":"crystal-a","name":"Crystal"},{"id":"crystal-z","name":"Crystal Next"}]},
+        "relay-two":{"api":"openai-completions","baseUrl":"https://two.example/v1",
+            "models":[{"id":"widget-z","name":"Widget Pro"},{"id":"widget-a","name":"Widget Alpha"}]}
+    }});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    let run = |query: &str, inline: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_pi"));
+        cmd.current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--mode",
+                "rpc",
+                "--no-session",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                query,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if inline {
+            cmd.args(["--api-key", "inline-fixture"]);
+        }
+        let mut process = cmd.spawn().unwrap();
+        if let Err(error) = process
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n")
+        {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+        process.wait_with_output().unwrap()
+    };
+    for (query, inline, provider, model) in [
+        ("Widget", false, "relay-one", "widget-a"),
+        ("Widget:high", false, "relay-one", "widget-a"),
+        ("Widget", true, "relay-two", "widget-z"),
+        ("widget-z-20260101", false, "relay-one", "widget-z-20260101"),
+        ("Widget Pro", false, "relay-two", "widget-z"),
+        ("Crystal", false, "relay-one", "crystal-z"),
+        ("relay-one/Crystal", false, "relay-one", "crystal-a"),
+    ] {
+        let result = run(query, inline);
+        assert!(
+            result.status.success(),
+            "{query}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output = String::from_utf8(result.stdout).unwrap();
+        let response: Value = output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|reply| reply["id"] == "state")
+            .unwrap();
+        assert_eq!(response["data"]["model"]["provider"], provider, "{query}");
+        assert_eq!(response["data"]["model"]["id"], model, "{query}");
+    }
+    let ambiguous = run("Widget Alpha", true);
+    assert!(!ambiguous.status.success());
+    let stderr = String::from_utf8(ambiguous.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "relay-one/widget-a, relay-two/widget-a. --api-key does not choose a provider."
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn default_model_and_provider_are_read_as_separate_fields() {
     for (settings, provider, model) in [
         (
@@ -7832,6 +7980,45 @@ fn default_model_and_provider_are_read_as_separate_fields() {
         let after = events.iter().find(|event| event["id"] == "after").unwrap();
         assert_eq!(after["data"]["model"]["provider"], provider);
         assert_eq!(after["data"]["model"]["id"], model);
+    }
+}
+
+#[test]
+fn selected_builtin_provider_uses_its_pi_default_without_a_model() {
+    for (settings, provider_args) in [
+        (json!({}), vec!["--provider", "google"]),
+        (json!({"defaultProvider":"google"}), vec![]),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("settings.json"), settings.to_string()).unwrap();
+        let mut process = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("GEMINI_API_KEY", "fixture")
+            .args(["--mode", "rpc", "--no-session", "--no-mcp", "--offline"])
+            .args(provider_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
+        let output = process.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for id in ["state", "after"] {
+            let event = events.iter().find(|event| event["id"] == id).unwrap();
+            assert_eq!(event["data"]["model"]["provider"], "google");
+            assert_eq!(event["data"]["model"]["id"], "gemini-4-argon");
+        }
     }
 }
 
@@ -8640,6 +8827,74 @@ fn kimi_auth_commands_wait_for_refresh_after_sigint() {
     }
 }
 
+#[test]
+fn auth_check_with_model_uses_catalog_resolution_without_crossing_endpoints() {
+    let root = tempfile::tempdir().unwrap();
+    let models = json!({"providers":{
+        "relay-one":{"api":"openai-completions","baseUrl":"https://one.example/v1","apiKey":"fixture-one",
+            "models":[{"id":"widget-a","name":"Widget Alpha"},{"id":"widget-b","baseUrl":"https://other.example/v1"}]},
+        "relay-two":{"api":"openai-completions","baseUrl":"https://two.example/v1",
+            "models":[{"id":"widget-z","name":"Widget Pro"},{"id":"widget-a","name":"Widget Alpha"},{"id":"relay-one/local-only"}]}
+    }});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    for (model, code, provider, status, reason) in [
+        ("relay-one/Widget Alpha", 0, "relay-one", "ready", None),
+        ("relay-one/local-only", 0, "relay-one", "ready", None),
+        (
+            "Widget Alpha",
+            2,
+            "Widget Alpha",
+            "invalid",
+            Some("invalid_state"),
+        ),
+        (
+            "Widget:high",
+            1,
+            "relay-two",
+            "not_ready",
+            Some("credentials_not_configured"),
+        ),
+        (
+            "Widget Pro",
+            1,
+            "relay-two",
+            "not_ready",
+            Some("credentials_not_configured"),
+        ),
+        (
+            "relay-one/widget-b",
+            1,
+            "relay-one",
+            "not_ready",
+            Some("credentials_not_configured"),
+        ),
+        (
+            "unknown-local-catalog-id",
+            2,
+            "unknown-local-catalog-id",
+            "invalid",
+            Some("invalid_state"),
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["auth", "check", "--model", model, "--json", "--no-refresh"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{model}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["provider"], provider);
+        assert_eq!(response["status"], status);
+        assert_eq!(response["reason"].as_str(), reason);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn auth_check_reads_readonly_store_and_environment_keys() {
@@ -9221,6 +9476,206 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         Some(130),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn auth_logout_resolves_provider_names_and_preserves_other_credential_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("models.json");
+    let models = json!({"providers":{"example-lab":{
+        "name":"Example Lab", "api":"openai-completions",
+        "baseUrl":"https://example.test/v1", "apiKey":"configured-fixture",
+        "models":[{"id":"chat"}]
+    }}})
+    .to_string();
+    std::fs::write(&config, &models).unwrap();
+    let auth = root.path().join("auth.json");
+    let oauth =
+        json!({"type":"oauth", "access":"test-access", "refresh":"test-refresh", "expires":1});
+    let original = json!({
+        "example-lab":{"type":"api_key", "key":"saved-fixture", "endpoint":"https://example.test/v1/chat/completions"},
+        "extension-oauth":oauth,
+        "unrelated":{"type":"api_key", "key":"retained-fixture"}
+    });
+    std::fs::write(&auth, original.to_string()).unwrap();
+    let logout = |provider: &str| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["auth", "logout", provider])
+            .output()
+            .unwrap()
+    };
+    let output = logout("  eXaMpLe LAB  ");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Removed stored API key for Example Lab. Environment variables and models.json config are unchanged."
+    );
+    let output = logout("extension-oauth");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Logged out of extension-oauth."
+    );
+    let after = std::fs::read_to_string(&auth).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&after).unwrap(),
+        json!({"unrelated":original["unrelated"]})
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), models);
+
+    let output = logout("Google Vertex AI");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .starts_with("No stored credentials for Google Vertex AI.")
+    );
+    let output = logout("missing");
+    assert_eq!(output.status.code(), Some(1));
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostic.contains("Unknown provider \"missing\".\n"));
+    assert!(diagnostic.contains("Stored credentials: unrelated"));
+    assert_eq!(std::fs::read_to_string(&auth).unwrap(), after);
+}
+
+#[test]
+fn auth_logout_prioritizes_exact_stored_ids_and_works_with_invalid_model_config() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("models.json");
+    std::fs::write(
+        &config,
+        json!({"providers":{"relay":{
+            "name":"extension-oauth", "api":"openai-completions",
+            "baseUrl":"https://example.test/v1", "models":[{"id":"chat"}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let auth = root.path().join("auth.json");
+    let relay = json!({"type":"api_key", "key":"relay-key"});
+    let source = json!({"extension-oauth":{"type":"oauth"}, "relay":relay});
+    std::fs::write(&auth, source.to_string()).unwrap();
+    let logout = |id: &str| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["auth", "logout", id])
+            .output()
+            .unwrap()
+    };
+    let output = logout("extension-oauth");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&auth).unwrap()).unwrap(),
+        json!({"relay":relay})
+    );
+    std::fs::write(&config, "{").unwrap();
+    let output = logout("relay");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&auth).unwrap()).unwrap(),
+        json!({})
+    );
+}
+
+#[test]
+fn auth_logout_removes_unusable_oauth_for_the_selected_local_provider() {
+    let root = tempfile::tempdir().unwrap();
+    let auth = root.path().join("auth.json");
+    std::fs::write(
+        &auth,
+        json!({
+            "openai-chatgpt":{"type":"oauth", "credential":{"client_id":"broken-client"}},
+            "radius":{"type":"oauth", "gateway":"https://configured-gateway.example.test/"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let sessions = root.path().join("chatgpt-sessions.json");
+    std::fs::write(
+        &sessions,
+        json!({"broken-client":{}, "other-client":{}}).to_string(),
+    )
+    .unwrap();
+    for provider in ["openai-chatgpt", "radius"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env(
+                "PI_RADIUS_GATEWAY",
+                "https://configured-gateway.example.test/",
+            )
+            .args(["auth", "logout", provider])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&auth).unwrap()).unwrap(),
+        json!({})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&sessions).unwrap()).unwrap(),
+        json!({"other-client":{}})
+    );
+}
+
+#[test]
+fn auth_logout_keeps_radius_credentials_for_a_different_gateway() {
+    let root = tempfile::tempdir().unwrap();
+    let auth = root.path().join("auth.json");
+    let original = json!({"radius":{
+        "type":"oauth", "access":"test-access", "refresh":"test-refresh", "expires":1,
+        "gateway":"https://other-gateway.example.test/"
+    }});
+    std::fs::write(&auth, original.to_string()).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .env(
+            "PI_RADIUS_GATEWAY",
+            "https://configured-gateway.example.test/",
+        )
+        .args(["auth", "logout", "radius"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).starts_with("No stored credentials for Radius.")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&auth).unwrap()).unwrap(),
+        original
     );
 }
 
