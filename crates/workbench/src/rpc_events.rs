@@ -14,7 +14,7 @@ use super::Cli;
 
 #[derive(Default)]
 pub(super) struct Stream {
-    pub messages: Vec<Value>,
+    messages: Vec<Value>,
     assistant: Value,
     request_id: Option<Uuid>,
     started: bool,
@@ -31,6 +31,17 @@ pub(super) struct Stream {
     text_items: HashMap<u64, (usize, bool)>,
     aborted: bool,
     summary: bool,
+    retryable_failure: bool,
+    retry_attempt: RetryAttempt,
+    retry_end: Option<Value>,
+}
+
+#[derive(Default, PartialEq)]
+enum RetryAttempt {
+    #[default]
+    Initial,
+    Waiting,
+    Resumed,
 }
 
 struct PendingTool {
@@ -76,6 +87,10 @@ impl Stream {
             Some("summary_request_start") => {
                 self.finish_turn(&mut events);
                 self.summary = true;
+                self.retryable_failure = false;
+            }
+            Some("auto_retry_start" | "auto_retry_end") => {
+                self.retry(event.clone(), &mut events);
             }
             Some("record") => {
                 if let Ok(record) = Record::deserialize(&event["record"]) {
@@ -156,6 +171,13 @@ impl Stream {
             Notification::SummaryRequest => {
                 self.finish_turn(&mut events);
                 self.summary = true;
+                self.retryable_failure = false;
+            }
+            Notification::Retry(event) => {
+                self.retry(
+                    serde_json::to_value(event).expect("retry event"),
+                    &mut events,
+                );
             }
             Notification::Committed(record) => {
                 if let Event::ToolFinished { operation_id, .. } = &record.event
@@ -214,7 +236,25 @@ impl Stream {
         Some(event)
     }
 
-    pub fn settle(&mut self, aborted: bool) -> Vec<Value> {
+    fn retry(&mut self, event: Value, events: &mut Vec<Value>) {
+        if event["type"] == "auto_retry_start" && std::mem::take(&mut self.retryable_failure) {
+            events.push(self.agent_end(false, true));
+            self.retry_attempt = RetryAttempt::Waiting;
+        } else if event["type"] == "auto_retry_end" && self.retry_attempt == RetryAttempt::Resumed {
+            // A resumed attempt reports recovery after message_end and reports
+            // exhaustion after its terminal agent_end.
+            self.retry_end = Some(event);
+            return;
+        }
+        events.push(event);
+    }
+
+    fn agent_end(&mut self, success: bool, will_retry: bool) -> Value {
+        let messages = std::mem::take(&mut self.messages);
+        json!({"type":"agent_end","success":success,"messages":messages,"willRetry":will_retry})
+    }
+
+    pub fn settle(&mut self, aborted: bool, success: bool) -> Vec<Value> {
         self.aborted |= aborted;
         let mut events = Vec::new();
         if !self.assistant.is_null() && !self.ended {
@@ -227,6 +267,11 @@ impl Stream {
             self.finish_message(None, &mut events);
         }
         self.finish_turn(&mut events);
+        // A retry cancelled during the wait has already ended its last attempt.
+        if self.retry_attempt != RetryAttempt::Waiting {
+            events.push(self.agent_end(success, false));
+        }
+        events.extend(self.retry_end.take());
         events
     }
 
@@ -248,6 +293,7 @@ impl Stream {
                 // Pi emits a turn for every assistant response and tool batch.
                 self.finish_turn(events);
                 self.begin_turn(events);
+                self.retryable_failure = false;
                 self.started = false;
                 self.ended = false;
                 self.request_id = request_id;
@@ -272,6 +318,7 @@ impl Stream {
                 if let Some(failure) = failure
                     && !self.assistant.is_null()
                 {
+                    self.retryable_failure = failure == ModelFailure::Retryable;
                     self.aborted |= failure == ModelFailure::Cancelled;
                     self.assistant["stopReason"] =
                         json!(if self.aborted { "aborted" } else { "error" });
@@ -383,6 +430,14 @@ impl Stream {
                         });
                 }
                 self.finish_message(Some(content), events);
+                if self
+                    .retry_end
+                    .as_ref()
+                    .is_some_and(|event| event["success"] == true)
+                {
+                    events.extend(self.retry_end.take());
+                    self.retry_attempt = RetryAttempt::Initial;
+                }
             }
             Event::ToolPlanned {
                 invocation,
@@ -456,6 +511,10 @@ impl Stream {
     }
 
     fn begin_turn(&mut self, events: &mut Vec<Value>) {
+        if self.retry_attempt == RetryAttempt::Waiting {
+            self.retry_attempt = RetryAttempt::Resumed;
+            events.push(json!({"type":"agent_start"}));
+        }
         if !self.turn {
             self.turn = true;
             events.push(json!({"type":"turn_start"}));
@@ -914,6 +973,60 @@ pub(super) fn tool_event_result_value(
     result
 }
 
+pub(super) fn auto_compaction_value(
+    reason: pi_rs::CompactionTrigger,
+    update: &pi_rs::AutoCompactionUpdate,
+) -> Value {
+    use pi_rs::AutoCompactionUpdate;
+
+    match update {
+        AutoCompactionUpdate::Started => json!({"type":"compaction_start","reason":reason}),
+        AutoCompactionUpdate::Completed {
+            compaction_entry,
+            details,
+            estimated_tokens_after,
+            will_retry,
+        } => {
+            let Event::Compacted {
+                summary,
+                retain_from,
+                tokens_before,
+                usage,
+                usage_metadata,
+                ..
+            } = &compaction_entry.event
+            else {
+                unreachable!("completed automatic compaction must have a compaction record");
+            };
+            let mut result = json!({
+                "summary":summary,
+                "firstKeptEntryId":retain_from.unwrap_or(compaction_entry.id).to_string(),
+                "tokensBefore":tokens_before.unwrap_or_default(),
+                "estimatedTokensAfter":estimated_tokens_after,
+            });
+            if let Some(usage) = usage {
+                let metadata = usage_metadata.as_ref().map(|usage| &usage.metadata);
+                result["usage"] =
+                    usage_value(*usage, metadata.unwrap_or(&ModelMetadata::default()));
+            }
+            if let Some(details) = details {
+                result["details"] = details.clone();
+            }
+            json!({"type":"compaction_end","reason":reason,"aborted":false,"willRetry":will_retry,"result":result})
+        }
+        AutoCompactionUpdate::Failed {
+            aborted,
+            error_message,
+        } => {
+            let mut event = json!({"type":"compaction_end","reason":reason,"aborted":aborted,"willRetry":false});
+            if let Some(error_message) = error_message {
+                event["errorMessage"] = json!(error_message);
+            }
+            event
+        }
+    }
+}
+
 pub(super) fn usage_value(usage: Usage, metadata: &ModelMetadata) -> Value {
     let read = metadata.cached_input_tokens.unwrap_or_default();
     let write = metadata.cache_creation_input_tokens.unwrap_or_default();
@@ -1029,6 +1142,26 @@ mod streaming_tool_tests {
         );
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["type"], "tool_execution_start");
+    }
+
+    #[test]
+    fn automatic_compaction_uses_pi_16_event_names() {
+        use pi_rs::{AutoCompactionUpdate, CompactionTrigger};
+
+        assert_eq!(
+            auto_compaction_value(CompactionTrigger::Threshold, &AutoCompactionUpdate::Started),
+            json!({"type":"compaction_start","reason":"threshold"})
+        );
+        assert_eq!(
+            auto_compaction_value(
+                CompactionTrigger::Overflow,
+                &AutoCompactionUpdate::Failed {
+                    aborted: true,
+                    error_message: None
+                },
+            ),
+            json!({"type":"compaction_end","reason":"overflow","aborted":true,"willRetry":false})
+        );
     }
 
     #[test]
@@ -1199,7 +1332,7 @@ mod streaming_tool_tests {
             &json!({"type":"reasoning_item_start", "index":4, "redacted":true}),
             &args,
         );
-        let events = stream.settle(true);
+        let events = stream.settle(true, false);
         let end = events
             .iter()
             .filter_map(|event| event.get("assistantMessageEvent"))

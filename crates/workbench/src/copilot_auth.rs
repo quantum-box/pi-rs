@@ -743,7 +743,11 @@ mod tests {
         let claude = profile.model(&provider, "claude-fable-5.2").unwrap();
         assert!(profile.anthropic_strict_tool_support(&provider, Some(&claude)));
         let gpt = profile.model(&provider, "gpt-6.2-sol").unwrap();
-        assert!(profile.responses_strict_tool_support(&provider, Some(&gpt)));
+        assert!(profile.responses_strict_tool_support(
+            &provider,
+            crate::providers::Adapter::OpenAiResponses,
+            Some(&gpt)
+        ));
         let keys = Keys::parse(&json!({"github-copilot": {
             "type":"oauth","access":"fixture","refresh":"refresh-fixture","expires":1,
         }}));
