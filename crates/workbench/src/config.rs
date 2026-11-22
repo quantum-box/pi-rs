@@ -623,11 +623,16 @@ fn read_settings_layer(
         .and_then(|parent| parent.canonicalize().ok())
         .and_then(|parent| absolute.file_name().map(|name| parent.join(name)))
         .unwrap_or(absolute);
-    match read_object(&absolute) {
+    match read_json_object(&absolute, true, true) {
         Ok(value) => value,
         Err(error) => {
+            let reason = match error {
+                JsonObjectError::Read(error) => error.to_string(),
+                JsonObjectError::Parse(reason) => reason,
+                JsonObjectError::NotAnObject => "Settings must contain a JSON object".into(),
+            };
             diagnostics.push(format!(
-                "Warning: Invalid settings file {}: {error}",
+                "Warning: Invalid settings file {}: {reason}",
                 absolute.display()
             ));
             previous
@@ -1027,6 +1032,12 @@ pub(super) fn read_readonly_auth(path: &Path, error: Error) -> Result<Value> {
     }
 }
 
+enum JsonObjectError {
+    Read(std::io::Error),
+    Parse(String),
+    NotAnObject,
+}
+
 pub(super) fn read_object_unlocked(path: &Path) -> Result<Value> {
     let name = path.file_name();
     let settings = name.is_some_and(|name| name == "settings.json");
@@ -1038,6 +1049,20 @@ pub(super) fn read_object_unlocked(path: &Path) -> Result<Value> {
 }
 
 fn read_object_with_format(path: &Path, empty_is_object: bool, allow_bom: bool) -> Result<Value> {
+    read_json_object(path, empty_is_object, allow_bom).map_err(|error| match error {
+        JsonObjectError::Read(error) => error.into(),
+        JsonObjectError::Parse(reason) => Error::Config(format!("{}: {reason}", path.display())),
+        JsonObjectError::NotAnObject => {
+            Error::Config(format!("{} must contain an object", path.display()))
+        }
+    })
+}
+
+fn read_json_object(
+    path: &Path,
+    empty_is_object: bool,
+    allow_bom: bool,
+) -> std::result::Result<Value, JsonObjectError> {
     match std::fs::read(path) {
         Ok(bytes) => {
             // Pi treats an empty settings file as an empty settings scope.
@@ -1050,18 +1075,23 @@ fn read_object_with_format(path: &Path, empty_is_object: bool, allow_bom: bool) 
             } else {
                 &bytes
             };
-            let value: Value = serde_json::from_slice(input)
-                .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+            let value: Value = serde_json::from_slice(input).map_err(|error| {
+                let reason = if path.file_name().is_some_and(|name| name == "settings.json")
+                    && let Ok(text) = std::str::from_utf8(input)
+                {
+                    super::rpc::json_syntax_diagnostic(text, &error)
+                } else {
+                    error.to_string()
+                };
+                JsonObjectError::Parse(reason)
+            })?;
             if !value.is_object() {
-                return Err(Error::Config(format!(
-                    "{} must contain an object",
-                    path.display()
-                )));
+                return Err(JsonObjectError::NotAnObject);
             }
             Ok(value)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Object(Map::new())),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(JsonObjectError::Read(error)),
     }
 }
 

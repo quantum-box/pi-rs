@@ -2580,7 +2580,9 @@ the other pages without discarding the edit.
 
 Like Pi, user and trusted-project `settings.json` files may start with a UTF-8
 BOM when loaded or updated. Malformed or unreadable user and trusted-project
-settings are reported and the other scope remains available. Settings updates
+settings are reported and the other scope remains available. Syntax warnings
+show the path once and use the same Pi-compatible JSON syntax diagnostics as
+RPC, including UTF-16 positions where available. Settings updates
 do not overwrite malformed files. Invalid implemented setting values remain
 errors; updates preserve unknown keys. On reload, a failed scope retains its
 previous in-memory values while valid changes in the other scope take effect.
