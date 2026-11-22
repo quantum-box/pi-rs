@@ -1502,7 +1502,7 @@ impl Tool for RemoteEditTool {
         self.tool.output_limit()
     }
     async fn prepare_arguments(&self, arguments: Value) -> pi_rs::ExtensionResult<Value> {
-        self.tool.prepare_arguments(arguments).await
+        crate::text_edit::prepare_arguments(arguments).map_err(edit_error_text)
     }
     async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
         let result = async {
@@ -1613,24 +1613,10 @@ impl Tool for RemoteEditTool {
 fn edit_success(display_path: &str, original: &str, output: &str, count: usize) -> Outcome {
     let original = crate::text_edit::normalized_content(original);
     let edited = crate::text_edit::normalized_content(output);
-    let diff = similar::TextDiff::from_lines(&original, &edited);
-    let first_changed_line = diff
-        .ops()
-        .iter()
-        .find(|op| !matches!(op, similar::DiffOp::Equal { .. }))
-        .map(|op| op.new_range().start + 1);
-    let digits = original
-        .split('\n')
-        .count()
-        .max(edited.split('\n').count())
-        .to_string()
-        .len();
-    let display = crate::text_edit::numbered_diff(&diff, digits);
-    let patch = diff
-        .unified_diff()
-        .context_radius(4)
-        .header(display_path, display_path)
-        .to_string();
+    let diff = crate::text_edit::EditDiff::new(&original, &edited);
+    let first_changed_line = diff.first_changed_line();
+    let display = diff.numbered_diff();
+    let patch = diff.unified_patch(display_path);
     Outcome::SucceededWithDetails {
         output: format!("Successfully replaced {count} block(s) in {display_path}."),
         details: json!({"diff":bounded(display),"patch":bounded(patch),"firstChangedLine":first_changed_line}),
@@ -1874,7 +1860,7 @@ impl RemoteShellTool {
             };
         }
         let started = std::time::Instant::now();
-        let timeout = shell_timeout(args)?;
+        let timeout = shell_timeout(args, false)?;
         let context = self.tool.shell.spawn_context(
             &self.tool.root,
             true,
@@ -1995,7 +1981,9 @@ impl RemoteShellTool {
 #[async_trait::async_trait]
 impl Tool for RemoteShellTool {
     fn spec(&self) -> ToolSpec {
-        self.tool.spec()
+        let mut spec = self.tool.spec();
+        spec.parameters["properties"]["timeout"] = shell_timeout_schema(false);
+        spec
     }
     fn constrained_sampling(&self) -> Option<ToolConstraint> {
         self.tool.constrained_sampling()
@@ -2047,6 +2035,14 @@ impl Tool for RemoteShellTool {
             }
             Err(error) => Outcome::Failed(error.to_string()).into(),
         }
+    }
+}
+
+fn pi_tool_failure(output: String) -> Outcome {
+    Outcome::TextResult {
+        output,
+        details: Some(json!({})),
+        is_error: true,
     }
 }
 
@@ -2146,7 +2142,7 @@ impl Tool for CodingTool {
                     "bash"
                 },
                 "Run a shell command in the workspace. Returns the last 2000 lines or 50 KiB and saves complete output to a temporary file when truncated.",
-                json!({"command":{"type":"string"},"timeout":{"type":"number","exclusiveMinimum":0,"maximum":2147483.647}}),
+                json!({"command":{"type":"string"},"timeout":shell_timeout_schema(self.unrestricted)}),
                 vec!["command"],
             ),
             Kind::Grep => (
@@ -2227,7 +2223,18 @@ impl Tool for CodingTool {
         }
     }
 
-    async fn prepare_arguments(&self, arguments: Value) -> pi_rs::ExtensionResult<Value> {
+    async fn prepare_arguments(&self, mut arguments: Value) -> pi_rs::ExtensionResult<Value> {
+        if self.unrestricted {
+            if matches!(self.kind, Kind::Edit)
+                && let Some(edits) = arguments.get_mut("edits")
+                && let Some(encoded) = edits.as_str()
+                && let Ok(decoded @ (Value::Array(_) | Value::Object(_))) =
+                    serde_json::from_str(encoded)
+            {
+                *edits = decoded;
+            }
+            coerce_local_tool_argument(&mut arguments, &self.spec().parameters);
+        }
         if matches!(self.kind, Kind::Edit) {
             crate::text_edit::prepare_arguments(arguments).map_err(edit_error_text)
         } else {
@@ -2320,11 +2327,7 @@ impl Tool for CodingTool {
         };
         // Pi reports the tool's diagnostic as model-facing text with a separate error bit.
         match outcome {
-            Outcome::Failed(output) if self.unrestricted => Outcome::TextResult {
-                output,
-                details: None,
-                is_error: true,
-            },
+            Outcome::Failed(output) if self.unrestricted => pi_tool_failure(output),
             outcome => outcome,
         }
     }
@@ -2489,6 +2492,142 @@ fn is_unix_access_denied(error: &std::io::Error) -> bool {
 #[cfg(not(unix))]
 fn is_unix_access_denied(_error: &std::io::Error) -> bool {
     false
+}
+
+// These are the scalar and container types advertised by the local tool specs.
+fn coerce_local_tool_argument(value: &mut Value, schema: &Value) {
+    match schema["type"].as_str() {
+        Some("object") => {
+            let (Some(object), Some(properties)) =
+                (value.as_object_mut(), schema["properties"].as_object())
+            else {
+                return;
+            };
+            let required = schema["required"].as_array();
+            for (key, property) in properties {
+                if object.get(key) == Some(&Value::Null)
+                    && !required
+                        .is_some_and(|fields| fields.iter().any(|field| field == key.as_str()))
+                {
+                    object.remove(key);
+                } else if let Some(member) = object.get_mut(key) {
+                    coerce_local_tool_argument(member, property);
+                }
+            }
+        }
+        Some("array") => {
+            if !value.is_array() {
+                *value = Value::Array(vec![value.take()]);
+            }
+            if let Some(values) = value.as_array_mut() {
+                for item in values {
+                    coerce_local_tool_argument(item, &schema["items"]);
+                }
+            }
+        }
+        Some("string") => {
+            let converted = match value {
+                Value::Bool(boolean) => Some(boolean.to_string()),
+                Value::Number(number) => number.as_f64().map(js_number),
+                Value::Null => Some("null".into()),
+                _ => None,
+            };
+            if let Some(converted) = converted {
+                *value = Value::String(converted);
+            }
+        }
+        Some(kind @ ("number" | "integer")) if !value.is_number() || kind == "integer" => {
+            let parsed = match value {
+                Value::Bool(boolean) => Some(u8::from(*boolean).into()),
+                Value::Null => Some(0.0),
+                Value::String(text) => parse_local_tool_number(text),
+                Value::Number(number) if number.is_f64() => number.as_f64(),
+                _ => None,
+            };
+            if let Some(number) = parsed {
+                *value = if kind == "integer"
+                    && number.fract() == 0.0
+                    && (0.0..u64::MAX as f64).contains(&number)
+                {
+                    json!(number as u64)
+                } else {
+                    json!(number)
+                };
+            }
+        }
+        Some("boolean") => {
+            let converted = match value {
+                Value::String(text) if text == "1" || text.eq_ignore_ascii_case("true") => {
+                    Some(true)
+                }
+                Value::String(text) if text == "0" || text.eq_ignore_ascii_case("false") => {
+                    Some(false)
+                }
+                Value::Number(number) if number.as_f64() == Some(1.0) => Some(true),
+                Value::Number(number) if number.as_f64() == Some(0.0) => Some(false),
+                Value::Null => Some(false),
+                _ => None,
+            };
+            if let Some(converted) = converted {
+                *value = Value::Bool(converted);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_local_tool_number(text: &str) -> Option<f64> {
+    let trimmed = text.trim_matches(is_ecmascript_whitespace);
+    if trimmed.is_empty() {
+        return Some(0.0);
+    }
+    let radix = match trimmed.get(..2) {
+        Some("0b" | "0B") => Some(2),
+        Some("0o" | "0O") => Some(8),
+        Some("0x" | "0X") => Some(16),
+        _ => None,
+    };
+    if let Some(radix) = radix {
+        let digits = &trimmed[2..];
+        if digits.is_empty() || !digits.chars().all(|digit| digit.is_digit(radix)) {
+            return None;
+        }
+        let digits = digits.trim_start_matches('0');
+        if digits.is_empty() {
+            return Some(0.0);
+        }
+        let bits_per_digit = radix.trailing_zeros() as usize;
+        let (prefix, suffix) = digits.split_at(digits.len().min(128 / bits_per_digit));
+        let shift = suffix.len().saturating_mul(bits_per_digit);
+        if shift >= 1024 {
+            return None;
+        }
+        // Keep a sticky bit so the cast rounds correctly when digits were discarded.
+        let prefix = u128::from_str_radix(prefix, radix).ok()?;
+        let sticky = suffix.bytes().any(|digit| digit != b'0');
+        let number = (prefix | u128::from(sticky)) as f64 * 2.0_f64.powi(shift as i32);
+        return number.is_finite().then_some(number);
+    }
+    if let Ok(number) = trimmed.parse::<f64>()
+        && number.is_finite()
+    {
+        return Some(number);
+    }
+    if text.eq_ignore_ascii_case("true") {
+        return Some(1.0);
+    }
+    if text.eq_ignore_ascii_case("false") {
+        return Some(0.0);
+    }
+    let bigint = text.strip_suffix('n')?;
+    let digits = bigint.strip_prefix('-').unwrap_or(bigint);
+    if digits == "0"
+        || (!digits.starts_with('0') && digits.bytes().all(|digit| digit.is_ascii_digit()))
+    {
+        let number: i64 = bigint.parse().ok()?;
+        return (number.unsigned_abs() <= 9_007_199_254_740_991).then_some(number as f64);
+    }
+    None
 }
 
 // Pi parses JSON numbers as JavaScript doubles and formats them using Number.toString.
@@ -3120,13 +3259,7 @@ impl CodingTool {
         let unrestricted_find_limit = if is_find && self.unrestricted {
             match fd_numeric_limit(numeric_find_limit) {
                 Ok(limit) => Some(limit),
-                Err(output) => {
-                    return Ok(Outcome::TextResult {
-                        output,
-                        details: None,
-                        is_error: true,
-                    });
-                }
+                Err(output) => return Ok(pi_tool_failure(output)),
             }
         } else {
             None
@@ -3447,10 +3580,15 @@ impl CodingTool {
             .shell_stream(args, cancellation, &mut |_| {}, false, host)
             .await?;
         if result.timed_out {
-            let status = format!(
-                "Command timed out after {} seconds",
-                shell_timeout(args)?.expect("elapsed timeout").as_secs_f64()
-            );
+            let seconds = if self.unrestricted {
+                js_number(args["timeout"].as_f64().expect("validated timeout"))
+            } else {
+                shell_timeout(args, false)?
+                    .expect("elapsed timeout")
+                    .as_secs_f64()
+                    .to_string()
+            };
+            let status = format!("Command timed out after {seconds} seconds");
             return Err(Error::Config(shell_status(&result.output.display, &status)));
         }
         if result.cancelled {
@@ -3470,7 +3608,7 @@ impl CodingTool {
         host: Option<Arc<dyn ToolHost>>,
     ) -> Result<ShellResult> {
         let started = std::time::Instant::now();
-        let timeout = shell_timeout(args)?;
+        let timeout = shell_timeout(args, self.unrestricted && !sanitize_user_output)?;
         let crate::shell_config::Launch {
             mut command,
             input,
@@ -4014,18 +4152,46 @@ fn shell_status(output: &str, status: &str) -> String {
     }
 }
 
-fn shell_timeout(args: &Value) -> Result<Option<Duration>> {
+const MAX_SHELL_TIMEOUT_MILLIS: f64 = 2_147_483_647.0;
+const MAX_SHELL_TIMEOUT_SECONDS: f64 = MAX_SHELL_TIMEOUT_MILLIS / 1_000.0;
+
+fn shell_timeout_schema(pi_diagnostics: bool) -> Value {
+    if pi_diagnostics {
+        // Pi's tool code distinguishes nonpositive values from excessive timeouts.
+        json!({"type":"number"})
+    } else {
+        json!({"type":"number","exclusiveMinimum":0,"maximum":MAX_SHELL_TIMEOUT_SECONDS})
+    }
+}
+
+fn shell_timeout(args: &Value, pi_diagnostics: bool) -> Result<Option<Duration>> {
     let Some(value) = args.get("timeout") else {
         return Ok(None);
     };
-    let seconds = value
+    let native_error = || {
+        Error::Config(
+            "timeout must be a positive number no greater than 2147483.647 seconds".into(),
+        )
+    };
+    let Some(seconds) = value
         .as_f64()
-        .filter(|seconds| seconds.is_finite() && *seconds > 0.0 && *seconds <= 2_147_483.647)
-        .ok_or_else(|| {
-            Error::Config(
-                "timeout must be a positive number no greater than 2147483.647 seconds".into(),
-            )
-        })?;
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+    else {
+        return Err(if pi_diagnostics {
+            Error::Config("Invalid timeout: must be a finite number of seconds".into())
+        } else {
+            native_error()
+        });
+    };
+    if pi_diagnostics {
+        if seconds * 1_000.0 > MAX_SHELL_TIMEOUT_MILLIS {
+            return Err(Error::Config(format!(
+                "Invalid timeout: maximum is {MAX_SHELL_TIMEOUT_SECONDS} seconds"
+            )));
+        }
+    } else if seconds > MAX_SHELL_TIMEOUT_SECONDS {
+        return Err(native_error());
+    }
     Ok(Some(Duration::from_secs_f64(seconds)))
 }
 
@@ -4985,7 +5151,7 @@ mod tests {
         {
             Outcome::SucceededWithDetails { details, .. } => {
                 assert!(details.get("matchLimitReached").is_none());
-                assert_eq!(details["truncation"]["totalLines"], count * 3 - 1);
+                assert_eq!(details["truncation"]["totalLines"], count);
             }
             other => panic!("expected truncated result with details, got {other:?}"),
         }
@@ -4994,6 +5160,77 @@ mod tests {
             !jsonschema::validator_for(&tool.spec().parameters)
                 .unwrap()
                 .is_valid(&args)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_tool_argument_coercion_stays_within_the_unrestricted_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let args = json!({
+            "pattern": 42,
+            "path": null,
+            "ignoreCase": "TRUE",
+            "literal": 1,
+            "limit": "1.5",
+            "context": "0x2",
+        });
+        let prepared = tool.prepare_arguments(args.clone()).await.unwrap();
+        assert_eq!(
+            prepared,
+            json!({"pattern":"42", "ignoreCase":true, "literal":true, "limit":1.5, "context":2})
+        );
+        assert!(
+            jsonschema::validator_for(&tool.spec().parameters)
+                .unwrap()
+                .is_valid(&prepared)
+        );
+        tool.unrestricted = false;
+        assert_eq!(tool.prepare_arguments(args.clone()).await.unwrap(), args);
+
+        tool.unrestricted = true;
+        tool.kind = Kind::Edit;
+        let prepared = tool
+            .prepare_arguments(json!({"path":true,"edits":"[{\"oldText\":42,\"newText\":null}]"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared,
+            json!({"path":"true", "edits":[{"oldText":"42","newText":"null"}]})
+        );
+    }
+
+    #[test]
+    fn local_tool_numeric_strings_follow_javascript_conversion() {
+        for (input, expected) in [
+            ("", Some(0.0)),
+            ("\u{feff} 4.5e1 ", Some(45.0)),
+            ("0Xf", Some(15.0)),
+            ("0b10", Some(2.0)),
+            ("0o10", Some(8.0)),
+            ("1n", Some(1.0)),
+            ("-1n", Some(-1.0)),
+            ("FALSE", Some(0.0)),
+            (" true ", None),
+            ("0x+1", None),
+            ("-0x10", None),
+            ("01n", None),
+            ("9007199254740992n", None),
+            ("1e400", None),
+        ] {
+            assert_eq!(parse_local_tool_number(input), expected, "{input}");
+        }
+        // A radix value just above a halfway point must round up even when its
+        // lowest set bit falls outside the integer prefix.
+        let long = format!("0b1{}1{}1", "0".repeat(52), "0".repeat(80));
+        assert_eq!(
+            parse_local_tool_number(&long),
+            Some(2.0_f64.powi(134) + 2.0_f64.powi(82))
         );
     }
 
@@ -5029,12 +5266,21 @@ mod tests {
             ),
             (
                 json!(2.5),
-                3,
-                "2.5 matches limit reached. Use limit=5",
-                json!(2.5),
+                2,
+                "2 matches limit reached. Use limit=4",
+                json!(2.0),
+            ),
+            (
+                json!("0b10"),
+                2,
+                "2 matches limit reached. Use limit=4",
+                json!(2.0),
             ),
         ] {
-            let args = json!({"pattern":"needle", "limit":limit, "context":1});
+            let args = tool
+                .prepare_arguments(json!({"pattern":"needle", "limit":limit, "context":1}))
+                .await
+                .unwrap();
             assert!(validator.is_valid(&args));
             let outcome = tool
                 .invoke(
@@ -7671,9 +7917,40 @@ mod tests {
         };
         assert!(error.contains("before"));
         assert!(error.contains(&format!("timed out after {timeout}")));
-        assert_eq!(shell_timeout(&json!({})).unwrap(), None);
+        assert_eq!(shell_timeout(&json!({}), false).unwrap(), None);
         for value in [json!(0), json!(-1), json!(null), json!("1"), json!(2147484)] {
-            assert!(shell_timeout(&json!({"timeout":value})).is_err());
+            assert!(shell_timeout(&json!({"timeout":value}), false).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn unrestricted_local_shell_reports_pi_numeric_timeout_diagnostics() {
+        let root = tempfile::tempdir().unwrap();
+        for kind in [Kind::Bash, Kind::PowerShell] {
+            let tool = CodingTool {
+                root: root.path().to_path_buf(),
+                unrestricted: true,
+                shell: ShellConfig::default(),
+                kind,
+            };
+            let validator = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+            for (value, expected) in [
+                (0.0, "Invalid timeout: must be a finite number of seconds"),
+                (-0.5, "Invalid timeout: must be a finite number of seconds"),
+                (
+                    2147483.648,
+                    "Invalid timeout: maximum is 2147483.647 seconds",
+                ),
+                (1e100, "Invalid timeout: maximum is 2147483.647 seconds"),
+            ] {
+                let args = json!({"command":"exit 99", "timeout":value});
+                assert!(validator.is_valid(&args));
+                let outcome = tool.bash(&args, &pi_rs::CancellationToken::new()).await;
+                assert!(
+                    matches!(&outcome, Outcome::Failed(actual) if actual == expected),
+                    "{outcome:?}"
+                );
+            }
         }
     }
 
