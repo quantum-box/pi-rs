@@ -1070,6 +1070,11 @@ project definition. OAuth can be implicit for an HTTP server without an
 Authorization header or provider authentication. An explicit
 `"oauth": false` disables OAuth and must be changed before signing in.
 
+MCP server `timeout` accepts fractional seconds. Native request deadlines
+range from 1 ms to one hour. A legacy explicit zero keeps the one-second
+timeout, and an omitted timeout defaults to 60 seconds. Logout accepts the
+same fractional settings when it selects an HTTP server.
+
 `--timeout SECONDS` bounds discovery, sign-in, and preparation to save
 (default 300 seconds). Before publishing credentials, login locks the
 configuration files against concurrent pi-rs writers and rechecks the
