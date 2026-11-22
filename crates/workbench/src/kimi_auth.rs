@@ -521,13 +521,22 @@ mod tests {
         }
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(14)).await;
+        tokio::task::yield_now().await;
         assert!(!refresh.is_finished());
-        tokio::time::advance(Duration::from_secs(2)).await;
+        // Give the timer wheel and the refresh task a chance to run without
+        // extending the caller's deadline by several seconds of real time.
+        for _ in 0..25 {
+            if refresh.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+        assert!(
+            refresh.is_finished(),
+            "caller must stop waiting by 16.5 seconds while the reply is held"
+        );
+        let result = refresh.await.unwrap();
         tokio::time::resume();
-        let result = tokio::time::timeout(Duration::from_secs(5), refresh)
-            .await
-            .expect("caller must stop waiting before the server replies")
-            .unwrap();
         assert!(matches!(result, Err(err) if err.to_string().contains("token refresh timed out")));
         reply.send(()).unwrap();
         server.await.unwrap();
