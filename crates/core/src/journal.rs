@@ -4514,6 +4514,180 @@ pub(crate) fn system_context(
     (content.join("\n\n"), tools)
 }
 
+/// System checkpoints projected onto the request before provider serialization.
+pub(crate) struct SystemTranscript {
+    leading: String,
+    updates: Vec<(usize, Message)>,
+}
+
+/// Fold the restored checkpoints only after the final model route is known.
+pub(crate) struct SystemTranscriptFallback {
+    collapsed: String,
+    projected: Vec<String>,
+}
+
+impl SystemTranscript {
+    pub(crate) fn apply(self, messages: &mut Vec<Message>) -> Option<SystemTranscriptFallback> {
+        let Some(Message::System { content }) = messages.first_mut() else {
+            return None;
+        };
+        if *content == self.leading && self.updates.is_empty() {
+            return None;
+        }
+        let collapsed = std::mem::replace(content, self.leading);
+        let mut updates = self.updates.into_iter().peekable();
+        let mut projected = Vec::with_capacity(messages.len() + updates.len());
+        for (index, message) in std::mem::take(messages).into_iter().enumerate() {
+            while let Some((_, update)) = updates.next_if(|(position, _)| *position == index) {
+                projected.push(update);
+            }
+            projected.push(message);
+        }
+        projected.extend(updates.map(|(_, update)| update));
+        *messages = projected;
+        Some(SystemTranscriptFallback {
+            collapsed,
+            projected: system_messages(messages).map(str::to_owned).collect(),
+        })
+    }
+}
+
+fn system_messages(messages: &[Message]) -> impl Iterator<Item = &str> {
+    messages.iter().filter_map(|message| match message {
+        Message::System { content } => Some(content.as_str()),
+        _ => None,
+    })
+}
+
+impl SystemTranscriptFallback {
+    pub(crate) fn finish(
+        self,
+        model: &dyn crate::Model,
+        request: &mut crate::ModelRequest,
+    ) -> bool {
+        if model.supports_mid_conversation_system_messages(&request.model) {
+            return true;
+        }
+        let unchanged =
+            system_messages(&request.messages).eq(self.projected.iter().map(String::as_str));
+        let content = if unchanged {
+            self.collapsed
+        } else {
+            // Explicit hook edits replace the journal's resolved instructions.
+            system_messages(&request.messages)
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        request
+            .messages
+            .retain(|message| !matches!(message, Message::System { .. }));
+        if unchanged || !content.is_empty() {
+            request.messages.insert(0, Message::System { content });
+        }
+        false
+    }
+}
+
+pub(crate) fn system_transcript(
+    path: &[&Record],
+    conversation: &[(u64, Message)],
+    conversation_start: usize,
+    fallback: &str,
+) -> Option<SystemTranscript> {
+    let compacted = path
+        .iter()
+        .rposition(|record| matches!(record.event, Event::Compacted { .. }));
+    let start = compacted.map_or(0, |index| {
+        // Imported compactions already carry the resolved prompt snapshot.
+        // Native compaction can retain original messages without such a snapshot.
+        if path[index].run_id.is_some()
+            && let Event::Compacted {
+                system_prompt: None,
+                retain_from: Some(first),
+                ..
+            } = path[index].event
+        {
+            let retained = path[..index].partition_point(|record| record.id < first);
+            if retained < index {
+                // An earlier imported snapshot is still the prompt authority.
+                let snapshot_floor = path[..index]
+                    .iter()
+                    .rposition(|record| {
+                        matches!(
+                            record.event,
+                            Event::Compacted {
+                                system_prompt: Some(_),
+                                ..
+                            }
+                        )
+                    })
+                    .map_or(0, |snapshot| snapshot + 1);
+                return retained.max(snapshot_floor);
+            }
+        }
+        index + 1
+    });
+    let retained = &path[start..];
+    let mut checkpoints = retained
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::SystemCheckpoint {
+                content, sections, ..
+            } => Some((record.id, content, sections)),
+            _ => None,
+        })
+        .peekable();
+    let (first_source, _, _) = *checkpoints.peek()?;
+    let mut boundaries = conversation
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, message))| !matches!(message, Message::Tool { .. }))
+        .peekable();
+    let leading = if compacted.is_some() {
+        system_context(&path[..start], fallback, Vec::new()).0
+    } else if conversation_start == 1
+        && boundaries
+            .peek()
+            .is_none_or(|(_, (source, _))| first_source < *source)
+    {
+        let (_, content, sections) = checkpoints.next().expect("first checkpoint");
+        std::iter::once(content.as_str())
+            .chain(sections.iter().filter_map(|(_, value)| value.as_deref()))
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    } else {
+        fallback.to_owned()
+    };
+    let updates = checkpoints
+        .filter_map(|(source, content, sections)| {
+            // A checkpoint in the middle of a tool batch follows its results.
+            while boundaries.next_if(|(_, (id, _))| *id < source).is_some() {}
+            let position = boundaries
+                .peek()
+                .map_or(conversation.len(), |(index, _)| *index);
+            let mut parts = Vec::with_capacity(sections.len() + 1);
+            if !content.is_empty() {
+                parts.push(content.clone());
+            }
+            parts.extend(sections.iter().map(|(name, value)| match value {
+                Some(text) => format!("Updated system prompt section \"{name}\":\n\n{text}"),
+                None => format!("Removed system prompt section \"{name}\"."),
+            }));
+            (!parts.is_empty()).then(|| {
+                (
+                    conversation_start + position,
+                    Message::System {
+                        content: parts.join("\n\n"),
+                    },
+                )
+            })
+        })
+        .collect();
+    Some(SystemTranscript { leading, updates })
+}
+
 fn project_messages(
     branch: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
@@ -6145,6 +6319,12 @@ mod system_checkpoint_tests {
             })
             .unwrap();
         session
+            .append(Event::User {
+                content: "before update".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
             .append(Event::SystemCheckpoint {
                 content: "new instructions".into(),
                 sections: vec![("rules".into(), Some("updated".into()))],
@@ -6164,10 +6344,157 @@ mod system_checkpoint_tests {
                 vec![read.clone()]
             )
         );
+        let path = reopened.branch();
+        let conversation = conversation_entries(&path, reopened.operations());
+        let mut messages = vec![
+            Message::System {
+                content: "snapshot\n\nnew instructions\n\nupdated".into(),
+            },
+            Message::User {
+                content: "summary".into(),
+            },
+        ];
+        messages.extend(conversation.iter().map(|(_, message)| message.clone()));
+        assert!(
+            system_transcript(&path, &conversation, 2, "fallback")
+                .unwrap()
+                .apply(&mut messages)
+                .is_some()
+        );
+        assert_eq!(
+            messages,
+            [
+                Message::System {
+                    content: "snapshot\n\nsaved".into()
+                },
+                Message::User {
+                    content: "summary".into()
+                },
+                Message::User {
+                    content: "before update".into()
+                },
+                Message::System {
+                    content:
+                        "new instructions\n\nUpdated system prompt section \"rules\":\n\nupdated"
+                            .into()
+                },
+            ]
+        );
         session.checkout(previous).unwrap();
         assert_eq!(
             system_context(&session.branch(), "fallback", vec![read, old.clone()]),
             ("old base\n\nold section".into(), vec![old])
+        );
+    }
+
+    #[test]
+    fn system_transcript_keeps_fallback_before_the_first_mid_conversation_checkpoint() {
+        let checkpoint = Record {
+            version: FORMAT_VERSION,
+            id: 2,
+            parent: Some(1),
+            timestamp: None,
+            run_id: None,
+            event: Event::SystemCheckpoint {
+                content: "update".into(),
+                sections: vec![],
+                tools_added: vec![],
+                tools_removed: vec![],
+            },
+        };
+        let conversation = vec![(
+            1,
+            Message::User {
+                content: "first".into(),
+            },
+        )];
+        let transcript = system_transcript(&[&checkpoint], &conversation, 1, "fallback").unwrap();
+        assert_eq!(transcript.leading, "fallback");
+        assert_eq!(
+            transcript.updates,
+            vec![(
+                2,
+                Message::System {
+                    content: "update".into()
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn native_compaction_replays_updates_between_retained_messages() {
+        let checkpoint = |content: &str| Event::SystemCheckpoint {
+            content: content.into(),
+            sections: vec![],
+            tools_added: vec![],
+            tools_removed: vec![],
+        };
+        let user = |text: &str| Event::User {
+            content: text.into(),
+            input_id: None,
+        };
+        let records: Vec<_> = [
+            checkpoint("base"),
+            user("first"),
+            checkpoint("update"),
+            user("second"),
+            Event::Compacted {
+                summary: "older conversation".into(),
+                retain_from: Some(2),
+                system_prompt: None,
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| Record {
+            version: FORMAT_VERSION,
+            id: index as u64 + 1,
+            parent: (index > 0).then_some(index as u64),
+            timestamp: None,
+            run_id: Some(Uuid::nil()),
+            event,
+        })
+        .collect();
+        let path: Vec<_> = records.iter().collect();
+        let conversation = conversation_entries(&path, vec![]);
+        let mut messages = vec![
+            Message::System {
+                content: "base\n\nupdate".into(),
+            },
+            Message::User {
+                content: "older conversation".into(),
+            },
+        ];
+        messages.extend(conversation.iter().map(|(_, message)| message.clone()));
+        assert!(
+            system_transcript(&path, &conversation, 2, "fallback")
+                .unwrap()
+                .apply(&mut messages)
+                .is_some()
+        );
+        assert_eq!(
+            messages,
+            [
+                Message::System {
+                    content: "base".into()
+                },
+                Message::User {
+                    content: "older conversation".into()
+                },
+                Message::User {
+                    content: "first".into()
+                },
+                Message::System {
+                    content: "update".into()
+                },
+                Message::User {
+                    content: "second".into()
+                },
+            ]
         );
     }
 
