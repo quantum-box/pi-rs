@@ -3596,8 +3596,13 @@ other permanent failures. A server delay above the ceiling stops the provider
 retry and can trigger the agent's separately configured retry. Native reports
 the requested delay and ceiling without echoing the provider body. This policy
 also loads legacy
-`retry.maxDelayMs` when the replacement is unset. Google Gemini and Codex-specific
-provider retries and summary-specific retry policy remain open.
+`retry.maxDelayMs` when the replacement is unset.
+
+Google Gemini and Vertex AI honor the configured retry count for HTTP 408,
+409, 429, and server errors, using exponential backoff. Pi 1.6's Google adapters
+receive no retry headers from the SDK and leave transport errors and
+`retry.provider.timeoutMs` outside this policy. Codex-specific provider retries
+and summary-specific retry policy remain open.
 
 Tests cover recovery, request and retry caps, queued input, wait cancellation,
 dropped-wait cleanup and usage-settlement failures. Loopback RPC checks verify

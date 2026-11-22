@@ -33,8 +33,45 @@ impl ProviderRetry {
     /// Dropping the future also cancels any pending retry wait.
     pub async fn send<T, Attempt>(
         self,
-        mut attempt: impl FnMut() -> Attempt,
+        attempt: impl FnMut() -> Attempt,
         response_info: impl Fn(&T) -> (u16, &HeaderMap),
+    ) -> Result<T>
+    where
+        Attempt: Future<Output = Result<T>>,
+    {
+        self.send_with_policy(
+            attempt,
+            |value| {
+                let (status, headers) = response_info(value);
+                (status, Some(headers))
+            },
+            true,
+        )
+        .await
+    }
+
+    /// Retry only HTTP statuses for a provider whose API errors expose no headers.
+    pub async fn send_status_only<T, Attempt>(
+        self,
+        attempt: impl FnMut() -> Attempt,
+        response_status: impl Fn(&T) -> u16,
+    ) -> Result<T>
+    where
+        Attempt: Future<Output = Result<T>>,
+    {
+        Self {
+            timeout: None,
+            ..self
+        }
+        .send_with_policy(attempt, |value| (response_status(value), None), false)
+        .await
+    }
+
+    async fn send_with_policy<T, Attempt>(
+        self,
+        mut attempt: impl FnMut() -> Attempt,
+        response_info: impl Fn(&T) -> (u16, Option<&HeaderMap>),
+        retry_transport_errors: bool,
     ) -> Result<T>
     where
         Attempt: Future<Output = Result<T>>,
@@ -57,9 +94,12 @@ impl ProviderRetry {
                     if (200..300).contains(&status) || !retryable_status(status, headers) {
                         return response;
                     }
-                    self.delay(headers, index, Utc::now())?
+                    match headers {
+                        Some(headers) => self.delay(headers, index, Utc::now())?,
+                        None => fallback_delay(index),
+                    }
                 }
-                Err(Error::RetryableModel(_)) => fallback_delay(index),
+                Err(Error::RetryableModel(_)) if retry_transport_errors => fallback_delay(index),
                 Err(_) => return response,
             };
             drop(response);
@@ -96,8 +136,8 @@ impl ProviderRetry {
     }
 }
 
-fn retryable_status(status: u16, headers: &HeaderMap) -> bool {
-    match retry_header(headers, "x-should-retry") {
+fn retryable_status(status: u16, headers: Option<&HeaderMap>) -> bool {
+    match headers.and_then(|headers| retry_header(headers, "x-should-retry")) {
         Some("true") => true,
         Some("false") => false,
         _ => matches!(status, 408 | 409 | 429 | 500..),

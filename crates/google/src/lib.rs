@@ -42,6 +42,7 @@ type ReasoningObserver = Arc<dyn Fn(&str) + Send + Sync>;
 pub struct Google {
     client: Client,
     http_proxies: Vec<reqwest::Proxy>,
+    provider_retry: pi_rs_core::ProviderRetry,
     endpoint: Url,
     vertex: bool,
     vertex_bearer: Option<HeaderValue>,
@@ -95,6 +96,7 @@ impl Google {
         Ok(Self {
             client,
             http_proxies: Vec::new(),
+            provider_retry: pi_rs_core::ProviderRetry::default(),
             endpoint,
             vertex: false,
             vertex_bearer: None,
@@ -183,6 +185,12 @@ impl Google {
             .map_err(|_| Error::Config("could not build Google Gemini HTTP client".into()))?;
         self.http_proxies = proxies.to_vec();
         Ok(self)
+    }
+
+    /// Configure retries for retryable HTTP statuses before streaming.
+    pub fn with_provider_retry(mut self, policy: pi_rs_core::ProviderRetry) -> Self {
+        self.provider_retry = policy;
+        self
     }
 
     /// Bind signed Gemini parts to a named provider and its model route.
@@ -1315,21 +1323,30 @@ impl Model for Google {
             &mut last_progress,
             Progress::WaitingForModel,
         );
+        let request = self.authenticate(self.client.post(url)).json(&body);
         let response = self
-            .authenticate(self.client.post(url))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| {
-                Error::RetryableModel(
-                    if error.is_timeout() && !error.is_connect() {
-                        "HTTP idle timeout"
-                    } else {
-                        "Google Gemini request failed"
+            .provider_retry
+            .send_status_only(
+                || {
+                    let request = request.try_clone().ok_or_else(|| {
+                        Error::Config("Google Gemini request cannot be replayed".into())
+                    });
+                    async {
+                        request?.send().await.map_err(|error| {
+                            Error::RetryableModel(
+                                if error.is_timeout() && !error.is_connect() {
+                                    "HTTP idle timeout"
+                                } else {
+                                    "Google Gemini request failed"
+                                }
+                                .into(),
+                            )
+                        })
                     }
-                    .into(),
-                )
-            })?;
+                },
+                |response| response.status().as_u16(),
+            )
+            .await?;
         let error_secrets = self.error_secrets();
         pi_rs_core::observe_provider_response(
             response.status(),
@@ -2250,6 +2267,64 @@ mod tests {
             Some(Err(Error::RetryableModel(_)))
         ));
         worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_retry_uses_gemini_http_status_without_retry_headers() {
+        assert_provider_retry_by_status(false).await;
+    }
+
+    #[tokio::test]
+    async fn provider_retry_uses_vertex_http_status_without_retry_headers() {
+        assert_provider_retry_by_status(true).await;
+    }
+
+    async fn assert_provider_retry_by_status(vertex: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let replies = [
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 86400\r\nX-Should-Retry: false\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"responseId\":\"retried\"}\n\n",
+            ];
+            for reply in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let model = Google::new(&format!("http://{address}"), "key")
+            .unwrap()
+            .with_context_probe(false)
+            .with_provider_retry(pi_rs_core::ProviderRetry {
+                max_retries: 1,
+                max_retry_delay_ms: 1,
+                timeout: Some(Duration::from_millis(1)),
+            });
+        let model = if vertex {
+            model.with_vertex(true).unwrap()
+        } else {
+            model
+        };
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let mut stream = tokio::time::timeout(Duration::from_secs(5), model.stream(request))
+            .await
+            .unwrap()
+            .unwrap();
+        match stream.next().await.unwrap().unwrap() {
+            ModelEvent::Metadata(metadata) => {
+                assert_eq!(metadata.provider_request_id.as_deref(), Some("retried"));
+            }
+            _ => panic!("expected response metadata"),
+        }
+        server.await.unwrap();
     }
 
     #[tokio::test]

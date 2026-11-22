@@ -738,7 +738,11 @@ impl Client {
                     .with_http_options(timeout, &proxies)?
                     .with_provider_retry(retry),
             ),
-            Self::Google(client) => Self::Google(client.with_http_options(timeout, &proxies)?),
+            Self::Google(client) => Self::Google(
+                client
+                    .with_http_options(timeout, &proxies)?
+                    .with_provider_retry(retry),
+            ),
             Self::PiMessages(client) => {
                 Self::PiMessages(client.with_http_options(timeout, &proxies)?)
             }
