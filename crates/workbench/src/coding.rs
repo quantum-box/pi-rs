@@ -635,7 +635,7 @@ impl Extension for CodingTools {
                         operations: operations.clone(),
                         shell_outputs: self.shell_outputs.clone(),
                     }) as Arc<dyn Tool>
-                } else if matches!(kind, Kind::Read { .. })
+                } else if matches!(tool.kind, Kind::Read { .. })
                     && let Some(UnsupportedImageModel::Current(model)) =
                         &self.unsupported_image_model
                 {

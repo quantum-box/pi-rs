@@ -550,7 +550,7 @@ impl Worker {
     }
     pub(super) fn adopt_live_model(&mut self, args: &Cli) {
         let route = configuration(args);
-        for key in ["provider", "endpoint", "token_fingerprint"] {
+        for key in ["provider", "endpoint", "token_fingerprint", "image_profile"] {
             self.configuration[key] = route[key].clone();
         }
     }
