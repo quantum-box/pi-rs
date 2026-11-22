@@ -2328,9 +2328,10 @@ Recursive quote rendering stops at 32 levels and preserves deeper content as tex
 Horizontal rules use the reference 80-column maximum.
 Top-level horizontal rules separate following blocks with one blank line and
 do not add a trailing blank line at the end of the rendered message.
-Consecutive paragraphs retain a single separating blank line, including inside
-block quotes. Paragraphs preserve source indentation on their first line and
-after soft and hard line breaks.
+A paragraph is separated from a following paragraph, heading, or quote by one
+blank line, including inside block quotes. Tight list items keep these blocks
+compact. Paragraphs preserve source indentation on their first line and after
+soft and hard line breaks.
 Source-level blank blocks are retained after visible blocks and between link
 reference definitions. List items retain block separators and continuation
 indentation for code and quotes. A pinned Pi fixture checks these layouts,
@@ -5347,17 +5348,23 @@ Live provider acceptance was unverified.
 
 ### Fireworks and OpenRouter Messages catalogs checkpoint
 
-The offline catalog includes 19 Fireworks and 20 OpenRouter models using
-Messages. The OpenRouter catalog follows Pi AI v1.6.0 and includes 397 Chat
-Completions entries. Those requests default to the system instruction role,
-and profiles can override the role or disable session affinity. Fable 5.2
-uses the Messages route with per-reply effort. The official
-Messages routes use bearer authentication. Environment credentials and
-imported provider-wide keys or OpenRouter OAuth work on the official routes.
+The offline Fireworks catalog matches the Pi 1.6.0 release. It includes
+16 Messages models and 11 Chat Completions models. DeepSeek V4.1 Flash
+1017 Ultra-fast uses adaptive thinking and image input on the Messages
+route. Kimi K3.1 Pro uses Chat Completions with model-specific reasoning
+and image support. The OpenRouter catalog follows Pi AI v1.6.0 and includes
+20 Messages models and 397 Chat Completions models. OpenRouter Chat Completions
+uses the system instruction role by default. Profiles can override the role or
+disable session affinity. OpenRouter Fable 5.2 uses Messages with per-reply
+effort. The official Messages routes use bearer authentication. Environment
+credentials, imported provider-wide keys, and OpenRouter OAuth work on those
+routes.
 Explicitly stored keys remain bound to their saved endpoints. Loopback tests
 covered adaptive thinking, effort mapping and replay with Fireworks empty
-signatures and OpenRouter signed blocks. Additional cache warming and
-mid-conversation options remain to be matched.
+signatures and OpenRouter signed blocks. Fireworks Kimi models retain
+mid-conversation system messages. Tool additions within those messages
+and additional cache warming remain open. Live Fireworks inference was
+unverified.
 
 ### Terminal output padding checkpoint
 

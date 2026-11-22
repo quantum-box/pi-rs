@@ -72,7 +72,7 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         id: "fireworks",
         endpoint: "https://api.fireworks.ai/inference/v1/chat/completions",
         env: "FIREWORKS_API_KEY",
-        compatibility: standard,
+        compatibility: || json!({"supportsStore":true,"maxTokensField":"max_completion_tokens"}),
     },
     Builtin {
         id: "github-copilot",
