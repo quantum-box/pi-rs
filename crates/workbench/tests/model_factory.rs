@@ -590,6 +590,73 @@ fn granted_auth_only_resolves_real_variables_on_matching_routes() {
     assert!(auth.get("unmatched", endpoint).is_none());
 }
 #[tokio::test]
+async fn granted_codex_model_routes_use_the_codex_bearer_protocol() {
+    use base64::Engine;
+    use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};
+    use serde_json::json;
+
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("models.json");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/backend-api/codex/responses",
+        listener.local_addr().unwrap()
+    );
+    let base_url = "https://chatgpt.com/backend-api/codex";
+    std::fs::write(
+        &file,
+        json!({"providers":{"openai-codex":{
+            "api":"openai-codex-responses", "baseUrl":base_url, "models":[{"id":"fixture"}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let route = ModelFileRoute {
+        provider: "openai-codex".into(),
+        api: NativeModelApi::OpenAiCodexResponses,
+        base_url: base_url.into(),
+        endpoint: endpoint.clone(),
+    };
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"test-account"}}"#);
+    let token = format!("fixture.{payload}.signature");
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        "openai-codex",
+        &endpoint,
+        HostCredential::new(HostCredentialKind::Bearer, token).unwrap(),
+    )
+    .unwrap();
+    let factory = ModelClientFactory::new(auth.build());
+    let catalog = ModelFileReadGrants {
+        file,
+        routes: vec![route],
+    }
+    .load(&factory)
+    .unwrap();
+    let model = catalog.get("openai-codex", "fixture").unwrap();
+    let captured = capture_model_headers(
+        listener,
+        model,
+        pi_rs::ModelRequest {
+            model: "fixture".into(),
+            messages: vec![pi_rs::Message::User {
+                content: "hello".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 16,
+        },
+    )
+    .await;
+    assert!(captured.starts_with("POST /backend-api/codex/responses HTTP/1.1\r\n"));
+    assert!(
+        captured
+            .to_ascii_lowercase()
+            .contains("chatgpt-account-id: test-account")
+    );
+}
+
+#[tokio::test]
 async fn granted_model_file_composes_saved_auth_with_exact_api_and_base_routes() {
     use pi_rs_workbench::auth_factory::{AuthFileReadGrants, AuthRoute};
     use pi_rs_workbench::model_file::{ModelFileReadGrants, ModelFileRoute};

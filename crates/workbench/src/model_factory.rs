@@ -12,6 +12,7 @@ use pi_rs::{
 pub enum NativeModelApi {
     OpenAiChat,
     OpenAiResponses,
+    OpenAiCodexResponses,
     ChatGptResponses,
     AnthropicMessages,
     GoogleGemini,
@@ -78,6 +79,9 @@ impl ModelClientFactory {
             NativeModelApi::OpenAiResponses => {
                 Ok(Arc::new(self.responses_client(provider, endpoint)?))
             }
+            NativeModelApi::OpenAiCodexResponses => {
+                Ok(Arc::new(self.codex_client(provider, endpoint)?))
+            }
             NativeModelApi::ChatGptResponses => {
                 Ok(Arc::new(self.chatgpt_client(provider, endpoint)?))
             }
@@ -115,6 +119,27 @@ impl ModelClientFactory {
             credential.secret().to_owned(),
             provider,
         )
+    }
+
+    /// A typed Codex Responses client. The host supplies a Codex OAuth access
+    /// token for an exact route and owns token refresh. The SDK defaults to SSE.
+    pub fn codex_client(
+        &self,
+        provider: &str,
+        endpoint: &str,
+    ) -> Result<pi_rs::openai::OpenAiResponses> {
+        let credential = self.credential(provider, endpoint)?;
+        if provider != "openai-codex" || credential.kind() != HostCredentialKind::Bearer {
+            return Err(Error::Config(
+                "credential kind is not supported for this model API".into(),
+            ));
+        }
+        Ok(pi_rs::openai::OpenAiResponses::new_codex(
+            endpoint,
+            credential.secret().to_owned(),
+            provider,
+        )?
+        .with_codex_transport(pi_rs::openai::CodexTransport::Sse))
     }
 
     /// A typed ChatGPT plan client. Only the exact `openai-chatgpt` identity

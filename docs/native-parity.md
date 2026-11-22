@@ -1400,7 +1400,10 @@ overrides them. The grant supplies the actual request endpoint and the model
 factory supplies its exact credential. The import applies descriptive
 `modelOverrides` to selected declarations, including partial prices. Transport options such as
 configuration headers, provider compatibility and command-based keys stay
-under host control.
+under host control. Codex Responses declarations use the Codex transport.
+The SDK defaults to SSE and uses a host-supplied OAuth access token on the
+exact `openai-codex` route. The typed client lets hosts select another Codex
+transport. ChatGPT plan clients use the separate `openai-responses` API.
 
 Hosts may resolve saved key variables with
 `AuthFileReadGrants::load_with_variables`. The resolver receives the exact
