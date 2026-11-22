@@ -25,7 +25,7 @@ pub(super) struct Stream {
     tool_results: Vec<Value>,
     calls: HashMap<Uuid, (Invocation, Option<String>)>,
     started_tools: HashSet<Uuid>,
-    result_metadata: HashMap<Uuid, Value>,
+    result_metadata: HashMap<Uuid, ToolResultMetadata>,
     pending_tools: HashMap<u64, PendingTool>,
     reasoning_items: HashMap<u64, (usize, bool)>,
     text_items: HashMap<u64, (usize, bool)>,
@@ -42,6 +42,16 @@ enum RetryAttempt {
     Initial,
     Waiting,
     Resumed,
+}
+
+#[derive(Default)]
+struct ToolResultMetadata {
+    structured_content: Option<Value>,
+    duration_ms: Option<u64>,
+}
+
+pub(super) fn tool_duration_ms(metadata: Option<&Value>) -> Option<u64> {
+    metadata.and_then(|metadata| metadata["durationMs"].as_u64())
 }
 
 struct PendingTool {
@@ -73,10 +83,14 @@ impl Stream {
         let mut events = Vec::new();
         match event["type"].as_str() {
             Some("internal_tool_result_metadata") => {
-                if let Some(id) = event["operationId"].as_str().and_then(|id| id.parse().ok())
-                    && let Some(content) = event.get("structuredContent")
-                {
-                    self.result_metadata.insert(id, content.clone());
+                if let Some(id) = event["operationId"].as_str().and_then(|id| id.parse().ok()) {
+                    self.result_metadata.insert(
+                        id,
+                        ToolResultMetadata {
+                            structured_content: event.get("structuredContent").cloned(),
+                            duration_ms: event["durationMs"].as_u64(),
+                        },
+                    );
                 }
             }
             Some("internal_tool_attempt") => {
@@ -180,10 +194,19 @@ impl Stream {
                 );
             }
             Notification::Committed(record) => {
-                if let Event::ToolFinished { operation_id, .. } = &record.event
-                    && let Some(content) = pi_rs::tool_result_event_metadata(*operation_id)
-                {
-                    self.result_metadata.insert(*operation_id, content);
+                if let Event::ToolFinished { operation_id, .. } = &record.event {
+                    let structured_content = pi_rs::tool_result_event_metadata(*operation_id);
+                    let duration_ms =
+                        tool_duration_ms(pi_rs::record_event_metadata(record.id).as_ref());
+                    if structured_content.is_some() || duration_ms.is_some() {
+                        self.result_metadata.insert(
+                            *operation_id,
+                            ToolResultMetadata {
+                                structured_content,
+                                duration_ms,
+                            },
+                        );
+                    }
                 }
                 self.record(record.event.clone(), args, &mut events)
             }
@@ -466,6 +489,10 @@ impl Stream {
                 outcome,
             } => {
                 self.started_tools.remove(&operation_id);
+                let metadata = self
+                    .result_metadata
+                    .remove(&operation_id)
+                    .unwrap_or_default();
                 if let Some((invocation, parent)) = self.calls.remove(&operation_id) {
                     let is_error = tool_failed(&outcome);
                     let mut result = tool_event_result_value(
@@ -473,21 +500,23 @@ impl Stream {
                         Some(&outcome),
                         Some(outcome.is_structured()),
                     );
-                    let sidecar = self.result_metadata.remove(&operation_id);
-                    if let Some(content) = &sidecar {
+                    if let Some(content) = &metadata.structured_content {
                         result["structuredContent"] = content.clone();
                     }
                     let mut event = json!({
                         "type":"tool_execution_end","toolCallId":invocation.call.id,
                         "toolName":invocation.call.name,"result":result,"isError":is_error,
                     });
+                    if let Some(duration_ms) = metadata.duration_ms {
+                        event["durationMs"] = json!(duration_ms);
+                    }
                     if let Some(parent) = &parent {
                         event["parentToolCallId"] = json!(parent);
                     }
                     events.push(event);
                     if parent.is_none() {
                         let mut message = result;
-                        if sidecar.is_some()
+                        if metadata.structured_content.is_some()
                             || matches!(outcome, Outcome::TextResultWithStructuredContent { .. })
                         {
                             message
@@ -499,6 +528,9 @@ impl Stream {
                         message["toolCallId"] = json!(invocation.call.id);
                         message["toolName"] = json!(invocation.call.name);
                         message["isError"] = json!(is_error);
+                        if let Some(duration_ms) = metadata.duration_ms {
+                            message["durationMs"] = json!(duration_ms);
+                        }
                         message["timestamp"] = json!(timestamp());
                         self.message(message.clone(), events);
                         self.tool_results.push(message);
@@ -1611,8 +1643,14 @@ mod streaming_tool_tests {
             ),
         );
         let metadata = json!("page\n\n[1 more line]");
-        stream.result_metadata.insert(other_id, json!("other"));
-        assert!(stream.observe(&json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":metadata}), &args).is_empty());
+        stream.result_metadata.insert(
+            other_id,
+            ToolResultMetadata {
+                structured_content: Some(json!("other")),
+                duration_ms: Some(500),
+            },
+        );
+        assert!(stream.observe(&json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":metadata, "durationMs":0}), &args).is_empty());
         let mut events = Vec::new();
         stream.record(
             Event::ToolFinished {
@@ -1628,12 +1666,20 @@ mod streaming_tool_tests {
             .find(|event| event["type"] == "tool_execution_end")
             .unwrap();
         assert_eq!(end["result"]["structuredContent"], metadata);
+        assert_eq!(end["durationMs"], 0);
+        assert!(end["result"].get("durationMs").is_none());
         let message = events
             .iter()
             .find(|event| event["type"] == "message_end")
             .unwrap();
         assert!(message["message"].get("structuredContent").is_none());
-        assert_eq!(stream.result_metadata.get(&other_id), Some(&json!("other")));
+        assert_eq!(
+            stream.result_metadata[&other_id].structured_content,
+            Some(json!("other"))
+        );
+        assert_eq!(stream.result_metadata[&other_id].duration_ms, Some(500));
+        assert_eq!(message["message"]["durationMs"], 0);
+        assert_eq!(stream.tool_results[0]["durationMs"], 0);
         assert!(!stream.result_metadata.contains_key(&operation_id));
     }
 
@@ -1679,11 +1725,13 @@ mod streaming_tool_tests {
             .unwrap();
         assert_eq!(end["result"]["content"], blocks);
         assert_eq!(end["result"]["structuredContent"], structured);
+        assert!(end.get("durationMs").is_none());
         let message = events
             .iter()
             .find(|event| event["type"] == "message_end")
             .unwrap();
         assert_eq!(message["message"]["content"], blocks);
+        assert!(message["message"].get("durationMs").is_none());
         assert!(message["message"].get("structuredContent").is_none());
     }
 

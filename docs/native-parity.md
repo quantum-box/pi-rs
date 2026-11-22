@@ -638,6 +638,10 @@ run with `agent_settled.aborted: true`. The interface emits native journal event
 alongside Pi-style
 message start, update and end events, including indexed text and reasoning
 blocks, tool calls, tool results and turn boundaries.
+JSON and RPC `tool_execution_end` events and tool result messages include
+`durationMs` for dispatched tools. The native journal stores this measurement
+as presentation metadata so RPC history can reproduce it. Results rejected
+before execution omit the field.
 `toolcall_start` includes the ID and tool name available at that point.
 JSON and RPC emit `tool_execution_start` before preparation and authorization,
 including for rejected attempts. As in Pi, unparseable or non-object arguments

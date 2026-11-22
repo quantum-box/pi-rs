@@ -3917,6 +3917,7 @@ impl Agent<'_> {
                 observer,
                 replies,
                 false,
+                None,
             )?;
         }
         Ok(())
@@ -3954,6 +3955,7 @@ impl Agent<'_> {
         observer: &mut Observer<'_>,
         replies: Option<&HashMap<Uuid, ReplySnapshot>>,
         allow_event_metadata: bool,
+        duration_ms: Option<u64>,
     ) -> Result<()> {
         let ToolReply {
             outcome,
@@ -4061,6 +4063,7 @@ impl Agent<'_> {
                 },
                 observer,
                 replies,
+                duration_ms,
             )
         })?;
         if let Some(error) = waiting {
@@ -7365,27 +7368,36 @@ fn commit_with_reply(
     event: Event,
     observer: &mut Observer<'_>,
     replies: Option<&HashMap<Uuid, ReplySnapshot>>,
+    duration_ms: Option<u64>,
 ) -> Result<()> {
-    let snapshot = match &event {
-        Event::ToolFinished { operation_id, .. } => {
-            replies.and_then(|replies| replies.get(operation_id))
-        }
+    let reply = match &event {
+        Event::ToolFinished {
+            operation_id,
+            outcome,
+            ..
+        } => replies
+            .and_then(|replies| replies.get(operation_id))
+            .map(|snapshot| {
+                (
+                    snapshot.lock().expect("nested reply snapshot"),
+                    outcome.clone(),
+                )
+            }),
         _ => None,
     };
-    if let Some(snapshot) = snapshot {
-        let mut snapshot = snapshot.lock().expect("nested reply snapshot");
-        let outcome = match &event {
-            Event::ToolFinished { outcome, .. } => outcome.clone(),
-            _ => unreachable!(),
-        };
-        let record = session.append(event)?;
-        *snapshot = Some(outcome);
-        drop(snapshot);
-        observer(Notification::Committed(record));
-        Ok(())
+    let metadata = duration_ms.map(|duration| serde_json::json!({"durationMs":duration}));
+    let record = if metadata.is_some() {
+        session.append_with_advisory_metadata(event, metadata.clone())?
     } else {
-        commit(session, event, observer)
+        session.append(event)?
+    };
+    if let Some((mut snapshot, outcome)) = reply {
+        *snapshot = Some(outcome);
     }
+    with_record_event_metadata(record.id, metadata, || {
+        observer(Notification::Committed(record));
+    });
+    Ok(())
 }
 
 async fn receive_input<T>(inputs: &mut Option<&mut mpsc::Receiver<T>>) -> Option<T> {
