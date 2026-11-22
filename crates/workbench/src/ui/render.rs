@@ -5127,6 +5127,7 @@ mod tests {
             .join("\n");
         let entry = Entry::Tool {
             id: "edit-14".into(),
+            call_id: None,
             name: "edit".into(),
             arguments: r#"{"file_path":"sample.txt"}"#.into(),
             output,
