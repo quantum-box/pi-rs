@@ -16,6 +16,8 @@ impl Model for Script {
                 ("ls-zero", "ls", json!({"limit": 0})),
                 ("ls-negative", "ls", json!({"limit": -2})),
                 ("ls-fraction", "ls", json!({"limit": 1.5})),
+                ("ls-fraction-two", "ls", json!({"limit": 2.99})),
+                ("ls-exact", "ls", json!({"limit": 3})),
                 ("ls-huge", "ls", json!({"limit": 1e100})),
                 ("ls-missing", "ls", json!({"path": "missing"})),
                 (
@@ -32,6 +34,8 @@ impl Model for Script {
                     "find",
                     json!({"pattern":"*", "limit": 1.5}),
                 ),
+                ("find-two", "find", json!({"pattern":"*", "limit": 2.99})),
+                ("find-exact", "find", json!({"pattern":"*", "limit": 3})),
                 (
                     "find-large",
                     "find",
@@ -113,7 +117,7 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
         .into_iter()
         .map(|(invocation, state)| (invocation.call.id, state))
         .collect();
-    for call_id in ["ls-missing", "grep-missing", "read-offset", "find-fraction"]
+    for call_id in ["ls-missing", "grep-missing", "read-offset", "find-exp"]
         .into_iter()
         .chain(cfg!(unix).then_some("bash-timeout"))
     {
@@ -144,22 +148,23 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
             _ => None,
         })
         .collect();
+    for id in ["ls-float", "ls-zero", "ls-negative", "ls-fraction"] {
+        assert_eq!(
+            replies[id],
+            (
+                "a\n\n[1 entries limit reached. Use limit=2 for more]",
+                false
+            )
+        );
+    }
     assert_eq!(
-        replies["ls-float"],
+        replies["ls-fraction-two"],
         (
-            "a\n\n[1 entries limit reached. Use limit=2 for more]",
+            "a\nb\n\n[2 entries limit reached. Use limit=4 for more]",
             false
         )
     );
-    assert_eq!(replies["ls-zero"], ("(empty directory)", false));
-    assert_eq!(replies["ls-negative"], ("(empty directory)", false));
-    assert_eq!(
-        replies["ls-fraction"],
-        (
-            "a\nb\n\n[1.5 entries limit reached. Use limit=3 for more]",
-            false
-        )
-    );
+    assert_eq!(replies["ls-exact"], ("a\nb\nc", false));
     assert_eq!(replies["ls-huge"], ("a\nb\nc", false));
     let missing = format!(
         "Path not found: {}",
@@ -180,34 +185,23 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
         replies["read-offset"],
         ("Offset 9 is beyond end of file (1 lines total)", true)
     );
+    for id in ["find-float", "find-zero", "find-negative", "find-fraction"] {
+        assert_eq!(
+            replies[id],
+            (
+                "a\n\n[1 results limit reached. Use limit=2 for more, or refine pattern]",
+                false
+            )
+        );
+    }
     assert_eq!(
-        replies["find-float"],
+        replies["find-two"],
         (
-            "a\n\n[1 results limit reached. Use limit=2 for more, or refine pattern]",
+            "a\nb\n\n[2 results limit reached. Use limit=4 for more, or refine pattern]",
             false
         )
     );
-    assert_eq!(
-        replies["find-zero"],
-        (
-            "a\nb\nc\n\n[0 results limit reached. Use limit=0 for more, or refine pattern]",
-            false
-        )
-    );
-    assert_eq!(
-        replies["find-negative"],
-        (
-            "error: a value is required for '--max-results <count>' but none was supplied\n\nFor more information, try '--help'.",
-            true
-        )
-    );
-    assert_eq!(
-        replies["find-fraction"],
-        (
-            "error: invalid value '1.5' for '--max-results <count>': invalid digit found in string\n\nFor more information, try '--help'.",
-            true
-        )
-    );
+    assert_eq!(replies["find-exact"], ("a\nb\nc", false));
     assert_eq!(
         replies["find-large"],
         (
@@ -215,8 +209,16 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
             true
         )
     );
-    assert_eq!(replies["find-missing-fraction"], replies["find-fraction"]);
-    assert_eq!(replies["find-missing-negative"], replies["find-negative"]);
+    assert_eq!(
+        replies["find-missing-fraction"],
+        replies["find-missing-negative"]
+    );
+    assert!(
+        replies["find-missing-fraction"]
+            .0
+            .contains("is not a directory.")
+    );
+    assert!(replies["find-missing-fraction"].1);
     assert_eq!(replies["find-missing-large"], replies["find-exp"]);
     assert_eq!(
         replies["find-exp"],
