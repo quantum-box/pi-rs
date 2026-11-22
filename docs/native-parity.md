@@ -1146,8 +1146,29 @@ and the CLI closes connections after each run.
 In the terminal, `/mcp` now opens a server list with each server's status,
 scope, tool count and exposure. Select one to inspect its description and
 the announced tools with their effective exposure. The view reflects the
-configuration loaded by the running session. Use the CLI MCP commands to
-manage configuration and credentials.
+configuration loaded by the running session. Reconnect restarts the selected
+server and updates the available tools in the current session. The previous
+tools are withdrawn if reconnection fails. If the selected server changed
+on disk, reload the session before reconnecting. Terminal and loopback model
+checks covered a stale tool being replaced, a failed restart withdrawing that
+tool, and a later retry restoring access. Enable and Disable update the
+configuration scope shown for the server and take effect in the current
+session. The project-only action adds an override for a global server in a
+trusted project. Exposure changes between codemode, deferred and direct
+save to the server's effective configuration scope and update the model's
+tool declarations without restarting the connection. Per-tool overrides
+retain precedence. Extension-registered servers retain their extension scope
+and their extension controls their enabled state and exposure. The manager offers Sign in for a server requiring OAuth
+and Sign out for a live OAuth connection. Sign-in opens the browser, checks
+the applied configuration before saving credentials, and reconnects the
+server. Sign-in can validate a read-only trusted project without creating
+a project lock file there. Sign-out clears the selected server's stored credentials and removes
+its live tools. The sign-in panel shows the authorization URL and can accept
+a pasted redirect URL if the browser cannot reach the loopback callback.
+Both routes validate the callback origin, path and OAuth state. Loopback
+tests covered nonstandard metadata discovery, browser and pasted callbacks,
+a rejected state, sign-out and a reconnect failure after sign-in. Hosted
+OAuth with a pi-rs client identity still requires live acceptance.
 
 Trusted project overrides of a global MCP server reject unknown fields and
 invalid values before applying any part of that override, so a typo or
@@ -3712,8 +3733,12 @@ delay ceiling using Codex's own policy. It uses exponential backoff from one
 second and handles numeric or HTTP-date retry delays before accepting the stream.
 Native keeps its bounded, redacted error handling and stops immediately for
 permanent quota errors, context overflow, and oversized requests. Codex
-WebSocket timeouts, Google
-Gemini provider retries, and summary-specific retry policy remain open.
+WebSocket timeouts and summary-specific retry policy remain open.
+
+Google Gemini and Vertex AI honor the configured retry count for HTTP 408,
+409, 429, and server errors, using exponential backoff. Pi 1.6's Google adapters
+receive no retry headers from the SDK and leave transport errors and
+`retry.provider.timeoutMs` outside this policy.
 
 Tests cover recovery, request and retry caps, queued input, wait cancellation,
 dropped-wait cleanup and usage-settlement failures. Loopback RPC checks verify
@@ -5272,7 +5297,19 @@ Codemode lists classifier and image entries using `models.getModelsOfType`,
 `models.getAvailableOfType`, and `models.getModelOfType`. Scripts invoke System
 One classifiers with `models.classify` and OpenRouter image models with
 `models.generateImages`. Model credentials remain in the native host and
-provider responses enter the same journal as other nested tool calls. Native
+provider responses enter the same journal as other nested tool calls.
+Codemode also lists and runs GitHub Copilot's `microsoft-decision-1` classifier
+from Pi 1.6.0 via `/v1/systemone`. A saved Copilot subscription, a key saved
+for the official Copilot chat endpoint, or `COPILOT_GITHUB_TOKEN` makes it available. Discovery does not refresh the
+subscription or filter this classifier by the subscription's chat model list.
+Requests with a saved subscription use the token's official individual,
+business or enterprise Copilot host. A saved Enterprise domain also scopes
+the account's classifier route, just as it scopes the chat route.
+An unversioned custom base also uses
+`/v1/systemone` relative to its configured path. Native also accepts an
+explicit versioned base or classifier endpoint. Custom endpoints need their
+own scoped credentials. Live Copilot classifier requests were not verified.
+Native
 `models.json` also accepts configured entries with `type: "classifier"` or
 `type: "image"` for supported endpoints.
 Cloudflare Workers AI System One classifiers include Pi's five pinned catalog

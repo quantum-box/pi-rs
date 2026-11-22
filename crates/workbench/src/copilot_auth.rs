@@ -11,6 +11,8 @@ const GITHUB_ACCESS_URL: &str = "https://github.com/login/oauth/access_token";
 const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 const TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 const API: &str = "api.individual.githubcopilot.com";
+pub(super) const CLASSIFIER_ENDPOINT: &str =
+    "https://api.individual.githubcopilot.com/v1/systemone";
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -120,18 +122,31 @@ pub(super) fn routed_endpoint(endpoint: &str, credential: &Credential) -> Result
             "saved credentials require an official Copilot API route",
         ));
     }
-    let mut url = Url::parse(endpoint).map_err(|_| error("invalid API endpoint"))?;
+    let url = Url::parse(endpoint).map_err(|_| error("invalid API endpoint"))?;
     if url.scheme() != "https" || url.host_str() != Some(API) || url.port().is_some() {
         return Err(error(
             "saved credentials require an official Copilot API route",
         ));
     }
+    Ok(route_subscriber_endpoint(url, credential)?.to_string())
+}
+
+pub(super) fn routed_classifier_endpoint(endpoint: &Url, credential: &Credential) -> Result<Url> {
+    if endpoint.as_str() != CLASSIFIER_ENDPOINT {
+        return Err(error(
+            "saved credentials require the official Copilot classifier endpoint",
+        ));
+    }
+    route_subscriber_endpoint(endpoint.clone(), credential)
+}
+
+fn route_subscriber_endpoint(mut url: Url, credential: &Credential) -> Result<Url> {
     url.set_host(Some(&endpoint_host(
         &credential.access,
         credential.enterprise_url.as_deref(),
     )?))
     .map_err(|_| error("invalid API endpoint"))?;
-    Ok(url.to_string())
+    Ok(url)
 }
 
 fn poll_interval(seconds: &Value) -> Option<Duration> {
@@ -396,6 +411,16 @@ pub(super) async fn access(
     minimum: Option<Duration>,
     no_refresh: bool,
 ) -> Result<String> {
+    credential(settings, minimum, no_refresh)
+        .await
+        .map(|credential| credential.access)
+}
+
+pub(super) async fn credential(
+    settings: &super::config::Settings,
+    minimum: Option<Duration>,
+    no_refresh: bool,
+) -> Result<Credential> {
     credential_for_path(
         &super::config::agent_dir().join("auth.json"),
         settings,
@@ -403,7 +428,6 @@ pub(super) async fn access(
         no_refresh,
     )
     .await
-    .map(|credential| credential.access)
 }
 
 pub(super) async fn credential_for_path(
@@ -878,6 +902,60 @@ mod tests {
             original[PROVIDER]["enterpriseUrl"]
         );
         assert_eq!(saved[PROVIDER]["access"], "enterprise-access-fixture");
+    }
+
+    #[test]
+    fn classifier_routes_only_to_account_copilot_hosts() {
+        let endpoint = Url::parse(CLASSIFIER_ENDPOINT).unwrap();
+        let credential = |token, enterprise| {
+            read_entry(&json!({
+                "access":token,
+                "refresh":"fixture",
+                "expires":1,
+                "enterpriseUrl":enterprise,
+            }))
+            .unwrap()
+        };
+        for (token, host) in [
+            ("fixture", "api.individual.githubcopilot.com"),
+            (
+                "proxy-ep=proxy.business.githubcopilot.com",
+                "api.business.githubcopilot.com",
+            ),
+            (
+                "proxy-ep=proxy.enterprise.githubcopilot.com",
+                "api.enterprise.githubcopilot.com",
+            ),
+        ] {
+            let routed = routed_classifier_endpoint(&endpoint, &credential(token, None)).unwrap();
+            assert_eq!(routed.as_str(), format!("https://{host}/v1/systemone"));
+        }
+        let enterprise = Some("example.ghe.com");
+        for (token, host) in [
+            ("fixture", "copilot-api.example.ghe.com"),
+            ("proxy-ep=proxy.example.ghe.com", "api.example.ghe.com"),
+        ] {
+            let routed =
+                routed_classifier_endpoint(&endpoint, &credential(token, enterprise)).unwrap();
+            assert_eq!(routed.as_str(), format!("https://{host}/v1/systemone"));
+        }
+        for domain in [None, enterprise] {
+            let foreign = credential("proxy-ep=other.invalid", domain);
+            assert!(routed_classifier_endpoint(&endpoint, &foreign).is_err());
+        }
+        for endpoint in [
+            "https://other.invalid/v1/systemone",
+            "https://api.individual.githubcopilot.com/systemone",
+            "https://api.individual.githubcopilot.com/v1/systemone?redirect=fixture",
+        ] {
+            assert!(
+                routed_classifier_endpoint(
+                    &Url::parse(endpoint).unwrap(),
+                    &credential("fixture", enterprise)
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
