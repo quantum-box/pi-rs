@@ -417,7 +417,7 @@ fn http_client(settings: &super::config::Settings) -> Result<Client> {
 pub(super) async fn access(
     auth_path: &std::path::Path,
     settings: &super::config::Settings,
-    minimum: Duration,
+    minimum: Option<Duration>,
     no_refresh: bool,
 ) -> Result<String> {
     let origin = Url::parse(TOKEN_ENDPOINT).expect("official OpenAI OAuth token URL");
@@ -429,7 +429,7 @@ async fn access_at(
     path: &std::path::Path,
     client: &Client,
     token_endpoint: &Url,
-    minimum: Duration,
+    minimum: Option<Duration>,
     no_refresh: bool,
 ) -> Result<String> {
     fn saved(data: &Value) -> Result<Credential> {
@@ -443,24 +443,27 @@ async fn access_at(
     if no_refresh {
         return Ok(saved(&super::config::read_auth_object(path).await?)?.access);
     }
-    let minimum_ms = minimum.as_millis().min(u128::from(u64::MAX)) as u64;
-    let fresh =
-        |value: &Credential| value.expires > now_ms().saturating_add(minimum_ms.max(30_000));
+    let window_ms = minimum
+        .unwrap_or_default()
+        .max(super::model_auth::PI_OAUTH_MINIMUM_VALIDITY)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let fresh = move |expires: u64| expires > now_ms().saturating_add(window_ms);
     let guard = match super::auth_lock::acquire_async(path).await {
         Ok(guard) => guard,
         Err(err) => {
             let auth = super::config::read_readonly_auth(path, err)?;
             let stored = saved(&auth)?;
-            if fresh(&stored) {
+            if fresh(stored.expires) {
                 return Ok(stored.access);
             }
             return Err(error("cannot refresh credentials in a read-only store"));
         }
     };
-    let auth = super::config::read_object_unlocked(path)?;
+    let auth = super::config::read_auth_object_locked(&guard)?;
     let stored = saved(&auth)?;
     guard.check()?;
-    if fresh(&stored) {
+    if fresh(stored.expires) {
         return Ok(stored.access);
     }
     let path = path.to_path_buf();
@@ -468,13 +471,14 @@ async fn access_at(
     let client = client.clone();
     let token_endpoint = token_endpoint.clone();
     // Keep the exchange and disk write alive if the requesting turn is cancelled.
-    tokio::task::spawn_blocking(move || {
+    super::model_auth::await_admitted_oauth_refresh(Some(PROVIDER), move |admitted| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| error("cannot start refresh runtime"))?;
         let barrier = super::process::refresh_barrier()?;
         let guard = super::process::guard_refresh_auth(barrier, guard);
+        let _ = admitted.send(());
         let replacement =
             runtime.block_on(refresh_token(&client, token_endpoint, &stored.refresh))?;
         let Credential {
@@ -501,13 +505,12 @@ async fn access_at(
             entry.insert("expires".into(), Value::from(expires));
             Ok(())
         })?;
-        if expires <= now_ms().saturating_add(minimum_ms) {
+        if minimum.is_some() && !fresh(expires) {
             return Err(error("refreshed token expires too soon"));
         }
         Ok(access)
     })
     .await
-    .map_err(|_| error("refresh task failed"))?
 }
 
 async fn refresh_token(client: &Client, token_endpoint: Url, refresh: &str) -> Result<Credential> {
@@ -546,15 +549,98 @@ mod tests {
         format!("e30.{payload}.{signature}")
     }
 
+    fn read_token_form(socket: &mut std::net::TcpStream) -> String {
+        let mut socket = BufReader::new(socket);
+        let mut line = String::new();
+        socket.read_line(&mut line).unwrap();
+        assert!(line.starts_with("POST /oauth/token "));
+        let mut length = 0;
+        loop {
+            line.clear();
+            socket.read_line(&mut line).unwrap();
+            if line.trim().is_empty() {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        let mut form = vec![0; length];
+        socket.read_exact(&mut form).unwrap();
+        String::from_utf8(form).unwrap()
+    }
+
+    #[tokio::test]
+    async fn short_codex_refresh_is_saved_before_explicit_validity_is_enforced() {
+        for minimum in [None, Some(Duration::ZERO)] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("auth.json");
+            let entry = json!({ "openai-codex": {
+                "type":"oauth", "access":fake_jwt("old"), "refresh":"old-fixture",
+                "expires":now_ms()+120_000
+            } });
+            std::fs::write(&path, entry.to_string()).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = Url::parse(&format!(
+                "http://{}/oauth/token",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let form = read_token_form(&mut socket);
+                assert!(form.contains("refresh_token=old-fixture"));
+                let body = json!({
+                    "access_token":fake_jwt("short"),
+                    "refresh_token":"rotated-short",
+                    "expires_in":180
+                })
+                .to_string();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).unwrap();
+            });
+            let client = Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap();
+            let result = access_at(&path, &client, &endpoint, minimum, false).await;
+            if minimum.is_some() {
+                assert!(result.unwrap_err().to_string().contains("expires too soon"));
+            } else {
+                assert_eq!(result.unwrap(), fake_jwt("short"));
+            }
+            worker.join().unwrap();
+            let saved = crate::config::read_auth_object(&path).await.unwrap();
+            assert_eq!(saved[PROVIDER]["refresh"], "rotated-short");
+        }
+    }
+
     #[tokio::test]
     async fn imported_codex_tokens_refresh_once_and_preserve_foreign_auth_fields() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("auth.json");
         let old = fake_jwt("old");
         std::fs::write(&path, serde_json::to_vec(&json!({
-            "openai-codex":{"type":"oauth","access":old,"refresh":"old-fixture","expires":1,"extra":"preserved"},
+            "openai-codex":{"type":"oauth","access":old,"refresh":"old-fixture","expires":now_ms()+120_000,"extra":"preserved"},
             "openai-chatgpt":{"type":"oauth","access":"fixture-placeholder"}
         })).unwrap()).unwrap();
+        #[cfg(unix)]
+        let alias = {
+            let directory = temp.path().join("alias");
+            std::fs::create_dir(&directory).unwrap();
+            let alias = directory.join("auth.json");
+            std::os::unix::fs::symlink("../auth.json", &alias).unwrap();
+            alias
+        };
+        #[cfg(not(unix))]
+        let alias = path.clone();
         let fresh = fake_jwt("new");
         let expected = fresh.clone();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -566,28 +652,11 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let (socket, _) = listener.accept().unwrap();
+            let (mut socket, _) = listener.accept().unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
-            let mut socket = BufReader::new(socket);
-            let mut line = String::new();
-            socket.read_line(&mut line).unwrap();
-            assert!(line.starts_with("POST /oauth/token "));
-            let mut length = 0;
-            loop {
-                line.clear();
-                socket.read_line(&mut line).unwrap();
-                if line.trim().is_empty() {
-                    break;
-                }
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = value.trim().parse().unwrap();
-                }
-            }
-            let mut form = vec![0; length];
-            socket.read_exact(&mut form).unwrap();
-            let form = String::from_utf8(form).unwrap();
+            let form = read_token_form(&mut socket);
             assert!(form.contains("grant_type=refresh_token&refresh_token=old-fixture"));
             assert!(form.contains(CLIENT_ID));
             started_tx.send(()).unwrap();
@@ -597,7 +666,7 @@ mod tests {
             })
             .to_string();
             write!(
-                socket.get_mut(),
+                socket,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
                 response.len(),
             ).unwrap();
@@ -608,19 +677,19 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            access_at(&path, &client, &endpoint, Duration::ZERO, true)
+            access_at(&path, &client, &endpoint, None, true)
                 .await
                 .unwrap(),
             old
         );
         let (cancelled_path, cancelled_client, cancelled_endpoint) =
-            (path.clone(), client.clone(), endpoint.clone());
+            (alias.clone(), client.clone(), endpoint.clone());
         let cancelled = tokio::spawn(async move {
             access_at(
                 &cancelled_path,
                 &cancelled_client,
                 &cancelled_endpoint,
-                Duration::ZERO,
+                None,
                 false,
             )
             .await
@@ -633,8 +702,8 @@ mod tests {
         assert!(cancelled.await.unwrap_err().is_cancelled());
         reply_tx.send(()).unwrap();
         let (first, second) = tokio::join!(
-            access_at(&path, &client, &endpoint, Duration::ZERO, false),
-            access_at(&path, &client, &endpoint, Duration::ZERO, false),
+            access_at(&path, &client, &endpoint, None, false),
+            access_at(&alias, &client, &endpoint, None, false),
         );
         assert_eq!(first.unwrap(), expected);
         assert_eq!(second.unwrap(), expected);
@@ -644,6 +713,8 @@ mod tests {
         assert_eq!(data[PROVIDER]["accountId"], "fixture-account");
         assert_eq!(data[PROVIDER]["extra"], "preserved");
         assert_eq!(data["openai-chatgpt"]["access"], "fixture-placeholder");
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(&alias).unwrap().is_symlink());
     }
 
     #[cfg(unix)]
@@ -676,8 +747,15 @@ mod tests {
         }
         let client = Client::builder().no_proxy().build().unwrap();
         let endpoint = Url::parse("http://127.0.0.1:1/oauth/token").unwrap();
-        let fresh = access_at(&path, &client, &endpoint, Duration::ZERO, false).await;
-        let expired = access_at(&path, &client, &endpoint, Duration::from_secs(1800), false).await;
+        let fresh = access_at(&path, &client, &endpoint, None, false).await;
+        let expired = access_at(
+            &path,
+            &client,
+            &endpoint,
+            Some(Duration::from_secs(1800)),
+            false,
+        )
+        .await;
         std::fs::set_permissions(temp.path(), original).unwrap();
         assert_eq!(fresh.unwrap(), access);
         assert!(expired.unwrap_err().to_string().contains("read-only store"));

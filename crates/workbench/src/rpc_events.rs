@@ -14,7 +14,7 @@ use super::Cli;
 
 #[derive(Default)]
 pub(super) struct Stream {
-    pub messages: Vec<Value>,
+    messages: Vec<Value>,
     assistant: Value,
     request_id: Option<Uuid>,
     started: bool,
@@ -25,12 +25,33 @@ pub(super) struct Stream {
     tool_results: Vec<Value>,
     calls: HashMap<Uuid, (Invocation, Option<String>)>,
     started_tools: HashSet<Uuid>,
-    result_metadata: HashMap<Uuid, Value>,
+    result_metadata: HashMap<Uuid, ToolResultMetadata>,
     pending_tools: HashMap<u64, PendingTool>,
     reasoning_items: HashMap<u64, (usize, bool)>,
     text_items: HashMap<u64, (usize, bool)>,
     aborted: bool,
     summary: bool,
+    retryable_failure: bool,
+    retry_attempt: RetryAttempt,
+    retry_end: Option<Value>,
+}
+
+#[derive(Default, PartialEq)]
+enum RetryAttempt {
+    #[default]
+    Initial,
+    Waiting,
+    Resumed,
+}
+
+#[derive(Default)]
+struct ToolResultMetadata {
+    structured_content: Option<Value>,
+    duration_ms: Option<u64>,
+}
+
+pub(super) fn tool_duration_ms(metadata: Option<&Value>) -> Option<u64> {
+    metadata.and_then(|metadata| metadata["durationMs"].as_u64())
 }
 
 struct PendingTool {
@@ -62,10 +83,14 @@ impl Stream {
         let mut events = Vec::new();
         match event["type"].as_str() {
             Some("internal_tool_result_metadata") => {
-                if let Some(id) = event["operationId"].as_str().and_then(|id| id.parse().ok())
-                    && let Some(content) = event.get("structuredContent")
-                {
-                    self.result_metadata.insert(id, content.clone());
+                if let Some(id) = event["operationId"].as_str().and_then(|id| id.parse().ok()) {
+                    self.result_metadata.insert(
+                        id,
+                        ToolResultMetadata {
+                            structured_content: event.get("structuredContent").cloned(),
+                            duration_ms: event["durationMs"].as_u64(),
+                        },
+                    );
                 }
             }
             Some("internal_tool_attempt") => {
@@ -76,6 +101,10 @@ impl Stream {
             Some("summary_request_start") => {
                 self.finish_turn(&mut events);
                 self.summary = true;
+                self.retryable_failure = false;
+            }
+            Some("auto_retry_start" | "auto_retry_end") => {
+                self.retry(event.clone(), &mut events);
             }
             Some("record") => {
                 if let Ok(record) = Record::deserialize(&event["record"]) {
@@ -156,12 +185,28 @@ impl Stream {
             Notification::SummaryRequest => {
                 self.finish_turn(&mut events);
                 self.summary = true;
+                self.retryable_failure = false;
+            }
+            Notification::Retry(event) => {
+                self.retry(
+                    serde_json::to_value(event).expect("retry event"),
+                    &mut events,
+                );
             }
             Notification::Committed(record) => {
-                if let Event::ToolFinished { operation_id, .. } = &record.event
-                    && let Some(content) = pi_rs::tool_result_event_metadata(*operation_id)
-                {
-                    self.result_metadata.insert(*operation_id, content);
+                if let Event::ToolFinished { operation_id, .. } = &record.event {
+                    let structured_content = pi_rs::tool_result_event_metadata(*operation_id);
+                    let duration_ms =
+                        tool_duration_ms(pi_rs::record_event_metadata(record.id).as_ref());
+                    if structured_content.is_some() || duration_ms.is_some() {
+                        self.result_metadata.insert(
+                            *operation_id,
+                            ToolResultMetadata {
+                                structured_content,
+                                duration_ms,
+                            },
+                        );
+                    }
                 }
                 self.record(record.event.clone(), args, &mut events)
             }
@@ -214,7 +259,25 @@ impl Stream {
         Some(event)
     }
 
-    pub fn settle(&mut self, aborted: bool) -> Vec<Value> {
+    fn retry(&mut self, event: Value, events: &mut Vec<Value>) {
+        if event["type"] == "auto_retry_start" && std::mem::take(&mut self.retryable_failure) {
+            events.push(self.agent_end(false, true));
+            self.retry_attempt = RetryAttempt::Waiting;
+        } else if event["type"] == "auto_retry_end" && self.retry_attempt == RetryAttempt::Resumed {
+            // A resumed attempt reports recovery after message_end and reports
+            // exhaustion after its terminal agent_end.
+            self.retry_end = Some(event);
+            return;
+        }
+        events.push(event);
+    }
+
+    fn agent_end(&mut self, success: bool, will_retry: bool) -> Value {
+        let messages = std::mem::take(&mut self.messages);
+        json!({"type":"agent_end","success":success,"messages":messages,"willRetry":will_retry})
+    }
+
+    pub fn settle(&mut self, aborted: bool, success: bool) -> Vec<Value> {
         self.aborted |= aborted;
         let mut events = Vec::new();
         if !self.assistant.is_null() && !self.ended {
@@ -227,6 +290,11 @@ impl Stream {
             self.finish_message(None, &mut events);
         }
         self.finish_turn(&mut events);
+        // A retry cancelled during the wait has already ended its last attempt.
+        if self.retry_attempt != RetryAttempt::Waiting {
+            events.push(self.agent_end(success, false));
+        }
+        events.extend(self.retry_end.take());
         events
     }
 
@@ -248,6 +316,7 @@ impl Stream {
                 // Pi emits a turn for every assistant response and tool batch.
                 self.finish_turn(events);
                 self.begin_turn(events);
+                self.retryable_failure = false;
                 self.started = false;
                 self.ended = false;
                 self.request_id = request_id;
@@ -272,6 +341,7 @@ impl Stream {
                 if let Some(failure) = failure
                     && !self.assistant.is_null()
                 {
+                    self.retryable_failure = failure == ModelFailure::Retryable;
                     self.aborted |= failure == ModelFailure::Cancelled;
                     self.assistant["stopReason"] =
                         json!(if self.aborted { "aborted" } else { "error" });
@@ -383,6 +453,14 @@ impl Stream {
                         });
                 }
                 self.finish_message(Some(content), events);
+                if self
+                    .retry_end
+                    .as_ref()
+                    .is_some_and(|event| event["success"] == true)
+                {
+                    events.extend(self.retry_end.take());
+                    self.retry_attempt = RetryAttempt::Initial;
+                }
             }
             Event::ToolPlanned {
                 invocation,
@@ -411,6 +489,10 @@ impl Stream {
                 outcome,
             } => {
                 self.started_tools.remove(&operation_id);
+                let metadata = self
+                    .result_metadata
+                    .remove(&operation_id)
+                    .unwrap_or_default();
                 if let Some((invocation, parent)) = self.calls.remove(&operation_id) {
                     let is_error = tool_failed(&outcome);
                     let mut result = tool_event_result_value(
@@ -418,21 +500,23 @@ impl Stream {
                         Some(&outcome),
                         Some(outcome.is_structured()),
                     );
-                    let sidecar = self.result_metadata.remove(&operation_id);
-                    if let Some(content) = &sidecar {
+                    if let Some(content) = &metadata.structured_content {
                         result["structuredContent"] = content.clone();
                     }
                     let mut event = json!({
                         "type":"tool_execution_end","toolCallId":invocation.call.id,
                         "toolName":invocation.call.name,"result":result,"isError":is_error,
                     });
+                    if let Some(duration_ms) = metadata.duration_ms {
+                        event["durationMs"] = json!(duration_ms);
+                    }
                     if let Some(parent) = &parent {
                         event["parentToolCallId"] = json!(parent);
                     }
                     events.push(event);
                     if parent.is_none() {
                         let mut message = result;
-                        if sidecar.is_some()
+                        if metadata.structured_content.is_some()
                             || matches!(outcome, Outcome::TextResultWithStructuredContent { .. })
                         {
                             message
@@ -444,6 +528,9 @@ impl Stream {
                         message["toolCallId"] = json!(invocation.call.id);
                         message["toolName"] = json!(invocation.call.name);
                         message["isError"] = json!(is_error);
+                        if let Some(duration_ms) = metadata.duration_ms {
+                            message["durationMs"] = json!(duration_ms);
+                        }
                         message["timestamp"] = json!(timestamp());
                         self.message(message.clone(), events);
                         self.tool_results.push(message);
@@ -456,6 +543,10 @@ impl Stream {
     }
 
     fn begin_turn(&mut self, events: &mut Vec<Value>) {
+        if self.retry_attempt == RetryAttempt::Waiting {
+            self.retry_attempt = RetryAttempt::Resumed;
+            events.push(json!({"type":"agent_start"}));
+        }
         if !self.turn {
             self.turn = true;
             events.push(json!({"type":"turn_start"}));
@@ -923,6 +1014,60 @@ pub(super) fn tool_event_result_value(
     result
 }
 
+pub(super) fn auto_compaction_value(
+    reason: pi_rs::CompactionTrigger,
+    update: &pi_rs::AutoCompactionUpdate,
+) -> Value {
+    use pi_rs::AutoCompactionUpdate;
+
+    match update {
+        AutoCompactionUpdate::Started => json!({"type":"compaction_start","reason":reason}),
+        AutoCompactionUpdate::Completed {
+            compaction_entry,
+            details,
+            estimated_tokens_after,
+            will_retry,
+        } => {
+            let Event::Compacted {
+                summary,
+                retain_from,
+                tokens_before,
+                usage,
+                usage_metadata,
+                ..
+            } = &compaction_entry.event
+            else {
+                unreachable!("completed automatic compaction must have a compaction record");
+            };
+            let mut result = json!({
+                "summary":summary,
+                "firstKeptEntryId":retain_from.unwrap_or(compaction_entry.id).to_string(),
+                "tokensBefore":tokens_before.unwrap_or_default(),
+                "estimatedTokensAfter":estimated_tokens_after,
+            });
+            if let Some(usage) = usage {
+                let metadata = usage_metadata.as_ref().map(|usage| &usage.metadata);
+                result["usage"] =
+                    usage_value(*usage, metadata.unwrap_or(&ModelMetadata::default()));
+            }
+            if let Some(details) = details {
+                result["details"] = details.clone();
+            }
+            json!({"type":"compaction_end","reason":reason,"aborted":false,"willRetry":will_retry,"result":result})
+        }
+        AutoCompactionUpdate::Failed {
+            aborted,
+            error_message,
+        } => {
+            let mut event = json!({"type":"compaction_end","reason":reason,"aborted":aborted,"willRetry":false});
+            if let Some(error_message) = error_message {
+                event["errorMessage"] = json!(error_message);
+            }
+            event
+        }
+    }
+}
+
 pub(super) fn usage_value(usage: Usage, metadata: &ModelMetadata) -> Value {
     let read = metadata.cached_input_tokens.unwrap_or_default();
     let write = metadata.cache_creation_input_tokens.unwrap_or_default();
@@ -937,6 +1082,9 @@ pub(super) fn usage_value(usage: Usage, metadata: &ModelMetadata) -> Value {
             "total":metadata.cost_usd.as_ref().and_then(serde_json::Number::as_f64).unwrap_or_default()
         },
     });
+    if let Some(reasoning) = metadata.reasoning_output_tokens {
+        value["reasoning"] = json!(reasoning);
+    }
     if let Some(long) = metadata.cache_write_1h_tokens {
         value["cacheWrite1h"] = json!(long);
     }
@@ -956,6 +1104,28 @@ fn timestamp() -> u64 {
 #[cfg(test)]
 mod streaming_tool_tests {
     use super::*;
+
+    #[test]
+    fn portable_usage_reports_reasoning_without_counting_it_twice() {
+        let usage = Usage {
+            input_tokens: 12,
+            output_tokens: 9,
+        };
+        let metadata = ModelMetadata {
+            reasoning_output_tokens: Some(4),
+            ..Default::default()
+        };
+        let value = usage_value(usage, &metadata);
+        assert_eq!(value["reasoning"], 4);
+        assert_eq!(value["output"], 9);
+        assert_eq!(value["totalTokens"], 21);
+        assert!(
+            usage_value(usage, &ModelMetadata::default())
+                .get("reasoning")
+                .is_none()
+        );
+    }
+
     use clap::Parser;
 
     #[test]
@@ -1070,6 +1240,26 @@ mod streaming_tool_tests {
         );
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["type"], "tool_execution_start");
+    }
+
+    #[test]
+    fn automatic_compaction_uses_pi_16_event_names() {
+        use pi_rs::{AutoCompactionUpdate, CompactionTrigger};
+
+        assert_eq!(
+            auto_compaction_value(CompactionTrigger::Threshold, &AutoCompactionUpdate::Started),
+            json!({"type":"compaction_start","reason":"threshold"})
+        );
+        assert_eq!(
+            auto_compaction_value(
+                CompactionTrigger::Overflow,
+                &AutoCompactionUpdate::Failed {
+                    aborted: true,
+                    error_message: None
+                },
+            ),
+            json!({"type":"compaction_end","reason":"overflow","aborted":true,"willRetry":false})
+        );
     }
 
     #[test]
@@ -1240,7 +1430,7 @@ mod streaming_tool_tests {
             &json!({"type":"reasoning_item_start", "index":4, "redacted":true}),
             &args,
         );
-        let events = stream.settle(true);
+        let events = stream.settle(true, false);
         let end = events
             .iter()
             .filter_map(|event| event.get("assistantMessageEvent"))
@@ -1494,8 +1684,14 @@ mod streaming_tool_tests {
             ),
         );
         let metadata = json!("page\n\n[1 more line]");
-        stream.result_metadata.insert(other_id, json!("other"));
-        assert!(stream.observe(&json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":metadata}), &args).is_empty());
+        stream.result_metadata.insert(
+            other_id,
+            ToolResultMetadata {
+                structured_content: Some(json!("other")),
+                duration_ms: Some(500),
+            },
+        );
+        assert!(stream.observe(&json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":metadata, "durationMs":0}), &args).is_empty());
         let mut events = Vec::new();
         stream.record(
             Event::ToolFinished {
@@ -1511,12 +1707,20 @@ mod streaming_tool_tests {
             .find(|event| event["type"] == "tool_execution_end")
             .unwrap();
         assert_eq!(end["result"]["structuredContent"], metadata);
+        assert_eq!(end["durationMs"], 0);
+        assert!(end["result"].get("durationMs").is_none());
         let message = events
             .iter()
             .find(|event| event["type"] == "message_end")
             .unwrap();
         assert!(message["message"].get("structuredContent").is_none());
-        assert_eq!(stream.result_metadata.get(&other_id), Some(&json!("other")));
+        assert_eq!(
+            stream.result_metadata[&other_id].structured_content,
+            Some(json!("other"))
+        );
+        assert_eq!(stream.result_metadata[&other_id].duration_ms, Some(500));
+        assert_eq!(message["message"]["durationMs"], 0);
+        assert_eq!(stream.tool_results[0]["durationMs"], 0);
         assert!(!stream.result_metadata.contains_key(&operation_id));
     }
 
@@ -1562,11 +1766,13 @@ mod streaming_tool_tests {
             .unwrap();
         assert_eq!(end["result"]["content"], blocks);
         assert_eq!(end["result"]["structuredContent"], structured);
+        assert!(end.get("durationMs").is_none());
         let message = events
             .iter()
             .find(|event| event["type"] == "message_end")
             .unwrap();
         assert_eq!(message["message"]["content"], blocks);
+        assert!(message["message"].get("durationMs").is_none());
         assert!(message["message"].get("structuredContent").is_none());
     }
 

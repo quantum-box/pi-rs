@@ -80,6 +80,7 @@ pub(crate) fn replacement_replay(
         api,
         ModelApi::AnthropicMessages
             | ModelApi::GoogleGenerativeAi
+            | ModelApi::GoogleVertex
             | ModelApi::OpenaiResponses
             | ModelApi::OpenaiCodexResponses
             | ModelApi::OpenaiCompletions
@@ -134,7 +135,7 @@ pub(crate) fn replacement_replay(
                 }
             }
             (
-                ModelApi::GoogleGenerativeAi,
+                ModelApi::GoogleGenerativeAi | ModelApi::GoogleVertex,
                 ContentBlock::Text {
                     text,
                     text_signature,
@@ -147,7 +148,7 @@ pub(crate) fn replacement_replay(
                 Some(part)
             }
             (
-                ModelApi::GoogleGenerativeAi,
+                ModelApi::GoogleGenerativeAi | ModelApi::GoogleVertex,
                 ContentBlock::Thinking {
                     thinking,
                     thinking_signature,
@@ -204,11 +205,12 @@ pub(crate) fn replacement_replay(
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
                 .filter(|v| v["type"] == "reasoning"),
-            (ModelApi::OpenaiCompletions, ContentBlock::Text { text, .. }) => {
-                Some(json!({"type":"context_edit_text","text":text}))
-            }
             (
-                ModelApi::OpenaiCompletions,
+                ModelApi::OpenaiCompletions | ModelApi::MistralConversations,
+                ContentBlock::Text { text, .. },
+            ) => Some(json!({"type":"context_edit_text","text":text})),
+            (
+                ModelApi::OpenaiCompletions | ModelApi::MistralConversations,
                 ContentBlock::Thinking {
                     thinking,
                     thinking_signature,
@@ -239,7 +241,7 @@ pub(crate) fn replacement_replay(
                 ModelApi::AnthropicMessages | ModelApi::BedrockConverseStream => {
                     Some(json!({"type":"tool_use","id":id,"name":name,"input":arguments}))
                 }
-                ModelApi::GoogleGenerativeAi => {
+                ModelApi::GoogleGenerativeAi | ModelApi::GoogleVertex => {
                     let mut part = json!({"functionCall":{"id":id,"name":name,"args":arguments}});
                     if let Some(signature) = thought_signature.as_deref().filter(|s| !s.is_empty())
                     {
@@ -284,6 +286,59 @@ pub(crate) fn replacement_replay(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_provider_blocks_stay_on_compatible_transports() {
+        use crate::ModelApi::*;
+
+        let replay = |blocks| crate::ProviderReplay {
+            identity: crate::ResolvedModelIdentity {
+                provider: "reused-provider".into(),
+                model: "reused-model".into(),
+            },
+            blocks,
+        };
+        let anthropic =
+            serde_json::json!({"type":"thinking","thinking":"private","signature":"sig"});
+        let bedrock = serde_json::json!({"type":"reasoning","text":"private","signature":"sig"});
+        let shared = serde_json::json!({"type":"tool_use","name":"read","input":{}});
+        let mistral = serde_json::json!({"mistral_content":[{"type":"thinking","thinking":[]}]});
+        let responses =
+            serde_json::json!({"type":"reasoning","summary":[],"encrypted_content":"opaque"});
+
+        assert!(replay(vec![anthropic.clone(), shared.clone()]).supports_api(AnthropicMessages));
+        assert!(replay(vec![bedrock.clone(), shared]).supports_api(BedrockConverseStream));
+        assert!(
+            replay(vec![
+                serde_json::json!({"type":"pi-rs:pi-messages-origin"}),
+                anthropic.clone()
+            ])
+            .supports_api(PiMessages)
+        );
+        let chat = serde_json::json!({"type":"reasoning_content","text":"private"});
+        assert!(replay(vec![mistral.clone(), chat.clone()]).supports_api(MistralConversations));
+        assert!(replay(vec![chat.clone()]).supports_api(OpenaiCompletions));
+        assert!(!replay(vec![chat]).supports_api(OpenaiResponses));
+        assert!(
+            !replay(vec![
+                serde_json::json!({"type":"reasoning.encrypted","data":"private"})
+            ])
+            .supports_api(GoogleGenerativeAi)
+        );
+        assert!(
+            !replay(vec![
+                serde_json::json!({"type":"message","role":"assistant","content":[]})
+            ])
+            .supports_api(GoogleGenerativeAi)
+        );
+        assert!(replay(vec![responses.clone()]).supports_api(OpenaiResponses));
+        for foreign in [anthropic, bedrock, mistral, responses] {
+            assert!(!replay(vec![foreign]).supports_api(GoogleGenerativeAi));
+        }
+        let gemini = replay(vec![serde_json::json!({"thought":true,"text":"gemini"})]);
+        assert!(gemini.supports_api(GoogleGenerativeAi));
+        assert!(!gemini.supports_api(OpenaiResponses));
+    }
+
     use super::*;
     use crate::{Event, MemoryStore, Message, ResolvedModelIdentity, Session, UsageReport};
     use uuid::Uuid;

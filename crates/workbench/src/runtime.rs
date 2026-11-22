@@ -877,7 +877,9 @@ async fn configure_after(
             )));
         }
         if enabled("builtin:codemode")? {
-            extensions.push(Arc::new(super::operation_models::Operations::new(args)?));
+            let mut operations = super::operation_models::Operations::new(args)?;
+            operations.discover_llama().await;
+            extensions.push(Arc::new(operations));
             extensions.push(Arc::new(pi_rs_extensions::codemode::Codemode {
                 only: only_code,
                 inline_budget: args.settings.value()["codemode"]["inlineBudget"]
@@ -1536,7 +1538,7 @@ mod resource_origin_tests {
     use super::*;
 
     #[test]
-    fn runtime_final_strict_policy_is_limited_to_openai_adapters() {
+    fn runtime_final_strict_policy_tracks_adapter_support() {
         use clap::Parser;
         for (api, path, expected) in [
             ("openai-responses", "v1", true),
@@ -1558,6 +1560,17 @@ mod resource_origin_tests {
             let model = model_client(&args, false, false).unwrap();
             assert_eq!(model.strict_policy.is_some(), expected, "{api}");
         }
+
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.provider = args.model_profiles.provider("amazon-bedrock").unwrap();
+        args.model = "anthropic.claude-fable-5-2".into();
+        args.endpoint.clear();
+        assert!(
+            model_client(&args, false, false)
+                .unwrap()
+                .strict_policy
+                .is_some()
+        );
     }
 
     struct InlineCommand;

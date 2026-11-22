@@ -35,10 +35,10 @@ enum Mode {
 
 impl Mode {
     fn from_settings(settings: &super::config::Settings) -> Self {
-        match settings.string("cacheWarming") {
-            Some("off") => Self::Off,
-            Some("idle") => Self::Idle,
-            _ => Self::Streaming,
+        match settings.cache_warming_mode() {
+            "off" => Self::Off,
+            "streaming" => Self::Streaming,
+            _ => Self::Idle,
         }
     }
 
@@ -175,9 +175,12 @@ impl Policy {
                 .ok_or("request disabled prompt caching")?,
             Adapter::PiMessages => true,
             Adapter::Google
+            | Adapter::GoogleVertex
             | Adapter::Bedrock
             | Adapter::OpenAiResponses
-            | Adapter::CodexResponses => {
+            | Adapter::AzureResponses
+            | Adapter::CodexResponses
+            | Adapter::MistralConversations => {
                 return Err("cache lifetime unavailable");
             }
         };
