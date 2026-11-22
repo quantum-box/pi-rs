@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 pub struct ChatCompatibility {
     supports_store: Option<bool>,
     supports_mid_convo_system_messages: Option<bool>,
+    supports_additional_tools: Option<bool>,
+    supports_tool_search: Option<bool>,
     pub(super) supports_developer_role: Option<bool>,
     supports_usage_in_streaming: Option<bool>,
     pub(super) supports_finish_reason: Option<bool>,
@@ -382,6 +384,14 @@ impl ChatCompatibility {
         self.supports_mid_convo_system_messages.unwrap_or(false)
     }
 
+    /// Whether Responses can declare changes or additions in the transcript.
+    pub fn responses_tool_transcript(&self) -> (bool, bool) {
+        (
+            self.supports_additional_tools.unwrap_or(false),
+            self.supports_tool_search.unwrap_or(false),
+        )
+    }
+
     /// Whether the model explicitly declares strict tool support.
     pub fn supports_strict_mode(&self) -> Option<bool> {
         self.supports_strict_mode
@@ -416,6 +426,10 @@ impl ChatCompatibility {
             supports_mid_convo_system_messages: model
                 .supports_mid_convo_system_messages
                 .or(self.supports_mid_convo_system_messages),
+            supports_additional_tools: model
+                .supports_additional_tools
+                .or(self.supports_additional_tools),
+            supports_tool_search: model.supports_tool_search.or(self.supports_tool_search),
             supports_developer_role: model
                 .supports_developer_role
                 .or(self.supports_developer_role),

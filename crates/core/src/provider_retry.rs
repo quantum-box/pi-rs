@@ -82,6 +82,34 @@ impl ProviderRetry {
         let Some(delay) = delay else {
             return Ok(fallback_delay(index));
         };
+        self.validate_delay(delay)
+    }
+
+    /// Codex SSE uses whole numeric values and a one-second exponential backoff.
+    pub fn codex_sse_delay(self, headers: Option<&HeaderMap>, attempt: u32) -> Result<Duration> {
+        let delay = headers.and_then(|headers| {
+            let header = |name| {
+                let mut values = headers.get_all(name).iter();
+                let value = values.next()?.to_str().ok()?;
+                values.next().is_none().then_some(value)
+            };
+            header("retry-after-ms").and_then(whole_number).or_else(|| {
+                let value = header("retry-after").filter(|value| !value.is_empty())?;
+                whole_number(value).map_or_else(
+                    || http_date(value).map(|date| (date - Utc::now()).num_milliseconds() as f64),
+                    |seconds| Some(seconds * 1000.0),
+                )
+            })
+        });
+        match delay.filter(|delay| delay.is_finite()) {
+            Some(delay) => self.validate_delay(delay),
+            None => Ok(Duration::from_secs(
+                1u64.checked_shl(attempt).unwrap_or(u64::MAX),
+            )),
+        }
+    }
+
+    fn validate_delay(self, delay: f64) -> Result<Duration> {
         if self.max_retry_delay_ms > 0 && delay > self.max_retry_delay_ms as f64 {
             let limit = Duration::from_millis(self.max_retry_delay_ms)
                 .as_secs_f64()
@@ -126,6 +154,27 @@ fn number_prefix(value: &str) -> Option<f64> {
         .parse::<f64>()
         .ok()
         .filter(|value| value.is_finite())
+}
+
+fn whole_number(value: &str) -> Option<f64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(0.0);
+    }
+    for (prefix, radix) in [("0x", 16), ("0o", 8), ("0b", 2)] {
+        if let Some(digits) = value
+            .strip_prefix(prefix)
+            .or_else(|| value.strip_prefix(&prefix.to_ascii_uppercase()))
+        {
+            return u64::from_str_radix(digits, radix)
+                .ok()
+                .map(|number| number as f64);
+        }
+    }
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())
 }
 
 fn http_date(value: &str) -> Option<DateTime<Utc>> {
@@ -206,6 +255,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status.0, 429);
+    }
+
+    #[test]
+    fn codex_delays_require_a_whole_number_and_use_one_second_backoff() {
+        let policy = ProviderRetry::default();
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after-ms", HeaderValue::from_static("3ms"));
+        assert_eq!(
+            policy.codex_sse_delay(Some(&headers), 0).unwrap(),
+            Duration::from_secs(1)
+        );
+        headers.insert("retry-after", HeaderValue::from_static("0.002"));
+        assert_eq!(
+            policy.codex_sse_delay(Some(&headers), 2).unwrap(),
+            Duration::from_millis(2)
+        );
+        headers.insert("retry-after-ms", HeaderValue::from_static("0"));
+        assert_eq!(
+            policy.codex_sse_delay(Some(&headers), 3).unwrap(),
+            Duration::ZERO
+        );
+        assert_eq!(
+            policy.codex_sse_delay(None, 3).unwrap(),
+            Duration::from_secs(8)
+        );
     }
 
     #[test]
