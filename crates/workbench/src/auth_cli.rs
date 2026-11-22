@@ -279,9 +279,20 @@ async fn logout(settings: &super::config::Settings, reference: &str) -> Result<i
     };
     let path = config::agent_dir().join("auth.json");
     let data = config::read_auth_object(&path).await?;
-    let profiles = model_profiles::Profiles::load(&model_auth::Keys::parse(&data))?;
-    let provider = profiles.auth_provider(reference)?;
-    let id = provider.as_ref().map_or(reference, Provider::id);
+    let exact = auth_type(&data[reference]).is_some();
+    let profiles = match model_profiles::Profiles::load(&model_auth::Keys::parse(&data)) {
+        Ok(profiles) => profiles,
+        Err(_) if exact => model_profiles::Profiles::default(),
+        Err(error) => return Err(error),
+    };
+    let (provider, id) = if exact {
+        (profiles.provider(reference), reference.to_owned())
+    } else {
+        let provider = profiles.auth_provider(reference)?;
+        let id = provider.as_ref().map_or(reference, Provider::id).to_owned();
+        (provider, id)
+    };
+    let id = id.as_str();
     let name = printable(provider.as_ref().map_or(reference, |provider| {
         profiles.provider_display_name(provider)
     }));

@@ -9298,6 +9298,54 @@ fn auth_logout_resolves_provider_names_and_preserves_other_credential_sources() 
 }
 
 #[test]
+fn auth_logout_prioritizes_exact_stored_ids_and_works_with_invalid_model_config() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("models.json");
+    std::fs::write(
+        &config,
+        json!({"providers":{"relay":{
+            "name":"extension-oauth", "api":"openai-completions",
+            "baseUrl":"https://example.test/v1", "models":[{"id":"chat"}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let auth = root.path().join("auth.json");
+    let relay = json!({"type":"api_key", "key":"relay-key"});
+    let source = json!({"extension-oauth":{"type":"oauth"}, "relay":relay});
+    std::fs::write(&auth, source.to_string()).unwrap();
+    let logout = |id: &str| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["auth", "logout", id])
+            .output()
+            .unwrap()
+    };
+    let output = logout("extension-oauth");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&auth).unwrap()).unwrap(),
+        json!({"relay":relay})
+    );
+    std::fs::write(&config, "{").unwrap();
+    let output = logout("relay");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&auth).unwrap()).unwrap(),
+        json!({})
+    );
+}
+
+#[test]
 fn auth_logout_keeps_radius_credentials_for_a_different_gateway() {
     let root = tempfile::tempdir().unwrap();
     let auth = root.path().join("auth.json");

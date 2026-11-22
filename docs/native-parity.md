@@ -4702,9 +4702,10 @@ reasoning, final arguments and tool output, and abort before completion.
 `pi auth logout <provider>` removes the saved key or OAuth entry from
 `auth.json` under the shared lock. It accepts provider IDs, built-in display
 names, and the `name` configured in `models.json`. A stored extension
-credential can be removed by exact ID even if its extension is not loaded.
-A provider ID takes precedence over a display name, and ambiguous display
-names require an explicit ID. Environment and model-file credentials are
+credential can be removed by exact ID even when its extension is not loaded
+or `models.json` cannot be read. An exact stored ID or configured provider ID
+takes precedence over a display name. Ambiguous display names require an
+explicit ID. Environment and model-file credentials are
 unchanged. Native ChatGPT plan revocation and Radius gateway isolation still
 apply. Tests use local credentials without calling live OAuth endpoints.
 
