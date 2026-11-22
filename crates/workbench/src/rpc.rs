@@ -2715,6 +2715,7 @@ fn complete_model_catalog(
         {
             entry.generation = generation;
             entry.images = None;
+            entry.radius = None;
         }
     }
     cache.completed.insert(scope, generation);
@@ -3527,6 +3528,13 @@ mod tests {
         assert_eq!(model["cost"]["input"], 3.0);
         assert_eq!(model["inputLimits"]["images"]["resize"]["maxWidth"], 512);
         args.model_keys = key("second-fixture-key");
+        assert!(
+            model_value(&args, &provider, "balanced")
+                .get("cost")
+                .is_none()
+        );
+        args.model_keys = key("first-fixture-key");
+        complete_model_catalog(&args, &provider, &[], next_model_generation(&args));
         assert!(
             model_value(&args, &provider, "balanced")
                 .get("cost")
