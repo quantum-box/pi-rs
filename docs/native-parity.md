@@ -4965,6 +4965,15 @@ the running extension and delivers the resulting snapshots in mutation
 order. An executable negotiates this access through
 `mcp_registry_host_calls` and the duplex capability advertisement. SDK forks
 have their own snapshot of the active MCP registrations.
+Workbench reconciles these declarations at its next catalog refresh, before
+preparing the next model request. It reconnects changed definitions and
+retires the connections and tools for removed ones. A model reply keeps
+the tool identities advertised to its request. A retired endpoint cannot
+receive a queued call, and its replacement appears on the next request.
+MCP inspection shows
+the current declarations with cached connection status. An explicit
+Workbench refresh retries a disconnected declaration. Configured namespaces
+retain their precedence across refreshes.
 
 Native extensions can subscribe to `after_provider_response` to observe the
 HTTP status and normalized headers from an agent turn. The OpenAI Responses,
