@@ -1754,7 +1754,8 @@ impl BashOperations for LocalBashOperations {
                 _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
                 _ = &mut deadline => {
                     let timeout = timeout.expect("timeout");
-                    let shell_exit = process.terminate_at_timeout(shell_exit, spawned_at, timeout);
+                    let shell_exit = shell_exit.filter(|_| stdout_open || stderr_open);
+                    process.terminate();
                     return Err(operation_timeout(timeout, shell_exit));
                 },
                 result = process.wait(), if shell_exit.is_none() => {
@@ -1774,7 +1775,8 @@ impl BashOperations for LocalBashOperations {
                                 _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
                                 _ = &mut deadline => {
                                     let timeout = timeout.expect("timeout");
-                                    let shell_exit = process.terminate_at_timeout(shell_exit, spawned_at, timeout);
+                                    let shell_exit = shell_exit.filter(|_| stdout_open || stderr_open);
+                                    process.terminate();
                                     return Err(operation_timeout(timeout, shell_exit));
                                 },
                                 result = process.wait(), if shell_exit.is_none() => {
@@ -1801,7 +1803,8 @@ impl BashOperations for LocalBashOperations {
                                 _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
                                 _ = &mut deadline => {
                                     let timeout = timeout.expect("timeout");
-                                    let shell_exit = process.terminate_at_timeout(shell_exit, spawned_at, timeout);
+                                    let shell_exit = shell_exit.filter(|_| stdout_open || stderr_open);
+                                    process.terminate();
                                     return Err(operation_timeout(timeout, shell_exit));
                                 },
                                 result = process.wait(), if shell_exit.is_none() => {
@@ -3747,11 +3750,11 @@ impl CodingTool {
                 _ = &mut deadline, if !cancelled => {
                     timed_out = true;
                     cancelled = true;
-                    exit_before_timeout = process.terminate_at_timeout(
-                        shell_exit,
-                        spawned_at,
-                        timeout.expect("timeout"),
-                    );
+                    // Pi captures its exit event before the deadline callback.
+                    // Only describe inherited pipes when the exit was observed
+                    // and the output loop was still draining at the deadline.
+                    exit_before_timeout = shell_exit.filter(|_| stdout_open || stderr_open);
+                    process.terminate();
                     if shell_exit.is_some() {
                         drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
                     }
@@ -4325,31 +4328,6 @@ impl ProcessGroup {
         }
         let _ = self.child.start_kill();
     }
-    fn terminate_at_timeout(
-        &mut self,
-        observed_exit: Option<(std::process::ExitStatus, Duration)>,
-        started_at: tokio::time::Instant,
-        timeout: Duration,
-    ) -> Option<(std::process::ExitStatus, Duration)> {
-        // Observe a ready exit before killing the process group, including
-        // when the task was first woken with both the exit and deadline ready.
-        let exit = observed_exit.or_else(|| {
-            // The Windows job wrapper waits for descendants too. Here we
-            // need the shell's status before terminating the job.
-            #[cfg(windows)]
-            let child = self.child.inner_mut();
-            #[cfg(not(windows))]
-            let child = &mut self.child;
-            child
-                .try_wait()
-                .ok()
-                .flatten()
-                .map(|status| (status, started_at.elapsed().min(timeout)))
-        });
-        self.terminate();
-        exit
-    }
-
     fn stdin(&mut self) -> tokio::process::ChildStdin {
         #[cfg(windows)]
         {
@@ -8097,24 +8075,6 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Config(message)) if message.contains("timed out after 120 seconds"))
         );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn shell_timeout_can_observe_a_ready_status_on_the_deadline_path() {
-        let mut command = tokio::process::Command::new("sh");
-        command.args(["-c", "exit 7"]).process_group(0);
-        let mut process = ProcessGroup::spawn(command).unwrap();
-        let timeout = Duration::from_millis(50);
-        let started_at = tokio::time::Instant::now() - Duration::from_secs(1);
-        // Reap the child through the backend without passing its status to
-        // the timeout branch, as if no wait event had been recorded yet.
-        process.child.wait().await.unwrap();
-        let (exit, elapsed) = process
-            .terminate_at_timeout(None, started_at, timeout)
-            .unwrap();
-        assert_eq!(exit.code(), Some(7));
-        assert_eq!(elapsed, timeout);
     }
 
     #[cfg(unix)]
