@@ -884,6 +884,19 @@ pub(super) fn tree_context_text(content: &pi_rs::ContextContent) -> std::borrow:
     }
 }
 
+pub(super) fn tree_imported_system_text<'a>(
+    session: &Session,
+    record: &'a Record,
+) -> Option<&'a str> {
+    let Event::SystemCheckpoint { content, .. } = &record.event else {
+        return None;
+    };
+    let source = tree_parent(session, record)?;
+    matches!(&source.event, Event::SourceEntry { format, entry }
+        if format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "system")
+    .then_some(content.as_str())
+}
+
 pub(super) fn tree_assistant_completion<'a>(
     session: &'a Session,
     assistant: &Record,
@@ -989,6 +1002,9 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
             Event::Compacted { summary, .. }
             | Event::CompactionSummaryMessage { summary, .. }
             | Event::BranchSummary { summary, .. } => Some(Cow::Borrowed(summary.as_str())),
+            Event::SystemCheckpoint { .. } => {
+                tree_imported_system_text(session, record).map(Cow::Borrowed)
+            }
             _ => None,
         })
         .filter(|text| !text.trim().is_empty())

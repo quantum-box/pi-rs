@@ -280,7 +280,7 @@ where
     let auth = directory.join("auth.json");
     let guard = super::auth_lock::acquire_async(&auth).await?;
     let from_pi = if let Some(expected) = expected_active {
-        let data = super::config::read_object_unlocked(&auth)?;
+        let data = super::config::read_auth_object_locked(&guard)?;
         let current = parse_credential(&data)?;
         guard.check()?;
         let from_pi = pi_entry(&data);
@@ -310,32 +310,35 @@ where
     } else {
         false
     };
-    tokio::task::spawn_blocking(move || {
-        let _chat_lock = chat_lock;
-        let barrier = super::process::refresh_barrier()?;
-        let guard = super::process::guard_refresh_auth(barrier, guard);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| Error::Config("could not start ChatGPT refresh runtime".into()))?;
-        match runtime.block_on(exchange(previous.clone())) {
-            Ok(refreshed) => {
-                if from_pi {
-                    save_pi_refresh(&auth, &guard, &refreshed)?;
-                } else {
-                    save_locked(&directory, &guard, &refreshed)?;
+    super::model_auth::await_admitted_oauth_refresh(
+        from_pi.then_some("openai-chatgpt"),
+        move |admitted| {
+            let _chat_lock = chat_lock;
+            let barrier = super::process::refresh_barrier()?;
+            let guard = super::process::guard_refresh_auth(barrier, guard);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| Error::Config("could not start ChatGPT refresh runtime".into()))?;
+            let _ = admitted.send(());
+            match runtime.block_on(exchange(previous.clone())) {
+                Ok(refreshed) => {
+                    if from_pi {
+                        save_pi_refresh(&auth, &guard, &refreshed)?;
+                    } else {
+                        save_locked(&directory, &guard, &refreshed)?;
+                    }
+                    Ok(refreshed)
                 }
-                Ok(refreshed)
+                Err(error @ Error::AuthorizationRequired { .. }) if !from_pi => {
+                    clear_session_locked(&directory, &guard, &previous.client_id)?;
+                    Err(error)
+                }
+                Err(error) => Err(error),
             }
-            Err(error @ Error::AuthorizationRequired { .. }) if !from_pi => {
-                clear_session_locked(&directory, &guard, &previous.client_id)?;
-                Err(error)
-            }
-            Err(error) => Err(error),
-        }
-    })
+        },
+    )
     .await
-    .map_err(|_| Error::Config("ChatGPT refresh task failed".into()))?
 }
 
 fn client(settings: &super::config::Settings) -> Result<reqwest::Client> {
@@ -646,7 +649,7 @@ where
 {
     let auth = directory.join("auth.json");
     let guard = super::auth_lock::acquire_async(&auth).await?;
-    let data = super::config::read_object_unlocked(&auth)?;
+    let data = super::config::read_auth_object_locked(&guard)?;
     let credential = parse_credential(&data)?;
     let from_pi = pi_entry(&data);
     guard.check()?;
