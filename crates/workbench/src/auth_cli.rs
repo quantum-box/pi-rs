@@ -127,6 +127,12 @@ async fn resolve(
                 }),
             );
         }
+        if matches!(credential, super::model_auth::Credential::VertexAdc(_)) {
+            return Ok((wanted.is_none()).then_some(Resolved {
+                kind: AuthType::ApiKey,
+                value: None,
+            }));
+        }
         if matches!(credential, super::model_auth::Credential::BedrockProfile(_)) {
             return Ok((wanted.is_none()).then_some(Resolved {
                 kind: AuthType::ApiKey,
@@ -150,6 +156,14 @@ async fn resolve(
             .await?
         } else if matches!(credential, super::model_auth::Credential::ChatGpt) {
             super::chatgpt_auth::access_options(
+                &args.settings,
+                (wanted == Some(AuthType::OAuth)).then_some(minimum),
+                no_refresh,
+            )
+            .await?
+        } else if matches!(credential, super::model_auth::Credential::Codex) {
+            super::codex_auth::access(
+                &super::config::agent_dir().join("auth.json"),
                 &args.settings,
                 (wanted == Some(AuthType::OAuth)).then_some(minimum),
                 no_refresh,
@@ -264,12 +278,12 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
         .or_else(|| args.model_explicit.then_some(args.model.as_str()))
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| Error::Config("auth requires --provider or --model".into()))?;
-    let configuration = match super::model_profiles::Profiles::load() {
-        Ok(profiles) => super::model_auth::Keys::load_async()
-            .await
-            .map(|keys| (profiles, keys)),
-        Err(error) => Err(error),
-    };
+    let configuration = super::model_auth::Keys::load_async()
+        .await
+        .and_then(|keys| {
+            let profiles = super::model_profiles::Profiles::load(&keys)?;
+            Ok((profiles, keys))
+        });
     match configuration {
         Ok((profiles, keys)) => {
             args.model_profiles = profiles;
