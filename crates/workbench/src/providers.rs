@@ -1335,6 +1335,12 @@ impl Client {
                         &args.model,
                         args.explicit_endpoint_for(&args.provider),
                     ))
+                    .with_model_temperatures(args.model_profiles.anthropic_model_temperatures(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
+                        thinking,
+                    ))
                     .with_mid_conversation_system_models(
                         args.model_profiles
                             .anthropic_mid_conversation_system_models(

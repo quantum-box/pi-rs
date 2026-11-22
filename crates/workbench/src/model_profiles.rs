@@ -210,6 +210,7 @@ struct ModelCompatibility {
     supports_strict_tools: Option<bool>,
     supports_max_output_tokens: Option<bool>,
     supports_mid_convo_effort: Option<bool>,
+    supports_temperature: Option<bool>,
     allowed_fallback_models: Option<Vec<AnthropicFallbackModel>>,
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
@@ -240,6 +241,7 @@ impl ModelCompatibility {
             supports_mid_convo_effort: newer
                 .supports_mid_convo_effort
                 .or(self.supports_mid_convo_effort),
+            supports_temperature: newer.supports_temperature.or(self.supports_temperature),
             allowed_fallback_models: newer
                 .allowed_fallback_models
                 .or(self.allowed_fallback_models),
@@ -1412,6 +1414,31 @@ impl Profiles {
         })
         .into_iter()
         .filter(|(_, targets)| !targets.is_empty())
+        .collect()
+    }
+
+    pub fn anthropic_model_temperatures(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+        thinking: Option<&str>,
+    ) -> BTreeMap<String, f64> {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+            if self
+                .cache_compatibility(provider, metadata)
+                .supports_temperature
+                == Some(false)
+            {
+                return None;
+            }
+            metadata?
+                .sampling(thinking.unwrap_or("off"))
+                .get("temperature")?
+                .as_f64()
+        })
+        .into_iter()
+        .filter_map(|(model, value)| value.map(|temperature| (model, temperature)))
         .collect()
     }
 
@@ -2666,6 +2693,60 @@ mod tests {
     }
 
     #[test]
+    fn direct_anthropic_models_honor_temperature_capability() {
+        let unsupported = [
+            "claude-haiku-5-5",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+        ];
+        let overrides: serde_json::Map<String, Value> = unsupported
+            .into_iter()
+            .chain(["claude-haiku-4-5"])
+            .map(|id| (id.into(), json!({"samplingParams":{"temperature":0.25}})))
+            .collect();
+        let profiles = Profiles::parse(&json!({"providers":{"anthropic":{
+            "modelOverrides": overrides
+        }}}))
+        .unwrap();
+        let provider = Provider::Anthropic;
+        let temperatures =
+            profiles.anthropic_model_temperatures(&provider, "claude-haiku-4-5", None, None);
+        assert_eq!(
+            temperatures,
+            BTreeMap::from([("claude-haiku-4-5".into(), 0.25)])
+        );
+    }
+
+    #[test]
+    fn vercel_gateway_temperatures_respect_model_capability_and_thinking_overrides() {
+        let profiles = Profiles::parse(&json!({"providers":{"vercel-ai-gateway":{
+            "modelOverrides":{
+                "anthropic/claude-sonnet-5":{"samplingParams":{"temperature":0.4}},
+                "anthropic/claude-sonnet-4.6":{
+                    "samplingParams":{"temperature":0.3},
+                    "samplingParamsByThinkingLevel":{"off":{"temperature":0.2}}
+                }
+            }
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("vercel-ai-gateway").unwrap();
+        let temperatures = profiles.anthropic_model_temperatures(
+            &provider,
+            "anthropic/claude-sonnet-4.6",
+            None,
+            Some("off"),
+        );
+        assert_eq!(
+            temperatures,
+            BTreeMap::from([("anthropic/claude-sonnet-4.6".into(), 0.2)])
+        );
+    }
+
+    #[test]
     fn anthropic_tool_input_streaming_uses_the_selected_model_configuration() {
         let profiles = Profiles::parse(&json!({"providers":{"fireworks":{"modelOverrides":{
             "accounts/fireworks/models/deepseek-v4p1-flash":{"compat":{"supportsEagerToolInputStreaming":true}}
@@ -2731,7 +2812,13 @@ mod tests {
             builtin_chat::find(provider.id()).unwrap().env(),
             "AI_GATEWAY_API_KEY"
         );
-        assert_eq!(profiles.model_ids(&provider).len(), 303);
+        assert_eq!(profiles.model_ids(&provider).len(), 305);
+        assert!(profiles.model(&provider, "alibaba/qwen-3-235b").is_none());
+        let model = profiles
+            .model(&provider, "anthropic/claude-fable-5.2")
+            .unwrap();
+        assert_eq!(model.adaptive_thinking(), Some(true));
+        assert_eq!(model.mapped_effort("off"), Some(None));
         let model = profiles
             .model(&provider, "anthropic/claude-sonnet-4.6")
             .unwrap();

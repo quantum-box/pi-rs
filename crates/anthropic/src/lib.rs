@@ -117,6 +117,7 @@ pub struct Anthropic {
     probe_context: bool,
     thinking_level: Option<String>,
     thinking_budgets: Option<Value>,
+    temperatures: Arc<BTreeMap<String, f64>>,
     thinking_display: ThinkingDisplay,
     interleaved_thinking: bool,
     managed_effort_models: Arc<BTreeMap<String, bool>>,
@@ -229,6 +230,7 @@ impl Anthropic {
             probe_context: true,
             thinking_level: None,
             thinking_budgets: None,
+            temperatures: Arc::default(),
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
             managed_effort_models: Arc::default(),
@@ -385,6 +387,12 @@ impl Anthropic {
 
     pub fn with_thinking(mut self, level: Option<&str>) -> Self {
         self.thinking_level = level.map(str::to_owned);
+        self
+    }
+
+    /// Supply temperatures for models on the active Messages route.
+    pub fn with_model_temperatures(mut self, temperatures: BTreeMap<String, f64>) -> Self {
+        self.temperatures = Arc::new(temperatures);
         self
     }
 
@@ -1857,6 +1865,15 @@ impl Model for Anthropic {
         } else {
             base
         };
+        let base = if self.temperatures.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "messages-temperature-v1",
+                self.temperatures.as_ref(),
+            ))?
+        };
         let base = if self.managed_effort_models.is_empty() {
             base
         } else {
@@ -2183,6 +2200,12 @@ impl Anthropic {
         body.as_object_mut()
             .expect("encoded request")
             .append(thinking.as_object_mut().expect("thinking options object"));
+        if !supports_managed_effort
+            && matches!(body["thinking"]["type"].as_str(), None | Some("disabled"))
+            && let Some(temperature) = self.temperatures.get(&requested_model)
+        {
+            body["temperature"] = json!(temperature);
+        }
         if let Some(progress) = &self.progress {
             progress(Progress::WaitingForModel);
         }
@@ -3193,6 +3216,56 @@ mod tests {
             String::from_utf8_lossy(&request[..pos]).to_ascii_lowercase(),
             serde_json::from_slice(&request[pos + 4..]).unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn temperature_is_sent_only_when_thinking_and_managed_effort_are_inactive() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for expected in [Some(0.35), None, None, None] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (_, body) = read_fixture_request(&mut socket);
+                assert_eq!(body["temperature"].as_f64(), expected);
+                socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+            }
+        });
+        let client = Anthropic::new(&format!("http://{address}/v1/messages"), "fixture")
+            .unwrap()
+            .with_context_probe(false)
+            .with_model_temperatures(BTreeMap::from([("m".into(), 0.35)]));
+        for (client, model) in [
+            (client.clone(), "m"),
+            (client.clone(), "another-model"),
+            (
+                client.clone().with_configured_thinking("low", true, true),
+                "m",
+            ),
+            (
+                client
+                    .clone()
+                    .with_managed_effort_models(BTreeMap::from([("m".into(), true)])),
+                "m",
+            ),
+        ] {
+            let result = client
+                .stream(ModelRequest {
+                    model: model.into(),
+                    messages: vec![Message::User {
+                        content: "hello".into(),
+                    }],
+                    tools: vec![],
+                    max_output_tokens: 2048,
+                })
+                .await;
+            assert!(result.is_err());
+        }
+        worker.join().unwrap();
     }
 
     #[tokio::test]

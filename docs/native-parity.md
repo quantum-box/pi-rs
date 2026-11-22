@@ -500,12 +500,14 @@ account has not been verified.
 
 ### Vercel AI Gateway checkpoint
 
-Vercel AI Gateway exposes the 303 chat models and 14 classifier models from the
-pinned Pi v1.5.0 catalog using `AI_GATEWAY_API_KEY`. Classifiers use the gateway's
-System One endpoint, and Codemode supports discovery and classification with
-the same endpoint-scoped credential rules as other providers. Model-specific
-reasoning and empty-signature compatibility are retained. Live acceptance with
-a Vercel account remains open.
+Vercel AI Gateway exposes the 305 chat models from Pi 1.6.0 using
+`AI_GATEWAY_API_KEY`, including the Claude Fable 5.2 variants and updated
+model prices and limits. Model-specific reasoning and empty-signature rules
+apply on the Messages route. Messages accepts configured per-model
+temperature when the model supports it, thinking is disabled or absent, and
+the route does not manage effort through the transcript. The 14 existing
+System One classifier entries use endpoint-scoped credentials and remain
+available to Codemode. Live Vercel authentication and inference were unverified.
 
 ### Mistral checkpoint
 
@@ -4162,6 +4164,10 @@ A loopback fixture verified pagination, authentication, image input, a real
 native read tool round trip, usage and RPC. Live account sign-in and provider switching within a running session remain open.
 
 ### Anthropic thinking checkpoint
+
+Claude models that disallow temperature in the Pi 1.6 Messages catalog omit a
+configured temperature in native requests. A published Pi fixture verified
+all seven marked models and an older Claude model that accepts temperature.
 
 Budgeted Anthropic Messages requests use Pi's interleaved-thinking beta by
 default. An explicit `anthropic-beta` header overrides the optional defaults,
