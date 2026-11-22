@@ -1768,18 +1768,22 @@ impl Agent<'_> {
                 session.apply_live_model_selection(&next, observer)?;
                 selected = Some(next);
             }
+            let (model, model_name, limits) = selected.as_ref().map_or_else(
+                || (self.model, self.model_name, self.limits.clone()),
+                |selection| {
+                    (
+                        selection.adapter.as_ref(),
+                        selection.model.as_str(),
+                        selection.limits.clone(),
+                    )
+                },
+            );
             let active = Agent {
                 registry: &runtime_registry,
                 system_prompt: &runtime_prompt,
-                model: selected
-                    .as_ref()
-                    .map_or(self.model, |selection| selection.adapter.as_ref()),
-                model_name: selected
-                    .as_ref()
-                    .map_or(self.model_name, |selection| &selection.model),
-                limits: selected
-                    .as_ref()
-                    .map_or_else(|| self.limits.clone(), |selection| selection.limits.clone()),
+                model,
+                model_name,
+                limits: limits.clone(),
             };
             // A recorded provider overflow survives process interruption. The
             // marker is committed before compaction so recovery is attempted at
@@ -2437,9 +2441,9 @@ impl Agent<'_> {
                     let compact_agent = Agent {
                         registry: &runtime_registry,
                         system_prompt: &runtime_prompt,
-                        model: active.model,
-                        model_name: active.model_name,
-                        limits: active.limits.clone(),
+                        model,
+                        model_name,
+                        limits,
                     };
                     compact_agent
                         .compact_silent_overflow(
@@ -12823,7 +12827,7 @@ mod queue_tests {
                 limits: Limits::default(),
             }));
             sender
-                .send(QueuedInput {
+                .send(crate::QueuedInput {
                     id: Uuid::new_v4(),
                     kind: InputKind::FollowUp,
                     content: "follow-up".into(),

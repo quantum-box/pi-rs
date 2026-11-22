@@ -1288,8 +1288,30 @@ async fn run_worker(
             emit_refreshed_entries(refreshed);
             cache_capture.initialize(session, &runtime.registry);
             let agent = runtime.agent(&args, session);
+            let mut live_shell_context = live_model.as_ref().map(|_| {
+                (
+                    runtime::shell_session_context(&args, session),
+                    session.external_session_id(),
+                )
+            });
             let mut summary_request = false;
             let mut observer = |event: pi_rs::Notification<'_>| {
+                if let Some((context, external_id)) = live_shell_context.as_mut()
+                    && let pi_rs::Notification::Committed(record) = &event
+                    && let pi_rs::Event::ModelSelected {
+                        model,
+                        provider,
+                        thinking,
+                    } = &record.event
+                {
+                    context.provider = provider
+                        .clone()
+                        .unwrap_or_else(|| super::providers::Provider::Ollama.id().into());
+                    context.model = model.clone();
+                    context.reasoning_level =
+                        Some(thinking.clone().unwrap_or_else(|| "off".into()));
+                    runtime.set_shell_context(context.clone(), external_id.clone());
+                }
                 snapshot
                     .lock()
                     .expect("session snapshot")

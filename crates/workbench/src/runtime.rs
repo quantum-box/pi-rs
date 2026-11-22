@@ -355,15 +355,8 @@ impl Runtime {
                 );
             }
         }
-        self.shell.set_context_with_external_id(
-            ShellContext {
-                id: session_id,
-                path: (!args.no_session && !args.ephemeral_worker_session)
-                    .then(|| args.session.clone()),
-                provider: args.provider.id().into(),
-                model: args.model.clone(),
-                reasoning_level: Some(args.thinking.clone().unwrap_or_else(|| "off".into())),
-            },
+        self.set_shell_context(
+            shell_session_context(args, session),
             session.external_session_id(),
         );
         self.auto_compaction.set_token_settings(
@@ -378,6 +371,11 @@ impl Runtime {
             limits: effective_limits(args),
         }
     }
+    pub(super) fn set_shell_context(&self, context: ShellContext, external_id: String) {
+        self.shell
+            .set_context_with_external_id(context, external_id);
+    }
+
     pub fn mcp_status(&self, args: &Cli) -> Result<()> {
         let servers = self.catalog.servers.lock().expect("MCP catalogs");
         for (name, value) in
@@ -1128,6 +1126,16 @@ async fn configure_after(
             .await;
     }
     result
+}
+
+pub(super) fn shell_session_context(args: &Cli, session: &Session) -> ShellContext {
+    ShellContext {
+        id: session.session_id(),
+        path: (!args.no_session && !args.ephemeral_worker_session).then(|| args.session.clone()),
+        provider: args.provider.id().into(),
+        model: args.model.clone(),
+        reasoning_level: Some(args.thinking.clone().unwrap_or_else(|| "off".into())),
+    }
 }
 
 pub(super) fn effective_limits(args: &Cli) -> Limits {
