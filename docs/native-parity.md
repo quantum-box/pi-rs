@@ -4964,6 +4964,11 @@ field is covered by loopback tests; no live compatible server was used.
 Loopback RPC checks exercised model and endpoint switching, header and key
 isolation, reasoning replay, stream completion and reported usage and cost.
 
+Chat Completions combines system instructions at the start of the request by
+default. Models that declare `compat.supportsMidConvoSystemMessages` keep
+later system instructions in place. The catalog preserves this capability
+from Pi for applicable models, and provider or model configuration can override it.
+
 The bundled chat catalog includes chat-completions entries for Cerebras,
 DeepSeek, Fireworks, Groq, Hugging Face, Moonshot AI and Moonshot AI CN,
 OpenRouter, Together, Z.AI, and Z.AI Coding CN. It preserves their context,
