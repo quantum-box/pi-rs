@@ -102,6 +102,11 @@ impl Model for Script {
                     arguments: raw.into(),
                 }),
             )
+            .chain([ToolCall {
+                id: "ls-large-malformed".into(),
+                name: "ls".into(),
+                arguments: format!("{{\"path\":\"{}", "界".repeat(400_000)),
+            }])
             .collect()
         } else {
             vec![]
@@ -218,6 +223,20 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
             Event::ToolStarted { operation_id, .. } if operation_id == invocation.operation_id
         )));
     }
+    let OperationState::Finished(Outcome::TextResult {
+        output,
+        details: Some(details),
+        is_error: true,
+    }) = &tool_results["ls-large-malformed"]
+    else {
+        panic!("large malformed arguments lost the parsing result");
+    };
+    assert!(output.starts_with("Invalid arguments for tool \"ls\": Unterminated string in JSON"));
+    assert!(output.contains("\n\nReceived arguments:\n"));
+    assert!(output.ends_with("界\n[Received arguments truncated]"));
+    assert!(output.len() < 66 * 1024);
+    assert_eq!(*details, json!({}));
+
     let requests = model.0.lock().unwrap();
     let replies: std::collections::HashMap<_, _> = requests[1]
         .messages
