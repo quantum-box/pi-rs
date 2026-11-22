@@ -1332,7 +1332,10 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        master.write_all(b"TUI mode\r").unwrap();
+        // Fix the mistyped search in place before activating its result.
+        master
+            .write_all(b"TUU mode\x01\x1b[C\x1b[C\x1b[3~I\x1b[F\r")
+            .unwrap();
         let changed = if mode == "regular" {
             "fullscreen"
         } else {
