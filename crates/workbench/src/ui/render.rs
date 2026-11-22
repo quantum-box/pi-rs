@@ -2149,6 +2149,17 @@ fn markdown_plain_at_depth(
             *after_math = false;
         }
         let is_text = matches!(&event, Event::Text(_));
+        if lists.is_empty()
+            && matches!(
+                &event,
+                Event::Start(Tag::Heading { .. } | Tag::BlockQuote(_))
+            )
+            && let Some(end) = previous_paragraph_end.take()
+            && end <= range.start
+            && text[end..range.start].trim().is_empty()
+        {
+            lines.push(Line::default());
+        }
         match event {
             Event::Start(Tag::Paragraph) if lists.is_empty() => {
                 if let Some(end) = previous_paragraph_end.take()
@@ -4286,6 +4297,27 @@ mod tests {
                 && span.dim == system.is_dim("syntaxComment")
         }));
     }
+    #[test]
+    fn markdown_separates_paragraphs_from_headings_and_quotes() {
+        for (source, expected) in [
+            ("one\n# Head", vec!["one", "", "Head"]),
+            ("one\n\n# Head", vec!["one", "", "Head"]),
+            ("one\n> quote", vec!["one", "", "│ quote"]),
+            ("one\n\n> quote", vec!["one", "", "│ quote"]),
+            ("> one\n> # Head", vec!["│ one", "│ ", "│ Head"]),
+            ("> one\n> > quote", vec!["│ one", "│ ", "│ │ quote"]),
+            ("one\n- item", vec!["one", "- item"]),
+            ("- one\n  # Head", vec!["- one", "  Head"]),
+            ("- one\n  > quote", vec!["- one", "  │ quote"]),
+        ] {
+            let rendered: Vec<String> = markdown(source, &Theme::system(), 36)
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+                .collect();
+            assert_eq!(rendered, expected, "{source:?}");
+        }
+    }
+
     #[test]
     fn markdown_separates_headings_from_following_blocks() {
         for (source, expected) in [
