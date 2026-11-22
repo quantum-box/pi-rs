@@ -28,6 +28,7 @@ pub(super) struct Profiles {
 #[derive(Clone)]
 struct Profile {
     provider: Provider,
+    name: Option<String>,
     endpoint: String,
     base_url: Option<String>,
     configured_cloudflare_base: Option<String>,
@@ -141,6 +142,7 @@ impl RequestHeaders {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfiguredProfile {
+    name: Option<String>,
     base_url: Option<String>,
     api: Option<String>,
     api_key: Option<String>,
@@ -1081,6 +1083,7 @@ impl Profiles {
                     id.clone(),
                     Profile {
                         provider,
+                        name: profile.name,
                         endpoint,
                         base_url: profile.base_url,
                         configured_cloudflare_base,
@@ -1142,6 +1145,34 @@ impl Profiles {
             .get(&name.to_ascii_lowercase())
             .map(|profile| profile.provider.clone())
             .or_else(|| Provider::named(name))
+    }
+
+    pub fn provider_display_name<'a>(&'a self, provider: &'a Provider) -> &'a str {
+        self.entries
+            .get(provider.id())
+            .and_then(|profile| profile.name.as_deref())
+            .unwrap_or_else(|| provider.display_name())
+    }
+
+    pub fn auth_provider(&self, reference: &str) -> Result<Option<Provider>> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Ok(None);
+        }
+        if let Some(provider) = self.provider(reference) {
+            return Ok(Some(provider));
+        }
+        let normalized = reference.to_lowercase();
+        let mut matches = self
+            .providers()
+            .filter(|provider| self.provider_display_name(provider).to_lowercase() == normalized);
+        let provider = matches.next();
+        if matches.next().is_some() {
+            return Err(Error::Config(
+                "More than one provider uses that name. Specify its provider ID.".into(),
+            ));
+        }
+        Ok(provider)
     }
 
     pub fn providers(&self) -> impl Iterator<Item = Provider> + '_ {
@@ -1343,6 +1374,35 @@ impl Profiles {
         selected: &str,
         explicit_endpoint: Option<&str>,
     ) -> (bool, BTreeMap<String, bool>) {
+        self.responses_route_policy(
+            provider,
+            selected,
+            explicit_endpoint,
+            ChatCompatibility::supports_mid_conversation_system_messages,
+        )
+    }
+
+    pub fn responses_tool_transcript_policy(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> ((bool, bool), BTreeMap<String, (bool, bool)>) {
+        self.responses_route_policy(
+            provider,
+            selected,
+            explicit_endpoint,
+            ChatCompatibility::responses_tool_transcript,
+        )
+    }
+
+    fn responses_route_policy<T: PartialEq + Default>(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+        capability: fn(&ChatCompatibility) -> T,
+    ) -> (T, BTreeMap<String, T>) {
         let adapter = self.model_adapter(provider, selected);
         let endpoint = |id: &str| {
             explicit_endpoint
@@ -1350,9 +1410,7 @@ impl Profiles {
                 .unwrap_or_else(|| self.endpoint(provider))
         };
         let selected_endpoint = endpoint(selected);
-        let default = self
-            .chat_compatibility(provider, None)
-            .supports_mid_conversation_system_messages();
+        let default = capability(&self.chat_compatibility(provider, None));
         let overrides = self
             .entries
             .get(provider.id())
@@ -1369,10 +1427,13 @@ impl Profiles {
             .map(|id| {
                 let same_route = self.model_adapter(provider, &id) == adapter
                     && endpoint(&id) == selected_endpoint;
-                let supported = same_route
-                    && self
-                        .chat_compatibility(provider, self.model(provider, &id).as_ref())
-                        .supports_mid_conversation_system_messages();
+                let supported = if same_route {
+                    capability(
+                        &self.chat_compatibility(provider, self.model(provider, &id).as_ref()),
+                    )
+                } else {
+                    T::default()
+                };
                 (id, supported)
             })
             .filter(|(_, supported)| *supported != default)
@@ -3281,6 +3342,61 @@ mod tests {
                 .session_affinity(&chatgpt, "gpt", "https://example.test")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn responses_tool_transcript_capabilities_follow_the_active_route() {
+        let profiles = Profiles::default();
+        let openai = Provider::named("openai").unwrap();
+        let (default, models) =
+            profiles.responses_tool_transcript_policy(&openai, "gpt-6-luna", None);
+        assert_eq!(default, (false, false));
+        assert_eq!(models.get("gpt-6-luna"), Some(&(true, true)));
+        assert!(!models.contains_key("gpt-5-mini"));
+
+        let profiles = Profiles::parse(&json!({"providers":{"fixture":{
+            "api":"openai-responses","baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsAdditionalTools":true,"supportsToolSearch":true},
+            "models":[
+                {"id":"selected"},
+                {"id":"search-only","compat":{"supportsAdditionalTools":false}},
+                {"id":"other-api","api":"openai-completions"},
+                {"id":"other-endpoint","baseUrl":"http://localhost:2/v1"}
+            ]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("fixture").unwrap();
+        assert_eq!(
+            profiles.responses_tool_transcript_policy(&provider, "selected", None),
+            (
+                (true, true),
+                BTreeMap::from([
+                    ("search-only".into(), (false, true)),
+                    ("other-api".into(), (false, false)),
+                    ("other-endpoint".into(), (false, false)),
+                ])
+            )
+        );
+    }
+
+    #[test]
+    fn copilot_responses_uses_additional_tools_on_supported_models() {
+        let profiles = Profiles::default();
+        let copilot = Provider::named("github-copilot").unwrap();
+        let selected = "gpt-6.1-sol";
+        assert_eq!(
+            profiles.model_adapter(&copilot, selected),
+            Adapter::OpenAiResponses
+        );
+        let (default, tools) = profiles.responses_tool_transcript_policy(&copilot, selected, None);
+        let (_, system) =
+            profiles.responses_mid_conversation_system_policy(&copilot, selected, None);
+        assert_eq!(default, (false, false));
+        for model in [selected, "gpt-6.2-sol"] {
+            assert_eq!(tools.get(model), Some(&(true, false)));
+            assert_eq!(system.get(model), Some(&true));
+        }
+        assert!(!tools.contains_key("claude-fable-5.2"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! OpenAI custom grammar tools carry raw strings rather than JSON objects.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pi_rs_core::{Error, Message, ModelRequest, Result, ToolCall};
 use serde_json::{Value, json};
@@ -9,9 +9,13 @@ pub(super) fn project_input(
     input: &mut Value,
     properties: &BTreeMap<String, String>,
     namespace: Option<&str>,
+    transcript_grammar: Option<&BTreeMap<(&str, &str), String>>,
 ) -> Result<()> {
     let input = input.as_array_mut().expect("Responses input array");
-    if properties.is_empty() && !input.iter().any(|item| item["type"] == "custom_tool_call") {
+    if properties.is_empty()
+        && transcript_grammar.is_none_or(BTreeMap::is_empty)
+        && !input.iter().any(|item| item["type"] == "custom_tool_call")
+    {
         return Ok(());
     }
     let arguments: BTreeMap<_, _> = request
@@ -29,15 +33,20 @@ pub(super) fn project_input(
             )
         })
         .collect();
-    let mut custom_calls = std::collections::BTreeSet::new();
+    let mut custom_calls = BTreeSet::new();
     for item in input {
-        if item["type"] == "function_call_output" {
-            if item["call_id"]
+        if matches!(
+            item["type"].as_str(),
+            Some("function_call_output" | "custom_tool_call_output")
+        ) {
+            item["type"] = if item["call_id"]
                 .as_str()
                 .is_some_and(|id| custom_calls.contains(id))
             {
-                item["type"] = json!("custom_tool_call_output");
-            }
+                json!("custom_tool_call_output")
+            } else {
+                json!("function_call_output")
+            };
             continue;
         }
         let was_custom = item["type"] == "custom_tool_call";
@@ -46,7 +55,11 @@ pub(super) fn project_input(
         }
         let id = super::field(item, "call_id")?;
         let name = super::field(item, "name")?;
-        let projected_input = properties.get(name).and_then(|property| {
+        let property = match transcript_grammar {
+            Some(transcript) => transcript.get(&(id, name)),
+            None => properties.get(name),
+        };
+        let projected_input = property.and_then(|property| {
             let arguments = arguments
                 .get(&(id, name))
                 .copied()
@@ -152,4 +165,49 @@ fn quoted(text: &str) -> String {
 
 fn inner(quoted: &str) -> &str {
     &quoted[1..quoted.len() - 1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_replays_each_call_using_the_declaration_at_its_position() {
+        let request = ModelRequest {
+            model: "gpt".into(),
+            messages: vec![Message::Assistant {
+                content: String::new(),
+                calls: vec![ToolCall {
+                    id: "old".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"old"}"#.into(),
+                }],
+                replay: None,
+            }],
+            tools: vec![],
+            max_output_tokens: 64,
+        };
+        let mut input = json!([
+            {"type":"additional_tools","tools":[{"type":"function","name":"read"}]},
+            {"type":"custom_tool_call","name":"read","call_id":"old","input":"old"},
+            {"type":"custom_tool_call_output","call_id":"old","output":"old result"},
+            {"type":"additional_tools","tools":[{"type":"custom","name":"read"}]},
+            {"type":"function_call","name":"read","call_id":"new","arguments":"{\"path\":\"new\"}"},
+            {"type":"function_call_output","call_id":"new","output":"new result"}
+        ]);
+        project_input(
+            &request,
+            &mut input,
+            &BTreeMap::from([("read".into(), "path".into())]),
+            None,
+            Some(&BTreeMap::from([(("new", "read"), "path".into())])),
+        )
+        .unwrap();
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["arguments"], r#"{"path":"old"}"#);
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[4]["type"], "custom_tool_call");
+        assert_eq!(input[4]["input"], "new");
+        assert_eq!(input[5]["type"], "custom_tool_call_output");
+    }
 }
