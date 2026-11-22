@@ -4529,6 +4529,7 @@ pub(crate) struct SystemTranscript {
 pub(crate) struct SystemTranscriptFallback {
     collapsed: String,
     projected: Vec<String>,
+    insertions: Vec<usize>,
 }
 
 impl SystemTranscript {
@@ -4540,6 +4541,7 @@ impl SystemTranscript {
             return None;
         }
         let collapsed = std::mem::replace(content, self.leading);
+        let insertions = self.updates.iter().map(|(position, _)| *position).collect();
         let mut updates = self.updates.into_iter().peekable();
         let mut projected = Vec::with_capacity(messages.len() + updates.len());
         for (index, message) in std::mem::take(messages).into_iter().enumerate() {
@@ -4553,6 +4555,7 @@ impl SystemTranscript {
         Some(SystemTranscriptFallback {
             collapsed,
             projected: system_messages(messages).map(str::to_owned).collect(),
+            insertions,
         })
     }
 }
@@ -4565,6 +4568,18 @@ fn system_messages(messages: &[Message]) -> impl Iterator<Item = &str> {
 }
 
 impl SystemTranscriptFallback {
+    pub(crate) fn inserted_count(&self) -> usize {
+        self.insertions.len()
+    }
+
+    /// At a shared checkpoint, the tool declaration is emitted before its system text.
+    pub(crate) fn project_tool_boundary(&self, index: usize) -> usize {
+        index
+            + self
+                .insertions
+                .partition_point(|position| *position < index)
+    }
+
     pub(crate) fn finish(
         self,
         model: &dyn crate::Model,

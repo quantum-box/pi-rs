@@ -7,6 +7,10 @@ use serde_json::{Value, json};
 pub struct ChatCompatibility {
     supports_store: Option<bool>,
     supports_mid_convo_system_messages: Option<bool>,
+    supports_mid_convo_tool_changes: Option<bool>,
+    supports_mid_convo_tool_additions: Option<bool>,
+    supports_additional_tools: Option<bool>,
+    supports_tool_search: Option<bool>,
     pub(super) supports_developer_role: Option<bool>,
     supports_usage_in_streaming: Option<bool>,
     pub(super) supports_finish_reason: Option<bool>,
@@ -16,6 +20,10 @@ pub struct ChatCompatibility {
     supports_openai_grammar_tools: Option<bool>,
     pub(super) requires_reasoning_content_on_assistant_messages: Option<bool>,
     pub(super) requires_thinking_as_text: Option<bool>,
+    pub(super) requires_tool_result_name: Option<bool>,
+    pub(super) requires_assistant_after_tool_result: Option<bool>,
+    pub(super) requires_non_null_assistant_content: Option<bool>,
+    pub(super) requires_tools_with_tool_history: Option<bool>,
     pub(super) reasoning_field: Option<String>,
     max_tokens_field: Option<MaxTokensField>,
     thinking_format: Option<ThinkingFormat>,
@@ -382,6 +390,26 @@ impl ChatCompatibility {
         self.supports_mid_convo_system_messages.unwrap_or(false)
     }
 
+    /// Whether this Chat Completions route accepts tool-bearing system messages.
+    pub fn supports_mid_conversation_tool_additions(&self) -> bool {
+        self.supports_mid_conversation_system_messages()
+            && self.supports_mid_convo_tool_additions == Some(true)
+    }
+
+    /// Whether Anthropic can declare tool changes in native system messages.
+    pub fn supports_anthropic_tool_changes(&self) -> bool {
+        self.supports_mid_conversation_system_messages()
+            && self.supports_mid_convo_tool_changes == Some(true)
+    }
+
+    /// Whether Responses can declare changes or additions in the transcript.
+    pub fn responses_tool_transcript(&self) -> (bool, bool) {
+        (
+            self.supports_additional_tools.unwrap_or(false),
+            self.supports_tool_search.unwrap_or(false),
+        )
+    }
+
     /// Whether the model explicitly declares strict tool support.
     pub fn supports_strict_mode(&self) -> Option<bool> {
         self.supports_strict_mode
@@ -416,6 +444,16 @@ impl ChatCompatibility {
             supports_mid_convo_system_messages: model
                 .supports_mid_convo_system_messages
                 .or(self.supports_mid_convo_system_messages),
+            supports_mid_convo_tool_changes: model
+                .supports_mid_convo_tool_changes
+                .or(self.supports_mid_convo_tool_changes),
+            supports_mid_convo_tool_additions: model
+                .supports_mid_convo_tool_additions
+                .or(self.supports_mid_convo_tool_additions),
+            supports_additional_tools: model
+                .supports_additional_tools
+                .or(self.supports_additional_tools),
+            supports_tool_search: model.supports_tool_search.or(self.supports_tool_search),
             supports_developer_role: model
                 .supports_developer_role
                 .or(self.supports_developer_role),
@@ -436,6 +474,18 @@ impl ChatCompatibility {
             requires_thinking_as_text: model
                 .requires_thinking_as_text
                 .or(self.requires_thinking_as_text),
+            requires_tool_result_name: model
+                .requires_tool_result_name
+                .or(self.requires_tool_result_name),
+            requires_assistant_after_tool_result: model
+                .requires_assistant_after_tool_result
+                .or(self.requires_assistant_after_tool_result),
+            requires_non_null_assistant_content: model
+                .requires_non_null_assistant_content
+                .or(self.requires_non_null_assistant_content),
+            requires_tools_with_tool_history: model
+                .requires_tools_with_tool_history
+                .or(self.requires_tools_with_tool_history),
             reasoning_field: model.reasoning_field.or(self.reasoning_field),
             max_tokens_field: model.max_tokens_field.or(self.max_tokens_field),
             thinking_format: model.thinking_format.or(self.thinking_format),

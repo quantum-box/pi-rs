@@ -1703,6 +1703,7 @@ fn setting_description(selection: &Selection) -> Option<&'static str> {
         _ => return None,
     };
     Some(match key {
+        "transport" => "Preferred transport for providers that support multiple transports.",
         "httpIdleTimeoutMs" => {
             "Maximum idle gap while waiting for HTTP headers or body chunks. Disable it for models that pause longer."
         }

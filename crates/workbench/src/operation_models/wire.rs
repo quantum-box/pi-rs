@@ -291,7 +291,22 @@ pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
             if !value.contains_key("input_tokens") && !value.contains_key("output_tokens") {
                 return None;
             }
-            (count("input_tokens"), count("output_tokens"), 0, 0)
+            let total_input = count("input_tokens");
+            let details = value.get("input_tokens_details");
+            let cache_read = details
+                .and_then(|details| details["cached_tokens"].as_u64())
+                .unwrap_or_default()
+                .min(total_input);
+            let cache_write = details
+                .and_then(|details| details["cache_write_tokens"].as_u64())
+                .unwrap_or_default()
+                .min(total_input - cache_read);
+            (
+                total_input - cache_read - cache_write,
+                count("output_tokens"),
+                cache_read,
+                cache_write,
+            )
         }
         Api::OpenRouterImages => {
             let prompt = count("prompt_tokens");
