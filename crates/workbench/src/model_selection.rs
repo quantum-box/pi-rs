@@ -265,6 +265,119 @@ fn add_scoped_choice(
     }
 }
 
+fn add_scope_matches(
+    pattern: &str,
+    matches: Vec<(&Catalog, &str)>,
+    thinking: Option<&str>,
+    selected: &mut Vec<ScopedChoice>,
+    warnings: &mut Vec<String>,
+) {
+    if matches.len() > 1 {
+        let mut providers: Vec<_> = matches
+            .iter()
+            .map(|(catalog, _)| catalog.provider.id())
+            .collect();
+        providers.sort_unstable();
+        warnings.push(format!(
+            "Pattern \"{pattern}\" matches several providers: {}. Use provider/id to choose one.",
+            providers.join(", ")
+        ));
+    }
+    for (catalog, model) in matches {
+        add_scoped_choice(
+            selected,
+            &catalog.provider,
+            model.to_owned(),
+            thinking.map(str::to_owned),
+        );
+    }
+}
+
+fn bare_scope_matches<'a>(reference: &str, catalogs: &'a [Catalog]) -> Vec<(&'a Catalog, &'a str)> {
+    let exact = exact_scope_matches(reference, None, catalogs);
+    if !exact.is_empty() {
+        return exact;
+    }
+    // Retain native exact display aliases ahead of other partial scope matches.
+    if let Some(exact_alias) = catalogs.iter().find_map(|catalog| {
+        catalog
+            .aliases
+            .iter()
+            .find(|(_, name)| name.eq_ignore_ascii_case(reference))
+            .map(|(id, _)| (catalog, id.as_str()))
+    }) {
+        return vec![exact_alias];
+    }
+    let query = reference.to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let fuzzy: Vec<_> = catalogs
+        .iter()
+        .flat_map(|catalog| {
+            catalog
+                .models
+                .iter()
+                .filter(|id| fuzzy_model_matches(id, Some(catalog.display_name(id)), &query))
+                .map(|id| (catalog, id.as_str()))
+        })
+        .collect();
+    let locale = super::locale::select(|name| std::env::var(name).ok());
+    let collator = super::locale::collator(&locale).ok();
+    let Some((_, best)) = fuzzy
+        .iter()
+        .max_by(|(_, left), (_, right)| {
+            compare_fuzzy_ids(left, right, |left, right| {
+                collator
+                    .as_ref()
+                    .map_or_else(|| left.cmp(right), |collator| collator.compare(left, right))
+            })
+        })
+        .copied()
+    else {
+        return Vec::new();
+    };
+    fuzzy
+        .into_iter()
+        .filter(|(_, model)| *model == best)
+        .collect()
+}
+
+fn add_bare_scope(
+    pattern: &str,
+    catalogs: &[Catalog],
+    selected: &mut Vec<ScopedChoice>,
+    warnings: &mut Vec<String>,
+) {
+    let mut reference = pattern;
+    let mut thinking = None;
+    let mut invalid = None;
+    loop {
+        let matches = bare_scope_matches(reference, catalogs);
+        if !matches.is_empty() {
+            if let Some(suffix) = invalid {
+                warnings.push(format!("Invalid thinking level \"{suffix}\" in pattern \"{pattern}\". Using default instead."));
+                thinking = None;
+            }
+            add_scope_matches(pattern, matches, thinking, selected, warnings);
+            return;
+        }
+        if let Some((base, level)) = thinking_suffix(reference) {
+            thinking.get_or_insert(level);
+            reference = base;
+        } else if let Some((base, suffix)) = reference
+            .rsplit_once(':')
+            .filter(|(base, _)| !base.is_empty())
+        {
+            invalid.get_or_insert(suffix);
+            reference = base;
+        } else {
+            warnings.push(format!("No models match pattern \"{pattern}\""));
+            return;
+        }
+    }
+}
+
 pub fn scoped_choices<'a>(
     patterns: impl IntoIterator<Item = &'a str>,
     catalogs: &[Catalog],
@@ -282,6 +395,10 @@ pub fn scoped_choices<'a>(
                 .iter()
                 .find(|catalog| prefix.eq_ignore_ascii_case(catalog.provider.id()))
         });
+        if !glob && qualified.is_none() {
+            add_bare_scope(pattern, catalogs, &mut selected, &mut warnings);
+            continue;
+        }
         let suffix = thinking_suffix(pattern);
         // Pi strips the suffix before testing a glob-like pattern for a literal ID.
         let (mut exact, mut thinking) = if glob {
@@ -296,39 +413,9 @@ pub fn scoped_choices<'a>(
             thinking = Some(level);
         }
         if !exact.is_empty() {
-            if exact.len() > 1 {
-                let mut providers: Vec<_> = exact
-                    .iter()
-                    .map(|(catalog, _)| catalog.provider.id())
-                    .collect();
-                providers.sort_unstable();
-                warnings.push(format!(
-                    "Pattern \"{pattern}\" matches several providers: {}. Use provider/id to choose one.",
-                    providers.join(", ")
-                ));
-            }
-            for (catalog, model) in exact {
-                add_scoped_choice(
-                    &mut selected,
-                    &catalog.provider,
-                    model.to_owned(),
-                    thinking.map(str::to_owned),
-                );
-            }
+            add_scope_matches(pattern, exact, thinking, &mut selected, &mut warnings);
             continue;
         }
-        // Keep native display-name aliases ahead of partial matches.
-        let qualified = qualified.or_else(|| {
-            if glob {
-                return None;
-            }
-            catalogs.iter().find(|catalog| {
-                catalog.aliases.iter().any(|(_, name)| {
-                    name.eq_ignore_ascii_case(pattern)
-                        || suffix.is_some_and(|(model, _)| name.eq_ignore_ascii_case(model))
-                })
-            })
-        });
         let mut matched = false;
         for catalog in catalogs
             .iter()
@@ -468,11 +555,9 @@ fn resolve_cli_catalog_model(
             let mut fuzzy = Vec::new();
             for (provider, models) in &catalogs {
                 fuzzy.extend(models.iter().filter_map(|id| {
-                    let matched = id.to_lowercase().contains(&query)
-                        || profiles
-                            .model(provider, id)
-                            .and_then(|model| model.name)
-                            .is_some_and(|name| name.to_lowercase().contains(&query));
+                    let metadata = profiles.model(provider, id);
+                    let name = metadata.as_ref().and_then(|model| model.name.as_deref());
+                    let matched = fuzzy_model_matches(id, name, &query);
                     matched.then(|| candidate(provider, id.clone(), false))
                 }));
             }
@@ -494,9 +579,7 @@ fn resolve_cli_catalog_model(
                 .max_by(|left, right| {
                     let left = &left.choice.model;
                     let right = &right.choice.model;
-                    is_alias(left)
-                        .cmp(&is_alias(right))
-                        .then_with(|| collator.compare(left, right))
+                    compare_fuzzy_ids(left, right, |left, right| collator.compare(left, right))
                 })
                 .expect("nonempty fuzzy candidates")
                 .choice
@@ -651,6 +734,21 @@ fn is_alias(model: &str) -> bool {
     !model.rsplit_once('-').is_some_and(|(_, suffix)| {
         suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit())
     })
+}
+
+fn fuzzy_model_matches(id: &str, name: Option<&str>, query: &str) -> bool {
+    id.to_lowercase().contains(query)
+        || name.is_some_and(|name| name.to_lowercase().contains(query))
+}
+
+fn compare_fuzzy_ids(
+    left: &str,
+    right: &str,
+    compare: impl FnOnce(&str, &str) -> std::cmp::Ordering,
+) -> std::cmp::Ordering {
+    is_alias(left)
+        .cmp(&is_alias(right))
+        .then_with(|| compare(left, right))
 }
 
 fn partial<'a>(value: &str, available: &'a [String], provider: &str) -> Option<&'a String> {
@@ -859,6 +957,10 @@ mod tests {
                     "literal1",
                     "anthropic/same",
                     "alias-extra",
+                    "widget-a",
+                    "widget-z-20260101",
+                    "duplicate-model",
+                    "literal-suffix:high-next",
                 ]
                 .map(str::to_owned)
                 .to_vec(),
@@ -876,9 +978,16 @@ mod tests {
                         false,
                     )
                     .unwrap(),
-                models: ["same", "exact", "literalm", "literal2"]
-                    .map(str::to_owned)
-                    .to_vec(),
+                models: [
+                    "same",
+                    "exact",
+                    "literalm",
+                    "literal2",
+                    "widget-z",
+                    "duplicate-model",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
                 aliases: vec![("exact".into(), "alias".into())],
                 probe_details: false,
                 complete: false,
@@ -945,6 +1054,42 @@ mod tests {
                 "anthropic/same"
             ]
         );
+
+        for (pattern, expected) in [
+            ("widget", vec!["anthropic/widget-z"]),
+            ("widget:high", vec!["anthropic/widget-z:high"]),
+            ("widget:high:low", vec!["anthropic/widget-z:low"]),
+            (
+                "literal-suffix:high",
+                vec!["ollama/literal-suffix:high-next"],
+            ),
+        ] {
+            let (choices, warnings) = scoped_choices([pattern], &catalogs);
+            assert!(warnings.is_empty(), "{pattern}: {warnings:?}");
+            assert_eq!(
+                choices
+                    .iter()
+                    .map(super::ScopedChoice::pattern)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{pattern}"
+            );
+        }
+        let (choices, warnings) = scoped_choices(["duplicate:high"], &catalogs);
+        assert_eq!(
+            choices
+                .iter()
+                .map(super::ScopedChoice::pattern)
+                .collect::<Vec<_>>(),
+            [
+                "ollama/duplicate-model:high",
+                "anthropic/duplicate-model:high"
+            ]
+        );
+        assert!(warnings[0].contains("matches several providers: anthropic, ollama"));
+        let (choices, warnings) = scoped_choices(["widget:bad:high"], &catalogs);
+        assert_eq!(choices[0].pattern(), "anthropic/widget-z");
+        assert!(warnings[0].contains("Invalid thinking level \"bad\""));
     }
 
     #[test]

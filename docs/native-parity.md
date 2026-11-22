@@ -132,7 +132,10 @@ report the new state using the same status row, as in Pi.
 Model scopes (`--models` and `enabledModels`) add all available providers that
 share an exact unqualified model ID and warn about the ambiguity. A literal ID
 containing glob characters takes precedence over glob expansion across providers,
-with an optional thinking suffix applied to the selected models.
+with an optional thinking suffix applied to the selected models. Bare partial
+scope matches are ranked across the available catalogs. If the winning ID is
+shared, all matching providers are included and a warning names them.
+The native exact display-name shortcut remains available for scopes.
 With no explicit provider or endpoint, a known `--model` ID can select the only
 authenticated matching provider across catalogs, including a gateway model
 whose literal ID starts with another provider's name. Unqualified partial IDs
