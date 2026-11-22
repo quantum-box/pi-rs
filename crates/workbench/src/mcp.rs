@@ -48,7 +48,9 @@ pub struct ServerConfig {
     pub url: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    pub timeout: Option<u64>,
+    /// Per-request timeout. JSON configuration expresses it in seconds.
+    #[serde(default, deserialize_with = "deserialize_server_timeout")]
+    pub timeout: Option<Duration>,
     pub protocol_version: Option<String>,
     pub description: Option<String>,
     pub enabled: Option<bool>,
@@ -90,15 +92,43 @@ impl ServerConfig {
 
 #[derive(Clone, Default)]
 struct NativeClient {
+    server_name: Option<Arc<str>>,
+    workspace_root: Option<WorkspaceRoot>,
     interaction: Arc<std::sync::Mutex<Option<Interaction>>>,
     catalog: Arc<CatalogSignal>,
     progress: Arc<ToolProgress>,
     dispatch_closed: Arc<std::sync::Mutex<crate::mcp_oauth_client::DispatchState>>,
 }
 
+#[derive(Clone)]
+struct WorkspaceRoot {
+    uri: String,
+    name: String,
+}
+
 impl NativeClient {
     fn progress_transport<T>(&self, transport: T) -> ProgressTransport<T> {
         ProgressTransport::new(transport, self.progress.clone())
+    }
+
+    async fn for_server(name: &str, workspace: &Path) -> Self {
+        let workspace_root = tokio::fs::canonicalize(workspace)
+            .await
+            .ok()
+            .and_then(|path| {
+                let uri = reqwest_mcp::Url::from_file_path(&path).ok()?.to_string();
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                Some(WorkspaceRoot { uri, name })
+            });
+        Self {
+            server_name: Some(Arc::from(name)),
+            workspace_root,
+            ..Self::default()
+        }
     }
 }
 
@@ -154,7 +184,9 @@ impl Drop for InteractionGuard {
 }
 impl rmcp::ClientHandler for NativeClient {
     fn get_info(&self) -> rmcp::model::ClientConfig {
-        let mut info = rmcp::model::ClientConfig::default();
+        let mut info = rmcp::model::ClientConfig::default()
+            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE);
+        info.capabilities.roots = self.workspace_root.as_ref().map(|_| Default::default());
         info.capabilities.elicitation = Some(
             rmcp::model::ElicitationCapability::new()
                 .with_form(rmcp::model::FormElicitationCapability::default())
@@ -168,6 +200,19 @@ impl rmcp::ClientHandler for NativeClient {
             .into(),
         );
         info
+    }
+
+    #[allow(deprecated)]
+    async fn list_roots(
+        &self,
+        _context: rmcp::service::RequestContext<RoleClient>,
+    ) -> std::result::Result<rmcp::model::ListRootsResult, rmcp::model::ErrorData> {
+        let roots = self
+            .workspace_root
+            .iter()
+            .map(|root| rmcp::model::Root::new(&root.uri).with_name(&root.name))
+            .collect();
+        Ok(rmcp::model::ListRootsResult::new(roots))
     }
 
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
@@ -585,7 +630,11 @@ impl McpExtension {
         } else {
             None
         };
-        let timeout = Duration::from_secs(config.timeout.unwrap_or(60).clamp(1, 3600));
+        let timeout = match config.timeout {
+            None => Duration::from_secs(60),
+            Some(Duration::ZERO) => Duration::from_secs(1),
+            Some(timeout) => timeout.clamp(MIN_MCP_TIMEOUT, MAX_MCP_TIMEOUT),
+        };
         let lifecycle = match config.protocol_version.as_deref() {
             None => ClientLifecycleMode::Initialize,
             Some("2026-07-28") => ClientLifecycleMode::Discover {
@@ -637,14 +686,21 @@ impl McpExtension {
             let initialize = async {
                 let service = match owned_stdio {
                     Some(owner) => {
-                        let native = NativeClient::default();
-                        let transport =
-                            native.progress_transport(owned_stdio_transport(wrapped, owner)?);
+                        let native = NativeClient::for_server(name, workspace).await;
+                        let transport = crate::mcp_log::LoggingTransport::new(
+                            owned_stdio_transport(wrapped, owner)?,
+                            Some(Arc::from(name)),
+                        );
+                        let transport = native.progress_transport(transport);
                         native.serve_with_lifecycle(transport, lifecycle).await
                     }
                     None => {
-                        let native = NativeClient::default();
-                        let transport = native.progress_transport(TokioChildProcess::new(wrapped)?);
+                        let native = NativeClient::for_server(name, workspace).await;
+                        let transport = crate::mcp_log::LoggingTransport::new(
+                            TokioChildProcess::new(wrapped)?,
+                            Some(Arc::from(name)),
+                        );
+                        let transport = native.progress_transport(transport);
                         native.serve_with_lifecycle(transport, lifecycle).await
                     }
                 };
@@ -733,7 +789,7 @@ impl McpExtension {
                         })?);
                     let native = NativeClient {
                         dispatch_closed: client.dispatch_state.clone(),
-                        ..Default::default()
+                        ..NativeClient::for_server(name, workspace).await
                     };
                     start_http_service(native, client, transport_config, lifecycle).await
                 } else if let Some(resolver) = provider_token.clone() {
@@ -742,11 +798,21 @@ impl McpExtension {
                         endpoint: Arc::from(url.as_str()),
                         resolver,
                     };
-                    start_http_service(NativeClient::default(), client, transport_config, lifecycle)
-                        .await
+                    start_http_service(
+                        NativeClient::for_server(name, workspace).await,
+                        client,
+                        transport_config,
+                        lifecycle,
+                    )
+                    .await
                 } else {
-                    start_http_service(NativeClient::default(), client, transport_config, lifecycle)
-                        .await
+                    start_http_service(
+                        NativeClient::for_server(name, workspace).await,
+                        client,
+                        transport_config,
+                        lifecycle,
+                    )
+                    .await
                 }
                 .map_err(|error| {
                     let challenge = error.auth_challenge().filter(|challenge| {
@@ -1247,7 +1313,10 @@ async fn start_http_service<C: StreamableHttpClient + Clone>(
     lifecycle: ClientLifecycleMode,
 ) -> std::result::Result<RunningService<RoleClient, NativeClient>, ClientInitializeError> {
     for delay in [Some(250), Some(1000), None] {
-        let transport = StreamableHttpClientTransport::with_client(client.clone(), config.clone());
+        let transport = crate::mcp_log::LoggingTransport::new(
+            StreamableHttpClientTransport::with_client(client.clone(), config.clone()),
+            native.server_name.clone(),
+        );
         let result = native
             .clone()
             .serve_with_lifecycle(native.progress_transport(transport), lifecycle.clone())
@@ -1678,10 +1747,7 @@ impl McpTool {
                 Ok(json!({"resources": visible_resource_listing(serde_json::to_value(resources)?)}))
             }
             "list_resource_templates" => {
-                let templates = service
-                    .list_all_resource_templates()
-                    .await
-                    .map_err(call_error)?;
+                let templates = templates_or_empty(service.list_all_resource_templates().await)?;
                 Ok(
                     json!({"resourceTemplates": visible_resource_listing(serde_json::to_value(templates)?)}),
                 )
@@ -1699,10 +1765,11 @@ impl McpTool {
                 ))
             }
             "list_resource_templates_page" => {
-                let result = service
-                    .list_resource_templates(Some(resource_page_params(arguments)?))
-                    .await
-                    .map_err(call_error)?;
+                let result = templates_or_empty(
+                    service
+                        .list_resource_templates(Some(resource_page_params(arguments)?))
+                        .await,
+                )?;
                 Ok(resource_page(
                     &self.connection.name,
                     "resourceTemplates",
@@ -1738,6 +1805,20 @@ impl McpTool {
             }
             _ => Err(Error::Config("unknown MCP resource operation".into()).into()),
         }
+    }
+}
+
+// Servers can provide resources without implementing resource templates.
+fn templates_or_empty<T: Default>(
+    result: std::result::Result<T, ServiceError>,
+) -> std::result::Result<T, CallError> {
+    match result {
+        Err(ServiceError::McpError(error))
+            if error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
+        {
+            Ok(T::default())
+        }
+        other => other.map_err(call_error),
     }
 }
 
@@ -1969,6 +2050,32 @@ fn normalize(name: &str) -> String {
         })
         .collect()
 }
+const MIN_MCP_TIMEOUT: Duration = Duration::from_millis(1);
+const MAX_MCP_TIMEOUT: Duration = Duration::from_secs(3600);
+
+fn deserialize_server_timeout<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<f64>::deserialize(deserializer)?
+        .map(|seconds| {
+            if !seconds.is_finite() || seconds < 0.0 {
+                return Err(serde::de::Error::custom(
+                    "MCP timeout must be a finite, non-negative number of seconds",
+                ));
+            }
+            let seconds = if seconds == 0.0 {
+                0.0
+            } else {
+                seconds.clamp(MIN_MCP_TIMEOUT.as_secs_f64(), MAX_MCP_TIMEOUT.as_secs_f64())
+            };
+            Ok(Duration::from_secs_f64(seconds))
+        })
+        .transpose()
+}
+
 fn expand_home(value: &str) -> String {
     value
         .strip_prefix("~/")
@@ -2230,6 +2337,97 @@ mod tests {
             }
         }
         fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_client_lists_only_its_workspace_root() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace café #1");
+        std::fs::create_dir(&workspace).unwrap();
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server = async move {
+            let mut transport = BufReader::new(server_transport);
+            let mut line = String::new();
+            transport.read_line(&mut line).await.unwrap();
+            let init: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(init["method"], "initialize");
+            assert_eq!(init["params"]["protocolVersion"], "2025-11-25");
+            assert!(init["params"]["capabilities"]["roots"].is_object());
+            let reply = json!({
+                "jsonrpc":"2.0", "id": init["id"],
+                "result":{
+                    "protocolVersion":init["params"]["protocolVersion"],
+                    "capabilities":{},
+                    "serverInfo":{"name":"fixture","version":"1"}
+                }
+            });
+            transport
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            line.clear();
+            transport.read_line(&mut line).await.unwrap();
+            let initialized: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(initialized["method"], "notifications/initialized");
+            transport
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":\"roots-fixture\",\"method\":\"roots/list\"}\n",
+                )
+                .await
+                .unwrap();
+            line.clear();
+            transport.read_line(&mut line).await.unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        let native = NativeClient::for_server("fixture", &workspace).await;
+        let (response, client) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                server,
+                native.serve_with_lifecycle(client_transport, ClientLifecycleMode::Initialize),
+            )
+        })
+        .await
+        .expect("MCP roots fixture timed out");
+        let _client = client.unwrap();
+        assert_eq!(response["id"], "roots-fixture");
+        let roots = response["result"]["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1);
+        let root = &roots[0];
+        assert_eq!(root["name"], "workspace café #1");
+        let uri = root["uri"].as_str().unwrap();
+        assert!(uri.ends_with("/workspace%20caf%C3%A9%20%231"), "{uri}");
+        assert_eq!(
+            reqwest_mcp::Url::parse(uri)
+                .unwrap()
+                .to_file_path()
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            workspace.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_workspace_root_resolves_symlinks_before_parent_components() {
+        let directory = tempfile::tempdir().unwrap();
+        let physical = directory.path().join("physical");
+        let child = physical.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&child, &alias).unwrap();
+        let native = NativeClient::for_server("fixture", &alias.join("..")).await;
+        let root = native.workspace_root.unwrap();
+        assert_eq!(root.name, "physical");
+        assert_eq!(
+            reqwest_mcp::Url::parse(&root.uri)
+                .unwrap()
+                .to_file_path()
+                .unwrap(),
+            physical.canonicalize().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2829,6 +3027,27 @@ mod tests {
         assert!(!tool_enabled(&config, "list_resources"));
         assert!(!tool_enabled(&config, "list_prompts"));
         assert!(tool_enabled(&config, "get_prompt"));
+    }
+    #[test]
+    fn mcp_server_timeout_accepts_fractional_seconds() {
+        let parse = |timeout: Value| {
+            serde_json::from_value::<ServerConfig>(json!({"command":"server","timeout":timeout}))
+                .map(|config| config.timeout)
+        };
+        for (seconds, duration) in [
+            (json!(0.25), Duration::from_millis(250)),
+            (json!(1.5), Duration::from_millis(1500)),
+            (json!(30), Duration::from_secs(30)),
+            (json!(0), Duration::ZERO),
+            (json!(0.00001), MIN_MCP_TIMEOUT),
+            (json!(1e100), MAX_MCP_TIMEOUT),
+        ] {
+            assert_eq!(parse(seconds).unwrap(), Some(duration));
+        }
+        assert_eq!(parse(Value::Null).unwrap(), None);
+        for invalid in [json!(-0.25), json!("0.25"), json!(true)] {
+            assert!(parse(invalid).is_err());
+        }
     }
     #[test]
     fn normalizes_mcp_names_and_preserves_configuration_defaults() {

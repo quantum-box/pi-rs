@@ -137,6 +137,56 @@ struct Terminal {
     appearance_notifications: bool,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
+    #[cfg(unix)]
+    _suspend_signal: Option<SuspendSignal>,
+}
+
+#[cfg(unix)]
+static SUSPEND_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+static TERMINAL_SIGNAL_WRITER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(unix)]
+extern "C" fn request_terminal_suspend(_: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    SUSPEND_REQUESTED.store(true, Ordering::Relaxed);
+    let fd = TERMINAL_SIGNAL_WRITER.load(Ordering::Relaxed);
+    // The signal registry keeps the nonblocking writer alive for the process.
+    if fd >= 0 {
+        let wake = [b'S'];
+        unsafe { libc::write(fd, wake.as_ptr().cast(), wake.len()) };
+    }
+}
+
+#[cfg(unix)]
+struct SuspendSignal(libc::sigaction);
+
+#[cfg(unix)]
+impl SuspendSignal {
+    fn install() -> std::io::Result<Self> {
+        // Restore the previous disposition when relinquishing the terminal.
+        // In particular, the editor and Ctrl+Z must still stop the job.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = request_terminal_suspend as *const () as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            let mut previous = std::mem::MaybeUninit::uninit();
+            if libc::sigaction(libc::SIGTSTP, &action, previous.as_mut_ptr()) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self(previous.assume_init()))
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SuspendSignal {
+    fn drop(&mut self) {
+        unsafe { libc::sigaction(libc::SIGTSTP, &self.0, std::ptr::null_mut()) };
+        SUSPEND_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(unix)]
@@ -157,6 +207,13 @@ struct ColorQuery {
 }
 
 #[cfg(any(unix, windows))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppearanceProbe {
+    WaitingForColors,
+    WaitingForMarker,
+}
+
+#[cfg(any(unix, windows))]
 #[derive(Default)]
 struct ColorQueries {
     initial_started: Option<Instant>,
@@ -165,6 +222,7 @@ struct ColorQueries {
     disabled: bool,
     last_appearance_report: Option<bool>,
     refresh_after_subscription: bool,
+    appearance_probe: Option<AppearanceProbe>,
 }
 
 impl Terminal {
@@ -174,6 +232,8 @@ impl Terminal {
         #[cfg(any(unix, windows))] previous_colors: Option<ColorQueries>,
         #[cfg(any(unix, windows))] auto_appearance: bool,
     ) -> Result<Self> {
+        #[cfg(unix)]
+        let suspend_signal = SuspendSignal::install()?;
         terminal::enable_raw_mode()?;
         #[cfg(any(unix, windows))]
         let initial_colors = previous_colors.is_none();
@@ -187,6 +247,8 @@ impl Terminal {
             appearance_notifications: false,
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
+            #[cfg(unix)]
+            _suspend_signal: Some(suspend_signal),
         };
         if guard.alternate {
             execute!(
@@ -226,6 +288,8 @@ impl Terminal {
             return Ok(false);
         }
         self.appearance_notifications = enabled;
+        self.colors.appearance_probe =
+            (enabled && !self.colors.disabled).then_some(AppearanceProbe::WaitingForColors);
         let command = if enabled {
             "\x1b[?2031h\x1b[?996n"
         } else {
@@ -362,6 +426,9 @@ impl ColorQueries {
             quarantined: false,
             batch: crate::ui::terminal_color_batch::ColorBatch::new(started),
         });
+        if self.appearance_probe == Some(AppearanceProbe::WaitingForColors) {
+            self.appearance_probe = Some(AppearanceProbe::WaitingForMarker);
+        }
         let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
         for index in 0..16 {
             query.push_str(&format!("\x1b]4;{index};?\x07"));
@@ -381,14 +448,9 @@ impl ColorQueries {
 
     fn appearance_report(&mut self, dark: bool, output: &mut dyn Write) -> Result<bool> {
         let previous = self.last_appearance_report.replace(dark);
-        // The first report may be the response to ?996n sent at startup.
-        // It cannot be distinguished from a simultaneous notification.
-        let initial_report = previous.is_none()
-            && self
-                .color_queries
-                .front()
-                .is_some_and(|query| Some(query.started) == self.initial_started);
-        if !initial_report {
+        // The first report before the matching color query's DA1 may answer
+        // the explicit appearance probe. That query already refreshes colors.
+        if self.appearance_probe.take().is_none() {
             self.query_terminal_colors(output)?;
         }
         Ok(std::mem::take(&mut self.refresh_after_subscription)
@@ -450,6 +512,9 @@ impl ColorQueries {
 
     fn finish_color_query(&mut self, output: &mut dyn Write) -> Result<()> {
         self.color_queries.pop_front();
+        if self.appearance_probe == Some(AppearanceProbe::WaitingForMarker) {
+            self.appearance_probe = None;
+        }
         if std::mem::take(&mut self.color_requery) {
             self.query_terminal_colors(output)?;
         }
@@ -480,6 +545,7 @@ impl ColorQueries {
         // Neither can be attributed reliably once ownership has changed.
         self.color_queries.clear();
         self.color_requery = false;
+        self.appearance_probe = None;
         self.disabled = true;
     }
 
@@ -623,10 +689,25 @@ enum LocalEditor {
     Setting(String),
     BranchSummary(u64),
     ProviderKey(super::Provider),
+    CloudflareLogin(CloudflareLoginField),
     BedrockProfile,
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
     AnthropicCode(Option<tokio::sync::oneshot::Sender<String>>),
+    CodexCode(Option<tokio::sync::oneshot::Sender<String>>),
+}
+
+enum CloudflareLoginField {
+    Key(super::Provider),
+    Account {
+        provider: super::Provider,
+        key: String,
+    },
+    Gateway {
+        provider: super::Provider,
+        key: String,
+        account: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -684,6 +765,7 @@ enum RemoteEvent {
     DeviceCode { url: String, code: String },
     OpenRouterCode(tokio::sync::oneshot::Sender<String>),
     AnthropicCode(tokio::sync::oneshot::Sender<String>),
+    CodexCode(tokio::sync::oneshot::Sender<String>),
     ForgetModelKey(&'static str),
     RefreshModelKeys,
     Finished(Result<Vec<String>>),
@@ -752,13 +834,14 @@ fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Resul
 
     let (mut reader, writer) = std::os::unix::net::UnixStream::pair()?;
     writer.set_nonblocking(true)?;
+    let signal_fd = writer.as_raw_fd();
     // Capture the editor state in the signal handler, not later on the reader
     // thread. write(2) is async-signal-safe and the stream stays registered
     // for the lifetime of the process.
     let id = unsafe {
         signal_hook_registry::register(libc::SIGINT, move || {
             if !EXTERNAL_EDITOR_ACTIVE.load(Ordering::SeqCst) {
-                let byte = [1_u8];
+                let byte = [b'I'];
                 libc::write(writer.as_raw_fd(), byte.as_ptr().cast(), byte.len());
             }
             #[cfg(test)]
@@ -776,8 +859,10 @@ fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Resul
                 }
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
-                    Ok(_) => {
-                        super::process::TERMINAL_INTERRUPTED.store(true, Ordering::SeqCst);
+                    Ok(count) => {
+                        if buffer[..count].contains(&b'I') {
+                            super::process::TERMINAL_INTERRUPTED.store(true, Ordering::SeqCst);
+                        }
                         notify.notify_one();
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -789,6 +874,7 @@ fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Resul
         signal_hook_registry::unregister(id);
         return Err(error.into());
     }
+    TERMINAL_SIGNAL_WRITER.store(signal_fd, Ordering::Relaxed);
     super::process::TERMINAL_SIGNAL_ENABLED.store(true, Ordering::SeqCst);
     Ok(())
 }
@@ -1037,6 +1123,13 @@ struct StreamingTool {
 
 type LinkRow = (u16, Vec<(std::ops::Range<usize>, String)>);
 
+struct TreeNavigationHandoff {
+    id: u64,
+    summarize: bool,
+    instructions: Option<String>,
+    clear_id: Option<uuid::Uuid>,
+}
+
 struct CustomMessageRenderPending {
     request: uuid::Uuid,
     record: u64,
@@ -1054,6 +1147,7 @@ struct View {
     local_editor: Option<(LocalEditor, crate::ui::dialog::Dialog)>,
     tree_confirmation: Option<u64>,
     tree_navigation: Option<(u64, bool)>,
+    tree_handoff: Option<TreeNavigationHandoff>,
     branch_error: Option<String>,
     ui_status: std::collections::BTreeMap<String, String>,
     widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
@@ -1064,6 +1158,7 @@ struct View {
     custom_render_redraw_at: Option<Instant>,
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
+    theme_refresh_requested: bool,
     thinking_settings: Option<ThinkingSettings>,
     pending_thinking: Option<PendingThinking>,
     session_name: Option<String>,
@@ -1114,7 +1209,7 @@ struct View {
     request_started: Option<Instant>,
     phase: Option<&'static str>,
     shell_running: bool,
-    restoring_queue: bool,
+    queue_restores: std::collections::HashMap<uuid::Uuid, bool>,
 }
 fn append_indexed(
     items: &mut std::collections::BTreeMap<u64, String>,
@@ -1430,6 +1525,16 @@ impl View {
             .collect();
         self.append_entry(Entry::Notice(text));
     }
+    fn show_status(&mut self, mode: Option<TuiMode>, status: String) {
+        if (mode != Some(TuiMode::Regular) || self.regular.committed < self.lines.len())
+            && let Some(Entry::Status(previous)) = self.lines.last_mut()
+        {
+            *previous = status;
+        } else {
+            self.append_entry(Entry::Status(status));
+        }
+    }
+
     fn append_entry(&mut self, entry: Entry) {
         self.lines.push(entry);
         if self.lines.len() > 4000 {
@@ -1727,7 +1832,96 @@ impl View {
         )));
     }
 
+    fn request_queue_restore(&mut self, worker: &mut Option<Worker>, args: &Cli, report: bool) {
+        let id = uuid::Uuid::new_v4();
+        match Worker::control(worker, args, json!({"type":"clear_queue","id":id})) {
+            Ok(()) => {
+                self.queue_restores.insert(id, report);
+            }
+            Err(error) => self.append(&error.to_string()),
+        }
+    }
+
+    fn complete_queue_restore(&mut self, mut value: Value, mode: Option<TuiMode>) {
+        let Some(report) = value["id"]
+            .as_str()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .and_then(|id| self.queue_restores.remove(&id))
+        else {
+            return;
+        };
+        if value["success"] != true {
+            self.append(value["error"].as_str().unwrap_or("Queue restore failed"));
+            return;
+        }
+
+        let mut messages: Vec<pi_rs::QueuedMessage> =
+            match serde_json::from_value(value["data"]["messages"].take()) {
+                Ok(messages) => messages,
+                Err(_) => {
+                    self.append("Queue restore failed");
+                    return;
+                }
+            };
+        let count = messages.len();
+        if count > 0 {
+            messages.sort_by_key(|message| message.input.kind == pi_rs::InputKind::FollowUp);
+            let mut text: Vec<_> = messages
+                .iter()
+                .map(|message| message.input.content.as_str())
+                .filter(|text| !text.trim().is_empty())
+                .collect();
+            if !text.is_empty() {
+                if !self.editor.text.trim().is_empty() {
+                    text.push(&self.editor.text);
+                }
+                self.editor.replace(text.join("\n\n"));
+            }
+
+            let mut images: Vec<_> = messages
+                .into_iter()
+                .flat_map(|message| message.images)
+                .collect();
+            images.append(&mut self.draft_images);
+            self.draft_images = images;
+        }
+        if report {
+            let status = match count {
+                0 => "No queued messages to restore".to_owned(),
+                1 => "Restored 1 queued message to editor".to_owned(),
+                _ => format!("Restored {count} queued messages to editor"),
+            };
+            self.show_status(mode, status);
+        }
+    }
+
     fn receive_worker(&mut self, mut value: Value, args: &mut Cli) {
+        if value["type"] == "response" && value["command"] == "set_session_label" {
+            if let Ok(request) = serde_json::from_value(value["id"].take())
+                && let Some(picker) = &mut self.picker
+                && let Some(target) = picker.take_tree_label(request)
+            {
+                if value["success"] == true {
+                    let focus = match picker.selected() {
+                        Some(Selection::Checkout(record)) => record,
+                        _ => target,
+                    };
+                    match Session::snapshot(&args.session) {
+                        Ok(session) => picker.refresh_tree(
+                            session_tree::picker(&session, TreeFilter::Default),
+                            focus,
+                        ),
+                        Err(error) => picker.show_feedback(Err(error.to_string())),
+                    }
+                } else {
+                    let message = value["error"]
+                        .as_str()
+                        .unwrap_or("Could not save the label");
+                    picker.show_feedback(Err(message.into()));
+                }
+            }
+            return;
+        }
         if value["type"] == "resources_discovered" {
             match serde_json::from_value::<pi_rs::DiscoveredResources>(value["resources"].take())
                 .map_err(Error::from)
@@ -1746,6 +1940,10 @@ impl View {
             if value["session"] == json!(args.session) {
                 self.cache_warming_status = serde_json::from_value(value["status"].take()).ok();
             }
+            return;
+        }
+        if value["type"] == "response" && value["command"] == "clear_queue" {
+            self.complete_queue_restore(value, args.tui_mode);
             return;
         }
         self.receive(&value);
@@ -1792,6 +1990,21 @@ impl View {
         }
     }
 
+    fn remember_prompt(&mut self, prompt: &str) {
+        const LIMIT: usize = 100;
+        let prompt = prompt
+            .trim_matches(|ch: char| ch == '\u{feff}' || (ch.is_whitespace() && ch != '\u{0085}'));
+        if prompt.is_empty() {
+            return;
+        }
+        if let Some(index) = self.history.iter().position(|entry| entry == prompt) {
+            self.history.remove(index);
+        } else if self.history.len() == LIMIT {
+            self.history.remove(0);
+        }
+        self.history.push(prompt.to_owned());
+    }
+
     fn restore(&mut self, args: &Cli) -> Result<()> {
         let session = Session::open(&args.session)?;
         if session.host_binding().is_some() {
@@ -1830,10 +2043,9 @@ impl View {
         self.dialogs.clear();
         self.local_editor = None;
         self.tree_confirmation = None;
-        self.restoring_queue = false;
+        self.queue_restores.clear();
         self.ui_status.clear();
         self.widgets.clear();
-        self.history.clear();
         self.history_index = None;
         self.tokens = 0;
         self.cache_stats = super::cache_stats::Tracker::default();
@@ -1869,7 +2081,7 @@ impl View {
                 }
                 pi_rs::Event::User { content, .. }
                 | pi_rs::Event::UserWithImages { content, .. } => {
-                    self.history.push(content.clone());
+                    self.remember_prompt(content);
                     self.lines.push(Entry::user(content.clone()));
                     if let pi_rs::Event::UserWithImages { images, .. } = &record.event {
                         self.append(&format!("{} attached image(s)", images.len()));
@@ -2135,21 +2347,41 @@ impl View {
             *output = crate::ui::render::strip_shell_ansi(&text);
         }
     }
+
+    fn restore_queue(&mut self, response: &Value) -> Result<()> {
+        if response["success"] != true {
+            return Err(Error::Config(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("Queue restore failed")
+                    .into(),
+            ));
+        }
+        let messages: Vec<pi_rs::QueuedMessage> =
+            serde_json::from_value(response["data"]["messages"].clone())?;
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut text: Vec<_> = messages
+            .iter()
+            .map(|message| message.input.content.as_str())
+            .filter(|text| !text.is_empty())
+            .collect();
+        if !self.editor.text.is_empty() {
+            text.push(&self.editor.text);
+        }
+        self.editor.replace(text.join("\n\n"));
+        let mut images: Vec<_> = messages
+            .into_iter()
+            .flat_map(|message| message.images)
+            .collect();
+        images.append(&mut self.draft_images);
+        self.draft_images = images;
+        Ok(())
+    }
+
     fn receive(&mut self, value: &Value) {
         match value["type"].as_str() {
-            Some("response") if value["command"] == "clear_queue" && self.restoring_queue => {
-                self.restoring_queue = false;
-                if value["success"] == true {
-                    if let Ok(messages) = serde_json::from_value::<Vec<pi_rs::QueuedMessage>>(value["data"]["messages"].clone()) {
-                        let mut text: Vec<_> = messages.iter().map(|message| message.input.content.clone()).filter(|text| !text.is_empty()).collect();
-                        if !self.editor.text.is_empty() { text.push(self.editor.text.clone()); }
-                        self.editor.replace(text.join("\n\n"));
-                        let mut images: Vec<_> = messages.into_iter().flat_map(|message| message.images).collect();
-                        images.append(&mut self.draft_images);
-                        self.draft_images = images;
-                    }
-                } else { self.append(value["error"].as_str().unwrap_or("Queue restore failed")); }
-            }
             Some("bash_execution_start") => {
                 self.shell_running = true;
                 self.lines.push(Entry::Tool {
@@ -2690,7 +2922,7 @@ impl View {
             ));
         }
         if let Some(picker) = &self.picker {
-            lines = picker.render(theme, width, body_height, keys);
+            lines = picker.render_in_terminal(theme, width, body_height, height, keys);
         }
         let dialog_cursor = self
             .dialog()
@@ -2742,6 +2974,23 @@ impl View {
                 self.mouse.highlight(&mut lines, start..end);
             }
         }
+        let search_overlay = self.search.as_ref().filter(|_| !modal).map(|search| {
+            let search_width = (width * 2 / 5).max(32).min(width.saturating_sub(2).max(1));
+            let left = width.saturating_sub(search_width + 1);
+            let top = usize::from(body_height > 3);
+            let (mut lines, cursor_row, cursor_column) = search.overlay(theme, keys, search_width);
+            if !hardware_cursor && let Some(line) = lines.get_mut(cursor_row) {
+                line.mark_cursor(cursor_column);
+            }
+            lines.truncate(body_height);
+            (
+                top..top + lines.len(),
+                left..left + search_width,
+                lines,
+                cursor_row,
+                cursor_column,
+            )
+        });
         let stdout = std::io::stdout();
         let mut out = FrameWriter::new(
             stdout.lock(),
@@ -2788,12 +3037,19 @@ impl View {
         for (row, line) in lines[start..end].iter().enumerate() {
             queue!(out, MoveTo(0, (row + header_rows) as u16))?;
             line.draw(&mut out, if modal { width } else { body_width })?;
-            self.graphics.paint(
-                line,
-                &mut out,
-                row,
-                images::visible_rows(&lines[start + row..end]),
-            )?;
+            let covered = search_overlay.as_ref().is_some_and(|(rows, columns, ..)| {
+                line.image
+                    .as_ref()
+                    .is_some_and(|image| image.intersects(row, rows, columns))
+            });
+            if !covered {
+                self.graphics.paint(
+                    line,
+                    &mut out,
+                    row,
+                    images::visible_rows(&lines[start + row..end]),
+                )?;
+            }
         }
         if !modal
             && width > 1
@@ -2866,18 +3122,12 @@ impl View {
             "dim",
         )
         .draw(&mut out, width)?;
-        if !modal && let Some(search) = &self.search {
-            let search_width = (width * 2 / 5).max(32).min(width.saturating_sub(2).max(1));
-            let left = width.saturating_sub(search_width + 1);
-            let top = header_rows + usize::from(body_height > 3);
-            let (mut overlay, cursor_row, cursor_column) =
-                search.overlay(theme, keys, search_width);
-            if !hardware_cursor && let Some(line) = overlay.get_mut(cursor_row) {
-                line.mark_cursor(cursor_column);
-            }
-            for (row, line) in overlay.iter().take(body_height).enumerate() {
+        if let Some((rows, columns, overlay, cursor_row, cursor_column)) = search_overlay {
+            let left = columns.start;
+            let top = header_rows + rows.start;
+            for (row, line) in overlay.iter().enumerate() {
                 queue!(out, MoveTo(left as u16, (top + row) as u16))?;
-                line.draw(&mut out, search_width)?;
+                line.draw(&mut out, columns.len())?;
             }
             if cursor_row < body_height {
                 queue!(
@@ -2919,6 +3169,27 @@ impl View {
             )?;
             self.regular.started = false;
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn suspend_terminal(
+        &mut self,
+        terminal: &mut Option<Terminal>,
+        mode: Option<TuiMode>,
+    ) -> Result<()> {
+        if mode == Some(TuiMode::Regular) {
+            self.finish_regular()?;
+        }
+        if let Err(error) = Terminal::suspend(terminal, mode, self.graphics.cleanup()) {
+            self.append(&error.to_string());
+        }
+        if self.graphics.enabled() {
+            images::query_cell_size()?;
+        }
+        self.graphics.reset();
+        self.regular.redraw = true;
+        self.regular.started = false;
         Ok(())
     }
 
@@ -3109,8 +3380,8 @@ impl View {
         };
         let modal = self.picker.is_some() || self.dialog().is_some();
         let committing = !busy && !modal;
-        // A trailing cycle notice can still be replaced by another cycle.
-        let trailing_status = matches!(self.lines.last(), Some(Entry::ModelCycleStatus(_)));
+        // A trailing status can still be replaced by another status.
+        let trailing_status = matches!(self.lines.last(), Some(Entry::Status(_)));
         let commit_end = if committing {
             (self.lines.len() - usize::from(trailing_status)).max(self.regular.committed)
         } else {
@@ -3150,8 +3421,13 @@ impl View {
                 active.extend(render_entry(&entry));
             }
             if let Some(picker) = &self.picker {
-                active =
-                    picker.render(theme, width, height - prompt_height - 4 - below.len(), keys);
+                active = picker.render_in_terminal(
+                    theme,
+                    width,
+                    height - prompt_height - 4 - below.len(),
+                    height,
+                    keys,
+                );
             }
         }
         let dialog_height = height - prompt_height - 4 - below.len();
@@ -3387,7 +3663,7 @@ fn slash(
             ))?);
             view.append(&super::cache_warming::status::describe(
                 view.cache_warming_status.as_ref(),
-                args.settings.string("cacheWarming").unwrap_or("streaming"),
+                args.settings.cache_warming_mode(),
                 session.head(),
             ));
             let stats = &view.cache_stats;
@@ -3647,6 +3923,15 @@ fn slash(
             super::Provider::named("openrouter").expect("built-in OpenRouter provider"),
             view,
         ),
+        "/login"
+            if rest.eq_ignore_ascii_case("openai-codex")
+                || rest.eq_ignore_ascii_case("openai-codex browser") =>
+        {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Browser)
+        }
+        "/login" if rest.eq_ignore_ascii_case("openai-codex device") => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
+        }
         "/login" if rest.eq_ignore_ascii_case("github-copilot") => {
             start_copilot_login(view, &args.settings)
         }
@@ -3686,6 +3971,20 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-codex · Browser authorization".into(),
+                            selection: Selection::LoginCodex,
+                        },
+                    );
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-codex · Device authorization".into(),
+                            selection: Selection::LoginCodexDevice,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -3781,6 +4080,8 @@ fn slash(
                 if login {
                     if provider.id() == "amazon-bedrock" {
                         show_bedrock_methods(view);
+                    } else if uses_cloudflare_login(&provider, args) {
+                        edit_cloudflare_login(view, CloudflareLoginField::Key(provider));
                     } else {
                         edit_provider_key(provider, view);
                     }
@@ -4048,7 +4349,7 @@ fn slash(
             );
         }
         "/tree" => {
-            let session = Session::open(&args.session)?;
+            let session = Session::snapshot(&args.session)?;
             let filter =
                 TreeFilter::parse(args.settings.string("treeFilterMode").unwrap_or("default"));
             view.picker = Some(session_tree::picker(&session, filter));
@@ -4172,7 +4473,7 @@ fn apply_terminal_color_snapshot(
 
 #[cfg(any(unix, windows))]
 fn refresh_terminal_theme_selection(args: &Cli, view: &mut View, theme: &mut Theme) {
-    let selection = args.use_theme.as_deref().unwrap_or("system");
+    let selection = args.theme_setting().unwrap_or("system");
     if let (Some(settings), Some(picker)) = (&view.theme_settings, &view.picker) {
         if let Ok(next) = settings.preview(picker, args) {
             *theme = next;
@@ -4215,7 +4516,7 @@ fn settle_complete_colors(colors: &ColorQueries, theme: &mut Theme) -> bool {
 fn startup_picker_theme(args: &Cli) -> Result<Theme> {
     let resources = super::resources::Resources::load_for_startup(args)?;
     Ok(load_resolved_theme(
-        args.use_theme.as_deref().unwrap_or("system"),
+        args.theme_setting().unwrap_or("system"),
         &resources.themes,
         &args.workspace,
         args.trusted,
@@ -4375,7 +4676,7 @@ pub(super) async fn run(
     let _pending_colors = crate::ui::theme::PendingTerminalColors::new();
     let mut deferred_theme_error = None;
     let mut theme = match load_resolved_theme(
-        args.use_theme.as_deref().unwrap_or("system"),
+        args.theme_setting().unwrap_or("system"),
         &args.theme_paths,
         &args.workspace,
         args.trusted,
@@ -4413,7 +4714,7 @@ pub(super) async fn run(
         #[cfg(any(unix, windows))]
         None,
         #[cfg(any(unix, windows))]
-        follows_terminal_appearance(args.use_theme.as_deref()),
+        follows_terminal_appearance(args.theme_setting()),
     )?);
     let mut input = crate::ui::input::Reader::new()?;
     let terminal_signal = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -4454,23 +4755,36 @@ pub(super) async fn run(
             interrupted = true;
             break 'interactive;
         }
+        #[cfg(unix)]
+        if SUSPEND_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
+            && _terminal.is_some()
+        {
+            view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+            dirty = true;
+        }
         #[cfg(any(unix, windows))]
         if let Some(terminal) = &mut _terminal {
-            let enabled = follows_terminal_appearance(args.use_theme.as_deref());
+            let enabled = follows_terminal_appearance(args.theme_setting());
+            let refresh_requested = std::mem::take(&mut view.theme_refresh_requested);
             let mut output = std::io::stdout();
             if terminal.set_appearance_notifications(enabled, &mut output)? && enabled {
                 terminal
                     .colors
                     .refresh_after_appearance_subscription(&mut output)?;
+            } else if refresh_requested {
+                terminal.colors.query_terminal_colors(&mut output)?;
             }
         }
         if let Some(task) = &auth_reload {
             match task.receiver.try_recv() {
                 Ok(Ok(keys)) => {
                     if args.model_keys.revision() == task.revision {
-                        args.model_keys = keys;
+                        let result = args.replace_model_keys(keys);
                         view.invalidate_model_catalog();
-                        view.append("Provider credentials reloaded");
+                        match result {
+                            Ok(()) => view.append("Provider credentials reloaded"),
+                            Err(error) => view.append(&format!("Model profile reload: {error}")),
+                        }
                     } else {
                         view.append("Provider credentials changed during reload; keeping the newer selection");
                     }
@@ -4776,6 +5090,32 @@ pub(super) async fn run(
                 {
                     view.append(&error);
                 }
+                if value["type"] == "response"
+                    && value["command"] == "clear_queue"
+                    && let Some(handoff) = &view.tree_handoff
+                    && handoff.clear_id.is_some_and(|id| value["id"] == json!(id))
+                {
+                    let result = view.restore_queue(&value).and_then(|()| {
+                        if active.busy && (active.compacting || view.summarizing) {
+                            return Err(tree_compaction_in_progress());
+                        }
+                        if active.busy {
+                            active.send(json!({"type":"cancel"}))?;
+                        }
+                        Ok(())
+                    });
+                    match result {
+                        Ok(()) => {
+                            view.tree_handoff.as_mut().expect("active handoff").clear_id = None
+                        }
+                        Err(error) => {
+                            view.tree_handoff = None;
+                            view.append(&error.to_string());
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
                 let settled = value["type"] == "agent_settled";
                 let success = value["success"] == true;
                 if view.tree_navigation.is_some() {
@@ -4806,7 +5146,7 @@ pub(super) async fn run(
                 }
                 let resources_changed = value["type"] == "resources_discovered";
                 view.receive_worker(value, &mut args);
-                if resources_changed && let Some(name) = args.use_theme.as_deref() {
+                if resources_changed && let Some(name) = args.theme_setting() {
                     match load_resolved_theme(
                         name,
                         &args.theme_paths,
@@ -4873,6 +5213,12 @@ pub(super) async fn run(
                 view.cache_warming_status = None;
                 cancel_running_extension_editor(&mut external_editor, None);
                 view.dialogs.clear();
+                if view.tree_handoff.take().is_some() {
+                    view.append("Branch navigation stopped when the active worker exited");
+                }
+                if let Some(picker) = &mut view.picker {
+                    picker.cancel_pending_tree_label();
+                }
                 if let Some((id, _)) = view.tree_navigation.take()
                     && let Err(error) = reopen_tree(&mut args, &mut view, id)
                 {
@@ -4888,6 +5234,25 @@ pub(super) async fn run(
                 view.shell_running = false;
                 dirty = true;
             }
+        }
+        if !is_busy(&worker)
+            && view
+                .tree_handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.clear_id.is_none())
+        {
+            let handoff = view.tree_handoff.take().expect("acknowledged tree handoff");
+            if let Err(error) = start_tree_navigation(
+                &args,
+                &mut view,
+                &mut worker,
+                handoff.id,
+                handoff.summarize,
+                handoff.instructions,
+            ) {
+                view.append(&error.to_string());
+            }
+            dirty = true;
         }
         if view
             .custom_render_redraw_at
@@ -4929,6 +5294,15 @@ pub(super) async fn run(
                     ));
                     dirty = true;
                 }
+                Ok(RemoteEvent::CodexCode(sender)) => {
+                    view.local_editor = Some((
+                        LocalEditor::CodexCode(Some(sender)),
+                        crate::ui::dialog::Dialog::secret(
+                            "OpenAI Codex code or redirect URL".into(),
+                        ),
+                    ));
+                    dirty = true;
+                }
                 Ok(RemoteEvent::AnthropicCode(sender)) => {
                     view.local_editor = Some((
                         LocalEditor::AnthropicCode(Some(sender)),
@@ -4937,7 +5311,11 @@ pub(super) async fn run(
                     dirty = true;
                 }
                 Ok(RemoteEvent::ForgetModelKey(provider)) => {
-                    args.model_keys.forget(provider);
+                    let mut keys = args.model_keys.clone();
+                    keys.forget(provider);
+                    if let Err(error) = args.replace_model_keys(keys) {
+                        view.append(&format!("Model profile reload: {error}"));
+                    }
                     view.invalidate_model_catalog();
                     dirty = true;
                 }
@@ -5018,7 +5396,7 @@ pub(super) async fn run(
                     };
                     view.lines
                         .push(Entry::user(display.unwrap_or_else(|| prompt.clone())));
-                    view.history.push(prompt);
+                    view.remember_prompt(&prompt);
                 }
                 Err(error) => view.append(&error.to_string()),
             }
@@ -5476,7 +5854,7 @@ pub(super) async fn run(
                                         Err(Error::Config("Enter an OpenRouter authorization code or redirect URL".into()))
                                     }
                                 }
-                                LocalEditor::AnthropicCode(sender) => {
+                                LocalEditor::AnthropicCode(sender) | LocalEditor::CodexCode(sender) => {
                                     if let Some(sender) = sender.take() { let _ = sender.send(text); }
                                     Ok(())
                                 }
@@ -5492,6 +5870,9 @@ pub(super) async fn run(
                                             view.append("AWS profile saved for amazon-bedrock");
                                         })
                                 }
+                                LocalEditor::CloudflareLogin(field) => {
+                                    advance_cloudflare_login(field, text.trim(), &mut args, &mut view)
+                                }
                                 LocalEditor::ProviderKey(provider) => super::model_auth::save(
                                     provider,
                                     args.model_endpoint_for(
@@ -5501,9 +5882,11 @@ pub(super) async fn run(
                                     &text,
                                 )
                                 .and_then(|()| super::model_auth::Keys::load())
-                                .map(|keys| {
-                                    args.model_keys = keys;
+                                .and_then(|keys| {
+                                    args.replace_model_keys(keys)?;
+                                    view.invalidate_model_catalog();
                                     view.append(&format!("API key saved for {}", provider.id()));
+                                    Ok(())
                                 }),
                             };
                             if let Err(error) = result {
@@ -5519,7 +5902,10 @@ pub(super) async fn run(
                         Some(_) => {
                             if let LocalEditor::BranchSummary(id) = editor {
                                 confirm_tree(&mut view, id);
-                            } else if matches!(editor, LocalEditor::AnthropicCode(_)) {
+                            } else if matches!(
+                                editor,
+                                LocalEditor::AnthropicCode(_) | LocalEditor::CodexCode(_)
+                            ) {
                                 interrupt_remote_task(&mut view);
                             }
                         }
@@ -5539,6 +5925,7 @@ pub(super) async fn run(
                     }
                     continue;
                 }
+                let mut submit_completion = false;
                 if let Some(mut picker) = view.picker.take() {
                     let input = if mouse_activate {
                         picker.activate_mouse_selection(&keys)
@@ -5579,7 +5966,7 @@ pub(super) async fn run(
                                 match settings.stage {
                                     ThemeSettingsStage::Single => {
                                         theme = load_resolved_theme(
-                                            args.use_theme.as_deref().unwrap_or("system"),
+                                            args.theme_setting().unwrap_or("system"),
                                             &args.theme_paths,
                                             &args.workspace,
                                             args.trusted,
@@ -5614,7 +6001,7 @@ pub(super) async fn run(
                         }
                         Input::CopyTreeRecord(id) => {
                             picker.show_feedback(
-                                Session::open(&args.session)
+                                Session::snapshot(&args.session)
                                     .and_then(|session| sessions::tree_record_text(&session, id))
                                     .and_then(|text| sessions::copy_text(&text))
                                     .map(|()| "Copied entry".into())
@@ -5623,14 +6010,24 @@ pub(super) async fn run(
                             view.picker = Some(picker);
                         }
                         Input::SetTreeLabel(id, label) => {
-                            let result = Session::open(&args.session).and_then(|mut session| {
-                                session.set_label(id, (!label.is_empty()).then_some(label))?;
-                                picker.refresh_tree(
-                                    session_tree::picker(&session, TreeFilter::Default),
-                                    id,
-                                );
-                                Ok(())
-                            });
+                            let label = (!label.is_empty()).then_some(label);
+                            let result = if let Some(active) =
+                                worker.as_mut().filter(|worker| worker.busy)
+                            {
+                                let request = uuid::Uuid::new_v4();
+                                active.send(json!({
+                                    "type":"set_session_label","target":id,"label":label,"id":request,
+                                })).map(|()| picker.track_tree_label(request, id))
+                            } else {
+                                Session::open(&args.session).and_then(|mut session| {
+                                    session.set_label(id, label)?;
+                                    picker.refresh_tree(
+                                        session_tree::picker(&session, TreeFilter::Default),
+                                        id,
+                                    );
+                                    Ok(())
+                                })
+                            };
                             if let Err(error) = result {
                                 picker.show_feedback(Err(error.to_string()));
                             }
@@ -5680,6 +6077,13 @@ pub(super) async fn run(
                         }
                         Input::Select(selection) => {
                             view.tree_confirmation = None;
+                            // A leading slash word opens the command-name menu.
+                            // File completions elsewhere can also start with "/".
+                            submit_completion = !mouse_activate
+                                && keys.matches("tui.select.confirm", key)
+                                && !keys.matches("tui.input.tab", key)
+                                && matches!(&selection, Selection::Completion { range, .. }
+                                    if range.start == 0 && view.editor.text.starts_with('/'));
                             let settings = picker.title == "Settings";
                             if settings
                                 && matches!(&selection, Selection::EditSetting(name) if name == "theme")
@@ -5926,9 +6330,11 @@ pub(super) async fn run(
                             }
                         }
                     }
-                    continue;
+                    if !submit_completion {
+                        continue;
+                    }
                 }
-                if args.tui_mode != Some(TuiMode::Regular) {
+                if !submit_completion && args.tui_mode != Some(TuiMode::Regular) {
                     if keys.matches("tui.altScreen.search", key) {
                         last_idle_interrupt = None;
                         view.mouse.clear();
@@ -5959,69 +6365,51 @@ pub(super) async fn run(
                         continue;
                     }
                 }
-                if view.keyboard_copies_selection(
-                    keys.matches("tui.input.copy", key),
-                    keys.matches("app.message.copy", key),
-                    args.settings.boolean("fullscreenCopyOnSelect") != Some(false),
-                ) && view.copy_selection()
+                if !submit_completion
+                    && view.keyboard_copies_selection(
+                        keys.matches("tui.input.copy", key),
+                        keys.matches("app.message.copy", key),
+                        args.settings.boolean("fullscreenCopyOnSelect") != Some(false),
+                    )
+                    && view.copy_selection()
                 {
                     continue;
                 }
                 view.mouse.clear();
-                let action = keys
-                    .action(
+                let action = if submit_completion {
+                    "tui.input.submit"
+                } else {
+                    keys.action(
                         key,
                         view.editor.text.is_empty() && view.draft_images.is_empty(),
                     )
-                    .unwrap_or("");
+                    .unwrap_or("")
+                };
                 if action != "app.interrupt" || is_busy(&worker) {
                     last_idle_interrupt = None;
                 }
-                if view.editor.jump_key(action, key) || view.editor.action(action) {
+                if !submit_completion
+                    && (view.editor.jump_key(action, key) || view.editor.action(action))
+                {
                     continue;
                 }
                 match action {
                     "app.suspend" => {
                         #[cfg(unix)]
-                        {
-                            if args.tui_mode == Some(TuiMode::Regular) {
-                                view.finish_regular()?;
-                            }
-                            if let Err(error) = Terminal::suspend(
-                                &mut _terminal,
-                                args.tui_mode,
-                                view.graphics.cleanup(),
-                            ) {
-                                view.append(&error.to_string());
-                            }
-                            if view.graphics.enabled() {
-                                images::query_cell_size()?;
-                            }
-                            view.graphics.reset();
-                            view.regular.redraw = true;
-                            view.regular.started = false;
-                        }
+                        view.suspend_terminal(&mut _terminal, args.tui_mode)?;
                         #[cfg(not(unix))]
                         view.append("Suspending the terminal is unavailable on this platform");
                     }
+                    "app.message.dequeue" | "app.interrupt" if view.tree_handoff.is_some() => {}
                     "app.message.dequeue" => {
-                        match Worker::control(&mut worker, &args, json!({"type":"clear_queue"})) {
-                            Ok(()) => view.restoring_queue = true,
-                            Err(error) => view.append(&error.to_string()),
-                        }
+                        view.request_queue_restore(&mut worker, &args, true);
                     }
                     "app.interrupt" if auth_reload.is_some() && !is_busy(&worker) => {
                         auth_reload = None;
                         view.append("Provider credential reload cancelled");
                     }
                     "app.interrupt" if worker.as_ref().is_some_and(|active| active.busy) => {
-                        if let Err(error) =
-                            Worker::control(&mut worker, &args, json!({"type":"clear_queue"}))
-                        {
-                            view.append(&error.to_string());
-                        } else {
-                            view.restoring_queue = true;
-                        }
+                        view.request_queue_restore(&mut worker, &args, false);
                         if let Some(active) = &mut worker {
                             let _ = active.send(json!({"type":"cancel"}));
                         }
@@ -6056,13 +6444,19 @@ pub(super) async fn run(
                             }
                         }
                     }
-                    "app.session.new" | "app.session.tree" | "app.session.fork"
-                    | "app.session.resume"
-                        if !is_busy(&worker) =>
+                    "app.session.tree"
+                        if view.tree_handoff.is_none() && view.tree_navigation.is_none() =>
+                    {
+                        if let Err(error) = slash("/tree", &mut args, &mut view, Some(&mut worker))
+                        {
+                            view.append(&error.to_string());
+                        }
+                    }
+                    "app.session.new" | "app.session.fork" | "app.session.resume"
+                        if !is_busy(&worker) && view.tree_handoff.is_none() =>
                     {
                         let command = match action {
                             "app.session.new" => "/new",
-                            "app.session.tree" => "/tree",
                             "app.session.fork" => "/fork",
                             _ => "/resume",
                         };
@@ -6088,19 +6482,37 @@ pub(super) async fn run(
                     }
                     "app.thinking.cycle" if !is_busy(&worker) => {
                         match super::thinking::cycle(&mut args) {
-                            Ok(Some(level)) => view.append(&format!("Thinking level: {level}")),
-                            Ok(None) => view.append("Current model does not support thinking"),
+                            Ok(Some(level)) => {
+                                view.show_status(args.tui_mode, format!("Thinking level: {level}"));
+                            }
+                            Ok(None) => view.show_status(
+                                args.tui_mode,
+                                "Current model does not support thinking".into(),
+                            ),
                             Err(error) => view.append(&error.to_string()),
                         }
                     }
-                    "app.tools.expand" => view.set_expand_tools(!view.expand_tools),
+                    "app.tools.expand" => {
+                        view.set_expand_tools(!view.expand_tools);
+                        let state = if view.expand_tools {
+                            "expanded"
+                        } else {
+                            "collapsed"
+                        };
+                        view.show_status(args.tui_mode, format!("Tool output: {state}"));
+                    }
                     "app.thinking.toggle" => {
                         let hidden = !view.hide_thinking;
                         view.set_hide_thinking(hidden);
-                        if let Err(error) =
-                            args.settings.set_user("hideThinkingBlock", json!(hidden))
-                        {
-                            view.append(&error.to_string());
+                        match args.settings.set_user("hideThinkingBlock", json!(hidden)) {
+                            Ok(()) => {
+                                let state = if hidden { "hidden" } else { "visible" };
+                                view.show_status(
+                                    args.tui_mode,
+                                    format!("Thinking blocks: {state}"),
+                                );
+                            }
+                            Err(error) => view.append(&error.to_string()),
                         }
                     }
                     "app.clipboard.pasteImage" => view.paste_clipboard(&args),
@@ -6126,7 +6538,7 @@ pub(super) async fn run(
                     }
                     "tui.input.submit" if view.editor.continued_line() => {}
                     "tui.input.submit" | "app.message.followUp" => {
-                        if view.tree_navigation.is_some() {
+                        if view.tree_navigation.is_some() || view.tree_handoff.is_some() {
                             continue;
                         }
                         if view.clipboard.is_some() {
@@ -6149,7 +6561,7 @@ pub(super) async fn run(
                         let auth_command =
                             matches!(input.split_whitespace().next(), Some("/login" | "/logout"));
                         if !auth_command {
-                            view.history.push(input.clone());
+                            view.remember_prompt(&input);
                         }
                         view.history_index = None;
                         if input.trim() == "/theme" {
@@ -6188,6 +6600,7 @@ pub(super) async fn run(
                                     args.settings.set_user("theme", json!(name.trim()))?;
                                     args.use_theme = Some(name.trim().into());
                                     theme = next;
+                                    view.theme_refresh_requested = true;
                                 }
                                 Err(error) => view.append(&error.to_string()),
                             }
@@ -6213,7 +6626,7 @@ pub(super) async fn run(
                                 view.append(&error.to_string());
                                 view.editor.replace(input);
                             }
-                        } else if matches!(input.trim(), "/session" | "/share")
+                        } else if matches!(input.trim(), "/session" | "/share" | "/tree")
                             && view.draft_images.is_empty()
                         {
                             if let Err(error) =
@@ -6254,9 +6667,24 @@ pub(super) async fn run(
                                 Some(AuthReload::start(args.model_keys.revision().to_owned()));
                             view.append("Reloading provider credentials (Esc to cancel)");
                             args.reload_model_profiles()?;
-                            tokio::select! {
-                                result = super::packages::prepare(&args) => result?,
-                                _ = terminal_signal.notified() => { interrupted = true; break 'interactive; },
+                            {
+                                let preparation = super::packages::prepare(&args);
+                                tokio::pin!(preparation);
+                                loop {
+                                    tokio::select! {
+                                        result = &mut preparation => break result?,
+                                        _ = terminal_signal.notified() => {
+                                            if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+                                                interrupted = true;
+                                                break 'interactive;
+                                            }
+                                            #[cfg(unix)]
+                                            if SUSPEND_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                                                view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+                                            }
+                                        },
+                                    }
+                                }
                             }
                             view.resources = super::resources::Resources::load(&args)?;
                             args.theme_paths = view.resources.themes.clone();
@@ -6265,7 +6693,7 @@ pub(super) async fn run(
                                 Err(error) => view.append(&error.to_string()),
                             }
                             match load_resolved_theme(
-                                args.use_theme.as_deref().unwrap_or("system"),
+                                args.theme_setting().unwrap_or("system"),
                                 &args.theme_paths,
                                 &args.workspace,
                                 args.trusted,
@@ -6273,6 +6701,7 @@ pub(super) async fn run(
                                 Ok(next) => theme = next,
                                 Err(error) => view.append(&error.to_string()),
                             }
+                            view.theme_refresh_requested = true;
                             view.append("Reloaded settings, context, skills, prompts, native extensions, MCP, keybindings and theme");
                             args.session_transition = Some(pi_rs::SessionStartReason::Reload);
                         } else if input.starts_with('/') {
@@ -6475,9 +6904,110 @@ fn edit_provider_key(provider: super::Provider, view: &mut View) {
     view.local_editor = Some((LocalEditor::ProviderKey(provider), dialog));
 }
 
+fn uses_cloudflare_login(provider: &super::Provider, args: &Cli) -> bool {
+    matches!(
+        provider.id(),
+        "cloudflare-workers-ai" | "cloudflare-ai-gateway"
+    ) && args.explicit_endpoint_for(provider).is_none()
+        && !args.model_profiles.has_fixed_cloudflare_endpoint(
+            provider,
+            (provider == &args.provider).then_some(args.model.as_str()),
+        )
+}
+
+fn edit_cloudflare_login(view: &mut View, field: CloudflareLoginField) {
+    use crate::ui::dialog::Dialog;
+    let dialog = match field {
+        CloudflareLoginField::Key(_) => Dialog::secret("Enter Cloudflare API key".into()),
+        _ => Dialog::new(
+            uuid::Uuid::new_v4(),
+            pi_rs::UiRequest::Input {
+                title: match field {
+                    CloudflareLoginField::Account { .. } => "Enter Cloudflare account ID",
+                    _ => "Enter Cloudflare AI Gateway ID",
+                }
+                .into(),
+                placeholder: None,
+                initial_value: None,
+                timeout: None,
+            },
+        ),
+    };
+    view.local_editor = Some((LocalEditor::CloudflareLogin(field), dialog));
+}
+
+fn cloudflare_login_matches_gateway_base(base: &str, account: &str, gateway: &str) -> bool {
+    super::cloudflare_gateway::Route::new(account, gateway).is_some_and(|route| {
+        super::cloudflare_gateway::Route::from_configured(base, Some(&route)) == Some(route)
+    })
+}
+
+fn advance_cloudflare_login(
+    field: &CloudflareLoginField,
+    text: &str,
+    args: &mut Cli,
+    view: &mut View,
+) -> Result<()> {
+    let (provider, key, account, gateway) = match field {
+        CloudflareLoginField::Key(provider) => {
+            if !super::model_auth::valid_key(text) {
+                return Err(Error::Config("Enter a valid Cloudflare API key".into()));
+            }
+            edit_cloudflare_login(
+                view,
+                CloudflareLoginField::Account {
+                    provider: provider.clone(),
+                    key: text.into(),
+                },
+            );
+            return Ok(());
+        }
+        CloudflareLoginField::Account { provider, key } => {
+            if !super::operation_models::valid_cloudflare_account(text) {
+                return Err(Error::Config("Enter a valid Cloudflare account ID".into()));
+            }
+            if provider.id() == "cloudflare-ai-gateway" {
+                edit_cloudflare_login(
+                    view,
+                    CloudflareLoginField::Gateway {
+                        provider: provider.clone(),
+                        key: key.clone(),
+                        account: text.into(),
+                    },
+                );
+                return Ok(());
+            }
+            (provider, key.as_str(), text, None)
+        }
+        CloudflareLoginField::Gateway {
+            provider,
+            key,
+            account,
+        } => (provider, key.as_str(), account.as_str(), Some(text)),
+    };
+    if let Some(gateway) = gateway
+        && let Some(base) = args.model_profiles.cloudflare_configured_base(
+            provider,
+            (provider == &args.provider).then_some(args.model.as_str()),
+        )
+        && !cloudflare_login_matches_gateway_base(base, account, gateway)
+    {
+        return Err(Error::Config(
+            "Enter identifiers that match the configured Cloudflare route".into(),
+        ));
+    }
+    super::model_auth::save_cloudflare_login(provider, key, account, gateway)?;
+    args.replace_model_keys(super::model_auth::Keys::load()?)?;
+    view.invalidate_model_catalog();
+    view.append(&format!("Cloudflare API key saved for {}", provider.id()));
+    Ok(())
+}
+
 fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut View) -> Result<()> {
     let removed = super::model_auth::remove(&provider)?;
-    args.model_keys.forget(provider.id());
+    let mut keys = args.model_keys.clone();
+    keys.forget(provider.id());
+    let result = args.replace_model_keys(keys);
     view.invalidate_model_catalog();
     view.append(&format!(
         "{} for {}",
@@ -6488,7 +7018,7 @@ fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut Vie
         },
         provider.id()
     ));
-    Ok(())
+    result
 }
 
 fn select_model_input(args: &mut Cli, view: &mut View, input: &str) -> Result<()> {
@@ -6595,14 +7125,7 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     } else {
         "Only one model in scope".into()
     };
-    // A normal terminal has already printed committed rows to its scrollback.
-    if (args.tui_mode != Some(TuiMode::Regular) || view.regular.committed < view.lines.len())
-        && let Some(Entry::ModelCycleStatus(previous)) = view.lines.last_mut()
-    {
-        *previous = status;
-    } else {
-        view.append_entry(Entry::ModelCycleStatus(status));
-    }
+    view.show_status(args.tui_mode, status);
     Ok(())
 }
 
@@ -6714,6 +7237,41 @@ fn take_device_code_action(
         return None;
     }
     view.remote_task.as_mut()?.device_code.take()
+}
+
+fn start_codex_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    method: super::codex_auth::Method,
+) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to OpenAI Codex",
+        "OpenAI Codex login cancelled",
+        move |sender| async move {
+            super::codex_auth::login(&settings, task_control, method, |notice| match notice {
+                super::codex_auth::Notice::Device { url, code } => {
+                    let _ = sender.send(RemoteEvent::DeviceCode {
+                        url: url.to_owned(),
+                        code,
+                    });
+                }
+                super::codex_auth::Notice::Browser(url, input) => {
+                    let _ = sender.send(RemoteEvent::Notice(format!(
+                        "Continue in your browser: {url}"
+                    )));
+                    let _ = sender.send(RemoteEvent::CodexCode(input));
+                }
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to OpenAI Codex".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
 }
 
 fn start_copilot_login(view: &mut View, settings: &crate::config::Settings) {
@@ -6889,6 +7447,8 @@ fn interrupt_remote_task(view: &mut View) {
     } else if task.meta_login_control.is_some() {
         view.append(if task.status == "Signing in to xAI" {
             "xAI sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to OpenAI Codex" {
+            "OpenAI Codex sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to GitHub Copilot" {
             "GitHub Copilot sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to Anthropic" {
@@ -6905,7 +7465,9 @@ fn clear_openrouter_editor(view: &mut View) {
     if matches!(
         view.local_editor,
         Some((
-            LocalEditor::OpenRouterCode(_) | LocalEditor::AnthropicCode(_),
+            LocalEditor::OpenRouterCode(_)
+                | LocalEditor::AnthropicCode(_)
+                | LocalEditor::CodexCode(_),
             _
         ))
     ) {
@@ -7092,6 +7654,10 @@ fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()>
     Ok(())
 }
 
+fn tree_compaction_in_progress() -> Error {
+    Error::Config("Wait for the current compaction or tree navigation to finish before navigating the session tree".into())
+}
+
 fn start_tree_navigation(
     args: &Cli,
     view: &mut View,
@@ -7100,6 +7666,28 @@ fn start_tree_navigation(
     summarize: bool,
     instructions: Option<String>,
 ) -> Result<()> {
+    if view.tree_handoff.is_some() || view.tree_navigation.is_some() {
+        return Err(tree_compaction_in_progress());
+    }
+    if let Some(active) = worker.as_mut() {
+        if active.bashing {
+            return Err(Error::Config("Wait for the shell command to finish".into()));
+        }
+        if active.busy {
+            if active.compacting || view.summarizing {
+                return Err(tree_compaction_in_progress());
+            }
+            let clear_id = uuid::Uuid::new_v4();
+            active.send(json!({"type":"clear_queue", "id": clear_id}))?;
+            view.tree_handoff = Some(TreeNavigationHandoff {
+                id,
+                summarize,
+                instructions,
+                clear_id: Some(clear_id),
+            });
+            return Ok(());
+        }
+    }
     let configured_reserve = &args.settings.value()["branchSummary"]["reserveTokens"];
     let reserve_tokens = configured_reserve
         .as_u64()
@@ -7119,7 +7707,7 @@ fn start_tree_navigation(
 
 impl ThemeSettings {
     fn new(parent: Picker, args: &Cli, theme: &Theme) -> Self {
-        let selected = args.use_theme.as_deref().unwrap_or("system");
+        let selected = args.theme_setting().unwrap_or("system");
         let pair = crate::ui::theme::parse_auto_theme_setting(selected);
         let (light, dark) = pair.unwrap_or((selected, selected));
         Self {
@@ -7280,7 +7868,7 @@ fn start_thinking_levels(
 }
 
 fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item> {
-    let cache_mode = args.settings.string("cacheWarming").unwrap_or("streaming");
+    let cache_mode = args.settings.cache_warming_mode();
     let next_cache_mode = match cache_mode {
         "streaming" => "idle",
         "idle" => "off",
@@ -7631,7 +8219,7 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
             ),
         },
         Item {
-            label: format!("Theme · {}", args.use_theme.as_deref().unwrap_or("system")),
+            label: format!("Theme · {}", args.theme_setting().unwrap_or("system")),
             selection: Selection::EditSetting("theme".into()),
         },
         Item {
@@ -7765,7 +8353,7 @@ fn select(
             )?;
         }
         Selection::Checkout(id) => {
-            if id == Session::open(&args.session)?.head() {
+            if id == Session::snapshot(&args.session)?.head() {
                 view.append("Already at this point");
             } else if args.settings.value()["branchSummary"]["skipPrompt"] == true {
                 start_tree_navigation(args, view, worker, id, false, None)?;
@@ -7800,6 +8388,9 @@ fn select(
         Selection::LoginProvider(provider) if provider.id() == "amazon-bedrock" => {
             show_bedrock_methods(view)
         }
+        Selection::LoginProvider(provider) if uses_cloudflare_login(&provider, args) => {
+            edit_cloudflare_login(view, CloudflareLoginField::Key(provider));
+        }
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
         Selection::BedrockBearer => edit_provider_key(super::Provider::Bedrock, view),
         Selection::BedrockProfile => {
@@ -7826,6 +8417,12 @@ fn select(
             );
             view.local_editor = Some((LocalEditor::BedrockChain, dialog));
         }
+        Selection::LoginCodex => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Browser)
+        }
+        Selection::LoginCodexDevice => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
+        }
         Selection::LoginCopilot => start_copilot_login(view, &args.settings),
         Selection::LoginXai => start_xai_login(view, &args.settings),
         Selection::LoginMeta => start_meta_login(view, &args.settings),
@@ -7850,7 +8447,7 @@ fn select(
         Selection::SaveDefaultModel => save_default_model(args)?,
         Selection::EditSetting(key) => {
             let default = match key.as_str() {
-                "theme" => json!(args.use_theme.as_deref().unwrap_or("system")),
+                "theme" => json!(args.theme_setting().unwrap_or("system")),
                 "defaultModel" => json!(args.model),
                 "defaultThinkingLevel" => json!(args.thinking.as_deref().unwrap_or("off")),
                 "tuiMode" => json!(if args.tui_mode == Some(TuiMode::Regular) {
@@ -7960,6 +8557,7 @@ fn select(
                 args.settings.set_user(&key, value.clone())?;
                 args.use_theme = value.as_str().map(str::to_owned);
                 *theme = next;
+                view.theme_refresh_requested = true;
             } else {
                 args.settings.set_user(&key, value.clone())?;
             }
@@ -8002,6 +8600,7 @@ fn select(
             args.settings.set_user("theme", json!(name))?;
             args.use_theme = Some(name);
             *theme = next;
+            view.theme_refresh_requested = true;
         }
         Selection::ThemeSettings(_) => {
             return Err(Error::Config(
@@ -8617,7 +9216,7 @@ fn finish_external_editor(
         #[cfg(any(unix, windows))]
         editor_colors.take(),
         #[cfg(any(unix, windows))]
-        follows_terminal_appearance(args.use_theme.as_deref()),
+        follows_terminal_appearance(args.theme_setting()),
     )?);
     EXTERNAL_EDITOR_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
     if view.graphics.enabled() {
@@ -8889,6 +9488,62 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cloudflare_login_validates_fixed_identifiers_in_gateway_templates() {
+        let base = "https://gateway.ai.cloudflare.com/v1/fixed/{CLOUDFLARE_GATEWAY_ID}/compat";
+        assert!(cloudflare_login_matches_gateway_base(
+            base,
+            "fixed",
+            "other-gateway"
+        ));
+        assert!(!cloudflare_login_matches_gateway_base(
+            base,
+            "wrong",
+            "other-gateway"
+        ));
+    }
+
+    #[test]
+    fn cloudflare_login_preserves_key_entry_for_fixed_routes() {
+        use clap::Parser;
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(uses_cloudflare_login(&provider, &args));
+        }
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{
+                "cloudflare-workers-ai":{"baseUrl":"http://127.0.0.1:31415/v1"},
+                "cloudflare-ai-gateway":{"baseUrl":"http://127.0.0.1:31416/v1"},
+            }}))
+            .unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(!uses_cloudflare_login(&provider, &args));
+        }
+        args.model_profiles = super::super::model_profiles::Profiles::parse(
+            &serde_json::json!({"providers":{
+                "cloudflare-workers-ai":{"baseUrl":"https://api.cloudflare.com/client/v4/accounts/fixture/ai/v1"},
+                "cloudflare-ai-gateway":{"baseUrl":"https://gateway.ai.cloudflare.com/v1/fixture/gateway/compat"},
+            }}),
+        ).unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(!uses_cloudflare_login(&provider, &args));
+        }
+        args.model_profiles = super::super::model_profiles::Profiles::parse_with_cloudflare_routes(
+            &serde_json::json!({}),
+            Some("storedworker"),
+            super::super::cloudflare_gateway::Route::new("storedaccount", "storedgateway"),
+        )
+        .unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(!args.model_profiles.endpoint(&provider).is_empty());
+            assert!(uses_cloudflare_login(&provider, &args));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn signal_listener_survives_interrupt_during_editor() {
@@ -10521,6 +11176,57 @@ exit {exit}
             super::next_thinking_level_input(&mut pending, false, true, false),
             None
         );
+    }
+
+    #[test]
+    fn explicit_dequeue_reports_empty_and_restored_queues_without_losing_draft() {
+        let mut view = View::default();
+        view.editor.replace("draft".to_owned());
+        view.editor.cursor = 2;
+
+        let empty = uuid::Uuid::new_v4();
+        let restored = uuid::Uuid::new_v4();
+        view.queue_restores.insert(empty, true);
+        view.queue_restores.insert(restored, true);
+        view.complete_queue_restore(
+            json!({"id":empty,"success":true,"data":{"messages":[]}}),
+            Some(TuiMode::Fullscreen),
+        );
+
+        assert_eq!(view.editor.text, "draft");
+        assert_eq!(view.editor.cursor, 2);
+        assert!(matches!(
+            view.lines.last(),
+            Some(Entry::Status(text)) if text == "No queued messages to restore"
+        ));
+
+        let image = pi_rs::ImageContent {
+            data: "AA==".into(),
+            mime_type: "image/png".into(),
+        };
+        let message = |kind, content: &str, images| pi_rs::QueuedMessage {
+            input: pi_rs::QueuedInput {
+                id: uuid::Uuid::new_v4(),
+                kind,
+                content: content.to_owned(),
+            },
+            images,
+        };
+        let messages = [
+            message(pi_rs::InputKind::FollowUp, "follow-up", vec![]),
+            message(pi_rs::InputKind::Steer, "steer", vec![image.clone()]),
+        ];
+        view.complete_queue_restore(
+            json!({"id":restored,"success":true,"data":{"messages":messages}}),
+            Some(TuiMode::Fullscreen),
+        );
+        assert_eq!(view.editor.text, "steer\n\nfollow-up\n\ndraft");
+        assert_eq!(view.draft_images, [image]);
+        assert!(view.queue_restores.is_empty());
+        assert!(matches!(
+            view.lines.as_slice(),
+            [Entry::Status(text)] if text == "Restored 2 queued messages to editor"
+        ));
     }
 
     #[test]
@@ -12641,10 +13347,7 @@ exit {exit}
                 quarantined: false,
                 batch: crate::ui::terminal_color_batch::ColorBatch::new(std::time::Instant::now()),
             }]),
-            color_requery: false,
-            disabled: false,
-            last_appearance_report: None,
-            refresh_after_subscription: false,
+            ..Default::default()
         };
         assert!(!super::expire_initial_terminal_colors(
             &terminal, &mut theme
@@ -12681,6 +13384,8 @@ exit {exit}
             appearance_notifications: false,
             #[cfg(unix)]
             keyboard: super::KeyboardProtocol::Disabled,
+            #[cfg(unix)]
+            _suspend_signal: None,
         };
         drop(guard);
         theme = super::Theme::system();
@@ -12762,6 +13467,7 @@ exit {exit}
     fn initial_appearance_report_does_not_discard_initial_colors() {
         let mut colors = super::ColorQueries::default();
         let mut output = Vec::new();
+        colors.appearance_probe = Some(super::AppearanceProbe::WaitingForColors);
         colors.query_terminal_colors(&mut output).unwrap();
         let initial_len = output.len();
         // A late initial appearance response may follow an OSC reply.
@@ -12777,6 +13483,39 @@ exit {exit}
         assert!(colors.appearance_report(false, &mut output).unwrap());
         assert!(colors.color_requery);
         assert!(!colors.accepts_color_reply(1, &mut output).unwrap());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn appearance_subscription_probe_does_not_repeat_the_color_query() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+
+        // The old color query is still in flight when notifications turn on.
+        // Its marker cannot expire the probe for the next query.
+        colors.appearance_probe = Some(super::AppearanceProbe::WaitingForColors);
+        colors
+            .refresh_after_appearance_subscription(&mut output)
+            .unwrap();
+        assert!(colors.color_requery);
+        colors.receive_color_marker(&mut output).unwrap();
+        assert!(!colors.color_requery);
+        let subscription_len = output.len();
+        assert!(!colors.appearance_report(false, &mut output).unwrap());
+        assert_eq!(output.len(), subscription_len);
+        assert!(!colors.color_requery);
+        colors.receive_color_marker(&mut output).unwrap();
+
+        // A terminal can ignore the explicit probe and still notify later.
+        colors.appearance_probe = Some(super::AppearanceProbe::WaitingForColors);
+        colors
+            .refresh_after_appearance_subscription(&mut output)
+            .unwrap();
+        colors.receive_color_marker(&mut output).unwrap();
+        let before_change = output.len();
+        assert!(colors.appearance_report(true, &mut output).unwrap());
+        assert!(output.len() > before_change);
     }
 
     #[cfg(any(unix, windows))]
@@ -13389,6 +14128,50 @@ exit {exit}
         assert_eq!(wrap("日本abc", 4), vec!["日本", "abc"]);
         assert!(!clean("hello\x1b[31m\x07").contains('\x1b'));
     }
+    #[test]
+    fn prompt_history_moves_repeated_prompts_to_the_most_recent_position() {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = dir.path().join("session.jsonl");
+        let mut session = Session::open(&args.session).unwrap();
+        for prompt in ["p1", "p2", "p3", "p4", "p5"] {
+            session
+                .append_user_with_images(prompt.to_owned(), Vec::new(), None)
+                .unwrap();
+        }
+        let third = session
+            .records()
+            .iter()
+            .find(|record| matches!(&record.event, pi_rs::Event::User { content, .. } if content == "p3"))
+            .unwrap()
+            .id;
+        drop(session);
+
+        let mut view = View::default();
+        view.restore(&args).unwrap();
+        assert_eq!(view.history, ["p1", "p2", "p3", "p4", "p5"]);
+        view.remember_prompt(" \u{feff}p1 ");
+        view.remember_prompt("  ");
+        assert_eq!(view.history, ["p2", "p3", "p4", "p5", "p1"]);
+
+        let mut session = Session::open(&args.session).unwrap();
+        session.checkout(third).unwrap();
+        drop(session);
+        view.restore(&args).unwrap();
+        assert_eq!(view.history, ["p4", "p5", "p1", "p2", "p3"]);
+        view.restore(&args).unwrap();
+        assert_eq!(view.history, ["p4", "p5", "p1", "p2", "p3"]);
+        for id in 0..100 {
+            view.remember_prompt(&format!("entry {id}"));
+        }
+        view.remember_prompt("entry 0");
+        assert_eq!(view.history.len(), 100);
+        assert_eq!(view.history.first().unwrap(), "entry 1");
+        assert_eq!(view.history.last().unwrap(), "entry 0");
+    }
+
     #[test]
     fn regular_history_eviction_preserves_the_uncommitted_entry_boundary() {
         let mut view = View::default();
