@@ -131,9 +131,112 @@ fn endpoint(project: &str, location: &str) -> Option<String> {
     ))
 }
 
+pub(super) fn validate_identifier(value: &str, field: &str) -> Result<()> {
+    if identifier(value) {
+        Ok(())
+    } else {
+        Err(Error::Config(format!("Enter a valid Google Cloud {field}")))
+    }
+}
+
+pub(super) fn save_login(
+    project: &str,
+    location: &str,
+    credentials_path: Option<&std::path::Path>,
+) -> Result<()> {
+    save_login_at(
+        &super::config::agent_dir().join("auth.json"),
+        project,
+        location,
+        credentials_path,
+        |env| Adc::configured(Some(env)).is_some(),
+    )
+}
+
+fn save_login_at(
+    path: &std::path::Path,
+    project: &str,
+    location: &str,
+    credentials_path: Option<&std::path::Path>,
+    adc_available: impl FnOnce(&Environment) -> bool,
+) -> Result<()> {
+    validate_identifier(project, "project ID")?;
+    validate_identifier(location, "location")?;
+    let mut env = Environment::from_iter([
+        ("GOOGLE_CLOUD_PROJECT".into(), project.into()),
+        ("GOOGLE_CLOUD_LOCATION".into(), location.into()),
+    ]);
+    if let Some(path) = credentials_path {
+        let path = std::path::absolute(path)?;
+        let path = path.to_str().filter(|_| path.is_file()).ok_or_else(|| {
+            Error::Config("Enter the path to an existing service account credentials file".into())
+        })?;
+        env.insert("GOOGLE_APPLICATION_CREDENTIALS".into(), path.into());
+    } else if !adc_available(&env) {
+        return Err(Error::Config(
+            "No Application Default Credentials file found. Run gcloud auth application-default login or set GOOGLE_APPLICATION_CREDENTIALS.".into(),
+        ));
+    }
+    super::config::update_object(path, |data| {
+        data.insert(
+            "google-vertex".into(),
+            serde_json::json!({"type": "api_key", "env": env}),
+        );
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_saves_a_pi_compatible_adc_entry_without_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let fixture = dir.path().join("service-account.json");
+        std::fs::write(&fixture, "{}").unwrap();
+
+        save_login_at(&path, "project-id", "us-central1", Some(&fixture), |_| {
+            false
+        })
+        .unwrap();
+        let saved = super::super::config::read_object(&path).unwrap();
+        let entry = saved["google-vertex"].as_object().unwrap();
+        assert_eq!(entry["type"], "api_key");
+        assert!(!entry.contains_key("key"));
+        let adc = Adc::configured(entry["env"].as_object()).unwrap();
+        assert_eq!(
+            adc.endpoint,
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/project-id/locations/us-central1"
+        );
+        assert_eq!(adc.credentials_path, Some(fixture));
+
+        assert!(save_login_at(&path, "invalid/id", "global", None, |_| true).is_err());
+        assert!(save_login_at(&path, "project-id", "global", None, |_| false).is_err());
+        assert!(
+            save_login_at(
+                &path,
+                "project-id",
+                "global",
+                Some(&dir.path().join("missing.json")),
+                |_| true,
+            )
+            .is_err()
+        );
+        assert_eq!(super::super::config::read_object(&path).unwrap(), saved);
+        save_login_at(&path, "project-id", "global", None, |_| true).unwrap();
+        let saved = super::super::config::read_object(&path).unwrap();
+        assert_eq!(
+            saved["google-vertex"]["env"]["GOOGLE_CLOUD_LOCATION"],
+            "global"
+        );
+        assert!(
+            saved["google-vertex"]["env"]
+                .get("GOOGLE_APPLICATION_CREDENTIALS")
+                .is_none()
+        );
+    }
 
     #[test]
     fn adc_resolves_regional_and_global_projects_with_saved_precedence() {

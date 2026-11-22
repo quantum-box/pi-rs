@@ -97,7 +97,7 @@ async fn list_json_reports_servers_tools_sources_and_failures() {
     std::fs::write(
         project.join("mcp.json"),
         json!({"mcpServers":{
-            "fixture":{"toolExposure":{"Private":"hidden"}},
+            "fixture":{"toolExposure":{"P*":"direct","*":"deferred","Private":"hidden"}},
             "local":{"command":"ignored","enabled":false}
         }})
         .to_string(),
@@ -163,7 +163,10 @@ async fn list_json_reports_servers_tools_sources_and_failures() {
             .as_ref()
     );
     assert_eq!(fixture["tools"], json!(["Public", "Private"]));
-    assert_eq!(fixture["toolExposure"], json!({"Private":"hidden"}));
+    assert_eq!(
+        fixture["toolExposure"],
+        json!({"Public":"direct","Private":"hidden"})
+    );
     assert_eq!(fixture["resources"], true);
     assert_eq!(find("disabled")["state"], "disabled");
     assert_eq!(find("local")["scope"], "project");
@@ -519,5 +522,56 @@ fn text_list_reports_bad_configuration_and_continues_with_the_other_scope() {
             stdout.contains("retired") && stdout.contains("disabled"),
             "{stdout}"
         );
+    }
+}
+
+#[test]
+fn mcp_add_forwards_stdio_arguments_with_or_without_a_separator() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    for (name, separator) in [("implicit", None), ("explicit", Some("--"))] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(["mcp", "add", name, "--env", "SAMPLE=value"])
+            .args(separator)
+            .args([
+                "node",
+                "-v",
+                "-nt",
+                "--description",
+                "child option",
+                "-l",
+                "--",
+                "--url",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(home.join("mcp.json")).unwrap()).unwrap();
+    let servers = &config["mcpServers"];
+    for name in ["implicit", "explicit"] {
+        assert_eq!(servers[name]["command"], "node");
+        assert_eq!(
+            servers[name]["args"],
+            json!([
+                "-v",
+                "-nt",
+                "--description",
+                "child option",
+                "-l",
+                "--",
+                "--url"
+            ])
+        );
+        assert_eq!(servers[name]["env"], json!({"SAMPLE":"value"}));
+        assert!(servers[name].get("description").is_none());
     }
 }

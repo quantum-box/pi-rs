@@ -566,6 +566,78 @@ fn mcp_add_saves_stdio_and_http_options() {
 }
 
 #[test]
+fn mcp_config_writes_validate_urls_and_report_the_removal_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("agent");
+    let global = home.join("mcp.json");
+    let project = root.path().join(".pi/mcp.json");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &[
+            "mcp",
+            "add",
+            "global",
+            "--url",
+            "https://example.invalid/mcp?tenant=fixture",
+        ][..],
+        &[
+            "mcp",
+            "add",
+            "local",
+            "--url",
+            "http://127.0.0.1:1/mcp",
+            "--local",
+        ][..],
+    ] {
+        let output = run(args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let old_global = std::fs::read(&global).unwrap();
+    let old_project = std::fs::read(&project).unwrap();
+    for url in [
+        "not a URL",
+        "ftp://example.invalid/mcp",
+        "http://example.invalid/mcp",
+        "https://account:fixture-secret@example.invalid/mcp",
+    ] {
+        let result = run(&["mcp", "add", "global", "--url", url]);
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success());
+        assert!(error.contains("MCP URL"), "{error}");
+        assert!(!error.contains("fixture-secret"));
+    }
+    let result = run(&["mcp", "remove", "local"]);
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(
+        error.contains("No global MCP server named \"local\"") && error.contains("use --local"),
+        "{error}"
+    );
+    let result = run(&["mcp", "remove", "--local", "global"]);
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(
+        error.contains("No project MCP server named \"global\"") && error.contains("omit --local"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&global).unwrap(), old_global);
+    assert_eq!(std::fs::read(&project).unwrap(), old_project);
+    assert!(run(&["mcp", "remove", "--local", "local"]).status.success());
+    assert!(run(&["mcp", "remove", "global"]).status.success());
+}
+
+#[test]
 fn startup_fork_preserves_inert_sibling_history() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source.jsonl");
@@ -1717,6 +1789,70 @@ fn model_listing_searches_ids_with_pi_token_swaps() {
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(text.contains(expected), "{text}");
         assert!(!text.contains(absent), "{text}");
+    }
+}
+
+#[test]
+fn model_listing_uses_pi_table_collation_and_spacing() {
+    let root = tempfile::tempdir().unwrap();
+    let models: Vec<_> = ["Za", "zA", "z-a", "z_a", "ä", "日本語", "😀"]
+        .into_iter()
+        .map(|id| {
+            json!({
+                "id":id, "contextWindow":1_250_000, "maxTokens":1_250,
+                "reasoning":false, "input":["text"],
+            })
+        })
+        .collect();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"fixture":{
+            "baseUrl":"http://127.0.0.1:1/v1",
+            "api":"openai-completions",
+            "apiKey":"fixture",
+            "models":models,
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    for (locale, expected) in [
+        (
+            "en_US.UTF-8",
+            ["😀", "ä", "z_a", "z-a", "zA", "Za", "日本語"],
+        ),
+        (
+            "sv_SE.UTF-8",
+            ["😀", "z_a", "z-a", "zA", "Za", "ä", "日本語"],
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("LC_ALL", locale)
+            .args([
+                "--offline",
+                "--no-mcp",
+                "--no-approve",
+                "--provider",
+                "fixture",
+                "--list-models",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        let ids: Vec<_> = text
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_ascii_whitespace().nth(1))
+            .collect();
+        assert_eq!(ids, expected);
+        assert!(text.contains("fixture   😀     1.3M     1.3K"));
+        assert!(text.contains("fixture   日本語    1.3M     1.3K"));
     }
 }
 
@@ -4156,6 +4292,92 @@ async fn rpc_manual_compaction_preflight_has_only_compaction_events() {
 #[test]
 fn rpc_replacement_worker_keeps_retry_disabled() {
     rpc_replacement_retry_case(true);
+}
+
+#[test]
+fn provider_retry_recovers_chat_completions_with_agent_retry_disabled() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        r#"{"retry":{"enabled":false,"provider":{"maxRetries":1}}}"#,
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = std::thread::spawn(move || {
+        let mut bodies = Vec::new();
+        for attempt in 0..2 {
+            let (mut socket, mut reader, first) =
+                accept_proxy_request(listener.try_clone().unwrap());
+            assert!(first.starts_with("POST /v1/chat/completions "), "{first}");
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            bodies.push(serde_json::from_slice::<Value>(&body).unwrap());
+            let (status, headers, body) = if attempt == 0 {
+                ("429 Too Many Requests", "Retry-After-Ms: 0\r\n", "")
+            } else {
+                (
+                    "200 OK",
+                    "Content-Type: text/event-stream\r\n",
+                    concat!(
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"retried answer\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    ),
+                )
+            };
+            write!(
+                socket,
+                "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .unwrap();
+        }
+        assert_eq!(bodies[0], bodies[1]);
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "kimi-coding",
+            "--model",
+            "k3.1-pro",
+            "--api-key",
+            "fixture",
+            "--endpoint",
+            &endpoint,
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("retried answer"));
 }
 
 #[test]
