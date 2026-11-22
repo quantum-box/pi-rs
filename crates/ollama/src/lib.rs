@@ -41,6 +41,7 @@ pub struct Ollama {
     thinking_budget_level: Option<String>,
     thinking_budgets: Option<Value>,
     compatibility: Arc<ChatCompatibility>,
+    tool_transcript: Option<pi_rs_core::BoundToolTranscript>,
     supports_reasoning: Option<bool>,
     reasoning_enabled: bool,
     allow_reasoning_off: bool,
@@ -63,6 +64,7 @@ pub struct PreparedChatRequest {
 
 #[derive(Default)]
 struct ChatWireTools {
+    source: Vec<pi_rs_core::ToolDeclaration>,
     declarations: Vec<Value>,
     grammar_inputs: BTreeMap<String, String>,
 }
@@ -251,6 +253,7 @@ impl Ollama {
             reasoning_enabled: false,
             allow_reasoning_off: true,
             sampling: BTreeMap::new(),
+            tool_transcript: None,
             deployments: Arc::default(),
             native_probes: true,
             mistral: None,
@@ -886,6 +889,23 @@ fn running_context_window(value: &Value, model: &str) -> Option<u32> {
 
 #[async_trait::async_trait]
 impl Model for Ollama {
+    fn uses_tool_transcript(&self, _model: &str) -> bool {
+        self.mistral.is_none()
+            && self
+                .compatibility
+                .supports_mid_conversation_tool_additions()
+    }
+
+    async fn prepare_context_with_tool_transcript<'a>(
+        &'a self,
+        request: &ModelRequest,
+        changes: &[pi_rs_core::ToolTranscriptChange],
+    ) -> Result<Option<Arc<dyn Model + 'a>>> {
+        Ok(self.uses_tool_transcript(&request.model).then(|| {
+            Arc::new(self.clone().with_tool_transcript(request, changes)) as Arc<dyn Model>
+        }))
+    }
+
     fn supports_mid_conversation_system_messages(&self, _model: &str) -> bool {
         self.mistral.is_none()
             && self
@@ -950,7 +970,7 @@ impl Model for Ollama {
     }
 
     fn context_identity(&self) -> Option<String> {
-        if !self.http_proxies.is_empty() {
+        if !self.http_proxies.is_empty() || self.tool_transcript.is_some() {
             return None;
         }
         let mut headers: Vec<_> = self
@@ -1096,6 +1116,18 @@ impl Model for Ollama {
     }
 
     fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        // The bound transcript contains the original declarations, so a
+        // normalized reservation request projects the same wire schemas.
+        if let Some((messages, tools)) = self.project_tool_additions(
+            request,
+            &self.replay_identity(&request.model),
+            &ChatWireTools::default(),
+        ) {
+            return 8_u64
+                .saturating_add(pi_rs_core::estimate_replay_tokens(&messages))
+                .saturating_add(pi_rs_core::estimate_replay_tokens(&tools));
+        }
+
         let head = self
             .mistral
             .is_none()
@@ -1164,6 +1196,97 @@ impl Model for Ollama {
 }
 
 impl Ollama {
+    /// Freeze tool additions for the specific request being prepared.
+    pub fn with_tool_transcript(
+        mut self,
+        request: &ModelRequest,
+        changes: &[pi_rs_core::ToolTranscriptChange],
+    ) -> Self {
+        self.tool_transcript = if !changes.is_empty() && self.uses_tool_transcript(&request.model) {
+            pi_rs_core::BoundToolTranscript::bind(request, changes)
+        } else {
+            None
+        };
+        self
+    }
+
+    fn function_tool(&self, spec: &pi_rs_core::ToolSpec) -> Value {
+        let mut function = json!(spec);
+        if self.compatibility.supports_strict_mode == Some(true) {
+            function["strict"] = json!(false);
+        }
+        json!({"type":"function","function":function})
+    }
+
+    fn project_tool_additions(
+        &self,
+        request: &ModelRequest,
+        identity: &ResolvedModelIdentity,
+        wire_tools: &ChatWireTools,
+    ) -> Option<(Vec<Value>, Vec<Value>)> {
+        let changes = self.tool_transcript.as_ref()?.changes_for(request)?;
+        let plan = pi_rs_core::plan_tool_transcript(
+            pi_rs_core::ToolTranscriptMode::Additions,
+            changes,
+            &wire_tools.source,
+        );
+        let supports_strict = self.compatibility.supports_strict_mode == Some(true);
+        let supports_grammar = self.compatibility.supports_openai_grammar_tools() == Some(true);
+        let encode = |declaration: &pi_rs_core::ToolDeclaration| {
+            wire_tools
+                .source
+                .iter()
+                .position(|active| active == declaration)
+                .map(|index| wire_tools.declarations[index].clone())
+                .unwrap_or_else(|| {
+                    resolve_chat_wire_tool(declaration, supports_strict, supports_grammar)
+                        .map(|(wire, _)| wire)
+                        .unwrap_or_else(|_| self.function_tool(&declaration.spec))
+                })
+        };
+        let mut by_message = BTreeMap::<usize, Vec<Value>>::new();
+        for checkpoint in plan.anchored {
+            by_message
+                .entry(checkpoint.message_index)
+                .or_default()
+                .extend(checkpoint.added.iter().map(encode));
+        }
+        let mut messages = Vec::new();
+        for (index, message) in request.messages.iter().enumerate() {
+            if let Some(tools) = by_message.remove(&index)
+                && !tools.is_empty()
+            {
+                messages.push(json!({"role":"system","tools":tools}));
+            }
+            if !matches!(message, Message::System { content } if content.is_empty()) {
+                messages.extend(self.compatible_message(message.clone(), identity));
+            }
+        }
+        if let Some(tools) = by_message.remove(&request.messages.len())
+            && !tools.is_empty()
+        {
+            messages.push(json!({"role":"system","tools":tools}));
+        }
+        if supports_grammar {
+            // Pi folds same-name replacements on addition-only routes. Its
+            // grammar lookup uses the latest definition for each name.
+            let declared: BTreeMap<_, _> = changes
+                .iter()
+                .flat_map(|checkpoint| &checkpoint.added)
+                .map(|tool| (tool.spec.name.as_str(), tool))
+                .collect();
+            let properties = declared
+                .into_iter()
+                .filter_map(|(name, tool)| {
+                    let (_, _, property) = pi_rs_core::resolve_openai_tool_grammar(tool).ok()??;
+                    Some((name.to_owned(), property.to_owned()))
+                })
+                .collect();
+            project_grammar_calls(&mut messages, &properties);
+        }
+        Some((messages, plan.top_level.into_iter().map(encode).collect()))
+    }
+
     fn wire_messages(
         &self,
         messages: Vec<Message>,
@@ -1209,27 +1332,28 @@ impl Ollama {
             ModelProgress::WaitingForModel,
         );
         let mistral = self.mistral.is_some();
-        let mut messages = if let Some(options) = &self.mistral {
-            mistral::messages(request.messages, &identity, options.images)?
-        } else {
-            self.wire_messages(request.messages, &identity)
-        };
-        let mut wire_tools = wire_tools.unwrap_or_else(|| ChatWireTools {
+        let wire_tools = wire_tools.unwrap_or_else(|| ChatWireTools {
             declarations: request
                 .tools
-                .into_iter()
-                .map(|function| {
-                    let mut function = json!(function);
-                    if self.compatibility.supports_strict_mode == Some(true) {
-                        function["strict"] = json!(false);
-                    }
-                    json!({"type": "function", "function": function})
-                })
+                .iter()
+                .map(|tool| self.function_tool(tool))
                 .collect(),
             ..Default::default()
         });
-        project_grammar_calls(&mut messages, &wire_tools.grammar_inputs);
-        let tools = std::mem::take(&mut wire_tools.declarations);
+        let (messages, tools) = if let Some(options) = &self.mistral {
+            (
+                mistral::messages(request.messages, &identity, options.images)?,
+                wire_tools.declarations,
+            )
+        } else if let Some(projected) =
+            self.project_tool_additions(&request, &identity, &wire_tools)
+        {
+            projected
+        } else {
+            let mut messages = self.wire_messages(request.messages, &identity);
+            project_grammar_calls(&mut messages, &wire_tools.grammar_inputs);
+            (messages, wire_tools.declarations)
+        };
         let declared_mistral_tools: Vec<String> = if mistral {
             tools
                 .iter()
@@ -1713,69 +1837,82 @@ fn resolved_constrained_tools(
         ));
     }
     let mut wire = ChatWireTools {
+        source: declarations.to_vec(),
         declarations: Vec::with_capacity(declarations.len()),
         ..Default::default()
     };
     let mut effective = Vec::with_capacity(declarations.len());
     for declaration in declarations {
-        let spec = &declaration.spec;
-        if supports_grammar
-            && let Some((syntax, definition, property)) =
-                pi_rs_core::resolve_openai_tool_grammar(declaration)
-                    .map_err(|error| Error::Config(error.to_string()))?
-        {
-            wire.declarations.push(json!({
-                "type":"custom", "custom":{
-                    "name":spec.name, "description":spec.description,
-                    "format":{"type":"grammar","grammar":{"syntax":syntax,"definition":definition}}
-                }
-            }));
+        let (tool, sampling) =
+            resolve_chat_wire_tool(declaration, supports_strict, supports_grammar)?;
+        if let pi_rs_core::EffectiveToolSampling::OpenAiGrammar { input_property, .. } = &sampling {
             wire.grammar_inputs
-                .insert(spec.name.clone(), property.to_owned());
-            effective.push(pi_rs_core::EffectiveToolDeclaration {
-                spec: spec.clone(),
-                sampling: pi_rs_core::EffectiveToolSampling::OpenAiGrammar {
-                    syntax,
-                    input_property: property.to_owned(),
-                },
-            });
-            continue;
+                .insert(declaration.spec.name.clone(), input_property.clone());
         }
-        let strict = match &declaration.constrained_sampling {
-            Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => {
-                pi_rs_core::resolve_strict_tool_schema(
-                    &spec.name,
-                    &spec.parameters,
-                    *strict,
-                    supports_strict,
-                    |_, _| false,
-                )
-                .map_err(|error| Error::Config(error.to_string()))?
-            }
-            _ => None,
-        };
-        let mut function = json!({"name":spec.name,"description":spec.description,"parameters":strict.as_ref().unwrap_or(&spec.parameters)});
-        if supports_strict {
-            function["strict"] = json!(strict.is_some());
-        }
-        let sampling = if strict.is_some() {
-            pi_rs_core::EffectiveToolSampling::StrictJsonSchema {
-                original_schema: spec.parameters.clone(),
-                normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
-            }
-        } else {
-            pi_rs_core::EffectiveToolSampling::Unconstrained
-        };
-        wire.declarations
-            .push(json!({"type":"function", "function":function}));
+        wire.declarations.push(tool);
         effective.push(pi_rs_core::EffectiveToolDeclaration {
-            spec: spec.clone(),
+            spec: declaration.spec.clone(),
             sampling,
         });
     }
     pi_rs_core::validate_effective_tool_declarations(request, declarations, &effective)
         .map_err(|error| Error::Config(error.to_string()))?;
     Ok((wire, effective))
+}
+
+fn resolve_chat_wire_tool(
+    declaration: &pi_rs_core::ToolDeclaration,
+    supports_strict: bool,
+    supports_grammar: bool,
+) -> Result<(Value, pi_rs_core::EffectiveToolSampling)> {
+    use pi_rs_core::{EffectiveToolSampling, ToolConstraint};
+    let spec = &declaration.spec;
+    if supports_grammar
+        && let Some((syntax, definition, property)) =
+            pi_rs_core::resolve_openai_tool_grammar(declaration)
+                .map_err(|error| Error::Config(error.to_string()))?
+    {
+        let tool = json!({
+            "type":"custom", "custom":{
+                "name":spec.name,"description":spec.description,
+                "format":{"type":"grammar","grammar":{"syntax":syntax,"definition":definition}}
+            }
+        });
+        return Ok((
+            tool,
+            EffectiveToolSampling::OpenAiGrammar {
+                syntax,
+                input_property: property.to_owned(),
+            },
+        ));
+    }
+    let schema = match &declaration.constrained_sampling {
+        Some(ToolConstraint::JsonSchema { strict }) => pi_rs_core::resolve_strict_tool_schema(
+            &spec.name,
+            &spec.parameters,
+            *strict,
+            supports_strict,
+            |_, _| false,
+        )
+        .map_err(|error| Error::Config(error.to_string()))?,
+        _ => None,
+    };
+    let mut function = json!({
+        "name":spec.name,"description":spec.description,
+        "parameters":schema.as_ref().unwrap_or(&spec.parameters)
+    });
+    if supports_strict {
+        function["strict"] = json!(schema.is_some());
+    }
+    let sampling = if schema.is_some() {
+        EffectiveToolSampling::StrictJsonSchema {
+            original_schema: spec.parameters.clone(),
+            normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
+        }
+    } else {
+        EffectiveToolSampling::Unconstrained
+    };
+    Ok((json!({"type":"function","function":function}), sampling))
 }
 
 fn project_grammar_calls(messages: &mut [Value], properties: &BTreeMap<String, String>) {
@@ -3359,6 +3496,198 @@ mod constrained_chat_tests {
         let mut model = Ollama::new(endpoint, None).unwrap();
         Arc::make_mut(&mut model.compatibility).supports_strict_mode = support;
         model
+    }
+
+    #[test]
+    fn chat_tool_transcript_folds_removals_and_encodes_later_additions() {
+        use pi_rs_core::ToolTranscriptChange;
+
+        let (mut request, declaration) = fixture(
+            StrictToolPolicy::Require,
+            json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        );
+        let tool = |name: &str| ToolDeclaration {
+            spec: ToolSpec {
+                name: name.into(),
+                description: name.into(),
+                parameters: json!({"type":"object","properties":{}}),
+            },
+            constrained_sampling: None,
+        };
+        let initial = tool("initial");
+        let added = tool("added");
+        request.messages = ["first", "second", "third"]
+            .into_iter()
+            .map(|content| Message::User {
+                content: content.into(),
+            })
+            .collect();
+        request.tools = vec![
+            initial.spec.clone(),
+            added.spec.clone(),
+            declaration.spec.clone(),
+        ];
+        let changes = [
+            ToolTranscriptChange {
+                message_index: 0,
+                added: vec![initial, tool("removed")],
+                removed: vec![],
+            },
+            ToolTranscriptChange {
+                message_index: 1,
+                added: vec![added],
+                removed: vec!["removed".into()],
+            },
+            ToolTranscriptChange {
+                message_index: 2,
+                added: vec![declaration.clone()],
+                removed: vec![],
+            },
+        ];
+        let base = model(Some(true), "http://localhost");
+        let mut enabled = base.clone();
+        enabled.compatibility = Arc::new(
+            serde_json::from_value(json!({
+                "supportsMidConvoSystemMessages": true,
+                "supportsMidConvoToolAdditions": true,
+                "supportsStrictMode": true
+            }))
+            .unwrap(),
+        );
+        let bound = enabled.with_tool_transcript(&request, &changes);
+        let identity = bound.replay_identity(&request.model);
+        let mut declarations: Vec<_> = request.tools[..2]
+            .iter()
+            .cloned()
+            .map(|spec| ToolDeclaration {
+                spec,
+                constrained_sampling: None,
+            })
+            .collect();
+        declarations.push(declaration);
+        let prepared = bound
+            .prepare_tool_request(request.clone(), &declarations)
+            .unwrap();
+        let (messages, tools) = bound
+            .project_tool_additions(&request, &identity, &prepared.wire_tools)
+            .unwrap();
+        assert_eq!(tools, prepared.wire_tools.declarations[..2]);
+        assert_eq!(messages[1]["content"], "second");
+        assert_eq!(
+            messages[2],
+            json!({"role":"system","tools":[prepared.wire_tools.declarations[2]]})
+        );
+        assert_eq!(messages[2]["tools"][0]["function"]["strict"], true);
+        assert_eq!(messages[3]["content"], "third");
+
+        let (reservation_messages, reservation_tools) = bound
+            .project_tool_additions(
+                &prepared.reservation_request,
+                &identity,
+                &ChatWireTools::default(),
+            )
+            .unwrap();
+        assert_eq!(reservation_tools, tools);
+        assert_eq!(reservation_messages, messages);
+        let projected_reservation = 8
+            + pi_rs_core::estimate_replay_tokens(&reservation_messages)
+            + pi_rs_core::estimate_replay_tokens(&reservation_tools);
+        assert_eq!(
+            bound.estimate_request_tokens(&prepared.reservation_request),
+            projected_reservation,
+        );
+
+        let fallback = base.with_tool_transcript(&request, &changes);
+        assert!(
+            fallback
+                .project_tool_additions(&request, &identity, &prepared.wire_tools)
+                .is_none()
+        );
+        request.messages.remove(0);
+        assert!(
+            bound
+                .project_tool_additions(&request, &identity, &prepared.wire_tools)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn chat_grammar_redefinition_uses_the_latest_folded_declaration_like_pi() {
+        use pi_rs_core::{ToolGrammarVariants, ToolTranscriptChange};
+        let spec = ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: json!({
+                "type":"object","properties":{"path":{"type":"string"}},"required":["path"]
+            }),
+        };
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![
+                Message::User {
+                    content: "first".into(),
+                },
+                Message::Assistant {
+                    content: String::new(),
+                    calls: vec![ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: json!({"path":"one"}).to_string(),
+                    }],
+                    replay: None,
+                },
+                Message::User {
+                    content: "next".into(),
+                },
+            ],
+            tools: vec![spec.clone()],
+            max_output_tokens: 32,
+        };
+        let history = [
+            ToolTranscriptChange {
+                message_index: 0,
+                added: vec![ToolDeclaration {
+                    spec: spec.clone(),
+                    constrained_sampling: None,
+                }],
+                removed: vec![],
+            },
+            ToolTranscriptChange {
+                message_index: 2,
+                added: vec![ToolDeclaration {
+                    spec,
+                    constrained_sampling: Some(ToolConstraint::Grammar {
+                        variants: ToolGrammarVariants {
+                            openai_regex: Some(".+".into()),
+                            ..Default::default()
+                        },
+                    }),
+                }],
+                removed: vec![],
+            },
+        ];
+        let mut enabled = model(None, "http://localhost");
+        enabled.compatibility = Arc::new(
+            serde_json::from_value(json!({
+                "supportsMidConvoSystemMessages": true,
+                "supportsMidConvoToolAdditions": true,
+                "supportsOpenAIGrammarTools": true,
+            }))
+            .unwrap(),
+        );
+        let model = enabled.with_tool_transcript(&request, &history);
+        let (messages, tools) = model
+            .project_tool_additions(
+                &request,
+                &model.replay_identity(&request.model),
+                &ChatWireTools::default(),
+            )
+            .unwrap();
+        assert_eq!(tools[0]["type"], "custom");
+        assert_eq!(
+            messages[1]["tool_calls"][0],
+            json!({"type":"custom","id":"call","custom":{"name":"read","input":"one"}}),
+        );
     }
 
     #[test]
