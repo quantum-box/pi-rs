@@ -575,7 +575,7 @@ impl Anthropic {
         url.path_segments_mut().ok()?.push(model);
         let details = tokio::time::timeout(Duration::from_secs(2), async {
             let response = send(
-                self.authenticate(self.client.get(url), false, false, false, false),
+                self.authenticate(self.client.get(url), false, false, false, false, false),
                 &self.error_secrets(),
             )
             .await
@@ -767,7 +767,7 @@ impl Anthropic {
                 url.query_pairs_mut().append_pair("after_id", cursor);
             }
             let response = send(
-                self.authenticate(self.client.get(url), false, false, false, false),
+                self.authenticate(self.client.get(url), false, false, false, false, false),
                 &self.error_secrets(),
             )
             .await?;
@@ -5513,6 +5513,7 @@ mod tests {
                     legacy_streaming,
                     false,
                     false,
+                    false,
                 )
                 .build()
                 .unwrap();
@@ -5578,6 +5579,7 @@ mod tests {
                 .authenticate(
                     client.client.post(DEFAULT_ENDPOINT),
                     interleaved,
+                    false,
                     false,
                     false,
                     false,
