@@ -3733,8 +3733,12 @@ delay ceiling using Codex's own policy. It uses exponential backoff from one
 second and handles numeric or HTTP-date retry delays before accepting the stream.
 Native keeps its bounded, redacted error handling and stops immediately for
 permanent quota errors, context overflow, and oversized requests. Codex
-WebSocket timeouts, Google
-Gemini provider retries, and summary-specific retry policy remain open.
+WebSocket timeouts and summary-specific retry policy remain open.
+
+Google Gemini and Vertex AI honor the configured retry count for HTTP 408,
+409, 429, and server errors, using exponential backoff. Pi 1.6's Google adapters
+receive no retry headers from the SDK and leave transport errors and
+`retry.provider.timeoutMs` outside this policy.
 
 Tests cover recovery, request and retry caps, queued input, wait cancellation,
 dropped-wait cleanup and usage-settlement failures. Loopback RPC checks verify
