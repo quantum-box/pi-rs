@@ -1915,12 +1915,13 @@ impl OpenAiResponses {
         }
         self.apply_cache(&mut body);
         let requested_service_tier = body["service_tier"].as_str().map(str::to_owned);
-        let error_secrets = pi_rs_core::provider_error_secrets(
+        let mut error_secrets = pi_rs_core::provider_error_secrets(
             Some(self.token.as_str()),
             self.headers.iter().filter_map(|(name, value)| {
                 value.to_str().ok().map(|value| (name.as_str(), value))
             }),
         );
+        error_secrets.extend(self.codex_account.iter().cloned());
         let mut headers = self.headers.clone();
         if provider == "github-copilot" {
             for (name, value) in pi_rs_core::copilot_request_headers(&request.messages) {
@@ -1957,6 +1958,8 @@ impl OpenAiResponses {
         } else {
             None
         };
+        let observation_headers =
+            pi_rs_core::observes_provider_stream().then(|| self.headers.clone());
         let (mut source, declared_sse) = match ws {
             Some(source) => (source, true),
             None => self.open_sse(&body, headers, &error_secrets).await?,
@@ -1969,6 +1972,11 @@ impl OpenAiResponses {
             let mut text_items: BTreeMap<u64, String> = BTreeMap::new();
             while let Some(item) = source.next().await {
                 let event = item?;
+                if let Some(headers) = &observation_headers {
+                    pi_rs_core::observe_provider_stream(
+                        &provider, api, &model, &event, &error_secrets, headers,
+                    ).await;
+                }
                 let kind = field(&event, "type")?;
                 let kind = if api == pi_rs_core::ModelApi::OpenaiCodexResponses && kind == "response.done" {
                     match event["response"]["status"].as_str() {
