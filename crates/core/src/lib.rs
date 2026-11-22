@@ -13,9 +13,11 @@ mod journal;
 mod lifecycle;
 mod mcp_registration;
 mod model_catalog;
+mod model_price;
 mod persistent_map;
 #[doc(hidden)]
 pub mod pi_import;
+mod provider_response;
 mod resource;
 mod retry;
 mod runtime;
@@ -49,7 +51,9 @@ pub use lifecycle::{
 };
 pub use mcp_registration::{McpRegistryHost, McpServerDeclaration, RegisteredMcpServer};
 pub use model_catalog::*;
+pub use model_price::ChatPrice;
 pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};
+pub use provider_response::{ProviderResponseEvent, observe_provider_response};
 pub use resource::Resource;
 pub use retry::*;
 pub use sdk::*;
@@ -57,12 +61,13 @@ pub use statistics::{ContextUsage, SessionStats, TokenTotals};
 pub use strict_tool_schema::{
     EffectiveToolDeclaration, EffectiveToolSampling, STRICT_TOOL_NORMALIZATION_VERSION,
     StrictSchemaError, StrictToolPolicy, ToolConstraint, ToolDecisionSnapshot, ToolDeclaration,
-    ToolGrammarVariants, ValidatedToolDecisionSnapshot, normalize_strict_tool_arguments,
+    ToolGrammarSyntax, ToolGrammarVariants, ValidatedToolDecisionSnapshot,
+    lossless_openai_grammar_input, normalize_strict_tool_arguments, resolve_openai_tool_grammar,
     resolve_strict_tool_schema, strict_tool_schema, validate_effective_tool_declarations,
 };
 pub use tokens::{
-    ContextUsageEstimate, estimate_message_tokens, estimate_replay_tokens, estimate_request_tokens,
-    fingerprint_model_context,
+    ContextUsageEstimate, estimate_assistant_output_tokens, estimate_message_tokens,
+    estimate_replay_tokens, estimate_request_tokens, fingerprint_model_context,
 };
 pub use tokio_util::sync::CancellationToken;
 pub use tool_execution_snapshot::{ToolExecutionSnapshot, ValidatedToolExecutionSnapshot};

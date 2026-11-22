@@ -1427,9 +1427,36 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Custom message types this extension can render in a native host.
+    fn custom_message_renderer_types(&self) -> Vec<&str> {
+        Vec::new()
+    }
+
+    /// Render a displayed message without a session host or model access.
+    async fn render_custom_message(
+        &self,
+        _message: &CustomMessage,
+        _options: &crate::CustomMessageRenderOptions,
+    ) -> ExtensionResult<Option<crate::RenderedCustomMessage>> {
+        Ok(None)
+    }
+
     /// Observe when an extension starts and stops waiting on a native UI prompt.
     fn handles_ui_prompt_lifecycle(&self) -> bool {
         false
+    }
+
+    /// Opt in to observing HTTP metadata before consuming a provider response body.
+    fn handles_after_provider_response(&self) -> bool {
+        false
+    }
+
+    async fn after_provider_response(
+        &self,
+        _event: &crate::ProviderResponseEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        Ok(())
     }
 
     /// Opt in to model and thinking-level selection events.
@@ -1953,6 +1980,7 @@ pub struct Registry {
     pub(crate) omit_default_tool_timeout: bool,
     pub(crate) mcp_servers: Arc<crate::mcp_registration::McpRuntime>,
     omit_mcp_declarations: bool,
+    pub(crate) publish_tool_attempts: bool,
     branch_models: Arc<RwLock<BranchModels>>,
     branch_reservations: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
 }
@@ -2066,6 +2094,20 @@ impl Registry {
             self.mcp_servers = Arc::new(runtime);
         }
         removed
+    }
+
+    /// Snapshot the first renderer registered for each custom message type.
+    pub fn custom_message_renderers(&self) -> crate::CustomMessageRenderers {
+        let mut renderers = crate::CustomMessageRenderers::default();
+        for extension in &self.extensions {
+            for custom_type in extension.custom_message_renderer_types() {
+                renderers
+                    .renderers
+                    .entry(custom_type.to_owned())
+                    .or_insert_with(|| extension.clone());
+            }
+        }
+        renderers
     }
 
     /// Whether a registered extension without a source path is a host built-in.
@@ -2413,6 +2455,12 @@ impl Registry {
     /// Explicitly configured host timeouts should leave this disabled.
     pub fn omit_default_tool_timeout(&mut self, omit: bool) {
         self.omit_default_tool_timeout = omit;
+    }
+
+    /// Publish transient tool starts before argument preparation. Enabled by
+    /// hosts that expose Pi's tool execution event stream.
+    pub fn publish_tool_attempts(&mut self, publish: bool) {
+        self.publish_tool_attempts = publish;
     }
     pub fn has_resource_discovery_hooks(&self) -> bool {
         self.extensions
@@ -3011,6 +3059,7 @@ impl Registry {
             omit_default_tool_timeout: self.omit_default_tool_timeout,
             mcp_servers: Arc::new(self.mcp_servers.copy_registrations()),
             omit_mcp_declarations: self.omit_mcp_declarations,
+            publish_tool_attempts: self.publish_tool_attempts,
             branch_models: self.branch_models.clone(),
             branch_reservations: self.branch_reservations.clone(),
         })

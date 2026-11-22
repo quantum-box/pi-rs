@@ -12,6 +12,7 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 fluent-uri = "0.3"
 futures-util = "0.3"
+http = "1"
 jsonschema = { version = "0.33", default-features = false }
 regex = "1"
 ryu-js = "1.0.3"

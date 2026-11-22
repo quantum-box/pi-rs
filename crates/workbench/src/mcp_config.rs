@@ -792,8 +792,8 @@ async fn connect_for_discovery(
             let share_refresh = share_refresh.clone();
             let cleanup = cleanup.clone();
             Box::pin(async move {
-                args.model_profiles = super::model_profiles::Profiles::load()?;
                 args.model_keys = super::model_auth::Keys::load_async().await?;
+                args.model_profiles = super::model_profiles::Profiles::load(&args.model_keys)?;
                 let provider = args.model_profiles.provider(&provider).ok_or_else(|| {
                     Error::Config("MCP auth.provider does not name an installed provider".into())
                 })?;
@@ -1601,9 +1601,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             if value
                 .get("description")
                 .is_some_and(|field| !(field.is_string() || inherited_global && field.is_null()))
-                || value.get("timeout").is_some_and(|field| {
-                    !(inherited_global && field.is_null()) && field.as_u64().is_none()
-                })
+                || !inherited_global && value.get("timeout").is_some_and(Value::is_null)
             {
                 return Err(Error::Config("invalid MCP server configuration".into()));
             }

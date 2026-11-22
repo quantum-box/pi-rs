@@ -37,6 +37,11 @@ enum Request {
         session: PathBuf,
     },
     CacheWarmingChanged,
+    RenderCustomMessage {
+        id: Uuid,
+        record_id: u64,
+        options: pi_rs::CustomMessageRenderOptions,
+    },
     CheckSessionTransition {
         id: Uuid,
         event: pi_rs::BeforeSessionTransition,
@@ -124,6 +129,11 @@ enum Request {
     },
     SetSessionName {
         name: String,
+        id: Option<serde_json::Value>,
+    },
+    SetSessionLabel {
+        target: u64,
+        label: Option<String>,
         id: Option<serde_json::Value>,
     },
     SetQueueMode {
@@ -899,7 +909,15 @@ async fn run_worker(
     if runtime.registry.has_resource_discovery_hooks() {
         output(json!({"type":"resources_discovered","resources":discovered}));
     }
-    output(json!({"type":"backend_ready"}));
+    if args.terminal_managed_worker {
+        let renderers = runtime.registry.custom_message_renderers();
+        output(json!({
+            "type":"backend_ready",
+            "custom_message_renderers":renderers.types().collect::<Vec<_>>()
+        }));
+    } else {
+        output(json!({"type":"backend_ready"}));
+    }
     let mut continue_queue = false;
     let mut pending_discovery_trigger = startup_trigger;
     let cache = super::cache_warming::Controller::default();
@@ -1260,7 +1278,7 @@ async fn run_worker(
                         &mut |event| match event {
                             pi_rs::AgentEvent::Notification(event) => observer(event),
                             event if args.trace => {
-                                let mut event = super::reasoning_event_json(event);
+                                let mut event = super::agent_stream_event_json(event);
                                 if args.mode == Some(super::OutputMode::Rpc) {
                                     super::attach_redacted_reasoning(&mut event);
                                 }
@@ -1396,7 +1414,7 @@ async fn run_worker(
                         &mut |event| match event {
                             pi_rs::AgentEvent::Notification(event) => observer(event),
                             event if args.trace => {
-                                let mut event = super::reasoning_event_json(event);
+                                let mut event = super::agent_stream_event_json(event);
                                 if args.mode == Some(super::OutputMode::Rpc) {
                                     super::attach_redacted_reasoning(&mut event);
                                 }
@@ -1438,7 +1456,7 @@ async fn run_worker(
                             &mut |event| match event {
                                 pi_rs::AgentEvent::Notification(event) => observer(event),
                                 event if args.trace => {
-                                    let mut event = super::reasoning_event_json(event);
+                                    let mut event = super::agent_stream_event_json(event);
                                     if args.mode == Some(super::OutputMode::Rpc) {
                                         super::attach_redacted_reasoning(&mut event);
                                     }
@@ -1817,11 +1835,23 @@ fn observe_snapshot(
 ) {
     if let pi_rs::Notification::Committed(record) = &event
         && let pi_rs::Event::ToolFinished { operation_id, .. } = &record.event
-        && let Some(structured_content) = pi_rs::tool_result_event_metadata(*operation_id)
     {
-        output(
-            json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":structured_content}),
-        );
+        let structured_content = pi_rs::tool_result_event_metadata(*operation_id);
+        let duration_ms =
+            super::rpc_events::tool_duration_ms(pi_rs::record_event_metadata(record.id).as_ref());
+        if structured_content.is_some() || duration_ms.is_some() {
+            let mut metadata = json!({
+                "type": "internal_tool_result_metadata",
+                "operationId": operation_id
+            });
+            if let Some(content) = structured_content {
+                metadata["structuredContent"] = content;
+            }
+            if let Some(duration_ms) = duration_ms {
+                metadata["durationMs"] = json!(duration_ms);
+            }
+            output(metadata);
+        }
     }
     let name = match &event {
         pi_rs::Notification::Committed(record) => match &record.event {
@@ -1873,6 +1903,7 @@ fn read_requests(
         shell,
     } = controls;
     let runtime = tokio::runtime::Handle::current();
+    let message_renderers = registry.custom_message_renderers();
     let prepare_in_background =
         registry.has_input_hooks() || registry.has_resource_discovery_hooks();
     let processor = Arc::new(queue::Processor {
@@ -1887,6 +1918,7 @@ fn read_requests(
         trace,
     });
     let share_slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let render_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let (queue_requests, queue) = mpsc::channel(32);
     let queue = prepare_in_background.then(|| runtime.spawn(processor.clone().run(queue)));
     std::thread::spawn(move || {
@@ -1905,6 +1937,42 @@ fn read_requests(
                 }
             };
             match request {
+                Request::RenderCustomMessage {
+                    id,
+                    record_id,
+                    options,
+                } => {
+                    let message = {
+                        let snapshot = snapshot.lock().expect("session snapshot");
+                        snapshot
+                            .records
+                            .binary_search_by_key(&record_id, |record| record.id)
+                            .ok()
+                            .and_then(|index| match &snapshot.records[index].event {
+                                pi_rs::Event::CustomMessage { message }
+                                | pi_rs::Event::CustomMessageDelivered { message, .. }
+                                    if message.display
+                                        && message_renderers.contains(&message.custom_type) =>
+                                {
+                                    Some(message.clone())
+                                }
+                                _ => None,
+                            })
+                    };
+                    match (message, render_slots.clone().try_acquire_owned()) {
+                        (Some(message), Ok(slot)) => {
+                            let renderers = message_renderers.clone();
+                            runtime.spawn(async move {
+                                let rendered = renderers.render(&message, &options, std::time::Duration::from_secs(1)).await;
+                                drop(slot);
+                                output(json!({"type":"custom_message_rendered","id":id,"rendered":rendered}));
+                            });
+                        }
+                        _ => output(
+                            json!({"type":"custom_message_rendered","id":id,"rendered":null}),
+                        ),
+                    }
+                }
                 Request::ReadSession {
                     request,
                     path,
@@ -2077,6 +2145,7 @@ fn read_requests(
                 | Request::QueueInput { .. }
                 | Request::ClearQueue { .. }
                 | Request::SetSessionName { .. }
+                | Request::SetSessionLabel { .. }
                 | Request::SetQueueMode { .. }) => {
                     if prepare_in_background {
                         if let Err(error) = queue_requests.try_send(request) {
