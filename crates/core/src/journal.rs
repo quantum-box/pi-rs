@@ -4514,6 +4514,113 @@ pub(crate) fn system_context(
     (content.join("\n\n"), tools)
 }
 
+/// System checkpoints projected onto the request before provider serialization.
+pub(crate) struct SystemTranscript {
+    leading: String,
+    updates: Vec<(usize, Message)>,
+}
+
+impl SystemTranscript {
+    pub(crate) fn apply_if_supported(
+        self,
+        model: &dyn crate::Model,
+        request: &mut crate::ModelRequest,
+    ) -> bool {
+        model.supports_mid_conversation_system_messages(&request.model)
+            && self.apply(&mut request.messages)
+    }
+
+    fn apply(self, messages: &mut Vec<Message>) -> bool {
+        let Some(Message::System { content }) = messages.first_mut() else {
+            return false;
+        };
+        if *content == self.leading && self.updates.is_empty() {
+            return false;
+        }
+        *content = self.leading;
+        let mut updates = self.updates.into_iter().peekable();
+        let mut projected = Vec::with_capacity(messages.len() + updates.len());
+        for (index, message) in std::mem::take(messages).into_iter().enumerate() {
+            while let Some((_, update)) = updates.next_if(|(position, _)| *position == index) {
+                projected.push(update);
+            }
+            projected.push(message);
+        }
+        projected.extend(updates.map(|(_, update)| update));
+        *messages = projected;
+        true
+    }
+}
+
+pub(crate) fn system_transcript(
+    path: &[&Record],
+    conversation: &[(u64, Message)],
+    conversation_start: usize,
+    fallback: &str,
+) -> Option<SystemTranscript> {
+    let compacted = path
+        .iter()
+        .rposition(|record| matches!(record.event, Event::Compacted { .. }));
+    let retained = &path[compacted.map_or(0, |index| index + 1)..];
+    let mut checkpoints = retained
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::SystemCheckpoint {
+                content, sections, ..
+            } => Some((record.id, content, sections)),
+            _ => None,
+        })
+        .peekable();
+    let (first_source, _, _) = *checkpoints.peek()?;
+    let mut boundaries = conversation
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, message))| !matches!(message, Message::Tool { .. }))
+        .peekable();
+    let leading = if let Some(index) = compacted {
+        system_context(&path[..=index], fallback, Vec::new()).0
+    } else if conversation_start == 1
+        && boundaries
+            .peek()
+            .is_none_or(|(_, (source, _))| first_source < *source)
+    {
+        let (_, content, sections) = checkpoints.next().expect("first checkpoint");
+        std::iter::once(content.as_str())
+            .chain(sections.iter().filter_map(|(_, value)| value.as_deref()))
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    } else {
+        String::new()
+    };
+    let updates = checkpoints
+        .filter_map(|(source, content, sections)| {
+            // A checkpoint in the middle of a tool batch follows its results.
+            while boundaries.next_if(|(_, (id, _))| *id < source).is_some() {}
+            let position = boundaries
+                .peek()
+                .map_or(conversation.len(), |(index, _)| *index);
+            let mut parts = Vec::with_capacity(sections.len() + 1);
+            if !content.is_empty() {
+                parts.push(content.clone());
+            }
+            parts.extend(sections.iter().map(|(name, value)| match value {
+                Some(text) => format!("Updated system prompt section \"{name}\":\n\n{text}"),
+                None => format!("Removed system prompt section \"{name}\"."),
+            }));
+            (!parts.is_empty()).then(|| {
+                (
+                    conversation_start + position,
+                    Message::System {
+                        content: parts.join("\n\n"),
+                    },
+                )
+            })
+        })
+        .collect();
+    Some(SystemTranscript { leading, updates })
+}
+
 fn project_messages(
     branch: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
@@ -6145,6 +6252,12 @@ mod system_checkpoint_tests {
             })
             .unwrap();
         session
+            .append(Event::User {
+                content: "before update".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
             .append(Event::SystemCheckpoint {
                 content: "new instructions".into(),
                 sections: vec![("rules".into(), Some("updated".into()))],
@@ -6163,6 +6276,41 @@ mod system_checkpoint_tests {
                 "snapshot\n\nnew instructions\n\nupdated".into(),
                 vec![read.clone()]
             )
+        );
+        let path = reopened.branch();
+        let conversation = conversation_entries(&path, reopened.operations());
+        let mut messages = vec![
+            Message::System {
+                content: "snapshot\n\nnew instructions\n\nupdated".into(),
+            },
+            Message::User {
+                content: "summary".into(),
+            },
+        ];
+        messages.extend(conversation.iter().map(|(_, message)| message.clone()));
+        assert!(
+            system_transcript(&path, &conversation, 2, "fallback")
+                .unwrap()
+                .apply(&mut messages)
+        );
+        assert_eq!(
+            messages,
+            [
+                Message::System {
+                    content: "snapshot\n\nsaved".into()
+                },
+                Message::User {
+                    content: "summary".into()
+                },
+                Message::User {
+                    content: "before update".into()
+                },
+                Message::System {
+                    content:
+                        "new instructions\n\nUpdated system prompt section \"rules\":\n\nupdated"
+                            .into()
+                },
+            ]
         );
         session.checkout(previous).unwrap();
         assert_eq!(

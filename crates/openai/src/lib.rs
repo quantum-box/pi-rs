@@ -967,6 +967,10 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
+    fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
+        self.supports_mid_conversation_system(model)
+    }
+
     fn minimum_output_tokens(&self) -> u32 {
         if self.codex_account.is_some() && self.send_max_output_tokens {
             16

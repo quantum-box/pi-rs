@@ -1631,6 +1631,17 @@ pub(super) async fn stream_with_declarations(
 
 #[async_trait::async_trait]
 impl Model for Client {
+    fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
+        match self {
+            Self::Ollama(client) => client.supports_mid_conversation_system_messages(model),
+            Self::OpenAi(client) => client.supports_mid_conversation_system_messages(model),
+            Self::Deferred(client) => client
+                .estimation_client()
+                .is_some_and(|client| client.supports_mid_conversation_system_messages(model)),
+            _ => false,
+        }
+    }
+
     fn minimum_output_tokens(&self) -> u32 {
         match self {
             Self::OpenAi(client) => client.minimum_output_tokens(),

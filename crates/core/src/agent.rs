@@ -1893,7 +1893,7 @@ impl Agent<'_> {
                     phase: ToolInventoryPhase::RequestPreparation,
                     registry: active.registry,
                 });
-                let (mut request, transformed) = active
+                let (mut request, mut transformed, transcript) = active
                     .request(
                         session,
                         &states,
@@ -1969,6 +1969,9 @@ impl Agent<'_> {
                     limits: active.limits.clone(),
                     ..active
                 };
+                transformed |= transcript.is_some_and(|transcript| {
+                    transcript.apply_if_supported(active.model, &mut request)
+                });
                 let attempt = match active
                     .prepare_attempt(
                         session,
@@ -2706,7 +2709,7 @@ impl Agent<'_> {
         purpose: RequestPurpose,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
-    ) -> Result<(ModelRequest, bool)> {
+    ) -> Result<(ModelRequest, bool, Option<crate::journal::SystemTranscript>)> {
         let branch = session.branch();
         let summary = branch.iter().rev().find_map(|record| match &record.event {
             Event::Compacted { summary, .. } => Some(summary.as_str()),
@@ -2730,25 +2733,27 @@ impl Agent<'_> {
                 content: format!("Prior conversation summary (context only):\n{summary}"),
             });
         }
+        let mut conversation = model_conversation_entries(&branch, session.operations());
         if let Some(boundary) = before {
             let mut keep_group = false;
-            messages.extend(
-                model_conversation_entries(&branch, session.operations())
-                    .into_iter()
-                    .filter_map(|(source, message)| {
-                        if !matches!(message, Message::Tool { .. }) {
-                            keep_group = source < boundary;
-                        }
-                        keep_group.then_some(message)
-                    }),
-            );
-        } else {
-            messages.extend(
-                model_conversation_entries(history, session.operations())
-                    .into_iter()
-                    .map(|(_, message)| message),
-            );
+            conversation.retain(|(source, message)| {
+                if !matches!(message, Message::Tool { .. }) {
+                    keep_group = *source < boundary;
+                }
+                keep_group
+            });
         }
+        let transcript = if purpose == RequestPurpose::Turn {
+            crate::journal::system_transcript(
+                history,
+                &conversation,
+                messages.len(),
+                self.system_prompt,
+            )
+        } else {
+            None
+        };
+        messages.extend(conversation.into_iter().map(|(_, message)| message));
         if messages.len() == 1 {
             return Err(Error::Session("there is no conversation to resume".into()));
         }
@@ -2912,7 +2917,9 @@ impl Agent<'_> {
         let transformed = request.model != original.model
             || request.messages != original.messages
             || request.tools != original.tools;
-        Ok((request, transformed))
+        // A hook that changes the message list owns its instruction order.
+        let transcript = transcript.filter(|_| request.messages == original.messages);
+        Ok((request, transformed, transcript))
     }
 
     fn request_budget_tokens(
@@ -5242,7 +5249,7 @@ impl Agent<'_> {
             return Err(Error::Budget);
         }
         abandon_turn_request_for_summary(session, observer)?;
-        let (mut request, transformed) = self
+        let (mut request, transformed, _) = self
             .request(
                 session,
                 states,
@@ -13335,7 +13342,7 @@ mod request_privacy_tests {
                     system_prompt: "system",
                     limits: Limits::default(),
                 };
-                let (request, transformed) = agent
+                let (request, transformed, _) = agent
                     .request(
                         &mut session,
                         &ExtensionStates::default(),
@@ -13433,7 +13440,7 @@ mod request_privacy_tests {
                     notifications.push(serde_json::to_string(request).unwrap());
                 }
             };
-            let (request, transformed) = agent
+            let (request, transformed, _) = agent
                 .request(
                     &mut session,
                     &ExtensionStates::default(),

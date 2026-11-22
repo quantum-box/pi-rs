@@ -848,6 +848,13 @@ fn running_context_window(value: &Value, model: &str) -> Option<u32> {
 
 #[async_trait::async_trait]
 impl Model for Ollama {
+    fn supports_mid_conversation_system_messages(&self, _model: &str) -> bool {
+        self.mistral.is_none()
+            && self
+                .compatibility
+                .supports_mid_conversation_system_messages()
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,

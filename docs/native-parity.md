@@ -2803,6 +2803,14 @@ object order is preserved during import so named sections retain their declared
 order. Tool declarations resolve to current enabled native implementations and
 schemas. An imported declaration cannot enable an unavailable or disabled tool.
 
+On ordinary turns, models that support mid-conversation instructions receive
+the original system prompt followed by checkpoint updates at their conversation
+positions, with named sections rendered as replacements or removals. Compaction
+uses the saved prompt as the leading checkpoint. A checkpoint inside a tool
+batch follows its results to preserve provider tool-call pairing. Models
+without that capability receive the fully resolved leading prompt. An extension
+that rewrites the message list controls its instruction order.
+
 Tests cover branch restoration, section order, replacement/removal, current tool
 schemas and permission boundaries. A CLI import-and-resume fixture verified the
 actual model request and retained the original source file. Workspace tests and
