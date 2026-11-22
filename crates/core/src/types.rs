@@ -652,6 +652,25 @@ pub struct ProviderReplay {
 }
 
 impl ProviderReplay {
+    /// Keep the request effort as private metadata beside the response blocks.
+    pub fn record_openai_effort(&mut self, effort: &str) {
+        if !effort.is_empty() {
+            self.blocks
+                .retain(|block| block.get("_pi_openai_effort").is_none());
+            self.blocks
+                .push(serde_json::json!({"_pi_openai_effort":effort}));
+        }
+    }
+
+    pub fn openai_effort(&self) -> Option<&str> {
+        self.blocks.iter().find_map(|block| {
+            block
+                .get("_pi_openai_effort")?
+                .as_str()
+                .filter(|effort| !effort.is_empty())
+        })
+    }
+
     /// Preserve the recorded Anthropic effort without placing private data on the wire.
     pub fn record_anthropic_effort(&mut self, effort: &str) {
         if let Some(effort) = Self::valid_anthropic_effort(effort) {
@@ -685,12 +704,87 @@ impl ProviderReplay {
             .any(|b| b.get("_pi_context_edit_api").is_some())
     }
 
-    /// Edited replay is scoped to the originating transport as well as the model.
+    /// Replay with a known wire format must use the originating API family.
     pub fn supports_api(&self, api: ModelApi) -> bool {
-        self.blocks
+        if let Some(name) = self
+            .blocks
             .iter()
-            .find_map(|b| b.get("_pi_context_edit_api").and_then(Value::as_str))
-            .is_none_or(|name| name == api.as_str())
+            .find_map(|block| block.get("_pi_context_edit_api").and_then(Value::as_str))
+        {
+            return name == api.as_str();
+        }
+        // Pi Messages uses Anthropic-shaped content with its own marker.
+        if self
+            .blocks
+            .first()
+            .is_some_and(|block| block["type"] == "pi-rs:pi-messages-origin")
+        {
+            return api == ModelApi::PiMessages;
+        }
+        // Mistral may record a compatibility reasoning block alongside its
+        // native content envelope. The envelope defines the route for both.
+        if self
+            .blocks
+            .iter()
+            .any(|block| block.get("mistral_content").is_some())
+        {
+            return api == ModelApi::MistralConversations;
+        }
+        self.blocks.iter().all(|block| {
+            if block.get("_pi_anthropic_effort").is_some() {
+                return api == ModelApi::AnthropicMessages;
+            }
+            if block.get("_pi_openai_effort").is_some() {
+                return matches!(
+                    api,
+                    ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses
+                );
+            }
+            match block["type"].as_str() {
+                Some("thinking" | "redacted_thinking") => api == ModelApi::AnthropicMessages,
+                // Older Bedrock and Anthropic journals share these block types.
+                Some("text" | "tool_use") => {
+                    matches!(
+                        api,
+                        ModelApi::AnthropicMessages | ModelApi::BedrockConverseStream
+                    )
+                }
+                Some("reasoning")
+                    if block.get("text").is_some()
+                        || block.get("redacted").is_some()
+                        || block.get("signature").is_some() =>
+                {
+                    api == ModelApi::BedrockConverseStream
+                }
+                Some("message" | "reasoning" | "function_call" | "custom_tool_call") => {
+                    matches!(
+                        api,
+                        ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses
+                    )
+                }
+                Some(kind) if kind == "reasoning_content" || kind.starts_with("reasoning.") => {
+                    api == ModelApi::OpenaiCompletions
+                }
+                None if [
+                    "text",
+                    "thought",
+                    "thoughtSignature",
+                    "functionCall",
+                    "functionResponse",
+                    "inlineData",
+                    "fileData",
+                    "executableCode",
+                    "codeExecutionResult",
+                ]
+                .iter()
+                .any(|key| block.get(key).is_some()) =>
+                {
+                    api == ModelApi::GoogleGenerativeAi
+                }
+                // An older or host-defined block may have no recognizable API marker.
+                _ => true,
+            }
+        })
     }
 }
 

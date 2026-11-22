@@ -36,9 +36,10 @@ pub struct Ollama {
     prompt_cache_long: bool,
     session_cache_key: Option<String>,
     reasoning_effort: Option<String>,
+    template_reasoning_effort: Option<String>,
     thinking_budget_level: Option<String>,
     thinking_budgets: Option<Value>,
-    compatibility: ChatCompatibility,
+    compatibility: Arc<ChatCompatibility>,
     supports_reasoning: Option<bool>,
     reasoning_enabled: bool,
     allow_reasoning_off: bool,
@@ -240,9 +241,10 @@ impl Ollama {
                 && std::env::var("PI_CACHE_RETENTION").is_ok_and(|value| value == "long"),
             session_cache_key: None,
             reasoning_effort: None,
+            template_reasoning_effort: None,
             thinking_budget_level: None,
             thinking_budgets: None,
-            compatibility: ChatCompatibility::default(),
+            compatibility: Arc::default(),
             supports_reasoning: None,
             reasoning_enabled: false,
             allow_reasoning_off: true,
@@ -267,7 +269,9 @@ impl Ollama {
             prompt_mode,
             effort: effort.map(str::to_owned),
         });
-        self.compatibility.supports_strict_mode.get_or_insert(true);
+        Arc::make_mut(&mut self.compatibility)
+            .supports_strict_mode
+            .get_or_insert(true);
         self.native_probes = false;
         self
     }
@@ -347,6 +351,7 @@ impl Ollama {
     /// Override provider thinking effort. None preserves the model default.
     pub fn with_reasoning_effort(mut self, effort: Option<&str>) -> Self {
         let local_ollama = self.endpoint.port_or_known_default() == Some(11434);
+        self.template_reasoning_effort = effort.filter(|level| *level != "off").map(str::to_owned);
         self.reasoning_effort = effort.map(|effort| {
             match effort {
                 "off" => "none",
@@ -361,6 +366,7 @@ impl Ollama {
 
     /// Set an effort already resolved against the model's advertised controls.
     pub fn with_reported_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+        self.template_reasoning_effort = effort.filter(|level| *level != "off").map(str::to_owned);
         self.reasoning_effort =
             effort.map(|level| if level == "off" { "none" } else { level }.to_owned());
         self
@@ -368,8 +374,17 @@ impl Ollama {
 
     /// Apply the provider value from an explicit thinking-level map.
     pub fn with_mapped_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+        self.template_reasoning_effort = effort.map(str::to_owned);
         self.reasoning_effort = effort.map(str::to_owned);
         self
+    }
+
+    fn chat_reasoning_effort(&self) -> Option<&str> {
+        if self.compatibility.uses_chat_template() {
+            self.template_reasoning_effort.as_deref()
+        } else {
+            self.reasoning_effort.as_deref()
+        }
     }
 
     /// Set the selected Pi thinking level and optional budget overrides.
@@ -415,7 +430,7 @@ impl Ollama {
         enabled: bool,
         allow_off: bool,
     ) -> Self {
-        self.compatibility = compatibility;
+        self.compatibility = Arc::new(compatibility);
         self.supports_reasoning = reasoning;
         self.reasoning_enabled = enabled;
         self.allow_reasoning_off = allow_off;
@@ -425,14 +440,13 @@ impl Ollama {
     /// Set endpoint-wide strict tool support; callers must ensure it applies to
     /// every model dispatched through this client.
     pub fn with_strict_tool_support(mut self, supported: bool) -> Self {
-        self.compatibility.supports_strict_mode = Some(supported);
+        Arc::make_mut(&mut self.compatibility).supports_strict_mode = Some(supported);
         self
     }
 
     /// Set custom grammar tool support for the routed model.
     pub fn with_grammar_tool_support(mut self, supported: bool) -> Self {
-        self.compatibility
-            .set_openai_grammar_tool_support(supported);
+        Arc::make_mut(&mut self.compatibility).set_openai_grammar_tool_support(supported);
         self
     }
 
@@ -947,7 +961,7 @@ impl Model for Ollama {
             self.supports_reasoning,
             self.reasoning_enabled,
             self.allow_reasoning_off,
-            &self.reasoning_effort,
+            self.chat_reasoning_effort(),
             &self.thinking_budget_level,
             &self.thinking_budgets,
             &self.sampling,
@@ -1249,7 +1263,7 @@ impl Ollama {
                 body["reasoning_effort"] = json!(effort);
             }
         } else {
-            self.compatibility.thinking_budget_options(
+            let thinking_budget = self.compatibility.thinking_budget_options(
                 &mut body,
                 self.thinking_budget_level.as_deref(),
                 self.thinking_budgets.as_ref(),
@@ -1260,8 +1274,9 @@ impl Ollama {
                 &mut body,
                 self.supports_reasoning,
                 self.reasoning_enabled,
-                self.reasoning_effort.as_deref(),
+                self.chat_reasoning_effort(),
                 self.allow_reasoning_off,
+                thinking_budget,
             );
         }
         body.as_object_mut().expect("chat request object").extend(
@@ -2198,13 +2213,17 @@ mod content_tests {
             let body: serde_json::Value =
                 serde_json::from_slice(&bytes[offset..offset + length]).unwrap();
             assert_eq!(body["thinking_budget_tokens"], 2500);
+            assert_eq!(body["chat_template_args"]["budget"], 2500);
             assert_eq!(body["reasoning_effort"], "high");
             let reply = "data: [DONE]\n\n";
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply).unwrap();
         });
-        let compat =
-            serde_json::from_value(json!({"thinkingTokenBudgetField":"thinking_budget_tokens"}))
-                .unwrap();
+        let compat = serde_json::from_value(json!({
+            "thinkingTokenBudgetField":"thinking_budget_tokens",
+            "thinkingFormat":"baseten",
+            "chatTemplateArgs":{"budget":{"$var":"thinking.budget"}},
+        }))
+        .unwrap();
         let model = Ollama::new(&format!("http://{address}"), None)
             .unwrap()
             .with_chat_compatibility(compat, Some(true), true, true)
@@ -2218,6 +2237,37 @@ mod content_tests {
         };
         let _stream = model.stream(request).await.unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn chat_template_uses_only_explicitly_mapped_off_effort() {
+        let compat = serde_json::from_value(json!({"thinkingFormat":"chat-template"})).unwrap();
+        let model = Ollama::new("http://127.0.0.1:11434", None)
+            .unwrap()
+            .with_chat_compatibility(compat, Some(true), false, true);
+        let selected = model.clone().with_reasoning_effort(Some("minimal"));
+        assert_eq!(selected.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(selected.chat_reasoning_effort(), Some("minimal"));
+        assert_eq!(
+            model
+                .clone()
+                .with_reasoning_effort(Some("off"))
+                .chat_reasoning_effort(),
+            None
+        );
+        assert_eq!(
+            model
+                .clone()
+                .with_reported_reasoning_effort(Some("off"))
+                .chat_reasoning_effort(),
+            None
+        );
+        assert_eq!(
+            model
+                .with_mapped_reasoning_effort(Some("none"))
+                .chat_reasoning_effort(),
+            Some("none")
+        );
     }
 
     #[test]
@@ -3278,8 +3328,26 @@ mod constrained_chat_tests {
 
     fn model(support: Option<bool>, endpoint: &str) -> Ollama {
         let mut model = Ollama::new(endpoint, None).unwrap();
-        model.compatibility.supports_strict_mode = support;
+        Arc::make_mut(&mut model.compatibility).supports_strict_mode = support;
         model
+    }
+
+    #[test]
+    fn chat_compatibility_overrides_are_local_to_each_client_clone() {
+        let base = Ollama::new("http://127.0.0.1:11434", None).unwrap();
+        let configured = base
+            .clone()
+            .with_strict_tool_support(false)
+            .with_grammar_tool_support(true);
+        let mistral = base.clone().with_mistral(false, false, None);
+        assert_eq!(configured.compatibility.supports_strict_mode, Some(false));
+        assert_eq!(
+            configured.compatibility.supports_openai_grammar_tools(),
+            Some(true)
+        );
+        assert_eq!(mistral.compatibility.supports_strict_mode, Some(true));
+        assert_eq!(base.compatibility.supports_strict_mode, None);
+        assert_eq!(base.compatibility.supports_openai_grammar_tools(), None);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 //! Native Anthropic Messages and Models API integration.
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -6,9 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use pi_rs_core::{
-    AnthropicInputTransformations, AssistantDiagnostic, Error, Message, Model, ModelApi,
-    ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay, ReportedUsageCost,
-    ResolvedModelIdentity, Result, ToolCall, Usage,
+    AnthropicInputTransformations, AssistantDiagnostic, Error, ImageContent, Message, Model,
+    ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
+    ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, Usage,
 };
 use reqwest::{
     Client, Response, Url,
@@ -987,6 +988,32 @@ async fn read_json(mut response: Response) -> Result<Value> {
     serde_json::from_slice(&bytes).map_err(|_| Error::Model("invalid Anthropic response".into()))
 }
 
+fn tool_result_content(
+    content: &str,
+    is_structured: Option<bool>,
+) -> (Cow<'_, str>, Vec<ImageContent>) {
+    if pi_rs_core::tool_content_is_structured(content, is_structured) {
+        let (text, images) = pi_rs_core::extract_tool_images(content.to_owned());
+        if !images.is_empty() && images.iter().all(|image| image.validate().is_ok()) {
+            return (Cow::Owned(text), images);
+        }
+    }
+    (Cow::Borrowed(content), Vec::new())
+}
+
+fn image_block(image: ImageContent) -> Value {
+    json!({"type":"image","source":{
+        "type":"base64","media_type":image.mime_type,"data":image.data
+    }})
+}
+
+fn error_image_caption(call_id: &str, tool_name: Option<&str>) -> String {
+    match tool_name {
+        Some(name) => format!("Images from the error result of tool call {call_id} ({name}):"),
+        None => format!("Images from the error result of tool call {call_id}:"),
+    }
+}
+
 fn effort_message(effort: &str) -> Value {
     json!({"role":"system","content":[],"output_config":{"effort":effort}})
 }
@@ -1001,9 +1028,12 @@ fn encode_request(
 ) -> Result<Value> {
     let mut system = Vec::new();
     let mut pending_system = Vec::new();
+    let mut pending_error_images = Vec::new();
+    let mut tool_names = BTreeMap::new();
     let mut turns: Vec<(&str, Vec<Value>, Option<&'static str>)> = Vec::new();
     for (index, message) in request.messages.into_iter().enumerate() {
         let mut prior_effort = None;
+        let is_tool_result = matches!(&message, Message::Tool { .. });
         let (role, blocks) = match message {
             Message::System { content } => {
                 if index == 0 || !supports_mid_conversation_system {
@@ -1020,9 +1050,7 @@ fn encode_request(
                 let mut blocks: Vec<_> = text_block(content).into_iter().collect();
                 for image in images {
                     image.validate()?;
-                    blocks.push(json!({"type":"image","source":{
-                        "type":"base64","media_type":image.mime_type,"data":image.data
-                    }}));
+                    blocks.push(image_block(image));
                 }
                 ("user", blocks)
             }
@@ -1031,6 +1059,11 @@ fn encode_request(
                 calls,
                 replay,
             } => {
+                tool_names.extend(
+                    calls
+                        .iter()
+                        .map(|call| (call.id.clone(), call.name.clone())),
+                );
                 let blocks = match replay {
                     Some(replay)
                         if replay_matches(
@@ -1075,8 +1108,21 @@ fn encode_request(
                 call_id,
                 content,
                 is_error,
-                ..
+                is_structured,
             } => {
+                let (text, images) = tool_result_content(&content, is_structured);
+                let content = if images.is_empty() {
+                    Value::String(text.into_owned())
+                } else if is_error {
+                    let name = tool_names.get(&call_id).map(String::as_str);
+                    pending_error_images.extend(text_block(error_image_caption(&call_id, name)));
+                    pending_error_images.extend(images.into_iter().map(image_block));
+                    Value::String(text.into_owned())
+                } else {
+                    let mut blocks: Vec<_> = text_block(text.into_owned()).into_iter().collect();
+                    blocks.extend(images.into_iter().map(image_block));
+                    Value::Array(blocks)
+                };
                 let mut block =
                     json!({"type":"tool_result","tool_use_id":call_id,"content":content});
                 if is_error {
@@ -1087,6 +1133,10 @@ fn encode_request(
         };
         if blocks.is_empty() {
             continue;
+        }
+        // Anthropic requires all tool results to precede error images in the user turn.
+        if !is_tool_result && let Some(("user", content, _)) = turns.last_mut() {
+            content.append(&mut pending_error_images);
         }
         // System updates cannot separate an assistant tool call from its result.
         if role == "assistant" {
@@ -1106,6 +1156,9 @@ fn encode_request(
         return Err(Error::Model(
             "Anthropic requires at least one conversation message".into(),
         ));
+    }
+    if let Some(("user", content, _)) = turns.last_mut() {
+        content.append(&mut pending_error_images);
     }
     turns.append(&mut pending_system);
     let messages: Vec<_> = turns
@@ -1711,7 +1764,7 @@ impl Model for Anthropic {
         headers.sort();
         let identity = (
             headers,
-            "anthropic-v1",
+            "anthropic-v2",
             self.endpoint.as_str(),
             self.provider.as_ref(),
             self.replay_scope.as_ref(),
@@ -1798,7 +1851,35 @@ impl Model for Anthropic {
         let edited_scope =
             pi_rs_core::endpoint_replay_scope(&self.replay_scope, self.endpoint.as_str());
         match message {
-            Message::Tool { content, .. } => content.encode_utf16().count().div_ceil(4) as u64,
+            Message::Tool {
+                call_id,
+                content,
+                is_error,
+                is_structured,
+            } => {
+                let (mut content, images) = tool_result_content(content, *is_structured);
+                if *is_error && !images.is_empty() {
+                    let tool_name =
+                        request
+                            .messages
+                            .iter()
+                            .rev()
+                            .find_map(|message| match message {
+                                Message::Assistant { calls, .. } => calls
+                                    .iter()
+                                    .find(|call| call.id == *call_id)
+                                    .map(|call| call.name.as_str()),
+                                _ => None,
+                            });
+                    content
+                        .to_mut()
+                        .push_str(&error_image_caption(call_id, tool_name));
+                }
+                pi_rs_core::estimate_message_tokens(&Message::UserWithImages {
+                    content: content.into_owned(),
+                    images,
+                })
+            }
             Message::Assistant {
                 content,
                 calls,
@@ -2789,7 +2870,7 @@ mod tests {
     }
 
     #[test]
-    fn constrained_capability_preserves_legacy_context_identity() {
+    fn image_projection_updates_context_identity_while_preserving_strict_variants() {
         let model = Anthropic::new(DEFAULT_ENDPOINT, "key").unwrap();
         let mut headers: Vec<_> = model
             .headers
@@ -2814,17 +2895,19 @@ mod tests {
             model.cache_tools,
         ));
         assert!(legacy.is_some());
-        assert_eq!(model.context_identity(), legacy);
+        let current = model.context_identity();
+        assert!(current.is_some());
+        assert_ne!(current, legacy);
         assert_eq!(
             model
                 .clone()
                 .with_strict_tool_support(false)
                 .context_identity(),
-            legacy
+            current
         );
         assert_ne!(
             model.with_strict_tool_support(true).context_identity(),
-            legacy
+            current
         );
     }
 
@@ -3892,7 +3975,7 @@ mod tests {
         };
         let small = model.estimate_message_tokens(&request, &tool(4));
         let large = model.estimate_message_tokens(&request, &tool(20000));
-        assert!(large > small + 4000);
+        assert_eq!(large, small);
         let replay = ProviderReplay {
             identity: ResolvedModelIdentity {
                 provider: "anthropic".into(),
@@ -4127,6 +4210,114 @@ mod tests {
             "base\n\nwhile the tool runs\n\nnext instruction\n\nlast instruction"
         );
         assert_eq!(folded["messages"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn malformed_structured_tool_images_preserve_the_original_tool_result() {
+        for data in ["", "bad?base64"] {
+            let content = json!({"data":{"content":[
+                {"type":"text","text":"tool output"},
+                {"type":"image","mimeType":"image/png","data":data}
+            ]}})
+            .to_string();
+            let (text, images) = tool_result_content(&content, Some(true));
+            assert_eq!(text, content);
+            assert!(images.is_empty());
+        }
+    }
+
+    #[test]
+    fn structured_tool_images_use_native_blocks_without_breaking_result_order() {
+        let envelope = |data: &str| {
+            json!({"data":{"content":[
+                {"type":"text","text":"result"},
+                {"type":"image","mimeType":"image/png","data":data}
+            ]},"extra":"preserve"})
+            .to_string()
+        };
+        let tool = |id: &str, is_error, is_structured, data: &str| Message::Tool {
+            call_id: id.into(),
+            content: envelope(data),
+            is_error,
+            is_structured,
+        };
+        let mut reply = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "anthropic".into(),
+                model: "fixture".into(),
+            },
+            blocks: vec![text_block("finished".into()).unwrap()],
+        };
+        reply.record_anthropic_effort("low");
+        let request = ModelRequest {
+            model: "fixture".into(),
+            tools: Vec::new(),
+            max_output_tokens: 128,
+            messages: vec![
+                Message::User {
+                    content: "inspect".into(),
+                },
+                Message::Assistant {
+                    content: String::new(),
+                    calls: ["failed", "success", "plain"]
+                        .into_iter()
+                        .map(|id| ToolCall {
+                            id: id.into(),
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        })
+                        .collect(),
+                    replay: None,
+                },
+                tool("failed", true, Some(true), "ZmFpbGVk"),
+                Message::System {
+                    content: "update".into(),
+                },
+                tool("success", false, None, "c3VjY2Vzcw=="),
+                tool("plain", false, Some(false), "cGxhaW4="),
+                Message::Assistant {
+                    content: "finished".into(),
+                    calls: vec![],
+                    replay: Some(Box::new(reply)),
+                },
+            ],
+        };
+        let body = encode_request(request.clone(), "anthropic", "", false, true, true).unwrap();
+        let result = &body["messages"][2]["content"];
+        assert_eq!(result[0]["tool_use_id"], "failed");
+        assert_eq!(result[0]["is_error"], true);
+        let error_text = result[0]["content"].as_str().unwrap();
+        assert!(error_text.contains("[image attached]"));
+        assert!(!error_text.contains("ZmFpbGVk"));
+        assert_eq!(result[1]["tool_use_id"], "success");
+        assert!(
+            result[1]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("preserve")
+        );
+        assert_eq!(result[1]["content"][1]["source"]["data"], "c3VjY2Vzcw==");
+        assert_eq!(result[2]["content"], envelope("cGxhaW4="));
+        assert_eq!(
+            result[3]["text"],
+            "Images from the error result of tool call failed (read):"
+        );
+        assert_eq!(result[4]["source"]["data"], "ZmFpbGVk");
+        assert_eq!(body["messages"][3]["role"], "system");
+        assert_eq!(body["messages"][3]["content"][0]["text"], "update");
+        assert_eq!(body["messages"][4], effort_message("low"));
+        assert_eq!(body["messages"][5]["role"], "assistant");
+
+        let mut trailing = request;
+        trailing.messages.pop();
+        trailing.messages.remove(3);
+        let mut trailing = encode_request(trailing, "anthropic", "", false, true, true).unwrap();
+        assert_eq!(result, &trailing["messages"][2]["content"]);
+        apply_cache_control(&mut trailing, CacheRetention::Short, true);
+        assert_eq!(
+            trailing["messages"][2]["content"][4]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
     }
 
     #[test]

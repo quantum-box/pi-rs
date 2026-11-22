@@ -13,6 +13,23 @@ use std::sync::{Arc, OnceLock};
 
 use super::{Cli, model_auth::Credential, model_profiles::RequestHeaders, pi_messages::PiMessages};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RequestAuth {
+    Automatic,
+    Bearer,
+    HeaderBearer,
+}
+
+impl RequestAuth {
+    fn for_credential(credential: Option<&Credential>) -> Self {
+        match credential {
+            Some(Credential::Bearer(_)) => Self::HeaderBearer,
+            Some(credential) if credential.is_bearer() => Self::Bearer,
+            _ => Self::Automatic,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) enum Provider {
     #[default]
@@ -159,7 +176,28 @@ impl Provider {
         token: Option<String>,
         bearer: bool,
     ) -> Result<Client> {
-        self.connect_prechecked(adapter, endpoint, token, bearer, false)
+        let auth = if bearer {
+            RequestAuth::Bearer
+        } else {
+            RequestAuth::Automatic
+        };
+        self.connect_prechecked(adapter, endpoint, token, auth, false)
+    }
+
+    pub(super) fn connect_for_credential(
+        &self,
+        adapter: Adapter,
+        endpoint: &str,
+        token: Option<String>,
+        credential: Option<&Credential>,
+    ) -> Result<Client> {
+        self.connect_prechecked(
+            adapter,
+            endpoint,
+            token,
+            RequestAuth::for_credential(credential),
+            false,
+        )
     }
 
     fn connect_prechecked(
@@ -167,7 +205,7 @@ impl Provider {
         adapter: Adapter,
         endpoint: &str,
         token: Option<String>,
-        bearer: bool,
+        auth: RequestAuth,
         radius_checked: bool,
     ) -> Result<Client> {
         let missing_key = || {
@@ -245,9 +283,12 @@ impl Provider {
                 let token = token.ok_or_else(missing_key)?;
                 let mut client = if self.id() == "cloudflare-ai-gateway" {
                     Anthropic::with_cloudflare_gateway_token(endpoint, &token)?
-                } else if self == &Self::Anthropic && token.contains("sk-ant-oat") {
+                } else if self == &Self::Anthropic
+                    && auth != RequestAuth::HeaderBearer
+                    && token.contains("sk-ant-oat")
+                {
                     Anthropic::with_oauth_token(endpoint, &token)?
-                } else if bearer
+                } else if auth != RequestAuth::Automatic
                     || matches!(
                         self.id(),
                         "fireworks" | "openrouter" | "minimax" | "minimax-cn" | "github-copilot"
@@ -468,7 +509,7 @@ impl Deferred {
             .headers
             .resolve(&self.provider, token.as_deref())
             .await?;
-        let bearer = self.credential.as_ref().is_some_and(Credential::is_bearer);
+        let auth = RequestAuth::for_credential(self.credential.as_ref());
         let mut radius_checked = false;
         if self.provider == Provider::Radius
             && self.adapter == Adapter::PiMessages
@@ -494,7 +535,7 @@ impl Deferred {
         };
         let mut client = self
             .provider
-            .connect_prechecked(self.adapter, &endpoint, token, bearer, radius_checked)?
+            .connect_prechecked(self.adapter, &endpoint, token, auth, radius_checked)?
             .with_headers(headers.clone())
             .with_context_probes(self.probe_context);
         match (&self.credential, &mut client) {
@@ -526,7 +567,7 @@ impl Deferred {
 impl Client {
     pub(super) fn uses_final_strict_policy(&self) -> bool {
         match self {
-            Self::OpenAi(_) | Self::Ollama(_) => true,
+            Self::OpenAi(_) | Self::Ollama(_) | Self::Bedrock(_) => true,
             Self::Deferred(client) => matches!(
                 client.adapter,
                 Adapter::OpenAiResponses
@@ -534,6 +575,7 @@ impl Client {
                     | Adapter::CodexResponses
                     | Adapter::ChatCompletions
                     | Adapter::MistralConversations
+                    | Adapter::Bedrock
             ),
             _ => false,
         }
@@ -563,6 +605,10 @@ impl Client {
                 }
                 Self::OpenAi(client)
             }
+            Self::Bedrock(client) => Self::Bedrock(match strict {
+                Some(supported) => client.with_strict_tool_support(supported),
+                None => client,
+            }),
             Self::Deferred(client)
                 if matches!(
                     client.adapter,
@@ -571,6 +617,7 @@ impl Client {
                         | Adapter::CodexResponses
                         | Adapter::ChatCompletions
                         | Adapter::MistralConversations
+                        | Adapter::Bedrock
                 ) =>
             {
                 return Box::pin(
@@ -587,7 +634,11 @@ impl Client {
 
     pub fn supports_prepared_tool_dispatch(&self) -> bool {
         match self {
-            Self::OpenAi(_) | Self::Ollama(_) | Self::Google(_) | Self::Anthropic(_) => true,
+            Self::OpenAi(_)
+            | Self::Ollama(_)
+            | Self::Google(_)
+            | Self::Anthropic(_)
+            | Self::Bedrock(_) => true,
             Self::Deferred(client) => matches!(
                 client.adapter,
                 Adapter::OpenAiResponses
@@ -597,6 +648,7 @@ impl Client {
                     | Adapter::MistralConversations
                     | Adapter::Google
                     | Adapter::Anthropic
+                    | Adapter::Bedrock
             ),
             _ => false,
         }
@@ -990,6 +1042,12 @@ impl Client {
                     context,
                 )?))
             }
+            Self::Bedrock(client) => Ok(Some(
+                client
+                    .clone()
+                    .with_default_headers(defaults)?
+                    .prepare_bound_tool_dispatch(request, declarations, context)?,
+            )),
             Self::Deferred(client)
                 if matches!(
                     client.adapter,
@@ -1000,6 +1058,7 @@ impl Client {
                         | Adapter::MistralConversations
                         | Adapter::Google
                         | Adapter::Anthropic
+                        | Adapter::Bedrock
                 ) =>
             {
                 Box::pin(client.resolve().await?.prepare_tool_dispatch_with_headers(
@@ -1475,7 +1534,7 @@ impl Client {
                     .as_ref()
                     .and_then(|model| model.levels(adapter))
                     .unwrap_or_else(|| pi_rs::openai::thinking_levels(&args.model));
-                let thinking = if metadata
+                let mapped_thinking = if metadata
                     .as_ref()
                     .is_some_and(|model| model.reasoning == Some(false))
                     || levels.len() == 1 && levels[0] == "off"
@@ -1524,6 +1583,11 @@ impl Client {
                     );
                 let client = client
                     .with_mid_conversation_system_policy(system_default, system_models)
+                    .with_configuration_update_models(args.model_profiles.responses_effort_models(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
+                    ))
                     .with_max_output_tokens_field(
                         args.model_profiles
                             .responses_max_output_tokens(&args.provider, metadata.as_ref()),
@@ -1542,7 +1606,7 @@ impl Client {
                         args.model_profiles
                             .responses_prompt_cache_key_enabled(&args.provider, metadata.as_ref()),
                     )
-                    .with_thinking(thinking)
+                    .with_mapped_thinking(thinking, mapped_thinking)
                     .with_sampling(sampling)
                     .map_err(|error| {
                         pi_rs::Error::Config(format!(
@@ -1583,6 +1647,12 @@ impl Client {
                     )
                     .with_cache_retention(cache_retention(true))
                     .with_long_cache_support(long_cache_override)
+                    .with_strict_tool_support(
+                        args.model_profiles
+                            .chat_compatibility(&args.provider, metadata.as_ref())
+                            .supports_strict_mode()
+                            .unwrap_or(false),
+                    )
                     .with_reasoning(level, mapped.flatten())?;
                 if let Some(budgets) = args.settings.value().get("thinkingBudgets") {
                     client = client.with_thinking_budget_settings(budgets.clone());
@@ -1912,14 +1982,14 @@ mod contention_tests {
     use std::time::Duration;
 
     #[test]
-    fn final_strict_policy_only_applies_to_openai_adapters() {
+    fn final_strict_policy_applies_to_openai_style_and_bedrock_adapters() {
         let endpoint = "http://127.0.0.1:1234/v1";
         for (adapter, expected) in [
             (Adapter::OpenAiResponses, true),
             (Adapter::ChatCompletions, true),
             (Adapter::Anthropic, false),
             (Adapter::Google, false),
-            (Adapter::Bedrock, false),
+            (Adapter::Bedrock, true),
             (Adapter::PiMessages, false),
         ] {
             let provider = Provider::Custom {
@@ -3758,6 +3828,45 @@ mod contention_tests {
                 !summary && path != 0
             );
         }
+    }
+
+    #[tokio::test]
+    async fn anthropic_header_bearer_accepts_subscription_shaped_token_without_subscription_mode() {
+        let provider = Provider::Anthropic;
+        let endpoint = "http://127.0.0.1:1/v1/messages";
+        let token = "sk-ant-oat-fixture";
+        let expected = Client::Anthropic(Anthropic::with_bearer_token(endpoint, token).unwrap());
+        let subscription = provider.connect_for_credential(
+            Adapter::Anthropic,
+            endpoint,
+            Some(token.into()),
+            Some(&Credential::Literal(token.into())),
+        );
+        assert!(
+            matches!(subscription, Err(Error::Config(message)) if message.contains("OAuth requires"))
+        );
+
+        let credential = Credential::Bearer(token.into());
+        let explicit = provider
+            .connect_for_credential(
+                Adapter::Anthropic,
+                endpoint,
+                Some(token.into()),
+                Some(&credential),
+            )
+            .unwrap();
+        let (deferred, _) = Client::deferred(
+            provider,
+            Adapter::Anthropic,
+            endpoint,
+            Some(credential),
+            RequestHeaders::default(),
+        )
+        .resolve_affinity_headers()
+        .await
+        .unwrap();
+        assert_eq!(expected.context_identity(), explicit.context_identity());
+        assert_eq!(expected.context_identity(), deferred.context_identity());
     }
 
     #[tokio::test]

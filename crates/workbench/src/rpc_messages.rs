@@ -790,10 +790,11 @@ impl Projection {
                     "usage":super::rpc_events::usage_value(usage, metadata)
                 });
                 if !edited
-                    && api == "anthropic-messages"
-                    && let Some(effort) = replay
-                        .as_deref()
-                        .and_then(pi_rs::ProviderReplay::anthropic_effort)
+                    && let Some(effort) = replay.as_deref().and_then(|replay| match api {
+                        "openai-responses" => replay.openai_effort(),
+                        "anthropic-messages" => replay.anthropic_effort(),
+                        _ => None,
+                    })
                 {
                     value["providerThinkingLevel"] = json!(effort);
                 }

@@ -381,8 +381,9 @@ tool progress and completion-order notifications remain open.
 
 ### Azure OpenAI checkpoint
 
-Azure exposes the 45 pinned chat models and chooses Responses or Chat
-Completions per model. Configure the account with `AZURE_OPENAI_BASE_URL`
+Azure exposes the 48 chat models from Pi AI v1.6.0 and chooses Responses or
+Chat Completions per model. Catalog pricing includes the long-context tier
+above 272,000 input tokens where the Pi catalog declares it. Configure the account with `AZURE_OPENAI_BASE_URL`
 or `AZURE_OPENAI_RESOURCE_NAME` and authenticate with `AZURE_OPENAI_API_KEY`
 or a saved key. An explicit `models.json` provider base URL takes precedence
 over the environment. `AZURE_OPENAI_API_VERSION` configures the Responses
@@ -3304,10 +3305,11 @@ prefix-specific character estimates rather than borrowing usage for the whole
 conversation. The compaction record and RPC response report Pi-compatible
 `tokensBefore`, independently of the native retention budget.
 
-Native request budgeting uses adapter-specific message estimates. Anthropic tool
-results count their original text envelope; Bedrock and other adapters that
-extract tool images use a fixed image allowance instead of counting encoded
-image bytes. Bedrock also accepts user images. Matching provider replay blocks,
+Native request budgeting uses adapter-specific message estimates. Anthropic,
+Bedrock, and other adapters that extract tool images use a fixed image
+allowance. Anthropic counts the remaining text envelope and any error-image
+caption. Its request fingerprint changed so old measurements use a fresh
+estimate. Matching provider replay blocks,
 including reasoning and signatures, are included only when the adapter actually
 replays them. Bedrock freezes inspectable SDK credentials or bearer tokens,
 region and endpoint before reusing a measured baseline; opaque SDK clients or
@@ -4158,6 +4160,15 @@ and cache-aware token usage. It translates request and stream errors into
 the existing agent error categories. The journal records the selected
 provider separately from the model ID and accepts older records.
 
+Structured Anthropic tool results send images as Messages API image blocks.
+For errors, the result remains text and the captioned images follow all tool
+results in that user turn. The native tool-result text envelope is retained,
+with attached image data represented by a placeholder. Plain-text results
+and results with invalid supported image data keep their original bytes.
+Request fixtures covered successful and
+failed results, system-update ordering, and image budgets. Live authenticated
+tool-image requests were unverified.
+
 A loopback fixture verified pagination, authentication, image input, a real
 native read tool round trip, usage and RPC. Live account sign-in and provider switching within a running session remain open.
 
@@ -4411,7 +4422,8 @@ another route fails closed. A partial model override alone does not establish a
 routable model for a rewrite. Direct Anthropic declaration-aware streams reject
 strict decisions that only prepared dispatch can retain; preferred fallback
 streams use their resolved unconstrained wire schema. A model capability
-map with no strict-capable entries keeps the legacy Anthropic model fingerprint.
+map with no strict-capable entries keeps the same Anthropic model fingerprint
+as a client without a capability map.
 Existing usage anchors for constrained Anthropic requests can still be invalidated:
 the native agent records a separate prepared-tool configuration hash, and the
 new fallback projection can change the wire schema even with strict disabled
@@ -5102,8 +5114,14 @@ Pi's default or configured `thinkingBudgets`, capped to leave 1,024 tokens for
 the answer within the host's output limit. Off and non-reasoning models omit the
 field. Discovered Ollama reasoning capability is carried through the RPC and
 interactive worker to the request, even when discovery omits explicit thinking
-levels. Chat-template `thinking.budget` variables remain unsupported. The request
-field is covered by loopback tests; no live compatible server was used.
+levels. Both `chatTemplateArgs` for Baseten and `chatTemplateKwargs` for
+`chat-template` can resolve `thinking.budget` using the same cap.
+`chatTemplateKwargs` accepts scalar literals, null, and Pi's three thinking
+variables. An explicitly configured template can use a selected budget for a
+pi-rs custom model with unspecified reasoning capability. The variable is omitted when thinking is off
+or no budget fits. Loopback tests cover the
+top-level field and a Baseten template argument. Live compatible-server
+verification remains open.
 
 Loopback RPC checks exercised model and endpoint switching, header and key
 isolation, reasoning replay, stream completion and reported usage and cost.
@@ -5598,6 +5616,22 @@ the outgoing instruction text. Request fixtures covered
 both projections and the Codex wire payload. Live authenticated requests
 with later system instructions were unverified.
 
+### Responses effort history
+
+The five OpenAI API-key models marked `supportsMidConvoEffort` in Pi v1.5.0
+keep their top-level reasoning effort at `medium` when a thinking level is
+active. Configuration updates apply the stored level before each recorded
+reply and the current level at the end of the request, including after a
+tool result. Pi session imports retain the recorded effort and replay the
+portable assistant history. Compatible custom profiles retain their own
+effort mappings. RPC exposes the recorded level. With API-key Responses,
+`off` uses top-level reasoning and leaves no configuration update to replay
+when thinking resumes, as in Pi 1.5.0 and 1.6.0. For example, switching from
+`low` through `off` to `high` sends only `low` and `high` configuration updates
+on the final request. ChatGPT and Codex subscriptions
+use their existing reasoning options. Local request fixtures covered the
+payload and replay. Live authenticated configuration updates were unverified.
+
 ### Responses prompt cache key configuration
 
 Responses model compatibility accepts `promptCacheKeyMode` as `auto`,
@@ -5678,10 +5712,15 @@ ordinary message and tool-call representation.
 The standard Anthropic Messages endpoint accepts an explicitly supplied
 `ANTHROPIC_AUTH_TOKEN` as an Authorization bearer credential. Stored and
 configured keys retain precedence. The header token takes priority over
-`ANTHROPIC_API_KEY` on the standard endpoint. Custom URLs and ports do
-not inherit it. Auth status remains masked and uses Pi's API credential
-classification. Offline and loopback checks covered priority, endpoint
-isolation, and explicit proxy keys.
+`ANTHROPIC_OAUTH_TOKEN`, which takes priority over `ANTHROPIC_API_KEY`.
+The explicit header token keeps ordinary bearer authentication even when
+its value has the subscription token format.
+The OAuth variable uses the existing subscription request path for
+`sk-ant-oat` tokens. Custom URLs and ports inherit none of these
+environment credentials. Auth status remains masked and uses Pi's API
+credential classification. Offline and loopback checks covered priority,
+endpoint isolation, and explicit proxy keys. A live request with an OAuth
+environment token remains unverified.
 
 ### Published input limits and cache lifetimes checkpoint
 
@@ -5993,8 +6032,18 @@ named tool choices locally. The option is covered by signed loopback requests
 and a comparison with published Pi payloads. Live Bedrock tool selection with
 account credentials was unverified.
 
+Prepared ConverseStream dispatch supports Pi's strict JSON Schema tool
+sampling. Workbench resolves `compat.supportsStrictMode` against the final
+Bedrock model and its overrides. Supported constraints send `strict: true`
+with the normalized schema. Unsupported required constraints fail before
+dispatch and preferred constraints fall back to the original schema. The
+adapter retains the prepared decision if AWS rejects a request. Pi can retry
+some preferred constraints without strict mode after a service rejection.
+Signed loopback requests verified the wire and reservation schemas. Live
+strict tool sampling with an authenticated AWS account was unverified.
+
 Not yet supported: non-image multimodal inputs, workbench-specific thinking
-display controls, strict tool sampling, guardrails, prompt management ARNs, live account-specific
+display controls, guardrails, prompt management ARNs, live account-specific
 model discovery, and workbench proxy/idle-timeout settings. Custom model endpoints in workbench configuration are rejected;
 callers embedding the adapter can pass a configured AWS SDK client, including a
 test endpoint, through `Bedrock::new`.

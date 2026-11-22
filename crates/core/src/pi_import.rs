@@ -1265,6 +1265,27 @@ fn anthropic_replay(message: &Value) -> Option<Box<crate::ProviderReplay>> {
     })
 }
 
+fn openai_effort_replay(message: &Value) -> Option<Box<crate::ProviderReplay>> {
+    if message["api"] != "openai-responses" {
+        return None;
+    }
+    let provider = message["provider"]
+        .as_str()
+        .filter(|name| !name.is_empty())?;
+    let effort = message["providerThinkingLevel"]
+        .as_str()
+        .filter(|effort| !effort.is_empty())?;
+    let mut replay = crate::ProviderReplay {
+        identity: crate::ResolvedModelIdentity {
+            provider: provider.into(),
+            model: message["model"].as_str()?.into(),
+        },
+        blocks: Vec::new(),
+    };
+    replay.record_openai_effort(effort);
+    Some(Box::new(replay))
+}
+
 fn google_replay(message: &Value) -> Option<Box<crate::ProviderReplay>> {
     if message["provider"] != "google" || message["api"] != "google-generative-ai" {
         return None;
@@ -1408,7 +1429,9 @@ pub fn convert(
                             diagnostics: crate::AssistantDiagnostic::from_pi_diagnostics(
                                 &message["diagnostics"],
                             ),
-                            replay: anthropic_replay(message).or_else(|| google_replay(message)),
+                            replay: anthropic_replay(message)
+                                .or_else(|| google_replay(message))
+                                .or_else(|| openai_effort_replay(message)),
                             resolved_model: message["model"].as_str().map(|model| {
                                 crate::ResolvedModelIdentity {
                                     provider: message["provider"]
@@ -1748,6 +1771,29 @@ pub fn convert(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn keeps_the_provider_and_mapped_effort_from_openai_responses() {
+        let mut message = json!({
+            "provider":"openai","api":"openai-responses","model":"gpt-6-luna",
+            "providerThinkingLevel":"low",
+            "content":[{"type":"text","text":"reply"}],
+        });
+        let replay = openai_effort_replay(&message).unwrap();
+        assert_eq!(replay.openai_effort(), Some("low"));
+        assert_eq!(replay.identity.provider, "openai");
+        assert_eq!(replay.blocks.len(), 1);
+        message["provider"] = json!("custom-responses");
+        message["providerThinkingLevel"] = json!("strong");
+        let custom = openai_effort_replay(&message).unwrap();
+        assert_eq!(custom.identity.provider, "custom-responses");
+        assert_eq!(custom.openai_effort(), Some("strong"));
+        message["providerThinkingLevel"] = json!("");
+        assert!(openai_effort_replay(&message).is_none());
+        message["providerThinkingLevel"] = json!("low");
+        message["api"] = json!("openai-codex-responses");
+        assert!(openai_effort_replay(&message).is_none());
+    }
 
     #[test]
     fn pi_anthropic_effort_import_keeps_valid_levels_and_scopes_gateway_replay() {
