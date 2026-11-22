@@ -669,7 +669,7 @@ mod tests {
             assert!(request.get("stream_options").is_none());
             let first = json!({"id":"first","choices":[{"index":0,"delta":{"content":[
                 {"type":"thinking","thinking":[{"type":"text","text":"con"}]}, ""
-            ]}}]});
+            ]}}],"usage":{"num_cached_tokens":7}});
             let second = json!({"id":"second","choices":[{"index":0,"delta":{"content":[
                 {"type":"thinking","thinking":[{"type":"text","text":"sider"}]},
                 {"type":"text","text":"a tool"}
@@ -687,7 +687,7 @@ mod tests {
                 {"index":0,"id":"call"},
                 {"index":0,"id":"late-call"}
             ]},"finish_reason":"tool_calls"}],
-                "usage":{"prompt_tokens":12,"completion_tokens":3,"num_cached_tokens":7}});
+                "usage":{"prompt_tokens":12,"completion_tokens":3}});
             let output =
                 format!("data: {first}\n\ndata: {second}\n\ndata: {third}\n\ndata: {fourth}\n\n");
             write!(socket.get_mut(),

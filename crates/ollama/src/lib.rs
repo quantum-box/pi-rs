@@ -36,13 +36,15 @@ pub struct Ollama {
     prompt_cache_long: bool,
     session_cache_key: Option<String>,
     reasoning_effort: Option<String>,
+    template_reasoning_effort: Option<String>,
     thinking_budget_level: Option<String>,
     thinking_budgets: Option<Value>,
-    compatibility: ChatCompatibility,
+    compatibility: Arc<ChatCompatibility>,
     supports_reasoning: Option<bool>,
     reasoning_enabled: bool,
     allow_reasoning_off: bool,
     sampling: BTreeMap<String, Value>,
+    deployments: Arc<BTreeMap<String, String>>,
     native_probes: bool,
     mistral: Option<mistral::Options>,
     progress: Option<Arc<dyn Fn(ModelProgress) + Send + Sync>>,
@@ -239,13 +241,15 @@ impl Ollama {
                 && std::env::var("PI_CACHE_RETENTION").is_ok_and(|value| value == "long"),
             session_cache_key: None,
             reasoning_effort: None,
+            template_reasoning_effort: None,
             thinking_budget_level: None,
             thinking_budgets: None,
-            compatibility: ChatCompatibility::default(),
+            compatibility: Arc::default(),
             supports_reasoning: None,
             reasoning_enabled: false,
             allow_reasoning_off: true,
             sampling: BTreeMap::new(),
+            deployments: Arc::default(),
             native_probes: true,
             mistral: None,
             progress: None,
@@ -265,8 +269,16 @@ impl Ollama {
             prompt_mode,
             effort: effort.map(str::to_owned),
         });
-        self.compatibility.supports_strict_mode.get_or_insert(true);
+        Arc::make_mut(&mut self.compatibility)
+            .supports_strict_mode
+            .get_or_insert(true);
         self.native_probes = false;
+        self
+    }
+
+    /// Map catalog model IDs to their wire deployment names.
+    pub fn with_deployments(mut self, deployments: &BTreeMap<String, String>) -> Self {
+        self.deployments = Arc::new(deployments.clone());
         self
     }
 
@@ -339,6 +351,7 @@ impl Ollama {
     /// Override provider thinking effort. None preserves the model default.
     pub fn with_reasoning_effort(mut self, effort: Option<&str>) -> Self {
         let local_ollama = self.endpoint.port_or_known_default() == Some(11434);
+        self.template_reasoning_effort = effort.filter(|level| *level != "off").map(str::to_owned);
         self.reasoning_effort = effort.map(|effort| {
             match effort {
                 "off" => "none",
@@ -353,6 +366,7 @@ impl Ollama {
 
     /// Set an effort already resolved against the model's advertised controls.
     pub fn with_reported_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+        self.template_reasoning_effort = effort.filter(|level| *level != "off").map(str::to_owned);
         self.reasoning_effort =
             effort.map(|level| if level == "off" { "none" } else { level }.to_owned());
         self
@@ -360,8 +374,17 @@ impl Ollama {
 
     /// Apply the provider value from an explicit thinking-level map.
     pub fn with_mapped_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+        self.template_reasoning_effort = effort.map(str::to_owned);
         self.reasoning_effort = effort.map(str::to_owned);
         self
+    }
+
+    fn chat_reasoning_effort(&self) -> Option<&str> {
+        if self.compatibility.uses_chat_template() {
+            self.template_reasoning_effort.as_deref()
+        } else {
+            self.reasoning_effort.as_deref()
+        }
     }
 
     /// Set the selected Pi thinking level and optional budget overrides.
@@ -407,7 +430,7 @@ impl Ollama {
         enabled: bool,
         allow_off: bool,
     ) -> Self {
-        self.compatibility = compatibility;
+        self.compatibility = Arc::new(compatibility);
         self.supports_reasoning = reasoning;
         self.reasoning_enabled = enabled;
         self.allow_reasoning_off = allow_off;
@@ -417,14 +440,13 @@ impl Ollama {
     /// Set endpoint-wide strict tool support; callers must ensure it applies to
     /// every model dispatched through this client.
     pub fn with_strict_tool_support(mut self, supported: bool) -> Self {
-        self.compatibility.supports_strict_mode = Some(supported);
+        Arc::make_mut(&mut self.compatibility).supports_strict_mode = Some(supported);
         self
     }
 
     /// Set custom grammar tool support for the routed model.
     pub fn with_grammar_tool_support(mut self, supported: bool) -> Self {
-        self.compatibility
-            .set_openai_grammar_tool_support(supported);
+        Arc::make_mut(&mut self.compatibility).set_openai_grammar_tool_support(supported);
         self
     }
 
@@ -435,8 +457,16 @@ impl Ollama {
     }
 
     fn replay_identity(&self, model: &str) -> ResolvedModelIdentity {
+        let provider = if let Some(deployment) = self.deployments.get(model) {
+            pi_rs_core::endpoint_replay_scope(
+                &self.provider,
+                &format!("{}\n{deployment}", self.endpoint),
+            )
+        } else {
+            pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str())
+        };
         ResolvedModelIdentity {
-            provider: pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str()),
+            provider,
             model: model.to_owned(),
         }
     }
@@ -924,7 +954,7 @@ impl Model for Ollama {
             self.supports_reasoning,
             self.reasoning_enabled,
             self.allow_reasoning_off,
-            &self.reasoning_effort,
+            self.chat_reasoning_effort(),
             &self.thinking_budget_level,
             &self.thinking_budgets,
             &self.sampling,
@@ -936,6 +966,11 @@ impl Model for Ollama {
             })
         } else {
             base
+        };
+        let base = if self.deployments.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(base, self.deployments.as_ref()))
         };
         if self.prompt_cache_key_enabled || self.prompt_cache_long {
             base.and_then(|base| {
@@ -1045,6 +1080,30 @@ impl Model for Ollama {
         }
     }
 
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        let head = self
+            .mistral
+            .is_none()
+            .then(|| self.compatibility.leading_system_message(&request.messages))
+            .flatten();
+        let mut base = request.clone();
+        base.messages.clear();
+        let messages =
+            head.iter()
+                .chain(
+                    request.messages.iter().filter(|message| {
+                        head.is_none() || !matches!(message, Message::System { .. })
+                    }),
+                )
+                .filter(
+                    |message| !matches!(message, Message::System { content } if content.is_empty()),
+                );
+        messages.fold(
+            pi_rs_core::estimate_request_tokens(&base),
+            |total, message| total.saturating_add(self.estimate_message_tokens(request, message)),
+        )
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
         let value = self.running_models().await?;
         running_context_window(&value, model)
@@ -1090,6 +1149,24 @@ impl Model for Ollama {
 }
 
 impl Ollama {
+    fn wire_messages(
+        &self,
+        messages: Vec<Message>,
+        identity: &ResolvedModelIdentity,
+    ) -> Vec<Value> {
+        let head = self.compatibility.leading_system_message(&messages);
+        let collapse_system = head.is_some();
+        head.into_iter()
+            .chain(
+                messages.into_iter().filter(|message| {
+                    !collapse_system || !matches!(message, Message::System { .. })
+                }),
+            )
+            .filter(|message| !matches!(message, Message::System { content } if content.is_empty()))
+            .flat_map(|message| self.compatible_message(message, identity))
+            .collect()
+    }
+
     async fn stream_with_wire_tools(
         &self,
         request: ModelRequest,
@@ -1117,14 +1194,10 @@ impl Ollama {
             ModelProgress::WaitingForModel,
         );
         let mistral = self.mistral.is_some();
-        let mut messages: Vec<_> = if let Some(options) = &self.mistral {
+        let mut messages = if let Some(options) = &self.mistral {
             mistral::messages(request.messages, &identity, options.images)?
         } else {
-            request
-                .messages
-                .into_iter()
-                .flat_map(|message| self.compatible_message(message, &identity))
-                .collect()
+            self.wire_messages(request.messages, &identity)
         };
         let mut wire_tools = wire_tools.unwrap_or_else(|| ChatWireTools {
             declarations: request
@@ -1150,7 +1223,11 @@ impl Ollama {
         } else {
             Vec::new()
         };
-        let mut body = json!({"model":request.model,"messages":messages,"stream":true});
+        let wire_model = self
+            .deployments
+            .get(&request.model)
+            .unwrap_or(&request.model);
+        let mut body = json!({"model":wire_model,"messages":messages,"stream":true});
         if mistral {
             body["max_tokens"] = json!(request.max_output_tokens);
         } else {
@@ -1179,7 +1256,7 @@ impl Ollama {
                 body["reasoning_effort"] = json!(effort);
             }
         } else {
-            self.compatibility.thinking_budget_options(
+            let thinking_budget = self.compatibility.thinking_budget_options(
                 &mut body,
                 self.thinking_budget_level.as_deref(),
                 self.thinking_budgets.as_ref(),
@@ -1190,8 +1267,9 @@ impl Ollama {
                 &mut body,
                 self.supports_reasoning,
                 self.reasoning_enabled,
-                self.reasoning_effort.as_deref(),
+                self.chat_reasoning_effort(),
                 self.allow_reasoning_off,
+                thinking_budget,
             );
         }
         body.as_object_mut().expect("chat request object").extend(
@@ -1308,6 +1386,7 @@ impl Ollama {
             }).eventsource();
             let mut calls = BTreeMap::<usize, CallDelta>::new();
             let mut usage = None;
+            let mut reported_cached_input = None;
             let mut metadata = ModelMetadata {
                 provider_api: Some(if mistral { ModelApi::MistralConversations } else { ModelApi::OpenaiCompletions }),
                 replay_identity: Some(identity.clone()),
@@ -1366,18 +1445,27 @@ impl Ollama {
                     metadata.provider_request_id = Some(id);
                 }
                 if let Some(stats) = chunk.usage {
-                    usage = Some(Usage { input_tokens: stats.prompt_tokens, output_tokens: stats.completion_tokens });
+                    let previous: Usage = usage.unwrap_or_default();
+                    let input_tokens = stats.prompt_tokens.unwrap_or(previous.input_tokens);
+                    usage = Some(Usage { input_tokens, output_tokens: stats.completion_tokens.unwrap_or(previous.output_tokens) });
                     let details = stats.prompt_tokens_details.unwrap_or_default();
-                    metadata.cached_input_tokens = details.cached_tokens
+                    let cached = details.cached_tokens
                         .or(stats.prompt_cache_hit_tokens)
                         .or(stats.cached_tokens);
-                    if mistral {
-                        metadata.cached_input_tokens = metadata.cached_input_tokens
-                            .or(stats.mistral_cached_tokens)
+                    let cached = if mistral {
+                        cached.or(stats.mistral_cached_tokens)
                             .or_else(|| stats.mistral_prompt_details.and_then(|details| details.cached_tokens))
-                            .map(|cached| cached.min(stats.prompt_tokens));
-                    }
-                    metadata.cache_creation_input_tokens = details.cache_write_tokens;
+                    } else {
+                        cached
+                    };
+                    reported_cached_input = cached.or(reported_cached_input);
+                    metadata.cached_input_tokens = reported_cached_input
+                        .map(|cached| if mistral { cached.min(input_tokens) } else { cached });
+                    metadata.cache_creation_input_tokens = details.cache_write_tokens
+                        .or(metadata.cache_creation_input_tokens);
+                    let nested = stats.completion_tokens_details.and_then(|details| details.reasoning_tokens);
+                    metadata.reasoning_output_tokens = nested.filter(|count| *count != 0)
+                        .or(stats.reasoning_tokens).or(nested).or(metadata.reasoning_output_tokens);
                     if let Some(cost) = stats.accounting.total() {
                         metadata.cost_usd = Some(cost);
                         metadata.cost_from_provider = Some(true);
@@ -1793,10 +1881,10 @@ struct Chunk {
 
 #[derive(Deserialize)]
 struct WireUsage {
-    #[serde(default)]
-    prompt_tokens: u64,
-    #[serde(default)]
-    completion_tokens: u64,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    completion_tokens_details: Option<CompletionTokenDetails>,
+    reasoning_tokens: Option<u64>,
     prompt_cache_hit_tokens: Option<u64>,
     cached_tokens: Option<u64>,
     #[serde(alias = "promptTokensDetails")]
@@ -1807,6 +1895,11 @@ struct WireUsage {
     mistral_prompt_details: Option<PromptTokenDetails>,
     #[serde(flatten)]
     accounting: ReportedUsageCost,
+}
+
+#[derive(Deserialize)]
+struct CompletionTokenDetails {
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -1976,8 +2069,11 @@ mod content_tests {
             let _ = socket.read(&mut request).unwrap();
             let body = format!(
                 "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-                json!({"choices":[{"index":0,"delta":{"reasoning_content":"internal"}}]}),
-                json!({"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]})
+                json!({"choices":[{"index":0,"delta":{"reasoning_content":"internal"}}],
+                    "usage":{"prompt_tokens":12,"reasoning_tokens":2,
+                        "completion_tokens_details":{"reasoning_tokens":4}}}),
+                json!({"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}],
+                    "usage":{"completion_tokens":9}})
             );
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
         });
@@ -2001,11 +2097,24 @@ mod content_tests {
             .unwrap()
             .collect::<Vec<_>>()
             .await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(ModelEvent::Complete {
+                usage: Some(Usage {
+                    input_tokens: 12,
+                    output_tokens: 9
+                }),
+                ..
+            })
+        )));
         let replay = events
             .into_iter()
             .rev()
             .find_map(|event| match event.unwrap() {
-                ModelEvent::Metadata(metadata) => metadata.replay,
+                ModelEvent::Metadata(metadata) => {
+                    assert_eq!(metadata.reasoning_output_tokens, Some(4));
+                    metadata.replay
+                }
                 _ => None,
             })
             .expect("reasoning replay");
@@ -2097,13 +2206,17 @@ mod content_tests {
             let body: serde_json::Value =
                 serde_json::from_slice(&bytes[offset..offset + length]).unwrap();
             assert_eq!(body["thinking_budget_tokens"], 2500);
+            assert_eq!(body["chat_template_args"]["budget"], 2500);
             assert_eq!(body["reasoning_effort"], "high");
             let reply = "data: [DONE]\n\n";
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply).unwrap();
         });
-        let compat =
-            serde_json::from_value(json!({"thinkingTokenBudgetField":"thinking_budget_tokens"}))
-                .unwrap();
+        let compat = serde_json::from_value(json!({
+            "thinkingTokenBudgetField":"thinking_budget_tokens",
+            "thinkingFormat":"baseten",
+            "chatTemplateArgs":{"budget":{"$var":"thinking.budget"}},
+        }))
+        .unwrap();
         let model = Ollama::new(&format!("http://{address}"), None)
             .unwrap()
             .with_chat_compatibility(compat, Some(true), true, true)
@@ -2117,6 +2230,136 @@ mod content_tests {
         };
         let _stream = model.stream(request).await.unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn chat_template_uses_only_explicitly_mapped_off_effort() {
+        let compat = serde_json::from_value(json!({"thinkingFormat":"chat-template"})).unwrap();
+        let model = Ollama::new("http://127.0.0.1:11434", None)
+            .unwrap()
+            .with_chat_compatibility(compat, Some(true), false, true);
+        let selected = model.clone().with_reasoning_effort(Some("minimal"));
+        assert_eq!(selected.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(selected.chat_reasoning_effort(), Some("minimal"));
+        assert_eq!(
+            model
+                .clone()
+                .with_reasoning_effort(Some("off"))
+                .chat_reasoning_effort(),
+            None
+        );
+        assert_eq!(
+            model
+                .clone()
+                .with_reported_reasoning_effort(Some("off"))
+                .chat_reasoning_effort(),
+            None
+        );
+        assert_eq!(
+            model
+                .with_mapped_reasoning_effort(Some("none"))
+                .chat_reasoning_effort(),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn chat_system_messages_follow_model_capability_in_wire_and_estimates() {
+        let messages = vec![
+            Message::System {
+                content: "Initial instructions".into(),
+            },
+            Message::User {
+                content: "First question".into(),
+            },
+            Message::System {
+                content: "Additional instructions".into(),
+            },
+            Message::System {
+                content: String::new(),
+            },
+            Message::User {
+                content: "Second question".into(),
+            },
+        ];
+        let folded = vec![
+            Message::System {
+                content: "Initial instructions\n\nAdditional instructions".into(),
+            },
+            messages[1].clone(),
+            messages[4].clone(),
+        ];
+        for preserves in [false, true] {
+            let provider: ChatCompatibility =
+                serde_json::from_value(json!({"supportsMidConvoSystemMessages":!preserves}))
+                    .unwrap();
+            let override_value =
+                serde_json::from_value(json!({"supportsMidConvoSystemMessages":preserves}))
+                    .unwrap();
+            let model = Ollama::new("http://127.0.0.1:1/v1/chat/completions", None)
+                .unwrap()
+                .with_chat_compatibility(provider.overlay(override_value), Some(true), false, true);
+            let actual = model.wire_messages(messages.clone(), &model.replay_identity("fixture"));
+            let expected = if preserves {
+                vec![
+                    messages[0].clone(),
+                    messages[1].clone(),
+                    messages[2].clone(),
+                    messages[4].clone(),
+                ]
+            } else {
+                folded.clone()
+            };
+            let expected_wire: Vec<_> = expected.iter().cloned().flat_map(encode_message).collect();
+            assert_eq!(actual, expected_wire);
+            let request = ModelRequest {
+                model: "fixture".into(),
+                messages: messages.clone(),
+                tools: vec![],
+                max_output_tokens: 1024,
+            };
+            assert_eq!(
+                model.estimate_request_tokens(&request),
+                pi_rs_core::estimate_request_tokens(&ModelRequest {
+                    messages: expected,
+                    ..request
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn mistral_system_messages_keep_their_conversation_positions() {
+        let model = Ollama::new("http://127.0.0.1:1/v1/chat/completions", None)
+            .unwrap()
+            .with_mistral(false, false, None);
+        let request = ModelRequest {
+            model: "mistral".into(),
+            messages: vec![
+                Message::System {
+                    content: "Initial".into(),
+                },
+                Message::User {
+                    content: "Question".into(),
+                },
+                Message::System {
+                    content: "Update".into(),
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: 1024,
+        };
+        let messages = mistral::messages(
+            request.messages.clone(),
+            &model.replay_identity(&request.model),
+            false,
+        )
+        .unwrap();
+        assert_eq!(messages[2], json!({"role":"system","content":"Update"}));
+        assert_eq!(
+            model.estimate_request_tokens(&request),
+            pi_rs_core::estimate_request_tokens(&request)
+        );
     }
 
     #[tokio::test]
@@ -3078,8 +3321,26 @@ mod constrained_chat_tests {
 
     fn model(support: Option<bool>, endpoint: &str) -> Ollama {
         let mut model = Ollama::new(endpoint, None).unwrap();
-        model.compatibility.supports_strict_mode = support;
+        Arc::make_mut(&mut model.compatibility).supports_strict_mode = support;
         model
+    }
+
+    #[test]
+    fn chat_compatibility_overrides_are_local_to_each_client_clone() {
+        let base = Ollama::new("http://127.0.0.1:11434", None).unwrap();
+        let configured = base
+            .clone()
+            .with_strict_tool_support(false)
+            .with_grammar_tool_support(true);
+        let mistral = base.clone().with_mistral(false, false, None);
+        assert_eq!(configured.compatibility.supports_strict_mode, Some(false));
+        assert_eq!(
+            configured.compatibility.supports_openai_grammar_tools(),
+            Some(true)
+        );
+        assert_eq!(mistral.compatibility.supports_strict_mode, Some(true));
+        assert_eq!(base.compatibility.supports_strict_mode, None);
+        assert_eq!(base.compatibility.supports_openai_grammar_tools(), None);
     }
 
     #[test]

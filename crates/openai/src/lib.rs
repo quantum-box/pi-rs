@@ -8,12 +8,13 @@ use base64::Engine;
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::StreamExt;
 use pi_rs_core::{
-    CacheRetention, Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
-    ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
+    CacheRetention, Error, Message, Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest,
+    ModelStream, ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
 };
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -72,6 +73,9 @@ pub struct OpenAiResponses {
     endpoint: Url,
     endpoint_source: String,
     token: String,
+    azure_api_version: Option<String>,
+    azure_off_reasoning: Option<String>,
+    deployments: Arc<BTreeMap<String, String>>,
     codex_account: Option<String>,
     codex_off_effort: Option<String>,
     thinking: Option<String>,
@@ -271,6 +275,18 @@ impl OpenAiResponses {
         Ok(client)
     }
 
+    /// Connect to an Azure Responses endpoint using its API-key authentication.
+    pub fn new_azure(endpoint: &str, token: String, provider: &str) -> Result<Self> {
+        let mut client = Self::new_api_provider(endpoint, token, provider)?;
+        client.azure_api_version = Some("v1".into());
+        client.session_affinity_format = Some(SessionAffinityFormat::Disabled);
+        Ok(client)
+    }
+
+    pub fn is_azure(&self) -> bool {
+        self.azure_api_version.is_some()
+    }
+
     pub fn new_codex(endpoint: &str, token: String, provider: &str) -> Result<Self> {
         let account = codex_account_id(&token).ok_or_else(|| {
             Error::Config("OpenAI Codex requires a bearer token with an account ID".into())
@@ -328,6 +344,9 @@ impl OpenAiResponses {
             endpoint,
             endpoint_source,
             token,
+            azure_api_version: None,
+            azure_off_reasoning: None,
+            deployments: Arc::default(),
             codex_account: None,
             codex_off_effort: None,
             thinking: None,
@@ -345,6 +364,33 @@ impl OpenAiResponses {
             grammar_tool_support: false,
             use_developer_role: false,
         })
+    }
+
+    /// Set the API version and model-to-deployment map for Azure Responses.
+    pub fn with_azure_routes(
+        mut self,
+        version: &str,
+        deployments: &BTreeMap<String, String>,
+        off_reasoning: Option<&str>,
+    ) -> Self {
+        if self.azure_api_version.is_some() {
+            self.azure_api_version = Some(version.to_owned());
+            self.deployments = Arc::new(deployments.clone());
+            self.azure_off_reasoning = off_reasoning.map(str::to_owned);
+        }
+        self
+    }
+
+    fn replay_provider(&self, model: &str) -> String {
+        if self.azure_api_version.is_some() {
+            let deployment = self.deployments.get(model).map_or(model, String::as_str);
+            pi_rs_core::endpoint_replay_scope(
+                &self.provider,
+                &format!("{}\n{deployment}", self.endpoint),
+            )
+        } else {
+            self.provider.clone()
+        }
     }
 
     pub fn with_thinking(mut self, level: Option<&str>) -> Self {
@@ -530,20 +576,55 @@ impl OpenAiResponses {
         }
     }
 
-    fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if self.provider == "cloudflare-ai-gateway" {
-            request.header("cf-aig-authorization", format!("Bearer {}", self.token))
+    fn authenticate(
+        &self,
+        request: reqwest::RequestBuilder,
+        mut headers: reqwest::header::HeaderMap,
+        azure_version: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder> {
+        if let Some(version) = azure_version {
+            if !headers.contains_key("api-key") {
+                let mut key = reqwest::header::HeaderValue::from_str(&self.token)
+                    .map_err(|_| Error::Config("invalid Azure OpenAI API key".into()))?;
+                key.set_sensitive(true);
+                headers.insert("api-key", key);
+            }
+            Ok(request.headers(headers).query(&[("api-version", version)]))
+        } else if self.provider == "cloudflare-ai-gateway" {
+            Ok(request
+                .headers(headers)
+                .header("cf-aig-authorization", format!("Bearer {}", self.token)))
         } else {
-            request.bearer_auth(&self.token)
+            Ok(request.headers(headers).bearer_auth(&self.token))
         }
     }
 
     /// Return the signed-in account's displayable models in server order.
     pub async fn models(&self) -> Result<Vec<String>> {
+        self.models_with_azure_version(None).await
+    }
+
+    /// List models using the configured Azure API version when applicable.
+    pub async fn models_with_azure_version(
+        &self,
+        azure_version: Option<&str>,
+    ) -> Result<Vec<String>> {
         let mut endpoint = self.endpoint.clone();
-        endpoint.set_path("/v1/models");
+        let version = self
+            .azure_api_version
+            .as_deref()
+            .map(|version| azure_version.unwrap_or(version));
+        if version.is_some() {
+            let path = endpoint.path().trim_end_matches('/');
+            let base = path
+                .strip_suffix("/responses")
+                .ok_or_else(|| Error::Config("Azure discovery requires a /responses URL".into()))?;
+            endpoint.set_path(&format!("{base}/models"));
+        } else {
+            endpoint.set_path("/v1/models");
+        }
         let mut response = self
-            .authenticate(self.client.get(endpoint).headers(self.headers.clone()))
+            .authenticate(self.client.get(endpoint), self.headers.clone(), version)?
             .send()
             .await
             .map_err(|_| Error::RetryableModel("OpenAI model listing failed".into()))?;
@@ -587,6 +668,39 @@ impl OpenAiResponses {
                 .map(str::to_owned)
             })
             .collect())
+    }
+}
+
+fn response_usage_metadata(
+    api: ModelApi,
+    model: &str,
+    requested_tier: Option<&str>,
+    response: &Value,
+) -> ModelMetadata {
+    let returned_tier = response["service_tier"].as_str();
+    let codex = api == ModelApi::OpenaiCodexResponses;
+    let tier = if codex
+        && returned_tier == Some("default")
+        && matches!(requested_tier, Some("flex" | "priority"))
+    {
+        requested_tier
+    } else {
+        returned_tier.or(requested_tier)
+    };
+    let multiplier = match tier {
+        Some("flex") => Some(0.5),
+        Some("priority") => Some(if model == "gpt-5.5" { 2.5 } else { 2.0 }),
+        Some("fast") if !codex => Some(if model == "gpt-5.5" { 2.5 } else { 2.0 }),
+        _ => None,
+    };
+    let counts = &response["usage"]["input_tokens_details"];
+    ModelMetadata {
+        cached_input_tokens: counts["cached_tokens"].as_u64(),
+        cache_creation_input_tokens: counts["cache_write_tokens"].as_u64(),
+        reasoning_output_tokens: response["usage"]["output_tokens_details"]["reasoning_tokens"]
+            .as_u64(),
+        catalog_cost_multiplier: multiplier.and_then(serde_json::Number::from_f64),
+        ..Default::default()
     }
 }
 
@@ -922,7 +1036,7 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
     fn minimum_output_tokens(&self) -> u32 {
-        if self.codex_account.is_some() && self.send_max_output_tokens {
+        if self.send_max_output_tokens && (self.codex_account.is_some() || self.is_azure()) {
             16
         } else {
             1
@@ -979,6 +1093,16 @@ impl Model for OpenAiResponses {
                     self.explicit_cache_mode,
                 ))
             };
+        let base = if let Some(version) = &self.azure_api_version {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                version,
+                self.deployments.as_ref(),
+                &self.azure_off_reasoning,
+            ))
+        } else {
+            base
+        };
         let base = if self.session_affinity_format.is_none()
             && self.provider != "openrouter"
             && self.endpoint_source.contains("openrouter.ai")
@@ -1051,15 +1175,16 @@ impl Model for OpenAiResponses {
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        let replay_provider = self.replay_provider(&request.model);
         match message {
             Message::Assistant {
                 replay: Some(replay),
                 ..
             } if replay.identity.provider
                 == if self.codex_account.is_some() || replay.is_context_edit() {
-                    pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str())
+                    pi_rs_core::endpoint_replay_scope(&replay_provider, self.endpoint.as_str())
                 } else {
-                    self.provider.clone()
+                    replay_provider
                 }
                 && replay.identity.model == request.model
                 && replay.supports_api(self.api()) =>
@@ -1321,15 +1446,16 @@ impl OpenAiResponses {
     ) -> Result<pi_rs_core::EnrichedModelStream> {
         let max_output_tokens = request.max_output_tokens;
         let model = request.model.clone();
+        let replay_provider = self.replay_provider(&model);
         let edited_scope =
-            pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str());
+            pi_rs_core::endpoint_replay_scope(&replay_provider, self.endpoint.as_str());
         let api = self.api();
         if (1..self.minimum_output_tokens()).contains(&max_output_tokens) {
             return Err(Error::Budget);
         }
         let mut body = responses_payload(
             &request,
-            &self.provider,
+            &replay_provider,
             &edited_scope,
             if self.use_developer_role {
                 "developer"
@@ -1338,6 +1464,16 @@ impl OpenAiResponses {
             },
             api,
         );
+        if self.azure_api_version.is_some() {
+            if let Some(deployment) = self.deployments.get(&model) {
+                body["model"] = json!(deployment);
+            }
+            if request.max_output_tokens == 0 {
+                body.as_object_mut()
+                    .expect("Responses request object")
+                    .remove("max_output_tokens");
+            }
+        }
         let tools = tools.unwrap_or_default();
         grammar::project_input(
             &request,
@@ -1356,7 +1492,11 @@ impl OpenAiResponses {
         if let Some(thinking) = &self.thinking {
             body["reasoning"] = json!({"effort":thinking, "summary":"auto"});
             body["include"] = json!(["reasoning.encrypted_content"]);
-        } else if let Some(off) = &self.codex_off_effort {
+        } else if let Some(off) = self
+            .codex_off_effort
+            .as_ref()
+            .or(self.azure_off_reasoning.as_ref())
+        {
             body["reasoning"] = json!({"effort": off});
         }
         if self.codex_account.is_some()
@@ -1382,6 +1522,7 @@ impl OpenAiResponses {
                 .remove("max_output_tokens");
         }
         self.apply_cache(&mut body);
+        let requested_service_tier = body["service_tier"].as_str().map(str::to_owned);
         let error_secrets = pi_rs_core::provider_error_secrets(
             Some(self.token.as_str()),
             self.headers.iter().filter_map(|(name, value)| {
@@ -1408,8 +1549,8 @@ impl OpenAiResponses {
                 request = request.header("originator", "pi");
             }
         }
-        let mut response = self
-            .authenticate(request.headers(headers))
+        let request = self.authenticate(request, headers, self.azure_api_version.as_deref())?;
+        let mut response = request
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(&body)
             .send()
@@ -1652,12 +1793,12 @@ impl OpenAiResponses {
                         let usage = response["usage"]["input_tokens"].as_u64().zip(response["usage"]["output_tokens"].as_u64()).map(|(input_tokens,output_tokens)| Usage { input_tokens, output_tokens });
                         let identity = ResolvedModelIdentity { provider:provider.clone(), model:model.clone() };
                         let reasoning: String = reasoning.into_values().collect();
-                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(api), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay {
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(api), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay {
                             identity: if api == pi_rs_core::ModelApi::OpenaiCodexResponses {
                                 ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }
-                            } else { identity },
+                            } else { ResolvedModelIdentity { provider: replay_provider.clone(), model: model.clone() } },
                             blocks:output.clone()
-                        })), ..Default::default() }));
+                        })), ..response_usage_metadata(api, &model, requested_service_tier.as_deref(), response) }));
                         yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls:calls.into_values().collect(), usage });
                         return;
                     }
@@ -4185,6 +4326,98 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn responses_stream_applies_service_tier_and_records_cache_writes() {
+        for (codex, model, requested, returned, expected) in [
+            (false, "gpt-5.5", "priority", Some("default"), None),
+            (false, "gpt-5.5", "priority", None, Some(2.5)),
+            (false, "gpt-6-luna", "priority", Some("fast"), Some(2.0)),
+            (false, "gpt-5.5", "priority", Some("flex"), Some(0.5)),
+            (true, "gpt-5.5", "priority", Some("default"), Some(2.5)),
+            (true, "gpt-5.5", "flex", Some("default"), Some(0.5)),
+            (true, "gpt-5.5", "priority", Some("fast"), None),
+            (true, "gpt-5.5", "flex", None, Some(0.5)),
+        ] {
+            let payload = json!({"type":"response.completed", "response":{
+                "status":"completed", "output":[], "service_tier": returned,
+                "usage":{"input_tokens":100, "output_tokens":10,
+                    "input_tokens_details":{"cached_tokens":20, "cache_write_tokens":30}}
+            }});
+            let (mut client, server) = fixture(&format!("data: {payload}\n\n")).await;
+            if codex {
+                client.provider = "openai-codex".into();
+                client.codex_account = Some("fixture-account".into());
+            } else {
+                client.provider = "openai".into();
+            }
+            let client = client
+                .with_sampling(BTreeMap::from([("service_tier".into(), json!(requested))]))
+                .unwrap();
+            let mut request = request();
+            request.model = model.into();
+            let mut stream = client.stream(request).await.unwrap();
+            let mut saw_metadata = false;
+            let mut saw_usage = false;
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    ModelEvent::Metadata(metadata) => {
+                        assert_eq!(metadata.cached_input_tokens, Some(20));
+                        assert_eq!(metadata.cache_creation_input_tokens, Some(30));
+                        assert_eq!(
+                            metadata
+                                .catalog_cost_multiplier
+                                .as_ref()
+                                .and_then(serde_json::Number::as_f64),
+                            expected
+                        );
+                        saw_metadata = true;
+                    }
+                    ModelEvent::Complete { usage, .. } => {
+                        assert_eq!(
+                            usage,
+                            Some(Usage {
+                                input_tokens: 100,
+                                output_tokens: 10
+                            })
+                        );
+                        saw_usage = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_metadata && saw_usage);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_reasoning_usage_is_included_in_output_total() {
+        let response = json!({"type":"response.completed","response":{
+            "status":"completed","output":[],"usage":{"input_tokens":12,"output_tokens":9,
+                "output_tokens_details":{"reasoning_tokens":4}}
+        }});
+        let (client, server) = fixture(&format!("data: {response}\n\n")).await;
+        let events = client
+            .stream(request())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().any(|event| matches!(event,
+            Ok(ModelEvent::Metadata(metadata)) if metadata.reasoning_output_tokens == Some(4))));
+        assert!(matches!(
+            events.last(),
+            Some(Ok(ModelEvent::Complete {
+                usage: Some(Usage {
+                    input_tokens: 12,
+                    output_tokens: 9
+                }),
+                ..
+            }))
+        ));
+        server.await.unwrap();
+    }
+
     async fn fixture(events: &str) -> (OpenAiResponses, tokio::task::JoinHandle<()>) {
         fixture_with_content_type(events, Some("text/event-stream")).await
     }
@@ -4202,19 +4435,28 @@ mod tests {
         let body = events.to_owned();
         let content_type = content_type.map(str::to_owned);
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            loop {
-                let mut chunk = [0; 4096];
-                let n = socket.read(&mut chunk).await.unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&chunk[..n]);
-                if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+            let mut socket = loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
                 }
-            }
-            let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-            assert!(headers.contains("authorization: bearer fixture"));
+                let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                assert!(headers.contains("authorization: bearer fixture"));
+                // A Codex client with auto transport can try an upgrade before SSE.
+                if headers.starts_with("get ") && headers.contains("upgrade: websocket") {
+                    socket.write_all(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
+                assert!(headers.starts_with("post "));
+                break socket;
+            };
             let header =
                 content_type.map_or_else(String::new, |value| format!("Content-Type: {value}\r\n"));
             let response = format!(
