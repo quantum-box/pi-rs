@@ -1852,8 +1852,23 @@ mod tests {
             endpoint,
             "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
         );
-        assert_eq!(profiles.model_ids(&provider).len(), 19);
+        assert_eq!(profiles.model_ids(&provider).len(), 20);
         assert_eq!(profiles.model_ids(&provider)[0], "@cf/moonshotai/kimi-k2.6");
+        let inkling = "@cf/thinkingmachines/inkling-2-small";
+        assert!(
+            profiles
+                .model_ids(&provider)
+                .iter()
+                .any(|model| model == inkling)
+        );
+        assert_eq!(
+            profiles.model_adapter(&provider, inkling),
+            Adapter::ChatCompletions
+        );
+        let model = profiles.model(&provider, inkling).unwrap();
+        assert_eq!(model.context_window, Some(1_048_576));
+        assert_eq!(model.max_tokens, Some(1_048_576));
+        assert_eq!(model.supports_images(), Some(true));
         assert_eq!(
             keys.custom_credential(&provider, endpoint, &profiles)
                 .and_then(|key| key.literal()),
@@ -1905,7 +1920,7 @@ mod tests {
             "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
         );
         assert!(profiles.credential(&provider, endpoint).is_none());
-        assert_eq!(profiles.model_ids(&provider).len(), 19);
+        assert_eq!(profiles.model_ids(&provider).len(), 20);
     }
 
     #[test]

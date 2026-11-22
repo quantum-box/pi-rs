@@ -118,7 +118,7 @@ mod tests {
     use crate::{Provider, model_auth::Keys, model_profiles::Profiles};
     use pi_rs::{Model, ModelRequest};
     use serde_json::json;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::time::Duration;
 
@@ -134,7 +134,7 @@ mod tests {
         ).unwrap();
         assert_eq!(profiles.endpoint(&provider), endpoint);
         let models = profiles.model_ids(&provider);
-        assert_eq!(models.len(), 59);
+        assert_eq!(models.len(), 63);
         assert_eq!(models[0], "workers-ai/@cf/moonshotai/kimi-k2.6");
         let scoped = Keys::parse(&json!({"cloudflare-ai-gateway":{
             "type":"api_key","key":"fixture","endpoint":endpoint,
@@ -142,15 +142,17 @@ mod tests {
         let imported = Keys::parse(&json!({"cloudflare-ai-gateway":{
             "type":"api_key","key":"fixture","env":{"CLOUDFLARE_ACCOUNT_ID":"account123","CLOUDFLARE_GATEWAY_ID":"my-gateway"},
         }}));
-        for adapter in [
-            Adapter::Anthropic,
-            Adapter::ChatCompletions,
-            Adapter::OpenAiResponses,
+        for (model, adapter) in [
+            ("claude-fable-5-2", Adapter::Anthropic),
+            (
+                "workers-ai/@cf/thinkingmachines/inkling-2-small",
+                Adapter::ChatCompletions,
+            ),
+            ("gpt-6.2-astra", Adapter::OpenAiResponses),
+            ("gpt-6.2-sol", Adapter::OpenAiResponses),
         ] {
-            let model = models
-                .iter()
-                .find(|model| profiles.model_adapter(&provider, model) == adapter)
-                .unwrap();
+            assert!(models.iter().any(|candidate| candidate == model));
+            assert_eq!(profiles.model_adapter(&provider, model), adapter);
             let endpoint = route.endpoint(adapter).unwrap();
             assert_eq!(
                 profiles.model_endpoint(&provider, model),
@@ -221,19 +223,22 @@ mod tests {
     #[tokio::test]
     async fn cloudflare_gateway_adapters_send_only_gateway_authentication() {
         let provider = Provider::named("cloudflare-ai-gateway").unwrap();
-        for (adapter, path, request_path) in [
+        for (adapter, model, path, request_path) in [
             (
                 Adapter::ChatCompletions,
+                "workers-ai/@cf/thinkingmachines/inkling-2-small",
                 "/compat/chat/completions",
                 "/compat/chat/completions",
             ),
             (
                 Adapter::Anthropic,
+                "claude-fable-5-2",
                 "/anthropic/v1/messages",
                 "/anthropic/v1/messages?beta=true",
             ),
             (
                 Adapter::OpenAiResponses,
+                "gpt-6.2-astra",
                 "/openai/responses",
                 "/openai/responses",
             ),
@@ -250,6 +255,7 @@ mod tests {
                 socket.read_line(&mut line).unwrap();
                 assert_eq!(line.trim_end(), format!("POST {request_path} HTTP/1.1"));
                 let mut auth_count = 0;
+                let mut content_length = 0;
                 loop {
                     line.clear();
                     socket.read_line(&mut line).unwrap();
@@ -259,25 +265,48 @@ mod tests {
                     let line = line.to_ascii_lowercase();
                     assert!(!line.starts_with("authorization:"));
                     assert!(!line.starts_with("x-api-key:"));
+                    if let Some(length) = line.strip_prefix("content-length:") {
+                        content_length = length.trim().parse().unwrap();
+                    }
                     if line.trim_end() == "cf-aig-authorization: bearer gateway-fixture" {
                         auth_count += 1;
                     }
                 }
                 assert_eq!(auth_count, 1);
+                let mut body = vec![0; content_length];
+                socket.read_exact(&mut body).unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["model"], model);
+                if adapter == Adapter::ChatCompletions {
+                    assert_eq!(body["messages"][0]["role"], "system");
+                }
                 write!(
                     socket.get_mut(),
                     "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 )
                 .unwrap();
             });
+            let mut args = <crate::Cli as clap::Parser>::parse_from(["pi-rs"]);
+            args.provider = provider.clone();
+            args.model = model.into();
+            if adapter == Adapter::ChatCompletions {
+                args.thinking = Some("low".into());
+            }
             let client = provider
                 .connect(adapter, &endpoint, Some("gateway-fixture".into()), false)
+                .unwrap()
+                .with_model_options(&args, false)
                 .unwrap();
             let request = ModelRequest {
-                model: "fixture".into(),
-                messages: vec![pi_rs::Message::User {
-                    content: "hello".into(),
-                }],
+                model: model.into(),
+                messages: vec![
+                    pi_rs::Message::System {
+                        content: "instruction".into(),
+                    },
+                    pi_rs::Message::User {
+                        content: "hello".into(),
+                    },
+                ],
                 tools: vec![],
                 max_output_tokens: 64,
             };
