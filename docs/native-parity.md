@@ -459,13 +459,19 @@ The pinned Pi CLI defaults to Kimi K2.6 for Zen and Kimi K3 for Go.
 OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
 using its official System One endpoint and `OPENCODE_API_KEY`.
 
-OpenCode Zen and Go expose their 79 and 30 pinned chat models, respectively,
-using `OPENCODE_API_KEY`. The model selects the Messages, Gemini, Chat
+OpenCode Zen and Go expose the 84 and 33 chat models from Pi AI v1.6.0,
+respectively, using `OPENCODE_API_KEY`. The model selects the Messages, Gemini, Chat
 Completions or Responses route. Session requests include `x-opencode-session`
 unless configuration supplies the header explicitly. Endpointless saved keys
 apply to the official routes for the corresponding provider. Gemini prepared
-requests also accept an empty tool list. Live inference
-with a Zen or Go account has not been verified.
+requests also accept an empty tool list. Zen's Gemini 4 Hydrogen and Neon
+send the documented `XHIGH` level when selected. Pi v1.6.0 publishes that
+catalog mapping but its Google client rejects it before sending a request.
+Zen and Go use per-reply effort on
+the Anthropic models marked `supportsMidConvoEffort` in that catalog. Native
+requests include Anthropic's thinking block binding with
+`prefix_mismatch_behavior: drop_block`. Live inference with a Zen or Go
+account has not been verified.
 
 ### Vercel AI Gateway checkpoint
 

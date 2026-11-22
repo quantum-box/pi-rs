@@ -3113,15 +3113,15 @@ mod tests {
             (
                 "opencode",
                 "/inference",
-                79,
+                84,
                 "kimi-k2.6",
-                "claude-fable-5",
-                "gpt-6-sol",
+                "claude-fable-5-2",
+                "gpt-6.2-sol",
             ),
             (
                 "opencode-go",
                 "/inference/go",
-                30,
+                33,
                 "kimi-k3",
                 "claude-haiku-5-5",
                 "gpt-6-luna",
@@ -3133,6 +3133,19 @@ mod tests {
             assert_eq!(available.len(), count);
             assert_eq!(available[0], default);
             assert_eq!(builtin.env(), "OPENCODE_API_KEY");
+            assert!(!available.iter().any(|model| model == "glm-5.2"));
+            let efforts = profiles.anthropic_managed_effort_models(&provider, messages, None);
+            if id == "opencode" {
+                assert_eq!(efforts.len(), 6);
+                assert_eq!(efforts.get("claude-fable-5-2"), Some(&false));
+                assert_eq!(efforts.get("claude-opus-5"), Some(&true));
+            } else {
+                assert_eq!(efforts, BTreeMap::from([("claude-haiku-5-5".into(), true)]));
+                assert_eq!(
+                    profiles.model_adapter(&provider, "qwen4-max"),
+                    Adapter::Anthropic
+                );
+            }
 
             let keys = super::super::model_auth::Keys::parse(
                 &json!({id:{"type":"api_key","key":"fixture"}}),
