@@ -3,6 +3,7 @@ use crate::persistent_map::PersistentMap;
 use crate::{Error, Event, Invocation, Outcome, Result, ToolCall, Usage};
 use base64::Engine;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -77,6 +78,7 @@ fn append_imported_usage(events: &mut Vec<Event>, value: &Value) -> Option<Usage
             cost_breakdown: crate::UsageCostBreakdown::from_value(&value["cost"]),
             cost_from_provider: value["cost"]["totalFromProvider"].as_bool(),
             cache_write_1h_tokens: value["cacheWrite1h"].as_u64(),
+            reasoning_output_tokens: value["reasoning"].as_u64(),
             cached_input_tokens: Some(cache_read),
             cache_creation_input_tokens: Some(cache_write),
             ..Default::default()
@@ -1203,9 +1205,23 @@ pub fn imported_custom_message(entry: &Value, legacy: bool) -> Result<crate::Cus
 }
 
 fn anthropic_replay(message: &Value) -> Option<Box<crate::ProviderReplay>> {
-    if message["provider"] != "anthropic" || message["api"] != "anthropic-messages" {
+    if message["api"] != "anthropic-messages" {
         return None;
     }
+    let effort = message["providerThinkingLevel"]
+        .as_str()
+        .and_then(crate::ProviderReplay::valid_anthropic_effort);
+    let direct = message["provider"] == "anthropic";
+    let provider = if direct {
+        "anthropic".into()
+    } else if message["provider"] == "openrouter" && effort.is_some() {
+        format!(
+            "anthropic-messages:openrouter:{:x}",
+            Sha256::digest("https://openrouter.ai/api/v1/messages")
+        )
+    } else {
+        return None;
+    };
     let model = message["model"].as_str()?;
     let mut signed = false;
     let mut replay = Vec::new();
@@ -1234,15 +1250,40 @@ fn anthropic_replay(message: &Value) -> Option<Box<crate::ProviderReplay>> {
         };
         replay.push(raw);
     }
-    signed.then(|| {
-        Box::new(crate::ProviderReplay {
+    (signed || effort.is_some()).then(|| {
+        let mut replay = crate::ProviderReplay {
             identity: crate::ResolvedModelIdentity {
-                provider: "anthropic".into(),
+                provider,
                 model: model.into(),
             },
             blocks: replay,
-        })
+        };
+        if let Some(effort) = effort {
+            replay.record_anthropic_effort(effort);
+        }
+        Box::new(replay)
     })
+}
+
+fn openai_effort_replay(message: &Value) -> Option<Box<crate::ProviderReplay>> {
+    if message["api"] != "openai-responses" {
+        return None;
+    }
+    let provider = message["provider"]
+        .as_str()
+        .filter(|name| !name.is_empty())?;
+    let effort = message["providerThinkingLevel"]
+        .as_str()
+        .filter(|effort| !effort.is_empty())?;
+    let mut replay = crate::ProviderReplay {
+        identity: crate::ResolvedModelIdentity {
+            provider: provider.into(),
+            model: message["model"].as_str()?.into(),
+        },
+        blocks: Vec::new(),
+    };
+    replay.record_openai_effort(effort);
+    Some(Box::new(replay))
 }
 
 fn google_replay(message: &Value) -> Option<Box<crate::ProviderReplay>> {
@@ -1379,6 +1420,7 @@ pub fn convert(
                             cost_from_provider: message["usage"]["cost"]["totalFromProvider"]
                                 .as_bool(),
                             cache_write_1h_tokens: message["usage"]["cacheWrite1h"].as_u64(),
+                            reasoning_output_tokens: message["usage"]["reasoning"].as_u64(),
                             cached_input_tokens: message["usage"]["cacheRead"].as_u64(),
                             cache_creation_input_tokens: message["usage"]["cacheWrite"].as_u64(),
                             provider_api: message["api"].as_str().and_then(crate::ModelApi::named),
@@ -1387,7 +1429,9 @@ pub fn convert(
                             diagnostics: crate::AssistantDiagnostic::from_pi_diagnostics(
                                 &message["diagnostics"],
                             ),
-                            replay: anthropic_replay(message).or_else(|| google_replay(message)),
+                            replay: anthropic_replay(message)
+                                .or_else(|| google_replay(message))
+                                .or_else(|| openai_effort_replay(message)),
                             resolved_model: message["model"].as_str().map(|model| {
                                 crate::ResolvedModelIdentity {
                                     provider: message["provider"]
@@ -1721,4 +1765,88 @@ pub fn convert(
         }
     }
     Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn keeps_the_provider_and_mapped_effort_from_openai_responses() {
+        let mut message = json!({
+            "provider":"openai","api":"openai-responses","model":"gpt-6-luna",
+            "providerThinkingLevel":"low",
+            "content":[{"type":"text","text":"reply"}],
+        });
+        let replay = openai_effort_replay(&message).unwrap();
+        assert_eq!(replay.openai_effort(), Some("low"));
+        assert_eq!(replay.identity.provider, "openai");
+        assert_eq!(replay.blocks.len(), 1);
+        message["provider"] = json!("custom-responses");
+        message["providerThinkingLevel"] = json!("strong");
+        let custom = openai_effort_replay(&message).unwrap();
+        assert_eq!(custom.identity.provider, "custom-responses");
+        assert_eq!(custom.openai_effort(), Some("strong"));
+        message["providerThinkingLevel"] = json!("");
+        assert!(openai_effort_replay(&message).is_none());
+        message["providerThinkingLevel"] = json!("low");
+        message["api"] = json!("openai-codex-responses");
+        assert!(openai_effort_replay(&message).is_none());
+    }
+
+    #[test]
+    fn pi_anthropic_effort_import_keeps_valid_levels_and_scopes_gateway_replay() {
+        let mut message = json!({
+            "provider":"anthropic","api":"anthropic-messages","model":"fixture",
+            "providerThinkingLevel":"xhigh",
+            "content":[{"type":"text","text":"reply"}]
+        });
+        let direct = anthropic_replay(&message).unwrap();
+        assert_eq!(direct.anthropic_effort(), Some("xhigh"));
+        assert_eq!(direct.identity.provider, "anthropic");
+        message["provider"] = json!("openrouter");
+        message["content"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "type":"thinking","thinking":"gateway thinking","thinkingSignature":"signature",
+            }),
+        );
+        let gateway = anthropic_replay(&message).unwrap();
+        assert_eq!(gateway.anthropic_effort(), Some("xhigh"));
+        assert!(
+            gateway
+                .identity
+                .provider
+                .starts_with("anthropic-messages:openrouter:")
+        );
+        assert!(
+            gateway
+                .blocks
+                .iter()
+                .any(|block| block["type"] == "thinking" && block["signature"] == "signature")
+        );
+        message["providerThinkingLevel"] = json!("unrecognized");
+        assert!(anthropic_replay(&message).is_none());
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn pi_usage_retains_reasoning_without_increasing_output_tokens() {
+        let mut events = Vec::new();
+        let usage = append_imported_usage(
+            &mut events,
+            &serde_json::json!({
+                "input":12,"output":9,"reasoning":4
+            }),
+        )
+        .unwrap();
+        assert_eq!(usage.output_tokens, 9);
+        assert!(matches!(&events[0], Event::ModelFinished { metadata, .. }
+            if metadata.reasoning_output_tokens == Some(4)));
+    }
 }
