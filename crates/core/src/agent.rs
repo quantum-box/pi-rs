@@ -7634,25 +7634,8 @@ fn bound_tool_outcome(outcome: Outcome, max_output_bytes: usize) -> Result<Outco
                 outcome
             }
         }
-        outcome @ Outcome::Structured { .. } => {
-            let size = encoded_tool_output_bytes(&outcome)?;
-            if size > max_output_bytes {
-                Outcome::Truncated {
-                    original_bytes: size,
-                }
-            } else {
-                outcome
-            }
-        }
-        outcome @ Outcome::StructuredWithDetails { .. } => {
-            let size = encoded_tool_output_bytes(&outcome)?;
-            if size > max_output_bytes {
-                Outcome::Truncated {
-                    original_bytes: size,
-                }
-            } else {
-                outcome
-            }
+        outcome @ (Outcome::Structured { .. } | Outcome::StructuredWithDetails { .. }) => {
+            bound_structured_tool_outcome(outcome, max_output_bytes)?
         }
         Outcome::Failed(reason) if reason.len() > max_output_bytes => {
             Outcome::Failed("failure detail exceeds size limit".into())
@@ -8097,8 +8080,6 @@ fn recover(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
     ensure_settled(session.operations())
 }
 
-// Fingerprint only stable request configuration, excluding conversation and
-// output allowance, which legitimately change between turns.
 fn bound_structured_tool_outcome(outcome: Outcome, max_bytes: usize) -> Result<Outcome> {
     let size = if matches!(&outcome, Outcome::StructuredWithDetails { .. }) {
         serde_json::to_vec(&outcome)?.len()
@@ -8117,6 +8098,8 @@ fn bound_structured_tool_outcome(outcome: Outcome, max_bytes: usize) -> Result<O
     }
 }
 
+// Fingerprint only stable request configuration, excluding conversation and
+// output allowance, which legitimately change between turns.
 fn prepared_configuration_hash(
     model: &dyn Model,
     request: &ModelRequest,
