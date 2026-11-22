@@ -2205,13 +2205,49 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_fable_5_2_catalog_exposes_pi_limits_and_capabilities() {
+        let profiles = Profiles::default();
+        let provider = Provider::Anthropic;
+        let id = "claude-fable-5-2";
+        assert_eq!(profiles.model_ids(&provider).len(), 18);
+        assert_eq!(profiles.model_adapter(&provider, id), Adapter::Anthropic);
+        let model = profiles.model(&provider, id).unwrap();
+        assert_eq!(model.context_window, Some(1_000_000));
+        assert_eq!(model.max_tokens, Some(128_000));
+        assert_eq!(model.supports_images(), Some(true));
+        assert_eq!(model.adaptive_thinking(), Some(true));
+        assert_eq!(
+            model.levels(Adapter::Anthropic).unwrap(),
+            ["minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(profiles.anthropic_strict_tool_support(&provider, Some(&model)));
+        assert_eq!(
+            model.prompt_cache_seconds(pi_rs::CacheRetention::Long),
+            Some(3600.0)
+        );
+        let image_limits = model
+            .input_limits
+            .as_ref()
+            .unwrap()
+            .images
+            .as_ref()
+            .unwrap();
+        assert_eq!(image_limits.max_per_request, Some(600));
+        assert_eq!(
+            model.cost.as_ref().unwrap().value(),
+            json!({"input": 8.0, "output": 40.0, "cacheRead": 0.2, "cacheWrite": 10.0})
+        );
+    }
+
+    #[test]
     fn anthropic_managed_effort_uses_catalog_and_effective_model_route() {
         let profiles = Profiles::default();
         let native =
             profiles.anthropic_managed_effort_models(&Provider::Anthropic, "claude-opus-5", None);
-        assert_eq!(native.len(), 5);
+        assert_eq!(native.len(), 6);
         assert_eq!(native.get("claude-opus-5"), Some(&true));
         assert_eq!(native.get("claude-opus-5-5"), Some(&false));
+        assert_eq!(native.get("claude-fable-5-2"), Some(&false));
         assert!(!native.contains_key("claude-opus-4-8"));
         let openrouter = Provider::named("openrouter").unwrap();
         let gateway = profiles.anthropic_managed_effort_models(
