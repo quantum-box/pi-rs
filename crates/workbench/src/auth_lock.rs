@@ -84,13 +84,14 @@ fn busy() -> Error {
 
 pub(super) struct Guard {
     path: PathBuf,
-    staging: Option<tempfile::TempDir>,
     requested_auth: PathBuf,
     resolved_auth: PathBuf,
     identity: Arc<Identity>,
     compromised: Arc<AtomicBool>,
     stop: Option<mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    // Drop after the Windows directory handle in identity has closed.
+    staging: Option<tempfile::TempDir>,
 }
 impl Guard {
     pub(super) fn check(&self) -> Result<()> {
