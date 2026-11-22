@@ -656,8 +656,8 @@ async fn connect_for_discovery(
             let share_refresh = share_refresh.clone();
             let cleanup = cleanup.clone();
             Box::pin(async move {
-                args.model_profiles = super::model_profiles::Profiles::load()?;
                 args.model_keys = super::model_auth::Keys::load_async().await?;
+                args.model_profiles = super::model_profiles::Profiles::load(&args.model_keys)?;
                 let provider = args.model_profiles.provider(&provider).ok_or_else(|| {
                     Error::Config("MCP auth.provider does not name an installed provider".into())
                 })?;

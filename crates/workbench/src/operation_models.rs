@@ -179,17 +179,19 @@ fn classifier_retry_delay(
             .and_then(|value| value.to_str().ok())
             .and_then(retry_number)
     };
-    let delay_ms = numeric("retry-after-ms").or_else(|| {
-        numeric("retry-after")
-            .map(|seconds| seconds * 1000.0)
-            .or_else(|| {
-                headers
-                    .get("retry-after")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(classifier_retry_date)
-                    .map(|date| date.signed_duration_since(now).num_milliseconds() as f64)
-            })
-    });
+    let delay_ms = numeric("retry-after-ms")
+        .or_else(|| {
+            numeric("retry-after")
+                .map(|seconds| seconds * 1000.0)
+                .or_else(|| {
+                    headers
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(classifier_retry_date)
+                        .map(|date| date.signed_duration_since(now).num_milliseconds() as f64)
+                })
+        })
+        .filter(|delay| delay.is_finite());
     if let Some(delay_ms) = delay_ms {
         if delay_ms > MAX_SERVER_RETRY_DELAY.as_millis() as f64 {
             return Err(Error::Model(
@@ -429,7 +431,9 @@ impl Catalogue {
                         .find(|(key, _)| key.eq_ignore_ascii_case(&name))
                         .and_then(|(_, configured)| {
                             if name == "cloudflare-workers-ai" {
-                                cloudflare_model_binding(configured)
+                                configured["models"]
+                                    .as_array()
+                                    .and_then(|models| cloudflare_model_binding(models))
                             } else {
                                 configured["models"]
                                     .as_array()
@@ -640,8 +644,7 @@ impl Catalogue {
 
 // None means no model-level endpoint was configured. Some(None) means that
 // endpoints were configured but cannot be bound unambiguously.
-fn cloudflare_model_binding(provider: &Value) -> Option<Option<String>> {
-    let models = provider["models"].as_array()?;
+pub(super) fn cloudflare_model_binding(models: &[Value]) -> Option<Option<String>> {
     if !models
         .iter()
         .any(|model| model["baseUrl"].as_str().is_some())
@@ -3153,6 +3156,15 @@ mod tests {
             classifier_retry_delay(&headers, 0, now).unwrap(),
             Duration::from_millis(1500)
         );
+        headers.insert("retry-after", HeaderValue::from_static("61"));
+        assert!(classifier_retry_delay(&headers, 0, now).is_err());
+        for value in ["1e308", "-1e308"] {
+            headers.insert("retry-after", HeaderValue::from_static(value));
+            assert!(
+                (Duration::from_millis(375)..=Duration::from_millis(500))
+                    .contains(&classifier_retry_delay(&headers, 0, now).unwrap())
+            );
+        }
         assert_eq!(retry_number("1e+seconds"), Some(1.0));
         assert_eq!(retry_number(".25e2 seconds"), Some(25.0));
         assert_eq!(retry_number("Wed, 21 Oct 2015 07:28:05 GMT"), None);

@@ -1,31 +1,112 @@
 //! Wire differences for explicitly configured chat-completions providers.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ChatCompatibility {
     supports_store: Option<bool>,
+    supports_mid_convo_system_messages: Option<bool>,
     pub(super) supports_developer_role: Option<bool>,
     supports_usage_in_streaming: Option<bool>,
     pub(super) supports_finish_reason: Option<bool>,
     supports_reasoning_effort: Option<bool>,
     pub(super) supports_strict_mode: Option<bool>,
+    #[serde(rename = "supportsOpenAIGrammarTools")]
+    supports_openai_grammar_tools: Option<bool>,
     pub(super) requires_reasoning_content_on_assistant_messages: Option<bool>,
     pub(super) requires_thinking_as_text: Option<bool>,
     pub(super) reasoning_field: Option<String>,
     max_tokens_field: Option<MaxTokensField>,
     thinking_format: Option<ThinkingFormat>,
     chat_template_args: Option<serde_json::Map<String, Value>>,
+    open_router_routing: Option<serde_json::Map<String, Value>>,
+    vercel_gateway_routing: Option<VercelGatewayRouting>,
     zai_tool_stream: Option<bool>,
     vllm_priority: Option<serde_json::Number>,
     supports_thinking_token_budget: Option<bool>,
     thinking_token_budget_field: Option<ThinkingBudgetField>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct VercelGatewayRouting {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    only: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    order: Option<Vec<String>>,
+}
+
+fn overlay_map(
+    base: Option<serde_json::Map<String, Value>>,
+    newer: Option<serde_json::Map<String, Value>>,
+) -> Option<serde_json::Map<String, Value>> {
+    match (base, newer) {
+        (Some(mut base), Some(newer)) => {
+            base.extend(newer);
+            Some(base)
+        }
+        (base, newer) => newer.or(base),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routing_preferences_use_the_gateway_wire_fields_and_model_overrides() {
+        let provider: ChatCompatibility = serde_json::from_value(json!({
+            "openRouterRouting":{"only":["first"],"zdr":true,"data_collection":"deny"},
+            "vercelGatewayRouting":{"only":["anthropic"],"order":["first"]}
+        }))
+        .unwrap();
+        let model = serde_json::from_value(json!({
+            "openRouterRouting":{"order":["second"]},
+            "vercelGatewayRouting":{"order":["bedrock"],"ignored":true}
+        }))
+        .unwrap();
+        let mut body = json!({});
+        provider
+            .clone()
+            .overlay(model)
+            .request_options(&mut body, 32, false);
+        assert_eq!(
+            body["provider"],
+            json!({"only":["first"],"order":["second"],"zdr":true,"data_collection":"deny"})
+        );
+        assert_eq!(
+            body["providerOptions"],
+            json!({"gateway":{"order":["bedrock"],"only":["anthropic"]}})
+        );
+
+        let model = serde_json::from_value(json!({
+            "openRouterRouting":{}, "vercelGatewayRouting":{}
+        }))
+        .unwrap();
+        let mut body = json!({});
+        provider
+            .clone()
+            .overlay(model)
+            .request_options(&mut body, 32, false);
+        assert_eq!(
+            body["provider"],
+            json!({"only":["first"],"zdr":true,"data_collection":"deny"})
+        );
+        assert_eq!(
+            body["providerOptions"],
+            json!({"gateway":{"order":["first"],"only":["anthropic"]}})
+        );
+
+        let model = serde_json::from_value(json!({"vercelGatewayRouting":{"only":[]}})).unwrap();
+        let mut body = json!({});
+        provider
+            .overlay(model)
+            .request_options(&mut body, 32, false);
+        assert_eq!(
+            body["providerOptions"],
+            json!({"gateway":{"order":["first"],"only":[]}})
+        );
+    }
 
     #[test]
     fn overlay_merges_chat_template_arguments_by_key() {
@@ -208,6 +289,15 @@ impl ChatCompatibility {
         self.supports_strict_mode
     }
 
+    /// Whether the model accepts OpenAI custom tools constrained by a grammar.
+    pub fn supports_openai_grammar_tools(&self) -> Option<bool> {
+        self.supports_openai_grammar_tools
+    }
+
+    pub(super) fn set_openai_grammar_tool_support(&mut self, supported: bool) {
+        self.supports_openai_grammar_tools = Some(supported);
+    }
+
     /// Whether the configured model accepts the developer instruction role.
     pub fn supports_developer_role(&self) -> Option<bool> {
         self.supports_developer_role
@@ -215,15 +305,19 @@ impl ChatCompatibility {
 
     /// Model-specific values override the provider defaults field by field.
     pub fn overlay(self, model: Self) -> Self {
-        let chat_template_args = match (self.chat_template_args, model.chat_template_args) {
-            (Some(mut base), Some(newer)) => {
-                base.extend(newer);
-                Some(base)
-            }
-            (base, newer) => newer.or(base),
-        };
+        let vercel_gateway_routing =
+            match (self.vercel_gateway_routing, model.vercel_gateway_routing) {
+                (Some(base), Some(newer)) => Some(VercelGatewayRouting {
+                    only: newer.only.or(base.only),
+                    order: newer.order.or(base.order),
+                }),
+                (base, newer) => newer.or(base),
+            };
         Self {
             supports_store: model.supports_store.or(self.supports_store),
+            supports_mid_convo_system_messages: model
+                .supports_mid_convo_system_messages
+                .or(self.supports_mid_convo_system_messages),
             supports_developer_role: model
                 .supports_developer_role
                 .or(self.supports_developer_role),
@@ -235,6 +329,9 @@ impl ChatCompatibility {
                 .supports_reasoning_effort
                 .or(self.supports_reasoning_effort),
             supports_strict_mode: model.supports_strict_mode.or(self.supports_strict_mode),
+            supports_openai_grammar_tools: model
+                .supports_openai_grammar_tools
+                .or(self.supports_openai_grammar_tools),
             requires_reasoning_content_on_assistant_messages: model
                 .requires_reasoning_content_on_assistant_messages
                 .or(self.requires_reasoning_content_on_assistant_messages),
@@ -244,7 +341,9 @@ impl ChatCompatibility {
             reasoning_field: model.reasoning_field.or(self.reasoning_field),
             max_tokens_field: model.max_tokens_field.or(self.max_tokens_field),
             thinking_format: model.thinking_format.or(self.thinking_format),
-            chat_template_args,
+            chat_template_args: overlay_map(self.chat_template_args, model.chat_template_args),
+            open_router_routing: overlay_map(self.open_router_routing, model.open_router_routing),
+            vercel_gateway_routing,
             zai_tool_stream: model.zai_tool_stream.or(self.zai_tool_stream),
             vllm_priority: model.vllm_priority.or(self.vllm_priority),
             supports_thinking_token_budget: model
@@ -260,12 +359,40 @@ impl ChatCompatibility {
         matches!(self.thinking_format, Some(ThinkingFormat::Openrouter))
     }
 
+    pub(super) fn leading_system_message(
+        &self,
+        messages: &[pi_rs_core::Message],
+    ) -> Option<pi_rs_core::Message> {
+        if self.supports_mid_convo_system_messages == Some(true) {
+            return None;
+        }
+        let mut contents = messages.iter().filter_map(|message| match message {
+            pi_rs_core::Message::System { content } => Some(content.as_str()),
+            _ => None,
+        });
+        let first = contents.next()?;
+        let content = std::iter::once(first)
+            .chain(contents)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        Some(pi_rs_core::Message::System { content })
+    }
+
     pub(super) fn request_options(&self, body: &mut Value, max_tokens: u32, has_tools: bool) {
         let tokens = match self.max_tokens_field {
             Some(MaxTokensField::MaxCompletionTokens) => "max_completion_tokens",
             _ => "max_tokens",
         };
         body[tokens] = json!(max_tokens);
+        if let Some(routing) = &self.open_router_routing {
+            body["provider"] = json!(routing);
+        }
+        if let Some(routing) = &self.vercel_gateway_routing
+            && (routing.only.is_some() || routing.order.is_some())
+        {
+            body["providerOptions"] = json!({"gateway":routing});
+        }
         if self.supports_usage_in_streaming != Some(false) {
             body["stream_options"] = json!({"include_usage":true});
         }
