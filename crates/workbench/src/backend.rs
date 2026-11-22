@@ -2327,7 +2327,13 @@ fn select_live_model(
         provider: args.recorded_provider().map(str::to_owned),
         model: args.model.clone(),
         thinking: args.thinking.clone(),
-        limits: runtime::effective_limits(&args),
+        limits: pi_rs::Limits {
+            compaction_tokens: Some(
+                args.settings
+                    .compaction_tokens(args.provider.id(), &args.model),
+            ),
+            ..runtime::effective_limits(&args)
+        },
     });
     let mut state = active.lock().expect("worker control");
     let live = state
