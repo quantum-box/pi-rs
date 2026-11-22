@@ -94,7 +94,8 @@ fn worker_limit() -> usize {
 }
 
 fn parse_worker_limit(value: &str) -> Option<usize> {
-    let value = value.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let value =
+        value.trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}');
     let radix_number = |digits: &str, radix| {
         (!digits.is_empty() && digits.chars().all(|c| c.is_ascii() && c.is_digit(radix)))
             .then(|| u64::from_str_radix(digits, radix).ok().map(|n| n as f64))
@@ -1123,6 +1124,19 @@ fn visit_chunks(
         value = &value[end..];
     }
 }
+fn utf16_prefix_bytes(chars: impl Iterator<Item = char>, mut units: usize) -> usize {
+    chars
+        .take_while(|character| {
+            let Some(remaining) = units.checked_sub(character.len_utf16()) else {
+                return false;
+            };
+            units = remaining;
+            true
+        })
+        .map(char::len_utf8)
+        .sum()
+}
+
 impl Output {
     fn unshown_images_note(&self) -> Option<String> {
         let count = self.generated_images;
@@ -1238,7 +1252,7 @@ impl Output {
         elapsed: Duration,
         error: Option<&str>,
         maximum: usize,
-        chars: usize,
+        units: usize,
         cancellation: &pi_rs_core::CancellationToken,
     ) -> Option<FormattedOutput> {
         let mut file = tempfile::Builder::new()
@@ -1251,7 +1265,7 @@ impl Output {
         let mut newlines = 0usize;
         let mut last = None;
         let head_limit = maximum / 2;
-        let tail_start = chars - (maximum - head_limit);
+        let tail_start = units - (maximum - head_limit);
         self.visit_report(success, elapsed, error, |part| {
             visit_chunks(part, cancellation, |part| {
                 if let Ok(output) = &mut file
@@ -1259,14 +1273,21 @@ impl Output {
                 {
                     file = Err(error);
                 }
-                let part_chars = part.chars().count();
-                if offset < head_limit {
-                    head.extend(part.chars().take(head_limit - offset));
+                let part_units = part.encode_utf16().count();
+                let end = offset + part_units;
+                if end <= head_limit {
+                    head.push_str(part);
+                } else if offset < head_limit {
+                    let bytes = utf16_prefix_bytes(part.chars(), head_limit - offset);
+                    head.push_str(&part[..bytes]);
                 }
-                if offset + part_chars > tail_start {
-                    tail.extend(part.chars().skip(tail_start.saturating_sub(offset)));
+                if offset >= tail_start {
+                    tail.push_str(part);
+                } else if end > tail_start {
+                    let bytes = utf16_prefix_bytes(part.chars().rev(), end - tail_start);
+                    tail.push_str(&part[part.len() - bytes..]);
                 }
-                offset += part_chars;
+                offset = end;
                 newlines += part.bytes().filter(|byte| *byte == b'\n').count();
                 if !part.is_empty() {
                     last = part.chars().next_back();
@@ -1290,8 +1311,8 @@ impl Output {
         };
         let report = format!(
             "Warning: truncated output (original token count: {})\nTotal output lines: {lines}\n\n{head}…{} tokens truncated…{tail}\n\n[{location}]",
-            chars.div_ceil(4),
-            (chars - maximum).div_ceil(4)
+            units.div_ceil(4),
+            (units - maximum).div_ceil(4)
         );
         let text_block = json!({"type":"text","text":report});
         let mut budget = (7 * 1024 * 1024_usize).saturating_sub(text_block.to_string().len());
@@ -1386,17 +1407,17 @@ impl Output {
         cancellation: &pi_rs_core::CancellationToken,
     ) -> Option<FormattedOutput> {
         let maximum = tokens.saturating_mul(4).min(100 * 1024);
-        let mut chars = 0usize;
+        let mut units = 0usize;
         self.visit_report(success, elapsed, error, |part| {
             visit_chunks(part, cancellation, |chunk| {
-                chars = chars.saturating_add(chunk.chars().count())
+                units = units.saturating_add(chunk.encode_utf16().count())
             })
         });
         if cancellation.is_cancelled() {
             return None;
         }
-        if chars > maximum {
-            return self.finish_truncated(success, elapsed, error, maximum, chars, cancellation);
+        if units > maximum {
+            return self.finish_truncated(success, elapsed, error, maximum, units, cancellation);
         }
         let mut content = vec![json!({"type":"text","text":format!(
             "Script {}\nWall time: {:.3}s\n",
@@ -1588,11 +1609,31 @@ mod tests {
 
     #[test]
     fn worker_limit_accepts_pi_numeric_forms_with_native_ceiling() {
-        for value in ["3", " 3 ", "3.0", "3e0", "+3", "0x3", "0o3", "0b11"] {
+        for value in [
+            "3",
+            " 3 ",
+            "\u{feff}3\u{00a0}",
+            "3.0",
+            "3e0",
+            "+3",
+            "0x3",
+            "0o3",
+            "0b11",
+        ] {
             assert_eq!(parse_worker_limit(value), Some(3), "{value:?}");
         }
         for value in [
-            "", "0", "-1", "1.5", "NaN", "Infinity", "1025", "3workers", "+0x3", "0x+3",
+            "",
+            "0",
+            "-1",
+            "1.5",
+            "NaN",
+            "Infinity",
+            "1025",
+            "3workers",
+            "+0x3",
+            "0x+3",
+            "\u{0085}3",
         ] {
             assert_eq!(parse_worker_limit(value), None, "{value:?}");
         }
@@ -2990,6 +3031,55 @@ mod tests {
             .deliver();
         let path = truncated["full_output_path"].as_str().unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn output_budget_counts_utf16_and_keeps_supplementary_characters_intact() {
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let header = "Script completed\nWall time: 0.000s\n";
+        let header_units = header.encode_utf16().count();
+        let budget = 40;
+        let fits = "😀".repeat((budget - header_units) / 2);
+        let output = |text| Output {
+            items: vec![Item::Text(text)],
+            ..Output::default()
+        };
+        let fitting = output(fits.clone())
+            .finish(true, Duration::ZERO, None, budget / 4, &cancellation)
+            .unwrap()
+            .deliver();
+        assert!(fitting["full_output_path"].is_null());
+        let overflowing = format!("{fits}😀");
+        assert!(header_units + overflowing.chars().count() <= budget);
+        let truncated = output(overflowing)
+            .finish(true, Duration::ZERO, None, budget / 4, &cancellation)
+            .unwrap()
+            .deliver();
+        let path = truncated["full_output_path"].as_str().unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        let budget = 80;
+        let prefix = "x".repeat(budget / 2 - header_units - 1);
+        let suffix = "z".repeat(budget / 2 - 1);
+        let text = format!("{prefix}😀{}😀{suffix}", "mid".repeat(20));
+        let units = header_units + text.encode_utf16().count();
+        let result = output(text.clone())
+            .finish(true, Duration::ZERO, None, budget / 4, &cancellation)
+            .unwrap()
+            .deliver();
+        let report = result["content"][0]["text"].as_str().unwrap();
+        let omitted = (units - budget).div_ceil(4);
+        assert!(report.contains(&format!("original token count: {}", units.div_ceil(4))));
+        assert!(report.contains(&format!(
+            "{header}{prefix}…{omitted} tokens truncated…{suffix}"
+        )));
+        assert!(!report.contains('😀'));
+        let path = result["full_output_path"].as_str().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            format!("{header}{text}")
+        );
         std::fs::remove_file(path).unwrap();
     }
 

@@ -3,6 +3,7 @@ use crate::persistent_map::PersistentMap;
 use crate::{Error, Event, Invocation, Outcome, Result, ToolCall, Usage};
 use base64::Engine;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -1203,9 +1204,23 @@ pub fn imported_custom_message(entry: &Value, legacy: bool) -> Result<crate::Cus
 }
 
 fn anthropic_replay(message: &Value) -> Option<Box<crate::ProviderReplay>> {
-    if message["provider"] != "anthropic" || message["api"] != "anthropic-messages" {
+    if message["api"] != "anthropic-messages" {
         return None;
     }
+    let effort = message["providerThinkingLevel"]
+        .as_str()
+        .and_then(crate::ProviderReplay::valid_anthropic_effort);
+    let direct = message["provider"] == "anthropic";
+    let provider = if direct {
+        "anthropic".into()
+    } else if message["provider"] == "openrouter" && effort.is_some() {
+        format!(
+            "anthropic-messages:openrouter:{:x}",
+            Sha256::digest("https://openrouter.ai/api/v1/messages")
+        )
+    } else {
+        return None;
+    };
     let model = message["model"].as_str()?;
     let mut signed = false;
     let mut replay = Vec::new();
@@ -1234,14 +1249,18 @@ fn anthropic_replay(message: &Value) -> Option<Box<crate::ProviderReplay>> {
         };
         replay.push(raw);
     }
-    signed.then(|| {
-        Box::new(crate::ProviderReplay {
+    (signed || effort.is_some()).then(|| {
+        let mut replay = crate::ProviderReplay {
             identity: crate::ResolvedModelIdentity {
-                provider: "anthropic".into(),
+                provider,
                 model: model.into(),
             },
             blocks: replay,
-        })
+        };
+        if let Some(effort) = effort {
+            replay.record_anthropic_effort(effort);
+        }
+        Box::new(replay)
     })
 }
 
@@ -1721,4 +1740,45 @@ pub fn convert(
         }
     }
     Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn pi_anthropic_effort_import_keeps_valid_levels_and_scopes_gateway_replay() {
+        let mut message = json!({
+            "provider":"anthropic","api":"anthropic-messages","model":"fixture",
+            "providerThinkingLevel":"xhigh",
+            "content":[{"type":"text","text":"reply"}]
+        });
+        let direct = anthropic_replay(&message).unwrap();
+        assert_eq!(direct.anthropic_effort(), Some("xhigh"));
+        assert_eq!(direct.identity.provider, "anthropic");
+        message["provider"] = json!("openrouter");
+        message["content"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "type":"thinking","thinking":"gateway thinking","thinkingSignature":"signature",
+            }),
+        );
+        let gateway = anthropic_replay(&message).unwrap();
+        assert_eq!(gateway.anthropic_effort(), Some("xhigh"));
+        assert!(
+            gateway
+                .identity
+                .provider
+                .starts_with("anthropic-messages:openrouter:")
+        );
+        assert!(
+            gateway
+                .blocks
+                .iter()
+                .any(|block| block["type"] == "thinking" && block["signature"] == "signature")
+        );
+        message["providerThinkingLevel"] = json!("unrecognized");
+        assert!(anthropic_replay(&message).is_none());
+    }
 }

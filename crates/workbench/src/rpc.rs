@@ -188,6 +188,8 @@ pub(super) fn run(
                 match event["type"].as_str() {
                     Some("auto_retry_start") => active.retrying = true,
                     Some("auto_retry_end" | "agent_settled" | "request") => active.retrying = false,
+                    Some("compaction_start") => active.compacting = true,
+                    Some("compaction_end") => active.compacting = false,
                     Some("bash_execution_end") => active.bashing = false,
                     _ => {}
                 }
@@ -247,12 +249,9 @@ pub(super) fn run(
                     )?;
                 }
                 if finished.busy {
-                    for event in stream.settle(false) {
+                    for event in stream.settle(false, status.success()) {
                         emit(event)?;
                     }
-                    emit(
-                        json!({"type":"agent_end","success":status.success(),"messages":stream.messages,"willRetry":false}),
-                    )?;
                     emit(json!({"type":"agent_settled","aborted":stream.aborted()}))?;
                     stream.reset();
                 }
@@ -2989,12 +2988,9 @@ fn forward_event(
         Some("agent_settled") => {
             *busy = pending_compact.is_some();
             if event["started"] != false {
-                for mapped in stream.settle(event["aborted"] == true) {
+                for mapped in stream.settle(event["aborted"] == true, event["success"] == true) {
                     emit(mapped)?;
                 }
-                emit(
-                    json!({"type":"agent_end","success":event["success"],"messages":stream.messages,"willRetry":false}),
-                )?;
             }
             emit(
                 json!({"type":"agent_settled","aborted":event["aborted"] == true || (event["started"] != false && stream.aborted())}),
@@ -3029,7 +3025,10 @@ fn forward_event(
                         | "reasoning_item_end"
                         | "tool_call_delta"
                         | "summary_request_start"
+                        | "auto_retry_start"
+                        | "auto_retry_end"
                         | "internal_tool_result_metadata"
+                        | "internal_tool_attempt"
                 )
             ) {
                 return Ok(());
@@ -4121,18 +4120,23 @@ mod tests {
             "role":"assistant","stopReason":"aborted",
             "content":[{"type":"thinking","thinking":"partial reasoning"}]
         }});
+        let empty_reply = json!({"type":"message","id":"d","parentId":"c","message":{
+            "role":"assistant","stopReason":"stop","content":[]
+        }});
         let entries = [
             json!({"type":"session","version":3}),
             answer,
             aborted,
             thinking_only,
+            empty_reply,
         ];
         let mut args = Cli::try_parse_from(["pi"]).unwrap();
         for (length, expected) in [
             (1, json!({})),
             (2, json!({"text":"Hello world"})),
             (3, json!({"text":"Hello world"})),
-            (4, json!({})),
+            (4, json!({"text":"Hello world"})),
+            (5, json!({})),
         ] {
             let body = entries[..length]
                 .iter()

@@ -8,6 +8,9 @@ use sha2::{Digest, Sha256};
 
 use super::{Provider, config};
 
+pub(super) const PI_OAUTH_MINIMUM_VALIDITY: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
 #[derive(Clone)]
 pub(super) enum Credential {
     Literal(String),
@@ -16,6 +19,7 @@ pub(super) enum Credential {
     StoredCommand(String),
     Invalid,
     ChatGpt,
+    Codex,
     Copilot,
     AnthropicOAuth,
     Kimi,
@@ -55,6 +59,7 @@ impl Credential {
             | Self::StoredCommand(_)
             | Self::Invalid
             | Self::ChatGpt
+            | Self::Codex
             | Self::Copilot
             | Self::AnthropicOAuth
             | Self::Kimi
@@ -81,6 +86,7 @@ impl Credential {
             || matches!(
                 self,
                 Self::ChatGpt
+                    | Self::Codex
                     | Self::Copilot
                     | Self::AnthropicOAuth
                     | Self::Kimi
@@ -111,6 +117,16 @@ impl Credential {
             Self::ChatGpt => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
                 return super::chatgpt_auth::access(&settings).await;
+            }
+            Self::Codex => {
+                let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
+                return super::codex_auth::access(
+                    &config::agent_dir().join("auth.json"),
+                    &settings,
+                    None,
+                    false,
+                )
+                .await;
             }
             Self::Copilot => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
@@ -212,6 +228,7 @@ impl Keys {
                 }
                 let chatgpt =
                     name.eq_ignore_ascii_case("openai-chatgpt") && entry["type"] == "oauth";
+                let codex = name.eq_ignore_ascii_case("openai-codex") && entry["type"] == "oauth";
                 let copilot =
                     name.eq_ignore_ascii_case("github-copilot") && entry["type"] == "oauth";
                 let copilot_credential = copilot
@@ -224,6 +241,7 @@ impl Keys {
                 let anthropic = name.eq_ignore_ascii_case("anthropic") && entry["type"] == "oauth";
                 let oauth = (name.eq_ignore_ascii_case("openrouter")
                     || chatgpt
+                    || codex
                     || copilot
                     || kimi
                     || meta
@@ -233,6 +251,8 @@ impl Keys {
                 let key = if chatgpt {
                     super::chatgpt_auth::decode_entry(entry).ok()?;
                     Some(Credential::ChatGpt)
+                } else if codex {
+                    super::codex_auth::valid_entry(entry).then_some(Credential::Codex)
                 } else if copilot {
                     Some(Credential::Copilot)
                 } else if anthropic {
@@ -319,7 +339,11 @@ impl Keys {
                     }
                 };
                 let endpoint = match entry.get("endpoint") {
-                    None if name.eq_ignore_ascii_case("cloudflare-workers-ai") => None,
+                    None if name.eq_ignore_ascii_case("cloudflare-workers-ai")
+                        || name.eq_ignore_ascii_case("cloudflare-ai-gateway") =>
+                    {
+                        None
+                    }
                     None => Provider::named(name)
                         .map(|provider| provider.default_endpoint())
                         .or_else(|| {
@@ -329,6 +353,7 @@ impl Keys {
                 };
                 if oauth
                     && !chatgpt
+                    && !codex
                     && !anthropic
                     && super::builtin_chat::find(if kimi {
                         "kimi-coding"
@@ -345,7 +370,9 @@ impl Keys {
                 {
                     return None;
                 }
-                if chatgpt && endpoint != Some(pi_rs::openai::DEFAULT_ENDPOINT) {
+                if (codex && endpoint != Some(pi_rs::openai::CODEX_ENDPOINT))
+                    || (chatgpt && endpoint != Some(pi_rs::openai::DEFAULT_ENDPOINT))
+                {
                     return None;
                 }
                 if anthropic && endpoint != Some(pi_rs::anthropic::DEFAULT_ENDPOINT) {
@@ -393,10 +420,22 @@ impl Keys {
         let legacy_radius = provider == &Provider::Radius
             && endpoint == super::radius_auth::DEFAULT_MODEL_ENDPOINT
             && entry.endpoint.as_deref() == Some("https://radius.pi.dev/messages");
+        let gateway_scoped_route = provider.id() == "cloudflare-ai-gateway"
+            && super::cloudflare_gateway::Route::is_endpoint(endpoint)
+            && entry
+                .endpoint
+                .as_deref()
+                .and_then(super::cloudflare_gateway::Route::from_endpoint)
+                .is_some_and(|route| {
+                    Some(route) == super::cloudflare_gateway::Route::from_endpoint(endpoint)
+                });
         let builtin_route = entry.official_routes
             && super::builtin_chat::find(provider.id())
                 .is_some_and(|builtin| builtin.is_official_endpoint(endpoint));
-        (entry.endpoint.as_deref() == Some(endpoint) || legacy_radius || builtin_route)
+        (entry.endpoint.as_deref() == Some(endpoint)
+            || legacy_radius
+            || builtin_route
+            || gateway_scoped_route)
             .then_some(entry)
     }
 
@@ -428,9 +467,20 @@ impl Keys {
                         || self.cloudflare_chat_account() == Some(account)
                 },
             );
+        let gateway_match = provider.id() != "cloudflare-ai-gateway"
+            || (super::cloudflare_gateway::Route::is_endpoint(endpoint)
+                && super::cloudflare_gateway::Route::from_endpoint(endpoint).is_some_and(
+                    |route| {
+                        Some(route)
+                            == self.cloudflare_gateway_route_with_configured_endpoint(Some(
+                                profiles.endpoint(provider),
+                            ))
+                    },
+                ));
         (entry.endpoint.is_none()
             && profiles.has_provider_endpoint(provider, endpoint)
-            && cloudflare_match)
+            && cloudflare_match
+            && gateway_match)
             .then_some(entry)
     }
 
@@ -480,6 +530,37 @@ impl Keys {
         self.operation_entry(provider, endpoint, official)?
             .env
             .as_ref()
+    }
+
+    pub(super) fn cloudflare_gateway_route(&self) -> Option<super::cloudflare_gateway::Route> {
+        self.cloudflare_gateway_route_with_configured_endpoint(None)
+    }
+
+    fn cloudflare_gateway_route_with_configured_endpoint(
+        &self,
+        configured_endpoint: Option<&str>,
+    ) -> Option<super::cloudflare_gateway::Route> {
+        let entry = self.entries.get("cloudflare-ai-gateway");
+        if let Some(endpoint) = entry.and_then(|entry| entry.endpoint.as_deref()) {
+            return super::cloudflare_gateway::Route::from_endpoint(endpoint).filter(|route| {
+                route.matches_environment(entry.and_then(|entry| entry.env.as_ref()))
+            });
+        }
+        let get = |name: &str| {
+            entry
+                .and_then(|entry| entry.env.as_ref())
+                .and_then(|env| env.get(name))
+                .map_or_else(
+                    || std::env::var(name).ok(),
+                    |value| value.as_str().map(str::to_owned),
+                )
+        };
+        super::cloudflare_gateway::Route::with_route_identifiers(
+            get("CLOUDFLARE_ACCOUNT_ID").as_deref(),
+            get("CLOUDFLARE_GATEWAY_ID").as_deref(),
+            configured_endpoint.and_then(super::cloudflare_gateway::Route::from_endpoint),
+        )
+        .filter(|route| route.matches_environment(entry.and_then(|entry| entry.env.as_ref())))
     }
 
     fn cloudflare_worker_account_entry(&self) -> Option<(&SavedKey, &str)> {
@@ -594,6 +675,62 @@ pub(super) fn save(provider: &Provider, endpoint: &str, key: &str) -> Result<()>
     )
 }
 
+pub(super) fn save_cloudflare_login(
+    provider: &Provider,
+    key: &str,
+    account: &str,
+    gateway: Option<&str>,
+) -> Result<()> {
+    save_cloudflare_login_at(
+        &config::agent_dir().join("auth.json"),
+        provider,
+        key,
+        account,
+        gateway,
+    )
+}
+
+fn save_cloudflare_login_at(
+    path: &std::path::Path,
+    provider: &Provider,
+    key: &str,
+    account: &str,
+    gateway: Option<&str>,
+) -> Result<()> {
+    if !valid_key(key) {
+        return Err(Error::Config("Enter a valid Cloudflare API key".into()));
+    }
+    if !super::operation_models::valid_cloudflare_account(account) {
+        return Err(Error::Config("Enter a valid Cloudflare account ID".into()));
+    }
+    let mut environment = json!({"CLOUDFLARE_ACCOUNT_ID":account});
+    match (provider.id(), gateway) {
+        ("cloudflare-workers-ai", None) => {}
+        ("cloudflare-ai-gateway", Some(gateway))
+            if super::cloudflare_gateway::Route::new(account, gateway).is_some() =>
+        {
+            environment["CLOUDFLARE_GATEWAY_ID"] = json!(gateway);
+        }
+        ("cloudflare-ai-gateway", _) => {
+            return Err(Error::Config(
+                "Enter a valid Cloudflare AI Gateway ID".into(),
+            ));
+        }
+        _ => {
+            return Err(Error::Config(
+                "unsupported Cloudflare login provider".into(),
+            ));
+        }
+    }
+    config::update_object(path, |data| {
+        data.insert(
+            provider.id().into(),
+            json!({"type":"api_key","key":key,"literal":true,"env":environment}),
+        );
+        Ok(())
+    })
+}
+
 fn save_at(path: &std::path::Path, provider: &Provider, endpoint: &str, key: &str) -> Result<()> {
     let key = key.trim();
     if !valid_key(key) {
@@ -678,6 +815,83 @@ pub(super) use pi_rs_workbench::auth_factory::valid_api_key as valid_key;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cloudflare_login_saves_only_valid_account_and_gateway_routes() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let workers = Provider::named("cloudflare-workers-ai").unwrap();
+        let gateway = Provider::named("cloudflare-ai-gateway").unwrap();
+        save_cloudflare_login_at(&path, &workers, "$literal", "workersaccount", None).unwrap();
+        save_cloudflare_login_at(
+            &path,
+            &gateway,
+            "gateway-token",
+            "gatewayaccount",
+            Some("test-gateway"),
+        )
+        .unwrap();
+        assert!(
+            save_cloudflare_login_at(
+                &path,
+                &gateway,
+                "replacement",
+                "gatewayaccount",
+                Some("wrong/path")
+            )
+            .is_err()
+        );
+
+        let saved = config::read_object(&path).unwrap();
+        assert_eq!(
+            saved["cloudflare-workers-ai"]["env"]["CLOUDFLARE_ACCOUNT_ID"],
+            "workersaccount"
+        );
+        assert_eq!(saved["cloudflare-workers-ai"]["literal"], true);
+        assert_eq!(saved["cloudflare-ai-gateway"]["key"], "gateway-token");
+        let keys = Keys::parse(&saved);
+        assert_eq!(keys.cloudflare_chat_account(), Some("workersaccount"));
+        let route = keys.cloudflare_gateway_route().unwrap();
+        let profiles = super::super::model_profiles::Profiles::parse_with_cloudflare_routes(
+            &json!({}),
+            keys.cloudflare_chat_account(),
+            Some(route.clone()),
+        )
+        .unwrap();
+        let workers_endpoint =
+            "https://api.cloudflare.com/client/v4/accounts/workersaccount/ai/v1/chat/completions";
+        assert_eq!(
+            keys.custom_credential(&workers, workers_endpoint, &profiles)
+                .and_then(Credential::literal),
+            Some("$literal")
+        );
+        assert!(
+            keys.custom_credential(
+                &workers,
+                &workers_endpoint.replace("workersaccount", "otheraccount"),
+                &profiles
+            )
+            .is_none()
+        );
+
+        let gateway_endpoint = route
+            .endpoint(super::super::providers::Adapter::Anthropic)
+            .unwrap();
+        assert_eq!(
+            keys.custom_credential(&gateway, &gateway_endpoint, &profiles)
+                .and_then(Credential::literal),
+            Some("gateway-token")
+        );
+        assert!(
+            keys.custom_credential(
+                &gateway,
+                &gateway_endpoint.replace("test-gateway", "other-gateway"),
+                &profiles
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn vercel_ui_saved_key_only_bridges_exact_official_classifier_route() {
         use super::*;
