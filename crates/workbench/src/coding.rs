@@ -26,17 +26,34 @@ const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 #[derive(Clone, Default)]
 pub struct ShellOutputStore(Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>);
 
-/// Tracks the selected model for tools kept across model switches.
+/// Tracks the selected model's image settings for tools kept across switches.
 #[derive(Clone, Default)]
-pub struct ReadImageModel(Arc<std::sync::Mutex<Option<Arc<str>>>>);
+pub struct ReadImageModel(Arc<std::sync::Mutex<ReadImageSettings>>);
+
+#[derive(Clone, Default)]
+struct ReadImageSettings {
+    profile: Option<crate::image_profile::ImageResizeProfile>,
+    unsupported_model: Option<Arc<str>>,
+}
 
 impl ReadImageModel {
     pub fn set(&self, id: &str, supports_images: Option<bool>) {
-        *self.0.lock().expect("read image model") =
-            (supports_images == Some(false)).then(|| Arc::from(id));
+        self.set_profile(id, supports_images, None);
     }
 
-    fn unsupported_model(&self) -> Option<Arc<str>> {
+    pub fn set_profile(
+        &self,
+        id: &str,
+        supports_images: Option<bool>,
+        profile: Option<crate::image_profile::ImageResizeProfile>,
+    ) {
+        *self.0.lock().expect("read image model") = ReadImageSettings {
+            profile,
+            unsupported_model: (supports_images == Some(false)).then(|| Arc::from(id)),
+        };
+    }
+
+    fn snapshot(&self) -> ReadImageSettings {
         self.0.lock().expect("read image model").clone()
     }
 }
@@ -660,11 +677,102 @@ impl Extension for CodingTools {
                         operations: operations.clone(),
                         shell_outputs: self.shell_outputs.clone(),
                     }) as Arc<dyn Tool>
+                } else if matches!(tool.kind, Kind::Read { .. })
+                    && let Some(UnsupportedImageModel::Current(model)) =
+                        &self.unsupported_image_model
+                {
+                    Arc::new(LiveReadTool {
+                        tool,
+                        model: model.clone(),
+                    }) as Arc<dyn Tool>
                 } else {
                     Arc::new(tool) as Arc<dyn Tool>
                 }
             })
             .collect()
+    }
+}
+
+struct LiveReadTool {
+    tool: CodingTool,
+    model: ReadImageModel,
+}
+
+impl LiveReadTool {
+    fn snapshot(&self) -> CodingTool {
+        let settings = self.model.snapshot();
+        let auto_resize = matches!(
+            self.tool.kind,
+            Kind::Read {
+                auto_resize: true,
+                ..
+            }
+        );
+        CodingTool {
+            kind: Kind::Read {
+                auto_resize,
+                profile: settings.profile,
+                unsupported_image_model: settings
+                    .unsupported_model
+                    .map(UnsupportedImageModel::Selected),
+            },
+            ..self.tool.clone()
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for LiveReadTool {
+    fn spec(&self) -> ToolSpec {
+        self.tool.spec()
+    }
+
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        self.tool.constrained_sampling()
+    }
+
+    fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
+        self.tool.event_structured_content(outcome)
+    }
+
+    fn execution(&self) -> ToolExecution {
+        self.tool.execution()
+    }
+
+    fn output_limit(&self) -> usize {
+        self.tool.output_limit()
+    }
+
+    async fn prepare_arguments(&self, arguments: Value) -> pi_rs::ExtensionResult<Value> {
+        self.tool.prepare_arguments(arguments).await
+    }
+
+    async fn invoke(&self, arguments: Value, context: ToolContext) -> Outcome {
+        self.snapshot().invoke(arguments, context).await
+    }
+
+    async fn invoke_with_host(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&pi_rs::ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> Outcome {
+        self.snapshot()
+            .invoke_with_host(arguments, context, state, host)
+            .await
+    }
+
+    async fn invoke_programmatic(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&pi_rs::ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ToolReply {
+        self.snapshot()
+            .invoke_programmatic(arguments, context, state, host)
+            .await
     }
 }
 
@@ -2194,6 +2302,7 @@ fn shell_outcome(output: crate::shell_output::Output, code: i32, elapsed: f64) -
 enum UnsupportedImageModel {
     Legacy,
     Current(ReadImageModel),
+    Selected(Arc<str>),
 }
 
 #[derive(Clone)]
@@ -3171,11 +3280,16 @@ impl CodingTool {
             } = &self.kind
         {
             match model {
-                UnsupportedImageModel::Current(model) => {
+                UnsupportedImageModel::Current(_) | UnsupportedImageModel::Selected(_) => {
+                    let id = match model {
+                        UnsupportedImageModel::Current(model) => model.snapshot().unsupported_model,
+                        UnsupportedImageModel::Selected(id) => Some(id.clone()),
+                        UnsupportedImageModel::Legacy => unreachable!(),
+                    };
                     if data["content"]
                         .as_array()
                         .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
-                        && let Some(id) = model.unsupported_model()
+                        && let Some(id) = id
                     {
                         return Outcome::StructuredWithDetails {
                             data,
@@ -6676,6 +6790,57 @@ mod tests {
                 .to_string()
                 .contains("invalid model image resize profile")
         );
+    }
+
+    #[test]
+    fn live_read_policy_preserves_in_flight_image_limits_and_updates_the_next_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sample.png");
+        image::RgbImage::from_pixel(64, 32, image::Rgb([12, 34, 56]))
+            .save(&path)
+            .unwrap();
+        let model = ReadImageModel::default();
+        let read = LiveReadTool {
+            tool: CodingTool {
+                root: directory.path().into(),
+                unrestricted: true,
+                shell: ShellConfig::default(),
+                kind: Kind::Read {
+                    auto_resize: true,
+                    profile: None,
+                    unsupported_image_model: None,
+                },
+            },
+            model: model.clone(),
+        };
+        let profile = |width| crate::image_profile::ImageResizeProfile {
+            max_width: Some(width),
+            ..Default::default()
+        };
+        model.set_profile("small", Some(false), Some(profile(32)));
+        let in_flight = read.snapshot();
+        model.set_profile("smaller", Some(true), Some(profile(16)));
+        for (tool, dimensions, unsupported) in [
+            (in_flight, "32x16", Some("small")),
+            (read.snapshot(), "16x8", None),
+        ] {
+            let result = tool.read_image(&path).unwrap().unwrap();
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(dimensions)
+            );
+            let outcome = tool.image_outcome(result, true);
+            let model_id = match &outcome {
+                Outcome::StructuredWithDetails { details, .. } => {
+                    details["imageUnsupportedByModel"].as_str()
+                }
+                Outcome::Structured { .. } => None,
+                other => panic!("expected an image, got {other:?}"),
+            };
+            assert_eq!(model_id, unsupported);
+        }
     }
 
     #[test]

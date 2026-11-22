@@ -1796,6 +1796,7 @@ impl Agent<'_> {
         let lifecycle = crate::lifecycle::enabled(self.registry);
         let mut turn_index = completed_run_turns(session, run_id);
         let mut next_request_index = requests_used;
+        let mut selected = None;
         while next_request_index < self.limits.model_requests {
             let request_index = next_request_index;
             next_request_index += 1;
@@ -1810,18 +1811,44 @@ impl Agent<'_> {
                     runtime_prompt = prompt;
                 }
             }
-            let active = Agent {
-                registry: &runtime_registry,
-                system_prompt: &runtime_prompt,
-                model: self.model,
-                model_name: self.model_name,
-                limits: self.limits.clone(),
-            };
-
             queue_inputs(session, followups, observer)?;
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
+            // Use one adapter and its limits for the entire request and tool
+            // dispatch. A selection received during streaming is used only
+            // once this turn reaches a new request boundary.
+            if let Some(next) = session
+                .live_model
+                .as_ref()
+                .and_then(crate::LiveModelControl::selection)
+                && selected
+                    .as_ref()
+                    .is_none_or(|current| !Arc::ptr_eq(current, &next))
+                && pending.is_none()
+                && overflow_recovery_state(session, run_id)
+                    .is_none_or(|recovery| recovery.compacted)
+            {
+                session.apply_live_model_selection(&next, observer)?;
+                selected = Some(next);
+            }
+            let (model, model_name, limits) = selected.as_ref().map_or_else(
+                || (self.model, self.model_name, self.limits.clone()),
+                |selection| {
+                    (
+                        selection.adapter.as_ref(),
+                        selection.model.as_str(),
+                        selection.limits.clone(),
+                    )
+                },
+            );
+            let active = Agent {
+                registry: &runtime_registry,
+                system_prompt: &runtime_prompt,
+                model,
+                model_name,
+                limits: limits.clone(),
+            };
             // A recorded provider overflow survives process interruption. The
             // marker is committed before compaction so recovery is attempted at
             // most once, including after reopening the journal.
@@ -2532,9 +2559,9 @@ impl Agent<'_> {
                     let compact_agent = Agent {
                         registry: &runtime_registry,
                         system_prompt: &runtime_prompt,
-                        model: self.model,
-                        model_name: self.model_name,
-                        limits: self.limits.clone(),
+                        model,
+                        model_name,
+                        limits,
                     };
                     compact_agent
                         .compact_silent_overflow(
@@ -12905,6 +12932,127 @@ mod queue_tests {
         let old_branch =
             Session::from_records(restored.fork_records(before_clear).unwrap()).unwrap();
         assert_eq!(old_branch.queued_custom_messages().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_live_selection_is_applied_before_the_queued_followup_request() {
+        use futures_util::StreamExt;
+
+        struct Route {
+            id: &'static str,
+            started: Option<Arc<tokio::sync::Notify>>,
+            release: Arc<tokio::sync::Notify>,
+            seen: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Model for Route {
+            async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+                assert_eq!(request.model, "shared-model");
+                self.seen.lock().unwrap().push(self.id.to_owned());
+                if let Some(started) = &self.started {
+                    started.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(futures_util::stream::iter([
+                    Ok(crate::ModelEvent::Text(self.id.to_owned())),
+                    Ok(crate::ModelEvent::Complete {
+                        calls: Vec::new(),
+                        usage: Some(Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        }),
+                    }),
+                ])
+                .boxed())
+            }
+        }
+
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .record_request_identity("first-provider", "shared-model")
+            .unwrap();
+        let control = crate::LiveModelControl::default();
+        session.set_live_model_control(control.clone());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = Agent {
+            model: &Route {
+                id: "alpha",
+                started: Some(started.clone()),
+                release: release.clone(),
+                seen: seen.clone(),
+            },
+            model_name: "shared-model",
+            registry: &Registry::default(),
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let (sender, mut inputs) = mpsc::channel(2);
+        let switch = async {
+            started.notified().await;
+            control.select(Arc::new(crate::LiveModelSelection {
+                adapter: Arc::new(Route {
+                    id: "beta",
+                    started: None,
+                    release: release.clone(),
+                    seen: seen.clone(),
+                }),
+                provider: Some("second-provider".into()),
+                request_provider: "second-provider".into(),
+                model: "shared-model".into(),
+                thinking: Some("high".into()),
+                limits: Limits::default(),
+            }));
+            sender
+                .send(crate::QueuedInput {
+                    id: Uuid::new_v4(),
+                    kind: InputKind::FollowUp,
+                    content: "follow-up".into(),
+                })
+                .await
+                .unwrap();
+            release.notify_one();
+        };
+        let cancel = CancellationToken::new();
+        let mut observer = |_: Notification<'_>| {};
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(
+                agent.run_correlated(
+                    &mut session,
+                    Uuid::new_v4(),
+                    Some("initial".into()),
+                    &mut inputs,
+                    &cancel,
+                    &mut observer
+                ),
+                switch,
+            )
+        })
+        .await
+        .expect("live selection should settle");
+        assert_eq!(result.unwrap(), "beta");
+        assert_eq!(*seen.lock().unwrap(), ["alpha", "beta"]);
+        let mut provider = None;
+        let mut request_providers = Vec::new();
+        for record in session.records() {
+            match &record.event {
+                Event::SourceEntry { format, entry } if format == "pi-rs:request-identity" => {
+                    provider = entry["provider"].as_str();
+                }
+                Event::ModelRequested { .. } => request_providers.push(provider),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            request_providers,
+            [Some("first-provider"), Some("second-provider")]
+        );
+        assert_eq!(
+            session.model_selection(),
+            Some(("shared-model".into(), Some("high".into())))
+        );
     }
 
     struct WaitingModel(Arc<tokio::sync::Notify>);

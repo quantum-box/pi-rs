@@ -4,7 +4,7 @@ use pi_rs::{
     Agent, CancellationToken, Extension, ExtensionUi, Limits, ProjectResources, Registry, Result,
     Session, UiRequest, UiResponse,
 };
-use pi_rs_workbench::coding::{CodingTools, ShellConfig, ShellContext};
+use pi_rs_workbench::coding::{CodingTools, ReadImageModel, ShellConfig, ShellContext};
 use pi_rs_workbench::{CommandPolicy, ProjectInstructions, Tools, WorkbenchContext};
 use serde_json::json;
 use std::sync::Arc;
@@ -13,11 +13,11 @@ use std::time::Duration;
 pub struct Runtime {
     pub auto_compaction: pi_rs::AutoCompactionControl,
     pub retry: pi_rs::RetryControl,
-    provider: super::image_policy::WorkbenchModel,
-    read_image_model: pi_rs_workbench::coding::ReadImageModel,
+    pub(super) provider: super::image_policy::WorkbenchModel,
     pub registry: Registry,
     pub extension_sources: std::collections::BTreeMap<String, std::path::PathBuf>,
     shell: ShellConfig,
+    read_image_model: ReadImageModel,
     system_prompt: String,
     pub resources: resources::Resources,
     resource_origins: ResourceOrigins,
@@ -358,14 +358,7 @@ impl Runtime {
             }
         }
         self.shell.set_context_with_external_id(
-            ShellContext {
-                id: session_id,
-                path: (!args.no_session && !args.ephemeral_worker_session)
-                    .then(|| args.session.clone()),
-                provider: args.provider.id().into(),
-                model: args.model.clone(),
-                reasoning_level: Some(args.thinking.clone().unwrap_or_else(|| "off".into())),
-            },
+            shell_session_context(args, session),
             session.external_session_id(),
         );
         self.auto_compaction.set_token_settings(
@@ -380,6 +373,47 @@ impl Runtime {
             limits: effective_limits(args),
         }
     }
+    pub(super) fn refresh_read_image_policy(&self, args: &Cli) {
+        set_read_image_policy(
+            &self.read_image_model,
+            &args.model_profiles,
+            &args.provider,
+            &args.model,
+        );
+    }
+
+    pub(super) fn live_tool_model_context<'a>(
+        &self,
+        args: &'a Cli,
+        session: &Session,
+    ) -> impl FnMut(&pi_rs::Record) + use<'a> {
+        let shell = self.shell.clone();
+        let policy = self.read_image_model.clone();
+        let profiles = &args.model_profiles;
+        let mut context = shell_session_context(args, session);
+        let external_id = session.external_session_id();
+        move |record| {
+            let pi_rs::Event::ModelSelected {
+                model,
+                provider,
+                thinking,
+            } = &record.event
+            else {
+                return;
+            };
+            let provider = provider
+                .as_deref()
+                .unwrap_or(super::providers::Provider::Ollama.id());
+            if let Some(provider) = profiles.provider(provider) {
+                set_read_image_policy(&policy, profiles, &provider, model);
+            }
+            context.provider = provider.into();
+            context.model = model.clone();
+            context.reasoning_level = Some(thinking.clone().unwrap_or_else(|| "off".into()));
+            shell.set_context_with_external_id(context.clone(), external_id.clone());
+        }
+    }
+
     pub fn mcp_status(&self, args: &Cli) -> Result<()> {
         let servers = self.catalog.servers.lock().expect("MCP catalogs");
         for (name, value) in
@@ -771,10 +805,8 @@ impl Runtime {
     }
 
     pub fn configure_model_options(&mut self, args: &Cli, reported: bool) -> Result<()> {
-        let provider = model_client(args, reported, true)?;
-        self.read_image_model
-            .set(&args.model, provider.supports_images);
-        self.provider = provider;
+        self.provider = model_client(args, reported, true)?;
+        self.refresh_read_image_policy(args);
         Ok(())
     }
     pub async fn session_lifecycle(
@@ -1309,12 +1341,11 @@ async fn configure_after(
             .map(|url| (url, std::env::var("PI_RS_ORDERS_TOKEN").ok()));
         registry.register(Arc::new(Tools::new(&args.workspace, order_config)?))?;
         let shell = shell_config(args);
-        let read_image_model = pi_rs_workbench::coding::ReadImageModel::default();
+        let read_image_model = ReadImageModel::default();
         registry.register(Arc::new(
             CodingTools::local(&args.workspace)?
                 .with_shell_config(shell.clone())
                 .with_image_resize(args.settings.resize_model_images())
-                .with_image_profile(args.model_image_resize())
                 .with_read_image_model(read_image_model.clone()),
         ))?;
         let extra = mcp_config::discover_registered(
@@ -1355,7 +1386,12 @@ async fn configure_after(
         });
         registry.set_refresher(catalog.clone());
         let provider = model_client(args, super::thinking::reported(args).is_some(), true)?;
-        read_image_model.set(&args.model, provider.supports_images);
+        set_read_image_policy(
+            &read_image_model,
+            &args.model_profiles,
+            &args.provider,
+            &args.model,
+        );
 
         // Subprocesses must inherit the frontend's live controls rather than
         // re-resolving them from project settings when a worker is replaced.
@@ -1411,7 +1447,31 @@ async fn configure_after(
     result
 }
 
-fn effective_limits(args: &Cli) -> Limits {
+fn set_read_image_policy(
+    policy: &ReadImageModel,
+    profiles: &super::model_profiles::Profiles,
+    provider: &super::providers::Provider,
+    model: &str,
+) {
+    let profile = profiles.model(provider, model);
+    policy.set_profile(
+        model,
+        profile.as_ref().and_then(|model| model.supports_images()),
+        profile.as_ref().and_then(|model| model.image_resize()),
+    );
+}
+
+fn shell_session_context(args: &Cli, session: &Session) -> ShellContext {
+    ShellContext {
+        id: session.session_id(),
+        path: (!args.no_session && !args.ephemeral_worker_session).then(|| args.session.clone()),
+        provider: args.provider.id().into(),
+        model: args.model.clone(),
+        reasoning_level: Some(args.thinking.clone().unwrap_or_else(|| "off".into())),
+    }
+}
+
+pub(super) fn effective_limits(args: &Cli) -> Limits {
     Limits {
         model_requests: args.max_requests,
         output_tokens_per_request: args.effective_max_output_tokens(),
