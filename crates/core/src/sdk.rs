@@ -1799,6 +1799,10 @@ impl AgentSession {
     pub fn registered_tool_info(&self) -> Vec<crate::RegisteredToolInfo> {
         self.registry.registered_tool_info()
     }
+    /// Snapshot the configured tool renderer chain for host presentation.
+    pub fn tool_renderers(&self) -> crate::ToolRendererRegistry {
+        self.registry.tool_renderers()
+    }
     /// Snapshot configured custom-message renderers for the host presentation.
     pub fn custom_message_renderers(&self) -> crate::CustomMessageRenderers {
         self.registry.custom_message_renderers()

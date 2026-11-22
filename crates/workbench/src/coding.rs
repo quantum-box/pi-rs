@@ -2399,20 +2399,6 @@ fn image_omission(mime: &str, reason: &str) -> Value {
     json!({"content":[{"type":"text", "text":format!("Read image file [{mime}]\n{reason}")}]})
 }
 
-fn directory_collator(locale: &str) -> Result<icu_collator::CollatorBorrowed<'static>> {
-    let locale = locale
-        .split(['.', '@'])
-        .next()
-        .unwrap_or_default()
-        .replace('_', "-");
-    let locale = locale
-        .parse::<icu_locale_core::Locale>()
-        .map(icu_collator::CollatorPreferences::from)
-        .unwrap_or_default();
-    icu_collator::Collator::try_new(locale, Default::default())
-        .map_err(|error| Error::Config(format!("Cannot initialize directory collation: {error}")))
-}
-
 fn directory_read_error(error: std::io::Error, requested: &Path, unrestricted: bool) -> Error {
     #[cfg(unix)]
     if unrestricted && error.raw_os_error() == Some(libc::EACCES) {
@@ -2424,13 +2410,6 @@ fn directory_read_error(error: std::io::Error, requested: &Path, unrestricted: b
     #[cfg(not(unix))]
     let _ = (requested, unrestricted);
     Error::Config(format!("Cannot read directory: {error}"))
-}
-
-fn directory_locale(mut get: impl FnMut(&str) -> Option<String>) -> String {
-    ["LC_ALL", "LC_MESSAGES", "LANG"]
-        .into_iter()
-        .find_map(&mut get)
-        .unwrap_or_default()
 }
 
 fn is_ecmascript_whitespace(character: char) -> bool {
@@ -2635,21 +2614,14 @@ fn local_numeric_limit(args: &Value, default: f64) -> f64 {
     args.get("limit").and_then(Value::as_f64).unwrap_or(default)
 }
 
-// fd receives String(limit), and its --max-results parser accepts usize. Zero
-// is fd's unlimited sentinel; the original number remains relevant to notices.
+// Pi passes String(limit + 1) to fd to detect when the result set exceeds the displayed limit.
 fn fd_numeric_limit(value: f64) -> std::result::Result<usize, String> {
     let text = js_number(value);
-    let reason = if text.starts_with('-') {
-        return Err("error: a value is required for '--max-results <count>' but none was supplied\n\nFor more information, try '--help'.".into());
-    } else {
-        match text.parse::<usize>() {
-            Ok(limit) => return Ok(limit),
-            Err(error) => error.to_string(),
-        }
-    };
-    Err(format!(
-        "error: invalid value '{text}' for '--max-results <count>': {reason}\n\nFor more information, try '--help'."
-    ))
+    text.parse::<usize>().map_err(|reason| {
+        format!(
+            "error: invalid value '{text}' for '--max-results <count>': {reason}\n\nFor more information, try '--help'."
+        )
+    })
 }
 
 fn grep_glob_overrides(
@@ -3179,7 +3151,7 @@ impl CodingTool {
             &crate::coding_paths::normalize(requested_path)?,
         );
         let path = self.path(requested_path)?;
-        let numeric_limit = local_numeric_limit(args, 500.0);
+        let numeric_limit = local_numeric_limit(args, 500.0).floor().max(1.0);
         let limit = args["limit"].as_u64().unwrap_or(500).min(100_000) as usize;
         if !path.is_dir() {
             return Err(Error::Config(format!(
@@ -3198,8 +3170,10 @@ impl CodingTool {
                 .map_err(|error| directory_read_error(error, &requested, self.unrestricted))?;
             entries.push((entry.file_name().to_string_lossy().to_lowercase(), entry));
         }
-        let locale = directory_locale(|key| std::env::var(key).ok());
-        let collator = directory_collator(&locale)?;
+        let locale = crate::locale::select(|key| std::env::var(key).ok());
+        let collator = crate::locale::collator(&locale).map_err(|error| {
+            Error::Config(format!("Cannot initialize directory collation: {error}"))
+        })?;
         entries.sort_by(|(left, _), (right, _)| collator.compare(left, right));
         let mut listing = crate::tool_output::Listing::new();
         let mut result_count = 0usize;
@@ -3254,10 +3228,10 @@ impl CodingTool {
             return Err(Error::Cancelled);
         }
         let is_find = matches!(self.kind, Kind::Find);
-        let numeric_find_limit = local_numeric_limit(args, 1000.0);
+        let numeric_find_limit = local_numeric_limit(args, 1000.0).floor().max(1.0);
         // fd parses its arguments before checking the search path.
         let unrestricted_find_limit = if is_find && self.unrestricted {
-            match fd_numeric_limit(numeric_find_limit) {
+            match fd_numeric_limit(numeric_find_limit + 1.0) {
                 Ok(limit) => Some(limit),
                 Err(output) => return Ok(pi_tool_failure(output)),
             }
@@ -3303,8 +3277,20 @@ impl CodingTool {
         });
         let limit = if is_find { limit } else { limit.max(1) };
         let pattern = string(args, "pattern")?;
+        let windows_pattern =
+            (is_find && self.unrestricted && cfg!(windows)).then(|| pattern.replace('\\', "/"));
+        let pattern = windows_pattern.as_deref().unwrap_or(pattern);
+        let pattern = if is_find && self.unrestricted {
+            pattern.trim_start_matches("./")
+        } else {
+            pattern
+        };
+        let is_path_pattern = pattern.contains('/');
+        let relative_find_pattern =
+            self.unrestricted && is_path_pattern && !Path::new(pattern).has_root();
         let glob = if is_find {
-            let pattern = if pattern.contains('/')
+            let pattern = if !self.unrestricted
+                && is_path_pattern
                 && !pattern.starts_with('/')
                 && !pattern.starts_with("**/")
             {
@@ -3376,6 +3362,7 @@ impl CodingTool {
         let mut find_count = 0usize;
         let mut find_listing = crate::tool_output::Listing::new();
         let mut find_line_count = 0usize;
+        let mut find_limit_exceeded = false;
         let mut walker = ignore::WalkBuilder::new(&base);
         walker.hidden(false);
         if is_find {
@@ -3408,7 +3395,7 @@ impl CodingTool {
             walker.overrides(grep_glob_overrides(&self.root, glob, false)?);
         }
         let mut find_error = None;
-        for entry in walker.build() {
+        'entries: for entry in walker.build() {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
@@ -3433,7 +3420,9 @@ impl CodingTool {
                 .ok()
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new(entry.file_name()));
-            let match_path = if pattern.contains('/') {
+            let match_path = if relative_find_pattern {
+                relative
+            } else if is_path_pattern {
                 entry.path()
             } else {
                 Path::new(entry.file_name())
@@ -3462,6 +3451,10 @@ impl CodingTool {
                 let is_directory = entry.file_type().is_some_and(|kind| kind.is_dir());
                 if self.unrestricted {
                     for line in find_pi_lines(&base, entry.path(), is_directory) {
+                        if find_line_count as f64 >= numeric_find_limit {
+                            find_limit_exceeded = true;
+                            break 'entries;
+                        }
                         find_listing.push(&line);
                         find_line_count += 1;
                     }
@@ -3475,7 +3468,7 @@ impl CodingTool {
                     results.push(path);
                 }
                 find_count += 1;
-                if find_count >= limit && !(self.unrestricted && limit == 0) {
+                if find_count >= limit {
                     break;
                 }
             }
@@ -3492,7 +3485,7 @@ impl CodingTool {
             }
             let mut details = Map::new();
             let mut notices = Vec::new();
-            if (find_line_count as f64) >= numeric_find_limit {
+            if find_limit_exceeded {
                 details.insert("resultLimitReached".into(), json!(numeric_find_limit));
                 notices.push(format!(
                     "{} results limit reached. Use limit={} for more, or refine pattern",
@@ -4581,7 +4574,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_empty_truncated_snapshot_keeps_placeholder_and_exit_status() {
+    fn shell_partial_line_snapshot_keeps_output_and_exit_status() {
         for code in [0, 2] {
             let input = format!("{}\n", "x".repeat(300_000));
             let mut output = super::super::shell_output::Accumulator::default();
@@ -4600,12 +4593,13 @@ mod tests {
             else {
                 panic!("missing structured result")
             };
-            assert!(output.starts_with(
-                "(no output)\n\n[Showing lines 2-1 of 1 (50.0KB limit). Full output: "
-            ));
+            assert!(output.starts_with(&format!(
+                "{}\n\n[Showing last 50.0KB of line 1 (line is 0B). Full output: ",
+                "x".repeat(50 * 1024)
+            )));
             assert_eq!(is_error, code != 0);
             assert_eq!(output.ends_with("Command exited with code 2"), code == 2);
-            assert_eq!(details.unwrap()["truncation"]["outputLines"], 0);
+            assert_eq!(details.unwrap()["truncation"]["outputLines"], 1);
             assert_eq!(structured_content["output"], input);
             assert_eq!(std::fs::read(&path).unwrap(), input.as_bytes());
             std::fs::remove_file(path).unwrap();
@@ -6967,7 +6961,7 @@ mod tests {
     #[test]
     fn directory_collation_matches_pi_for_punctuation_and_local_accents() {
         let sort = |locale, mut names: Vec<&'static str>| {
-            let collator = directory_collator(locale).unwrap();
+            let collator = crate::locale::collator(locale).unwrap();
             names.sort_by(|left, right| {
                 collator.compare(&left.to_lowercase(), &right.to_lowercase())
             });
@@ -6997,7 +6991,7 @@ mod tests {
     #[test]
     fn directory_locale_uses_node_message_locale_precedence() {
         let select = |all: Option<&str>, messages: Option<&str>, lang: Option<&str>| {
-            directory_locale(|key| match key {
+            crate::locale::select(|key| match key {
                 "LC_ALL" => all.map(str::to_owned),
                 "LC_MESSAGES" => messages.map(str::to_owned),
                 "LANG" => lang.map(str::to_owned),
@@ -7015,7 +7009,8 @@ mod tests {
         assert_eq!(select(None, None, Some("en_US.UTF-8")), "en_US.UTF-8");
         assert_eq!(select(Some(""), Some("sv_SE.UTF-8"), None), "");
         let collator =
-            directory_collator(&select(None, Some("sv_SE.UTF-8"), Some("en_US.UTF-8"))).unwrap();
+            crate::locale::collator(&select(None, Some("sv_SE.UTF-8"), Some("en_US.UTF-8")))
+                .unwrap();
         assert!(collator.compare("z", "ä").is_lt());
     }
 
@@ -7339,27 +7334,25 @@ mod tests {
         let token = pi_rs::CancellationToken::new();
         let outcome = tool.list(&json!({"limit": 1.5}), &token).unwrap();
         assert!(
-            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["entryLimitReached"] == json!(1.5))
+            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["entryLimitReached"] == json!(1.0))
         );
         tool.kind = Kind::Find;
         let outcome = tool
             .search(&json!({"pattern":"*", "limit": 0.0}), &token)
             .unwrap();
         assert!(
-            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["resultLimitReached"] == json!(0.0))
+            matches!(&outcome, Outcome::SucceededWithDetails { details, .. } if details["resultLimitReached"] == json!(1.0))
         );
-        let failed = tool
+        let rounded = tool
             .search(&json!({"pattern":"*", "limit":1.5}), &token)
             .unwrap();
-        assert!(failed.is_error());
-        assert_eq!(
-            failed.tool_content(),
-            "error: invalid value '1.5' for '--max-results <count>': invalid digit found in string\n\nFor more information, try '--help'."
-        );
+        assert_eq!(rounded.tool_content(), outcome.tool_content());
         let missing = json!({"pattern":"*", "path":"missing", "limit":1.5});
-        let missing_outcome = tool.search(&missing, &token).unwrap();
-        assert!(missing_outcome.is_error());
-        assert_eq!(missing_outcome.tool_content(), failed.tool_content());
+        let missing_error = tool.search(&missing, &token).unwrap_err().to_string();
+        assert!(
+            missing_error.contains("is not a directory."),
+            "{missing_error}"
+        );
         tool.unrestricted = false;
         assert!(tool.search(&missing, &token).is_err());
         assert_eq!(js_number(9007199254740993_u64 as f64), "9007199254740992");
@@ -7422,21 +7415,20 @@ mod tests {
             shell: ShellConfig::default(),
             kind: Kind::Find,
         };
-        for limit in [1, 2] {
-            let output = tool
+        for (limit, expected) in [
+            (
+                1,
+                "foo\n\n[1 results limit reached. Use limit=2 for more, or refine pattern]",
+            ),
+            (2, "foo\nbar"),
+        ] {
+            let outcome = tool
                 .search(
                     &json!({"pattern":"*","limit":limit}),
                     &pi_rs::CancellationToken::new(),
                 )
-                .unwrap()
-                .tool_content();
-            assert_eq!(
-                output,
-                format!(
-                    "foo\nbar\n\n[{limit} results limit reached. Use limit={} for more, or refine pattern]",
-                    limit * 2
-                )
-            );
+                .unwrap();
+            assert_eq!(outcome.tool_content(), expected);
         }
     }
 
@@ -7524,6 +7516,52 @@ mod tests {
                 &pi_rs::CancellationToken::new()
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn unrestricted_find_anchors_relative_globs_at_search_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for path in ["src/a.ts", "pkg/src/b.ts", "CaseDir/mixed.ts"] {
+            let target = root.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, "").unwrap();
+        }
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root,
+            kind: Kind::Find,
+        };
+        let token = pi_rs::CancellationToken::new();
+        for (pattern, expected) in [
+            ("src/*.ts", "src/a.ts"),
+            ("./src/*.ts", "src/a.ts"),
+            ("././src/*.ts", "src/a.ts"),
+            ("**/src/*.ts", "pkg/src/b.ts\nsrc/a.ts"),
+            ("casedir/*.ts", "CaseDir/mixed.ts"),
+        ] {
+            assert_eq!(
+                tool.search(&json!({"pattern": pattern}), &token)
+                    .unwrap()
+                    .tool_content(),
+                expected,
+                "{pattern}"
+            );
+        }
+        assert_eq!(
+            tool.search(&json!({"pattern":"src/*.ts", "path":"pkg"}), &token)
+                .unwrap()
+                .tool_content(),
+            "src/b.ts"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            tool.search(&json!({"pattern":r"src\*.ts"}), &token)
+                .unwrap()
+                .tool_content(),
+            "src/a.ts"
         );
     }
 
@@ -8124,7 +8162,25 @@ mod tests {
             return;
         }
         let root = tempfile::tempdir().unwrap();
-        let command = "python3 -c 'import os,time; parent=os.getppid(); open(\"ready\",\"w\").close();\nwhile os.getppid()==parent: time.sleep(.001)\nend=time.monotonic()+.6; os.write(1,b\"out0\\n\"); os.write(2,b\"err0\\n\");\nwhile time.monotonic()<end:\n os.write(1,b\".\"); os.write(2,b\".\"); until=time.monotonic()+.002\n while time.monotonic()<until: pass\nos.write(1,b\"out11\\n\"); os.write(2,b\"err11\\n\")' & while [ ! -f ready ]; do sleep .01; done; rm ready; exit 0";
+        // Yield between writes so the producer and pipe readers can run on
+        // constrained CI hosts. The stream still outlives the idle window.
+        let command = r#"python3 -c '
+import os
+import time
+
+parent = os.getppid()
+open("ready", "w").close()
+while os.getppid() == parent:
+    time.sleep(.001)
+os.write(1, b"out0\n")
+os.write(2, b"err0\n")
+for _ in range(80):
+    os.write(1, b".")
+    os.write(2, b".")
+    time.sleep(.004)
+os.write(1, b"out11\n")
+os.write(2, b"err11\n")
+' & while [ ! -f ready ]; do sleep .01; done; rm ready; exit 0"#;
         let local = CodingTool {
             root: root.path().to_path_buf(),
             unrestricted: true,
@@ -8176,8 +8232,14 @@ mod tests {
         .await
         .unwrap();
         let output = result.tool_content();
-        assert!(output.contains("out11\n"), "{output:?}");
-        assert!(output.contains("err11\n"), "{output:?}");
+        assert!(
+            output.contains("out11\n"),
+            "backend stdout missing: {output:?}"
+        );
+        assert!(
+            output.contains("err11\n"),
+            "backend stderr missing: {output:?}"
+        );
     }
 
     #[cfg(unix)]
