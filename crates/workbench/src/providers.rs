@@ -310,7 +310,7 @@ impl Provider {
                 let token = token.ok_or_else(missing_key)?;
                 let mut client = Google::new(endpoint, &token)?;
                 if adapter == Adapter::GoogleVertex {
-                    client = client.with_vertex(bearer)?;
+                    client = client.with_vertex(auth != RequestAuth::Automatic)?;
                 }
                 if self != &Self::Google {
                     client = client.with_provider(self.id(), self.replay_scope(adapter, endpoint));
