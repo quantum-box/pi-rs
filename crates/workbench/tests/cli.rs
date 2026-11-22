@@ -4090,6 +4090,69 @@ fn rpc_replacement_compaction_edit_case(live_retry: bool) {
     );
 }
 
+#[tokio::test]
+async fn rpc_manual_compaction_preflight_has_only_compaction_events() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let root = tempfile::tempdir().unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--offline",
+            "--no-approve",
+            "--no-extensions",
+            "--no-mcp",
+            "--no-session",
+            "--mode",
+            "rpc",
+            "--provider",
+            "ollama",
+            "--model",
+            "fixture",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let events = tokio::time::timeout(Duration::from_secs(20), async {
+        input
+            .write_all(b"{\"id\":\"compact\",\"type\":\"compact\"}\n")
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(line) = output.next_line().await.unwrap() {
+            let event: Value = serde_json::from_str(&line).unwrap();
+            match event["type"].as_str().unwrap() {
+                "compaction_start" | "compaction_end" | "agent_start" | "agent_end"
+                | "agent_settled" | "error" | "response" => events.push(event),
+                _ => {}
+            }
+            if events.last().is_some_and(|event| event["id"] == "compact") {
+                break;
+            }
+        }
+        drop(input);
+        assert!(child.wait().await.unwrap().success());
+        events
+    })
+    .await
+    .expect("manual compaction did not settle");
+    assert_eq!(
+        events,
+        [
+            json!({"type":"compaction_start","reason":"manual"}),
+            json!({"type":"compaction_end","reason":"manual","aborted":false,"willRetry":false,
+            "errorMessage":"Compaction failed: Nothing to compact (session too small)"}),
+            json!({"id":"compact","type":"response","command":"compact","success":false,
+            "error":"Nothing to compact (session too small)"}),
+        ]
+    );
+}
+
 #[test]
 fn rpc_replacement_worker_keeps_retry_disabled() {
     rpc_replacement_retry_case(true);
@@ -5608,6 +5671,146 @@ fn scoped_thinking_applies_to_new_sessions_and_resumes_restore_branch_thinking()
                 .unwrap();
         assert_eq!(state["data"]["model"]["id"], expected_model, "{state}");
         assert_eq!(state["data"]["thinkingLevel"], expected_thinking, "{state}");
+    }
+}
+
+#[test]
+fn resumed_pi_system_updates_follow_the_selected_provider_capability() {
+    for (api, input, path, events) in [
+        (
+            "openai-responses",
+            "input",
+            "/v1/responses",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+        ),
+        (
+            "openai-completions",
+            "messages",
+            "/v1/chat/completions",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        ),
+        (
+            "anthropic-messages",
+            "messages",
+            "/v1/messages",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+        ),
+    ] {
+        for supports_updates in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+            let profile = json!({"providers":{"fixture-provider":{
+                "api":api,"baseUrl":endpoint,"apiKey":"fixture",
+                "models":[{"id":"fixture-model","input":["text"],"contextWindow":65536,
+                    "maxTokens":4096,"compat":{"supportsMidConvoSystemMessages":supports_updates}}]
+            }}});
+            std::fs::write(root.join("models.json"), profile.to_string()).unwrap();
+            let source = root.join("source.jsonl");
+            let entries = [
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"base","parentId":null,"message":{
+                    "role":"system","content":"Original","sections":{"keep":"Keep","state":"Old state"}
+                }}),
+                json!({"type":"message","id":"before","parentId":"base","message":{
+                    "role":"user","content":"Before update"
+                }}),
+                json!({"type":"message","id":"update","parentId":"before","message":{
+                    "role":"system","content":"Additional","sections":{"state":"New state","keep":null}
+                }}),
+                json!({"type":"message","id":"after","parentId":"update","message":{
+                    "role":"user","content":"After update"
+                }}),
+            ];
+            let journal: String = entries.iter().map(|entry| format!("{entry}\n")).collect();
+            std::fs::write(&source, &journal).unwrap();
+            let native = root.join("native.jsonl");
+            let command = || {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_pi-rs"));
+                command
+                    .current_dir(root)
+                    .env("PI_RS_HOME", root)
+                    .arg("--session")
+                    .arg(&native)
+                    .args(["--offline", "--no-trust", "--no-mcp", "--no-tools"]);
+                command
+            };
+            let imported = command().arg("import").arg(&source).output().unwrap();
+            assert!(
+                imported.status.success(),
+                "{}",
+                String::from_utf8_lossy(&imported.stderr)
+            );
+            let server = std::thread::spawn(move || {
+                let (mut socket, mut reader, first) = accept_proxy_request(listener);
+                assert!(first.starts_with(&format!("POST {path} ")), "{first}");
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let mut body = vec![0; length.unwrap()];
+                reader.read_exact(&mut body).unwrap();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}",
+                    events.len()
+                ).unwrap();
+                serde_json::from_slice::<Value>(&body).unwrap()
+            });
+            let output = command()
+                .args([
+                    "--provider",
+                    "fixture-provider",
+                    "--model",
+                    "fixture-model",
+                    "--print",
+                    "Continue",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{api}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let body = server.join().unwrap();
+            let messages = body[input].as_array().unwrap();
+            let roles: Vec<_> = messages
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect();
+            let update = "Additional\n\nUpdated system prompt section \"state\":\n\nNew state\n\nRemoved system prompt section \"keep\".";
+            if api == "anthropic-messages" && supports_updates {
+                assert_eq!(roles, ["user", "system"], "{body}");
+                assert_eq!(body["system"][0]["text"], "Original\n\nKeep\n\nOld state");
+                assert_eq!(messages[1]["content"][0]["text"], update);
+            } else if api == "anthropic-messages" {
+                assert_eq!(roles, ["user"], "{body}");
+                assert_eq!(
+                    body["system"][0]["text"],
+                    "Original\n\nAdditional\n\nNew state"
+                );
+            } else if supports_updates {
+                assert_eq!(roles, ["system", "user", "system", "user", "user"], "{api}");
+                assert_eq!(messages[0]["content"], "Original\n\nKeep\n\nOld state");
+                assert_eq!(messages[2]["content"], update);
+            } else {
+                assert_eq!(roles, ["system", "user", "user", "user"], "{api}");
+                assert_eq!(
+                    messages[0]["content"],
+                    "Original\n\nAdditional\n\nNew state"
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&source).unwrap(), journal);
+        }
     }
 }
 

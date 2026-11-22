@@ -248,6 +248,17 @@ pub(super) fn run(
                         )),
                     )?;
                 }
+                if let Some(request) = pending_compact.take() {
+                    finished.busy = false;
+                    let event = response_value(
+                        &request,
+                        Err(Error::Config(
+                            "compaction worker exited before returning a result".into(),
+                        )),
+                    );
+                    emit(manual_compaction_end(&event, false))?;
+                    emit(event)?;
+                }
                 if finished.busy {
                     for event in stream.settle(false, status.success()) {
                         emit(event)?;
@@ -257,14 +268,6 @@ pub(super) fn run(
                 }
                 if let Some(request) = pending_abort.take() {
                     response(&request, Ok(None))?;
-                }
-                if let Some(request) = pending_compact.take() {
-                    response(
-                        &request,
-                        Err(Error::Config(
-                            "compaction worker exited before returning a result".into(),
-                        )),
-                    )?;
                 }
                 if let Some(request) = pending_bash.take() {
                     response(
@@ -2892,6 +2895,18 @@ fn extension_error_for_rpc(mut event: Value) -> Value {
     event
 }
 
+fn manual_compaction_end(response: &Value, aborted: bool) -> Value {
+    let mut event = json!({
+        "type":"compaction_end","reason":"manual","aborted":aborted,"willRetry":false,
+    });
+    if response["success"] == true {
+        event["result"] = response["data"].clone();
+    } else if !aborted && let Some(error) = response["error"].as_str() {
+        event["errorMessage"] = json!(format!("Compaction failed: {error}"));
+    }
+    event
+}
+
 fn forward_event(
     event: Value,
     busy: &mut bool,
@@ -2932,16 +2947,7 @@ fn forward_event(
         Some("response") if event["command"] == "compact" => {
             pending_compact.take();
             *busy = false;
-            let mut completed = json!({
-                "type":"compaction_end","reason":"manual",
-                "aborted":stream.aborted(),"willRetry":false,
-            });
-            if event["success"] == true {
-                completed["result"] = event["data"].clone();
-            } else {
-                completed["errorMessage"] = event["error"].clone();
-            }
-            emit(completed)?;
+            emit(manual_compaction_end(&event, stream.aborted()))?;
             emit(event)?;
             if let Some(request) = pending_abort.take() {
                 response(&request, Ok(None))?;
@@ -2987,12 +2993,18 @@ fn forward_event(
             *busy = true;
             stream.reset();
             if pending_compact.is_some() {
-                emit(json!({"type":"compaction_start","reason":"manual"}))?;
+                return emit(json!({"type":"compaction_start","reason":"manual"}));
             }
             emit(json!({"type":"agent_start"}))
         }
+        Some("agent_settled") if pending_compact.is_some() => {
+            // The compact response ends this operation and releases any
+            // abort response waiting for it.
+            stream.mark_aborted(event["aborted"] == true);
+            Ok(())
+        }
         Some("agent_settled") => {
-            *busy = pending_compact.is_some();
+            *busy = false;
             if event["started"] != false {
                 for mapped in stream.settle(event["aborted"] == true, event["success"] == true) {
                     emit(mapped)?;
@@ -3001,11 +3013,7 @@ fn forward_event(
             emit(
                 json!({"type":"agent_settled","aborted":event["aborted"] == true || (event["started"] != false && stream.aborted())}),
             )?;
-            // Manual compaction can emit agent_settled before its command
-            // response. An abort must wait until the whole operation is idle.
-            if pending_compact.is_none()
-                && let Some(request) = pending_abort.take()
-            {
+            if let Some(request) = pending_abort.take() {
                 response(&request, Ok(None))?;
             }
             Ok(())
@@ -4162,6 +4170,30 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn manual_compaction_end_has_result_or_diagnostic_unless_aborted() {
+        let failed = json!({"success":false,"error":"Nothing to compact (session too small)"});
+        assert_eq!(
+            manual_compaction_end(&failed, false),
+            json!({"type":"compaction_end","reason":"manual","aborted":false,"willRetry":false,
+                "errorMessage":"Compaction failed: Nothing to compact (session too small)"})
+        );
+        assert_eq!(
+            manual_compaction_end(
+                &json!({"success":false,"error":"Compaction cancelled"}),
+                true
+            ),
+            json!({"type":"compaction_end","reason":"manual","aborted":true,"willRetry":false})
+        );
+        let result = json!({"summary":"summary","firstKeptEntryId":"12","tokensBefore":1000,
+            "estimatedTokensAfter":100});
+        assert_eq!(
+            manual_compaction_end(&json!({"success":true,"data":result}), false),
+            json!({"type":"compaction_end","reason":"manual","aborted":false,"willRetry":false,
+                "result":result})
+        );
     }
 
     #[test]
