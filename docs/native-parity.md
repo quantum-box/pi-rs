@@ -6430,6 +6430,19 @@ Known credentials and configured header values are redacted before error fields
 are classified, including for stream errors.
 Other provider adapters still need equivalent quota classification.
 
+### Provider stream retry classification
+
+The native error classifier recognizes upstream Pi's transient gateway stream
+failures, including temporary provider unavailability, incomplete replies, and
+connection resets. It recognizes Cloudflare 525 in provider error text or codes.
+Chat Completions finish reasons `error` and `network_error` reach the agent's
+configured retry policy. Quota and billing failures still take precedence.
+A generic `api_error` preserves explicit context overflow unless the provider
+also signals a transient failure. Content-filter stops and a generic provider unavailable error remain permanent.
+Tests cover structured and textual provider errors, quota precedence, and
+loopback Chat Completions streams. Live gateway failures were unverified.
+[Upstream retry classifier](https://github.com/earendil-works/pi/blob/9c4652688590abb836b40ebd1e4725ecf9a7c7d1/packages/ai/src/utils/retry.ts)
+
 ### Bedrock quota retry classification
 
 Bedrock service and stream exceptions stop agent retries when their redacted

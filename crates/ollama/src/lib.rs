@@ -1611,8 +1611,14 @@ impl Ollama {
                             index: index as u64, id, name, arguments,
                         });
                     }
-                    if mistral && choice.finish_reason.as_deref() == Some("error") {
-                        Err(Error::RetryableModel("Mistral reported a server error".into()))?;
+                    match choice.finish_reason.as_deref() {
+                        Some("error") if mistral => {
+                            Err(Error::RetryableModel("Mistral reported a server error".into()))?;
+                        }
+                        Some("error" | "network_error") => {
+                            Err(Error::RetryableModel("provider returned a transient finish reason".into()))?;
+                        }
+                        _ => {}
                     }
                     metadata.finish_reason = choice.finish_reason.filter(|reason| {
                         !infer_finish || matches!(reason.as_str(), "length" | "content_filter")
@@ -2470,6 +2476,50 @@ mod content_tests {
                 assert!(!error.to_string().contains(value));
                 worker.join().unwrap();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_completions_error_finish_reasons_preserve_retryability() {
+        use std::io::{Read, Write};
+        for (reason, retryable) in [
+            ("error", true),
+            ("network_error", true),
+            ("content_filter", false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let event = json!({"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":reason}]});
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = Ollama::new(&format!("http://{address}"), None).unwrap();
+            let mut stream = model
+                .stream(ModelRequest {
+                    model: "m".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                })
+                .await
+                .unwrap();
+            let error = loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => {}
+                    None => panic!("missing stream error for {reason}"),
+                }
+            };
+            assert_eq!(
+                matches!(error, Error::RetryableModel(_)),
+                retryable,
+                "{reason}"
+            );
+            worker.join().unwrap();
         }
     }
 
