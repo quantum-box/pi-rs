@@ -460,6 +460,13 @@ mod tests {
                 json!({"type":"text","text":"edited"}),
             ),
         ] {
+            let mut blocks = vec![visible, empty_signed.clone(), call.clone()];
+            let mut expected = vec![edited, empty_signed, call];
+            if api == ModelApi::PiMessages {
+                let origin = json!({"type":"pi-rs:pi-messages-origin"});
+                blocks.insert(0, origin.clone());
+                expected.insert(0, origin);
+            }
             let metadata = ModelMetadata {
                 provider_api: Some(api),
                 replay: Some(Box::new(ProviderReplay {
@@ -467,7 +474,7 @@ mod tests {
                         provider: "fixture".into(),
                         model: "fixture".into(),
                     },
-                    blocks: vec![visible, empty_signed.clone(), call.clone()],
+                    blocks,
                 })),
                 ..Default::default()
             };
@@ -475,7 +482,7 @@ mod tests {
                 replace_assistant_replay_text(&metadata, "edited")
                     .unwrap()
                     .blocks,
-                [edited, empty_signed, call]
+                expected
             );
         }
     }
