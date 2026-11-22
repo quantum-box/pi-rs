@@ -2230,8 +2230,10 @@ fn markdown_plain_at_depth(
                 gap
             };
             let mut blank = false;
-            for line in gap.lines() {
-                if line.trim().is_empty() {
+            // Ignore the indentation of the next block. Only complete
+            // intervening lines can represent blank rows.
+            for line in gap.split_inclusive('\n') {
+                if line.ends_with('\n') && line.trim().is_empty() {
                     if !blank {
                         lines.push(Line::default());
                     }
@@ -4552,6 +4554,33 @@ mod tests {
         let lines = markdown("first  \nsecond", &theme, 80);
         assert_eq!(lines.len(), 2);
     }
+    #[test]
+    fn markdown_list_block_indentation_does_not_add_a_blank_row() {
+        let rule = format!("  {}", "─".repeat(34));
+        let nested_rule = format!("│   {}", "─".repeat(32));
+        for (source, expected) in [
+            ("- one\n  ***\n\n  text", vec!["- one", &rule, "", "  text"]),
+            (
+                "- one\n  ### head\n\n  text",
+                vec!["- one", "  ### head", "", "  text"],
+            ),
+            (
+                "- one\n  > quote\n  ***\n- tail",
+                vec!["- one", "  │ quote", &rule, "- tail"],
+            ),
+            (
+                "> - one\n>   > quote\n>   ----\n> - tail",
+                vec!["│ - one", "│   │ quote", &nested_rule, "│ - tail"],
+            ),
+        ] {
+            let rendered: Vec<String> = markdown(source, &Theme::system(), 36)
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+                .collect();
+            assert_eq!(rendered, expected, "{source:?}");
+        }
+    }
+
     #[test]
     fn markdown_spaces_loose_list_items_at_each_depth() {
         let theme = Theme::system();
