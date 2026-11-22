@@ -1696,6 +1696,29 @@ mod final_strict_policy_tests {
     }
 
     #[test]
+    fn bedrock_final_model_policy_respects_bundled_capability_and_overrides() {
+        let profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers":{"amazon-bedrock":{
+                "modelOverrides":{
+                    "anthropic.claude-sonnet-4-6":{"compat":{"supportsStrictMode":false}}
+                }
+            }}
+        }))
+        .unwrap();
+        let policy = FinalStrictPolicy {
+            provider: profiles.provider("amazon-bedrock").unwrap(),
+            profiles,
+            selected_model: "anthropic.claude-fable-5-2".into(),
+            explicit_endpoint: false,
+            bound_support: None,
+        };
+        assert!(policy.baseline().unwrap());
+        assert!(!policy.support("anthropic.claude-sonnet-4-6").unwrap());
+        assert!(!policy.support("amazon.nova-micro-v1:0").unwrap());
+        assert!(!policy.support("unlisted").unwrap());
+    }
+
+    #[test]
     fn rewritten_model_must_use_same_route() {
         let profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"fixture":{
             "api":"openai-completions", "baseUrl":"http://127.0.0.1:1234/v1", "compat":{"supportsStrictMode":true},
