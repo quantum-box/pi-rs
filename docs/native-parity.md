@@ -131,7 +131,9 @@ scrollback. The tool-output, thinking-visibility, and thinking-level shortcuts
 report the new state using the same status row, as in Pi.
 During a streamed prompt, model and thinking shortcuts acknowledge a prepared
 selection without changing the request in flight. A queued follow-up uses the
-new route and effort. The worker commits the selection before the next request,
+new route and effort. Cycling models uses the destination's scoped or per-model
+thinking level, then the global default, then the current level. The worker
+commits the selection before the next request,
 or at settlement when the current prompt finishes without a follow-up. pi-rs
 uses the accepted model's configured image resize profile for new clipboard
 pastes and queued attachments.

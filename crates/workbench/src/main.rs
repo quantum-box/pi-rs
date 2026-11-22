@@ -699,6 +699,13 @@ impl Cli {
         if thinking.is_some() {
             selected.thinking = thinking;
         } else {
+            if matches!(source, pi_rs::ModelSelectSource::Cycle) {
+                selected.thinking = selected
+                    .settings
+                    .string("defaultThinkingLevel")
+                    .map(str::to_owned)
+                    .or_else(|| self.thinking.clone());
+            }
             selected.apply_model_thinking_defaults();
         }
         thinking::adjust(&mut selected);
