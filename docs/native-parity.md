@@ -4169,9 +4169,9 @@ Embedders can opt out of interleaving or request omitted thinking text while
 retaining its replay signature. Loopback requests verified the header and
 payload. Live authenticated interleaved thinking was unverified.
 
-Anthropic Messages uses per-reply effort for the six direct Anthropic and four
-OpenRouter catalog models marked `supportsMidConvoEffort`. The top-level
-effort stays low while system messages set the historical and active reply
+Anthropic Messages uses per-reply effort for Anthropic and OpenRouter catalog
+models marked `supportsMidConvoEffort`. The top-level effort stays low while
+system messages set the historical and active reply
 levels. Adaptive thinking drops signed blocks whose cached prefix no longer
 matches. Explicit off omits effort messages and block binding on models that
 can disable thinking. For models with an explicit null off mapping, an unset
@@ -5373,6 +5373,15 @@ with reasoning and image capabilities and token limits.
 The model picker and CLI can list them offline. Automatic environment keys
 are bound to the standard service endpoints, including the port and path.
 
+Anthropic Messages honors Pi's `supportsMidConvoSystemMessages` catalog metadata
+for direct Claude, GitHub Copilot, and OpenCode Zen. Model and provider profiles
+can override the capability. Native system updates are sent before the next
+emitted assistant turn or at the end of the transcript, preserving tool-call
+and tool-result adjacency. Other Messages models use one combined initial
+system prompt. Terminal and SDK tool declarations still represent the current
+tool set. Live requests using these models and authenticated gateways were
+unverified.
+
 ### Model-specific chat API checkpoint
 
 A native connection profile can declare the API per model. A model can
@@ -5394,10 +5403,13 @@ The offline Fireworks catalog matches the Pi 1.6.0 release. It includes
 16 Messages models and 11 Chat Completions models. DeepSeek V4.1 Flash
 1017 Ultra-fast uses adaptive thinking and image input on the Messages
 route. Kimi K3.1 Pro uses Chat Completions with model-specific reasoning
-and image support. The offline OpenRouter catalog includes 19 Messages
-models alongside Chat Completions. The official Messages routes use
-bearer authentication. Environment credentials and
-imported provider-wide keys or OpenRouter OAuth work on the official routes.
+and image support. The OpenRouter catalog follows Pi AI v1.6.0 and includes
+20 Messages models and 397 Chat Completions models. OpenRouter Chat Completions
+uses the system instruction role by default. Profiles can override the role or
+disable session affinity. OpenRouter Fable 5.2 uses Messages with per-reply
+effort. The official Messages routes use bearer authentication. Environment
+credentials, imported provider-wide keys, and OpenRouter OAuth work on those
+routes.
 Explicitly stored keys remain bound to their saved endpoints. Loopback tests
 covered adaptive thinking, effort mapping and replay with Fireworks empty
 signatures and OpenRouter signed blocks. Fireworks Kimi models retain
@@ -5558,6 +5570,13 @@ sends the 24-hour retention request. Provider and model overrides merge, and
 summary requests omit automatic keys and retention. Explicit sampling fields
 retain precedence. Native Ollama keeps long retention disabled by default as a
 pi-rs extension; its explicit compatibility setting can enable it.
+
+### Reported reasoning tokens
+
+OpenAI Responses and Chat Completions, Anthropic Messages, Gemini and Pi
+Messages retain provider-reported reasoning token counts. Pi JSON, RPC and
+session imports preserve the `usage.reasoning` field when available. Reasoning
+is part of total output and is counted once for budgets and cost estimates.
 
 ### Responses instruction role
 

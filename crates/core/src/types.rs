@@ -548,6 +548,9 @@ pub struct ModelMetadata {
     /// Provider-supplied visible reasoning, retained for session presentation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Provider-reported reasoning tokens already included in total output tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<AssistantDiagnostic>,
     /// Complete ordered assistant content required for provider-specific continuations.

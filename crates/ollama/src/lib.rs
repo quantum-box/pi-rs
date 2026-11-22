@@ -1378,6 +1378,7 @@ impl Ollama {
             }).eventsource();
             let mut calls = BTreeMap::<usize, CallDelta>::new();
             let mut usage = None;
+            let mut reported_cached_input = None;
             let mut metadata = ModelMetadata {
                 provider_api: Some(if mistral { ModelApi::MistralConversations } else { ModelApi::OpenaiCompletions }),
                 replay_identity: Some(identity.clone()),
@@ -1436,18 +1437,27 @@ impl Ollama {
                     metadata.provider_request_id = Some(id);
                 }
                 if let Some(stats) = chunk.usage {
-                    usage = Some(Usage { input_tokens: stats.prompt_tokens, output_tokens: stats.completion_tokens });
+                    let previous: Usage = usage.unwrap_or_default();
+                    let input_tokens = stats.prompt_tokens.unwrap_or(previous.input_tokens);
+                    usage = Some(Usage { input_tokens, output_tokens: stats.completion_tokens.unwrap_or(previous.output_tokens) });
                     let details = stats.prompt_tokens_details.unwrap_or_default();
-                    metadata.cached_input_tokens = details.cached_tokens
+                    let cached = details.cached_tokens
                         .or(stats.prompt_cache_hit_tokens)
                         .or(stats.cached_tokens);
-                    if mistral {
-                        metadata.cached_input_tokens = metadata.cached_input_tokens
-                            .or(stats.mistral_cached_tokens)
+                    let cached = if mistral {
+                        cached.or(stats.mistral_cached_tokens)
                             .or_else(|| stats.mistral_prompt_details.and_then(|details| details.cached_tokens))
-                            .map(|cached| cached.min(stats.prompt_tokens));
-                    }
-                    metadata.cache_creation_input_tokens = details.cache_write_tokens;
+                    } else {
+                        cached
+                    };
+                    reported_cached_input = cached.or(reported_cached_input);
+                    metadata.cached_input_tokens = reported_cached_input
+                        .map(|cached| if mistral { cached.min(input_tokens) } else { cached });
+                    metadata.cache_creation_input_tokens = details.cache_write_tokens
+                        .or(metadata.cache_creation_input_tokens);
+                    let nested = stats.completion_tokens_details.and_then(|details| details.reasoning_tokens);
+                    metadata.reasoning_output_tokens = nested.filter(|count| *count != 0)
+                        .or(stats.reasoning_tokens).or(nested).or(metadata.reasoning_output_tokens);
                     if let Some(cost) = stats.accounting.total() {
                         metadata.cost_usd = Some(cost);
                         metadata.cost_from_provider = Some(true);
@@ -1863,10 +1873,10 @@ struct Chunk {
 
 #[derive(Deserialize)]
 struct WireUsage {
-    #[serde(default)]
-    prompt_tokens: u64,
-    #[serde(default)]
-    completion_tokens: u64,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    completion_tokens_details: Option<CompletionTokenDetails>,
+    reasoning_tokens: Option<u64>,
     prompt_cache_hit_tokens: Option<u64>,
     cached_tokens: Option<u64>,
     #[serde(alias = "promptTokensDetails")]
@@ -1877,6 +1887,11 @@ struct WireUsage {
     mistral_prompt_details: Option<PromptTokenDetails>,
     #[serde(flatten)]
     accounting: ReportedUsageCost,
+}
+
+#[derive(Deserialize)]
+struct CompletionTokenDetails {
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -2046,8 +2061,11 @@ mod content_tests {
             let _ = socket.read(&mut request).unwrap();
             let body = format!(
                 "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-                json!({"choices":[{"index":0,"delta":{"reasoning_content":"internal"}}]}),
-                json!({"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]})
+                json!({"choices":[{"index":0,"delta":{"reasoning_content":"internal"}}],
+                    "usage":{"prompt_tokens":12,"reasoning_tokens":2,
+                        "completion_tokens_details":{"reasoning_tokens":4}}}),
+                json!({"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}],
+                    "usage":{"completion_tokens":9}})
             );
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
         });
@@ -2071,11 +2089,24 @@ mod content_tests {
             .unwrap()
             .collect::<Vec<_>>()
             .await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(ModelEvent::Complete {
+                usage: Some(Usage {
+                    input_tokens: 12,
+                    output_tokens: 9
+                }),
+                ..
+            })
+        )));
         let replay = events
             .into_iter()
             .rev()
             .find_map(|event| match event.unwrap() {
-                ModelEvent::Metadata(metadata) => metadata.replay,
+                ModelEvent::Metadata(metadata) => {
+                    assert_eq!(metadata.reasoning_output_tokens, Some(4));
+                    metadata.replay
+                }
                 _ => None,
             })
             .expect("reasoning replay");

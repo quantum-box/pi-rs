@@ -718,6 +718,8 @@ fn response_usage_metadata(
     ModelMetadata {
         cached_input_tokens: counts["cached_tokens"].as_u64(),
         cache_creation_input_tokens: counts["cache_write_tokens"].as_u64(),
+        reasoning_output_tokens: response["usage"]["output_tokens_details"]["reasoning_tokens"]
+            .as_u64(),
         catalog_cost_multiplier: multiplier.and_then(serde_json::Number::from_f64),
         ..Default::default()
     }
@@ -4590,6 +4592,34 @@ mod tests {
             assert!(saw_metadata && saw_usage);
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn responses_reasoning_usage_is_included_in_output_total() {
+        let response = json!({"type":"response.completed","response":{
+            "status":"completed","output":[],"usage":{"input_tokens":12,"output_tokens":9,
+                "output_tokens_details":{"reasoning_tokens":4}}
+        }});
+        let (client, server) = fixture(&format!("data: {response}\n\n")).await;
+        let events = client
+            .stream(request())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().any(|event| matches!(event,
+            Ok(ModelEvent::Metadata(metadata)) if metadata.reasoning_output_tokens == Some(4))));
+        assert!(matches!(
+            events.last(),
+            Some(Ok(ModelEvent::Complete {
+                usage: Some(Usage {
+                    input_tokens: 12,
+                    output_tokens: 9
+                }),
+                ..
+            }))
+        ));
+        server.await.unwrap();
     }
 
     async fn fixture(events: &str) -> (OpenAiResponses, tokio::task::JoinHandle<()>) {
