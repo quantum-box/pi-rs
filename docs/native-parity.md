@@ -5198,10 +5198,10 @@ with a five-minute idle timeout. An ongoing response can finish on its
 existing connection.
 An explicit connection-limit rejection before output opens a new connection
 once. Stream error statuses distinguish retryable service failures from
-terminal account limits. The native HTTP fallback sends uncompressed JSON.
+terminal account limits. Native HTTP SSE uses a zstd-compressed JSON body
+when compression succeeds. The WebSocket request stays a JSON text frame.
 
-OpenAI Responses
-and Codex models with `compat.supportsOpenAIGrammarTools` advertise grammar
+OpenAI Responses and Codex models with `compat.supportsOpenAIGrammarTools` advertise grammar
 tools as custom tools. They choose a nonempty Lark definition before a regex
 definition and map streamed input onto the single required string argument.
 Replay uses the matching call and result item types for the tools advertised
@@ -5679,8 +5679,9 @@ supports `supportsExplicitPromptCacheMode`. Provider and model compatibility
 overrides can disable long retention. Summary requests remove configured cache
 fields and, for explicit-mode models, request explicit caching with no
 breakpoints. ChatGPT plan requests omit these API-specific options. Responses requests use the active session ID as their prompt cache key,
-clamped to 64 Unicode characters, and omit it for summary requests. Pi’s
-Responses session-routing headers remain unsupported.
+clamped to 64 Unicode characters, and omit it for summary requests. Responses
+session-routing headers follow the provider or model's session-affinity format
+and are omitted for summary requests.
 
 ### Native Messages cache control checkpoint
 
