@@ -67,9 +67,27 @@
     }
     globalThis.tools = Object.freeze(tools);
     globalThis.ALL_TOOLS = Object.freeze(__catalog.map(({ name, description }) => Object.freeze({ name, description })));
-    globalThis.searchTools = async (query, options = {}) => JSON.parse(__search_tools(String(query), JSON.stringify(options)));
-    globalThis.describeTool = async name => JSON.parse(__describe_tool(String(name))) ?? undefined;
-    globalThis.describeNamespace = async name => JSON.parse(__describe_namespace(String(name))) ?? undefined;
+    globalThis.searchTools = async (...args) => {
+        // Normalize public arguments through the same JSON boundary as Pi.
+        const [query, options] = JSON.parse(JSON.stringify(args));
+        if (typeof query !== "string") throw new Error("searchTools() expects a query string");
+        const limit = options?.limit ?? 8;
+        if (!Number.isInteger(limit) || limit <= 0) throw new Error("searchTools() limit must be a positive integer");
+        const namespace = options?.namespace;
+        if (namespace != null && typeof namespace !== "string")
+            throw new Error("searchTools() namespace must be a string");
+        return JSON.parse(__search_tools(query, limit, namespace || undefined));
+    };
+    globalThis.describeTool = async (...args) => {
+        const [name] = JSON.parse(JSON.stringify(args));
+        if (typeof name !== "string") throw new Error("describeTool() expects a tool name");
+        return JSON.parse(__describe_tool(name)) ?? undefined;
+    };
+    globalThis.describeNamespace = async (...args) => {
+        const [name] = JSON.parse(JSON.stringify(args));
+        if (typeof name !== "string") throw new Error("describeNamespace() expects a namespace name");
+        return JSON.parse(__describe_namespace(name)) ?? undefined;
+    };
     const callModel = __call_model_operation;
     const modelType = type => {
         if (!["chat", "classifier", "image"].includes(type))
