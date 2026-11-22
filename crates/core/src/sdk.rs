@@ -1484,7 +1484,9 @@ impl SessionBuilder {
         let session_id = session.session_id();
         let session = Arc::new(tokio::sync::Mutex::new(session));
         let input = Arc::new(tokio::sync::Mutex::new(input));
-        let registry = Arc::new(self.registry);
+        let mut registry = self.registry;
+        registry.isolate_mcp_runtime();
+        let registry = Arc::new(registry);
         let pending_start = Arc::new(Mutex::new(Some((crate::SessionStartReason::Startup, None))));
         let owner = Arc::new(SessionOwner {
             id: Uuid::new_v4(),
@@ -1507,6 +1509,7 @@ impl SessionBuilder {
             model_identity_resolved,
             system_prompt: self.system_prompt,
             registry,
+            extension_registration_scope: Arc::new(()),
             limits: self.limits,
             session_id,
             session,
@@ -1543,6 +1546,7 @@ pub struct AgentSession {
     model_identity_resolved: bool,
     system_prompt: String,
     registry: Arc<Registry>,
+    extension_registration_scope: Arc<()>,
     limits: Limits,
     session_id: Uuid,
     session: Arc<tokio::sync::Mutex<Session>>,
@@ -2156,7 +2160,9 @@ impl AgentSession {
     /// Register before forking. Forks share the existing registry and its connections.
     pub fn register_extension(&mut self, extension: Arc<dyn Extension>) -> Result<()> {
         self.ensure_open()?;
-        if Arc::strong_count(&self.registry) != 1 {
+        if Arc::strong_count(&self.registry) != 1
+            || Arc::strong_count(&self.extension_registration_scope) != 1
+        {
             return Err(Error::Config(
                 "register extensions before sharing this session with a fork".into(),
             ));
@@ -2168,7 +2174,7 @@ impl AgentSession {
         Ok(())
     }
     /// Server declarations owned by the loaded extensions.
-    pub fn registered_mcp_servers(&self) -> &[crate::RegisteredMcpServer] {
+    pub fn registered_mcp_servers(&self) -> Vec<crate::RegisteredMcpServer> {
         self.registry.registered_mcp_servers()
     }
 
@@ -2183,10 +2189,8 @@ impl AgentSession {
             .session
             .try_lock()
             .map_err(|_| Error::Session("session journal is in use".into()))?;
-        let mut registry = self.registry.as_ref().clone();
-        registry.register_mcp_server(extension_id, server)?;
-        self.registry = Arc::new(registry);
-        self.refresh_run_config();
+        self.registry
+            .register_live_mcp_server(extension_id, server)?;
         self.notify_mcp_servers_changed(&mut journal, extension_id)
             .await;
         drop(journal);
@@ -2203,12 +2207,12 @@ impl AgentSession {
             .session
             .try_lock()
             .map_err(|_| Error::Session("session journal is in use".into()))?;
-        let mut registry = self.registry.as_ref().clone();
-        if !registry.unregister_mcp_server(extension_id, name) {
+        if !self
+            .registry
+            .unregister_live_mcp_server(extension_id, name)?
+        {
             return Ok(false);
         }
-        self.registry = Arc::new(registry);
-        self.refresh_run_config();
         self.notify_mcp_servers_changed(&mut journal, extension_id)
             .await;
         drop(journal);
@@ -2220,12 +2224,9 @@ impl AgentSession {
 
     async fn notify_mcp_servers_changed(&self, session: &mut Session, extension_id: &str) {
         let events = self.events.as_ref().expect("open session");
-        if let Err(error) = crate::lifecycle::notify_idle_with_host(
+        if let Err(error) = crate::lifecycle::notify_mcp_registrations_in_session(
             &self.registry,
             session,
-            crate::LifecycleEvent::McpServersChange {
-                servers: self.registry.registered_mcp_servers().to_vec(),
-            },
             self.limits.tool_timeout,
             &mut |notification| emit(events, &notification),
         )
@@ -3143,7 +3144,10 @@ impl AgentSession {
                 .map_err(|_| Error::Session("session journal is in use".into()))?
                 .session_id(),
         );
-        fork.registry = self.registry.clone();
+        let mut fork_registry = self.registry.as_ref().clone();
+        fork_registry.isolate_mcp_runtime();
+        fork.registry = Arc::new(fork_registry);
+        fork.extension_registration_scope = self.extension_registration_scope.clone();
         match resolution {
             BranchResolution::Existing {
                 provider,
@@ -3727,7 +3731,10 @@ impl AgentSession {
             Ok(())
         };
         let registry = std::mem::replace(&mut self.registry, Arc::new(Registry::default()));
-        let result = if Arc::strong_count(&registry) == 1 {
+        let registration_scope =
+            std::mem::replace(&mut self.extension_registration_scope, Arc::new(()));
+        let last_session = Arc::into_inner(registration_scope).is_some();
+        let result = if last_session && Arc::strong_count(&registry) == 1 {
             registry.shutdown().await
         } else {
             Ok(())

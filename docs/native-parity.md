@@ -4801,6 +4801,12 @@ handlers with the updated declaration list. Only the owner can replace or
 remove a registration. The SDK reports notification and follow-up errors
 through its session events after applying the registration change. The executable protocol negotiates that event
 independently of ordinary lifecycle events.
+Lifecycle handlers that opt in to the MCP registry host can read, register
+and remove declarations during their callback. The host binds operations to
+the running extension and delivers the resulting snapshots in mutation
+order. An executable negotiates this access through
+`mcp_registry_host_calls` and the duplex capability advertisement. SDK forks
+have their own snapshot of the active MCP registrations.
 
 Native extensions can subscribe to `after_provider_response` to observe the
 HTTP status and normalized headers from an agent turn. The OpenAI Responses,
