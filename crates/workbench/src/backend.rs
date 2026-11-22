@@ -1213,7 +1213,9 @@ async fn run_worker(
         let mut operation = Box::pin(async {
             if matches!(
                 &request,
-                Request::Prompt { .. } | Request::TriggerCustom { .. } | Request::McpStatus { .. }
+                Request::Prompt { .. }
+                    | Request::TriggerCustom { .. }
+                    | Request::McpStatus { inspect: false }
             ) {
                 tokio::select! {
                     biased;
@@ -1567,7 +1569,7 @@ async fn run_worker(
                 }
                 Request::McpStatus { inspect } => {
                     if inspect {
-                        runtime.inspect_mcp(ui.as_ref(), &cancel).await?;
+                        runtime.manage_mcp(&args, ui.as_ref(), &cancel).await?;
                     } else {
                         runtime.mcp_status(&args)?;
                     }
