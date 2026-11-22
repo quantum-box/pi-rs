@@ -115,6 +115,16 @@ should use the supplied context for their inputs. Resolver wrappers for
 other tools use the in-process API. Workbench terminal integration is
 tracked separately.
 
+## Share SDK extension events
+
+An embedding host can share a `pi_rs_extensions::ExtensionEventBus` with its
+Rust extension instances. `on` registers a listener and returns an owned
+subscription. Drop the subscription to remove that listener. The same bus
+can be reused while a host replaces extension instances. `emit` delivers a
+JSON value to listeners in registration order and returns callback errors.
+The native bus calls synchronous handlers on the emitting thread. It does
+not route events across executable extension processes.
+
 ## Observe extension UI prompts
 
 Opt in with `handles_lifecycle` and `handles_ui_prompt_lifecycle` to observe
