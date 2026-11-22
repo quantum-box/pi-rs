@@ -1,5 +1,5 @@
 //! Wire differences for explicitly configured chat-completions providers.
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Value, json};
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -20,12 +20,41 @@ pub struct ChatCompatibility {
     max_tokens_field: Option<MaxTokensField>,
     thinking_format: Option<ThinkingFormat>,
     chat_template_args: Option<serde_json::Map<String, Value>>,
+    #[serde(deserialize_with = "deserialize_chat_template_kwargs")]
+    chat_template_kwargs: Option<serde_json::Map<String, Value>>,
     open_router_routing: Option<serde_json::Map<String, Value>>,
     vercel_gateway_routing: Option<VercelGatewayRouting>,
     zai_tool_stream: Option<bool>,
     vllm_priority: Option<serde_json::Number>,
     supports_thinking_token_budget: Option<bool>,
     thinking_token_budget_field: Option<ThinkingBudgetField>,
+}
+
+fn deserialize_chat_template_kwargs<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Map<String, Value>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+    for (key, value) in &values {
+        let valid = match value {
+            Value::Array(_) => false,
+            Value::Object(spec) => {
+                matches!(
+                    spec.get("$var").and_then(Value::as_str),
+                    Some("thinking.enabled" | "thinking.effort" | "thinking.budget")
+                ) && spec.get("omitWhenOff").is_none_or(Value::is_boolean)
+            }
+            _ => true,
+        };
+        if !valid {
+            return Err(de::Error::custom(format!(
+                "chatTemplateKwargs.{key} must be a scalar, null, or a supported thinking variable"
+            )));
+        }
+    }
+    Ok(Some(values))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -109,24 +138,49 @@ mod tests {
     }
 
     #[test]
+    fn chat_template_kwargs_validate_upstream_value_types() {
+        for unsupported in [
+            json!({"nested": true}),
+            json!(["array"]),
+            json!({"$var": "unknown"}),
+            json!({"$var": "thinking.budget", "omitWhenOff": "true"}),
+        ] {
+            let error = serde_json::from_value::<ChatCompatibility>(
+                json!({"chatTemplateKwargs": {"setting": unsupported}}),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("chatTemplateKwargs.setting"));
+        }
+    }
+
+    #[test]
     fn overlay_merges_chat_template_arguments_by_key() {
         let base: ChatCompatibility = serde_json::from_value(json!({
-            "chatTemplateArgs":{"enable_thinking":true,"shared":"base"}
+            "chatTemplateArgs":{"enable_thinking":true,"shared":"base"},
+            "chatTemplateKwargs":{"budget":{"$var":"thinking.budget"},"shared":"base"},
         }))
         .unwrap();
         let provider: ChatCompatibility = serde_json::from_value(json!({
-            "chatTemplateArgs":{"provider":1,"shared":"provider"}
+            "chatTemplateArgs":{"provider":1,"shared":"provider"},
+            "chatTemplateKwargs":{"shared":"provider"},
         }))
         .unwrap();
         let model: ChatCompatibility = serde_json::from_value(json!({
-            "chatTemplateArgs":{"model":2,"shared":"model"}
+            "chatTemplateArgs":{"model":2,"shared":"model"},
+            "chatTemplateKwargs":{"effort":{"$var":"thinking.effort"}},
         }))
         .unwrap();
+        let compat = base.overlay(provider).overlay(model);
         assert_eq!(
-            base.overlay(provider).overlay(model).chat_template_args,
+            compat.chat_template_args,
             json!({"enable_thinking":true,"provider":1,"model":2,"shared":"model"})
                 .as_object()
                 .cloned()
+        );
+        assert_eq!(
+            compat.chat_template_kwargs,
+            json!({"budget":{"$var":"thinking.budget"},"shared":"provider","effort":{"$var":"thinking.effort"}})
+                .as_object().cloned()
         );
     }
 
@@ -202,7 +256,7 @@ mod tests {
         let compat: ChatCompatibility =
             serde_json::from_value(json!({"thinkingFormat":"ant-ling"})).unwrap();
         let mut body = json!({});
-        compat.reasoning_options(&mut body, Some(true), true, Some("high"), false);
+        compat.reasoning_options(&mut body, Some(true), true, Some("high"), false, None);
         assert_eq!(body, json!({"reasoning":{"effort":"high"}}));
         for (supported, enabled, effort) in [
             (Some(true), true, None),
@@ -210,7 +264,7 @@ mod tests {
             (Some(false), true, Some("high")),
         ] {
             let mut body = json!({});
-            compat.reasoning_options(&mut body, supported, enabled, effort, false);
+            compat.reasoning_options(&mut body, supported, enabled, effort, false, None);
             assert_eq!(body, json!({}));
         }
     }
@@ -224,17 +278,56 @@ mod tests {
         }))
         .unwrap();
         let mut enabled = json!({});
-        compat.reasoning_options(&mut enabled, Some(true), true, Some("high"), true);
+        compat.reasoning_options(&mut enabled, Some(true), true, Some("high"), true, None);
         assert_eq!(
             enabled,
             json!({"chat_template_args":{"enable_thinking":true},"reasoning_effort":"high"})
         );
         let mut disabled = json!({});
-        compat.reasoning_options(&mut disabled, Some(true), false, Some("none"), true);
+        compat.reasoning_options(&mut disabled, Some(true), false, Some("none"), true, None);
         assert_eq!(
             disabled,
             json!({"chat_template_args":{"enable_thinking":false},"reasoning_effort":"none"})
         );
+    }
+
+    #[test]
+    fn template_budget_is_omitted_when_thinking_is_off_or_has_no_answer_room() {
+        let compat: ChatCompatibility = serde_json::from_value(json!({
+            "thinkingFormat": "chat-template",
+            "chatTemplateKwargs": {
+                "enabled":{"$var":"thinking.enabled"},
+                "budget":{"$var":"thinking.budget"},
+                "effort":{"$var":"thinking.effort", "omitWhenOff":true},
+                "literal":null,
+            }
+        }))
+        .unwrap();
+        for (level, enabled, max, expected) in [
+            ("off", false, 4096, json!({"enabled":false,"literal":null})),
+            (
+                "low",
+                true,
+                1024,
+                json!({"enabled":true,"effort":"low","literal":null}),
+            ),
+            (
+                "low",
+                true,
+                1700,
+                json!({"enabled":true,"effort":"low","budget":676,"literal":null}),
+            ),
+        ] {
+            for supported in [Some(true), None] {
+                let mut body = json!({});
+                let budget = compat
+                    .thinking_budget_options(&mut body, Some(level), None, max, supported)
+                    .unwrap();
+                let effort = if enabled { Some(level) } else { None };
+                compat.reasoning_options(&mut body, supported, enabled, effort, true, budget);
+                assert_eq!(body, json!({"chat_template_kwargs":expected}));
+            }
+        }
     }
 }
 
@@ -276,6 +369,7 @@ enum ThinkingFormat {
     Zai,
     Qwen,
     QwenChatTemplate,
+    ChatTemplate,
     Together,
     Baseten,
     StringThinking,
@@ -346,6 +440,10 @@ impl ChatCompatibility {
             max_tokens_field: model.max_tokens_field.or(self.max_tokens_field),
             thinking_format: model.thinking_format.or(self.thinking_format),
             chat_template_args: overlay_map(self.chat_template_args, model.chat_template_args),
+            chat_template_kwargs: overlay_map(
+                self.chat_template_kwargs,
+                model.chat_template_kwargs,
+            ),
             open_router_routing: overlay_map(self.open_router_routing, model.open_router_routing),
             vercel_gateway_routing,
             zai_tool_stream: model.zai_tool_stream.or(self.zai_tool_stream),
@@ -418,26 +516,34 @@ impl ChatCompatibility {
         budgets: Option<&Value>,
         max_tokens: u32,
         supported: Option<bool>,
-    ) -> pi_rs_core::Result<()> {
-        let field = self
-            .thinking_token_budget_field
-            .map(ThinkingBudgetField::as_str)
-            .or_else(|| {
-                (self.supports_thinking_token_budget == Some(true))
-                    .then_some("thinking_token_budget")
-            });
-        let Some(field) = field else {
-            return Ok(());
+    ) -> pi_rs_core::Result<Option<u32>> {
+        if supported == Some(false) {
+            return Ok(None);
+        }
+        let field = if supported == Some(true) {
+            self.thinking_token_budget_field
+                .map(ThinkingBudgetField::as_str)
+                .or_else(|| {
+                    (self.supports_thinking_token_budget == Some(true))
+                        .then_some("thinking_token_budget")
+                })
+        } else {
+            None
         };
-        if supported != Some(true) {
-            return Ok(());
+        let template_wants_budget = self.thinking_template().is_some_and(|(_, template)| {
+            template
+                .values()
+                .any(|value| value.get("$var").and_then(Value::as_str) == Some("thinking.budget"))
+        });
+        if field.is_none() && !template_wants_budget {
+            return Ok(None);
         }
         let (key, default) = match level {
             Some("minimal") => ("minimal", 1024),
             Some("low") => ("low", 2048),
             Some("medium") => ("medium", 8192),
             Some("high" | "xhigh" | "max") => ("high", 16384),
-            _ => return Ok(()),
+            _ => return Ok(None),
         };
         let budget = match budgets {
             None => default,
@@ -460,10 +566,31 @@ impl ChatCompatibility {
             },
         }
         .min(max_tokens.saturating_sub(1024));
-        if budget > 0 {
+        if budget == 0 {
+            return Ok(None);
+        }
+        if let Some(field) = field {
             body[field] = json!(budget);
         }
-        Ok(())
+        Ok(Some(budget))
+    }
+
+    pub(super) fn uses_chat_template(&self) -> bool {
+        matches!(self.thinking_format, Some(ThinkingFormat::ChatTemplate))
+    }
+
+    fn thinking_template(&self) -> Option<(&'static str, &serde_json::Map<String, Value>)> {
+        match self.thinking_format {
+            Some(ThinkingFormat::Baseten) => self
+                .chat_template_args
+                .as_ref()
+                .map(|template| ("chat_template_args", template)),
+            Some(ThinkingFormat::ChatTemplate) => self
+                .chat_template_kwargs
+                .as_ref()
+                .map(|template| ("chat_template_kwargs", template)),
+            _ => None,
+        }
     }
 
     pub(super) fn reasoning_options(
@@ -473,6 +600,7 @@ impl ChatCompatibility {
         enabled: bool,
         effort: Option<&str>,
         allow_off: bool,
+        thinking_budget: Option<u32>,
     ) {
         if supported == Some(false) {
             return;
@@ -514,8 +642,8 @@ impl ChatCompatibility {
                 return;
             }
             Some(ThinkingFormat::Together) => body["reasoning"] = json!({"enabled":enabled}),
-            Some(ThinkingFormat::Baseten) => {
-                if let Some(template) = &self.chat_template_args {
+            Some(ThinkingFormat::Baseten | ThinkingFormat::ChatTemplate) => {
+                if let Some((field, template)) = self.thinking_template() {
                     let mut values = serde_json::Map::new();
                     for (key, value) in template {
                         let resolved = match value.as_object() {
@@ -530,6 +658,11 @@ impl ChatCompatibility {
                             Some(spec) if spec.get("$var") == Some(&json!("thinking.effort")) => {
                                 effort.map(|level| json!(level))
                             }
+                            Some(spec) if spec.get("$var") == Some(&json!("thinking.budget")) => {
+                                thinking_budget
+                                    .filter(|_| enabled)
+                                    .map(|budget| json!(budget))
+                            }
                             Some(_) => None,
                             None => Some(value.clone()),
                         };
@@ -538,10 +671,13 @@ impl ChatCompatibility {
                         }
                     }
                     if !values.is_empty() {
-                        body["chat_template_args"] = Value::Object(values);
+                        body[field] = Value::Object(values);
                     }
                 }
-                if support_effort && let Some(level) = effort {
+                if matches!(self.thinking_format, Some(ThinkingFormat::Baseten))
+                    && support_effort
+                    && let Some(level) = effort
+                {
                     body["reasoning_effort"] = json!(level);
                 }
                 return;
