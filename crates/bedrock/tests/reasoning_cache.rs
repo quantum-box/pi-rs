@@ -150,6 +150,56 @@ fn request(model: &str, max: u32) -> ModelRequest {
 }
 
 #[tokio::test]
+async fn temperature_and_request_metadata_match_pi_payloads() {
+    let (default, _) = capture("us-east-1", |model| model, request("fixture", 128), false).await;
+    assert_eq!(default["inferenceConfig"], json!({"maxTokens": 128}));
+    assert!(default.get("requestMetadata").is_none());
+
+    let (configured, _) = capture(
+        "us-east-1",
+        |model| {
+            model.with_temperature(0.0).unwrap().with_request_metadata(
+                [
+                    ("team".into(), "fixture".into()),
+                    ("run".into(), "42".into()),
+                ]
+                .into(),
+            )
+        },
+        request("fixture", 128),
+        false,
+    )
+    .await;
+    assert_eq!(
+        configured["inferenceConfig"],
+        json!({"maxTokens": 128, "temperature": 0.0})
+    );
+    assert_eq!(
+        configured["requestMetadata"],
+        json!({"team": "fixture", "run": "42"})
+    );
+    assert!(configured.get("additionalModelRequestFields").is_none());
+
+    let (empty_tags, _) = capture(
+        "us-east-1",
+        |model| {
+            model
+                .with_temperature(1.0)
+                .unwrap()
+                .with_request_metadata(Default::default())
+        },
+        request("fixture", 128),
+        true,
+    )
+    .await;
+    assert_eq!(
+        empty_tags["inferenceConfig"],
+        json!({"maxTokens": 128, "temperature": 1.0})
+    );
+    assert_eq!(empty_tags["requestMetadata"], json!({}));
+}
+
+#[tokio::test]
 async fn budgeted_claude_fits_host_limit_and_adds_short_checkpoints() {
     let (body, events) = capture(
         "us-east-1",

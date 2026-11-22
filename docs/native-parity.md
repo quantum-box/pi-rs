@@ -6073,6 +6073,13 @@ some preferred constraints without strict mode after a service rejection.
 Signed loopback requests verified the wire and reservation schemas. Live
 strict tool sampling with an authenticated AWS account was unverified.
 
+Library callers can set ConverseStream temperature and invocation-log labels
+through `Bedrock::with_temperature` and `Bedrock::with_request_metadata`.
+Temperature is optional and accepts values from zero through one. Request
+metadata is forwarded to AWS for service-side validation. The effective options
+are part of the protected prepared-request identity. Published Pi and signed
+loopback requests verified the payload; live AWS verification was unavailable.
+
 Not yet supported: non-image multimodal inputs, workbench-specific thinking
 display controls, guardrails, prompt management ARNs, live account-specific
 model discovery, and workbench proxy/idle-timeout settings. Custom model endpoints in workbench configuration are rejected;

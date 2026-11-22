@@ -58,6 +58,8 @@ pub struct Bedrock {
     interleaved_thinking: bool,
     tool_choice: Option<ToolChoice>,
     strict_tool_support: bool,
+    temperature: Option<f32>,
+    request_metadata: Option<BTreeMap<String, String>>,
     cache_retention: CacheRetention,
     long_cache_support: Option<bool>,
     force_cache: bool,
@@ -87,6 +89,8 @@ impl Bedrock {
             interleaved_thinking: true,
             tool_choice: None,
             strict_tool_support: false,
+            temperature: None,
+            request_metadata: None,
             cache_retention: default_cache_retention(),
             long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
@@ -116,6 +120,8 @@ impl Bedrock {
             interleaved_thinking: true,
             tool_choice: None,
             strict_tool_support: false,
+            temperature: None,
+            request_metadata: None,
             cache_retention: default_cache_retention(),
             long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
@@ -149,6 +155,8 @@ impl Bedrock {
             interleaved_thinking: true,
             tool_choice: None,
             strict_tool_support: false,
+            temperature: None,
+            request_metadata: None,
             cache_retention: default_cache_retention(),
             long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
@@ -375,6 +383,18 @@ impl Bedrock {
         } else {
             identity
         };
+        let identity = if self.temperature.is_some() || self.request_metadata.is_some() {
+            identity.and_then(|id| {
+                pi_rs_core::protected_model_fingerprint(&(
+                    "bedrock-request-options-v1",
+                    id,
+                    self.temperature,
+                    &self.request_metadata,
+                ))
+            })
+        } else {
+            identity
+        };
         let mut builder = aws_sdk_bedrockruntime::config::Builder::from(&frozen)
             .identity_cache(aws_sdk_bedrockruntime::config::IdentityCache::no_cache());
         // Freeze the endpoint selected above instead of consulting service
@@ -447,6 +467,25 @@ impl Bedrock {
     /// Enable strict JSON Schema sampling when the selected route supports it.
     pub fn with_strict_tool_support(mut self, supported: bool) -> Self {
         self.strict_tool_support = supported;
+        self.prepared_identity = None;
+        self
+    }
+
+    /// Set the ConverseStream inference temperature. Omit it to use the model default.
+    pub fn with_temperature(mut self, temperature: f32) -> Result<Self> {
+        if !(0.0..=1.0).contains(&temperature) {
+            return Err(Error::Config(
+                "Bedrock temperature must be between 0 and 1".into(),
+            ));
+        }
+        self.temperature = Some(temperature);
+        self.prepared_identity = None;
+        Ok(self)
+    }
+
+    /// Attach key-value labels used to filter Bedrock invocation logs.
+    pub fn with_request_metadata(mut self, metadata: BTreeMap<String, String>) -> Self {
+        self.request_metadata = Some(metadata);
         self.prepared_identity = None;
         self
     }
@@ -1508,9 +1547,15 @@ impl Bedrock {
             .set_messages(Some(messages))
             .set_system((!system.is_empty()).then_some(system))
             .set_tool_config(tool_config)
+            .set_request_metadata(
+                self.request_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.clone().into_iter().collect()),
+            )
             .inference_config(
                 types::InferenceConfiguration::builder()
                     .max_tokens(i32::try_from(request.max_output_tokens).map_err(build_error)?)
+                    .set_temperature(self.temperature)
                     .build(),
             );
         if let Some(fields) = fields {
@@ -2204,6 +2249,9 @@ mod tests {
             base.clone().with_thinking_display(ThinkingDisplay::Omitted),
             base.clone().with_interleaved_thinking(false),
             base.clone().with_tool_choice(ToolChoice::Any),
+            base.clone().with_temperature(0.0).unwrap(),
+            base.clone()
+                .with_request_metadata(BTreeMap::from([("team".into(), "fixture".into())])),
             base.clone().with_cache_retention(CacheRetention::None),
             base.clone().with_long_cache_support(Some(false)),
             base.clone().with_force_cache(true),
@@ -2218,6 +2266,16 @@ mod tests {
                     .context_identity()
                     .is_none()
             );
+        }
+    }
+
+    #[test]
+    fn temperature_rejects_invalid_aws_values() {
+        for temperature in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+            assert!(matches!(
+                Bedrock::from_env().with_temperature(temperature),
+                Err(Error::Config(_))
+            ));
         }
     }
 
