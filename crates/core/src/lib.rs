@@ -28,6 +28,7 @@ mod strict_tool_schema;
 mod tokens;
 mod tool_execution_snapshot;
 mod tool_render;
+mod tool_transcript;
 mod types;
 mod ui;
 mod ui_prompt;

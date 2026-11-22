@@ -755,6 +755,29 @@ impl Client {
         })
     }
 
+    pub(super) fn uses_tool_transcript(&self, model: &str) -> bool {
+        match self {
+            Self::OpenAi(client) => client.supports_tool_transcript(model),
+            Self::Deferred(client) => client
+                .estimation_client()
+                .is_some_and(|client| client.uses_tool_transcript(model)),
+            _ => false,
+        }
+    }
+
+    pub(super) fn with_tool_transcript(
+        self,
+        request: &ModelRequest,
+        tool_transcript: &[pi_rs::ToolTranscriptChange],
+    ) -> Self {
+        match self {
+            Self::OpenAi(client) => {
+                Self::OpenAi(client.with_tool_transcript(request, tool_transcript))
+            }
+            other => other,
+        }
+    }
+
     /// Resolve dynamic credentials and freeze any catalog route before estimating.
     pub(super) async fn prepare_for_context(
         &self,
@@ -1631,6 +1654,12 @@ impl Client {
                         &args.model,
                         args.explicit_endpoint_for(&args.provider),
                     );
+                let (tools_default, tools_models) =
+                    args.model_profiles.responses_tool_transcript_policy(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
+                    );
                 let client = client
                     .with_mid_conversation_system_policy(system_default, system_models)
                     .with_configuration_update_models(args.model_profiles.responses_effort_models(
@@ -1638,6 +1667,7 @@ impl Client {
                         &args.model,
                         args.explicit_endpoint_for(&args.provider),
                     ))
+                    .with_transcript_tools_policy(tools_default, tools_models)
                     .with_max_output_tokens_field(
                         args.model_profiles
                             .responses_max_output_tokens(&args.provider, metadata.as_ref()),

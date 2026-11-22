@@ -66,6 +66,10 @@ impl pi_rs_core::PreparedToolDispatch for PreparedBudgetDispatch<'_> {
 
 #[async_trait::async_trait]
 impl Model for BudgetedModel<'_> {
+    fn uses_tool_transcript(&self, model: &str) -> bool {
+        self.inner.uses_tool_transcript(model)
+    }
+
     fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
         self.inner.supports_mid_conversation_system_messages(model)
     }
@@ -108,12 +112,25 @@ impl Model for BudgetedModel<'_> {
         &'a self,
         request: &ModelRequest,
     ) -> Result<Option<Arc<dyn Model + 'a>>> {
-        Ok(self.inner.prepare_context(request).await?.map(|inner| {
-            Arc::new(PreparedBudgetedModel {
-                parent: self,
-                inner,
-            }) as Arc<dyn Model + 'a>
-        }))
+        self.prepare_context_with_tool_transcript(request, &[])
+            .await
+    }
+
+    async fn prepare_context_with_tool_transcript<'a>(
+        &'a self,
+        request: &ModelRequest,
+        tool_transcript: &[pi_rs_core::ToolTranscriptChange],
+    ) -> Result<Option<Arc<dyn Model + 'a>>> {
+        Ok(self
+            .inner
+            .prepare_context_with_tool_transcript(request, tool_transcript)
+            .await?
+            .map(|inner| {
+                Arc::new(PreparedBudgetedModel {
+                    parent: self,
+                    inner,
+                }) as Arc<dyn Model + 'a>
+            }))
     }
 
     fn context_identity(&self) -> Option<String> {
@@ -283,6 +300,10 @@ struct PreparedBudgetedModel<'a, 'b> {
 
 #[async_trait::async_trait]
 impl Model for PreparedBudgetedModel<'_, '_> {
+    fn uses_tool_transcript(&self, model: &str) -> bool {
+        self.inner.uses_tool_transcript(model)
+    }
+
     fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
         self.inner.supports_mid_conversation_system_messages(model)
     }

@@ -4,6 +4,7 @@
 mod codex_ws;
 mod grammar;
 pub mod oauth;
+mod transcript_tools;
 
 use base64::Engine;
 use eventsource_stream::{EventStreamError, Eventsource};
@@ -136,6 +137,29 @@ pub struct OpenAiResponses {
     use_developer_role: bool,
     mid_conversation_system_models: BTreeMap<String, bool>,
     mid_conversation_system_default: bool,
+    transcript_tools_default: (bool, bool),
+    transcript_tools_models: BTreeMap<String, (bool, bool)>,
+    tool_transcript: Option<BoundToolTranscript>,
+}
+
+#[derive(Clone)]
+struct BoundToolTranscript {
+    request: String,
+    changes: Vec<pi_rs_core::ToolTranscriptChange>,
+}
+
+fn tool_transcript_request_identity(request: &ModelRequest) -> Option<String> {
+    let tool_names: Vec<&str> = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    pi_rs_core::protected_model_fingerprint(&(
+        "responses-tool-transcript-request-v1",
+        &request.model,
+        &request.messages,
+        tool_names,
+    ))
 }
 
 /// A Responses request whose wire tools and effective sampling are fixed.
@@ -149,6 +173,7 @@ pub struct PreparedResponsesRequest {
 
 #[derive(Default)]
 struct ResponsesTools {
+    source: Vec<pi_rs_core::ToolDeclaration>,
     declarations: Vec<Value>,
     grammar_inputs: BTreeMap<String, String>,
 }
@@ -426,7 +451,149 @@ impl OpenAiResponses {
             use_developer_role: false,
             mid_conversation_system_models: BTreeMap::new(),
             mid_conversation_system_default: false,
+            transcript_tools_default: (false, false),
+            transcript_tools_models: BTreeMap::new(),
+            tool_transcript: None,
         })
+    }
+
+    /// Resolve additional-tools and tool-search support on the active route.
+    pub fn with_transcript_tools_policy(
+        mut self,
+        default: (bool, bool),
+        models: BTreeMap<String, (bool, bool)>,
+    ) -> Self {
+        self.transcript_tools_default = default;
+        self.transcript_tools_models = models;
+        self
+    }
+
+    pub fn supports_tool_transcript(&self, model: &str) -> bool {
+        self.transcript_tool_mode(model) != transcript_tools::Mode::TopLevel
+    }
+
+    /// Bind tool changes to an adapter prepared for a single conversation request.
+    pub fn with_tool_transcript(
+        mut self,
+        request: &ModelRequest,
+        changes: &[pi_rs_core::ToolTranscriptChange],
+    ) -> Self {
+        self.tool_transcript =
+            if changes.is_empty() || !self.supports_tool_transcript(&request.model) {
+                None
+            } else {
+                tool_transcript_request_identity(request).map(|request| BoundToolTranscript {
+                    request,
+                    changes: changes.to_vec(),
+                })
+            };
+        self
+    }
+
+    fn transcript_tool_mode(&self, model: &str) -> transcript_tools::Mode {
+        // A ChatGPT plan namespace uses a different declaration shape.
+        if self.provider == "openai-chatgpt" || !self.supports_mid_conversation_system(model) {
+            return transcript_tools::Mode::TopLevel;
+        }
+        let (additional, search) = self
+            .transcript_tools_models
+            .get(model)
+            .copied()
+            .unwrap_or(self.transcript_tools_default);
+        transcript_tools::Mode::from_capabilities(true, additional, search)
+    }
+
+    fn tool_projection(
+        &self,
+        request: &ModelRequest,
+        traits: &ResponsesTools,
+        instruction_role: &str,
+    ) -> Option<transcript_tools::WireProjection> {
+        let mode = self.transcript_tool_mode(&request.model);
+        let transcript = self.tool_transcript.as_ref()?;
+        if mode == transcript_tools::Mode::TopLevel
+            || tool_transcript_request_identity(request).as_deref() != Some(&transcript.request)
+        {
+            return None;
+        }
+        let encode = |declaration: &pi_rs_core::ToolDeclaration| {
+            let spec = &declaration.spec;
+            let prepared = traits.source.iter().position(|tool| tool == declaration);
+            let (mut wire, property) = if let Some(index) = prepared {
+                (
+                    traits.declarations[index].clone(),
+                    traits.grammar_inputs.get(&spec.name).cloned(),
+                )
+            } else {
+                let compiled = resolve_responses_wire_tool(
+                    declaration,
+                    self.strict_tool_support,
+                    self.has_implicit_strict_tools(),
+                    self.supports_grammar_tools(),
+                );
+                // A historical tool is context only. Required constraints that
+                // cannot run on the selected route still have a plain declaration.
+                compiled.map_or_else(
+                    |_| (unconstrained_wire_tool(spec), None),
+                    |(wire, sampling)| match sampling {
+                        pi_rs_core::EffectiveToolSampling::OpenAiGrammar {
+                            input_property, ..
+                        } => (wire, Some(input_property)),
+                        _ => (wire, None),
+                    },
+                )
+            };
+            if self.codex_account.is_some()
+                && !self.strict_tool_support
+                && !self.has_implicit_strict_tools()
+                && let Some(object) = wire.as_object_mut()
+            {
+                object.remove("strict");
+            }
+            (wire, property)
+        };
+        Some(transcript_tools::wire_projection(
+            transcript_tools::plan(mode, &transcript.changes, &traits.source),
+            mode,
+            instruction_role,
+            matches!(request.messages.first(), Some(Message::System { .. })),
+            encode,
+        ))
+    }
+
+    fn transcript_payload(
+        &self,
+        request: &ModelRequest,
+        tools: &ResponsesTools,
+        instruction_role: &str,
+    ) -> Result<Option<Value>> {
+        let Some(projection) = self.tool_projection(request, tools, instruction_role) else {
+            return Ok(None);
+        };
+        let grammar = projection.grammar_calls(&request.messages);
+        let replay_provider = self.replay_provider(&request.model);
+        let edited_scope =
+            pi_rs_core::endpoint_replay_scope(&replay_provider, self.endpoint.as_str());
+        let mut body = responses_payload(
+            request,
+            &replay_provider,
+            &edited_scope,
+            instruction_role,
+            self.api(),
+            ResponsesProjection {
+                supports_mid_conversation_system: true,
+                active_effort: self.configuration_update_effort(&request.model),
+                tools: Some(projection),
+            },
+        );
+        grammar::project_input(
+            request,
+            &mut body["input"],
+            &tools.grammar_inputs,
+            None,
+            Some(&grammar),
+        )?;
+        Ok(Some(body))
     }
 
     /// Set the API version and model-to-deployment map for Azure Responses.
@@ -892,7 +1059,7 @@ pub fn codex_account_id(token: &str) -> Option<String> {
 fn responses_transcript(
     messages: &[Message],
     supports_mid_conversation_system: bool,
-) -> impl Iterator<Item = Cow<'_, Message>> {
+) -> impl Iterator<Item = (Option<usize>, Cow<'_, Message>)> {
     let leading = (!supports_mid_conversation_system)
         .then(|| {
             messages
@@ -905,14 +1072,15 @@ fn responses_transcript(
                 .join("\n\n")
         })
         .filter(|content| !content.is_empty())
-        .map(|content| Cow::Owned(Message::System { content }));
+        .map(|content| (None, Cow::Owned(Message::System { content })));
     leading.into_iter().chain(
         messages
             .iter()
-            .filter(move |message| {
+            .enumerate()
+            .filter(move |(_, message)| {
                 supports_mid_conversation_system || !matches!(message, Message::System { .. })
             })
-            .map(Cow::Borrowed),
+            .map(|(index, message)| (Some(index), Cow::Borrowed(message))),
     )
 }
 
@@ -933,27 +1101,54 @@ fn payload(
         edited_scope,
         instruction_role,
         pi_rs_core::ModelApi::OpenaiResponses,
-        false,
-        None,
+        ResponsesProjection::default(),
     )
 }
 
+#[derive(Default)]
+struct ResponsesProjection<'a> {
+    supports_mid_conversation_system: bool,
+    active_effort: Option<&'a str>,
+    tools: Option<transcript_tools::WireProjection>,
+}
 fn responses_payload(
     request: &ModelRequest,
     provider: &str,
     edited_scope: &str,
     instruction_role: &str,
     api: pi_rs_core::ModelApi,
-    supports_mid_conversation_system: bool,
-    active_effort: Option<&str>,
+    projection: ResponsesProjection<'_>,
 ) -> Value {
+    let ResponsesProjection {
+        supports_mid_conversation_system,
+        active_effort,
+        tools: mut tool_projection,
+    } = projection;
     let codex = api == pi_rs_core::ModelApi::OpenaiCodexResponses;
     let mut input = Vec::new();
-    for message in responses_transcript(&request.messages, supports_mid_conversation_system) {
+    for (index, message) in
+        responses_transcript(&request.messages, supports_mid_conversation_system)
+    {
+        let anchored = index
+            .and_then(|index| tool_projection.as_mut()?.by_message.remove(&index))
+            .unwrap_or_default();
+        input.extend(anchored.before);
+        if !matches!(message.as_ref(), Message::System { .. })
+            && !anchored.removal_notices.is_empty()
+        {
+            input.push(
+                json!({"role":instruction_role,"content":anchored.removal_notices.join("\n\n")}),
+            );
+        }
         match message.as_ref() {
-            Message::System { content } if content.is_empty() => {}
             Message::System { content } => {
-                input.push(json!({"role":instruction_role, "content": content}))
+                let sections: Vec<&str> = std::iter::once(content.as_str())
+                    .chain(anchored.removal_notices.iter().map(String::as_str))
+                    .filter(|section| !section.is_empty())
+                    .collect();
+                if !sections.is_empty() {
+                    input.push(json!({"role":instruction_role, "content":sections.join("\n\n")}));
+                }
             }
             Message::User { content } => input.push(json!({"role":"user", "content": content})),
             Message::UserWithImages { content, images } => {
@@ -1042,6 +1237,17 @@ fn responses_payload(
             }
         }
     }
+    if let Some(anchored) = tool_projection
+        .as_mut()
+        .and_then(|projection| projection.by_message.remove(&request.messages.len()))
+    {
+        input.extend(anchored.before);
+        if !anchored.removal_notices.is_empty() {
+            input.push(
+                json!({"role":instruction_role,"content":anchored.removal_notices.join("\n\n")}),
+            );
+        }
+    }
     if let Some(effort) = active_effort {
         input.push(configuration_update(effort));
     }
@@ -1055,8 +1261,11 @@ fn responses_payload(
     if codex && request.max_output_tokens != 0 {
         body["max_output_tokens"] = json!(request.max_output_tokens);
     }
-    if !request.tools.is_empty() {
-        let tools: Vec<_> = request.tools.iter().map(|tool| json!({"type":"function", "name":tool.name, "description":tool.description, "parameters":tool.parameters, "strict":false})).collect();
+    let tools = tool_projection.map_or_else(
+        || request.tools.iter().map(unconstrained_wire_tool).collect(),
+        |projection| projection.top_level,
+    );
+    if !tools.is_empty() {
         body["tools"] = if provider == "openai-chatgpt" {
             json!([{"type":"namespace", "name":NAMESPACE, "description":"Local tools", "tools":tools}])
         } else {
@@ -1064,6 +1273,13 @@ fn responses_payload(
         };
     }
     body
+}
+
+fn unconstrained_wire_tool(tool: &pi_rs_core::ToolSpec) -> Value {
+    json!({
+        "type":"function", "name":tool.name, "description":tool.description,
+        "parameters":tool.parameters, "strict":false
+    })
 }
 
 fn resolved_constrained_tools(
@@ -1085,66 +1301,85 @@ fn resolved_constrained_tools(
         ));
     }
     let mut wire = ResponsesTools {
+        source: declarations.to_vec(),
         declarations: Vec::with_capacity(declarations.len()),
         ..Default::default()
     };
     let mut effective = Vec::with_capacity(declarations.len());
     for declaration in declarations {
-        let spec = &declaration.spec;
-        if supports_grammar
-            && let Some((syntax, definition, property)) =
-                pi_rs_core::resolve_openai_tool_grammar(declaration)
-                    .map_err(|error| Error::Config(error.to_string()))?
-        {
-            wire.declarations.push(json!({
-                "type":"custom","name":spec.name,"description":spec.description,
-                "format":{"type":"grammar","syntax":syntax,"definition":definition}
-            }));
+        let (tool, sampling) = resolve_responses_wire_tool(
+            declaration,
+            supports_strict,
+            implicit_strict_tools,
+            supports_grammar,
+        )?;
+        if let pi_rs_core::EffectiveToolSampling::OpenAiGrammar { input_property, .. } = &sampling {
             wire.grammar_inputs
-                .insert(spec.name.clone(), property.to_owned());
-            effective.push(pi_rs_core::EffectiveToolDeclaration {
-                spec: spec.clone(),
-                sampling: pi_rs_core::EffectiveToolSampling::OpenAiGrammar {
-                    syntax,
-                    input_property: property.to_owned(),
-                },
-            });
-            continue;
+                .insert(declaration.spec.name.clone(), input_property.clone());
         }
-        let strict_schema = match &declaration.constrained_sampling {
-            Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => {
-                pi_rs_core::resolve_strict_tool_schema(
-                    &spec.name,
-                    &spec.parameters,
-                    *strict,
-                    supports_strict,
-                    |_, _| false,
-                )
-                .map_err(|error| Error::Config(error.to_string()))?
-            }
-            _ => None,
-        };
-        let mut tool = json!({"type":"function","name":spec.name,"description":spec.description,"parameters":strict_schema.as_ref().unwrap_or(&spec.parameters)});
-        if supports_strict || implicit_strict_tools {
-            tool["strict"] = json!(strict_schema.is_some());
-        }
-        let sampling = if strict_schema.is_some() {
-            pi_rs_core::EffectiveToolSampling::StrictJsonSchema {
-                original_schema: spec.parameters.clone(),
-                normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
-            }
-        } else {
-            pi_rs_core::EffectiveToolSampling::Unconstrained
-        };
         wire.declarations.push(tool);
         effective.push(pi_rs_core::EffectiveToolDeclaration {
-            spec: spec.clone(),
+            spec: declaration.spec.clone(),
             sampling,
         });
     }
     pi_rs_core::validate_effective_tool_declarations(request, declarations, &effective)
         .map_err(|error| Error::Config(error.to_string()))?;
     Ok((wire, effective))
+}
+
+fn resolve_responses_wire_tool(
+    declaration: &pi_rs_core::ToolDeclaration,
+    supports_strict: bool,
+    implicit_strict_tools: bool,
+    supports_grammar: bool,
+) -> Result<(Value, pi_rs_core::EffectiveToolSampling)> {
+    use pi_rs_core::{EffectiveToolSampling, ToolConstraint};
+    let spec = &declaration.spec;
+    if supports_grammar
+        && let Some((syntax, definition, property)) =
+            pi_rs_core::resolve_openai_tool_grammar(declaration)
+                .map_err(|error| Error::Config(error.to_string()))?
+    {
+        let tool = json!({
+            "type":"custom","name":spec.name,"description":spec.description,
+            "format":{"type":"grammar","syntax":syntax,"definition":definition}
+        });
+        return Ok((
+            tool,
+            EffectiveToolSampling::OpenAiGrammar {
+                syntax,
+                input_property: property.to_owned(),
+            },
+        ));
+    }
+    let schema = match &declaration.constrained_sampling {
+        Some(ToolConstraint::JsonSchema { strict }) => pi_rs_core::resolve_strict_tool_schema(
+            &spec.name,
+            &spec.parameters,
+            *strict,
+            supports_strict,
+            |_, _| false,
+        )
+        .map_err(|error| Error::Config(error.to_string()))?,
+        _ => None,
+    };
+    let mut tool = json!({
+        "type":"function","name":spec.name,"description":spec.description,
+        "parameters":schema.as_ref().unwrap_or(&spec.parameters)
+    });
+    if supports_strict || implicit_strict_tools {
+        tool["strict"] = json!(schema.is_some());
+    }
+    let sampling = if schema.is_some() {
+        EffectiveToolSampling::StrictJsonSchema {
+            original_schema: spec.parameters.clone(),
+            normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
+        }
+    } else {
+        EffectiveToolSampling::Unconstrained
+    };
+    Ok((tool, sampling))
 }
 
 #[cfg(test)]
@@ -1190,6 +1425,20 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
+    fn uses_tool_transcript(&self, model: &str) -> bool {
+        self.supports_tool_transcript(model)
+    }
+
+    async fn prepare_context_with_tool_transcript<'a>(
+        &'a self,
+        request: &ModelRequest,
+        tool_transcript: &[pi_rs_core::ToolTranscriptChange],
+    ) -> Result<Option<Arc<dyn Model + 'a>>> {
+        Ok(self.supports_tool_transcript(&request.model).then(|| {
+            Arc::new(self.clone().with_tool_transcript(request, tool_transcript)) as Arc<dyn Model>
+        }))
+    }
+
     fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
         self.supports_mid_conversation_system(model)
     }
@@ -1215,7 +1464,7 @@ impl Model for OpenAiResponses {
         )?))
     }
     fn context_identity(&self) -> Option<String> {
-        if !self.identity_safe_transport {
+        if !self.identity_safe_transport || self.tool_transcript.is_some() {
             return None;
         }
         let mut headers: Vec<_> = self
@@ -1364,6 +1613,20 @@ impl Model for OpenAiResponses {
     }
 
     fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        let role = if self.use_developer_role {
+            "developer"
+        } else {
+            "system"
+        };
+        if let Ok(Some(body)) = self.transcript_payload(request, &ResponsesTools::default(), role) {
+            let input = body["input"]
+                .as_array()
+                .map_or(0, |input| pi_rs_core::estimate_replay_tokens(input));
+            let tools = body["tools"]
+                .as_array()
+                .map_or(0, |tools| pi_rs_core::estimate_replay_tokens(tools));
+            return 8_u64.saturating_add(input).saturating_add(tools);
+        }
         let overhead = pi_rs_core::estimate_request_tokens(&ModelRequest {
             model: request.model.clone(),
             max_output_tokens: request.max_output_tokens,
@@ -1374,6 +1637,7 @@ impl Model for OpenAiResponses {
             &request.messages,
             self.supports_mid_conversation_system(&request.model),
         )
+        .map(|(_, message)| message)
         .filter(|message| {
             !matches!(message.as_ref(), Message::System { content } if content.is_empty())
         }).fold(overhead, |tokens, message| {
@@ -1832,19 +2096,45 @@ impl OpenAiResponses {
             return Err(Error::Budget);
         }
         let active_effort = self.configuration_update_effort(&model).map(str::to_owned);
-        let mut body = responses_payload(
-            &request,
-            &replay_provider,
-            &edited_scope,
-            if self.use_developer_role {
-                "developer"
-            } else {
-                "system"
-            },
-            api,
-            self.supports_mid_conversation_system(&model),
-            active_effort.as_deref(),
-        );
+        let instruction_role = if self.use_developer_role {
+            "developer"
+        } else {
+            "system"
+        };
+        let tools = tools.unwrap_or_default();
+        let mut body = if let Some(body) =
+            self.transcript_payload(&request, &tools, instruction_role)?
+        {
+            body
+        } else {
+            let mut body = responses_payload(
+                &request,
+                &replay_provider,
+                &edited_scope,
+                instruction_role,
+                api,
+                ResponsesProjection {
+                    supports_mid_conversation_system: self.supports_mid_conversation_system(&model),
+                    active_effort: active_effort.as_deref(),
+                    ..Default::default()
+                },
+            );
+            grammar::project_input(
+                &request,
+                &mut body["input"],
+                &tools.grammar_inputs,
+                (self.provider == "openai-chatgpt").then_some(NAMESPACE),
+                None,
+            )?;
+            if !tools.declarations.is_empty() {
+                body["tools"] = if self.provider == "openai-chatgpt" {
+                    json!([{"type":"namespace","name":NAMESPACE,"description":"Local tools","tools":tools.declarations}])
+                } else {
+                    json!(tools.declarations)
+                };
+            }
+            body
+        };
         if self.azure_api_version.is_some() {
             if let Some(deployment) = self.deployments.get(&model) {
                 body["model"] = json!(deployment);
@@ -1854,20 +2144,6 @@ impl OpenAiResponses {
                     .expect("Responses request object")
                     .remove("max_output_tokens");
             }
-        }
-        let tools = tools.unwrap_or_default();
-        grammar::project_input(
-            &request,
-            &mut body["input"],
-            &tools.grammar_inputs,
-            (self.provider == "openai-chatgpt").then_some(NAMESPACE),
-        )?;
-        if !tools.declarations.is_empty() {
-            body["tools"] = if self.provider == "openai-chatgpt" {
-                json!([{"type":"namespace","name":NAMESPACE,"description":"Local tools","tools":tools.declarations}])
-            } else {
-                json!(tools.declarations)
-            };
         }
         let provider = self.provider.clone();
         if let Some(thinking) = &self.thinking {
@@ -2308,7 +2584,17 @@ mod tests {
             max_output_tokens: 64,
         };
         let make = |api, support| {
-            responses_payload(&request, "openai", "", "developer", api, support, None)
+            responses_payload(
+                &request,
+                "openai",
+                "",
+                "developer",
+                api,
+                ResponsesProjection {
+                    supports_mid_conversation_system: support,
+                    ..Default::default()
+                },
+            )
         };
         let folded = make(pi_rs_core::ModelApi::OpenaiResponses, false);
         assert_eq!(
@@ -2352,15 +2638,34 @@ mod tests {
             max_output_tokens: 64,
         };
         for support in [false, true] {
-            let body =
-                responses_payload(&request, "openai-codex", "", "system", api, support, None);
+            let body = responses_payload(
+                &request,
+                "openai-codex",
+                "",
+                "system",
+                api,
+                ResponsesProjection {
+                    supports_mid_conversation_system: support,
+                    ..Default::default()
+                },
+            );
             assert!(body.get("instructions").is_none());
             assert_eq!(body["input"], json!([{"role":"user","content":"ask"}]));
         }
         request.messages[0] = Message::System {
             content: "rules".into(),
         };
-        let body = responses_payload(&request, "openai-codex", "", "system", api, true, None);
+        let body = responses_payload(
+            &request,
+            "openai-codex",
+            "",
+            "system",
+            api,
+            ResponsesProjection {
+                supports_mid_conversation_system: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(body["input"][0], json!({"role":"system","content":"rules"}));
     }
 
@@ -3940,6 +4245,7 @@ mod tests {
             &mut body["input"],
             &BTreeMap::from([("read".into(), "path".into())]),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(body["input"][2], item);
@@ -3949,7 +4255,7 @@ mod tests {
         );
 
         let mut body = payload(&req, "openai", "openai", "system");
-        grammar::project_input(&req, &mut body["input"], &BTreeMap::new(), None).unwrap();
+        grammar::project_input(&req, &mut body["input"], &BTreeMap::new(), None, None).unwrap();
         assert_eq!(
             body["input"][2],
             json!({"type":"function_call","call_id":"c1","name":"read","arguments":fragments})
@@ -4047,6 +4353,7 @@ mod tests {
             &req,
             &mut body["input"],
             &BTreeMap::from([("read".into(), "path".into())]),
+            None,
             None,
         )
         .unwrap();
@@ -4815,8 +5122,10 @@ mod tests {
                 "fixture",
                 "system",
                 pi_rs_core::ModelApi::OpenaiResponses,
-                false,
-                Some("low"),
+                ResponsesProjection {
+                    active_effort: Some("low"),
+                    ..Default::default()
+                },
             );
             assert_eq!(
                 body["input"],
@@ -5073,8 +5382,10 @@ mod tests {
             "route",
             "developer",
             pi_rs_core::ModelApi::OpenaiResponses,
-            false,
-            Some("high"),
+            ResponsesProjection {
+                active_effort: Some("high"),
+                ..Default::default()
+            },
         );
         assert_eq!(
             body["input"],

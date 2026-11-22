@@ -2988,12 +2988,12 @@ schemas. An imported declaration cannot enable an unavailable or disabled tool.
 
 On ordinary turns, models that support mid-conversation instructions receive
 the original system prompt followed by checkpoint updates at their conversation
-positions, with named sections rendered as replacements or removals. An imported
-compaction snapshot supplies the leading prompt. Native compaction preserves
-checkpoint positions among retained messages when it has no prompt snapshot.
-A checkpoint inside a tool batch follows its results to preserve provider
-tool-call pairing. Models
-without that capability receive the fully resolved leading prompt. Extension
+positions, with named sections rendered as replacements or removals. Imported
+compaction snapshots supply the leading prompt and tool declarations before
+retained messages. Native compaction keeps checkpoint positions among retained
+messages when it has no snapshot. A checkpoint inside a tool batch follows its
+results to preserve provider tool-call pairing. Models without that capability
+receive the fully resolved leading prompt. Extension
 message hooks see the ordered checkpoints. Edits to other messages preserve
 checkpoint placement. If a hook edits system messages on a route that needs
 one prompt, the adapter joins the hook's current system text in order.
@@ -5371,7 +5371,26 @@ on the current request. Historical function arguments retain their full JSON
 when they cannot be represented as a single string. Models without the
 capability and the pi-rs ChatGPT plan namespace use function tools.
 
-Provider tool search remains open.
+Responses and Codex can anchor tool declarations to the session transcript.
+Models with `supportsAdditionalTools` and mid-conversation system messages
+receive `additional_tools` items and notices for removals. When a tool
+batch moves multiple changes to the same position, removal and reactivation
+retain their recorded order. Models with
+`supportsToolSearch` and mid-conversation system messages can receive synthetic
+search results for later additions. Removals and redefinitions start a new
+top-level tool set on that route. The agent keeps the request's active tool
+permissions as the authority for execution. Changed loadouts follow the
+session branch and retain native historical declarations after extension
+removal. Imported declarations can also explain retained calls for tools no
+longer registered. Sampling constraints travel with their recorded declarations.
+Responses projects historical grammar calls using the declaration at their
+position, including the original raw-input argument. This keeps a historical
+call replayable when a later definition renames the argument. Pi 1.6.0 uses
+the latest argument name in that case. Legacy declarations without a recorded
+constraint remain plain tools. When an extension rewrites the request, tools
+use the final
+top-level declaration list. Loopback tests cover successive requests and
+replay. Live Codex and Responses tool search were unverified.
 Authentication and grammar tool streaming were exercised with fixtures.
 Live sign-in and inference were unverified because no account was available
 for acceptance.
@@ -5384,7 +5403,9 @@ advertise thinking effort on Chat Completions use its reasoning-effort field.
 Copilot Messages and Responses expose strict sampling for supported tools.
 Ordinary Responses function declarations explicitly send `strict: false` to
 prevent Copilot from imposing strict sampling and filling optional fields.
-Projection of Copilot's transcript-level `additional_tools` remains open.
+Copilot Responses models with `supportsAdditionalTools` receive transcript-level
+`additional_tools` items through the same Responses adapter. A published Pi
+fixture confirmed the request shape. Live Copilot tool updates were unverified.
 `COPILOT_GITHUB_TOKEN` supplies a short-lived Copilot API token.
 `pi login github-copilot` and `/login github-copilot` support GitHub.com's
 device authorization and store a Pi-compatible OAuth entry. pi-rs can also

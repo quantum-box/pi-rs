@@ -870,6 +870,15 @@ impl From<EnrichedModelEvent> for DetailedModelEvent {
 }
 pub type DetailedModelStream = futures_util::stream::BoxStream<'static, Result<DetailedModelEvent>>;
 
+/// Native tool declarations that became effective before a message in a request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolTranscriptChange {
+    /// A value equal to the message count denotes the end of the request.
+    pub message_index: usize,
+    pub added: Vec<crate::ToolDeclaration>,
+    pub removed: Vec<String>,
+}
+
 /// Identity and cache purpose fixed when preparing a model dispatch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -926,6 +935,20 @@ pub trait Model: Send + Sync {
         _request: &ModelRequest,
     ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
         Ok(None)
+    }
+
+    /// Whether this adapter consumes ordered tool changes from native sessions.
+    fn uses_tool_transcript(&self, _model: &str) -> bool {
+        false
+    }
+
+    /// Resolve the adapter together with a branch-local transcript of tool changes.
+    async fn prepare_context_with_tool_transcript<'a>(
+        &'a self,
+        request: &ModelRequest,
+        _tool_transcript: &[ToolTranscriptChange],
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        self.prepare_context(request).await
     }
 
     /// Prepare the actual tool decisions and dispatch together. A legacy
