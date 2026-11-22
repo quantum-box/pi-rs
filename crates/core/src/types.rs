@@ -782,7 +782,7 @@ impl ProviderReplay {
                 .iter()
                 .any(|key| block.get(key).is_some()) =>
                 {
-                    api == ModelApi::GoogleGenerativeAi
+                    matches!(api, ModelApi::GoogleGenerativeAi | ModelApi::GoogleVertex)
                 }
                 // An older or host-defined block may have no recognizable API marker.
                 _ => true,
