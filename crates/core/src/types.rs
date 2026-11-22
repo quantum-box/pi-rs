@@ -707,9 +707,12 @@ impl ProviderReplay {
         self.blocks.iter().all(|block| {
             let kind = block["type"].as_str();
             if block.get("_pi_anthropic_effort").is_some()
-                || matches!(kind, Some("thinking" | "redacted_thinking" | "tool_use"))
+                || matches!(kind, Some("redacted_thinking" | "tool_use"))
+                || (kind == Some("thinking") && block["thinking"].is_string())
             {
                 api == ModelApi::AnthropicMessages
+            } else if block.get("mistral_content").is_some() {
+                api == ModelApi::MistralConversations
             } else if block.get("_pi_openai_effort").is_some()
                 || matches!(
                     kind,
