@@ -650,24 +650,21 @@ where
     let auth = directory.join("auth.json");
     let guard = super::auth_lock::acquire_async(&auth).await?;
     let data = super::config::read_auth_object_locked(&guard)?;
-    let credential = match parse_credential(&data) {
-        Ok(Some(credential)) => credential,
-        Ok(None) => return Ok(false),
-        Err(_) => {
-            // An unusable entry cannot be revoked. Clear the active local
-            // credential, plus its native session if the client ID is intact.
-            if let Some(id) = data[PROVIDER]["credential"]["client_id"].as_str() {
-                clear_session_locked(&directory, &guard, id)?;
-            } else {
-                super::config::update_object_locked(&auth, Some(&guard), |entries| {
-                    entries.remove(PROVIDER);
-                    Ok(())
-                })?;
-            }
-            return Ok(true);
+    let (credential, client_id) = match parse_credential(&data) {
+        Ok(Some(credential)) => {
+            let client_id = (!pi_entry(&data)).then(|| credential.client_id.clone());
+            (Some(credential), client_id)
         }
+        Ok(None) => return Ok(false),
+        // The unusable entry cannot be revoked. Its native session can still
+        // be cleared when the client ID is intact.
+        Err(_) => (
+            None,
+            data[PROVIDER]["credential"]["client_id"]
+                .as_str()
+                .map(str::to_owned),
+        ),
     };
-    let from_pi = pi_entry(&data);
     guard.check()?;
     let state = control.0;
     let _cancellation = LogoutCancellation(state.clone());
@@ -680,27 +677,28 @@ where
             return Err(Error::Cancelled);
         };
         let guard = super::process::guard_refresh_auth(barrier, guard);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build();
         if state
             .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
             return Err(Error::Cancelled);
         }
-        let revoked = match runtime {
-            Ok(runtime) => runtime.block_on(revoke(credential.clone())),
-            Err(error) => Err(Error::Io(error)),
+        let revoked = match credential {
+            Some(credential) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(Error::Io)
+                .and_then(|runtime| runtime.block_on(revoke(credential))),
+            None => Ok(()),
         };
         before_cleanup();
-        if from_pi {
+        if let Some(id) = client_id {
+            clear_session_locked(&directory, &guard, &id)?;
+        } else {
             super::config::update_object_locked(&auth, Some(&guard), |data| {
                 data.remove(PROVIDER);
                 Ok(())
             })?;
-        } else {
-            clear_session_locked(&directory, &guard, &credential.client_id)?;
         }
         revoked.map(|()| true).map_err(|_| {
             Error::Config(
