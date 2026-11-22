@@ -190,7 +190,7 @@ pub(super) fn expand_diagnostic_braces(pattern: &str) -> Option<Vec<String>> {
 
 // One top-level negation with literal alternatives and a simple component
 // suffix. Anything more complex must keep using the diagnostic fallback.
-fn negative_extglob_regex(pattern: &str) -> Option<fancy_regex::Regex> {
+pub(super) fn negative_extglob_regex(pattern: &str) -> Option<fancy_regex::Regex> {
     if pattern.len() > MAX_EXTGLOB_PATTERN
         || !pattern.is_ascii()
         || pattern.contains(['[', ']', '{', '}'])

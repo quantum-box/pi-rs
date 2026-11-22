@@ -127,6 +127,12 @@ async fn resolve(
                 }),
             );
         }
+        if matches!(credential, super::model_auth::Credential::VertexAdc(_)) {
+            return Ok((wanted.is_none()).then_some(Resolved {
+                kind: AuthType::ApiKey,
+                value: None,
+            }));
+        }
         if matches!(credential, super::model_auth::Credential::BedrockProfile(_)) {
             return Ok((wanted.is_none()).then_some(Resolved {
                 kind: AuthType::ApiKey,
@@ -150,6 +156,14 @@ async fn resolve(
             .await?
         } else if matches!(credential, super::model_auth::Credential::ChatGpt) {
             super::chatgpt_auth::access_options(
+                &args.settings,
+                (wanted == Some(AuthType::OAuth)).then_some(minimum),
+                no_refresh,
+            )
+            .await?
+        } else if matches!(credential, super::model_auth::Credential::Codex) {
+            super::codex_auth::access(
+                &super::config::agent_dir().join("auth.json"),
                 &args.settings,
                 (wanted == Some(AuthType::OAuth)).then_some(minimum),
                 no_refresh,

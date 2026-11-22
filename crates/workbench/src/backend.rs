@@ -131,6 +131,11 @@ enum Request {
         name: String,
         id: Option<serde_json::Value>,
     },
+    SetSessionLabel {
+        target: u64,
+        label: Option<String>,
+        id: Option<serde_json::Value>,
+    },
     SetQueueMode {
         kind: InputKind,
         mode: QueueMode,
@@ -1273,7 +1278,7 @@ async fn run_worker(
                         &mut |event| match event {
                             pi_rs::AgentEvent::Notification(event) => observer(event),
                             event if args.trace => {
-                                let mut event = super::reasoning_event_json(event);
+                                let mut event = super::agent_stream_event_json(event);
                                 if args.mode == Some(super::OutputMode::Rpc) {
                                     super::attach_redacted_reasoning(&mut event);
                                 }
@@ -1409,7 +1414,7 @@ async fn run_worker(
                         &mut |event| match event {
                             pi_rs::AgentEvent::Notification(event) => observer(event),
                             event if args.trace => {
-                                let mut event = super::reasoning_event_json(event);
+                                let mut event = super::agent_stream_event_json(event);
                                 if args.mode == Some(super::OutputMode::Rpc) {
                                     super::attach_redacted_reasoning(&mut event);
                                 }
@@ -1451,7 +1456,7 @@ async fn run_worker(
                             &mut |event| match event {
                                 pi_rs::AgentEvent::Notification(event) => observer(event),
                                 event if args.trace => {
-                                    let mut event = super::reasoning_event_json(event);
+                                    let mut event = super::agent_stream_event_json(event);
                                     if args.mode == Some(super::OutputMode::Rpc) {
                                         super::attach_redacted_reasoning(&mut event);
                                     }
@@ -1830,11 +1835,23 @@ fn observe_snapshot(
 ) {
     if let pi_rs::Notification::Committed(record) = &event
         && let pi_rs::Event::ToolFinished { operation_id, .. } = &record.event
-        && let Some(structured_content) = pi_rs::tool_result_event_metadata(*operation_id)
     {
-        output(
-            json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":structured_content}),
-        );
+        let structured_content = pi_rs::tool_result_event_metadata(*operation_id);
+        let duration_ms =
+            super::rpc_events::tool_duration_ms(pi_rs::record_event_metadata(record.id).as_ref());
+        if structured_content.is_some() || duration_ms.is_some() {
+            let mut metadata = json!({
+                "type": "internal_tool_result_metadata",
+                "operationId": operation_id
+            });
+            if let Some(content) = structured_content {
+                metadata["structuredContent"] = content;
+            }
+            if let Some(duration_ms) = duration_ms {
+                metadata["durationMs"] = json!(duration_ms);
+            }
+            output(metadata);
+        }
     }
     let name = match &event {
         pi_rs::Notification::Committed(record) => match &record.event {
@@ -2128,6 +2145,7 @@ fn read_requests(
                 | Request::QueueInput { .. }
                 | Request::ClearQueue { .. }
                 | Request::SetSessionName { .. }
+                | Request::SetSessionLabel { .. }
                 | Request::SetQueueMode { .. }) => {
                     if prepare_in_background {
                         if let Err(error) = queue_requests.try_send(request) {
