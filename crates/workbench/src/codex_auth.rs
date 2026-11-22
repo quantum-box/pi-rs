@@ -891,7 +891,7 @@ mod tests {
     fn codex_has_pinned_defaults_and_oauth_stays_on_its_endpoint() {
         let provider = Provider::named(PROVIDER).unwrap();
         let profiles = Profiles::default();
-        assert_eq!(profiles.model_ids(&provider).len(), 8);
+        assert_eq!(profiles.model_ids(&provider).len(), 10);
         assert_eq!(profiles.model_ids(&provider)[0], "gpt-6.1-sol");
         let upstream = json!({"openai-codex":{
             "type":"oauth","access":fake_jwt("fixture"),"refresh":"fixture","expires":1,

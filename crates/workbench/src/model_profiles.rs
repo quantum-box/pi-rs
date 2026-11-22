@@ -1386,13 +1386,20 @@ impl Profiles {
                 .unwrap_or_else(|| self.endpoint(provider))
         };
         let selected_endpoint = endpoint(selected);
+        let selected_adapter = self.model_adapter(provider, selected);
+        if !matches!(
+            selected_adapter,
+            Adapter::OpenAiResponses | Adapter::CodexResponses
+        ) {
+            return BTreeSet::new();
+        }
         let mut ids = self.model_ids(provider);
         if !ids.iter().any(|id| id == selected) {
             ids.push(selected.into());
         }
         ids.into_iter()
             .filter(|id| {
-                if self.model_adapter(provider, id) != Adapter::OpenAiResponses
+                if self.model_adapter(provider, id) != selected_adapter
                     || endpoint(id) != selected_endpoint
                 {
                     return false;
@@ -3188,9 +3195,17 @@ mod tests {
         let profiles = Profiles::default();
         let openai = Provider::named("openai").unwrap();
         let native = profiles.responses_effort_models(&openai, "gpt-6-luna", None);
-        assert_eq!(native.len(), 5);
+        assert_eq!(native.len(), 7);
         assert!(native.contains("gpt-6-luna"));
+        assert!(native.contains("gpt-6.2-sol"));
         assert!(!native.contains("gpt-5.4"));
+        let codex = Provider::named("openai-codex").unwrap();
+        let native = profiles.responses_effort_models(&codex, "gpt-6-luna", None);
+        assert_eq!(native.len(), 7);
+        assert!(native.contains("gpt-6.2-astra"));
+        assert!(!native.contains("gpt-5.6-sol"));
+        assert_eq!(profiles.model_ids(&codex).len(), 10);
+        assert_eq!(profiles.model_ids(&openai).len(), 47);
 
         let profiles = Profiles::parse(&json!({"providers":{"fixture":{
             "api":"openai-responses","baseUrl":"http://localhost:1/v1",

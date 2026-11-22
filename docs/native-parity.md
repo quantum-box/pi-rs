@@ -5276,7 +5276,15 @@ Google Cloud credential was available for acceptance testing.
 
 ### OpenAI Codex
 
-`openai-codex` exposes the eight pinned models through the ChatGPT Codex
+The direct OpenAI and Codex catalogs include the Pi v1.6.0 entries.
+Codex models advertising mid-conversation effort use configuration updates
+before earlier replies and for the current reply. This includes switching
+thinking off when the model maps that setting to `none`. The request keeps
+its top-level reasoning effort stable for prompt-cache reuse. System text is
+sent at the beginning of the ordered input, using the model's instruction
+role. This keeps the system prefix stable as turns are appended on GPT-6.2.
+
+`openai-codex` exposes ten pinned models through the ChatGPT Codex
 Responses route. It supports native HTTP streaming, model-specific reasoning
 levels, image inputs, tool calls, and endpoint-bound response replay.
 Codex's provider-side output limit starts at 16 tokens. With that limit enabled,
@@ -5769,19 +5777,21 @@ with later system instructions were unverified.
 
 ### Responses effort history
 
-The five OpenAI API-key models marked `supportsMidConvoEffort` in Pi v1.5.0
-keep their top-level reasoning effort at `medium` when a thinking level is
-active. Configuration updates apply the stored level before each recorded
-reply and the current level at the end of the request, including after a
-tool result. Pi session imports retain the recorded effort and replay the
+The OpenAI API-key and Codex models marked `supportsMidConvoEffort` in
+Pi v1.6.0 keep their top-level reasoning effort at `medium` while sending
+the selected effort in configuration updates. A configuration update applies
+the stored effort before each recorded reply and the current effort at the
+end of the request, including after a tool result. Compatible Codex models
+that map off to `none` also use an update for that setting. API-key requests
+with thinking off and the pi-rs ChatGPT plan adapter keep their usual
+reasoning options. Pi session imports retain the recorded effort and replay
 portable assistant history. Compatible custom profiles retain their own
 effort mappings. RPC exposes the recorded level. With API-key Responses,
 `off` uses top-level reasoning and leaves no configuration update to replay
 when thinking resumes, as in Pi 1.5.0 and 1.6.0. For example, switching from
 `low` through `off` to `high` sends only `low` and `high` configuration updates
-on the final request. ChatGPT and Codex subscriptions
-use their existing reasoning options. Local request fixtures covered the
-payload and replay. Live authenticated configuration updates were unverified.
+on the final request. Local request fixtures covered the payload and replay.
+Live authenticated configuration updates were unverified.
 
 ### Responses prompt cache key configuration
 

@@ -337,6 +337,7 @@ impl OpenAiResponses {
         })?;
         let mut client = Self::new_api_provider(endpoint, token, provider)?;
         client.codex_account = Some(account);
+        client.use_developer_role = true;
         client.codex_off_effort = Some("none".into());
         client.strict_tool_support = true;
         Ok(client)
@@ -486,17 +487,23 @@ impl OpenAiResponses {
     }
 
     fn configuration_update_effort(&self, model: &str) -> Option<&str> {
-        if !self.configuration_update_thinking
-            || !self.configuration_update_models.contains(model)
-            || self.codex_account.is_some()
+        if !self.configuration_update_models.contains(model)
             || self.provider == "openai-chatgpt"
+            || (self.codex_account.is_none() && !self.configuration_update_thinking)
             || (self.provider == "openai"
                 && self.endpoint.as_str() == DEFAULT_ENDPOINT
                 && !self.token.starts_with("sk-"))
         {
             return None;
         }
-        self.thinking.as_deref().filter(|effort| !effort.is_empty())
+        let codex_off = self
+            .codex_account
+            .as_ref()
+            .and(self.codex_off_effort.as_deref());
+        self.thinking
+            .as_deref()
+            .or(codex_off)
+            .filter(|effort| !effort.is_empty())
     }
 
     /// Set endpoint-wide strict JSON Schema tool support for this client.
@@ -529,8 +536,8 @@ impl OpenAiResponses {
         self
     }
 
-    /// Select whether model instructions use the developer role. Defaults to
-    /// the system role when model reasoning capability is not supplied.
+    /// Select whether model instructions use the developer role. Codex defaults
+    /// to developer; ordinary Responses defaults to system.
     pub fn with_developer_role(mut self, enabled: bool) -> Self {
         self.use_developer_role = enabled;
         self
@@ -1845,12 +1852,11 @@ impl OpenAiResponses {
             };
         }
         let provider = self.provider.clone();
-        if let Some(thinking) = &self.thinking {
-            let effort = if active_effort.is_some() {
-                "medium"
-            } else {
-                thinking
-            };
+        if let Some(effort) = active_effort
+            .as_ref()
+            .map(|_| "medium")
+            .or(self.thinking.as_deref())
+        {
             body["reasoning"] = json!({"effort":effort,"summary":"auto"});
             body["include"] = json!(["reasoning.encrypted_content"]);
         } else if let Some(off) = self
@@ -4806,13 +4812,22 @@ mod tests {
 
     #[tokio::test]
     async fn responses_configuration_updates_preserve_effort_across_replies() {
+        assert_configuration_updates_preserve_effort(false).await;
+    }
+
+    #[tokio::test]
+    async fn codex_configuration_updates_keep_the_request_effort_stable_when_thinking_is_off() {
+        assert_configuration_updates_preserve_effort(true).await;
+    }
+
+    async fn assert_configuration_updates_preserve_effort(codex: bool) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             for (level, previous, incomplete) in [
                 ("low", None, false),
                 ("xhigh", Some("low"), true),
-                ("none", None, false),
+                ("none", codex.then_some("low"), false),
                 ("high", Some("low"), false),
             ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -4839,7 +4854,7 @@ mod tests {
                 let input = body["input"].as_array().unwrap();
                 assert_eq!(input[0]["role"], "user");
                 assert!(!body.to_string().contains("_pi_openai_effort"));
-                if level == "none" {
+                if level == "none" && !codex {
                     assert_eq!(body["reasoning"]["effort"], "none");
                     assert!(
                         !input
@@ -4861,11 +4876,17 @@ mod tests {
                         .iter()
                         .filter(|item| item["type"] == "configuration_update")
                         .collect();
+                    let mut expected = vec![configuration_update("low")];
+                    if codex {
+                        expected.push(configuration_update("none"));
+                    }
+                    expected.push(configuration_update("high"));
+                    assert!(updates.into_iter().eq(&expected));
+                    let reply_index = if codex { 6 } else { 5 };
                     assert_eq!(
-                        updates,
-                        [&configuration_update("low"), &configuration_update("high")]
+                        input[reply_index]["content"][0]["text"],
+                        "reply with thinking off"
                     );
-                    assert_eq!(input[5]["content"][0]["text"], "reply with thinking off");
                 }
                 let state = if incomplete {
                     "incomplete"
@@ -4906,9 +4927,17 @@ mod tests {
                 socket.write_all(reply.as_bytes()).await.unwrap();
             }
         });
-        let client = OpenAiResponses::new_api(&endpoint, "sk-fixture".into())
-            .unwrap()
-            .with_configuration_update_models(BTreeSet::from(["gpt-6-luna".into()]));
+        let client = if codex {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}"#,
+            );
+            OpenAiResponses::new_codex(&endpoint, format!("e30.{payload}.fixture"), "openai-codex")
+        } else {
+            OpenAiResponses::new_api(&endpoint, "sk-fixture".into())
+        }
+        .unwrap()
+        .with_codex_transport(CodexTransport::Sse)
+        .with_configuration_update_models(BTreeSet::from(["gpt-6-luna".into()]));
         let mut request = ModelRequest {
             model: "gpt-6-luna".into(),
             messages: vec![Message::User {
@@ -4922,9 +4951,10 @@ mod tests {
             max_output_tokens: 64,
         };
         for level in ["low", "xhigh", "off", "high"] {
+            let thinking = (!codex || level != "off").then_some(level);
             let mut stream = client
                 .clone()
-                .with_thinking(Some(level))
+                .with_thinking(thinking)
                 .stream(request.clone())
                 .await
                 .unwrap();
@@ -4941,7 +4971,11 @@ mod tests {
             }
             assert_eq!(
                 replay.as_deref().and_then(ProviderReplay::openai_effort),
-                (level != "off").then_some(level),
+                if level == "off" {
+                    codex.then_some("none")
+                } else {
+                    Some(level)
+                },
             );
             if level == "low" {
                 request.messages.extend([
@@ -5020,6 +5054,71 @@ mod tests {
                 .configuration_update_effort("gpt-6-luna"),
             None
         );
+    }
+
+    #[test]
+    fn codex_effort_requires_a_configured_mapping_and_model() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}"#);
+        let client = OpenAiResponses::new_codex(
+            CODEX_ENDPOINT,
+            format!("e30.{payload}.fixture"),
+            "openai-codex",
+        )
+        .unwrap()
+        .with_configuration_update_models(BTreeSet::from(["gpt-6-luna".into()]));
+        assert_eq!(
+            client.configuration_update_effort("gpt-6-luna"),
+            Some("none")
+        );
+        assert_eq!(client.configuration_update_effort("unlisted"), None);
+        assert_eq!(
+            client
+                .clone()
+                .with_codex_off_effort(None)
+                .configuration_update_effort("gpt-6-luna"),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_uses_the_selected_instruction_role_and_omits_empty_system_text() {
+        let request = ModelRequest {
+            model: "gpt-6.2-sol".into(),
+            tools: vec![],
+            max_output_tokens: 32,
+            messages: vec![
+                Message::System {
+                    content: String::new(),
+                },
+                Message::User {
+                    content: "prompt".into(),
+                },
+                Message::System {
+                    content: "follow-up instruction".into(),
+                },
+            ],
+        };
+        for role in ["developer", "system"] {
+            let body = responses_payload(
+                &request,
+                "openai-codex",
+                "route",
+                role,
+                pi_rs_core::ModelApi::OpenaiCodexResponses,
+                true,
+                Some("high"),
+            );
+            assert!(body.get("instructions").is_none());
+            assert_eq!(
+                body["input"],
+                json!([
+                    {"role":"user","content":"prompt"},
+                    {"role":role,"content":"follow-up instruction"},
+                    configuration_update("high")
+                ])
+            );
+        }
     }
 
     #[test]
