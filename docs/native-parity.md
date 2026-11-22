@@ -1161,11 +1161,21 @@ is a known Pi-fidelity limitation rather than exact profile matching. Native
 resource tools remain namespaced per server and aggregate that server's pages.
 If a resource or template omits its name, native uses its URI or URI template
 in full and paged listings, matching Pi. Explicit empty names are preserved.
+Tool and resource discovery treat an empty next cursor as the end of the list.
+Full listings stop with an error on a repeated cursor or a continuation beyond
+1,000 pages, matching Pi. Native also applies the bound to its prompt listings
+and omits opaque cursor values from duplicate-cursor errors.
 Within the existing initialization deadline, HTTP connections retry after
 250 ms and 1 second on transient network errors, HTTP 408, 429, and 5xx
 other than 501. Remote resource reads and listings, including paged listings
 and templates, retry once on those HTTP statuses. Cancellation interrupts the
 resource retry wait, and ordinary tool calls are sent once on these failures.
+For stdio and streamable HTTP tool calls, progress notifications matching the
+request's MCP progress token renew its idle timeout. The live tool result shows
+the server's message or `Progress N[/total]` when no message was supplied.
+Progress for another request does not extend the deadline. The CLI can cancel
+an active tool call even while progress is arriving. Resource requests retain
+their fixed deadlines.
 
 Loopback fixtures verified stdio discovery and tool execution, HTTP bearer
 headers, resource reading, and the model/tool/model round trip. Credentials
@@ -6152,9 +6162,10 @@ before dispatch, uses the original affinity and tool definitions, and
 stops on a changed context or the 30-minute limit. A completed cache miss
 retains its billed usage and schedules another decision on the normal cadence,
 measured from the refresh request's start to protect the cache lifetime.
-Failed refreshes and local model timeouts stop warming without
-recording usage because the provider may still be processing the request. Pi
-waits for the refresh to settle and also retries errors.
+Like Pi, each cache refresh disables provider HTTP retries while preserving
+the configured HTTP attempt timeout. Failed refreshes and local model timeouts
+stop native warming without recording usage because the provider may still be
+processing the request. Pi can schedule another refresh after the first settles.
 Refresh usage is journaled and projected as a Pi usage entry. Response
 content stays out of the conversation. This checkpoint covers idle
 requests with thinking off. Streaming warming and extension decisions
