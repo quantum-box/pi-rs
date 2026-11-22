@@ -129,6 +129,13 @@ fn remember_fallback(key: String) {
     keys.push_back((key, Instant::now() + FALLBACK_COOLDOWN));
 }
 
+fn interrupted_transport(key: Option<&str>, error: Error) -> Error {
+    if let Some(key) = key {
+        remember_fallback(key.to_owned());
+    }
+    error
+}
+
 fn take_connection(key: &str) -> Option<IdleConnection> {
     let mut pool = POOL.lock().ok()?;
     let now = Instant::now();
@@ -432,17 +439,21 @@ pub(super) async fn open(
         continuation.unwrap_or_else(|| body.clone()),
         timeout,
     )
-    .await?;
+    .await
+    .map_err(|error| interrupted_transport(pool_key.as_deref(), error))?;
 
     Ok(Some(Box::pin(async_stream::try_stream! {
         let mut seen = 0usize;
         let mut has_output = false;
         let mut retried_connection_limit = false;
         loop {
-            let event = match next(&mut socket, timeout).await? {
+            let event = match next(&mut socket, timeout)
+                .await
+                .map_err(|error| interrupted_transport(pool_key.as_deref(), error))?
+            {
                 Message::Text(text) => text,
                 Message::Ping(_) | Message::Pong(_) => continue,
-                Message::Close(_) => Err(disconnected())?,
+                Message::Close(_) => Err(interrupted_transport(pool_key.as_deref(), disconnected()))?,
                 _ => Err(Error::Model("unexpected Codex WebSocket message".into()))?,
             };
             seen = seen.saturating_add(event.len());
@@ -464,9 +475,11 @@ pub(super) async fn open(
                 retried_connection_limit |= connection_limit;
                 // Release the rejected connection before asking the service for another slot.
                 drop(socket);
-                socket = handshake.connect().await?;
+                socket = handshake.connect().await
+                    .map_err(|error| interrupted_transport(pool_key.as_deref(), error))?;
                 connected = Instant::now();
-                send(&mut socket, body.clone(), timeout).await?;
+                send(&mut socket, body.clone(), timeout).await
+                    .map_err(|error| interrupted_transport(pool_key.as_deref(), error))?;
                 sent_continuation = false;
                 continue;
             }
@@ -1022,6 +1035,94 @@ mod tests {
             Some(Ok(ModelEvent::Complete { .. }))
         ));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_interruption_uses_sse_only_on_the_next_attempt() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (retry, next_attempt) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let body = read_request(&mut socket).await;
+            assert_eq!(body["input"][0]["content"], "first");
+            socket
+                .send(Message::Text(
+                    r#"{"type":"response.output_text.delta","delta":"partial"}"#.into(),
+                ))
+                .await
+                .unwrap();
+            socket.close(None).await.unwrap();
+
+            tokio::select! {
+                result = next_attempt => result.unwrap(),
+                attempt = listener.accept() => panic!("interrupted request was dispatched again: {attempt:?}"),
+            }
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut http = BufReader::new(tcp);
+            let mut line = String::new();
+            http.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                line.trim_end(),
+                "POST /backend-api/codex/responses HTTP/1.1"
+            );
+            let mut length = 0;
+            loop {
+                line.clear();
+                assert_ne!(http.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            http.read_exact(&mut body).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["input"][0]["content"], "retry");
+            let completion = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+            http.get_mut().write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{completion}",
+                completion.len()
+            ).as_bytes()).await.unwrap();
+        });
+        let model = client(
+            format!("http://{address}/backend-api/codex/responses"),
+            CodexTransport::Auto,
+        )
+        .with_session_cache_key(&uuid::Uuid::new_v4().to_string());
+        let exchange = async {
+            let events = model
+                .stream(request(vec![prompt("first")]))
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Ok(ModelEvent::Text(text)) if text == "partial"))
+            );
+            assert!(matches!(events.last(), Some(Err(Error::RetryableModel(_)))));
+            retry.send(()).unwrap();
+            let events = model
+                .stream(request(vec![prompt("retry")]))
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            assert!(matches!(
+                events.last(),
+                Some(Ok(ModelEvent::Complete { .. }))
+            ));
+            server.await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), exchange)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
