@@ -135,6 +135,7 @@ fn api_name(api: NativeModelApi) -> &'static str {
         NativeModelApi::OpenAiCodexResponses => "openai-codex-responses",
         NativeModelApi::AnthropicMessages => "anthropic-messages",
         NativeModelApi::GoogleGemini => "google-generative-ai",
+        NativeModelApi::BedrockConverse => "bedrock-converse-stream",
     }
 }
 
