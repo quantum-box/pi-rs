@@ -3161,7 +3161,16 @@ mod tests {
         let provider = Provider::named("openai-codex").unwrap();
         let (_, codex) =
             profiles.responses_mid_conversation_system_policy(&provider, "gpt-6.1-sol", None);
-        assert_eq!(codex.len(), 8);
+        assert_eq!(codex.get("gpt-6.2-astra"), Some(&true));
+        assert_eq!(codex.get("gpt-6.2-sol"), Some(&true));
+        assert_eq!(
+            codex,
+            profiles
+                .model_ids(&provider)
+                .into_iter()
+                .map(|id| (id, true))
+                .collect::<BTreeMap<_, _>>()
+        );
 
         let profiles = Profiles::parse(&json!({"providers":{"fixture":{
             "api":"openai-responses","baseUrl":"http://localhost:1/v1",
