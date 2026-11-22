@@ -117,13 +117,22 @@ impl ChatPrice {
             .cache_write_1h_tokens
             .unwrap_or_default()
             .min(writes);
+        let multiplier = metadata
+            .catalog_cost_multiplier
+            .as_ref()
+            .and_then(serde_json::Number::as_f64)
+            .filter(|multiplier| multiplier.is_finite() && *multiplier > 0.0)
+            .unwrap_or(1.0);
         let input_rate = rates.input.unwrap_or_default();
         crate::UsageCostBreakdown::new(
-            (input_rate / 1_000_000.0) * (other_input - writes) as f64,
-            (rates.output.unwrap_or_default() / 1_000_000.0) * usage.output_tokens as f64,
-            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64,
-            (rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
-                + (input_rate / 500_000.0) * long as f64,
+            (input_rate / 1_000_000.0) * (other_input - writes) as f64 * multiplier,
+            (rates.output.unwrap_or_default() / 1_000_000.0)
+                * usage.output_tokens as f64
+                * multiplier,
+            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64 * multiplier,
+            ((rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
+                + (input_rate / 500_000.0) * long as f64)
+                * multiplier,
         )
     }
 }
