@@ -18,6 +18,7 @@ mod persistent_map;
 #[doc(hidden)]
 pub mod pi_import;
 mod provider_hooks;
+mod provider_retry;
 mod resource;
 mod retry;
 mod runtime;
@@ -26,6 +27,7 @@ mod statistics;
 mod strict_tool_schema;
 mod tokens;
 mod tool_execution_snapshot;
+mod tool_render;
 mod types;
 mod ui;
 mod ui_prompt;
@@ -57,6 +59,7 @@ pub use provider_hooks::{
     ProviderResponseEvent, ProviderStreamEvent, observe_provider_response, observe_provider_stream,
     observes_provider_response, observes_provider_stream,
 };
+pub use provider_retry::ProviderRetry;
 pub use resource::Resource;
 pub use retry::*;
 pub use sdk::*;
@@ -74,6 +77,7 @@ pub use tokens::{
 };
 pub use tokio_util::sync::CancellationToken;
 pub use tool_execution_snapshot::{ToolExecutionSnapshot, ValidatedToolExecutionSnapshot};
+pub use tool_render::*;
 pub use types::*;
 pub use ui::*;
 pub use ui_prompt::{UiPromptKind, UiPromptReason};
