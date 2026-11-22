@@ -4552,7 +4552,7 @@ impl SystemTranscript {
     }
 }
 
-fn system_messages(messages: &[Message]) -> impl Iterator<Item = &str> + Clone {
+fn system_messages(messages: &[Message]) -> impl Iterator<Item = &str> {
     messages.iter().filter_map(|message| match message {
         Message::System { content } => Some(content.as_str()),
         _ => None,
@@ -4568,13 +4568,13 @@ impl SystemTranscriptFallback {
         if model.supports_mid_conversation_system_messages(&request.model) {
             return true;
         }
-        let system = system_messages(&request.messages);
-        let unchanged = system.clone().eq(self.projected.iter().map(String::as_str));
+        let unchanged =
+            system_messages(&request.messages).eq(self.projected.iter().map(String::as_str));
         let content = if unchanged {
             self.collapsed
         } else {
             // Explicit hook edits replace the journal's resolved instructions.
-            system
+            system_messages(&request.messages)
                 .filter(|part| !part.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n\n")
