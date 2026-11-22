@@ -3881,6 +3881,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_federation_token_is_invalidated_after_thread_fallback() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for (status, error) in [
+                (
+                    "404 Not Found",
+                    json!({"error":{"details":{"error_code":"thread_not_found"},"message":"fixture"}}),
+                ),
+                (
+                    "401 Unauthorized",
+                    json!({"error":{"type":"authentication_error","message":"expired"}}),
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (headers, body) = read_fixture_request(&mut socket);
+                assert!(headers.contains(MESSAGE_THREADS_BETA));
+                assert!(headers.contains(OAUTH_API_BETA));
+                assert_eq!(body["thread"], json!({"type":"create"}));
+                let error = error.to_string();
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}", error.len()).unwrap();
+            }
+        });
+        let rejections = Arc::new(AtomicUsize::new(0));
+        let rejected = Arc::clone(&rejections);
+        let mut client =
+            Anthropic::with_bearer_token(&format!("http://{address}/v1/messages"), "fixture-token")
+                .unwrap()
+                .with_message_thread_support(Some(true), BTreeMap::new())
+                .with_cache_retention(CacheRetention::Short, true);
+        client.federation_rejected = Some(Arc::new(move || {
+            rejected.fetch_add(1, Ordering::Relaxed);
+        }));
+        let request = ModelRequest {
+            model: "claude".into(),
+            messages: vec![Message::User {
+                content: "test".into(),
+            }],
+            tools: Vec::new(),
+            max_output_tokens: 8,
+        };
+        let mut stream = client
+            .stream_detailed_with_tools(request, None, Some((uuid::Uuid::new_v4(), "fixture")))
+            .await
+            .unwrap();
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert!(matches!(stream.next().await, Some(Err(_))));
+        assert_eq!(rejections.load(Ordering::Relaxed), 1);
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn prepared_message_threads_send_suffixes_and_recover_from_rejections() {
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
