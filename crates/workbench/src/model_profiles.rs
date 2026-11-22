@@ -280,7 +280,7 @@ impl ModelCompatibility {
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct InputLimits {
+pub(super) struct InputLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_request_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -298,7 +298,7 @@ impl InputLimits {
         }
     }
 
-    fn valid(self) -> bool {
+    pub(super) fn valid(self) -> bool {
         self.max_request_bytes != Some(0) && self.images.is_none_or(ImageLimits::valid)
     }
 }

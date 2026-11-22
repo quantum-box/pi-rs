@@ -43,6 +43,11 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
             .collect();
         models.sort_by(|left, right| compare(left, right));
         let mut details = catalog.details(&models, &args.model_profiles).await;
+        let radius = if json_mode {
+            catalog.client.discovered_radius_catalog().await
+        } else {
+            None
+        };
         for model in models {
             let detail = details.remove(&model);
             if json_mode {
@@ -52,6 +57,9 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
                 });
                 if let Some(metadata) = args.model_profiles.model(&catalog.provider, &model) {
                     metadata.apply_catalog_metadata(&mut row);
+                }
+                if let Some(radius) = &radius {
+                    radius.apply_metadata(&model, &mut row);
                 }
                 output(with_details(row, detail.as_ref()));
             } else {

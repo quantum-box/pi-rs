@@ -2165,8 +2165,13 @@ fn command_cancellable(
                         details.get(&candidate),
                         generation,
                     );
+                    let mut model =
+                        model_value_without_cache(&current, &catalog.provider, &candidate);
+                    if let Some(radius) = catalog.client.discovered_radius_catalog().await {
+                        radius.apply_metadata(&candidate, &mut model);
+                    }
                     Ok(Some(model_with_input_details(
-                        model_value_without_cache(&current, &catalog.provider, &candidate),
+                        model,
                         details.get(&candidate),
                     )))
                 })?
@@ -2704,6 +2709,11 @@ fn available_models_at(
             } else {
                 Default::default()
             };
+            let radius = if include_details {
+                catalog.client.discovered_radius_catalog().await
+            } else {
+                None
+            };
             if include_details && catalog.complete {
                 complete_model_catalog(&args, &catalog.provider, &catalog.models, generation);
             }
@@ -2716,10 +2726,11 @@ fn available_models_at(
                         details.get(&model),
                         generation,
                     );
-                    rows.push(model_with_input_details(
-                        model_value_without_cache(&args, &catalog.provider, &model),
-                        details.get(&model),
-                    ));
+                    let mut row = model_value_without_cache(&args, &catalog.provider, &model);
+                    if let Some(radius) = &radius {
+                        radius.apply_metadata(&model, &mut row);
+                    }
+                    rows.push(model_with_input_details(row, details.get(&model)));
                 }
                 choices.push(ScopedChoice {
                     provider: catalog.provider.clone(),

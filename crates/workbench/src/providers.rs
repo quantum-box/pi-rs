@@ -1203,6 +1203,15 @@ impl Client {
         }
     }
 
+    pub(super) async fn discovered_radius_catalog(
+        &self,
+    ) -> Option<Arc<super::radius_catalog::Catalog>> {
+        match self {
+            Self::PiMessages(client) => client.discovered_catalog().await,
+            _ => None,
+        }
+    }
+
     pub fn with_headers(self, headers: reqwest::header::HeaderMap) -> Self {
         match self {
             Self::Ollama(client) => Self::Ollama(client.with_headers(headers)),

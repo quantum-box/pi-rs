@@ -5,15 +5,34 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use pi_rs::{Error, Result, ollama::ModelDetails};
+use pi_rs::{ChatPrice, Error, Result, ollama::ModelDetails};
 use reqwest::{Client, Url};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+
+use super::model_profiles::InputLimits;
 
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 pub(super) struct Catalog {
     pub endpoint: Url,
     pub models: Vec<Model>,
+}
+
+impl Catalog {
+    pub(super) fn apply_metadata(&self, id: &str, row: &mut Value) {
+        let (Some(model), Some(row)) = (
+            self.models.iter().find(|model| model.id == id),
+            row.as_object_mut(),
+        ) else {
+            return;
+        };
+        if let Some(cost) = &model.cost {
+            row.entry("cost").or_insert_with(|| cost.value());
+        }
+        if let Some(limits) = model.input_limits {
+            row.entry("inputLimits").or_insert_with(|| json!(limits));
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -27,6 +46,25 @@ pub(super) struct Model {
     max_tokens: u32,
     #[serde(default)]
     thinking_level_map: BTreeMap<String, Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "optional_metadata",
+        skip_serializing_if = "Option::is_none"
+    )]
+    cost: Option<ChatPrice>,
+    #[serde(
+        default,
+        deserialize_with = "optional_metadata",
+        skip_serializing_if = "Option::is_none"
+    )]
+    input_limits: Option<InputLimits>,
+}
+
+fn optional_metadata<'de, D: Deserializer<'de>, T: DeserializeOwned>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 impl Model {
@@ -130,6 +168,11 @@ fn parse(config: Config, gateway: &Url) -> Result<Catalog> {
                 && model.max_tokens > 0
                 && seen.insert(model.id.clone())
         })
+        .map(|mut model| {
+            model.cost = model.cost.filter(ChatPrice::valid);
+            model.input_limits = model.input_limits.filter(|limits| limits.valid());
+            model
+        })
         .collect();
     Ok(Catalog { endpoint, models })
 }
@@ -199,5 +242,55 @@ mod tests {
         assert!(fable.details().images.unwrap());
         assert!(public.models.iter().any(|model| model.id == "gpt-6.2-sol"));
         assert!(baseline(&Url::parse("https://other.example/").unwrap()).is_none());
+
+        let mut row = json!({});
+        public.apply_metadata("balanced", &mut row);
+        assert_eq!(
+            row["cost"],
+            json!({"input":3.0,"output":15.0,"cacheRead":0.3,"cacheWrite":0.0})
+        );
+        assert_eq!(row["inputLimits"]["images"]["resize"]["maxWidth"], 2000);
+    }
+
+    #[test]
+    fn account_metadata_round_trips_and_preserves_configured_overrides() {
+        let gateway = Url::parse("https://gateway.example/").unwrap();
+        let mut model = json!({
+            "id":"fixture", "name":"Fixture", "reasoning":false, "input":["image"],
+            "contextWindow":131072, "maxTokens":4096,
+            "cost":{"input":1.5,"output":3},
+            "inputLimits":{"images":{"resize":{"maxWidth":512,"maxHeight":1024}}}
+        });
+        let mut invalid = model.clone();
+        invalid["id"] = json!("invalid-metadata");
+        invalid["cost"] = json!("malformed");
+        invalid["inputLimits"]["images"]["resize"]["maxWidth"] = json!(0);
+        let catalog = |models| {
+            parse(
+                Config {
+                    base_url: "https://gateway.example/v1".into(),
+                    models,
+                },
+                &gateway,
+            )
+            .unwrap()
+        };
+        let fresh = catalog(vec![model.clone(), invalid]);
+        let restored = catalog(serde_json::from_value(json!(fresh.models)).unwrap());
+        let mut row = json!({"cost":{"input":2}});
+        restored.apply_metadata("fixture", &mut row);
+        assert_eq!(row["cost"], json!({"input":2}));
+        assert_eq!(row["inputLimits"]["images"]["resize"]["maxWidth"], 512);
+        let mut row = json!({});
+        restored.apply_metadata("fixture", &mut row);
+        assert_eq!(row["cost"]["input"], 1.5);
+        assert_eq!(restored.models.len(), 2);
+        let mut row = json!({});
+        restored.apply_metadata("invalid-metadata", &mut row);
+        assert_eq!(row, json!({}));
+
+        model.as_object_mut().unwrap().remove("inputLimits");
+        model.as_object_mut().unwrap().remove("cost");
+        assert_eq!(catalog(vec![model]).models.len(), 1);
     }
 }

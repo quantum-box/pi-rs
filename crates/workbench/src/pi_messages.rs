@@ -254,6 +254,11 @@ impl PiMessages {
             .unwrap_or_default()
     }
 
+    pub(super) async fn discovered_catalog(&self) -> Option<Arc<radius_catalog::Catalog>> {
+        let cache = self.radius.as_ref()?.catalog.lock().await;
+        cache.as_ref().map(|entry| entry.value.clone())
+    }
+
     pub(super) async fn model_details(
         &self,
         ids: &[String],

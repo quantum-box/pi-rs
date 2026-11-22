@@ -4896,6 +4896,12 @@ Successful empty catalogs remain authoritative. Live authenticated Radius
 discovery for this release was unverified.
 [Pi AI 1.6.0 distribution](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.6.0)
 
+The bundled and account-scoped Radius catalogs retain advertised prices and
+image input limits. JSON model listings and RPC model discovery expose those
+fields when available. Explicit model settings take precedence. Missing or
+invalid optional metadata leaves the model available, including when loading
+an older cache.
+
 ### Single-shot JSON event stream
 
 `--mode json` emits the Pi session header followed by agent, turn,
