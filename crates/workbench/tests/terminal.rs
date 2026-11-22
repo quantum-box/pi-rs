@@ -232,6 +232,12 @@ fn terminal_appearance_notifications_follow_the_saved_theme_selection() {
         assert!(!text.contains("\x1b[?996n"));
         text.contains("\x1b]11;?\x07") && text.contains("Enter to send")
     });
+    master.write_all(b"\x1b[?1;2c/reload\r").unwrap();
+    output_until(&mut master, |text| {
+        assert!(!text.contains("\x1b[?2031h"));
+        assert!(!text.contains("\x1b[?996n"));
+        text.contains("Reloaded settings") && text.contains("\x1b]11;?\x07")
+    });
     master.write_all(b"\x1b[?1;2c/theme light/dark\r").unwrap();
     output_until(&mut master, |text| {
         text.contains("\x1b[?2031h\x1b[?996n") && text.contains("\x1b]11;?\x07")
@@ -955,6 +961,12 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
 
 #[test]
 fn autocomplete_settings_cycle_starts_at_first_preset_for_custom_value() {
+    for mode in ["regular", "fullscreen"] {
+        exercise_autocomplete_and_settings(mode);
+    }
+}
+
+fn exercise_autocomplete_and_settings(mode: &str) {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -1005,7 +1017,7 @@ fn autocomplete_settings_cycle_starts_at_first_preset_for_custom_value() {
                 "--model",
                 "fixture",
                 "--tui-mode",
-                "fullscreen",
+                mode,
             ])
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
@@ -1014,7 +1026,29 @@ fn autocomplete_settings_cycle_starts_at_first_preset_for_custom_value() {
             .unwrap(),
     );
     output_until(&mut master, |text| text.contains("Enter to send"));
-    master.write_all(b"/settings\r").unwrap();
+    for name in ["sample-a", "sample-b"] {
+        std::fs::File::create(root.path().join(name)).unwrap();
+    }
+    let file_draft = format!("look at {}/sample-\t", root.path().display());
+    master.write_all(file_draft.as_bytes()).unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Autocomplete") && text.contains("sample-b")
+    });
+    master.write_all(b"\r-draft").unwrap();
+    output_until(&mut master, |text| text.contains("sample-a-draft"));
+
+    master.write_all(b"\x15/se\t").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Autocomplete") && text.contains("/settings")
+    });
+    master.write_all(b"\x1b[B\t suffix").unwrap();
+    output_until(&mut master, |text| text.contains("/settings suffix"));
+
+    master.write_all(b"\x15/se\t").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Autocomplete") && text.contains("/settings")
+    });
+    master.write_all(b"\x1b[B\r").unwrap();
     output_until(&mut master, |text| text.contains("Auto-compact"));
     master.write_all(b"Autocomplete max items\r").unwrap();
     output_until(&mut master, |text| {
@@ -1288,7 +1322,31 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
 
 #[test]
 fn resize_and_suspend_preserve_input_and_restore_terminal() {
+    exercise_terminal_suspend("fullscreen", SuspendTrigger::Key);
+}
+
+#[test]
+fn external_suspend_restores_the_terminal_and_preserves_the_draft() {
+    for mode in ["regular", "fullscreen"] {
+        exercise_terminal_suspend(mode, SuspendTrigger::Signal);
+    }
+}
+
+#[test]
+fn external_suspend_interrupts_the_wait_during_reload_without_losing_preparation() {
+    exercise_terminal_suspend("fullscreen", SuspendTrigger::Reload);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SuspendTrigger {
+    Key,
+    Signal,
+    Reload,
+}
+
+fn exercise_terminal_suspend(mode: &str, trigger: SuspendTrigger) {
     let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
     let mut master_fd = -1;
     let mut slave_fd = -1;
     let mut size = libc::winsize {
@@ -1341,8 +1399,10 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
                 "--no-trust",
                 "--no-mcp",
                 "--no-extensions",
+                "--tui-mode",
+                mode,
             ])
-            .env("PI_RS_HOME", root.path().join("home"))
+            .env("PI_RS_HOME", &home)
             .env("TERM", "xterm-256color")
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
@@ -1366,12 +1426,53 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
         output_until(&mut master, |text| text.contains(&marker));
         master.write_all(b"\x15").unwrap();
     }
-    master.write_all(b"resume-draft").unwrap();
-    output_until(&mut master, |text| text.contains("resume-draft"));
-    master.write_all(b"\x1a").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    if trigger == SuspendTrigger::Reload {
+        use std::os::unix::fs::PermissionsExt;
+        let package = root.path().join("slow-package.sh");
+        std::fs::write(
+            &package,
+            r#"#!/bin/sh
+: > "$PI_RS_HOME/probe-started"
+for i in $(seq 1 160); do
+    if [ -f "$PI_RS_HOME/probe-release" ]; then
+        printf '%s\n' '{"version":1,"response":{"Ok":{"id":"probe","dependencies":[],"commands":[],"tools":[]}}}'
+        exit 0
+    fi
+    sleep .1
+done
+exit 1
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[package]}).to_string(),
+        )
+        .unwrap();
+        master.write_all(b"/reload\r").unwrap();
+        output_until(&mut master, |_| home.join("probe-started").exists());
+    } else {
+        master.write_all(b"resume-draft").unwrap();
+        output_until(&mut master, |text| text.contains("resume-draft"));
+    }
+    if trigger == SuspendTrigger::Key {
+        master.write_all(b"\x1a").unwrap();
+    } else {
+        assert_eq!(
+            unsafe { libc::kill(process.0.id() as libc::pid_t, libc::SIGTSTP) },
+            0
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut stopped = false;
+    let mut before_stop = Vec::new();
+    let mut buffer = [0; 8192];
     while Instant::now() < deadline {
+        while let Ok(count @ 1..) = master.read(&mut buffer) {
+            before_stop.extend_from_slice(&buffer[..count]);
+        }
         let mut status = 0;
         let observed = unsafe {
             libc::waitpid(
@@ -1386,11 +1487,18 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
             stopped = true;
             break;
         }
-        let mut buffer = [0; 8192];
-        let _ = master.read(&mut buffer);
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(stopped, "foreground job did not suspend");
+    while let Ok(count @ 1..) = master.read(&mut buffer) {
+        before_stop.extend_from_slice(&buffer[..count]);
+    }
+    let before_stop = String::from_utf8_lossy(&before_stop);
+    assert!(before_stop.contains("\x1b[?2004l"), "{before_stop:?}");
+    if mode == "fullscreen" {
+        assert!(before_stop.contains("\x1b[?1049l"), "{before_stop:?}");
+        assert!(before_stop.contains("\x1b[?1006l"), "{before_stop:?}");
+    }
     let mut paused = std::mem::MaybeUninit::<libc::termios>::uninit();
     assert_eq!(
         unsafe { libc::tcgetattr(slave.as_raw_fd(), paused.as_mut_ptr()) },
@@ -1405,9 +1513,15 @@ fn resize_and_suspend_preserve_input_and_restore_terminal() {
         unsafe { libc::kill(-(process.0.id() as libc::pid_t), libc::SIGCONT) },
         0
     );
+    let expected_after_resume = if trigger == SuspendTrigger::Reload {
+        std::fs::File::create(home.join("probe-release")).unwrap();
+        "Reloaded settings"
+    } else {
+        "resume-draft"
+    };
     output_until(&mut master, |text| {
         assert!(!text.contains("\x1b]11;?"));
-        text.contains("resume-draft") && text.contains("\x1b[>4;2m")
+        text.contains(expected_after_resume) && text.contains("\x1b[>4;2m")
     });
     // An old or foreign DA1 and late OSC must not launch another query after
     // the shell owned the terminal, and ordinary input must still be usable.
@@ -2004,6 +2118,25 @@ fn settings_switches_terminal_modes_and_restores_input() {
         }
         master.write_all(b"draft survives").unwrap();
         output_until(&mut master, |text| text.contains("draft survives"));
+        let mut previous = None;
+        for (key, notice) in [
+            (b"\x0f", "Tool output: expanded"),
+            (b"\x14", "Thinking blocks: hidden"),
+            (b"\x0f", "Tool output: collapsed"),
+            (b"\x14", "Thinking blocks: visible"),
+        ] {
+            master.write_all(key).unwrap();
+            output_until(&mut master, |text| {
+                text.contains(notice)
+                    && text.contains("draft survives")
+                    && previous.is_none_or(|previous| !text.contains(previous))
+            });
+            previous = Some(notice);
+        }
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(settings["hideThinkingBlock"], false);
     }
 }
 
@@ -2059,15 +2192,20 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
             .spawn()
             .unwrap(),
     );
-    output_until(&mut master, |text| text.contains("Enter to send"));
-    master.write_all(b"/settings\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Enter to send") && text.contains("\x1b]11;?\x07")
+    });
+    master.write_all(b"\x1b[?1;2c/settings\r").unwrap();
     output_until(&mut master, |text| text.contains("Auto-compact"));
     master.write_all(b"Theme\r").unwrap();
     output_until(&mut master, |text| {
         text.contains("Automatic · follow terminal appearance")
     });
     master.write_all(b"light").unwrap();
-    output_until(&mut master, |text| text.contains("Theme · light"));
+    output_until(&mut master, |text| {
+        assert!(!text.contains("\x1b]11;?\x07"));
+        text.contains("Theme · light")
+    });
     let read_theme = || -> String {
         serde_json::from_slice::<serde_json::Value>(
             &std::fs::read(home.join("settings.json")).unwrap(),
@@ -2089,9 +2227,22 @@ fn settings_theme_preview_cancel_and_automatic_selection() {
     });
     master.write_all(b"light\r").unwrap();
     output_until(&mut master, |text| {
-        settings_row_shows(text, "Theme", "light") && text.contains("to change")
+        assert!(!text.contains("\x1b[?2031h"));
+        text.contains("\x1b]11;?\x07")
+            && settings_row_shows(text, "Theme", "light")
+            && text.contains("to change")
     });
     assert_eq!(read_theme(), "light");
+    master.write_all(b"\x1b[?1;2c\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Automatic · follow terminal appearance")
+    });
+    master.write_all(b"light\r").unwrap();
+    output_until(&mut master, |text| {
+        assert!(!text.contains("\x1b[?2031h"));
+        text.contains("\x1b]11;?\x07") && settings_row_shows(text, "Theme", "light")
+    });
+    master.write_all(b"\x1b[?1;2c").unwrap();
     master.write_all(b"\r").unwrap();
     output_until(&mut master, |text| {
         text.contains("Automatic · follow terminal appearance")
@@ -2662,9 +2813,13 @@ fn save_default_model_persists_provider_and_extends_scope() {
     output_until(&mut master, |text| {
         text.contains("Switched to First Fixture (thinking: high)")
     });
+    master.write_all(b"\x1b[Z").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Thinking level: off") && !text.contains("Switched to First Fixture")
+    });
     master.write_all(b"\x10").unwrap();
     output_until(&mut master, |text| {
-        text.contains("Switched to second") && !text.contains("Switched to First Fixture")
+        text.contains("Switched to second") && !text.contains("Thinking level: off")
     });
     let mut restart = Command::new(env!("CARGO_BIN_EXE_pi"))
         .env("PI_RS_HOME", &home)
@@ -3637,6 +3792,7 @@ fn check_streaming_tree_navigation(mode: &str) {
     session
         .append_user_with_images("historical anchor".into(), vec![], None)
         .unwrap();
+    let anchor = session.head();
     drop(session);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3761,7 +3917,21 @@ fn check_streaming_tree_navigation(mode: &str) {
 
     master.write_all(b"/tree\r").unwrap();
     output_until(&mut master, |text| text.contains("Session tree"));
-    master.write_all(b"historical anchor\r").unwrap();
+    master.write_all(b"historical anchorL").unwrap();
+    output_until(&mut master, |text| text.contains("Label record"));
+    master.write_all(b"stream-bookmark\r").unwrap();
+    output_until(&mut master, |text| text.contains("[stream-bookmark]"));
+    let labeled = pi_rs::Session::snapshot(&session_path).unwrap();
+    assert_eq!(
+        labeled.labels().get(&anchor).map(String::as_str),
+        Some("stream-bookmark")
+    );
+    assert!(
+        !labeled.queued_inputs().is_empty(),
+        "editing a label keeps queued input"
+    );
+
+    master.write_all(b"\r").unwrap();
     output_until(&mut master, |text| text.contains("Summarize branch?"));
     let session = pi_rs::Session::snapshot(&session_path).unwrap();
     assert!(session.branch().iter().any(|record| matches!(&record.event,

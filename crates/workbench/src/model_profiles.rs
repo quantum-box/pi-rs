@@ -372,13 +372,22 @@ impl ChatPrice {
             .cache_write_1h_tokens
             .unwrap_or_default()
             .min(writes);
+        let multiplier = metadata
+            .catalog_cost_multiplier
+            .as_ref()
+            .and_then(serde_json::Number::as_f64)
+            .filter(|multiplier| multiplier.is_finite() && *multiplier > 0.0)
+            .unwrap_or(1.0);
         let input_rate = rates.input.unwrap_or_default();
         pi_rs::UsageCostBreakdown::new(
-            (input_rate / 1_000_000.0) * (other_input - writes) as f64,
-            (rates.output.unwrap_or_default() / 1_000_000.0) * usage.output_tokens as f64,
-            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64,
-            (rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
-                + (input_rate / 500_000.0) * long as f64,
+            (input_rate / 1_000_000.0) * (other_input - writes) as f64 * multiplier,
+            (rates.output.unwrap_or_default() / 1_000_000.0)
+                * usage.output_tokens as f64
+                * multiplier,
+            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64 * multiplier,
+            ((rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
+                + (input_rate / 500_000.0) * long as f64)
+                * multiplier,
         )
     }
 }
@@ -1876,6 +1885,35 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::json;
+
+    #[test]
+    fn service_tier_scales_all_catalog_cost_components() {
+        let price: ChatPrice = serde_json::from_value(json!({
+            "input":10, "output":20, "cacheRead":2, "cacheWrite":4
+        }))
+        .unwrap();
+        let usage = pi_rs::Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+        };
+        for (tier, multiplier) in [(None, 1.0), (Some(0.5), 0.5), (Some(2.5), 2.5)] {
+            let metadata = pi_rs::ModelMetadata {
+                cached_input_tokens: Some(200_000),
+                cache_creation_input_tokens: Some(300_000),
+                catalog_cost_multiplier: tier.and_then(serde_json::Number::from_f64),
+                ..Default::default()
+            };
+            let cost = price.estimate(usage, &metadata).unwrap();
+            for (actual, base) in [
+                (cost.input, 5.0),
+                (cost.output, 2.0),
+                (cost.cache_read, 0.4),
+                (cost.cache_write, 1.2),
+            ] {
+                assert!((actual.as_f64().unwrap() - base * multiplier).abs() < 1e-10);
+            }
+        }
+    }
 
     #[test]
     fn cloudflare_worker_chats_and_classifiers_keep_saved_account_scope() {
