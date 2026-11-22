@@ -19,6 +19,10 @@ pub struct ChatCompatibility {
     supports_openai_grammar_tools: Option<bool>,
     pub(super) requires_reasoning_content_on_assistant_messages: Option<bool>,
     pub(super) requires_thinking_as_text: Option<bool>,
+    pub(super) requires_tool_result_name: Option<bool>,
+    pub(super) requires_assistant_after_tool_result: Option<bool>,
+    pub(super) requires_non_null_assistant_content: Option<bool>,
+    pub(super) requires_tools_with_tool_history: Option<bool>,
     pub(super) reasoning_field: Option<String>,
     max_tokens_field: Option<MaxTokensField>,
     thinking_format: Option<ThinkingFormat>,
@@ -460,6 +464,18 @@ impl ChatCompatibility {
             requires_thinking_as_text: model
                 .requires_thinking_as_text
                 .or(self.requires_thinking_as_text),
+            requires_tool_result_name: model
+                .requires_tool_result_name
+                .or(self.requires_tool_result_name),
+            requires_assistant_after_tool_result: model
+                .requires_assistant_after_tool_result
+                .or(self.requires_assistant_after_tool_result),
+            requires_non_null_assistant_content: model
+                .requires_non_null_assistant_content
+                .or(self.requires_non_null_assistant_content),
+            requires_tools_with_tool_history: model
+                .requires_tools_with_tool_history
+                .or(self.requires_tools_with_tool_history),
             reasoning_field: model.reasoning_field.or(self.reasoning_field),
             max_tokens_field: model.max_tokens_field.or(self.max_tokens_field),
             thinking_format: model.thinking_format.or(self.thinking_format),

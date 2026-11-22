@@ -5406,6 +5406,18 @@ without both flags send the active top-level declarations. Compared the
 published Pi Moonshot request payloads and exercised native request projection
 with fixtures. Live Kimi tool additions were unverified.
 
+Chat Completions sends consecutive tool results before a single user message
+containing their attached images. The shared caption and image order match Pi.
+An automatic tool-list update anchored within
+that group is sent after the results and their images. Synthetic assistant
+messages include any reasoning field required by the configured provider. The native adapter keeps structured tool
+output in the result text and moves its image bytes to that user message.
+Custom model compatibility settings can
+include tool names on results, insert an assistant turn before the next user
+message, preserve empty assistant content, or send an empty tools array when
+the transcript has tool history. Loopback checks covered grouped images and
+the configured payload. Live verification on compatible servers remains open.
+
 ### GitHub Copilot
 
 The native catalog includes Pi AI v1.6.0's 35 Copilot chat models across

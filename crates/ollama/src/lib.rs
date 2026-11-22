@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+mod chat_history;
 mod compatibility;
 mod mistral;
 mod reasoning_details;
@@ -639,6 +640,16 @@ impl Ollama {
         {
             return Vec::new();
         }
+        if first["role"] == "assistant"
+            && first.get("tool_calls").is_some()
+            && first["content"]
+                .as_str()
+                .is_some_and(|text| text.trim().is_empty())
+            && self.compatibility.requires_assistant_after_tool_result != Some(true)
+            && self.compatibility.requires_non_null_assistant_content != Some(true)
+        {
+            first["content"] = Value::Null;
+        }
         messages
     }
 
@@ -1246,27 +1257,34 @@ impl Ollama {
         };
         let mut by_message = BTreeMap::<usize, Vec<Value>>::new();
         for checkpoint in plan.anchored {
+            // Keep the assistant call and its results contiguous on the wire.
+            let remaining = request.messages.get(checkpoint.message_index..)?;
+            let results = remaining
+                .iter()
+                .take_while(|message| matches!(message, Message::Tool { .. }))
+                .count();
             by_message
-                .entry(checkpoint.message_index)
+                .entry(checkpoint.message_index + results)
                 .or_default()
                 .extend(checkpoint.added.iter().map(encode));
         }
-        let mut messages = Vec::new();
+        let mut messages = chat_history::ChatHistory::new(self, identity);
         for (index, message) in request.messages.iter().enumerate() {
             if let Some(tools) = by_message.remove(&index)
                 && !tools.is_empty()
             {
-                messages.push(json!({"role":"system","tools":tools}));
+                messages.push_boundary(json!({"role":"system","tools":tools}));
             }
             if !matches!(message, Message::System { content } if content.is_empty()) {
-                messages.extend(self.compatible_message(message.clone(), identity));
+                messages.push(message.clone());
             }
         }
         if let Some(tools) = by_message.remove(&request.messages.len())
             && !tools.is_empty()
         {
-            messages.push(json!({"role":"system","tools":tools}));
+            messages.push_boundary(json!({"role":"system","tools":tools}));
         }
+        let mut messages = messages.finish();
         if supports_grammar {
             // Pi folds same-name replacements on addition-only routes. Its
             // grammar lookup uses the latest definition for each name.
@@ -1294,15 +1312,19 @@ impl Ollama {
     ) -> Vec<Value> {
         let head = self.compatibility.leading_system_message(&messages);
         let collapse_system = head.is_some();
-        head.into_iter()
-            .chain(
-                messages.into_iter().filter(|message| {
+        let mut projected = chat_history::ChatHistory::new(self, identity);
+        let messages =
+            head.into_iter()
+                .chain(messages.into_iter().filter(|message| {
                     !collapse_system || !matches!(message, Message::System { .. })
-                }),
-            )
-            .filter(|message| !matches!(message, Message::System { content } if content.is_empty()))
-            .flat_map(|message| self.compatible_message(message, identity))
-            .collect()
+                }))
+                .filter(
+                    |message| !matches!(message, Message::System { content } if content.is_empty()),
+                );
+        for message in messages {
+            projected.push(message);
+        }
+        projected.finish()
     }
 
     async fn stream_with_wire_tools(
@@ -1386,6 +1408,13 @@ impl Ollama {
         }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
+        } else if !mistral
+            && self.compatibility.requires_tools_with_tool_history == Some(true)
+            && messages
+                .iter()
+                .any(|message| message["role"] == "tool" || message.get("tool_calls").is_some())
+        {
+            body["tools"] = json!([]);
         }
         if let Some(options) = &self.mistral {
             if options.prompt_mode {
@@ -3401,6 +3430,147 @@ mod content_tests {
                 .compatible_message(empty, &model.replay_identity("other"))
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn chat_requests_group_tool_images_and_honor_history_compatibility() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        use pi_rs_core::{ToolDeclaration, ToolSpec};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                assert_ne!(socket.read_line(&mut line).unwrap(), 0);
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut bytes = vec![0; length.unwrap()];
+            socket.read_exact(&mut bytes).unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            socket.get_mut().write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 14\r\nConnection: close\r\n\r\ndata: [DONE]\n\n"
+            ).unwrap();
+            body
+        });
+        let messages: Vec<_> = std::iter::once(Message::Assistant {
+            content: String::new(),
+            calls: ["first", "second"].into_iter().map(|name| ToolCall {
+                id: name.into(), name: name.into(), arguments: "{}".into(),
+            }).collect(),
+            replay: None,
+        })
+        .chain([("first", "Zmlyc3Q="), ("second", "c2Vjb25k")].into_iter().map(|(name, data)| Message::Tool {
+            call_id: name.into(),
+            content: json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":data}]},"attachments":[]}).to_string(),
+            is_error: false,
+            is_structured: Some(true),
+        }))
+        .chain([Message::User { content: "continue".into() }])
+        .collect();
+        let base = Ollama::new(&endpoint, None).unwrap();
+        let defaults = base.wire_messages(messages.clone(), &base.replay_identity("fixture"));
+        assert_eq!(defaults.len(), 5);
+        assert!(defaults[0]["content"].is_null());
+        assert!(defaults[1].get("name").is_none());
+        assert_eq!(defaults[3]["content"].as_array().unwrap().len(), 3);
+
+        let compat = serde_json::from_value(json!({
+            "requiresToolResultName":true,
+            "requiresAssistantAfterToolResult":true,
+            "requiresReasoningContentOnAssistantMessages":true,
+            "requiresToolsWithToolHistory":true,
+            "supportsMidConvoSystemMessages":true,
+            "supportsMidConvoToolAdditions":true
+        }))
+        .unwrap();
+        let changes: Vec<_> = [(1, "added-before-first"), (2, "added-between-results")]
+            .into_iter()
+            .map(|(message_index, name)| pi_rs_core::ToolTranscriptChange {
+                message_index,
+                added: vec![ToolDeclaration {
+                    spec: ToolSpec {
+                        name: name.into(),
+                        description: String::new(),
+                        parameters: json!({"type":"object"}),
+                    },
+                    constrained_sampling: None,
+                }],
+                removed: vec![],
+            })
+            .collect();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages,
+            tools: changes
+                .iter()
+                .map(|change| change.added[0].spec.clone())
+                .collect(),
+            max_output_tokens: 32,
+        };
+        let stream = base
+            .with_chat_compatibility(compat, None, false, true)
+            .with_tool_transcript(&request, &changes)
+            .stream(request)
+            .await
+            .unwrap();
+        let body = worker.join().unwrap();
+        drop(stream);
+        assert_eq!(body["tools"], json!([]));
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 7);
+        assert_eq!(messages[0]["content"], "");
+        for (message, name) in messages[1..3].iter().zip(["first", "second"]) {
+            assert_eq!(message["role"], "tool");
+            assert_eq!(message["tool_call_id"], name);
+            assert_eq!(message["name"], name);
+            let result: Value = serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+            assert_eq!(result["data"]["content"][0]["data"], "[image attached]");
+        }
+        assert_eq!(
+            messages[3],
+            json!({
+                "role":"assistant","content":"I have processed the tool results.",
+                "reasoning_content":""
+            })
+        );
+        assert_eq!(messages[4]["role"], "user");
+        assert_eq!(
+            messages[4]["content"][0]["text"],
+            "Attached image(s) from tool result:"
+        );
+        assert_eq!(messages[4]["content"].as_array().unwrap().len(), 3);
+        for (index, url) in [
+            "data:image/png;base64,Zmlyc3Q=",
+            "data:image/png;base64,c2Vjb25k",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(messages[4]["content"][index + 1]["image_url"]["url"], url);
+        }
+        assert_eq!(messages[5]["role"], "system");
+        assert_eq!(
+            messages[5]["tools"][0]["function"]["name"],
+            "added-before-first"
+        );
+        assert_eq!(
+            messages[5]["tools"][1]["function"]["name"],
+            "added-between-results"
+        );
+        assert_eq!(messages[6], json!({"role":"user","content":"continue"}));
     }
 
     #[test]
