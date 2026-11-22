@@ -55,3 +55,11 @@ jobs:
         run: |
           wasm-bindgen --target web --out-dir "$RUNNER_TEMP/pi-sdk-web" crates/browser-sdk/target/wasm32-unknown-unknown/debug/pi_rs_browser_sdk.wasm
           node crates/browser-sdk/tests/browser-sdk.cjs "$RUNNER_TEMP/pi-sdk-web" "$CHROME_BIN"
+      - name: Build and exercise deployable preview
+        env:
+          PI_PREVIEW_USE_EXISTING_TOOLCHAIN: '1'
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+          PI_FETCH_CHROME_NO_SANDBOX: '1'
+        run: |
+          bash examples/browser-preview/build.sh
+          node crates/browser-sdk/tests/browser-sdk.cjs examples/browser-preview/dist/pkg "$CHROME_BIN"
