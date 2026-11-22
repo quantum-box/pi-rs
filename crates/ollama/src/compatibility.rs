@@ -11,6 +11,8 @@ pub struct ChatCompatibility {
     pub(super) supports_finish_reason: Option<bool>,
     supports_reasoning_effort: Option<bool>,
     pub(super) supports_strict_mode: Option<bool>,
+    #[serde(rename = "supportsOpenAIGrammarTools")]
+    supports_openai_grammar_tools: Option<bool>,
     pub(super) requires_reasoning_content_on_assistant_messages: Option<bool>,
     pub(super) requires_thinking_as_text: Option<bool>,
     pub(super) reasoning_field: Option<String>,
@@ -208,6 +210,15 @@ impl ChatCompatibility {
         self.supports_strict_mode
     }
 
+    /// Whether the model accepts OpenAI custom tools constrained by a grammar.
+    pub fn supports_openai_grammar_tools(&self) -> Option<bool> {
+        self.supports_openai_grammar_tools
+    }
+
+    pub(super) fn set_openai_grammar_tool_support(&mut self, supported: bool) {
+        self.supports_openai_grammar_tools = Some(supported);
+    }
+
     /// Whether the configured model accepts the developer instruction role.
     pub fn supports_developer_role(&self) -> Option<bool> {
         self.supports_developer_role
@@ -235,6 +246,9 @@ impl ChatCompatibility {
                 .supports_reasoning_effort
                 .or(self.supports_reasoning_effort),
             supports_strict_mode: model.supports_strict_mode.or(self.supports_strict_mode),
+            supports_openai_grammar_tools: model
+                .supports_openai_grammar_tools
+                .or(self.supports_openai_grammar_tools),
             requires_reasoning_content_on_assistant_messages: model
                 .requires_reasoning_content_on_assistant_messages
                 .or(self.requires_reasoning_content_on_assistant_messages),
