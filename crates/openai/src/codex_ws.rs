@@ -1049,6 +1049,95 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn codex_websocket_without_affinity_opens_fresh_connections() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        for (cache, has_session) in [
+            (pi_rs_core::CacheRetention::None, true),
+            (pi_rs_core::CacheRetention::Short, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut previous = String::new();
+                let mut idle: Option<WebSocketStream<tokio::net::TcpStream>> = None;
+                for expected in ["first", "second"] {
+                    let (tcp, _) = if let Some(mut socket) = idle.take() {
+                        tokio::select! {
+                            connection = listener.accept() => connection.unwrap(),
+                            () = async {
+                                while let Some(Ok(frame)) = socket.next().await {
+                                    match frame {
+                                        // Flush the automatically queued pong to keep the socket reusable.
+                                        Message::Ping(_) => socket.flush().await.unwrap(),
+                                        Message::Close(_) => break,
+                                        Message::Text(_) => panic!("the previous connection was reused"),
+                                        _ => {}
+                                    }
+                                }
+                                std::future::pending::<()>().await;
+                            } => unreachable!(),
+                        }
+                    } else {
+                        listener.accept().await.unwrap()
+                    };
+                    let mut socket = tokio_tungstenite::accept_hdr_async(
+                        tcp,
+                        |request: &Request, response: Response| {
+                            let sent = request.headers()["session-id"].to_str().unwrap();
+                            assert!(uuid::Uuid::parse_str(sent).is_ok());
+                            assert_ne!(sent, previous);
+                            previous = sent.to_owned();
+                            Ok(response)
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let body = read_request(&mut socket).await;
+                    assert_eq!(body["input"][0]["content"], expected);
+                    assert!(body.get("previous_response_id").is_none());
+                    let completion = json!({
+                        "type":"response.completed",
+                        "response":{"id":"fixture","status":"completed","output":[]}
+                    });
+                    socket
+                        .send(Message::Text(completion.to_string().into()))
+                        .await
+                        .unwrap();
+                    idle = Some(socket);
+                }
+            });
+            let model = client(
+                format!("http://{address}/backend-api/codex/responses"),
+                CodexTransport::Auto,
+            )
+            .with_cache_retention(cache, false);
+            let model = if has_session {
+                model.with_session_cache_key("fixed-session-with-cache-disabled")
+            } else {
+                model
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                for text in ["first", "second"] {
+                    let events = model
+                        .stream(request(vec![prompt(text)]))
+                        .await
+                        .unwrap()
+                        .collect::<Vec<_>>()
+                        .await;
+                    assert!(matches!(
+                        events.last(),
+                        Some(Ok(ModelEvent::Complete { .. }))
+                    ));
+                }
+                server.await.unwrap();
+            })
+            .await
+            .unwrap();
+        }
+    }
+
     async fn assert_next_attempt_uses_sse_after_interruption(
         cache: pi_rs_core::CacheRetention,
         has_session: bool,
