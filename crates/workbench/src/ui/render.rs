@@ -2171,7 +2171,9 @@ fn markdown_plain_at_depth(
             range.start += value.len() - trimmed.len();
             *value = trimmed.to_owned().into();
         }
-        if matches!(&event, Event::Start(Tag::HtmlBlock)) && text[range.clone()].contains("<!--") {
+        let html = if matches!(&event, Event::Start(Tag::HtmlBlock))
+            && text[range.clone()].contains("<!--")
+        {
             let mut html = String::new();
             for (part, _) in events.by_ref() {
                 match part {
@@ -2185,27 +2187,23 @@ fn markdown_plain_at_depth(
             if html.is_empty() {
                 continue;
             }
-            // The surrounding block is still distinct from the next paragraph
-            // after removing the comment and trimming its literal HTML.
-            spans.push(Span::themed(html, theme, "text"));
-            flush(&mut spans, &mut lines, width, item_prefixes.last());
-            if let Some(end) = item_block_ends.last_mut() {
-                *end = Some(range.end);
-            }
-            continue;
-        }
+            Some(html.to_owned())
+        } else {
+            None
+        };
         // Pulldown omits space and reference-definition tokens inside items.
         // Recover the blank runs between direct item blocks from their source ranges.
-        let starts_item_block = matches!(
-            &event,
-            Event::Start(
-                Tag::Paragraph
-                    | Tag::CodeBlock(_)
-                    | Tag::Heading { .. }
-                    | Tag::BlockQuote(_)
-                    | Tag::List(_)
-            ) | Event::Rule
-        );
+        let starts_item_block = html.is_some()
+            || matches!(
+                &event,
+                Event::Start(
+                    Tag::Paragraph
+                        | Tag::CodeBlock(_)
+                        | Tag::Heading { .. }
+                        | Tag::BlockQuote(_)
+                        | Tag::List(_)
+                ) | Event::Rule
+            );
         if starts_item_block
             && !item_after_math.last().copied().unwrap_or(false)
             && let Some(Some(end)) = item_block_ends.last().copied()
@@ -2218,6 +2216,11 @@ fn markdown_plain_at_depth(
                     >= if text[..end].ends_with('\n') { 1 } else { 2 })
         {
             let gap = &text[end..range.start];
+            let gap = if html.is_some() {
+                gap.trim_end_matches([' ', '\t'])
+            } else {
+                gap
+            };
             let without_comments = strip_html_comments(gap);
             // Collapse spacing across a comment-only gap. Keep reference
             // definitions and their source spacing when they share the gap.
@@ -2240,6 +2243,20 @@ fn markdown_plain_at_depth(
         }
         if starts_item_block && let Some(after_math) = item_after_math.last_mut() {
             *after_math = false;
+        }
+        if let Some(html) = html {
+            // Preserve a leading item marker, but finish any preceding text
+            // before drawing the visible remainder of this HTML block.
+            let prefix = item_prefixes.last();
+            if !prefix.is_some_and(|prefix| spans.as_slice() == std::slice::from_ref(prefix)) {
+                flush(&mut spans, &mut lines, width, prefix);
+            }
+            spans.push(Span::themed(html, theme, "text"));
+            flush(&mut spans, &mut lines, width, prefix);
+            if let Some(end) = item_block_ends.last_mut() {
+                *end = Some(range.end);
+            }
+            continue;
         }
         let is_text = matches!(&event, Event::Text(_));
         match event {
@@ -3108,6 +3125,31 @@ mod tests {
             render("<!-- hidden --> trailing text\nnext paragraph"),
             ["trailing text", "next paragraph"],
         );
+        for (source, expected) in [
+            ("- <!-- hidden --> first", vec!["- first"]),
+            (
+                "- <!-- hidden --> first\n  <!-- hidden --> second",
+                vec!["- first", "  second"],
+            ),
+            (
+                "- <!-- hidden --> first\n\n  <!-- hidden --> second",
+                vec!["- first", "", "  second"],
+            ),
+            (
+                "- one\n  <!-- hidden --> trailing text",
+                vec!["- one", "  trailing text"],
+            ),
+            (
+                "2. one\n\n   <!-- hidden --> `literal`",
+                vec!["2. one", "", "   `literal`"],
+            ),
+            (
+                "> - one\n>   <!-- hidden --> trailing text",
+                vec!["│ - one", "│   trailing text"],
+            ),
+        ] {
+            assert_eq!(render(source), expected, "{source:?}");
+        }
     }
 
     #[test]
