@@ -33,6 +33,7 @@ mod http_proxy;
 mod image_policy;
 mod interactive;
 mod kimi_auth;
+mod locale;
 mod mcp_config;
 mod meta_auth;
 mod model_auth;

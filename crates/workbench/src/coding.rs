@@ -26,13 +26,28 @@ const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 #[derive(Clone, Default)]
 pub struct ShellOutputStore(Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>);
 
+/// Tracks the selected model for tools kept across model switches.
+#[derive(Clone, Default)]
+pub struct ReadImageModel(Arc<std::sync::Mutex<Option<Arc<str>>>>);
+
+impl ReadImageModel {
+    pub fn set(&self, id: &str, supports_images: Option<bool>) {
+        *self.0.lock().expect("read image model") =
+            (supports_images == Some(false)).then(|| Arc::from(id));
+    }
+
+    fn unsupported_model(&self) -> Option<Arc<str>> {
+        self.0.lock().expect("read image model").clone()
+    }
+}
+
 pub struct CodingTools {
     root: PathBuf,
     unrestricted: bool,
     shell: ShellConfig,
     auto_resize_images: bool,
     image_profile: Option<crate::image_profile::ImageResizeProfile>,
-    model_supports_images: Option<bool>,
+    unsupported_image_model: Option<UnsupportedImageModel>,
     read_operations: Option<Arc<dyn ReadOperations>>,
     write_operations: Option<Arc<dyn WriteOperations>>,
     bash_operations: Option<Arc<dyn BashOperations>>,
@@ -54,7 +69,7 @@ impl CodingTools {
             shell: ShellConfig::default(),
             auto_resize_images: true,
             image_profile: None,
-            model_supports_images: None,
+            unsupported_image_model: None,
             read_operations: None,
             write_operations: None,
             bash_operations: None,
@@ -194,7 +209,15 @@ impl CodingTools {
     }
 
     pub fn with_model_image_support(mut self, supports_images: Option<bool>) -> Self {
-        self.model_supports_images = supports_images;
+        self.unsupported_image_model =
+            (supports_images == Some(false)).then_some(UnsupportedImageModel::Legacy);
+        self
+    }
+
+    /// Record the selected text-only model in image result details so the
+    /// saved tool text can be reused after a model switch.
+    pub fn with_read_image_model(mut self, model: ReadImageModel) -> Self {
+        self.unsupported_image_model = Some(UnsupportedImageModel::Current(model));
         self
     }
 
@@ -418,7 +441,7 @@ impl CodingTools {
             kind: Kind::Read {
                 auto_resize: self.auto_resize_images,
                 profile: self.image_profile,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         }
         .path(
@@ -449,7 +472,7 @@ impl CodingTools {
             kind: Kind::Read {
                 auto_resize: self.auto_resize_images,
                 profile: self.image_profile,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         let name = path
@@ -538,7 +561,7 @@ impl Extension for CodingTools {
             Kind::Read {
                 auto_resize: self.auto_resize_images,
                 profile: self.image_profile,
-                model_supports_images: self.model_supports_images,
+                unsupported_image_model: self.unsupported_image_model.clone(),
             },
             Kind::Write,
             Kind::Edit,
@@ -561,7 +584,7 @@ impl Extension for CodingTools {
                     shell: self.shell.clone(),
                     kind,
                 };
-                if matches!(kind, Kind::Read { .. })
+                if matches!(tool.kind, Kind::Read { .. })
                     && let Some(operations) = &self.read_operations
                 {
                     Arc::new(RemoteReadTool {
@@ -570,7 +593,7 @@ impl Extension for CodingTools {
                         shell_outputs: self.shell_outputs.clone(),
                         remote_home: self.remote_home.clone(),
                     }) as Arc<dyn Tool>
-                } else if matches!(kind, Kind::Write)
+                } else if matches!(tool.kind, Kind::Write)
                     && let Some(operations) = &self.write_operations
                 {
                     Arc::new(RemoteWriteTool {
@@ -578,7 +601,7 @@ impl Extension for CodingTools {
                         operations: operations.clone(),
                         remote_home: self.remote_home.clone(),
                     }) as Arc<dyn Tool>
-                } else if matches!(kind, Kind::Edit)
+                } else if matches!(tool.kind, Kind::Edit)
                     && let Some(operations) = &self.edit_operations
                 {
                     Arc::new(RemoteEditTool {
@@ -587,7 +610,7 @@ impl Extension for CodingTools {
                         options: self.edit_options,
                         remote_home: self.remote_home.clone(),
                     }) as Arc<dyn Tool>
-                } else if matches!(kind, Kind::Bash)
+                } else if matches!(tool.kind, Kind::Bash)
                     && let Some(operations) = &self.bash_operations
                 {
                     Arc::new(RemoteShellTool {
@@ -759,7 +782,7 @@ pub fn create_read_tool_with_options_and_shell_outputs(
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         },
         operations,
@@ -911,26 +934,43 @@ impl Tool for RemoteReadTool {
             let tool = self.tool.clone();
             let token = cancellation.clone();
             tokio::task::spawn_blocking(move || -> Result<Outcome> {
-                if token.is_cancelled() { return Err(Error::Cancelled); }
-                if let Some(mime) = mime {
-                    let mut source = CancellableReader { inner: source, cancellation: token.clone() };
-                    if source.seek(SeekFrom::End(0))? > 20 * 1024 * 1024 { return Err(Error::Config("image exceeds 20 MiB".into())); }
-                    source.seek(SeekFrom::Start(0))?;
-                    let format = image::ImageFormat::from_mime_type(&mime)
-                        .ok_or_else(|| Error::Config(format!("unsupported image MIME type: {mime}")))?;
-                    let reader = image::ImageReader::with_format(std::io::BufReader::new(source), format);
-                    let mut data = tool.process_image(&path, reader, format, Some(&token))?;
-                    if matches!(tool.kind, Kind::Read { model_supports_images: Some(false), .. })
-                        && let Some(note) = data["content"][0]["text"].as_str() {
-                        data["content"][0]["text"] = json!(format!("{note}\n[Current model does not support images. The image will be omitted from this request.]"));
-                    }
-                    Ok(Outcome::Structured { data, attachments: vec![] })
-                } else {
-                    let offset = usize::try_from(args["offset"].as_u64().unwrap_or(1).saturating_sub(1)).unwrap_or(usize::MAX);
-                    let limit = args["limit"].as_u64().map(|n| usize::try_from(n).unwrap_or(usize::MAX));
-                    crate::text_page::read_from(std::io::BufReader::new(source), &name, offset, limit, &token)
+                if token.is_cancelled() {
+                    return Err(Error::Cancelled);
                 }
-            }).await.map_err(|error| Error::Config(error.to_string()))?
+                if let Some(mime) = mime {
+                    let mut source = CancellableReader {
+                        inner: source,
+                        cancellation: token.clone(),
+                    };
+                    if source.seek(SeekFrom::End(0))? > 20 * 1024 * 1024 {
+                        return Err(Error::Config("image exceeds 20 MiB".into()));
+                    }
+                    source.seek(SeekFrom::Start(0))?;
+                    let format = image::ImageFormat::from_mime_type(&mime).ok_or_else(|| {
+                        Error::Config(format!("unsupported image MIME type: {mime}"))
+                    })?;
+                    let reader =
+                        image::ImageReader::with_format(std::io::BufReader::new(source), format);
+                    let data = tool.process_image(&path, reader, format, Some(&token))?;
+                    Ok(tool.image_outcome(data, true))
+                } else {
+                    let offset =
+                        usize::try_from(args["offset"].as_u64().unwrap_or(1).saturating_sub(1))
+                            .unwrap_or(usize::MAX);
+                    let limit = args["limit"]
+                        .as_u64()
+                        .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+                    crate::text_page::read_from(
+                        std::io::BufReader::new(source),
+                        &name,
+                        offset,
+                        limit,
+                        &token,
+                    )
+                }
+            })
+            .await
+            .map_err(|error| Error::Config(error.to_string()))?
         };
         let result = tokio::select! { biased; _ = cancellation.cancelled() => Err(Error::Cancelled), result = operation => result };
         match result {
@@ -947,7 +987,10 @@ impl Tool for RemoteReadTool {
         _: Arc<dyn ToolHost>,
     ) -> ToolReply {
         match self.invoke(args, context).await {
-            Outcome::Structured { data, attachments } => {
+            Outcome::Structured { data, attachments }
+            | Outcome::StructuredWithDetails {
+                data, attachments, ..
+            } => {
                 if let Some(blocks) = data["content"].as_array()
                     && !blocks.iter().any(|block| block["type"] == "image")
                     && let Some(text) = blocks.iter().find_map(|block| block["text"].as_str())
@@ -2066,12 +2109,18 @@ fn shell_outcome(output: crate::shell_output::Output, code: i32, elapsed: f64) -
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
+enum UnsupportedImageModel {
+    Legacy,
+    Current(ReadImageModel),
+}
+
+#[derive(Clone)]
 enum Kind {
     Read {
         auto_resize: bool,
         profile: Option<crate::image_profile::ImageResizeProfile>,
-        model_supports_images: Option<bool>,
+        unsupported_image_model: Option<UnsupportedImageModel>,
     },
     Write,
     Edit,
@@ -2365,7 +2414,10 @@ impl Tool for CodingTool {
         }
         let outcome = self.invoke(args, context).await;
         match outcome {
-            Outcome::Structured { data, attachments } if matches!(self.kind, Kind::Read { .. }) => {
+            Outcome::Structured { data, attachments }
+            | Outcome::StructuredWithDetails {
+                data, attachments, ..
+            } if matches!(self.kind, Kind::Read { .. }) => {
                 if let Some(blocks) = data["content"].as_array()
                     && !blocks.iter().any(|block| block["type"] == "image")
                     && let Some(text) = blocks.iter().find_map(|block| block["text"].as_str())
@@ -2399,20 +2451,6 @@ fn image_omission(mime: &str, reason: &str) -> Value {
     json!({"content":[{"type":"text", "text":format!("Read image file [{mime}]\n{reason}")}]})
 }
 
-fn directory_collator(locale: &str) -> Result<icu_collator::CollatorBorrowed<'static>> {
-    let locale = locale
-        .split(['.', '@'])
-        .next()
-        .unwrap_or_default()
-        .replace('_', "-");
-    let locale = locale
-        .parse::<icu_locale_core::Locale>()
-        .map(icu_collator::CollatorPreferences::from)
-        .unwrap_or_default();
-    icu_collator::Collator::try_new(locale, Default::default())
-        .map_err(|error| Error::Config(format!("Cannot initialize directory collation: {error}")))
-}
-
 fn directory_read_error(error: std::io::Error, requested: &Path, unrestricted: bool) -> Error {
     #[cfg(unix)]
     if unrestricted && error.raw_os_error() == Some(libc::EACCES) {
@@ -2424,13 +2462,6 @@ fn directory_read_error(error: std::io::Error, requested: &Path, unrestricted: b
     #[cfg(not(unix))]
     let _ = (requested, unrestricted);
     Error::Config(format!("Cannot read directory: {error}"))
-}
-
-fn directory_locale(mut get: impl FnMut(&str) -> Option<String>) -> String {
-    ["LC_ALL", "LC_MESSAGES", "LANG"]
-        .into_iter()
-        .find_map(&mut get)
-        .unwrap_or_default()
 }
 
 fn is_ecmascript_whitespace(character: char) -> bool {
@@ -2635,21 +2666,14 @@ fn local_numeric_limit(args: &Value, default: f64) -> f64 {
     args.get("limit").and_then(Value::as_f64).unwrap_or(default)
 }
 
-// fd receives String(limit), and its --max-results parser accepts usize. Zero
-// is fd's unlimited sentinel; the original number remains relevant to notices.
+// Pi passes String(limit + 1) to fd to detect when the result set exceeds the displayed limit.
 fn fd_numeric_limit(value: f64) -> std::result::Result<usize, String> {
     let text = js_number(value);
-    let reason = if text.starts_with('-') {
-        return Err("error: a value is required for '--max-results <count>' but none was supplied\n\nFor more information, try '--help'.".into());
-    } else {
-        match text.parse::<usize>() {
-            Ok(limit) => return Ok(limit),
-            Err(error) => error.to_string(),
-        }
-    };
-    Err(format!(
-        "error: invalid value '{text}' for '--max-results <count>': {reason}\n\nFor more information, try '--help'."
-    ))
+    text.parse::<usize>().map_err(|reason| {
+        format!(
+            "error: invalid value '{text}' for '--max-results <count>': {reason}\n\nFor more information, try '--help'."
+        )
+    })
 }
 
 fn grep_glob_overrides(
@@ -2703,6 +2727,10 @@ impl CodingTool {
         } else {
             path
         };
+        self.canonical_path(&path)
+    }
+
+    fn canonical_path(&self, path: &Path) -> Result<PathBuf> {
         let resolved = path.canonicalize().map_err(|error| {
             if self.unrestricted
                 && error.kind() == std::io::ErrorKind::NotFound
@@ -3009,25 +3037,8 @@ impl CodingTool {
                 ));
             }
         }
-        if let Some(mut data) = self.read_image_cancellable(&path, true, Some(cancellation))? {
-            if self.unrestricted
-                && matches!(
-                    self.kind,
-                    Kind::Read {
-                        model_supports_images: Some(false),
-                        ..
-                    }
-                )
-                && let Some(note) = data["content"][0]["text"].as_str()
-            {
-                data["content"][0]["text"] = json!(format!(
-                    "{note}\n[Current model does not support images. The image will be omitted from this request.]"
-                ));
-            }
-            return Ok(Outcome::Structured {
-                data,
-                attachments: vec![],
-            });
+        if let Some(data) = self.read_image_cancellable(&path, true, Some(cancellation))? {
+            return Ok(self.image_outcome(data, self.unrestricted));
         }
         if self.unrestricted {
             return crate::text_page::read_pi(
@@ -3044,6 +3055,42 @@ impl CodingTool {
             .as_u64()
             .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
         crate::text_page::read(&path, display_path, offset, limit, cancellation)
+    }
+
+    fn image_outcome(&self, mut data: Value, include_model_warning: bool) -> Outcome {
+        if include_model_warning
+            && let Kind::Read {
+                unsupported_image_model: Some(model),
+                ..
+            } = &self.kind
+        {
+            match model {
+                UnsupportedImageModel::Current(model) => {
+                    if data["content"]
+                        .as_array()
+                        .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
+                        && let Some(id) = model.unsupported_model()
+                    {
+                        return Outcome::StructuredWithDetails {
+                            data,
+                            attachments: vec![],
+                            details: json!({"imageUnsupportedByModel": id.as_ref()}),
+                        };
+                    }
+                }
+                UnsupportedImageModel::Legacy => {
+                    if let Some(note) = data["content"][0]["text"].as_str() {
+                        data["content"][0]["text"] = json!(format!(
+                            "{note}\n[Current model does not support images. The image will be omitted from this request.]"
+                        ));
+                    }
+                }
+            }
+        }
+        Outcome::Structured {
+            data,
+            attachments: vec![],
+        }
     }
 
     #[cfg(test)]
@@ -3082,25 +3129,41 @@ impl CodingTool {
                 .parent()
                 .ok_or_else(|| Error::Config("invalid parent".into()))?;
         }
-        self.path(&ancestor.to_string_lossy())?;
+        self.canonical_path(ancestor)?;
         check_mutation_cancelled(cancellation)?;
-        std::fs::create_dir_all(parent)?;
-        let parent = self.path(&parent.to_string_lossy())?;
-        let mut target = parent.join(
+        std::fs::create_dir_all(parent).map_err(|error| {
+            if self.unrestricted && cfg!(unix) {
+                local_write_mkdir_error(error, parent)
+            } else {
+                error.into()
+            }
+        })?;
+        let parent = self.canonical_path(parent)?;
+        let mut destination = parent.join(
             target
                 .file_name()
                 .ok_or_else(|| Error::Config("file name missing".into()))?,
         );
-        if target.symlink_metadata().is_ok() {
-            let existing = self.path(&target.to_string_lossy())?;
+        if destination.symlink_metadata().is_ok() {
+            let existing = self.canonical_path(&destination)?;
             if !existing.is_file() {
+                if self.unrestricted && cfg!(unix) && existing.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        format!(
+                            "EISDIR: illegal operation on a directory, open '{}'",
+                            target.display()
+                        ),
+                    )
+                    .into());
+                }
                 return Err(Error::Config("expected a regular file".into()));
             }
-            target = existing;
+            destination = existing;
         }
-        let _lock = mutation_lock(&target, cancellation)?;
+        let _lock = mutation_lock(&destination, cancellation)?;
         check_mutation_cancelled(cancellation)?;
-        atomic_write(&target, content.as_bytes(), cancellation)?;
+        atomic_write(&destination, content.as_bytes(), cancellation)?;
         check_mutation_cancelled(cancellation)?;
         Ok(format!("Successfully wrote to {display_path}"))
     }
@@ -3179,7 +3242,7 @@ impl CodingTool {
             &crate::coding_paths::normalize(requested_path)?,
         );
         let path = self.path(requested_path)?;
-        let numeric_limit = local_numeric_limit(args, 500.0);
+        let numeric_limit = local_numeric_limit(args, 500.0).floor().max(1.0);
         let limit = args["limit"].as_u64().unwrap_or(500).min(100_000) as usize;
         if !path.is_dir() {
             return Err(Error::Config(format!(
@@ -3198,8 +3261,10 @@ impl CodingTool {
                 .map_err(|error| directory_read_error(error, &requested, self.unrestricted))?;
             entries.push((entry.file_name().to_string_lossy().to_lowercase(), entry));
         }
-        let locale = directory_locale(|key| std::env::var(key).ok());
-        let collator = directory_collator(&locale)?;
+        let locale = crate::locale::select(|key| std::env::var(key).ok());
+        let collator = crate::locale::collator(&locale).map_err(|error| {
+            Error::Config(format!("Cannot initialize directory collation: {error}"))
+        })?;
         entries.sort_by(|(left, _), (right, _)| collator.compare(left, right));
         let mut listing = crate::tool_output::Listing::new();
         let mut result_count = 0usize;
@@ -3254,10 +3319,10 @@ impl CodingTool {
             return Err(Error::Cancelled);
         }
         let is_find = matches!(self.kind, Kind::Find);
-        let numeric_find_limit = local_numeric_limit(args, 1000.0);
+        let numeric_find_limit = local_numeric_limit(args, 1000.0).floor().max(1.0);
         // fd parses its arguments before checking the search path.
         let unrestricted_find_limit = if is_find && self.unrestricted {
-            match fd_numeric_limit(numeric_find_limit) {
+            match fd_numeric_limit(numeric_find_limit + 1.0) {
                 Ok(limit) => Some(limit),
                 Err(output) => return Ok(pi_tool_failure(output)),
             }
@@ -3303,8 +3368,20 @@ impl CodingTool {
         });
         let limit = if is_find { limit } else { limit.max(1) };
         let pattern = string(args, "pattern")?;
+        let windows_pattern =
+            (is_find && self.unrestricted && cfg!(windows)).then(|| pattern.replace('\\', "/"));
+        let pattern = windows_pattern.as_deref().unwrap_or(pattern);
+        let pattern = if is_find && self.unrestricted {
+            pattern.trim_start_matches("./")
+        } else {
+            pattern
+        };
+        let is_path_pattern = pattern.contains('/');
+        let relative_find_pattern =
+            self.unrestricted && is_path_pattern && !Path::new(pattern).has_root();
         let glob = if is_find {
-            let pattern = if pattern.contains('/')
+            let pattern = if !self.unrestricted
+                && is_path_pattern
                 && !pattern.starts_with('/')
                 && !pattern.starts_with("**/")
             {
@@ -3376,6 +3453,7 @@ impl CodingTool {
         let mut find_count = 0usize;
         let mut find_listing = crate::tool_output::Listing::new();
         let mut find_line_count = 0usize;
+        let mut find_limit_exceeded = false;
         let mut walker = ignore::WalkBuilder::new(&base);
         walker.hidden(false);
         if is_find {
@@ -3408,7 +3486,7 @@ impl CodingTool {
             walker.overrides(grep_glob_overrides(&self.root, glob, false)?);
         }
         let mut find_error = None;
-        for entry in walker.build() {
+        'entries: for entry in walker.build() {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
@@ -3433,7 +3511,9 @@ impl CodingTool {
                 .ok()
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new(entry.file_name()));
-            let match_path = if pattern.contains('/') {
+            let match_path = if relative_find_pattern {
+                relative
+            } else if is_path_pattern {
                 entry.path()
             } else {
                 Path::new(entry.file_name())
@@ -3462,6 +3542,10 @@ impl CodingTool {
                 let is_directory = entry.file_type().is_some_and(|kind| kind.is_dir());
                 if self.unrestricted {
                     for line in find_pi_lines(&base, entry.path(), is_directory) {
+                        if find_line_count as f64 >= numeric_find_limit {
+                            find_limit_exceeded = true;
+                            break 'entries;
+                        }
                         find_listing.push(&line);
                         find_line_count += 1;
                     }
@@ -3475,7 +3559,7 @@ impl CodingTool {
                     results.push(path);
                 }
                 find_count += 1;
-                if find_count >= limit && !(self.unrestricted && limit == 0) {
+                if find_count >= limit {
                     break;
                 }
             }
@@ -3492,7 +3576,7 @@ impl CodingTool {
             }
             let mut details = Map::new();
             let mut notices = Vec::new();
-            if (find_line_count as f64) >= numeric_find_limit {
+            if find_limit_exceeded {
                 details.insert("resultLimitReached".into(), json!(numeric_find_limit));
                 notices.push(format!(
                     "{} results limit reached. Use limit={} for more, or refine pattern",
@@ -4122,6 +4206,16 @@ fn atomic_write(
     Ok(())
 }
 
+fn local_write_mkdir_error(error: std::io::Error, parent: &Path) -> Error {
+    let kind = error.kind();
+    let diagnostic = match kind {
+        std::io::ErrorKind::AlreadyExists => "EEXIST: file already exists",
+        std::io::ErrorKind::NotADirectory => "ENOTDIR: not a directory",
+        _ => return error.into(),
+    };
+    std::io::Error::new(kind, format!("{diagnostic}, mkdir '{}'", parent.display())).into()
+}
+
 fn edit_error_text(error: Error) -> String {
     match error {
         Error::Config(message) => message,
@@ -4307,7 +4401,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         let token = pi_rs::CancellationToken::new();
@@ -4367,7 +4461,7 @@ mod tests {
                 kind: Kind::Read {
                     auto_resize: true,
                     profile: None,
-                    model_supports_images: None,
+                    unsupported_image_model: None,
                 },
             };
             let token = pi_rs::CancellationToken::new();
@@ -4581,7 +4675,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_empty_truncated_snapshot_keeps_placeholder_and_exit_status() {
+    fn shell_partial_line_snapshot_keeps_output_and_exit_status() {
         for code in [0, 2] {
             let input = format!("{}\n", "x".repeat(300_000));
             let mut output = super::super::shell_output::Accumulator::default();
@@ -4600,12 +4694,13 @@ mod tests {
             else {
                 panic!("missing structured result")
             };
-            assert!(output.starts_with(
-                "(no output)\n\n[Showing lines 2-1 of 1 (50.0KB limit). Full output: "
-            ));
+            assert!(output.starts_with(&format!(
+                "{}\n\n[Showing last 50.0KB of line 1 (line is 0B). Full output: ",
+                "x".repeat(50 * 1024)
+            )));
             assert_eq!(is_error, code != 0);
             assert_eq!(output.ends_with("Command exited with code 2"), code == 2);
-            assert_eq!(details.unwrap()["truncation"]["outputLines"], 0);
+            assert_eq!(details.unwrap()["truncation"]["outputLines"], 1);
             assert_eq!(structured_content["output"], input);
             assert_eq!(std::fs::read(&path).unwrap(), input.as_bytes());
             std::fs::remove_file(path).unwrap();
@@ -4650,6 +4745,121 @@ mod tests {
                 assert!(declarations.iter().any(|tool| tool.spec.name == name));
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_preserves_the_filesystem_spelling_of_a_symlink_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let actual = root.join("real\u{00a0}dir");
+        let lookalike = root.join("real dir");
+        std::fs::create_dir(&actual).unwrap();
+        std::fs::create_dir(&lookalike).unwrap();
+        std::fs::write(actual.join("file"), "original").unwrap();
+        std::fs::write(lookalike.join("file"), "untouched").unwrap();
+        std::os::unix::fs::symlink(&actual, root.join("alias")).unwrap();
+
+        for unrestricted in [false, true] {
+            let tool = CodingTool {
+                root: root.clone(),
+                unrestricted,
+                shell: ShellConfig::default(),
+                kind: Kind::Write,
+            };
+            tool.write(&json!({"path":"alias/file", "content":"updated"}))
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(actual.join("file")).unwrap(),
+                "updated"
+            );
+            assert_eq!(
+                std::fs::read_to_string(lookalike.join("file")).unwrap(),
+                "untouched"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_write_matches_pi_directory_diagnostics() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("dir")).unwrap();
+        std::fs::write(root.join("parent-file"), "retained").unwrap();
+        std::os::unix::fs::symlink("dir", root.join("dir-link")).unwrap();
+        std::os::unix::fs::symlink("parent-file", root.join("file-link")).unwrap();
+        let tool = CodingTool {
+            root: root.clone(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Write,
+        };
+        for (path, reported_path, diagnostic) in [
+            (
+                "dir",
+                "dir",
+                "EISDIR: illegal operation on a directory, open",
+            ),
+            (
+                "dir-link",
+                "dir-link",
+                "EISDIR: illegal operation on a directory, open",
+            ),
+            (
+                "parent-file/child",
+                "parent-file",
+                "EEXIST: file already exists, mkdir",
+            ),
+            (
+                "parent-file/nested/child",
+                "parent-file/nested",
+                "ENOTDIR: not a directory, mkdir",
+            ),
+            (
+                "file-link/child",
+                "file-link",
+                "EEXIST: file already exists, mkdir",
+            ),
+            (
+                "file-link/nested/child",
+                "file-link/nested",
+                "ENOTDIR: not a directory, mkdir",
+            ),
+        ] {
+            let result = tool
+                .invoke(
+                    json!({"path":path,"content":"replacement"}),
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            let expected = format!("{diagnostic} '{}'", root.join(reported_path).display());
+            assert!(
+                matches!(&result, Outcome::Failed(actual) if actual == &expected),
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("parent-file")).unwrap(),
+            "retained"
+        );
+        assert!(
+            std::fs::read_dir(root.join("dir"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        assert!(matches!(
+            scoped.write(&json!({"path":"dir","content":"replacement"})),
+            Err(Error::Config(message)) if message == "expected a regular file"
+        ));
     }
 
     #[cfg(unix)]
@@ -5351,7 +5561,7 @@ mod tests {
             tool.kind = kind;
             for path in ["missing", "file.txt/child"] {
                 let mut args = json!({"path": path});
-                if matches!(kind, Kind::Grep) {
+                if matches!(tool.kind, Kind::Grep) {
                     args["pattern"] = json!("match");
                 }
                 let output = tool.invoke(args, context()).await;
@@ -5362,7 +5572,7 @@ mod tests {
         tool.kind = Kind::Read {
             auto_resize: true,
             profile: None,
-            model_supports_images: None,
+            unsupported_image_model: None,
         };
         for path in ["missing", "missing/nested file.txt"] {
             let output = tool.invoke(json!({"path": path}), context()).await;
@@ -5373,7 +5583,7 @@ mod tests {
         tool.kind = Kind::Read {
             auto_resize: true,
             profile: None,
-            model_supports_images: None,
+            unsupported_image_model: None,
         };
         assert!(matches!(
             tool.invoke(json!({"path":"file.txt"}), context()).await,
@@ -5511,7 +5721,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         let result = tool
@@ -5555,7 +5765,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         let result = tool
@@ -5596,7 +5806,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         let result = tool
@@ -6000,6 +6210,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn read_image_records_model_omission_as_metadata_only() {
+        let directory = tempfile::tempdir().unwrap();
+        image::RgbImage::from_pixel(2, 2, image::Rgb([1, 2, 3]))
+            .save(directory.path().join("image.png"))
+            .unwrap();
+        let selected = ReadImageModel::default();
+        let tools = CodingTools::local(directory.path())
+            .unwrap()
+            .with_read_image_model(selected.clone());
+        let tool = tools
+            .tools()
+            .into_iter()
+            .find(|tool| tool.spec().name == "read")
+            .unwrap();
+        for (id, capability) in [
+            ("text-model", Some(false)),
+            ("vision-model", Some(true)),
+            ("another-text-model", Some(false)),
+            ("unknown-model", None),
+        ] {
+            selected.set(id, capability);
+            let result = tool
+                .invoke(
+                    json!({"path":"image.png"}),
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            let (data, details) = match &result {
+                Outcome::StructuredWithDetails { data, details, .. } => (data, Some(details)),
+                Outcome::Structured { data, .. } => (data, None),
+                other => panic!("expected image, got {other:?}"),
+            };
+            assert_eq!(
+                details,
+                (capability == Some(false))
+                    .then(|| json!({"imageUnsupportedByModel":id}))
+                    .as_ref()
+            );
+            assert_eq!(data["content"][0]["text"], "Read image file [image/png]");
+            assert_eq!(data["content"][1]["type"], "image");
+            let (text, images) = pi_rs::extract_tool_images(result.tool_content());
+            assert_eq!(images.len(), 1);
+            assert!(!text.contains(id));
+            assert!(!text.contains("does not support images"));
+        }
+    }
+
     #[test]
     fn read_image_notes_when_current_model_is_text_only() {
         let directory = tempfile::tempdir().unwrap();
@@ -6015,7 +6276,8 @@ mod tests {
                 kind: Kind::Read {
                     auto_resize: true,
                     profile: None,
-                    model_supports_images: support,
+                    unsupported_image_model: (support == Some(false))
+                        .then_some(UnsupportedImageModel::Legacy),
                 },
             };
             let Outcome::Structured { data, .. } = tool
@@ -6079,7 +6341,7 @@ mod tests {
                 kind: Kind::Read {
                     auto_resize,
                     profile: None,
-                    model_supports_images: None,
+                    unsupported_image_model: None,
                 },
             };
             let value = tool.read_image(&path).unwrap().unwrap();
@@ -6133,7 +6395,7 @@ mod tests {
                     max_height: Some(32),
                     ..Default::default()
                 }),
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         let value = tool.read_image(&path).unwrap().unwrap();
@@ -6153,7 +6415,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: false,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         let value = tool.read_image(&path).unwrap().unwrap();
@@ -6205,7 +6467,7 @@ mod tests {
                     max_bytes: Some(1),
                     ..Default::default()
                 }),
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         let result = tool.read_image(&path).unwrap().unwrap();
@@ -6217,7 +6479,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: false,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
             ..tool
         };
@@ -6261,7 +6523,7 @@ mod tests {
                     max_bytes: Some(0),
                     ..Default::default()
                 }),
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         let error = tool.read_image(&path).unwrap_err();
@@ -6290,7 +6552,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         assert_eq!(tool.output_limit(), 8 * 1024 * 1024);
@@ -6324,7 +6586,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: false,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
             ..tool
         }
@@ -6348,7 +6610,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         let value = tool.read_image(&path).unwrap().unwrap();
@@ -6375,7 +6637,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         assert!(scoped.path(skill.to_str().unwrap()).is_err());
@@ -6386,7 +6648,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         assert_eq!(
@@ -6428,7 +6690,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         let validator = jsonschema::validator_for(&tool.spec().parameters).unwrap();
@@ -6566,7 +6828,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
             ..tool
         };
@@ -6967,7 +7229,7 @@ mod tests {
     #[test]
     fn directory_collation_matches_pi_for_punctuation_and_local_accents() {
         let sort = |locale, mut names: Vec<&'static str>| {
-            let collator = directory_collator(locale).unwrap();
+            let collator = crate::locale::collator(locale).unwrap();
             names.sort_by(|left, right| {
                 collator.compare(&left.to_lowercase(), &right.to_lowercase())
             });
@@ -6997,7 +7259,7 @@ mod tests {
     #[test]
     fn directory_locale_uses_node_message_locale_precedence() {
         let select = |all: Option<&str>, messages: Option<&str>, lang: Option<&str>| {
-            directory_locale(|key| match key {
+            crate::locale::select(|key| match key {
                 "LC_ALL" => all.map(str::to_owned),
                 "LC_MESSAGES" => messages.map(str::to_owned),
                 "LANG" => lang.map(str::to_owned),
@@ -7015,7 +7277,8 @@ mod tests {
         assert_eq!(select(None, None, Some("en_US.UTF-8")), "en_US.UTF-8");
         assert_eq!(select(Some(""), Some("sv_SE.UTF-8"), None), "");
         let collator =
-            directory_collator(&select(None, Some("sv_SE.UTF-8"), Some("en_US.UTF-8"))).unwrap();
+            crate::locale::collator(&select(None, Some("sv_SE.UTF-8"), Some("en_US.UTF-8")))
+                .unwrap();
         assert!(collator.compare("z", "ä").is_lt());
     }
 
@@ -7339,27 +7602,25 @@ mod tests {
         let token = pi_rs::CancellationToken::new();
         let outcome = tool.list(&json!({"limit": 1.5}), &token).unwrap();
         assert!(
-            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["entryLimitReached"] == json!(1.5))
+            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["entryLimitReached"] == json!(1.0))
         );
         tool.kind = Kind::Find;
         let outcome = tool
             .search(&json!({"pattern":"*", "limit": 0.0}), &token)
             .unwrap();
         assert!(
-            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["resultLimitReached"] == json!(0.0))
+            matches!(&outcome, Outcome::SucceededWithDetails { details, .. } if details["resultLimitReached"] == json!(1.0))
         );
-        let failed = tool
+        let rounded = tool
             .search(&json!({"pattern":"*", "limit":1.5}), &token)
             .unwrap();
-        assert!(failed.is_error());
-        assert_eq!(
-            failed.tool_content(),
-            "error: invalid value '1.5' for '--max-results <count>': invalid digit found in string\n\nFor more information, try '--help'."
-        );
+        assert_eq!(rounded.tool_content(), outcome.tool_content());
         let missing = json!({"pattern":"*", "path":"missing", "limit":1.5});
-        let missing_outcome = tool.search(&missing, &token).unwrap();
-        assert!(missing_outcome.is_error());
-        assert_eq!(missing_outcome.tool_content(), failed.tool_content());
+        let missing_error = tool.search(&missing, &token).unwrap_err().to_string();
+        assert!(
+            missing_error.contains("is not a directory."),
+            "{missing_error}"
+        );
         tool.unrestricted = false;
         assert!(tool.search(&missing, &token).is_err());
         assert_eq!(js_number(9007199254740993_u64 as f64), "9007199254740992");
@@ -7422,21 +7683,20 @@ mod tests {
             shell: ShellConfig::default(),
             kind: Kind::Find,
         };
-        for limit in [1, 2] {
-            let output = tool
+        for (limit, expected) in [
+            (
+                1,
+                "foo\n\n[1 results limit reached. Use limit=2 for more, or refine pattern]",
+            ),
+            (2, "foo\nbar"),
+        ] {
+            let outcome = tool
                 .search(
                     &json!({"pattern":"*","limit":limit}),
                     &pi_rs::CancellationToken::new(),
                 )
-                .unwrap()
-                .tool_content();
-            assert_eq!(
-                output,
-                format!(
-                    "foo\nbar\n\n[{limit} results limit reached. Use limit={} for more, or refine pattern]",
-                    limit * 2
-                )
-            );
+                .unwrap();
+            assert_eq!(outcome.tool_content(), expected);
         }
     }
 
@@ -7524,6 +7784,52 @@ mod tests {
                 &pi_rs::CancellationToken::new()
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn unrestricted_find_anchors_relative_globs_at_search_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for path in ["src/a.ts", "pkg/src/b.ts", "CaseDir/mixed.ts"] {
+            let target = root.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, "").unwrap();
+        }
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root,
+            kind: Kind::Find,
+        };
+        let token = pi_rs::CancellationToken::new();
+        for (pattern, expected) in [
+            ("src/*.ts", "src/a.ts"),
+            ("./src/*.ts", "src/a.ts"),
+            ("././src/*.ts", "src/a.ts"),
+            ("**/src/*.ts", "pkg/src/b.ts\nsrc/a.ts"),
+            ("casedir/*.ts", "CaseDir/mixed.ts"),
+        ] {
+            assert_eq!(
+                tool.search(&json!({"pattern": pattern}), &token)
+                    .unwrap()
+                    .tool_content(),
+                expected,
+                "{pattern}"
+            );
+        }
+        assert_eq!(
+            tool.search(&json!({"pattern":"src/*.ts", "path":"pkg"}), &token)
+                .unwrap()
+                .tool_content(),
+            "src/b.ts"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            tool.search(&json!({"pattern":r"src\*.ts"}), &token)
+                .unwrap()
+                .tool_content(),
+            "src/a.ts"
         );
     }
 
@@ -8124,7 +8430,25 @@ mod tests {
             return;
         }
         let root = tempfile::tempdir().unwrap();
-        let command = "python3 -c 'import os,time; parent=os.getppid(); open(\"ready\",\"w\").close();\nwhile os.getppid()==parent: time.sleep(.001)\nend=time.monotonic()+.6; os.write(1,b\"out0\\n\"); os.write(2,b\"err0\\n\");\nwhile time.monotonic()<end:\n os.write(1,b\".\"); os.write(2,b\".\"); until=time.monotonic()+.002\n while time.monotonic()<until: pass\nos.write(1,b\"out11\\n\"); os.write(2,b\"err11\\n\")' & while [ ! -f ready ]; do sleep .01; done; rm ready; exit 0";
+        // Yield between writes so the producer and pipe readers can run on
+        // constrained CI hosts. The stream still outlives the idle window.
+        let command = r#"python3 -c '
+import os
+import time
+
+parent = os.getppid()
+open("ready", "w").close()
+while os.getppid() == parent:
+    time.sleep(.001)
+os.write(1, b"out0\n")
+os.write(2, b"err0\n")
+for _ in range(80):
+    os.write(1, b".")
+    os.write(2, b".")
+    time.sleep(.004)
+os.write(1, b"out11\n")
+os.write(2, b"err11\n")
+' & while [ ! -f ready ]; do sleep .01; done; rm ready; exit 0"#;
         let local = CodingTool {
             root: root.path().to_path_buf(),
             unrestricted: true,
@@ -8176,8 +8500,14 @@ mod tests {
         .await
         .unwrap();
         let output = result.tool_content();
-        assert!(output.contains("out11\n"), "{output:?}");
-        assert!(output.contains("err11\n"), "{output:?}");
+        assert!(
+            output.contains("out11\n"),
+            "backend stdout missing: {output:?}"
+        );
+        assert!(
+            output.contains("err11\n"),
+            "backend stderr missing: {output:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -8470,7 +8800,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         let context = || ToolContext {

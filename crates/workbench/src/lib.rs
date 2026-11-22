@@ -28,6 +28,7 @@ pub use coding_paths::windows_shell_path;
 pub mod diff_sequence;
 mod file_search;
 pub mod image_profile;
+mod locale;
 pub mod mcp;
 pub mod mcp_auth;
 mod mcp_log;
@@ -37,6 +38,7 @@ pub mod mcp_oauth_client;
 mod mcp_provider_auth;
 #[doc(hidden)]
 pub mod mcp_refresh;
+mod mcp_resource_compat;
 pub mod model_factory;
 #[doc(hidden)]
 pub mod oauth_callback;
