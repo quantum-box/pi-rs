@@ -1116,7 +1116,8 @@ session. The project-only action adds an override for a global server in a
 trusted project. Exposure changes between codemode, deferred and direct
 save to the server's effective configuration scope and update the model's
 tool declarations without restarting the connection. Per-tool overrides
-retain precedence. The manager offers Sign in for a server requiring OAuth
+retain precedence. Extension-registered servers retain their extension scope
+and their extension controls their enabled state and exposure. The manager offers Sign in for a server requiring OAuth
 and Sign out for a live OAuth connection. Sign-in opens the browser, checks
 the applied configuration before saving credentials, and reconnects the
 server. Sign-out clears the selected server's stored credentials and removes

@@ -588,7 +588,7 @@ pub(super) async fn discover_registered(
         .collect();
     let mut inspection = inspection_entries(&servers, &BTreeSet::new(), &BTreeSet::new());
     for entry in &mut inspection {
-        entry.scope = "extension";
+        entry.scope = InspectionScope::Extension;
         if entry.status == "disconnected"
             && (args
                 .disable_extension
@@ -1028,6 +1028,7 @@ enum InspectionScope {
     Global,
     Project,
     Override,
+    Extension,
 }
 
 impl InspectionScope {
@@ -1036,6 +1037,7 @@ impl InspectionScope {
             Self::Global => "global",
             Self::Project => "project",
             Self::Override => "global · project override",
+            Self::Extension => "extension",
         }
     }
 }
@@ -1290,6 +1292,11 @@ pub(super) async fn edit_manager_config(
     request: &ManagerRequest,
     cancel: &CancellationToken,
 ) -> Result<Inspection> {
+    if request.scope == InspectionScope::Extension {
+        return Err(Error::Config(
+            "MCP server configuration is owned by its extension".into(),
+        ));
+    }
     let mut expected = request.config.clone();
     let (key, value, in_project) = match request.action {
         ManagerAction::SetEnabled { enabled, project } => {
@@ -1504,7 +1511,9 @@ pub(super) async fn inspect_servers(
                         }));
                     }
                 }
-                ("exposure", Some(config)) if enabled == Some(true) => {
+                ("exposure", Some(config))
+                    if enabled == Some(true) && entry.scope != InspectionScope::Extension =>
+                {
                     if let Some(exposure) = choose_exposure(entry, ui, cancel).await? {
                         return Ok(Some(ManagerRequest {
                             name: entry.name.clone(),
@@ -1514,7 +1523,9 @@ pub(super) async fn inspect_servers(
                         }));
                     }
                 }
-                ("reconnect" | "toggle" | "toggle-project", Some(config)) => {
+                ("reconnect" | "toggle" | "toggle-project", Some(config))
+                    if action == "reconnect" || entry.scope != InspectionScope::Extension =>
+                {
                     let action = if action == "reconnect" {
                         ManagerAction::Reconnect
                     } else {
@@ -1596,19 +1607,22 @@ async fn show_inspection(
             label: Some(label.into()),
         });
     }
+    let can_edit = entry.is_some_and(|entry| entry.scope != InspectionScope::Extension);
     if enabled == Some(true) {
         actions.push(UiComponentAction {
             key: "r".into(),
             value: "reconnect".into(),
             label: Some("Reconnect".into()),
         });
-        actions.push(UiComponentAction {
-            key: "x".into(),
-            value: "exposure".into(),
-            label: Some("Exposure".into()),
-        });
+        if can_edit {
+            actions.push(UiComponentAction {
+                key: "x".into(),
+                value: "exposure".into(),
+                label: Some("Exposure".into()),
+            });
+        }
     }
-    if let Some(enabled) = enabled {
+    if can_edit && let Some(enabled) = enabled {
         let label = if enabled { "Disable" } else { "Enable" };
         actions.push(UiComponentAction {
             key: "e".into(),
