@@ -5132,7 +5132,8 @@ successful model listing with an unavailable `/props` response is cached with
 autoload treated as disabled. The cache contains classifier metadata and
 a scope fingerprint. It stores no raw credential or endpoint.
 When a refresh omits the runtime and configured context windows, it reuses
-the cached model's context window.
+a cached runtime window. A newly reported training window takes precedence
+over a cached estimate.
 Offline discovery uses a configured literal key or a keyless router without
 resolving credential commands. This refresh is scoped to the native Codemode
 classifier catalog. Pi also refreshes its chat catalog. A llama-server 1.0.0

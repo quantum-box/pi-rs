@@ -60,26 +60,38 @@ impl Model {
             || (autoload && self.unloaded_preset() && !self.status.failed)
     }
 
-    fn context_window(&self, cached: Option<u32>) -> u32 {
+    fn runtime_context_window(&self) -> Option<u32> {
         let positive = |value: Option<u32>| value.filter(|value| *value > 0);
         let meta = self.meta.as_ref();
-        positive(meta.and_then(|meta| meta.n_ctx))
-            .or_else(|| {
-                self.status.args.windows(2).find_map(|args| {
-                    if matches!(args[0].as_str(), "--ctx-size" | "-c" | "-ctx") {
-                        positive(args[1].parse().ok())
-                    } else {
-                        None
-                    }
-                })
+        positive(meta.and_then(|meta| meta.n_ctx)).or_else(|| {
+            self.status.args.windows(2).find_map(|args| {
+                if matches!(args[0].as_str(), "--ctx-size" | "-c" | "-ctx") {
+                    positive(args[1].parse().ok())
+                } else {
+                    None
+                }
             })
-            .or_else(|| positive(cached))
-            .or_else(|| positive(meta.and_then(|meta| meta.n_ctx_train)))
-            .unwrap_or(128_000)
+        })
     }
 
-    fn classifier(self, cached_window: Option<u32>) -> Classifier {
-        let context_window = self.context_window(cached_window);
+    fn classifier(self, cached: Option<&Classifier>) -> Classifier {
+        let runtime_context_window = self
+            .runtime_context_window()
+            .or_else(|| cached.and_then(|model| model.runtime_context_window))
+            .filter(|window| *window > 0);
+        let context_window = runtime_context_window
+            .or_else(|| {
+                self.meta
+                    .as_ref()
+                    .and_then(|meta| meta.n_ctx_train)
+                    .filter(|window| *window > 0)
+            })
+            .or_else(|| {
+                cached
+                    .map(|model| model.context_window)
+                    .filter(|window| *window > 0)
+            })
+            .unwrap_or(128_000);
         let decisions = self.architecture.is_some_and(|arch| {
             arch.output_modalities
                 .iter()
@@ -88,6 +100,7 @@ impl Model {
         Classifier {
             id: self.id,
             context_window,
+            runtime_context_window,
             decisions,
         }
     }
@@ -97,6 +110,7 @@ impl Model {
 struct Classifier {
     id: String,
     context_window: u32,
+    runtime_context_window: Option<u32>,
     decisions: bool,
 }
 
@@ -258,9 +272,9 @@ async fn discover(
     } else {
         false
     };
-    let cached_windows: BTreeMap<_, _> = stored
+    let cached_models: BTreeMap<_, _> = stored
         .iter()
-        .map(|model| (model.id.as_str(), model.context_window))
+        .map(|model| (model.id.as_str(), model))
         .collect();
     Some(
         models
@@ -268,8 +282,8 @@ async fn discover(
             .into_iter()
             .filter(|model| model.selectable(autoload))
             .map(|model| {
-                let window = cached_windows.get(model.id.as_str()).copied();
-                model.classifier(window)
+                let cached = cached_models.get(model.id.as_str()).copied();
+                model.classifier(cached)
             })
             .collect(),
     )
@@ -367,8 +381,12 @@ mod tests {
                 (
                     "/prefix/models",
                     "200 OK",
-                    json!({"data":[{"id":"chat","status":{"value":"sleeping"},
-                        "meta":{"n_ctx_train":4096}}]}),
+                    json!({"data":[
+                        {"id":"chat","status":{"value":"sleeping"},"meta":{"n_ctx_train":4096}},
+                        {"id":"decision","status":{"value":"sleeping"},
+                            "architecture":{"output_modalities":["decisions"]},
+                            "meta":{"n_ctx_train":16384}},
+                    ]}),
                 ),
                 ("/prefix/models", "200 OK", json!({"data":[]})),
             ] {
@@ -451,9 +469,10 @@ mod tests {
             );
         }
         let updated = catalogue(Some(&client), &root, Some("fixture"), cache.clone()).await;
-        assert_eq!(updated.len(), 1);
+        assert_eq!(updated.len(), 2);
         assert_eq!(updated[0].model.id, "chat");
         assert_eq!(updated[0].model.context_window, Some(8192));
+        assert_eq!(updated[1].model.context_window, Some(16384));
         assert!(
             catalogue(Some(&client), &root, Some("fixture"), cache.clone())
                 .await
