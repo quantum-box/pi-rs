@@ -87,7 +87,7 @@ impl ProviderRetry {
                 .as_secs_f64()
                 .ceil();
             let requested = (delay / 1000.0).ceil();
-            return Err(Error::Model(format!(
+            return Err(Error::RetryableModel(format!(
                 "Server requested {requested}s retry delay (max: {limit}s)"
             )));
         }
@@ -233,7 +233,7 @@ mod tests {
         );
         headers.insert("retry-after-ms", HeaderValue::from_static("6.001e4ms"));
         assert!(
-            matches!(policy.delay(&headers, 0, now), Err(Error::Model(message)) if message.contains("retry delay"))
+            matches!(policy.delay(&headers, 0, now), Err(Error::RetryableModel(message)) if message.contains("retry delay"))
         );
         let unlimited = ProviderRetry {
             max_retry_delay_ms: 0,

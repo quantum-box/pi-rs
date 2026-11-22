@@ -3499,7 +3499,10 @@ Completions, and Anthropic Messages HTTP requests honor `retry.provider.maxRetri
 `Retry-After` before accepting a response stream. As in Pi 1.6, this opt-in
 policy uses HTTP retry hints and status before processing the error body. The
 agent still uses the final provider error to distinguish quota exhaustion and
-other permanent failures. This policy also loads legacy
+other permanent failures. A server delay above the ceiling stops the provider
+retry and can trigger the agent's separately configured retry. Native reports
+the requested delay and ceiling without echoing the provider body. This policy
+also loads legacy
 `retry.maxDelayMs` when the replacement is unset. Google Gemini and Codex-specific
 provider retries and summary-specific retry policy remain open.
 
