@@ -385,7 +385,7 @@ async fn access_at(
             return Err(error("cannot refresh credentials in a read-only store"));
         }
     };
-    let stored = super::config::read_object_unlocked(path)?;
+    let stored = super::config::read_auth_object_locked(&guard)?;
     let credential = read(&stored)?;
     guard.check()?;
     if fresh(credential.expires) {
