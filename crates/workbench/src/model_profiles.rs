@@ -2470,9 +2470,19 @@ mod tests {
         let default = Profiles::default();
         let native =
             default.anthropic_mid_conversation_system_models(&provider, "claude-opus-4-8", None);
-        assert_eq!(native.len(), 7);
-        assert!(native.contains("claude-opus-4-8"));
-        assert!(!native.contains("claude-sonnet-5"));
+        assert_eq!(
+            native,
+            BTreeSet::from([
+                "claude-fable-5".into(),
+                "claude-fable-5-1".into(),
+                "claude-fable-5-2".into(),
+                "claude-haiku-5-5".into(),
+                "claude-opus-4-8".into(),
+                "claude-opus-5".into(),
+                "claude-opus-5-5".into(),
+                "claude-sonnet-5-5".into(),
+            ])
+        );
     }
 
     #[test]

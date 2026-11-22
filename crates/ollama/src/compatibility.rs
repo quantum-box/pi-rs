@@ -284,11 +284,11 @@ enum ThinkingFormat {
 }
 
 impl ChatCompatibility {
-    /// Whether the model explicitly declares strict tool support.
     pub fn supports_mid_conversation_system_messages(&self) -> bool {
         self.supports_mid_convo_system_messages.unwrap_or(false)
     }
 
+    /// Whether the model explicitly declares strict tool support.
     pub fn supports_strict_mode(&self) -> Option<bool> {
         self.supports_strict_mode
     }
