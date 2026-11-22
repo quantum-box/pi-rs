@@ -593,12 +593,7 @@ impl Anthropic {
         let mut url = self.models_url();
         url.path_segments_mut().ok()?.push(model);
         let details = tokio::time::timeout(Duration::from_secs(2), async {
-            let response = send(
-                self.authenticate(self.client.get(url), false, false, false, false, false),
-                &self.error_secrets(),
-            )
-            .await
-            .ok()?;
+            let response = self.send_catalog_request(url).await.ok()?;
             decode_model(&read_json(response).await.ok()?)
         })
         .await
@@ -788,11 +783,7 @@ impl Anthropic {
             if let Some(cursor) = &cursor {
                 url.query_pairs_mut().append_pair("after_id", cursor);
             }
-            let response = send(
-                self.authenticate(self.client.get(url), false, false, false, false, false),
-                &self.error_secrets(),
-            )
-            .await?;
+            let response = self.send_catalog_request(url).await?;
             let page = read_json(response).await?;
             let models = page["data"]
                 .as_array()
@@ -823,6 +814,21 @@ impl Anthropic {
         Err(Error::Model(
             "Anthropic model listing exceeds page limit".into(),
         ))
+    }
+
+    async fn send_catalog_request(&self, url: Url) -> Result<Response> {
+        let request = self.authenticate(self.client.get(url), false, false, false, false, false);
+        let response = send_http(request).await?;
+        self.invalidate_rejected_federation_token(response.status());
+        check_status(response, &self.error_secrets()).await
+    }
+
+    fn invalidate_rejected_federation_token(&self, status: reqwest::StatusCode) {
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(rejected) = &self.federation_rejected
+        {
+            rejected();
+        }
     }
 }
 
@@ -1083,6 +1089,7 @@ async fn is_permanent_quota(mut response: Response, secrets: &[String]) -> bool 
     .unwrap_or(false)
 }
 
+#[cfg(test)]
 async fn send(request: reqwest::RequestBuilder, secrets: &[String]) -> Result<Response> {
     check_status(send_http(request).await?, secrets).await
 }
@@ -2240,11 +2247,7 @@ impl Anthropic {
                 |response| (response.status().as_u16(), response.headers()),
             )
             .await?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED
-            && let Some(rejected) = &self.federation_rejected
-        {
-            rejected();
-        }
+        self.invalidate_rejected_federation_token(response.status());
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
@@ -3877,6 +3880,60 @@ mod tests {
         ] if matches!(diagnostics.as_slice(), [
             AssistantDiagnostic::AnthropicThreadFallback { details, .. },
         ] if details.reason == "thread_beta_unsupported")));
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_federation_token_is_invalidated_by_catalog_requests() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker =
+            std::thread::spawn(move || {
+                for (path, status) in [
+                    ("/v1/models?limit=100", "401 Unauthorized"),
+                    ("/v1/models/claude", "401 Unauthorized"),
+                    ("/v1/models?limit=100", "403 Forbidden"),
+                ] {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut reader = BufReader::new(&mut socket);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    assert_eq!(first.trim_end(), format!("GET {path} HTTP/1.1"));
+                    let headers: Vec<_> = reader
+                        .lines()
+                        .map(|line| line.unwrap())
+                        .take_while(|line| !line.is_empty())
+                        .collect();
+                    assert!(headers.iter().any(|line| {
+                        line.eq_ignore_ascii_case("authorization: Bearer fixture-token")
+                    }));
+                    write!(
+                        socket,
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                }
+            });
+        let rejected = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&rejected);
+        let mut client =
+            Anthropic::with_bearer_token(&format!("http://{address}/v1/messages"), "fixture-token")
+                .unwrap();
+        client.federation_rejected = Some(Arc::new(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        }));
+        assert!(client.models().await.is_err());
+        assert_eq!(rejected.load(Ordering::Relaxed), 1);
+        assert!(client.model("claude").await.is_none());
+        assert_eq!(rejected.load(Ordering::Relaxed), 2);
+        assert!(client.models().await.is_err());
+        assert_eq!(rejected.load(Ordering::Relaxed), 2);
         worker.join().unwrap();
     }
 

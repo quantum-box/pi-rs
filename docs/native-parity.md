@@ -6068,8 +6068,9 @@ exports use the selected API key or Bearer authorization header when present.
 Native exchanges at the official Anthropic endpoint
 and shares the access token in memory. It rereads the identity file on
 exchange, starts a background exchange within 120 seconds of expiry,
-waits for a fresh token within 30 seconds, and invalidates a rejected
-token for the next request. `pi auth check --no-refresh` checks the identity
+waits for a fresh token within 30 seconds, and invalidates a token rejected
+with HTTP 401 by Messages, model listing, or model lookup for the next request.
+`pi auth check --no-refresh` checks the identity
 file locally or reports a configured authentication header without running
 its command. A regular check exchanges the assertion when needed, and
 `print-bearer-token` can export the access token with a requested minimum
