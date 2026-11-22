@@ -1901,13 +1901,14 @@ remaining CLI aliases still require parity work.
 
 ### Legacy settings migration
 
-User and trusted-project settings independently migrate Pi's legacy
-`queueMode` to `steeringMode` and the legacy `skills` object to skill paths
-and `enableSkillCommands` before merging. Explicit modern keys win within
-their layer; project settings retain their usual precedence and untrusted
-project settings are ignored. Configured skill paths remain relative to their
-own settings file. Loading does not rewrite the original files. Regression
-tests exercise actual skill discovery, queue selection, precedence and trust.
+User and trusted-project settings migrate Pi's legacy keys before merging.
+`queueMode` becomes `steeringMode`, the legacy `skills` object becomes skill
+paths and `enableSkillCommands`, and boolean `websockets` selects Codex
+`transport` of `websocket` or `sse`. Explicit modern keys win within their
+layer. Trusted project settings retain their usual precedence. Configured
+skill paths remain relative to their settings file. Loading does not rewrite
+the original files. Regression tests cover skill discovery, queue selection,
+transport, precedence, and trust.
 
 ### Upstream session import checkpoint
 

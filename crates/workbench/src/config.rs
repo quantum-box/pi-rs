@@ -769,6 +769,13 @@ fn migrate_legacy_settings(value: &mut Value) {
     {
         settings.insert("steeringMode".into(), mode);
     }
+    if !settings.contains_key("transport")
+        && let Some(enabled) = settings.get("websockets").and_then(Value::as_bool)
+    {
+        let transport = if enabled { "websocket" } else { "sse" };
+        settings.insert("transport".into(), Value::String(transport.into()));
+        settings.remove("websockets");
+    }
     if let Some(retry) = settings.get_mut("retry").and_then(Value::as_object_mut)
         && let Some(delay) = retry.remove("maxDelayMs").filter(Value::is_number)
     {
@@ -1326,6 +1333,50 @@ mod tests {
         assert_eq!(saved["skills"], global_value["skills"]);
         assert_eq!(saved["queueMode"], "all");
         assert_eq!(saved["hideThinkingBlock"], true);
+    }
+
+    #[test]
+    fn legacy_websocket_settings_migrate_per_layer_without_rewriting() {
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let project = workspace.join(".pi/settings.json");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        let global = directory.path().join("settings.json");
+
+        for (user, local, trusted, untrusted) in [
+            (
+                json!({"websockets":true}),
+                json!({"websockets":false}),
+                "sse",
+                "websocket",
+            ),
+            (
+                json!({"websockets":false}),
+                json!({"transport":"websocket-cached","websockets":true}),
+                "websocket-cached",
+                "sse",
+            ),
+            (
+                json!({"transport":"auto","websockets":false}),
+                json!({"websockets":"true"}),
+                "auto",
+                "auto",
+            ),
+        ] {
+            let user = user.to_string();
+            let local = local.to_string();
+            std::fs::write(&global, &user).unwrap();
+            std::fs::write(&project, &local).unwrap();
+            for (trust, expected) in [(true, trusted), (false, untrusted)] {
+                let settings =
+                    super::Settings::load_from_paths(&workspace, trust, &global).unwrap();
+                assert_eq!(settings.string("transport"), Some(expected));
+            }
+            assert_eq!(std::fs::read_to_string(&global).unwrap(), user);
+            assert_eq!(std::fs::read_to_string(&project).unwrap(), local);
+        }
     }
 
     #[test]
