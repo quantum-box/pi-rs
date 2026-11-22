@@ -119,6 +119,12 @@
     "treeFilterMode": {
       "enum": ["default", "no-tools", "user-only", "labeled-only", "all"]
     },
+    "warnings": {
+      "type": "object",
+      "properties": {
+        "anthropicExtraUsage": { "type": "boolean", "default": true }
+      }
+    },
     "extensions": {
       "type": "array",
       "items": {

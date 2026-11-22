@@ -263,6 +263,9 @@ impl Picker {
     }
 
     pub fn paste(&mut self, text: &str) {
+        if self.title == "Warnings" {
+            return;
+        }
         let tree_focus = self.tree_filter_focus();
         if self.title == "Settings" {
             self.query.insert_settings_search(text);
@@ -822,7 +825,7 @@ impl Picker {
         let cancel = keys.matches("tui.select.cancel", key);
         let confirm = activate
             || keys.matches("tui.select.confirm", key)
-            || (self.title == "Settings"
+            || (matches!(self.title.as_str(), "Settings" | "Warnings")
                 && self.query.text.is_empty()
                 && key.code == KeyCode::Char(' ')
                 && key.modifiers == KeyModifiers::NONE)
@@ -1075,9 +1078,10 @@ impl Picker {
             KeyCode::Home if self.title != "Settings" => self.selected = 0,
             KeyCode::End if self.title != "Settings" => self.selected = count.saturating_sub(1),
             KeyCode::Char(character)
-                if !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                ) =>
+                if self.title != "Warnings"
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
             {
                 let focus = self.tree_filter_focus();
                 if self.title == "Settings" {
@@ -1246,12 +1250,12 @@ impl Picker {
             .tree
             .as_ref()
             .map_or_else(String::new, |tree| format!(" · {}", tree.filter.name()));
-        let settings = self.title == "Settings";
+        let settings = matches!(self.title.as_str(), "Settings" | "Warnings");
         let prefix = format!("{}{filter} · ", self.title);
-        let mut lines = vec![if settings {
-            self.settings_heading(&prefix, theme, width)
-        } else {
-            Line::themed(&format!("{prefix}{}", self.query.text), theme, "accent")
+        let mut lines = vec![match self.title.as_str() {
+            "Settings" => self.settings_heading(&prefix, theme, width),
+            "Warnings" => Line::themed(&self.title, theme, "accent"),
+            _ => Line::themed(&format!("{prefix}{}", self.query.text), theme, "accent"),
         }];
         let items = self.matches();
         let description = if settings {
@@ -1382,7 +1386,7 @@ impl Picker {
             .max()
             .unwrap_or(12)
             .clamp(12, 32);
-        let settings_column = (self.title == "Settings").then(|| {
+        let settings_column = matches!(self.title.as_str(), "Settings" | "Warnings").then(|| {
             self.items
                 .iter()
                 .map(|item| settings_label_parts(&item.label).0.width())
@@ -1608,6 +1612,12 @@ impl Picker {
                 hint("tui.select.confirm"),
                 hint("tui.select.cancel"),
             )
+        } else if self.title == "Warnings" {
+            format!(
+                "{}/Space to change · {} to go back",
+                hint("tui.select.confirm"),
+                hint("tui.select.cancel"),
+            )
         } else if self.title == "Settings" {
             format!(
                 "Type to search · {}/{} to select · {}/Space to change · {} to close",
@@ -1681,7 +1691,7 @@ fn render_settings_row(
 // them from the setting they describe.
 fn setting_description(selection: &Selection) -> Option<&'static str> {
     if let Selection::EditSetting(key) = selection
-        && !matches!(key.as_str(), "theme" | "modelThinkingLevels")
+        && !matches!(key.as_str(), "theme" | "modelThinkingLevels" | "warnings")
     {
         return Some("Edit the saved setting as JSON; changes apply on reload or startup.");
     }
@@ -1704,6 +1714,10 @@ fn setting_description(selection: &Selection) -> Option<&'static str> {
         }
         "theme" => "Choose a color theme for the interface.",
         "modelThinkingLevels" => "Override the default thinking level for specific models.",
+        "warnings" => "Enable or disable individual warnings.",
+        "warnings.anthropicExtraUsage" => {
+            "Warn when Anthropic subscription auth may use paid extra usage."
+        }
         "expandTools" => "Expand or collapse tool output in the transcript.",
         "hideThinkingBlock" => "Hide thinking blocks in assistant responses.",
         "showCacheMissNotices" => {

@@ -265,7 +265,10 @@ impl Policy {
 fn cache_warming_model(args: &Cli) -> pi_rs::Result<WorkbenchModel> {
     let mut replay = args.clone();
     replay.settings.disable_provider_retries();
-    runtime::model_client(&replay, super::thinking::reported(args).is_some(), false)
+    let mut model =
+        runtime::model_client(&replay, super::thinking::reported(args).is_some(), false)?;
+    model.client = model.client.without_message_thread_continuation();
+    Ok(model)
 }
 
 impl<'a> Capture<'a> {
