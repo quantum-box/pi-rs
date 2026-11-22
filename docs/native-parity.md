@@ -4381,6 +4381,13 @@ Loopback checks exercised native and custom authentication headers, model
 override order, endpoint isolation, redacted errors and a live terminal
 worker reload.
 
+For Chat Completions routes, `compat.openRouterRouting` becomes the
+request's `provider` object. This includes data-collection and zero-retention
+preferences. `compat.vercelGatewayRouting` sends the configured `only` and
+`order` lists in `providerOptions.gateway`. Model settings override the
+provider defaults for each routing field they specify. Local fixtures verify the request fields.
+Live gateway routing was unverified.
+
 ### Session sharing destinations
 
 `/share` and `pi share` honor `sessionShareDestination`. The default
@@ -4964,6 +4971,11 @@ field is covered by loopback tests; no live compatible server was used.
 Loopback RPC checks exercised model and endpoint switching, header and key
 isolation, reasoning replay, stream completion and reported usage and cost.
 
+Chat Completions combines system instructions at the start of the request by
+default. Models that declare `compat.supportsMidConvoSystemMessages` keep
+later system instructions in place. The catalog preserves this capability
+from Pi for applicable models, and provider or model configuration can override it.
+
 The bundled chat catalog includes chat-completions entries for Cerebras,
 DeepSeek, Fireworks, Groq, Hugging Face, Moonshot AI and Moonshot AI CN,
 OpenRouter, Together, Z.AI, and Z.AI Coding CN. It preserves their context,
@@ -5412,6 +5424,16 @@ Responses model compatibility accepts `promptCacheKeyMode` as `auto`,
 `disabled` omits the automatic key. An explicit sampling field can still
 supply a key, matching the upstream request merge order. The setting does not
 disable session routing headers or prompt caching itself.
+
+### Responses service tier and cache usage
+
+Responses and Codex SSE keep the cached-read and cache-write counts reported
+by the service. Estimated costs use the service tier returned by Responses, or
+the configured `samplingParams.service_tier` when the response omits it. Like
+Pi 1.6, Codex uses a requested `flex` or `priority` tier when the service echoes
+`default`. The multiplier applies to input, output, cache reads and cache
+writes. Loopback SSE fixtures cover both APIs. Live pricing and
+account acceptance were unverified.
 
 ### Responses cache retention checkpoint
 
