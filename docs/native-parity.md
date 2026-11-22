@@ -721,8 +721,12 @@ may behave differently. Other JavaScript date parsing edge cases
 remain open. Entries whose parent is missing or points to themselves appear as
 roots.
 
-During manual compaction, an RPC `abort` response waits for the compaction
-command to finish, even if an internal agent-settled event arrives first.
+RPC manual compaction emits `compaction_start` and `compaction_end` before
+the command response. Failures use Pi's event diagnostic, and cancellation
+reports `aborted: true` without `errorMessage`. A pending `abort` response
+follows the compaction response. Successful results include native before
+and after context token estimates, with provider usage and compaction details
+when recorded.
 
 Unknown RPC commands return `Unknown command: <type>` and preserve the
 request ID and original type when present. Object, array and numeric types use
