@@ -380,6 +380,10 @@ struct Description {
     user_bash_hook: bool,
     #[serde(default)]
     user_bash_operations_hook: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mcp_server_declarations: Vec<pi_rs_core::McpServerDeclaration>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    mcp_servers_change_hook: bool,
     #[serde(default)]
     lifecycle_hook: bool,
     #[serde(default)]
@@ -1031,6 +1035,12 @@ impl Extension for ExecutableExtension {
             .await
             .map_err(|error| error.to_string())?
     }
+    fn mcp_server_declarations(&self) -> Vec<pi_rs_core::McpServerDeclaration> {
+        self.description.mcp_server_declarations.clone()
+    }
+    fn handles_mcp_servers_change(&self) -> bool {
+        self.description.mcp_servers_change_hook
+    }
     fn handles_lifecycle(&self) -> bool {
         self.description.lifecycle_hook
     }
@@ -1145,6 +1155,12 @@ impl Extension for ExecutableExtension {
         event: &LifecycleEvent,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<()> {
+        if matches!(event, LifecycleEvent::McpServersChange { .. })
+            && !self.handles_mcp_servers_change()
+        {
+            return Ok(());
+        }
+
         use pi_rs_core::{SessionShutdownReason as Shutdown, SessionStartReason as Start};
         if matches!(event, LifecycleEvent::SessionInfoChanged { .. })
             && !self.description.session_info_hook
@@ -1183,6 +1199,12 @@ impl Extension for ExecutableExtension {
         state: Option<&ExtensionState>,
         host: Arc<dyn ToolHost>,
     ) -> ExtensionResult<()> {
+        if matches!(event, LifecycleEvent::McpServersChange { .. })
+            && !self.handles_mcp_servers_change()
+        {
+            return Ok(());
+        }
+
         if !self.description.lifecycle_host_calls {
             return self.lifecycle(event, state).await;
         }
@@ -3693,6 +3715,8 @@ async fn dispatch_inner(
             tool_call_hook: extension.handles_tool_call(),
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
+            mcp_server_declarations: extension.mcp_server_declarations(),
+            mcp_servers_change_hook: extension.handles_mcp_servers_change(),
             lifecycle_hook: extension.handles_lifecycle(),
             message_lifecycle_hook: extension.handles_message_lifecycle(),
             agent_before_settle_hook: extension.handles_agent_before_settle(),
@@ -4514,6 +4538,63 @@ mod tests {
         .unwrap();
         let edited: Message = serde_json::from_value(output).unwrap();
         assert!(matches!(edited, Message::Assistant { content, .. } if content == "raw/edited"));
+    }
+
+    #[tokio::test]
+    async fn native_mcp_registration_negotiates_declarations_and_change_events() {
+        use std::sync::Mutex;
+        let legacy: Description = serde_json::from_value(serde_json::json!({
+            "id":"legacy","dependencies":[],"commands":[],"tools":[],"lifecycle_hook":true,
+        }))
+        .unwrap();
+        assert!(!legacy.mcp_servers_change_hook);
+        assert!(legacy.mcp_server_declarations.is_empty());
+
+        struct Owner(Arc<Mutex<Vec<String>>>);
+        #[async_trait::async_trait]
+        impl Extension for Owner {
+            fn id(&self) -> &str {
+                "mcp-owner"
+            }
+            fn mcp_server_declarations(&self) -> Vec<pi_rs_core::McpServerDeclaration> {
+                vec![pi_rs_core::McpServerDeclaration {
+                    name: "example".into(),
+                    config: serde_json::json!({"command":"mcp-fixture"}),
+                }]
+            }
+            fn handles_mcp_servers_change(&self) -> bool {
+                true
+            }
+            async fn lifecycle(
+                &self,
+                event: &LifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                if let LifecycleEvent::McpServersChange { servers } = event {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .extend(servers.iter().map(|server| server.server.name.clone()));
+                }
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let extension: Arc<dyn Extension> = Arc::new(Owner(seen.clone()));
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["mcp_servers_change_hook"], true);
+        assert_eq!(description["mcp_server_declarations"][0]["name"], "example");
+        let request = serde_json::from_value(serde_json::json!({
+            "type":"lifecycle",
+            "event":{"type":"mcp_servers_change","servers":[{
+                "name":"example","config":{"command":"mcp-fixture"},"extensionId":"mcp-owner",
+            }]},
+        }))
+        .unwrap();
+        dispatch(extension, request).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["example"]);
     }
 
     #[tokio::test]

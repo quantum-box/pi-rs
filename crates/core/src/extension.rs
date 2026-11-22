@@ -1500,6 +1500,16 @@ pub trait Extension: Send + Sync {
         self.discover_resources(event, state).await
     }
 
+    /// MCP servers declared at extension load. The host controls transport and credentials.
+    fn mcp_server_declarations(&self) -> Vec<crate::McpServerDeclaration> {
+        Vec::new()
+    }
+
+    /// Opt in to changes to the registered MCP server list.
+    fn handles_mcp_servers_change(&self) -> bool {
+        false
+    }
+
     /// Opt in to session start and shutdown events in addition to run and turn events.
     fn handles_session_lifecycle(&self) -> bool {
         false
@@ -1960,12 +1970,62 @@ pub struct Registry {
     pub(crate) ui: Option<Arc<dyn crate::ExtensionUi>>,
     refresher: Option<Arc<dyn RegistryRefresher>>,
     pub(crate) omit_default_tool_timeout: bool,
+    mcp_servers: Arc<crate::mcp_registration::McpServerRegistrations>,
+    omit_mcp_declarations: bool,
     pub(crate) publish_tool_attempts: bool,
     branch_models: Arc<RwLock<BranchModels>>,
     branch_reservations: Arc<RwLock<BTreeMap<ReservedBranchModel, bool>>>,
 }
 
 impl Registry {
+    /// MCP server declarations in registration order.
+    pub fn registered_mcp_servers(&self) -> &[crate::RegisteredMcpServer] {
+        self.mcp_servers.servers()
+    }
+
+    fn insert_mcp_declarations(
+        registrations: &mut crate::mcp_registration::McpServerRegistrations,
+        extension: &dyn Extension,
+        servers: Vec<crate::McpServerDeclaration>,
+    ) -> Result<()> {
+        for server in servers {
+            registrations.put(crate::RegisteredMcpServer {
+                server,
+                extension_id: extension.id().into(),
+                extension_path: extension.command_source().map(std::path::Path::to_path_buf),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Register or update a declaration as a registered extension.
+    pub fn register_mcp_server(
+        &mut self,
+        extension_id: &str,
+        server: crate::McpServerDeclaration,
+    ) -> Result<()> {
+        if self.omit_mcp_declarations {
+            return Err(Error::Config(
+                "MCP declarations are disabled for this registry".into(),
+            ));
+        }
+        let extension = self
+            .extensions
+            .iter()
+            .find(|extension| extension.id() == extension_id)
+            .ok_or_else(|| Error::Config(format!("unknown extension {extension_id:?}")))?;
+        Arc::make_mut(&mut self.mcp_servers).put(crate::RegisteredMcpServer {
+            server,
+            extension_id: extension_id.into(),
+            extension_path: extension.command_source().map(std::path::Path::to_path_buf),
+        })
+    }
+
+    /// Remove a declaration owned by the named extension.
+    pub fn unregister_mcp_server(&mut self, extension_id: &str, name: &str) -> bool {
+        Arc::make_mut(&mut self.mcp_servers).remove(extension_id, name)
+    }
+
     /// Snapshot the first renderer registered for each custom message type.
     pub fn custom_message_renderers(&self) -> crate::CustomMessageRenderers {
         let mut renderers = crate::CustomMessageRenderers::default();
@@ -2750,6 +2810,15 @@ impl Registry {
         extensions: Vec<Arc<dyn Extension>>,
         disabled: &BTreeSet<String>,
     ) -> Result<Self> {
+        Self::compose_with_mcp_declarations(extensions, disabled, true)
+    }
+
+    /// Compose extensions, with MCP declarations optional for hosts that disable transport.
+    pub fn compose_with_mcp_declarations(
+        extensions: Vec<Arc<dyn Extension>>,
+        disabled: &BTreeSet<String>,
+        mcp_enabled: bool,
+    ) -> Result<Self> {
         let ids: BTreeSet<_> = extensions.iter().map(|extension| extension.id()).collect();
         if ids.len() != extensions.len() || ids.contains("") {
             return Err(Error::Config("invalid or duplicate extension ID".into()));
@@ -2761,7 +2830,10 @@ impl Registry {
             .into_iter()
             .filter(|extension| !disabled.contains(extension.id()))
             .collect();
-        let mut registry = Self::default();
+        let mut registry = Self {
+            omit_mcp_declarations: !mcp_enabled,
+            ..Self::default()
+        };
         while !pending.is_empty() {
             let index = pending
                 .iter()
@@ -2908,6 +2980,8 @@ impl Registry {
             ui: self.ui.clone(),
             refresher: None,
             omit_default_tool_timeout: self.omit_default_tool_timeout,
+            mcp_servers: self.mcp_servers.clone(),
+            omit_mcp_declarations: self.omit_mcp_declarations,
             publish_tool_attempts: self.publish_tool_attempts,
             branch_models: self.branch_models.clone(),
             branch_reservations: self.branch_reservations.clone(),
@@ -2926,6 +3000,13 @@ impl Registry {
         };
         let mut candidate = self.clone();
         candidate.extensions.remove(index);
+        if candidate
+            .registered_mcp_servers()
+            .iter()
+            .any(|server| server.extension_id == extension.id())
+        {
+            Arc::make_mut(&mut candidate.mcp_servers).remove_owner(extension.id());
+        }
         candidate
             .tools
             .retain(|_, tool| tool.owner != extension.id());
@@ -2996,6 +3077,14 @@ impl Registry {
                     validator,
                 }),
             );
+        }
+        if !self.omit_mcp_declarations {
+            let servers = extension.mcp_server_declarations();
+            if !servers.is_empty() {
+                let mut registrations = self.mcp_servers.as_ref().clone();
+                Self::insert_mcp_declarations(&mut registrations, extension.as_ref(), servers)?;
+                self.mcp_servers = Arc::new(registrations);
+            }
         }
         self.tools.extend(tools);
         self.extensions.push(extension);

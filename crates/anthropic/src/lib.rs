@@ -1740,6 +1740,10 @@ fn resolve_tools(
 
 #[async_trait::async_trait]
 impl Model for Anthropic {
+    fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
+        self.mid_conversation_system_models.contains(model)
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,

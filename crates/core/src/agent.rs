@@ -1933,7 +1933,7 @@ impl Agent<'_> {
                     phase: ToolInventoryPhase::RequestPreparation,
                     registry: active.registry,
                 });
-                let (mut request, transformed) = active
+                let (mut request, mut transformed, transcript) = active
                     .request(
                         session,
                         &states,
@@ -2009,6 +2009,8 @@ impl Agent<'_> {
                     limits: active.limits.clone(),
                     ..active
                 };
+                transformed |= transcript
+                    .is_some_and(|transcript| transcript.finish(active.model, &mut request));
                 let attempt = match active
                     .prepare_attempt(
                         session,
@@ -2790,7 +2792,11 @@ impl Agent<'_> {
         purpose: RequestPurpose,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
-    ) -> Result<(ModelRequest, bool)> {
+    ) -> Result<(
+        ModelRequest,
+        bool,
+        Option<crate::journal::SystemTranscriptFallback>,
+    )> {
         let branch = session.branch();
         let summary = branch.iter().rev().find_map(|record| match &record.event {
             Event::Compacted { summary, .. } => Some(summary.as_str()),
@@ -2814,25 +2820,27 @@ impl Agent<'_> {
                 content: format!("Prior conversation summary (context only):\n{summary}"),
             });
         }
+        let mut conversation = model_conversation_entries(&branch, session.operations());
         if let Some(boundary) = before {
             let mut keep_group = false;
-            messages.extend(
-                model_conversation_entries(&branch, session.operations())
-                    .into_iter()
-                    .filter_map(|(source, message)| {
-                        if !matches!(message, Message::Tool { .. }) {
-                            keep_group = source < boundary;
-                        }
-                        keep_group.then_some(message)
-                    }),
-            );
-        } else {
-            messages.extend(
-                model_conversation_entries(history, session.operations())
-                    .into_iter()
-                    .map(|(_, message)| message),
-            );
+            conversation.retain(|(source, message)| {
+                if !matches!(message, Message::Tool { .. }) {
+                    keep_group = *source < boundary;
+                }
+                keep_group
+            });
         }
+        let transcript = if purpose == RequestPurpose::Turn {
+            crate::journal::system_transcript(
+                history,
+                &conversation,
+                messages.len(),
+                self.system_prompt,
+            )
+        } else {
+            None
+        };
+        messages.extend(conversation.into_iter().map(|(_, message)| message));
         if messages.len() == 1 {
             return Err(Error::Session("there is no conversation to resume".into()));
         }
@@ -2842,6 +2850,7 @@ impl Agent<'_> {
             tools,
             max_output_tokens,
         };
+        let transcript = transcript.and_then(|transcript| transcript.apply(&mut request.messages));
         let original = request.clone();
         let invocation = if let Some(run_id) = session.current_run_id()
             && !self.registry.extensions.is_empty()
@@ -2996,7 +3005,7 @@ impl Agent<'_> {
         let transformed = request.model != original.model
             || request.messages != original.messages
             || request.tools != original.tools;
-        Ok((request, transformed))
+        Ok((request, transformed, transcript))
     }
 
     fn request_budget_tokens(
@@ -5424,7 +5433,7 @@ impl Agent<'_> {
             return Err(Error::Budget);
         }
         abandon_turn_request_for_summary(session, observer)?;
-        let (mut request, transformed) = self
+        let (mut request, transformed, _) = self
             .request(
                 session,
                 states,
@@ -13448,6 +13457,97 @@ mod request_privacy_tests {
         }
     }
 
+    #[tokio::test]
+    async fn safe_user_hooks_preserve_system_checkpoints_for_the_effective_route() {
+        struct SystemRoute {
+            supported: bool,
+            capture: CaptureModel,
+        }
+        #[async_trait::async_trait]
+        impl Model for SystemRoute {
+            fn supports_mid_conversation_system_messages(&self, _model: &str) -> bool {
+                self.supported
+            }
+
+            async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+                self.capture.stream(request).await
+            }
+        }
+        let checkpoint = |content: &str, section: &str| Event::SystemCheckpoint {
+            content: content.into(),
+            sections: vec![("rules".into(), Some(section.into()))],
+            tools_added: vec![],
+            tools_removed: vec![],
+        };
+        let user = |content: &str| Event::User {
+            content: content.into(),
+            input_id: None,
+        };
+        for supported in [true, false] {
+            for after in [true, false] {
+                let mut session = Session::with_store(MemoryStore::default()).unwrap();
+                for event in [
+                    checkpoint("base", "old"),
+                    user("replaced by hook"),
+                    checkpoint("update", "new"),
+                    user("follow-up"),
+                ] {
+                    session.append(event).unwrap();
+                }
+                let captured = Arc::new(Mutex::new(Vec::new()));
+                let model = SystemRoute {
+                    supported,
+                    capture: CaptureModel(captured.clone()),
+                };
+                let mut registry = Registry::default();
+                registry
+                    .register(Arc::new(SafeUserEdits { after }))
+                    .unwrap();
+                let agent = Agent {
+                    model: &model,
+                    model_name: "fixture",
+                    registry: &registry,
+                    system_prompt: "",
+                    limits: Limits::default(),
+                };
+                let (_sender, mut inputs) = mpsc::channel(1);
+                agent
+                    .run(
+                        &mut session,
+                        None,
+                        &mut inputs,
+                        &CancellationToken::new(),
+                        &mut |_| {},
+                    )
+                    .await
+                    .unwrap();
+                let requests = captured.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                let system = |content: &str| Message::System {
+                    content: content.into(),
+                };
+                let user = |content: &str| Message::User {
+                    content: content.into(),
+                };
+                let expected = if supported {
+                    vec![
+                        system("base\n\nold"),
+                        user("inserted"),
+                        system("update\n\nUpdated system prompt section \"rules\":\n\nnew"),
+                        user("follow-up"),
+                    ]
+                } else {
+                    vec![
+                        system("base\n\nupdate\n\nnew"),
+                        user("inserted"),
+                        user("follow-up"),
+                    ]
+                };
+                assert_eq!(requests[0].messages, expected);
+            }
+        }
+    }
+
     fn tool_group(count: usize) -> Vec<Message> {
         let calls: Vec<_> = (0..count)
             .map(|i| crate::ToolCall {
@@ -13712,7 +13812,7 @@ mod request_privacy_tests {
                     system_prompt: "system",
                     limits: Limits::default(),
                 };
-                let (request, transformed) = agent
+                let (request, transformed, _) = agent
                     .request(
                         &mut session,
                         &ExtensionStates::default(),
@@ -13810,7 +13910,7 @@ mod request_privacy_tests {
                     notifications.push(serde_json::to_string(request).unwrap());
                 }
             };
-            let (request, transformed) = agent
+            let (request, transformed, _) = agent
                 .request(
                     &mut session,
                     &ExtensionStates::default(),

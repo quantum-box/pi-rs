@@ -721,8 +721,12 @@ may behave differently. Other JavaScript date parsing edge cases
 remain open. Entries whose parent is missing or points to themselves appear as
 roots.
 
-During manual compaction, an RPC `abort` response waits for the compaction
-command to finish, even if an internal agent-settled event arrives first.
+RPC manual compaction emits `compaction_start` and `compaction_end` before
+the command response. Failures use Pi's event diagnostic, and cancellation
+reports `aborted: true` without `errorMessage`. A pending `abort` response
+follows the compaction response. Successful results include native before
+and after context token estimates, with provider usage and compaction details
+when recorded.
 
 Unknown RPC commands return `Unknown command: <type>` and preserve the
 request ID and original type when present. Object, array and numeric types use
@@ -1379,6 +1383,8 @@ factory. The caller supplies one absolute file path and exact provider and
 endpoint grants. An endpointless entry is usable only on granted routes. A
 pi-rs entry with a saved endpoint must also match that endpoint. File contents
 can supply variables for key expansion, including Pi's `$$` and `$!` escapes.
+Closed braced references with invalid names are preserved verbatim. A missing
+closing brace leaves the opening dollar sign literal and scanning continues.
 The pi-rs `literal` flag preserves the key verbatim.
 
 Each load reads the file afresh and leaves existing clients and snapshots
@@ -1817,9 +1823,13 @@ its default `Duration::MAX` means no deadline, while other values set a limit.
 to `SessionBuilder::limits` enforces that timeout for Codemode too. Direct
 `Agent` users retain their configured timeout unless they explicitly opt out
 through the registry. Nested tools retain their own limits. Large text output
-is saved to a local file. The preview counts UTF-16 code units, as in Pi
-1.6.0. When a head or tail boundary falls inside a supplementary character,
-the preview omits that whole character and the saved output keeps it.
+is saved to a local file. Like Pi 1.6.0, the preview counts UTF-16 code units
+in script output and keeps the status header and image locations outside
+the preview budget. When a head or tail boundary falls inside a supplementary
+character, the preview omits that whole character and the saved output keeps it.
+The native full transcript also records the status header and image locations.
+If the native result size limit omits inline image locations, a transcript
+includes every location.
 
 MCP tools default to codemode exposure. `--exposure direct`, `deferred`,
 `codemode` and `hidden` select another mode when adding a server. The root
@@ -2155,7 +2165,11 @@ count lines and rewind the same file while keeping memory bounded. Scoped and
 injected read tools retain positive integer paging parameters.
 
 Text reads now scan files with bounded memory, including files larger than
-4 MiB. Pages retain complete lines and UTF-8 boundaries, report the next
+4 MiB. Unrestricted local reads with integer offsets and nonnegative integer
+limits scan regular files up to the size observed when opened, as in Pi. Files
+that report a size of zero are read to EOF. The snapshot bound also applies to
+the total lines used in continuation notices. Pages retain complete lines and
+UTF-8 boundaries, report the next
 `offset`, reject offsets beyond the file, and explain when a single line
 exceeds the byte limit. Explicit line limits report remaining lines. Image
 normalization and the separate write-size limit retain their existing bounds.
@@ -2236,14 +2250,15 @@ buffer, it indexes matches on disk and streams the selected context from the
 same open file.
 
 Unrestricted local `find` and `ls` accept Pi's numeric limit schema and interpret
-JSON numbers as JavaScript doubles. `ls` compares the number directly, including
-zero, negative and fractional values. Local `find` reproduces fd's numeric
-argument parsing: zero means unlimited, while negative, fractional, and values
-outside fd's host-sized integer range produce fd-style errors before checking
-the search path. These diagnostics retain error status and reach the model
-without an added failure prefix. Generated local tool errors carry Pi's empty
-`details` object in JSON and RPC. Notices and details retain the JavaScript
-numeric value. Scoped tools retain their positive
+JSON numbers as JavaScript doubles. As in Pi 1.6.0, `ls` rounds its limit down
+to a whole number and uses at least one entry. Notices and details use the
+effective limit. Local `find` applies the same rounding, passes the
+effective limit plus one through fd-style numeric parsing, and reports a limit
+only when an extra result exists. Values outside fd's host-sized integer range
+produce fd-style errors before checking the search path. These diagnostics
+retain error status and reach the model without an added failure prefix.
+Generated local tool errors carry Pi's empty `details` object in JSON and RPC.
+Scoped tools retain their positive
 integer schema and 100,000-entry cap. Their incremental output formatter retains at most 50 KiB
 plus one byte while counting the complete output. Directory enumeration and
 locale sorting still retain all directory entries in memory. `find` uses the
@@ -2957,9 +2972,22 @@ object order is preserved during import so named sections retain their declared
 order. Tool declarations resolve to current enabled native implementations and
 schemas. An imported declaration cannot enable an unavailable or disabled tool.
 
+On ordinary turns, models that support mid-conversation instructions receive
+the original system prompt followed by checkpoint updates at their conversation
+positions, with named sections rendered as replacements or removals. An imported
+compaction snapshot supplies the leading prompt. Native compaction preserves
+checkpoint positions among retained messages when it has no prompt snapshot.
+A checkpoint inside a tool batch follows its results to preserve provider
+tool-call pairing. Models
+without that capability receive the fully resolved leading prompt. Extension
+message hooks see the ordered checkpoints. Edits to other messages preserve
+checkpoint placement. If a hook edits system messages on a route that needs
+one prompt, the adapter joins the hook's current system text in order.
+
 Tests cover branch restoration, section order, replacement/removal, current tool
-schemas and permission boundaries. A CLI import-and-resume fixture verified the
-actual model request and retained the original source file. Workspace tests and
+schemas and permission boundaries. A CLI import-and-resume fixture checked
+Anthropic Messages, Responses, and Chat Completions requests, and retained
+the original source file. Workspace tests and
 all-target Clippy passed on Rust 1.89, along with direct/deferred live MCP updates
 and form elicitation after the serialization change. A local qwen3.5:4b CLI call
 also returned the requested `OK` response.
@@ -3473,8 +3501,11 @@ Native `find` now includes directory matches (with a trailing slash), hidden
 entries and symlinks without following symlink targets. It follows the reference
 CLI's ignore-file behavior instead of unconditionally excluding `node_modules`
 and `.git`. Git ignore rules also apply outside repositories. Basename patterns
-use smart case; patterns containing a slash match full paths with the reference's
-implicit `**/` prefix. Results use forward slashes and sorted output.
+use smart case. Unrestricted local `find` anchors relative path patterns at the
+search root, strips leading `./` segments and uses explicit `**/` to match
+nested paths, as in Pi 1.6.0. Windows patterns accept backslash separators.
+Scoped `find` retains its implicit `**/` prefix. Native results use forward
+slashes and deterministic traversal order.
 Unrestricted local `find` uses fd's diagnostics for missing or non-directory
 search roots and invalid glob patterns. Search-root validation comes first.
 
@@ -4785,6 +4816,17 @@ extension callback finishes, including initial-prompt input hooks. Host scopes
 are bound to their session owner, so nested sessions cannot write to the
 caller’s journal. Ordinary control clones used by independently spawned tasks
 enter the normal FIFO queue.
+Native extensions can declare MCP servers during loading. Workbench connects
+them through its existing MCP catalog. Explicit configuration takes precedence
+over extension declarations in the same normalized namespace. Provider
+tokens and host credential references require explicit configuration. Embedded hosts can
+read the declarations and choose a connector. The SDK can register and
+unregister a server for a loaded extension and awaits `mcp_servers_change`
+handlers with the updated declaration list. Only the owner can replace or
+remove a registration. The SDK reports notification and follow-up errors
+through its session events after applying the registration change. The executable protocol negotiates that event
+independently of ordinary lifecycle events.
+
 Native extensions can subscribe to assistant `message_start`,
 `message_update`, and `message_end` through the message lifecycle callback.
 The stream notifications use native text, thinking and tool-call fragments
@@ -5732,6 +5774,16 @@ and model overrides merge for that compatibility setting. When capabilities
 are unavailable, the standalone adapter defaults to `system`; SDK hosts can
 explicitly select the developer role. This is also the fallback for unknown
 workbench models, whose upstream capabilities cannot be inferred.
+
+Responses and Codex honor Pi's `supportsMidConvoSystemMessages` catalog
+setting and resolve overrides for the final request model. Compatible models
+keep later system instructions in place. Other models send one combined initial instruction.
+As in Pi v1.6.0, Codex sends the initial instruction in the input transcript,
+using the same selected role as later instructions. This keeps the initial
+instruction at the start of the prompt for cache reuse. Token estimates use
+the outgoing instruction text. Request fixtures covered
+both projections and the Codex wire payload. Live authenticated requests
+with later system instructions were unverified.
 
 ### Responses effort history
 
