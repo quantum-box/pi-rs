@@ -2185,7 +2185,11 @@ count lines and rewind the same file while keeping memory bounded. Scoped and
 injected read tools retain positive integer paging parameters.
 
 Text reads now scan files with bounded memory, including files larger than
-4 MiB. Pages retain complete lines and UTF-8 boundaries, report the next
+4 MiB. Unrestricted local reads with integer offsets and nonnegative integer
+limits scan regular files up to the size observed when opened, as in Pi. Files
+that report a size of zero are read to EOF. The snapshot bound also applies to
+the total lines used in continuation notices. Pages retain complete lines and
+UTF-8 boundaries, report the next
 `offset`, reject offsets beyond the file, and explain when a single line
 exceeds the byte limit. Explicit line limits report remaining lines. Image
 normalization and the separate write-size limit retain their existing bounds.
@@ -5290,8 +5294,13 @@ file when it supplies one. Vertex SDK clients scope signed replay to their
 Vertex endpoint by default. Explicit provider replay scopes remain available.
 
 Native ADC discovery checks the explicitly configured file or the local gcloud
-credentials file. The Vertex sign-in wizard and metadata-only ambient credentials
-remain unsupported. Loopback tests cover Express and project-scoped routes. No real
+credentials file. Terminal `/login google-vertex` offers a masked API key,
+ADC, or a service account file. The last two save the project and location
+in a Pi-compatible credential entry. Both file-based methods check that a
+credentials file exists before replacing the saved credential. An environment API key still
+takes precedence over ADC, and ADC uses `GOOGLE_APPLICATION_CREDENTIALS` when
+it has no saved credentials file, following Pi. Metadata-only ambient credentials remain
+unsupported. Loopback tests cover Express and project-scoped routes. No real
 Google Cloud credential was available for acceptance testing.
 
 ### OpenAI Codex

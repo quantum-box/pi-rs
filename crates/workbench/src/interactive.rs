@@ -689,12 +689,27 @@ enum LocalEditor {
     Setting(String),
     BranchSummary(u64),
     ProviderKey(super::Provider),
+    VertexLogin(VertexLoginField),
     CloudflareLogin(CloudflareLoginField),
     BedrockProfile,
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
     AnthropicCode(Option<tokio::sync::oneshot::Sender<String>>),
     CodexCode(Option<tokio::sync::oneshot::Sender<String>>),
+}
+
+enum VertexLoginField {
+    Project {
+        service_account: bool,
+    },
+    Location {
+        project: String,
+        service_account: bool,
+    },
+    CredentialsPath {
+        project: String,
+        location: String,
+    },
 }
 
 enum CloudflareLoginField {
@@ -3849,6 +3864,11 @@ fn slash(
         "/login" if rest.eq_ignore_ascii_case("meta api-key") => {
             edit_provider_key(super::Provider::named("meta").expect("Meta provider"), view)
         }
+        "/login" if rest.eq_ignore_ascii_case("google-vertex") => show_vertex_methods(view),
+        "/login" if rest.eq_ignore_ascii_case("google-vertex api-key") => edit_provider_key(
+            super::Provider::named("google-vertex").expect("Vertex provider"),
+            view,
+        ),
         "/login" if rest.eq_ignore_ascii_case("kimi-coding") => {
             start_kimi_login(view, &args.settings)
         }
@@ -5839,6 +5859,9 @@ pub(super) async fn run(
                                             view.append("AWS profile saved for amazon-bedrock");
                                         })
                                 }
+                                LocalEditor::VertexLogin(field) => {
+                                    advance_vertex_login(field, text.trim(), &mut args, &mut view)
+                                }
                                 LocalEditor::CloudflareLogin(field) => {
                                     advance_cloudflare_login(field, text.trim(), &mut args, &mut view)
                                 }
@@ -6871,6 +6894,107 @@ fn start_request(args: &Cli, request: Value, worker: &mut Option<Worker>) -> Res
 fn edit_provider_key(provider: super::Provider, view: &mut View) {
     let dialog = crate::ui::dialog::Dialog::secret(format!("{} API key", provider.id()));
     view.local_editor = Some((LocalEditor::ProviderKey(provider), dialog));
+}
+
+fn show_vertex_methods(view: &mut View) {
+    view.picker = Some(Picker::new(
+        "Google Vertex AI authentication",
+        vec![
+            Item {
+                label: "Google Cloud API key".into(),
+                selection: Selection::VertexApiKey,
+            },
+            Item {
+                label: "Application Default Credentials".into(),
+                selection: Selection::VertexAdc {
+                    service_account: false,
+                },
+            },
+            Item {
+                label: "Service account credentials file".into(),
+                selection: Selection::VertexAdc {
+                    service_account: true,
+                },
+            },
+        ],
+    ));
+}
+
+fn edit_vertex_login(view: &mut View, field: VertexLoginField) {
+    let title = match field {
+        VertexLoginField::Project { .. } => "Enter Google Cloud project ID",
+        VertexLoginField::Location { .. } => "Enter Google Cloud location",
+        VertexLoginField::CredentialsPath { .. } => "Enter service account credentials file path",
+    };
+    let dialog = crate::ui::dialog::Dialog::new(
+        uuid::Uuid::new_v4(),
+        pi_rs::UiRequest::Input {
+            title: title.into(),
+            placeholder: None,
+            initial_value: None,
+            timeout: None,
+        },
+    );
+    view.local_editor = Some((LocalEditor::VertexLogin(field), dialog));
+}
+
+fn advance_vertex_login(
+    field: &VertexLoginField,
+    text: &str,
+    args: &mut Cli,
+    view: &mut View,
+) -> Result<()> {
+    use super::vertex_auth::{save_login, validate_identifier};
+    match field {
+        VertexLoginField::Project { service_account } => {
+            validate_identifier(text, "project ID")?;
+            edit_vertex_login(
+                view,
+                VertexLoginField::Location {
+                    project: text.into(),
+                    service_account: *service_account,
+                },
+            );
+            return Ok(());
+        }
+        VertexLoginField::Location {
+            project,
+            service_account: true,
+        } => {
+            validate_identifier(text, "location")?;
+            edit_vertex_login(
+                view,
+                VertexLoginField::CredentialsPath {
+                    project: project.clone(),
+                    location: text.into(),
+                },
+            );
+            return Ok(());
+        }
+        VertexLoginField::Location {
+            project,
+            service_account: false,
+        } => {
+            save_login(project, text, None)?;
+        }
+        VertexLoginField::CredentialsPath { project, location } => {
+            let path = if let Some(relative) = text.strip_prefix("~/") {
+                std::env::home_dir()
+                    .ok_or_else(|| Error::Config("Home directory is unavailable".into()))?
+                    .join(relative)
+            } else {
+                args.workspace.join(text)
+            };
+            save_login(project, location, Some(&path))?;
+        }
+    }
+    args.replace_model_keys(super::model_auth::Keys::load()?)?;
+    view.invalidate_model_catalog();
+    view.append("Google Vertex AI credentials saved");
+    if std::env::var("GOOGLE_CLOUD_API_KEY").is_ok_and(|key| !key.trim().is_empty()) {
+        view.append("GOOGLE_CLOUD_API_KEY takes precedence over ADC.");
+    }
+    Ok(())
 }
 
 fn uses_cloudflare_login(provider: &super::Provider, args: &Cli) -> bool {
@@ -8357,10 +8481,29 @@ fn select(
         Selection::LoginProvider(provider) if provider.id() == "amazon-bedrock" => {
             show_bedrock_methods(view)
         }
+        Selection::LoginProvider(provider) if provider.id() == "google-vertex" => {
+            show_vertex_methods(view)
+        }
         Selection::LoginProvider(provider) if uses_cloudflare_login(&provider, args) => {
             edit_cloudflare_login(view, CloudflareLoginField::Key(provider));
         }
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
+        Selection::VertexApiKey => edit_provider_key(
+            super::Provider::named("google-vertex").expect("Vertex provider"),
+            view,
+        ),
+        Selection::VertexAdc { service_account } => {
+            if !service_account {
+                if std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS")
+                    .is_some_and(|path| !path.is_empty())
+                {
+                    view.append("ADC uses the file set by GOOGLE_APPLICATION_CREDENTIALS.");
+                } else {
+                    view.append("Run gcloud auth application-default login, then enter your project and location.");
+                }
+            }
+            edit_vertex_login(view, VertexLoginField::Project { service_account });
+        }
         Selection::BedrockBearer => edit_provider_key(super::Provider::Bedrock, view),
         Selection::BedrockProfile => {
             let dialog = crate::ui::dialog::Dialog::new(
