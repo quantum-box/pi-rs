@@ -116,6 +116,8 @@ pub(super) async fn automatic_startup_model(args: &Cli) -> Option<ScopedChoice> 
     {
         let radius = if provider == Provider::Radius {
             match args.connect_provider(&provider, None) {
+                // A model fallback must not fetch catalogs or refresh OAuth.
+                // Pi Messages can read its local Radius catalog without probing.
                 Ok(Client::PiMessages(client)) => client
                     .with_context_probe(false)
                     .models()
