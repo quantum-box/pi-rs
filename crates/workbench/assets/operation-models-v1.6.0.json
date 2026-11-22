@@ -14,15 +14,15 @@
         "cost": {
           "input": 0.1,
           "output": 0,
-          "cacheRead": 0,
-          "cacheWrite": 0,
+          "cacheRead": 0.1,
+          "cacheWrite": 0.1,
           "tiers": [
             {
               "inputTokensAbove": 272000,
               "input": 0.2,
               "output": 0,
-              "cacheRead": 0,
-              "cacheWrite": 0
+              "cacheRead": 0.2,
+              "cacheWrite": 0.2
             }
           ]
         }

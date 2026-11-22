@@ -253,6 +253,34 @@ mod tests {
         let billed = usage(entry, &json!({"input_tokens":300000,"output_tokens":0})).unwrap();
         assert!((billed["cost"]["total"].as_f64().unwrap() - 0.06).abs() < 1e-12);
         assert_eq!(billed["cost"]["totalFromProvider"], false);
+        for (total_input, cached, written, total_cost) in [
+            (2_000, 1_600, 100, 0.0002),
+            (300_000, 275_000, 10_000, 0.06),
+        ] {
+            let billed = usage(
+                entry,
+                &json!({
+                    "input_tokens": total_input,
+                    "output_tokens": 0,
+                    "input_tokens_details": {"cached_tokens": cached, "cache_write_tokens": written}
+                }),
+            )
+            .unwrap();
+            assert_eq!(billed["input"], total_input - cached - written);
+            assert_eq!(billed["cacheRead"], cached);
+            assert_eq!(billed["cacheWrite"], written);
+            assert_eq!(billed["totalTokens"], total_input);
+            assert!((billed["cost"]["total"].as_f64().unwrap() - total_cost).abs() < 1e-12);
+        }
+        let overreported = usage(
+            entry,
+            &json!({"input_tokens": 5, "input_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 3}}),
+        )
+        .unwrap();
+        assert_eq!(overreported["input"], 0);
+        assert_eq!(overreported["cacheRead"], 4);
+        assert_eq!(overreported["cacheWrite"], 1);
+        assert_eq!(overreported["totalTokens"], 5);
         let image_config = json!({"relay":{"baseUrl":"http://127.0.0.1:1", "models":[{
             "type":"image", "id":"fixture", "api":"openrouter-images",
             "cost":{"input":1.0,"cacheRead":1.0,"tiers":[{"inputTokensAbove":100,"input":2.0,"cacheRead":2.0}]}
@@ -289,9 +317,10 @@ mod tests {
             let mut request = vec![0; 8192];
             let length = stream.read(&mut request).await.unwrap();
             let request = String::from_utf8_lossy(&request[..length]).to_string();
-            let body =
-                json!({"answers":[{"name":"q","type":"refusal"}],"usage":{"input_tokens":5}})
-                    .to_string();
+            let body = json!({
+                "answers": [{"name":"q","type":"refusal"}],
+                "usage": {"input_tokens": 5, "input_tokens_details": {"cached_tokens": 2, "cache_write_tokens": 1}}
+            }).to_string();
             stream
                 .write_all(
                     format!(
@@ -317,7 +346,10 @@ mod tests {
             .perform(entry, &context, &Keys::parse(&json!({})), &mut data)
             .await;
         assert!(result.unwrap_err().to_string().contains("refused"));
-        assert_eq!(data["usage"]["input"], 5);
+        assert_eq!(data["usage"]["input"], 2);
+        assert_eq!(data["usage"]["cacheRead"], 2);
+        assert_eq!(data["usage"]["cacheWrite"], 1);
+        assert_eq!(data["usage"]["totalTokens"], 5);
         assert_eq!(data["answers"], json!({}));
         let request = server.await.unwrap();
         assert!(request.starts_with("POST /v1/decisions "));
