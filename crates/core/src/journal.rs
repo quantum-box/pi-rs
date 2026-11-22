@@ -4520,24 +4520,21 @@ pub(crate) struct SystemTranscript {
     updates: Vec<(usize, Message)>,
 }
 
-impl SystemTranscript {
-    pub(crate) fn apply_if_supported(
-        self,
-        model: &dyn crate::Model,
-        request: &mut crate::ModelRequest,
-    ) -> bool {
-        model.supports_mid_conversation_system_messages(&request.model)
-            && self.apply(&mut request.messages)
-    }
+/// Fold the restored checkpoints only after the final model route is known.
+pub(crate) struct SystemTranscriptFallback {
+    collapsed: String,
+    projected: Vec<String>,
+}
 
-    fn apply(self, messages: &mut Vec<Message>) -> bool {
+impl SystemTranscript {
+    pub(crate) fn apply(self, messages: &mut Vec<Message>) -> Option<SystemTranscriptFallback> {
         let Some(Message::System { content }) = messages.first_mut() else {
-            return false;
+            return None;
         };
         if *content == self.leading && self.updates.is_empty() {
-            return false;
+            return None;
         }
-        *content = self.leading;
+        let collapsed = std::mem::replace(content, self.leading);
         let mut updates = self.updates.into_iter().peekable();
         let mut projected = Vec::with_capacity(messages.len() + updates.len());
         for (index, message) in std::mem::take(messages).into_iter().enumerate() {
@@ -4548,7 +4545,47 @@ impl SystemTranscript {
         }
         projected.extend(updates.map(|(_, update)| update));
         *messages = projected;
-        true
+        Some(SystemTranscriptFallback {
+            collapsed,
+            projected: system_messages(messages).map(str::to_owned).collect(),
+        })
+    }
+}
+
+fn system_messages(messages: &[Message]) -> impl Iterator<Item = &str> + Clone {
+    messages.iter().filter_map(|message| match message {
+        Message::System { content } => Some(content.as_str()),
+        _ => None,
+    })
+}
+
+impl SystemTranscriptFallback {
+    pub(crate) fn finish(
+        self,
+        model: &dyn crate::Model,
+        request: &mut crate::ModelRequest,
+    ) -> bool {
+        if model.supports_mid_conversation_system_messages(&request.model) {
+            return true;
+        }
+        let system = system_messages(&request.messages);
+        let unchanged = system.clone().eq(self.projected.iter().map(String::as_str));
+        let content = if unchanged {
+            self.collapsed
+        } else {
+            // Explicit hook edits replace the journal's resolved instructions.
+            system
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        request
+            .messages
+            .retain(|message| !matches!(message, Message::System { .. }));
+        if unchanged || !content.is_empty() {
+            request.messages.insert(0, Message::System { content });
+        }
+        false
     }
 }
 
@@ -6292,6 +6329,7 @@ mod system_checkpoint_tests {
             system_transcript(&path, &conversation, 2, "fallback")
                 .unwrap()
                 .apply(&mut messages)
+                .is_some()
         );
         assert_eq!(
             messages,

@@ -2808,8 +2808,10 @@ the original system prompt followed by checkpoint updates at their conversation
 positions, with named sections rendered as replacements or removals. Compaction
 uses the saved prompt as the leading checkpoint. A checkpoint inside a tool
 batch follows its results to preserve provider tool-call pairing. Models
-without that capability receive the fully resolved leading prompt. An extension
-that rewrites the message list controls its instruction order.
+without that capability receive the fully resolved leading prompt. Extension
+message hooks see the ordered checkpoints. Edits to other messages preserve
+checkpoint placement. If a hook edits system messages on a route that needs
+one prompt, the adapter joins the hook's current system text in order.
 
 Tests cover branch restoration, section order, replacement/removal, current tool
 schemas and permission boundaries. A CLI import-and-resume fixture verified the

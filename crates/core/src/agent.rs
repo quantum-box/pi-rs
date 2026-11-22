@@ -1969,9 +1969,8 @@ impl Agent<'_> {
                     limits: active.limits.clone(),
                     ..active
                 };
-                transformed |= transcript.is_some_and(|transcript| {
-                    transcript.apply_if_supported(active.model, &mut request)
-                });
+                transformed |= transcript
+                    .is_some_and(|transcript| transcript.finish(active.model, &mut request));
                 let attempt = match active
                     .prepare_attempt(
                         session,
@@ -2709,7 +2708,11 @@ impl Agent<'_> {
         purpose: RequestPurpose,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
-    ) -> Result<(ModelRequest, bool, Option<crate::journal::SystemTranscript>)> {
+    ) -> Result<(
+        ModelRequest,
+        bool,
+        Option<crate::journal::SystemTranscriptFallback>,
+    )> {
         let branch = session.branch();
         let summary = branch.iter().rev().find_map(|record| match &record.event {
             Event::Compacted { summary, .. } => Some(summary.as_str()),
@@ -2763,6 +2766,7 @@ impl Agent<'_> {
             tools,
             max_output_tokens,
         };
+        let transcript = transcript.and_then(|transcript| transcript.apply(&mut request.messages));
         let original = request.clone();
         let invocation = if let Some(run_id) = session.current_run_id()
             && !self.registry.extensions.is_empty()
@@ -2917,8 +2921,6 @@ impl Agent<'_> {
         let transformed = request.model != original.model
             || request.messages != original.messages
             || request.tools != original.tools;
-        // A hook that changes the message list owns its instruction order.
-        let transcript = transcript.filter(|_| request.messages == original.messages);
         Ok((request, transformed, transcript))
     }
 
@@ -13075,6 +13077,97 @@ mod request_privacy_tests {
             )?;
             messages.remove_user(2)?;
             Ok(crate::ContextChange::Changed)
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_user_hooks_preserve_system_checkpoints_for_the_effective_route() {
+        struct SystemRoute {
+            supported: bool,
+            capture: CaptureModel,
+        }
+        #[async_trait::async_trait]
+        impl Model for SystemRoute {
+            fn supports_mid_conversation_system_messages(&self, _model: &str) -> bool {
+                self.supported
+            }
+
+            async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+                self.capture.stream(request).await
+            }
+        }
+        let checkpoint = |content: &str, section: &str| Event::SystemCheckpoint {
+            content: content.into(),
+            sections: vec![("rules".into(), Some(section.into()))],
+            tools_added: vec![],
+            tools_removed: vec![],
+        };
+        let user = |content: &str| Event::User {
+            content: content.into(),
+            input_id: None,
+        };
+        for supported in [true, false] {
+            for after in [true, false] {
+                let mut session = Session::with_store(MemoryStore::default()).unwrap();
+                for event in [
+                    checkpoint("base", "old"),
+                    user("replaced by hook"),
+                    checkpoint("update", "new"),
+                    user("follow-up"),
+                ] {
+                    session.append(event).unwrap();
+                }
+                let captured = Arc::new(Mutex::new(Vec::new()));
+                let model = SystemRoute {
+                    supported,
+                    capture: CaptureModel(captured.clone()),
+                };
+                let mut registry = Registry::default();
+                registry
+                    .register(Arc::new(SafeUserEdits { after }))
+                    .unwrap();
+                let agent = Agent {
+                    model: &model,
+                    model_name: "fixture",
+                    registry: &registry,
+                    system_prompt: "",
+                    limits: Limits::default(),
+                };
+                let (_sender, mut inputs) = mpsc::channel(1);
+                agent
+                    .run(
+                        &mut session,
+                        None,
+                        &mut inputs,
+                        &CancellationToken::new(),
+                        &mut |_| {},
+                    )
+                    .await
+                    .unwrap();
+                let requests = captured.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                let system = |content: &str| Message::System {
+                    content: content.into(),
+                };
+                let user = |content: &str| Message::User {
+                    content: content.into(),
+                };
+                let expected = if supported {
+                    vec![
+                        system("base\n\nold"),
+                        user("inserted"),
+                        system("update\n\nUpdated system prompt section \"rules\":\n\nnew"),
+                        user("follow-up"),
+                    ]
+                } else {
+                    vec![
+                        system("base\n\nupdate\n\nnew"),
+                        user("inserted"),
+                        user("follow-up"),
+                    ]
+                };
+                assert_eq!(requests[0].messages, expected);
+            }
         }
     }
 
