@@ -1471,6 +1471,9 @@ impl StreamUsage {
         metadata.cached_input_tokens = self.cached;
         metadata.cache_creation_input_tokens = self.cache_written;
         metadata.provider_prompt_tokens = self.total_input();
+        metadata.reasoning_output_tokens = value["output_tokens_details"]["thinking_tokens"]
+            .as_u64()
+            .or(metadata.reasoning_output_tokens);
     }
     fn total_input(&self) -> Option<u64> {
         Some(
@@ -3818,6 +3821,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn anthropic_reasoning_usage_survives_later_partial_usage_updates() {
+        let mut usage = StreamUsage::default();
+        let mut metadata = ModelMetadata::default();
+        usage.update(
+            &json!({"input_tokens":10,"output_tokens":7,
+            "output_tokens_details":{"thinking_tokens":5}}),
+            &mut metadata,
+        );
+        usage.update(&json!({"output_tokens":9}), &mut metadata);
+        assert_eq!(usage.finish().unwrap().output_tokens, 9);
+        assert_eq!(metadata.reasoning_output_tokens, Some(5));
+    }
 
     #[cfg(any(unix, windows))]
     #[test]
