@@ -31,6 +31,7 @@ use uuid::Uuid;
 
 use crate::mcp_provider_auth::ProviderClient;
 pub use crate::mcp_provider_auth::TokenResolver;
+use crate::mcp_resource_compat::ResourceCompatibility;
 use crate::process_cleanup::Children;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -710,10 +711,10 @@ impl McpExtension {
                         NativeClient::for_server(name, workspace)
                             .await
                             .serve_with_lifecycle(
-                                crate::mcp_log::LoggingTransport::new(
+                                ResourceCompatibility(crate::mcp_log::LoggingTransport::new(
                                     owned_stdio_transport(wrapped, owner)?,
                                     Some(Arc::from(name)),
-                                ),
+                                )),
                                 lifecycle,
                             )
                             .await
@@ -722,10 +723,10 @@ impl McpExtension {
                         NativeClient::for_server(name, workspace)
                             .await
                             .serve_with_lifecycle(
-                                crate::mcp_log::LoggingTransport::new(
+                                ResourceCompatibility(crate::mcp_log::LoggingTransport::new(
                                     TokioChildProcess::new(wrapped)?,
                                     Some(Arc::from(name)),
-                                ),
+                                )),
                                 lifecycle,
                             )
                             .await
@@ -1346,7 +1347,7 @@ async fn start_http_service<C: StreamableHttpClient + Clone>(
         );
         let result = native
             .clone()
-            .serve_with_lifecycle(transport, lifecycle.clone())
+            .serve_with_lifecycle(ResourceCompatibility(transport), lifecycle.clone())
             .await;
         match (result, delay) {
             (Err(error), Some(delay)) if transient_http_initialization(&error) => {

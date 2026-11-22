@@ -175,7 +175,7 @@ async fn http_mcp_resources_and_tool_retries_match_pi() {
                     ),
                     Some("resources/list") if request["params"]["cursor"] == "next" => {
                         Some(json!({"resources":[
-                            {"uri":"file:///second.txt","name":"second","mimeType":"text/plain","_meta":{"secret":"discard"},"icons":[{"src":"https://example.invalid/icon"}]},
+                            {"uri":"file:///second.txt","mimeType":"text/plain","_meta":{"secret":"discard"},"icons":[{"src":"https://example.invalid/icon"}]},
                         {"uri":"file:///panel.html","name":"panel","mimeType":"text/html; PROFILE = \"mcp-app\""},
                         {"uri":"file:///extension.html","name":"prefix-match","mimeType":"text/html;profile=mcp-app-extra"}
                         ]}))
@@ -187,7 +187,7 @@ async fn http_mcp_resources_and_tool_retries_match_pi() {
                     ],"nextCursor":"next"})),
                     Some("resources/templates/list") if request["params"]["cursor"] == "next" => {
                         Some(json!({"resourceTemplates":[
-                            {"uriTemplate":"file:///items/{id}","name":"item","mimeType":"text/plain","_meta":{"private":true},"icons":[{"src":"https://example.invalid/icon"}]},
+                            {"uriTemplate":"file:///items/{id}","mimeType":"text/plain","_meta":{"private":true},"icons":[{"src":"https://example.invalid/icon"}]},
                         {"uriTemplate":"file:///app/{id}","name":"app","mimeType":"text/html;profile=mcp-app"},
                         {"uriTemplate":"file:///extension/{id}","name":"prefix-match","mimeType":"text/html;profile=mcp-app-extra"}
                         ]}))
@@ -223,9 +223,13 @@ async fn http_mcp_resources_and_tool_retries_match_pi() {
         (
             "list_resources",
             "resources",
-            vec!["first", "plain", "second"],
+            vec!["first", "plain", "file:///second.txt"],
         ),
-        ("list_resource_templates", "resourceTemplates", vec!["item"]),
+        (
+            "list_resource_templates",
+            "resourceTemplates",
+            vec!["file:///items/{id}"],
+        ),
     ] {
         let tool = tools
             .iter()
@@ -265,13 +269,13 @@ async fn http_mcp_resources_and_tool_retries_match_pi() {
             "list_resources_page",
             "resources",
             vec!["first", "plain"],
-            vec!["second"],
+            vec!["file:///second.txt"],
         ),
         (
             "list_resource_templates_page",
             "resourceTemplates",
             vec![],
-            vec!["item"],
+            vec!["file:///items/{id}"],
         ),
     ] {
         let tool = tools
