@@ -1189,6 +1189,7 @@ pub(super) async fn manager_login(
         .chain(args.trusted.then(|| path(args, true)))
         .collect();
     let validate_args = args.clone();
+    let validate_registered = registered.to_vec();
     let validate = pending.clone();
     let options = super::http_proxy::configured_mcp(&args.settings)?;
     let login_cancel = cancel.child_token();
@@ -1207,7 +1208,12 @@ pub(super) async fn manager_login(
         },
         paths,
         move || {
-            check_manager_connection(&validate_args, registered, &validate.name, &validate.config)
+            check_manager_connection(
+                &validate_args,
+                &validate_registered,
+                &validate.name,
+                &validate.config,
+            )
         },
     );
     let present = present_mcp_login(&pending.name, announcement, redirect, ui, &login_cancel);
