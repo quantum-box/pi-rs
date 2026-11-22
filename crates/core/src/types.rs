@@ -712,6 +712,15 @@ impl ProviderReplay {
         {
             return api == ModelApi::PiMessages;
         }
+        // Mistral may record a compatibility reasoning block alongside its
+        // native content envelope. The envelope defines the route for both.
+        if self
+            .blocks
+            .iter()
+            .any(|block| block.get("mistral_content").is_some())
+        {
+            return api == ModelApi::MistralConversations;
+        }
         self.blocks.iter().all(|block| {
             if block.get("_pi_anthropic_effort").is_some() {
                 return api == ModelApi::AnthropicMessages;
@@ -721,9 +730,6 @@ impl ProviderReplay {
                     api,
                     ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses
                 );
-            }
-            if block.get("mistral_content").is_some() {
-                return api == ModelApi::MistralConversations;
             }
             match block["type"].as_str() {
                 Some("thinking" | "redacted_thinking") => api == ModelApi::AnthropicMessages,
@@ -741,13 +747,32 @@ impl ProviderReplay {
                 {
                     api == ModelApi::BedrockConverseStream
                 }
-                Some("reasoning" | "function_call" | "custom_tool_call") => {
+                Some("message" | "reasoning" | "function_call" | "custom_tool_call") => {
                     matches!(
                         api,
                         ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses
                     )
                 }
-                Some("reasoning_content") => api == ModelApi::OpenaiCompletions,
+                Some(kind) if kind == "reasoning_content" || kind.starts_with("reasoning.") => {
+                    api == ModelApi::OpenaiCompletions
+                }
+                None if [
+                    "text",
+                    "thought",
+                    "thoughtSignature",
+                    "functionCall",
+                    "functionResponse",
+                    "inlineData",
+                    "fileData",
+                    "executableCode",
+                    "codeExecutionResult",
+                ]
+                .iter()
+                .any(|key| block.get(key).is_some()) =>
+                {
+                    api == ModelApi::GoogleGenerativeAi
+                }
+                // An older or host-defined block may have no recognizable API marker.
                 _ => true,
             }
         })

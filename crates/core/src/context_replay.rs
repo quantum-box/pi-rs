@@ -257,15 +257,29 @@ mod tests {
             ])
             .supports_api(PiMessages)
         );
-        assert!(replay(vec![mistral.clone()]).supports_api(MistralConversations));
+        let chat = serde_json::json!({"type":"reasoning_content","text":"private"});
+        assert!(replay(vec![mistral.clone(), chat.clone()]).supports_api(MistralConversations));
+        assert!(replay(vec![chat.clone()]).supports_api(OpenaiCompletions));
+        assert!(!replay(vec![chat]).supports_api(OpenaiResponses));
+        assert!(
+            !replay(vec![
+                serde_json::json!({"type":"reasoning.encrypted","data":"private"})
+            ])
+            .supports_api(GoogleGenerativeAi)
+        );
+        assert!(
+            !replay(vec![
+                serde_json::json!({"type":"message","role":"assistant","content":[]})
+            ])
+            .supports_api(GoogleGenerativeAi)
+        );
         assert!(replay(vec![responses.clone()]).supports_api(OpenaiResponses));
         for foreign in [anthropic, bedrock, mistral, responses] {
             assert!(!replay(vec![foreign]).supports_api(GoogleGenerativeAi));
         }
-        assert!(
-            replay(vec![serde_json::json!({"thought":true,"text":"gemini"})])
-                .supports_api(GoogleGenerativeAi)
-        );
+        let gemini = replay(vec![serde_json::json!({"thought":true,"text":"gemini"})]);
+        assert!(gemini.supports_api(GoogleGenerativeAi));
+        assert!(!gemini.supports_api(OpenaiResponses));
     }
 
     use super::*;
