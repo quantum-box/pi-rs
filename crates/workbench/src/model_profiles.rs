@@ -372,13 +372,22 @@ impl ChatPrice {
             .cache_write_1h_tokens
             .unwrap_or_default()
             .min(writes);
+        let multiplier = metadata
+            .catalog_cost_multiplier
+            .as_ref()
+            .and_then(serde_json::Number::as_f64)
+            .filter(|multiplier| multiplier.is_finite() && *multiplier > 0.0)
+            .unwrap_or(1.0);
         let input_rate = rates.input.unwrap_or_default();
         pi_rs::UsageCostBreakdown::new(
-            (input_rate / 1_000_000.0) * (other_input - writes) as f64,
-            (rates.output.unwrap_or_default() / 1_000_000.0) * usage.output_tokens as f64,
-            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64,
-            (rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
-                + (input_rate / 500_000.0) * long as f64,
+            (input_rate / 1_000_000.0) * (other_input - writes) as f64 * multiplier,
+            (rates.output.unwrap_or_default() / 1_000_000.0)
+                * usage.output_tokens as f64
+                * multiplier,
+            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64 * multiplier,
+            ((rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
+                + (input_rate / 500_000.0) * long as f64)
+                * multiplier,
         )
     }
 }
@@ -1878,6 +1887,35 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn service_tier_scales_all_catalog_cost_components() {
+        let price: ChatPrice = serde_json::from_value(json!({
+            "input":10, "output":20, "cacheRead":2, "cacheWrite":4
+        }))
+        .unwrap();
+        let usage = pi_rs::Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+        };
+        for (tier, multiplier) in [(None, 1.0), (Some(0.5), 0.5), (Some(2.5), 2.5)] {
+            let metadata = pi_rs::ModelMetadata {
+                cached_input_tokens: Some(200_000),
+                cache_creation_input_tokens: Some(300_000),
+                catalog_cost_multiplier: tier.and_then(serde_json::Number::from_f64),
+                ..Default::default()
+            };
+            let cost = price.estimate(usage, &metadata).unwrap();
+            for (actual, base) in [
+                (cost.input, 5.0),
+                (cost.output, 2.0),
+                (cost.cache_read, 0.4),
+                (cost.cache_write, 1.2),
+            ] {
+                assert!((actual.as_f64().unwrap() - base * multiplier).abs() < 1e-10);
+            }
+        }
+    }
+
+    #[test]
     fn cloudflare_worker_chats_and_classifiers_keep_saved_account_scope() {
         let keys = super::super::model_auth::Keys::parse(&json!({
             "cloudflare-workers-ai":{
@@ -2128,13 +2166,49 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_fable_5_2_catalog_exposes_pi_limits_and_capabilities() {
+        let profiles = Profiles::default();
+        let provider = Provider::Anthropic;
+        let id = "claude-fable-5-2";
+        assert_eq!(profiles.model_ids(&provider).len(), 18);
+        assert_eq!(profiles.model_adapter(&provider, id), Adapter::Anthropic);
+        let model = profiles.model(&provider, id).unwrap();
+        assert_eq!(model.context_window, Some(1_000_000));
+        assert_eq!(model.max_tokens, Some(128_000));
+        assert_eq!(model.supports_images(), Some(true));
+        assert_eq!(model.adaptive_thinking(), Some(true));
+        assert_eq!(
+            model.levels(Adapter::Anthropic).unwrap(),
+            ["minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(profiles.anthropic_strict_tool_support(&provider, Some(&model)));
+        assert_eq!(
+            model.prompt_cache_seconds(pi_rs::CacheRetention::Long),
+            Some(3600.0)
+        );
+        let image_limits = model
+            .input_limits
+            .as_ref()
+            .unwrap()
+            .images
+            .as_ref()
+            .unwrap();
+        assert_eq!(image_limits.max_per_request, Some(600));
+        assert_eq!(
+            model.cost.as_ref().unwrap().value(),
+            json!({"input": 8.0, "output": 40.0, "cacheRead": 0.2, "cacheWrite": 10.0})
+        );
+    }
+
+    #[test]
     fn anthropic_managed_effort_uses_catalog_and_effective_model_route() {
         let profiles = Profiles::default();
         let native =
             profiles.anthropic_managed_effort_models(&Provider::Anthropic, "claude-opus-5", None);
-        assert_eq!(native.len(), 5);
+        assert_eq!(native.len(), 6);
         assert_eq!(native.get("claude-opus-5"), Some(&true));
         assert_eq!(native.get("claude-opus-5-5"), Some(&false));
+        assert_eq!(native.get("claude-fable-5-2"), Some(&false));
         assert!(!native.contains_key("claude-opus-4-8"));
         let openrouter = Provider::named("openrouter").unwrap();
         let gateway = profiles.anthropic_managed_effort_models(
@@ -2215,9 +2289,19 @@ mod tests {
         let default = Profiles::default();
         let native =
             default.anthropic_mid_conversation_system_models(&provider, "claude-opus-4-8", None);
-        assert_eq!(native.len(), 7);
-        assert!(native.contains("claude-opus-4-8"));
-        assert!(!native.contains("claude-sonnet-5"));
+        assert_eq!(
+            native,
+            BTreeSet::from([
+                "claude-fable-5".into(),
+                "claude-fable-5-1".into(),
+                "claude-fable-5-2".into(),
+                "claude-haiku-5-5".into(),
+                "claude-opus-4-8".into(),
+                "claude-opus-5".into(),
+                "claude-opus-5-5".into(),
+                "claude-sonnet-5-5".into(),
+            ])
+        );
     }
 
     #[test]

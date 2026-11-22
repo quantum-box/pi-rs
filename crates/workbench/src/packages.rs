@@ -1183,21 +1183,36 @@ pub(crate) fn resource_matches(
     if let Some(name) = path.file_name() {
         candidates.push(name.to_string_lossy().into_owned());
     }
-    if let Some(Some(extglob)) = package_diagnostic::extglob_regex(pattern) {
-        // The bounded translator matches ASCII paths. Leave dot-path and
-        // Unicode cases to the existing native matcher until their Node
-        // semantics can be reproduced.
-        let in_supported_subset = |candidate: &str| {
-            candidate.is_ascii() && !candidate.split('/').any(|part| part.starts_with('.'))
-        };
-        if candidates.iter().any(|candidate| {
-            in_supported_subset(candidate) && (extglob.is_match(candidate) != negated)
-        }) {
-            return true;
-        }
-        candidates.retain(|candidate| !in_supported_subset(candidate));
-        if candidates.is_empty() {
-            return false;
+    let positive_extglob = package_diagnostic::extglob_regex(pattern).flatten();
+    let negative_extglob = if directory_roots {
+        None
+    } else {
+        package_diagnostic::negative_extglob_regex(pattern)
+    };
+    if positive_extglob.is_some() || negative_extglob.is_some() {
+        // The bounded translators match ASCII paths without hidden components.
+        // Keep using the native matcher for other paths or a backtracking error.
+        let mut matched = false;
+        candidates.retain(|candidate| {
+            if !candidate.is_ascii() || candidate.split('/').any(|part| part.starts_with('.')) {
+                return true;
+            }
+            let extglob_match = if let Some(regex) = &negative_extglob {
+                regex.is_match(candidate).ok()
+            } else {
+                positive_extglob
+                    .as_ref()
+                    .map(|regex| regex.is_match(candidate))
+            };
+            if let Some(extglob_match) = extglob_match {
+                matched |= extglob_match != negated;
+                false
+            } else {
+                true
+            }
+        });
+        if matched || candidates.is_empty() {
+            return matched;
         }
     }
     let Ok(glob) = resource_glob(pattern, !directory_roots) else {
@@ -3850,6 +3865,36 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
             delta.states(&candidates, root, false).unwrap(),
             [Some(true), None, None, Some(true), None]
         );
+    }
+
+    #[test]
+    fn package_settings_filters_match_a_bounded_negative_extglob() {
+        let root = Path::new("package");
+        let candidates = ["review", "triage", "audit", "review-quick", ".hidden"]
+            .map(|name| root.join(format!("prompts/{name}.md")));
+
+        for (patterns, expected) in [
+            (
+                vec!["prompts/!(review|triage).md"],
+                [false, false, true, true, false],
+            ),
+            (
+                vec!["!prompts/!(review|triage).md"],
+                [true, true, false, false, true],
+            ),
+            (
+                vec!["prompts/!(review|triage).md", "+prompts/review.md"],
+                [true, false, true, true, false],
+            ),
+            (vec!["!!prompts/!(review|triage).md"], [false; 5]),
+        ] {
+            let filter = ResourceFilter::new(&json!({"prompts": patterns}), "prompts").unwrap();
+            assert_eq!(
+                filter.states(&candidates, root, false).unwrap(),
+                expected.map(Some),
+                "{patterns:?}"
+            );
+        }
     }
 
     #[test]
