@@ -9280,11 +9280,28 @@ fn anthropic_federation_auth_check_without_refresh_uses_only_the_identity_file()
     assert!(status.get("credentials").is_none());
 
     let export = command().arg("print-bearer-token").output().unwrap();
-    assert!(!export.status.success());
-    assert!(
-        String::from_utf8_lossy(&export.stderr).contains("identity token is empty"),
-        "{export:?}"
+    assert!(export.status.success(), "{export:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&export.stdout).trim(),
+        "fixture-header"
     );
+    let export = command().arg("print-api-key").output().unwrap();
+    assert!(!export.status.success());
+
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"anthropic":{"headers":{"x-api-key":"fixture-key"}}}}).to_string(),
+    )
+    .unwrap();
+    let export = command().arg("print-api-key").output().unwrap();
+    assert!(export.status.success(), "{export:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&export.stdout).trim(),
+        "fixture-key"
+    );
+    let export = command().arg("print-bearer-token").output().unwrap();
+    assert!(!export.status.success());
+    assert!(String::from_utf8_lossy(&export.stderr).contains("No usable OAuth bearer token"));
 
     std::fs::write(
         root.path().join("models.json"),

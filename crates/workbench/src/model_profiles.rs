@@ -111,10 +111,7 @@ impl RequestHeaders {
         Ok((headers, None))
     }
 
-    pub(super) async fn has_anthropic_auth(&self, no_refresh: bool) -> Result<bool> {
-        if !no_refresh {
-            return Ok(self.resolve_anthropic_auth().await?.1.is_some());
-        }
+    pub(super) async fn has_anthropic_auth_without_refresh(&self) -> Result<bool> {
         for name in ANTHROPIC_AUTH_HEADERS {
             let Some(value) = self.values.get(name.as_str()) else {
                 continue;

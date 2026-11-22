@@ -120,30 +120,55 @@ async fn resolve(
         .unwrap_or_else(|| args.model_profiles.endpoint(provider));
     if let Some(credential) = args.configured_model_credential(provider, endpoint) {
         if let super::model_auth::Credential::AnthropicFederation(federation) = &credential {
-            if wanted == Some(AuthType::ApiKey)
-                || model.is_some_and(|id| {
-                    args.model_profiles.model_adapter(provider, id)
-                        != super::providers::Adapter::Anthropic
-                })
-            {
+            if model.is_some_and(|id| {
+                args.model_profiles.model_adapter(provider, id)
+                    != super::providers::Adapter::Anthropic
+            }) {
                 return Ok(None);
             }
-            if wanted.is_none()
-                && args
-                    .model_profiles
-                    .header_settings(provider, endpoint, model)
-                    .with_environment(args.model_keys.environment(
-                        provider,
-                        endpoint,
-                        &args.model_profiles,
-                    ))
-                    .has_anthropic_auth(no_refresh)
-                    .await?
-            {
-                return Ok(Some(Resolved {
-                    kind: AuthType::ApiKey,
-                    value: None,
-                }));
+            let headers = args
+                .model_profiles
+                .header_settings(provider, endpoint, model)
+                .with_environment(args.model_keys.environment(
+                    provider,
+                    endpoint,
+                    &args.model_profiles,
+                ));
+            if no_refresh {
+                if headers.has_anthropic_auth_without_refresh().await? {
+                    return Ok(Some(Resolved {
+                        kind: AuthType::ApiKey,
+                        value: None,
+                    }));
+                }
+            } else {
+                let (resolved, selected) = headers.resolve_anthropic_auth().await?;
+                if let Some(selected) = selected {
+                    let value = resolved[&selected]
+                        .to_str()
+                        .expect("validated Anthropic header");
+                    let (kind, value) = match selected.as_str() {
+                        "x-api-key" => (AuthType::ApiKey, Some(value.trim().to_owned())),
+                        "authorization" => {
+                            let mut parts = value.split_ascii_whitespace();
+                            match (parts.next(), parts.next(), parts.next()) {
+                                (Some(scheme), Some(token), None)
+                                    if scheme.eq_ignore_ascii_case("bearer") =>
+                                {
+                                    (AuthType::OAuth, Some(token.to_owned()))
+                                }
+                                _ => (AuthType::ApiKey, None),
+                            }
+                        }
+                        _ => (AuthType::ApiKey, None),
+                    };
+                    return Ok(wanted
+                        .is_none_or(|wanted| wanted == kind)
+                        .then_some(Resolved { kind, value }));
+                }
+            }
+            if wanted == Some(AuthType::ApiKey) {
+                return Ok(None);
             }
             let value = if no_refresh {
                 federation.check_identity_file().await?;

@@ -5920,7 +5920,8 @@ native supports workload identity federation with
 `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, and
 `ANTHROPIC_IDENTITY_TOKEN_FILE`. Optional `ANTHROPIC_SERVICE_ACCOUNT_ID`
 and `ANTHROPIC_WORKSPACE_ID` scope the exchange. Explicit authentication
-headers take precedence in Messages requests and credential checks.
+headers take precedence in Messages requests and credential checks. Credential
+exports use the selected API key or Bearer authorization header when present.
 Native exchanges at the official Anthropic endpoint
 and shares the access token in memory. It rereads the identity file on
 exchange, starts a background exchange within 120 seconds of expiry,
