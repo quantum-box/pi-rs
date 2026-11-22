@@ -1,5 +1,6 @@
 //! Searchable keyboard selectors for session and model navigation.
 use super::{
+    editor::Editor,
     keys::Keys,
     render::{Line, Span},
     theme::Theme,
@@ -26,6 +27,10 @@ pub enum Selection {
         description: Option<String>,
     },
     LoginProvider(super::super::Provider),
+    VertexApiKey,
+    VertexAdc {
+        service_account: bool,
+    },
     BedrockBearer,
     BedrockProfile,
     BedrockChain,
@@ -161,7 +166,7 @@ impl TreeFilter {
 pub struct Picker {
     pub title: String,
     items: Vec<Item>,
-    query: String,
+    query: Editor,
     selected: usize,
     page_size: std::cell::Cell<usize>,
     mouse_layout: std::cell::Cell<(usize, usize, usize)>,
@@ -216,7 +221,7 @@ impl Picker {
         Self {
             title: title.into(),
             items,
-            query: String::new(),
+            query: Editor::default(),
             selected: 0,
             page_size: std::cell::Cell::new(10),
             mouse_layout: std::cell::Cell::new((0, 0, 0)),
@@ -258,19 +263,15 @@ impl Picker {
     }
 
     pub fn paste(&mut self, text: &str) {
+        if self.title == "Warnings" {
+            return;
+        }
         let tree_focus = self.tree_filter_focus();
         if self.title == "Settings" {
-            // Pi's single-line input removes CR/LF, expands tabs, and keeps
-            // other characters for filtering. Rendering sanitizes controls.
-            for character in text.chars() {
-                match character {
-                    '\r' | '\n' => {}
-                    '\t' => self.query.push_str("    "),
-                    character => self.query.push(character),
-                }
-            }
+            self.query.insert_settings_search(text);
         } else {
             self.query
+                .text
                 .extend(text.chars().filter(|character| !character.is_control()));
         }
         self.apply_search_focus(tree_focus);
@@ -468,9 +469,9 @@ impl Picker {
         if keys.matches("tui.select.cancel", key)
             && key.code == KeyCode::Char('c')
             && key.modifiers.contains(KeyModifiers::CONTROL)
-            && !self.query.is_empty()
+            && !self.query.text.is_empty()
         {
-            self.query.clear();
+            self.query.text.clear();
             self.selected = 0;
             return Some(Input::Continue);
         }
@@ -691,13 +692,13 @@ impl Picker {
         self.selected = visible.len().saturating_sub(1);
     }
     fn matches(&self) -> Vec<&Item> {
-        let query = self.query.to_lowercase();
+        let query = self.query.text.to_lowercase();
         let tree_tokens: Vec<_> = if self.tree.is_some() {
             query.split_whitespace().collect()
         } else {
             Vec::new()
         };
-        let session_query = super::session_search::Query::new(&self.query);
+        let session_query = super::session_search::Query::new(&self.query.text);
         let mut matches: Vec<_> = self
             .items
             .iter()
@@ -824,8 +825,8 @@ impl Picker {
         let cancel = keys.matches("tui.select.cancel", key);
         let confirm = activate
             || keys.matches("tui.select.confirm", key)
-            || (self.title == "Settings"
-                && self.query.is_empty()
+            || (matches!(self.title.as_str(), "Settings" | "Warnings")
+                && self.query.text.is_empty()
                 && key.code == KeyCode::Char(' ')
                 && key.modifiers == KeyModifiers::NONE)
             || (self.completion_limit.is_some() && keys.matches("tui.input.tab", key));
@@ -833,9 +834,9 @@ impl Picker {
             if cancel {
                 self.session_action = None;
                 match action {
-                    SessionAction::Rename(_) => self.query.clear(),
+                    SessionAction::Rename(_) => self.query.text.clear(),
                     SessionAction::Label(id, search) => {
-                        self.query = search;
+                        self.query.text = search;
                         self.focus_record(id);
                     }
                     SessionAction::Delete(_) => {}
@@ -851,10 +852,10 @@ impl Picker {
                     };
                 }
                 SessionAction::Rename(path) if confirm => {
-                    return Input::Select(Selection::RenameSession(path, self.query.clone()));
+                    return Input::Select(Selection::RenameSession(path, self.query.text.clone()));
                 }
                 SessionAction::Label(id, search) if confirm => {
-                    let label = std::mem::replace(&mut self.query, search);
+                    let label = std::mem::replace(&mut self.query.text, search);
                     self.session_action = None;
                     self.focus_record(id);
                     return Input::SetTreeLabel(id, label);
@@ -892,11 +893,12 @@ impl Picker {
             if let Some(Selection::Resume(path)) = selected {
                 if keys.matches("app.session.rename", key) {
                     self.session_action = Some(SessionAction::Rename(path));
-                    self.query.clear();
+                    self.query.text.clear();
                     return Input::Continue;
                 }
                 if keys.matches("app.session.delete", key)
-                    || (self.query.is_empty() && keys.matches("app.session.deleteNoninvasive", key))
+                    || (self.query.text.is_empty()
+                        && keys.matches("app.session.deleteNoninvasive", key))
                 {
                     if path.canonicalize().ok()
                         == self
@@ -941,7 +943,7 @@ impl Picker {
                 }
                 if keys.matches("app.tree.editLabel", key) {
                     let label = tree.labels.get(&id).cloned().unwrap_or_default();
-                    let search = std::mem::replace(&mut self.query, label);
+                    let search = std::mem::replace(&mut self.query.text, label);
                     self.session_action = Some(SessionAction::Label(id, search));
                     return Input::Continue;
                 }
@@ -1010,10 +1012,10 @@ impl Picker {
             }
         }
         if cancel {
-            if !self.query.is_empty()
+            if !self.query.text.is_empty()
                 && let Some(focus) = self.tree_filter_focus()
             {
-                self.query.clear();
+                self.query.text.clear();
                 self.apply_search_focus(Some(focus));
                 return Input::Continue;
             }
@@ -1043,10 +1045,21 @@ impl Picker {
             self.selected = (self.selected + self.page_size.get()).min(count.saturating_sub(1));
             return Input::Continue;
         }
+        if self.title == "Settings"
+            && let Some(action) = keys.editor_action(key)
+        {
+            let previous = self.query.text.clone();
+            if self.query.settings_search_action(action) {
+                if self.query.text != previous {
+                    self.selected = 0;
+                }
+                return Input::Continue;
+            }
+        }
         if keys.matches("tui.editor.deleteCharBackward", key) {
-            if let Some((index, _)) = self.query.grapheme_indices(true).next_back() {
+            if let Some((index, _)) = self.query.text.grapheme_indices(true).next_back() {
                 let focus = self.tree_filter_focus();
-                self.query.truncate(index);
+                self.query.text.truncate(index);
                 self.apply_search_focus(focus);
             } else if self.tree.is_none() {
                 self.selected = 0;
@@ -1055,20 +1068,27 @@ impl Picker {
         }
         if keys.matches("tui.editor.deleteWordBackward", key) {
             let focus = self.tree_filter_focus();
-            self.query.truncate(previous_word_start(&self.query));
+            self.query
+                .text
+                .truncate(previous_word_start(&self.query.text));
             self.apply_search_focus(focus);
             return Input::Continue;
         }
         match key.code {
-            KeyCode::Home => self.selected = 0,
-            KeyCode::End => self.selected = count.saturating_sub(1),
+            KeyCode::Home if self.title != "Settings" => self.selected = 0,
+            KeyCode::End if self.title != "Settings" => self.selected = count.saturating_sub(1),
             KeyCode::Char(character)
-                if !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                ) =>
+                if self.title != "Warnings"
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
             {
                 let focus = self.tree_filter_focus();
-                self.query.push(character);
+                if self.title == "Settings" {
+                    self.query.type_settings_search(character);
+                } else {
+                    self.query.text.push(character);
+                }
                 self.apply_search_focus(focus);
             }
             _ => {}
@@ -1159,6 +1179,33 @@ impl Picker {
         }
     }
 
+    fn settings_heading(&self, prefix: &str, theme: &Theme, width: usize) -> Line {
+        let query = super::render::clean(&self.query.text);
+        let available = width.saturating_sub(prefix.width());
+        if available == 0 {
+            return Line::themed(prefix, theme, "accent");
+        }
+        let before_cursor = &self.query.text[..self.query.cursor.min(self.query.text.len())];
+        let cursor = super::render::clean(before_cursor).width();
+        let scroll_width = available.saturating_sub(usize::from(cursor == query.width()));
+        let first_column = cursor
+            .saturating_sub(scroll_width / 2)
+            .min(query.width().saturating_sub(scroll_width));
+        let mut start_column = 0;
+        let mut first_byte = 0;
+        for grapheme in query.graphemes(true) {
+            if start_column >= first_column {
+                break;
+            }
+            start_column += grapheme.width();
+            first_byte += grapheme.len();
+        }
+        let visible = clip_completion(&query[first_byte..], available);
+        let mut line = Line::themed(&format!("{prefix}{visible}"), theme, "accent");
+        line.mark_cursor(prefix.width() + cursor.saturating_sub(start_column));
+        line
+    }
+
     pub fn render(&self, theme: &Theme, width: usize, height: usize, keys: &Keys) -> Vec<Line> {
         self.render_in_terminal(theme, width, height, height, keys)
     }
@@ -1177,11 +1224,11 @@ impl Picker {
             let cancel = hint("tui.select.cancel");
             let (title, hint) = match action {
                 SessionAction::Rename(_) => (
-                    format!("Rename session · {}", self.query),
+                    format!("Rename session · {}", self.query.text),
                     format!("Type the new name · {confirm} to save · {cancel} to cancel"),
                 ),
                 SessionAction::Label(id, _) => (
-                    format!("Label record {id} · {}", self.query),
+                    format!("Label record {id} · {}", self.query.text),
                     format!(
                         "Type the label · {confirm} to save · Empty to remove · {cancel} to cancel"
                     ),
@@ -1203,13 +1250,14 @@ impl Picker {
             .tree
             .as_ref()
             .map_or_else(String::new, |tree| format!(" · {}", tree.filter.name()));
-        let mut lines = vec![Line::themed(
-            &format!("{}{filter} · {}", self.title, self.query),
-            theme,
-            "accent",
-        )];
+        let settings = matches!(self.title.as_str(), "Settings" | "Warnings");
+        let prefix = format!("{}{filter} · ", self.title);
+        let mut lines = vec![match self.title.as_str() {
+            "Settings" => self.settings_heading(&prefix, theme, width),
+            "Warnings" => Line::themed(&self.title, theme, "accent"),
+            _ => Line::themed(&format!("{prefix}{}", self.query.text), theme, "accent"),
+        }];
         let items = self.matches();
-        let settings = self.title == "Settings";
         let description = if settings {
             items
                 .get(self.selected)
@@ -1255,7 +1303,7 @@ impl Picker {
         let mut prefixes = vec![String::new(); items.len()];
         if self.active_session.is_some()
             && self.session_sort == SessionSort::Threaded
-            && self.query.trim().is_empty()
+            && self.query.text.trim().is_empty()
             && let Some(rows) = self.session_layout(&items)
         {
             for row in rows {
@@ -1338,7 +1386,7 @@ impl Picker {
             .max()
             .unwrap_or(12)
             .clamp(12, 32);
-        let settings_column = (self.title == "Settings").then(|| {
+        let settings_column = matches!(self.title.as_str(), "Settings" | "Warnings").then(|| {
             self.items
                 .iter()
                 .map(|item| settings_label_parts(&item.label).0.width())
@@ -1472,16 +1520,18 @@ impl Picker {
             lines.push(line);
         }
         if items.is_empty() {
-            let message =
-                if self.active_session.is_some() && self.query.is_empty() && !self.all_workspaces {
-                    "No sessions in current folder. Press Tab to view all."
-                } else if settings {
-                    "No matching settings"
-                } else if self.tree.is_some() {
-                    "  No entries found"
-                } else {
-                    "No matches"
-                };
+            let message = if self.active_session.is_some()
+                && self.query.text.is_empty()
+                && !self.all_workspaces
+            {
+                "No sessions in current folder. Press Tab to view all."
+            } else if settings {
+                "No matching settings"
+            } else if self.tree.is_some() {
+                "  No entries found"
+            } else {
+                "No matches"
+            };
             lines.push(Line::themed(message, theme, "dim"));
         }
         if scrolling || self.tree.is_some() {
@@ -1562,6 +1612,12 @@ impl Picker {
                 hint("tui.select.confirm"),
                 hint("tui.select.cancel"),
             )
+        } else if self.title == "Warnings" {
+            format!(
+                "{}/Space to change · {} to go back",
+                hint("tui.select.confirm"),
+                hint("tui.select.cancel"),
+            )
         } else if self.title == "Settings" {
             format!(
                 "Type to search · {}/{} to select · {}/Space to change · {} to close",
@@ -1635,7 +1691,7 @@ fn render_settings_row(
 // them from the setting they describe.
 fn setting_description(selection: &Selection) -> Option<&'static str> {
     if let Selection::EditSetting(key) = selection
-        && !matches!(key.as_str(), "theme" | "modelThinkingLevels")
+        && !matches!(key.as_str(), "theme" | "modelThinkingLevels" | "warnings")
     {
         return Some("Edit the saved setting as JSON; changes apply on reload or startup.");
     }
@@ -1658,6 +1714,10 @@ fn setting_description(selection: &Selection) -> Option<&'static str> {
         }
         "theme" => "Choose a color theme for the interface.",
         "modelThinkingLevels" => "Override the default thinking level for specific models.",
+        "warnings" => "Enable or disable individual warnings.",
+        "warnings.anthropicExtraUsage" => {
+            "Warn when Anthropic subscription auth may use paid extra usage."
+        }
         "expandTools" => "Expand or collapse tool output in the transcript.",
         "hideThinkingBlock" => "Hide thinking blocks in assistant responses.",
         "showCacheMissNotices" => {
@@ -2288,7 +2348,7 @@ mod tests {
         );
         picker.paste("changes");
         assert!(picker.matches().is_empty());
-        picker.query.clear();
+        picker.query.text.clear();
         picker.paste("audit");
         assert_eq!(picker.matches().len(), 1);
     }
@@ -2300,14 +2360,14 @@ mod tests {
         picker.paste("alpha café-file  ");
         let delete_word = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
         picker.input(delete_word, &keys);
-        assert_eq!(picker.query, "alpha café-");
+        assert_eq!(picker.query.text, "alpha café-");
         picker.input(delete_word, &keys);
-        assert_eq!(picker.query, "alpha café");
+        assert_eq!(picker.query.text, "alpha café");
         picker.input(delete_word, &keys);
-        assert_eq!(picker.query, "alpha ");
+        assert_eq!(picker.query.text, "alpha ");
         picker.paste("e\u{301}");
         picker.input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &keys);
-        assert_eq!(picker.query, "alpha ");
+        assert_eq!(picker.query.text, "alpha ");
     }
 
     #[test]
@@ -2322,9 +2382,9 @@ mod tests {
             let mut picker = Picker::new("Choose", vec![]);
             picker.paste(query);
             picker.input(delete, &keys);
-            assert_eq!(picker.query, expected, "first deletion from {query}");
+            assert_eq!(picker.query.text, expected, "first deletion from {query}");
             picker.input(delete, &keys);
-            assert_eq!(picker.query, next, "second deletion from {query}");
+            assert_eq!(picker.query.text, next, "second deletion from {query}");
         }
     }
 
@@ -2340,16 +2400,16 @@ mod tests {
             let mut picker = Picker::new("Choose", vec![]);
             picker.paste(query);
             for remaining in expected {
-                let previous_len = picker.query.len();
+                let previous_len = picker.query.text.len();
                 picker.input(delete, &keys);
                 assert_eq!(
-                    picker.query, remaining,
+                    picker.query.text, remaining,
                     "deleting from {query:?} at length {previous_len}"
                 );
-                assert!(picker.query.len() < previous_len);
+                assert!(picker.query.text.len() < previous_len);
             }
             picker.input(delete, &keys);
-            assert!(picker.query.is_empty());
+            assert!(picker.query.text.is_empty());
         }
     }
 
@@ -2367,7 +2427,7 @@ mod tests {
         assert_eq!(picker.matches().len(), 1);
         let keys = Keys::default();
         picker.input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT), &keys);
-        assert_eq!(picker.query, "first ");
+        assert_eq!(picker.query.text, "first ");
         assert!(picker.session_action.is_none());
     }
 
@@ -2545,7 +2605,113 @@ mod tests {
         assert!(
             matches!(&picker.matches()[picker.selected].selection, Selection::Setting(name, value) if name == "HTTP timeout" && *value == 30)
         );
-        assert_eq!(picker.query, "ht to");
+        assert_eq!(picker.query.text, "ht to");
+    }
+
+    #[test]
+    fn settings_search_can_edit_at_the_cursor_without_moving_the_selection() {
+        let settings = ["Quiet startup", "HTTP idle timeout", "Model timeout"]
+            .into_iter()
+            .map(|label| Item {
+                label: format!("{label} · value"),
+                selection: Selection::Setting(label.into(), serde_json::json!(true)),
+            })
+            .collect();
+        let mut picker = Picker::new("Settings", settings);
+        let keys = Keys::default();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        let empty = picker.render(&Theme::system(), 80, 20, &keys);
+        assert!(
+            empty[0]
+                .spans
+                .iter()
+                .any(|span| span.inverse && span.text == " ")
+        );
+        picker.paste("ttp timeout");
+        picker.input(key(KeyCode::Home), &keys);
+        picker.input(key(KeyCode::Char('h')), &keys);
+        assert_eq!(picker.query.text, "http timeout");
+        assert_eq!(picker.query.cursor, 1);
+        assert_eq!(
+            picker.matches()[picker.selected].label,
+            "HTTP idle timeout · value"
+        );
+        let lines = picker.render(&Theme::system(), 80, 20, &keys);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.inverse && span.text == "t")
+        );
+
+        picker.input(key(KeyCode::Delete), &keys);
+        assert_eq!(picker.query.text, "htp timeout");
+        picker.paste("t");
+        picker.input(key(KeyCode::End), &keys);
+        assert_eq!(picker.query.text, "http timeout");
+        assert_eq!(picker.query.cursor, picker.query.text.len());
+
+        picker.paste(" avec une recherche plus longue 界");
+        let narrow = picker.render(&Theme::system(), 27, 20, &keys);
+        assert!(narrow[0].spans.iter().any(|span| span.inverse));
+        assert!(
+            narrow[0]
+                .spans
+                .iter()
+                .map(|span| span.text.width())
+                .sum::<usize>()
+                <= 27
+        );
+    }
+
+    #[test]
+    fn settings_search_prefers_editor_bindings_over_app_shortcuts() {
+        let mut picker = Picker::new("Settings", vec![]);
+        let mut keys = Keys::default();
+        keys.set_test_binding("tui.editor.cursorLeft", "ctrl+l");
+        picker.paste("hte");
+        picker.input(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            &keys,
+        );
+        picker.input(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &keys);
+        assert_eq!(picker.query.text, "htre");
+    }
+
+    #[test]
+    fn settings_search_yank_preserves_the_original_query() {
+        let mut picker = Picker::new("Settings", vec![]);
+        let keys = Keys::default();
+        picker.paste("http\u{1b}timeout");
+        picker.input(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &keys,
+        );
+        assert!(picker.query.text.is_empty());
+        picker.input(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &keys,
+        );
+        assert_eq!(picker.query.text, "http\u{1b}timeout");
+    }
+
+    #[test]
+    fn settings_search_matches_control_characters_without_rendering_them() {
+        let mut picker = Picker::new("Settings", vec![]);
+        picker.paste("http");
+        picker.input(
+            KeyEvent::new(KeyCode::Char('\u{85}'), KeyModifiers::NONE),
+            &Keys::default(),
+        );
+        assert_eq!(picker.query.text, "http\u{85}");
+        let heading = picker.settings_heading("Settings · ", &Theme::system(), 80);
+        assert!(
+            heading
+                .spans
+                .iter()
+                .all(|span| !span.text.contains('\u{85}'))
+        );
     }
 
     #[test]
@@ -2567,7 +2733,7 @@ mod tests {
             .collect(),
         );
         for query in ["timeout/http", "timeout http", "ht\u{feff}time"] {
-            picker.query = query.into();
+            picker.query.text = query.into();
             let matches = picker.matches();
             let names: Vec<_> = matches.iter().map(|item| item.label.as_str()).collect();
             assert_eq!(
@@ -2580,9 +2746,9 @@ mod tests {
                 "{query:?}"
             );
         }
-        picker.query = "http\u{85}timeout".into();
+        picker.query.text = "http\u{85}timeout".into();
         assert!(picker.matches().is_empty());
-        picker.query = "//".into();
+        picker.query.text = "//".into();
         assert_eq!(picker.matches().len(), 4);
     }
 
@@ -2632,12 +2798,12 @@ mod tests {
             }],
         );
         picker.paste("time\r\nout\thttp");
-        assert_eq!(picker.query, "timeout    http");
+        assert_eq!(picker.query.text, "timeout    http");
         assert_eq!(picker.matches().len(), 1);
 
-        picker.query.clear();
+        picker.query.replace(String::new());
         picker.paste("http\u{85}timeout");
-        assert_eq!(picker.query, "http\u{85}timeout");
+        assert_eq!(picker.query.text, "http\u{85}timeout");
         assert!(picker.matches().is_empty());
 
         picker.paste("\u{1b}]8;;https://example.invalid\u{7}");
@@ -2681,7 +2847,7 @@ mod tests {
         assert_eq!(picker.matches().len(), 1);
         picker.paste("3");
         assert_eq!(picker.matches()[0].label, "node 3");
-        picker.query.clear();
+        picker.query.text.clear();
         picker.focus_record(1);
         picker.input(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &keys);
         picker.input(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &keys);
@@ -2710,16 +2876,16 @@ mod tests {
             &keys,
         );
         picker.input(edit_label, &keys);
-        assert_eq!(picker.query, "root");
+        assert_eq!(picker.query.text, "root");
         assert!(matches!(picker.input(escape, &keys), Input::Continue));
-        assert_eq!(picker.query, "node 1");
+        assert_eq!(picker.query.text, "node 1");
         assert!(matches!(picker.selected(), Some(Selection::Checkout(1))));
         picker.input(edit_label, &keys);
-        picker.query = "updated".into();
+        picker.query.text = "updated".into();
         assert!(
             matches!(picker.input(confirm, &keys), Input::SetTreeLabel(1, value) if value == "updated")
         );
-        assert_eq!(picker.query, "node 1");
+        assert_eq!(picker.query.text, "node 1");
         assert!(matches!(picker.selected(), Some(Selection::Checkout(1))));
         let tree = picker.tree.as_ref().unwrap();
         assert_eq!(tree.filter.name(), "labeled-only");
@@ -3181,7 +3347,7 @@ mod tests {
         let keys = Keys::default();
         picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys);
         assert_eq!(picker.model_scope().unwrap().1, ["beta", "gamma"]);
-        picker.query = "gam".into();
+        picker.query.text = "gam".into();
         picker.selected = 0;
         picker.input(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &keys);
         assert_eq!(picker.model_scope().unwrap().1, ["gamma", "beta"]);
@@ -3336,9 +3502,9 @@ mod tests {
             selected(&picker),
             vec![parent.clone(), child.clone(), other.clone()]
         );
-        picker.query = "needle".into();
+        picker.query.text = "needle".into();
         assert_eq!(selected(&picker), paths);
-        picker.query.clear();
+        picker.query.text.clear();
         let keys = Keys::default();
         picker.input(
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
@@ -3399,14 +3565,14 @@ mod tests {
                 ),
             ),
         ]));
-        picker.query = "needle".into();
+        picker.query.text = "needle".into();
         assert_eq!(picker.matches().len(), 1);
         assert!(
             matches!(&picker.matches()[0].selection, Selection::Resume(path) if *path == local)
         );
         picker.all_workspaces = true;
         assert_eq!(picker.matches().len(), 2);
-        picker.query = "re:transcript.*needle".into();
+        picker.query.text = "re:transcript.*needle".into();
         assert_eq!(picker.matches().len(), 1);
     }
 
@@ -3421,7 +3587,7 @@ mod tests {
             PathBuf::from("active.jsonl"),
             Default::default(),
         );
-        picker.query = "Victim".into();
+        picker.query.text = "Victim".into();
         picker.session_action = Some(SessionAction::Delete(path.clone()));
         assert!(matches!(
             picker.input(
@@ -3430,7 +3596,7 @@ mod tests {
             ),
             Input::Continue
         ));
-        assert_eq!(picker.query, "Victim");
+        assert_eq!(picker.query.text, "Victim");
         assert!(picker.session_action.is_none());
         assert!(
             matches!(&picker.matches()[0].selection, Selection::Resume(selected) if *selected == path)

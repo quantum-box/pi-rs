@@ -16,6 +16,7 @@ use super::{
 
 mod decisions;
 mod llama_cpp;
+mod llama_discovery;
 mod wire;
 use wire::{
     classifier_answers, classifier_payload, classifier_response, image_output, image_payload, usage,
@@ -128,9 +129,12 @@ fn classifier_retry_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     if let Ok(date) = chrono::DateTime::parse_from_rfc2822(value) {
         return Some(date.to_utc());
     }
+    let value = value.trim();
+    let Some((weekday, rest)) = value.split_once(',') else {
+        return classifier_retry_asctime(value);
+    };
     // Date.parse also accepts the obsolete RFC 850 HTTP-date form. Use
     // JavaScript's 1950/2049 pivot for its two-digit year.
-    let (weekday, rest) = value.trim().split_once(',')?;
     if ![
         "Monday",
         "Tuesday",
@@ -166,6 +170,42 @@ fn classifier_retry_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     )
     .ok()
     .map(|date| date.and_utc())
+}
+
+fn classifier_retry_asctime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{Local, LocalResult, TimeZone};
+
+    let explicit_zone = value
+        .rsplit_once(char::is_whitespace)
+        .filter(|(_, zone)| zone.eq_ignore_ascii_case("GMT") || zone.eq_ignore_ascii_case("UTC"));
+    let date = explicit_zone.map_or(value, |(date, _)| date);
+    let (weekday, date) = date.split_once(char::is_whitespace)?;
+    // Date.parse recognizes the weekday but does not use it to check the date.
+    weekday.parse::<chrono::Weekday>().ok()?;
+    let date =
+        chrono::NaiveDateTime::parse_from_str(date.trim_start(), "%b %d %H:%M:%S %Y").ok()?;
+    if explicit_zone.is_some() {
+        Some(date.and_utc())
+    } else {
+        // Pi's Date.parse treats an asctime value with no zone as local time.
+        let offset = match Local.offset_from_local_datetime(&date) {
+            LocalResult::Single(offset) => offset,
+            LocalResult::Ambiguous(first, second) => {
+                // The larger offset maps the repeated wall time to its first instant.
+                std::cmp::max_by_key(first, second, |offset| offset.local_minus_utc())
+            }
+            LocalResult::None => {
+                // JavaScript moves through forward clock changes using the
+                // offset from before the gap. Look up that offset the day before.
+                let previous = date.checked_sub_days(chrono::Days::new(1))?;
+                Local.offset_from_local_datetime(&previous).earliest()?
+            }
+        };
+        offset
+            .from_local_datetime(&date)
+            .single()
+            .map(|date| date.to_utc())
+    }
 }
 
 fn classifier_retry_delay(
@@ -368,6 +408,7 @@ struct Entry {
     endpoint: Url,
     api_key: Option<String>,
     cloudflare_default: bool,
+    llama_root: Option<Url>,
 }
 
 #[derive(Clone, Default)]
@@ -376,7 +417,7 @@ pub(super) struct Catalogue(Vec<Entry>);
 impl Catalogue {
     pub fn parse(providers: &Map<String, Value>) -> Result<Self> {
         let mut combined: Map<String, Value> =
-            serde_json::from_str(include_str!("../assets/operation-models-v1.5.0.json"))
+            serde_json::from_str(include_str!("../assets/operation-models-v1.6.0.json"))
                 .expect("pinned Pi model operation catalogue");
         for (provider, configured) in providers {
             let name = provider.to_ascii_lowercase();
@@ -589,6 +630,7 @@ impl Catalogue {
                     endpoint,
                     api_key,
                     cloudflare_default,
+                    llama_root: None,
                 });
             }
         }
@@ -612,10 +654,12 @@ impl Catalogue {
                 continue;
             }
             if available {
+                let allows_keyless = model.allows_keyless(keys);
                 let key = (
                     model.provider.as_str(),
                     model.endpoint.as_str(),
-                    model.allows_keyless(),
+                    allows_keyless,
+                    model.llama_root.is_some(),
                 );
                 let usable = match resolved.get(&key) {
                     Some(usable) => *usable,
@@ -626,7 +670,7 @@ impl Catalogue {
                             .and_then(|model| model.credential(keys))
                         {
                             Some(credential) => credential.resolve().await.is_ok(),
-                            None => model.allows_keyless(),
+                            None => allows_keyless,
                         };
                         resolved.insert(key, usable);
                         usable
@@ -785,8 +829,26 @@ async fn resolve_header(value: &str, env: Option<&Map<String, Value>>) -> Option
 }
 
 impl Entry {
-    fn allows_keyless(&self) -> bool {
-        matches!(self.api, Api::LlamaCppClassifier)
+    fn allows_keyless(&self, keys: &Keys) -> bool {
+        self.llama_root.is_some()
+            || matches!(self.api, Api::LlamaCppClassifier)
+            || matches!(
+                self.router_credential(keys, |name| std::env::var(name).ok()),
+                Some(None)
+            )
+    }
+
+    fn router_credential(
+        &self,
+        keys: &Keys,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Option<Option<Credential>> {
+        if self.provider != "llama.cpp" {
+            return None;
+        }
+        let (root, key) = llama_discovery::configured_server(keys, env)?;
+        let (_, endpoint) = llama_discovery::classifier_endpoints(&root, self.api)?;
+        (endpoint == self.endpoint).then_some(key)
     }
 
     fn is_official(&self) -> bool {
@@ -862,6 +924,12 @@ impl Entry {
         keys: &Keys,
         env: impl Fn(&str) -> Option<String>,
     ) -> Option<Credential> {
+        if let Some(root) = &self.llama_root {
+            return match llama_discovery::configured_server(keys, env) {
+                Some((configured, key)) if configured == *root => key,
+                _ => Some(Credential::Invalid),
+            };
+        }
         let official = self.is_official();
         if let Some(key) =
             keys.operation_credential(&self.provider, self.endpoint.as_str(), official)
@@ -876,6 +944,9 @@ impl Entry {
                 Some(credential @ Credential::Command(_)) => credential,
                 _ => Credential::Invalid,
             });
+        }
+        if let Some(key) = self.router_credential(keys, &env) {
+            return key;
         }
         {
             let key = match (self.provider.as_str(), official) {
@@ -949,6 +1020,39 @@ impl Operations {
                 Error::Config("could not initialize model operation HTTP client".into())
             })?,
         })
+    }
+
+    pub async fn discover_llama(&mut self) {
+        let keys = Keys::load_async().await.unwrap_or_default();
+        let Some((root, key)) =
+            llama_discovery::configured_server(&keys, |name| std::env::var(name).ok())
+        else {
+            return;
+        };
+        let key = match key {
+            Some(key) if self.args.offline => match key.literal() {
+                Some(secret) => Some(secret.to_owned()),
+                None => return,
+            },
+            Some(key) => match tokio::time::timeout(Duration::from_secs(2), key.resolve()).await {
+                Ok(Ok(secret)) => Some(secret),
+                _ => return,
+            },
+            None => None,
+        };
+        let cache = super::config::agent_dir().join("llama-classifier-models.json");
+        let client = (!self.args.offline).then_some(&self.client);
+        let discovered = llama_discovery::catalogue(client, &root, key.as_deref(), cache).await;
+        let configured = &mut self.args.model_profiles.operations_mut().0;
+        for entry in discovered {
+            if !configured.iter().any(|model| {
+                model.provider == entry.provider
+                    && model.api.kind() == entry.api.kind()
+                    && model.model.id == entry.model.id
+            }) {
+                configured.push(entry);
+            }
+        }
     }
 }
 
@@ -1297,7 +1401,7 @@ impl Operations {
                 .map_err(|_| Error::Config("invalid model operation credential".into()))?;
             authorization.set_sensitive(true);
             headers.insert(reqwest::header::AUTHORIZATION, authorization);
-        } else if !entry.allows_keyless() {
+        } else if !entry.allows_keyless(keys) {
             return Err(Error::Config(format!(
                 "No API key for provider: {}",
                 entry.provider
@@ -1341,6 +1445,93 @@ async fn send_model_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_llama_classifiers_inherit_keys_only_for_the_matching_router() {
+        let providers = json!({
+            "llama.cpp": {
+                "models": [
+                    {"id":"chat","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://router.example/prefix/v1/v1"},
+                    {"id":"decisions","type":"classifier","api":"typesafe-system-one",
+                     "baseUrl":"https://router.example/prefix/v1/v1"},
+                    {"id":"other-path","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://router.example/prefix/v1"},
+                    {"id":"other-host","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://other.example/prefix/v1/v1"}
+                ]
+            }
+        });
+        let catalogue = Catalogue::parse(providers.as_object().unwrap()).unwrap();
+        let keys = Keys::default();
+        let env = |name: &str| match name {
+            "LLAMA_BASE_URL" => Some("https://router.example/prefix/v1/v1/".into()),
+            "LLAMA_API_KEY" => Some("router-key".into()),
+            _ => None,
+        };
+        for entry in catalogue
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "llama.cpp")
+        {
+            let credential = entry.credential_with_env(&keys, env);
+            match entry.model.id.as_str() {
+                "chat" | "decisions" => {
+                    assert_eq!(credential.unwrap().literal(), Some("router-key"));
+                }
+                "other-path" | "other-host" => assert!(credential.is_none()),
+                id => panic!("unexpected fixture model {id}"),
+            }
+        }
+        assert_eq!(
+            catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == "llama.cpp")
+                .count(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_system_one_classifier_can_use_only_the_matching_keyless_router() {
+        use clap::Parser;
+
+        let providers = json!({"llama.cpp":{"models":[
+            {"id":"decision","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://router.example/prefix/v1"},
+            {"id":"other-path","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://router.example/other/v1"},
+            {"id":"other-host","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://other.example/prefix/v1"}
+        ]}});
+        let catalogue = Catalogue::parse(providers.as_object().unwrap()).unwrap();
+        let keys = Keys::parse(&json!({"llama.cpp":{
+            "type":"api_key","env":{"LLAMA_BASE_URL":"https://router.example/prefix"}
+        }}));
+        let available = catalogue
+            .list(Kind::Classifier, Some("llama.cpp"), None, true, &keys)
+            .await;
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0]["id"], "decision");
+        let operations = Operations::new(&Cli::parse_from(["pi"])).unwrap();
+        for entry in catalogue
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "llama.cpp")
+        {
+            let headers = operations.request_headers(entry, &keys).await;
+            if entry.model.id == "decision" {
+                assert!(
+                    !headers
+                        .unwrap()
+                        .contains_key(reqwest::header::AUTHORIZATION)
+                );
+            } else {
+                assert!(headers.is_err());
+            }
+        }
+    }
 
     #[tokio::test]
     async fn unfiltered_catalogue_does_not_read_auth_file() {
@@ -1458,7 +1649,7 @@ mod tests {
             .iter()
             .filter(|entry| entry.provider == "vercel-ai-gateway")
             .collect();
-        assert_eq!(models.len(), 14);
+        assert_eq!(models.len(), 27);
         let ids: BTreeSet<_> = models.iter().map(|entry| entry.model.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1467,12 +1658,25 @@ mod tests {
                 "baseten/joey-1",
                 "baseten/mammoth-1",
                 "convaiinnovations/laya",
+                "google/gemini-decision-1",
+                "heygen/heygen-decision-1",
+                "heygen/heygen-decision-1-turbo",
                 "liquid/d1",
                 "liquid/d1-ultra",
+                "liquid/d1.2",
+                "liquid/d1.2-ultra",
+                "microsoft/decision-1.1",
                 "microsoft/microsoft-decision-1",
+                "modaic/mo",
+                "nace-ai/drex-max-finance",
+                "nace-ai/drex-max-v1.1",
+                "nace-ai/drex-v2.0",
                 "openai/gpt-6-luna-decisions",
+                "parallel/parallel-decisions-fast",
                 "perplexity/pplx-decider-flash-v1.2",
+                "perplexity/pplx-decider-flash-v1.3",
                 "perplexity/pplx-decider-v1.2",
+                "perplexity/pplx-decider-v1.3",
                 "scaledown/scaledown-classify-1",
                 "typesafe-ai/jev",
                 "typesafe-ai/jev-1.13.0",
@@ -1543,7 +1747,7 @@ mod tests {
                 &keys,
             )
             .await;
-        assert_eq!(available.len(), 14);
+        assert_eq!(available.len(), 27);
         assert!(available.iter().all(|entry| entry["type"] == "classifier"));
     }
 
@@ -2891,6 +3095,56 @@ mod tests {
     }
 
     #[test]
+    fn pinned_openrouter_and_vercel_catalogues_match_pi_v160() {
+        let catalogue = Catalogue::parse(&Map::new()).unwrap();
+        for (provider, kind, expected) in [
+            ("openrouter", Kind::Classifier, 44),
+            ("openrouter", Kind::Image, 74),
+        ] {
+            let entries = catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == provider && entry.api.kind() == kind);
+            assert_eq!(entries.count(), expected);
+        }
+        for (provider, id, api) in [
+            (
+                "openrouter",
+                "google/gemini-decision-1",
+                "typesafe-system-one",
+            ),
+            (
+                "openrouter",
+                "openai/gpt-image-2.6-sunburst",
+                "openrouter-images",
+            ),
+            (
+                "vercel-ai-gateway",
+                "liquid/d1.2-ultra",
+                "typesafe-system-one",
+            ),
+        ] {
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| entry.provider == provider && entry.model.id == id)
+                .expect("model from Pi's catalog");
+            assert_eq!(entry.descriptor()["api"], api);
+            assert!(entry.is_official());
+        }
+        assert!(
+            !catalogue
+                .0
+                .iter()
+                .any(|entry| entry.provider == "openrouter"
+                    && matches!(
+                        entry.model.id.as_str(),
+                        "inception/mercury-decide" | "x-ai/grok-imagine-image-quality"
+                    ))
+        );
+    }
+
+    #[test]
     fn operation_catalogue_exposes_image_limits_and_classifier_compatibility() {
         let catalog = Catalogue::parse(&Map::new()).unwrap();
         let images: Vec<_> = catalog
@@ -2903,7 +3157,7 @@ mod tests {
                 .iter()
                 .filter(|entry| entry.descriptor().get("inputLimits").is_some())
                 .count(),
-            63
+            70
         );
         let flux = images
             .iter()
@@ -3040,6 +3294,12 @@ mod tests {
             (
                 Api::SystemOne,
                 vec![(429, "retry-after-ms: 60001\r\n")],
+                false,
+                "over 60 seconds",
+            ),
+            (
+                Api::SystemOne,
+                vec![(429, "retry-after: Mon Nov  6 08:51:00 2095\r\n")],
                 false,
                 "over 60 seconds",
             ),
@@ -3184,6 +3444,35 @@ mod tests {
             HeaderValue::from_static("Sunday, 06-Nov-94 08:51:00 GMT"),
         );
         assert!(classifier_retry_delay(&headers, 0, old_now).is_err());
+        for zone in ["GMT", "UTC"] {
+            headers.insert(
+                "retry-after",
+                HeaderValue::from_str(&format!("Mon Nov  6 08:49:37 1994 {zone}")).unwrap(),
+            );
+            assert_eq!(
+                classifier_retry_delay(&headers, 0, old_now).unwrap(),
+                Duration::from_secs(5)
+            );
+        }
+        use chrono::TimeZone;
+        let local_now = chrono::Local
+            .with_ymd_and_hms(1994, 11, 6, 8, 49, 32)
+            .earliest()
+            .unwrap()
+            .to_utc();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sun Nov  6 08:49:37 1994"),
+        );
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, local_now).unwrap(),
+            Duration::from_secs(5)
+        );
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sun Nov  6 08:51:00 1994"),
+        );
+        assert!(classifier_retry_delay(&headers, 0, local_now).is_err());
         assert_eq!(
             classifier_retry_date("Sunday, 06-Nov-50 08:49:37 GMT")
                 .unwrap()
@@ -3196,6 +3485,38 @@ mod tests {
                 .to_rfc3339(),
             "2049-11-06T08:49:37+00:00"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifier_retry_asctime_follows_local_clock_changes() {
+        const CHILD: &str = "PI_RS_CLASSIFIER_RETRY_CLOCK_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "operation_models::tests::classifier_retry_asctime_follows_local_clock_changes",
+                ])
+                .env(CHILD, "1")
+                .env("TZ", "America/New_York")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        for (header, expected) in [
+            ("Sun Mar 10 02:00:05 2024", "2024-03-10T07:00:05+00:00"),
+            ("Sun Nov  3 01:00:05 2024", "2024-11-03T05:00:05+00:00"),
+        ] {
+            assert_eq!(
+                classifier_retry_date(header).unwrap().to_rfc3339(),
+                expected
+            );
+        }
     }
 
     #[tokio::test]

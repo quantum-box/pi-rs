@@ -230,6 +230,12 @@ impl Keys {
                 .any(|binding| binding.code == key.code && binding.modifiers == key.modifiers)
         })
     }
+    pub(super) fn editor_action(&self, key: KeyEvent) -> Option<&str> {
+        self.bindings
+            .keys()
+            .find(|action| action.starts_with("tui.editor.") && self.matches(action, key))
+            .map(String::as_str)
+    }
     pub fn action(&self, key: KeyEvent, empty: bool) -> Option<&str> {
         let key = normalize(key);
         // Exit shares Ctrl+D with forward delete, and applies only to an empty editor.

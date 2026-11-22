@@ -115,6 +115,12 @@ pub struct Editor {
     scroll_offset: usize,
     jump_forward: Option<bool>,
 }
+enum InputMode {
+    Text,
+    TranscriptSearch,
+    SettingsSearch,
+}
+
 impl Editor {
     fn remember(&mut self) {
         self.undo.push(Snapshot {
@@ -136,26 +142,43 @@ impl Editor {
         self.cursor = self.text.len();
     }
     pub fn insert(&mut self, text: &str) {
-        self.remember();
-        let text = super::render::clean(text);
-        self.text.insert_str(self.cursor, &text);
-        self.cursor += text.len();
+        self.insert_text(&super::render::clean(text));
     }
     // Only transcript search retains U+0085 internally. Rendering remains
     // sanitized by Span; all other control characters stay excluded.
     pub(super) fn insert_search(&mut self, text: &str) {
-        self.remember();
         let text: String = text
             .chars()
             .filter(|character| !character.is_control() || *character == '\u{85}')
             .collect();
-        self.text.insert_str(self.cursor, &text);
+        self.insert_text(&text);
+    }
+    pub(super) fn insert_settings_search(&mut self, text: &str) {
+        // Pi's single-line input removes CR/LF and expands tabs.
+        // Retain the other input characters for matching and sanitize at render.
+        self.insert_text(&text.replace(['\r', '\n'], "").replace('\t', "    "));
+    }
+    fn insert_text(&mut self, text: &str) {
+        self.remember();
+        self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
     }
     /// Insert a typed character, grouping consecutive typing as Pi does.
     /// Paste and programmatic insertion continue to use the atomic `insert`.
     pub fn type_character(&mut self, character: char) {
-        let text = super::render::clean(&character.to_string());
+        self.type_character_text(character, &super::render::clean(&character.to_string()));
+    }
+    pub(super) fn type_settings_search(&mut self, character: char) {
+        let mut utf8 = [0; 4];
+        let text = match character {
+            '\r' | '\n' => return,
+            '\t' => "    ",
+            _ => character.encode_utf8(&mut utf8),
+        };
+        self.type_character_text(character, text);
+    }
+
+    fn type_character_text(&mut self, character: char, text: &str) {
         if text.is_empty() {
             return;
         }
@@ -170,7 +193,7 @@ impl Editor {
             self.preferred_column = None;
             self.jump_forward = None;
         }
-        self.text.insert_str(self.cursor, &text);
+        self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
         self.typing_word = true;
     }
@@ -387,14 +410,18 @@ impl Editor {
     }
 
     pub fn action(&mut self, action: &str) -> bool {
-        self.action_inner(action, false)
+        self.action_inner(action, InputMode::Text)
     }
 
     pub(super) fn search_action(&mut self, action: &str) -> bool {
-        self.action_inner(action, true)
+        self.action_inner(action, InputMode::TranscriptSearch)
     }
 
-    fn action_inner(&mut self, action: &str, search: bool) -> bool {
+    pub(super) fn settings_search_action(&mut self, action: &str) -> bool {
+        self.action_inner(action, InputMode::SettingsSearch)
+    }
+
+    fn action_inner(&mut self, action: &str, mode: InputMode) -> bool {
         if !matches!(
             action,
             "tui.editor.deleteWordBackward"
@@ -464,10 +491,10 @@ impl Editor {
             "tui.editor.yank" => {
                 if let Some(text) = self.kills.first().cloned() {
                     let start = self.cursor;
-                    if search {
-                        self.insert_search(&text);
-                    } else {
-                        self.insert(&text);
+                    match mode {
+                        InputMode::Text => self.insert(&text),
+                        InputMode::TranscriptSearch => self.insert_search(&text),
+                        InputMode::SettingsSearch => self.insert_settings_search(&text),
                     }
                     self.yank = Some((start..self.cursor, 0));
                 }

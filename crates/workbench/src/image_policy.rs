@@ -127,6 +127,10 @@ impl FinalStrictPolicy {
 
 #[async_trait::async_trait]
 impl Model for WorkbenchModel {
+    fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
+        self.client.supports_mid_conversation_system_messages(model)
+    }
+
     fn minimum_output_tokens(&self) -> u32 {
         self.client.minimum_output_tokens()
     }
@@ -474,6 +478,10 @@ impl pi_rs::PreparedToolDispatch for PreparedWorkbenchToolDispatch {
 
 #[async_trait::async_trait]
 impl Model for PreparedWorkbenchModel {
+    fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
+        self.inner.supports_mid_conversation_system_messages(model)
+    }
+
     fn minimum_output_tokens(&self) -> u32 {
         self.inner.minimum_output_tokens()
     }

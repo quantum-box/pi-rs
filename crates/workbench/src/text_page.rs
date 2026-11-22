@@ -1,5 +1,6 @@
 //! Streaming text pages with Pi's line and byte limits.
-use std::io::{BufRead, BufReader, Seek};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::Path;
 
 use encoding_rs::{CoderResult, UTF_8};
@@ -15,7 +16,14 @@ pub(super) fn read(
     limit: Option<usize>,
     cancellation: &CancellationToken,
 ) -> Result<Outcome> {
-    read_from(open(path)?, display_path, offset, limit, cancellation)
+    let (file, _) = open(path)?;
+    read_from(
+        BufReader::new(file),
+        display_path,
+        offset,
+        limit,
+        cancellation,
+    )
 }
 
 pub(super) const PI_FRACTIONAL_OVERSIZE_LINE: &str = "The \"string\" argument must be of type string or an instance of Buffer or ArrayBuffer. Received undefined";
@@ -34,7 +42,27 @@ pub(super) fn read_pi(
     limit: Option<f64>,
     cancellation: &CancellationToken,
 ) -> Result<Outcome> {
-    let mut reader = open(path)?;
+    let (file, size) = open(path)?;
+    read_pi_file(file, size, display_path, offset, limit, cancellation)
+}
+
+fn read_pi_file(
+    file: File,
+    size: u64,
+    display_path: &str,
+    offset: f64,
+    limit: Option<f64>,
+    cancellation: &CancellationToken,
+) -> Result<Outcome> {
+    // Pi bounds streaming reads by the opened file's size. The full-file
+    // slicing path and files reporting zero bytes read through EOF.
+    let streamable =
+        offset.fract() == 0.0 && limit.is_none_or(|limit| limit >= 0.0 && limit.fract() == 0.0);
+    let bytes = if streamable && size > 0 {
+        size
+    } else {
+        u64::MAX
+    };
     let start = (offset - 1.0).max(0.0);
     let end = limit.map(|limit| start + limit);
     let mut counted_lines = None;
@@ -43,8 +71,9 @@ pub(super) fn read_pi(
         // Array.slice interprets negative integral end positions from EOF.
         // Count raw newlines before decoding so the retained prefix stays bounded.
         let end_index = if end <= -1.0 {
-            let total = count_lines(&mut reader, cancellation)?;
-            reader.rewind()?;
+            let mut lines = BufReader::new(&file);
+            let total = count_lines(&mut lines, cancellation)?;
+            lines.rewind()?;
             counted_lines = Some(total);
             total.saturating_sub((-end) as usize)
         } else {
@@ -61,7 +90,7 @@ pub(super) fn read_pi(
         counted_lines,
     };
     read_page(
-        reader,
+        BufReader::new(file.take(bytes)),
         display_path,
         start_index,
         limit,
@@ -70,12 +99,13 @@ pub(super) fn read_pi(
     )
 }
 
-fn open(path: &Path) -> Result<BufReader<std::fs::File>> {
-    let file = std::fs::File::open(path)?;
-    if !file.metadata()?.is_file() {
+fn open(path: &Path) -> Result<(File, u64)> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(Error::Config("expected a regular text file".into()));
     }
-    Ok(BufReader::new(file))
+    Ok((file, metadata.len()))
 }
 
 fn count_lines(reader: &mut impl BufRead, cancellation: &CancellationToken) -> Result<usize> {
@@ -318,6 +348,49 @@ mod tests {
         std::fs::write(file.path(), "").unwrap();
         assert_eq!(read(file.path(), "fixture", 0, None).unwrap(), "");
     }
+    #[test]
+    fn pi_stream_counts_only_the_open_size_of_nonempty_files() {
+        use std::io::Write;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        for (initial, offset, limit, expected) in [
+            ("first\nsecond", 1.0, None, "first\nsecond"),
+            (
+                "first\nsecond",
+                1.0,
+                Some(1.0),
+                "first\n\n[1 more lines in file. Use offset=2 to continue.]",
+            ),
+            ("", 1.0, None, "\nappended"),
+            ("first", 1.5, None, "first\nappended"),
+            (
+                "first",
+                1.0,
+                Some(-1.0),
+                "first\n\n[3 more lines in file. Use offset=0 to continue.]",
+            ),
+        ] {
+            std::fs::write(file.path(), initial).unwrap();
+            let (source, size) = open(file.path()).unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(file.path())
+                .unwrap()
+                .write_all(b"\nappended")
+                .unwrap();
+            let result = read_pi_file(
+                source,
+                size,
+                "fixture",
+                offset,
+                limit,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(result.tool_content(), expected);
+        }
+    }
+
     #[test]
     fn large_files_and_long_lines_remain_pageable() {
         let file = tempfile::NamedTempFile::new().unwrap();
