@@ -8285,8 +8285,9 @@ mod tests {
             return;
         }
         let root = tempfile::tempdir().unwrap();
-        // Yield between writes so the producer and pipe readers can run on
-        // constrained CI hosts. The stream still outlives the idle window.
+        // Keep the pipes active beyond the idle timeout without sleeping between
+        // writes. An oversleep can make an active pipe look idle. Limit
+        // both the write rate and the total time spent producing output.
         let command = r#"python3 -c '
 import os
 import time
@@ -8297,10 +8298,13 @@ while os.getppid() == parent:
     time.sleep(.001)
 os.write(1, b"out0\n")
 os.write(2, b"err0\n")
-for _ in range(80):
+deadline = time.monotonic() + .30
+while time.monotonic() < deadline:
     os.write(1, b".")
     os.write(2, b".")
-    time.sleep(.004)
+    next_write = min(deadline, time.monotonic() + .005)
+    while time.monotonic() < next_write:
+        pass
 os.write(1, b"out11\n")
 os.write(2, b"err11\n")
 ' & while [ ! -f ready ]; do sleep .01; done; rm ready; exit 0"#;
