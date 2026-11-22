@@ -531,6 +531,7 @@ impl Deferred {
     }
 
     async fn connect_at(&self, auth_path: &std::path::Path) -> Result<(Client, HeaderMap)> {
+        let mut endpoint = self.endpoint.clone();
         let token = match &self.credential {
             Some(Credential::BedrockProfile(_) | Credential::BedrockChain) => None,
             Some(Credential::AnthropicOAuth) if self.http_settings.is_some() => Some(
@@ -557,7 +558,11 @@ impl Deferred {
                     Some(settings) => settings.clone(),
                     None => super::config::Settings::load(&std::env::current_dir()?, false)?,
                 };
-                Some(super::copilot_auth::access_for_path(auth_path, &settings, None, false).await?)
+                let credential =
+                    super::copilot_auth::credential_for_path(auth_path, &settings, None, false)
+                        .await?;
+                endpoint = super::copilot_auth::routed_endpoint(&endpoint, &credential)?;
+                Some(credential.access)
             }
             Some(Credential::Kimi) if self.http_settings.is_some() => Some(
                 super::kimi_auth::access(
@@ -606,22 +611,15 @@ impl Deferred {
                 radius_checked = true;
             }
         }
-        let endpoint = match &self.credential {
-            Some(Credential::VertexAdc(adc)) => {
-                if !headers.contains_key("x-goog-user-project")
-                    && let Some(quota) = adc.quota_project()
-                    && let Ok(value) = reqwest::header::HeaderValue::from_str(&quota)
-                {
-                    headers.insert("x-goog-user-project", value);
-                }
-                adc.endpoint.clone()
+        if let Some(Credential::VertexAdc(adc)) = &self.credential {
+            if !headers.contains_key("x-goog-user-project")
+                && let Some(quota) = adc.quota_project()
+                && let Ok(value) = reqwest::header::HeaderValue::from_str(&quota)
+            {
+                headers.insert("x-goog-user-project", value);
             }
-            Some(Credential::Copilot) => super::copilot_auth::routed_endpoint(
-                &self.endpoint,
-                token.as_deref().expect("resolved Copilot access"),
-            )?,
-            _ => self.endpoint.clone(),
-        };
+            endpoint = adc.endpoint.clone();
+        }
         let client = self.provider.connect_prechecked(
             self.adapter,
             &endpoint,

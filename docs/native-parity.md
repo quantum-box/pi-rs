@@ -5396,11 +5396,16 @@ on `slow_down` and adds five seconds when it supplies no interval. Saved OAuth
 tokens can route to individual, business, or enterprise Copilot inference hosts. Requests carry the Copilot initiator and
 vision headers.
 
-Native sign-in leaves account model policies as configured. Authentication
-through private GitHub Enterprise domains remains unsupported. The published
-Pi AI package and local HTTP fixtures were used to compare the catalog and
-wire behavior. Live GitHub device authorization and Copilot inference were
-unverified because no subscription credentials were available.
+Native sign-in leaves account model policies as configured. Use
+`pi login github-copilot --enterprise-url company.ghe.com` or
+`/login github-copilot company.ghe.com` for an Enterprise account. The
+saved domain directs future refreshes, including for credentials imported
+from Pi. The inference token can select an official Copilot proxy or an
+API host bound to that Enterprise domain. Sign-in and refresh use HTTPS,
+and the verification link must belong to the selected GitHub host.
+Local fixtures cover Enterprise endpoints, polling, refresh and routing.
+Live GitHub device authorization and Copilot inference were unverified
+because no subscription credentials were available.
 
 ### OpenRouter browser authorization
 

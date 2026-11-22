@@ -1227,6 +1227,9 @@ enum Command {
         /// Use Anthropic's headless copy-code authorization.
         #[arg(long, conflicts_with = "device_code")]
         copy_code: bool,
+        /// GitHub Enterprise domain or HTTPS URL for Copilot.
+        #[arg(long)]
+        enterprise_url: Option<String>,
         /// Register a different ChatGPT account or workspace.
         #[arg(long, conflicts_with_all = ["account", "list_accounts"])]
         new_account: bool,
@@ -1942,6 +1945,7 @@ async fn execute(
             provider,
             device_code,
             copy_code,
+            enterprise_url,
             new_account,
             account,
             list_accounts,
@@ -1966,6 +1970,11 @@ async fn execute(
             }
             if *copy_code && provider != "anthropic" {
                 return Err(Error::Config("--copy-code requires anthropic".into()));
+            }
+            if enterprise_url.is_some() && provider != "github-copilot" {
+                return Err(Error::Config(
+                    "--enterprise-url requires github-copilot".into(),
+                ));
             }
             let login = async {
                 if provider == "anthropic" {
@@ -2020,6 +2029,7 @@ async fn execute(
                 } else if provider == "github-copilot" {
                     copilot_auth::login(
                         &args.settings,
+                        enterprise_url.as_deref(),
                         meta_auth::LoginControl::default(),
                         |url, code| eprintln!("Enter code {code} at {url}"),
                     )

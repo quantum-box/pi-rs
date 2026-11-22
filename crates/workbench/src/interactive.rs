@@ -3921,13 +3921,21 @@ fn slash(
         "/login" if rest.eq_ignore_ascii_case("openai-codex device") => {
             start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
         }
-        "/login" if rest.eq_ignore_ascii_case("github-copilot") => {
-            start_copilot_login(view, &args.settings)
-        }
         "/login" if rest.eq_ignore_ascii_case("github-copilot api-key") => edit_provider_key(
             super::Provider::named("github-copilot").expect("built-in Copilot provider"),
             view,
         ),
+        "/login"
+            if rest
+                .split_whitespace()
+                .next()
+                .is_some_and(|provider| provider.eq_ignore_ascii_case("github-copilot")) =>
+        {
+            let enterprise = rest
+                .split_once(char::is_whitespace)
+                .map(|(_, domain)| domain.trim());
+            start_copilot_login(view, &args.settings, enterprise)
+        }
         "/login" | "/logout" => {
             let login = name == "/login";
             if rest.is_empty() {
@@ -7367,20 +7375,30 @@ fn start_codex_login(
     view.remote_task = Some(task);
 }
 
-fn start_copilot_login(view: &mut View, settings: &crate::config::Settings) {
+fn start_copilot_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    enterprise: Option<&str>,
+) {
     let settings = settings.clone();
+    let enterprise = enterprise.map(str::to_owned);
     let control = super::meta_auth::LoginControl::default();
     let task_control = control.clone();
     let mut task = RemoteTask::start(
         "Signing in to GitHub Copilot",
         "GitHub Copilot login cancelled",
         move |sender| async move {
-            super::copilot_auth::login(&settings, task_control, |url, code| {
-                let _ = sender.send(RemoteEvent::DeviceCode {
-                    url: url.to_string(),
-                    code: code.to_owned(),
-                });
-            })
+            super::copilot_auth::login(
+                &settings,
+                enterprise.as_deref(),
+                task_control,
+                |url, code| {
+                    let _ = sender.send(RemoteEvent::DeviceCode {
+                        url: url.to_string(),
+                        code: code.to_owned(),
+                    });
+                },
+            )
             .await?;
             let _ = sender.send(RemoteEvent::RefreshModelKeys);
             Ok(vec!["Signed in to GitHub Copilot".into()])
@@ -8535,7 +8553,7 @@ fn select(
         Selection::LoginCodexDevice => {
             start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
         }
-        Selection::LoginCopilot => start_copilot_login(view, &args.settings),
+        Selection::LoginCopilot => start_copilot_login(view, &args.settings, None),
         Selection::LoginXai => start_xai_login(view, &args.settings),
         Selection::LoginMeta => start_meta_login(view, &args.settings),
         Selection::LoginKimi => start_kimi_login(view, &args.settings),
