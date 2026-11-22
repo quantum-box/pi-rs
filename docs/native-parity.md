@@ -4149,8 +4149,9 @@ provider separately from the model ID and accepts older records.
 Structured Anthropic tool results send images as Messages API image blocks.
 For errors, the result remains text and the captioned images follow all tool
 results in that user turn. The native tool-result text envelope is retained,
-with attached image data represented by a placeholder. Explicit plain-text
-results keep their original bytes. Request fixtures covered successful and
+with attached image data represented by a placeholder. Plain-text results
+and results with invalid supported image data keep their original bytes.
+Request fixtures covered successful and
 failed results, system-update ordering, and image budgets. Live authenticated
 tool-image requests were unverified.
 

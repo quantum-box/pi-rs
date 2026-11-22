@@ -994,18 +994,17 @@ fn tool_result_content(
 ) -> (Cow<'_, str>, Vec<ImageContent>) {
     if pi_rs_core::tool_content_is_structured(content, is_structured) {
         let (text, images) = pi_rs_core::extract_tool_images(content.to_owned());
-        if !images.is_empty() {
+        if !images.is_empty() && images.iter().all(|image| image.validate().is_ok()) {
             return (Cow::Owned(text), images);
         }
     }
     (Cow::Borrowed(content), Vec::new())
 }
 
-fn image_block(image: ImageContent) -> Result<Value> {
-    image.validate()?;
-    Ok(json!({"type":"image","source":{
+fn image_block(image: ImageContent) -> Value {
+    json!({"type":"image","source":{
         "type":"base64","media_type":image.mime_type,"data":image.data
-    }}))
+    }})
 }
 
 fn error_image_caption(call_id: &str, tool_name: Option<&str>) -> String {
@@ -1050,7 +1049,8 @@ fn encode_request(
             Message::UserWithImages { content, images } => {
                 let mut blocks: Vec<_> = text_block(content).into_iter().collect();
                 for image in images {
-                    blocks.push(image_block(image)?);
+                    image.validate()?;
+                    blocks.push(image_block(image));
                 }
                 ("user", blocks)
             }
@@ -1116,15 +1116,11 @@ fn encode_request(
                 } else if is_error {
                     let name = tool_names.get(&call_id).map(String::as_str);
                     pending_error_images.extend(text_block(error_image_caption(&call_id, name)));
-                    for image in images {
-                        pending_error_images.push(image_block(image)?);
-                    }
+                    pending_error_images.extend(images.into_iter().map(image_block));
                     Value::String(text.into_owned())
                 } else {
                     let mut blocks: Vec<_> = text_block(text.into_owned()).into_iter().collect();
-                    for image in images {
-                        blocks.push(image_block(image)?);
-                    }
+                    blocks.extend(images.into_iter().map(image_block));
                     Value::Array(blocks)
                 };
                 let mut block =
@@ -4193,6 +4189,20 @@ mod tests {
             "base\n\nwhile the tool runs\n\nnext instruction\n\nlast instruction"
         );
         assert_eq!(folded["messages"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn malformed_structured_tool_images_preserve_the_original_tool_result() {
+        for data in ["", "bad?base64"] {
+            let content = json!({"data":{"content":[
+                {"type":"text","text":"tool output"},
+                {"type":"image","mimeType":"image/png","data":data}
+            ]}})
+            .to_string();
+            let (text, images) = tool_result_content(&content, Some(true));
+            assert_eq!(text, content);
+            assert!(images.is_empty());
+        }
     }
 
     #[test]
