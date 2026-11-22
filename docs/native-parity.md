@@ -4038,11 +4038,24 @@ native read tool round trip, usage and RPC. Live account sign-in and provider sw
 ### Anthropic thinking checkpoint
 
 Budgeted Anthropic Messages requests use Pi's interleaved-thinking beta by
-default. An explicit `anthropic-beta` header overrides the defaults, including
-for OAuth. Adaptive and disabled thinking do not add the interleaved beta.
+default. An explicit `anthropic-beta` header overrides the optional defaults,
+including for OAuth. Adaptive and disabled thinking do not add the interleaved beta.
 Embedders can opt out of interleaving or request omitted thinking text while
 retaining its replay signature. Loopback requests verified the header and
 payload. Live authenticated interleaved thinking was unverified.
+
+Anthropic Messages uses per-reply effort for the five Anthropic and four
+OpenRouter models marked `supportsMidConvoEffort` in Pi v1.5.0. The top-level
+effort stays low while system messages set the historical and active reply
+levels. Adaptive thinking drops signed blocks whose cached prefix no longer
+matches. Explicit off omits effort messages and block binding on models that
+can disable thinking. For models with an explicit null off mapping, an unset
+level uses Pi's default high effort. Sessions retain effort and signed
+thinking with route-scoped replay. RPC exposes the effort level. Native
+requests include the betas required for managed effort even when a profile
+provides a custom beta header. Loopback
+tests exercised a level change, disabled thinking, and the default effort.
+Live authenticated managed-effort requests were unverified.
 
 Native Anthropic streams expose individual text and thinking block boundaries,
 and show redacted thinking as `[Reasoning redacted]` while retaining its opaque
