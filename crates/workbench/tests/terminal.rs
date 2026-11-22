@@ -1342,6 +1342,7 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
             settings_row_shows(text, "Auto-compact", "true")
         });
         for (setting, first, second) in [
+            ("Transport", "sse", Some("websocket")),
             ("HTTP idle timeout", "disabled", Some("30 sec")),
             ("Steering mode", "all", None),
             ("Follow-up mode", "all", None),
@@ -1422,6 +1423,7 @@ fn settings_stays_open_after_changes_and_editor_cancel() {
         let settings: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
                 .unwrap();
+        assert_eq!(settings["transport"], "websocket");
         assert_eq!(settings["httpIdleTimeoutMs"], 30_000);
         assert_eq!(settings["steeringMode"], "all");
         assert_eq!(settings["followUpMode"], "all");
@@ -4584,10 +4586,15 @@ fn mcp_inspector_lists_servers_and_announced_tool_exposure() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&project).unwrap();
     let server = root.path().join("mcp-fixture.py");
+    let tool_name = root.path().join("tool-name");
+    std::fs::write(&tool_name, "fixture_tool").unwrap();
     std::fs::write(
         &server,
         r#"
-import json, sys
+import json, pathlib, sys
+name = pathlib.Path(sys.argv[1]).read_text()
+if name == "fail":
+    sys.exit(1)
 for line in sys.stdin:
     request = json.loads(line)
     if request["method"] == "initialize":
@@ -4597,7 +4604,7 @@ for line in sys.stdin:
             "serverInfo": {"name": "fixture", "version": "1"},
         }
     elif request["method"] == "tools/list":
-        result = {"tools": [{"name": "fixture_tool", "inputSchema": {"type": "object"}}]}
+        result = {"tools": [{"name": name, "inputSchema": {"type": "object"}}]}
     else:
         continue
     print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
@@ -4611,7 +4618,7 @@ for line in sys.stdin:
     .unwrap();
     std::fs::write(
         project.join("mcp.json"),
-        serde_json::json!({"mcpServers":{"ready":{"command":"python3","args":[server],"description":"Fixture server description","toolExposure":{"fixture_tool":"hidden"}}}}).to_string(),
+        serde_json::json!({"mcpServers":{"ready":{"command":"python3","args":[server, tool_name],"description":"Fixture server description","toolExposure":{"fixture_tool":"hidden"}}}}).to_string(),
     )
     .unwrap();
 
@@ -4671,6 +4678,66 @@ for line in sys.stdin:
     });
     master.write_all(b"\x1b").unwrap();
     output_until(&mut master, |text| text.contains("MCP server · ready"));
+
+    std::fs::write(&tool_name, "replacement_tool").unwrap();
+    master.write_all(b"r").unwrap();
+    output_until(&mut master, |text| text.contains("Reconnected"));
+    master.write_all(b"t").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("replacement_tool · codemode") && !text.contains("fixture_tool · hidden")
+    });
+    master.write_all(b"\x1b").unwrap();
+    output_until(&mut master, |text| text.contains("MCP server · ready"));
+
+    std::fs::write(&tool_name, "fail").unwrap();
+    master.write_all(b"r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Status · disconnected") && text.contains("Tools · 0")
+    });
+    std::fs::write(&tool_name, "fixture_tool").unwrap();
+    master.write_all(b"r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Reconnected") && text.contains("Tools · 1")
+    });
+
+    master.write_all(b"x").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Exposure of ready") && text.contains("codemode ✓")
+    });
+    master.write_all(b"\x1b[B\x1b[B\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Exposure updated") && text.contains("Exposure · direct")
+    });
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(project.join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(saved["mcpServers"]["ready"]["exposure"], "direct");
+    assert_eq!(
+        saved["mcpServers"]["ready"]["toolExposure"]["fixture_tool"],
+        "hidden"
+    );
+    master.write_all(b"t").unwrap();
+    output_until(&mut master, |text| text.contains("fixture_tool · hidden"));
+    master.write_all(b"\x1b").unwrap();
+    output_until(&mut master, |text| text.contains("MCP server · ready"));
+
+    for enabled in [false, true] {
+        master.write_all(b"e").unwrap();
+        output_until(&mut master, |text| {
+            if enabled {
+                text.contains("Enabled") && text.contains("Tools · 1")
+            } else {
+                text.contains("Disabled") && text.contains("Tools · 0")
+            }
+        });
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(project.join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(saved["mcpServers"]["ready"]["enabled"], enabled);
+        assert_eq!(
+            saved["mcpServers"]["ready"]["toolExposure"]["fixture_tool"],
+            "hidden"
+        );
+    }
+
     master.write_all(b"\x1b").unwrap();
     output_until(&mut master, |text| text.contains("MCP servers"));
     master.write_all(b"\x1b").unwrap();
@@ -4687,4 +4754,20 @@ for line in sys.stdin:
     output_until(&mut master, |text| text.contains("MCP server · ready"));
     master.write_all(b"t").unwrap();
     output_until(&mut master, |text| text.contains("fixture_tool · hidden"));
+}
+
+#[test]
+fn mcp_manager_handles_loopback_oauth_sign_in_and_sign_out() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mcp_manager_oauth.py");
+    let output = Command::new("python3")
+        .arg(fixture)
+        .arg(env!("CARGO_BIN_EXE_pi"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

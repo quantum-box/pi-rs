@@ -2024,7 +2024,7 @@ impl Agent<'_> {
                     phase: ToolInventoryPhase::RequestPreparation,
                     registry: active.registry,
                 });
-                let (mut request, mut transformed, transcript) = active
+                let (mut request, transformed, transcript) = active
                     .request(
                         session,
                         &states,
@@ -2040,10 +2040,46 @@ impl Agent<'_> {
                 if request.max_output_tokens == 0 {
                     return Err(Error::Budget);
                 }
+                let tool_transcript = if !transformed
+                    && active.model.uses_tool_transcript(&request.model)
+                {
+                    let branch = session.branch();
+                    let conversation = model_conversation_entries(&branch, session.operations());
+                    let sources: Vec<_> = conversation.iter().map(|(source, _)| *source).collect();
+                    let inserted = transcript
+                        .as_ref()
+                        .map_or(0, |system| system.inserted_count());
+                    let start = request
+                        .messages
+                        .len()
+                        .saturating_sub(sources.len() + inserted);
+                    let mut tools = crate::tool_transcript::replay(
+                        &branch,
+                        &sources,
+                        start,
+                        &active.registry.tool_specs(),
+                        &active.registry.declarations_for_request(&request),
+                    );
+                    for tool in &mut tools {
+                        if let Some(offset) = tool.message_index.checked_sub(start) {
+                            let results = conversation[offset..]
+                                .iter()
+                                .take_while(|(_, message)| matches!(message, Message::Tool { .. }))
+                                .count();
+                            tool.message_index += results;
+                        }
+                        if let Some(system) = &transcript {
+                            tool.message_index = system.project_tool_boundary(tool.message_index);
+                        }
+                    }
+                    tools
+                } else {
+                    Vec::new()
+                };
                 let preparation = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = platform_time::timeout(active.limits.model_timeout, active.model.prepare_context(&request)) =>
+                    result = platform_time::timeout(active.limits.model_timeout, active.model.prepare_context_with_tool_transcript(&request, &tool_transcript)) =>
                         result.unwrap_or_else(|_| Err(Error::RetryableModel("model preparation timed out".into()))),
                 };
                 let prepared = match preparation {
@@ -2100,9 +2136,9 @@ impl Agent<'_> {
                     limits: active.limits.clone(),
                     ..active
                 };
-                transformed |= transcript
+                let projected_system = transcript
                     .is_some_and(|transcript| transcript.finish(active.model, &mut request));
-                let attempt = match active
+                let mut attempt = match active
                     .prepare_attempt(
                         session,
                         request,
@@ -2162,6 +2198,7 @@ impl Agent<'_> {
                     }
                     Err(error) => return Err(error),
                 };
+                attempt.transformed |= projected_system;
                 let budget_request = attempt.reservation_request();
                 let capacity = active.context_capacity(budget_request, cancel).await?;
                 let input_tokens = capacity.map_or(0, |_| {
@@ -2170,7 +2207,7 @@ impl Agent<'_> {
                         session,
                         budget_request,
                         estimate,
-                        transformed,
+                        attempt.transformed,
                         attempt.configuration.as_deref(),
                     )
                 });
@@ -3229,6 +3266,7 @@ impl Agent<'_> {
             dispatch_context,
             prepared,
             transformed,
+            known_loadout: !transformed,
             configuration,
         })
     }
@@ -3249,6 +3287,7 @@ impl Agent<'_> {
             dispatch_context,
             prepared,
             transformed,
+            known_loadout,
             configuration,
         } = attempt;
         if cancel.is_cancelled() {
@@ -3258,6 +3297,14 @@ impl Agent<'_> {
         let allowance = request.max_output_tokens;
         let advertised_tools =
             retain_reply.then(|| request.tools.iter().map(|tool| tool.name.clone()).collect());
+        if retain_reply
+            && known_loadout
+            && self.model.uses_tool_transcript(&request.model)
+            && let Some(loadout) =
+                crate::tool_transcript::changed_loadout(&session.branch(), &declarations)
+        {
+            commit(session, loadout, observer)?;
+        }
         let context_head = session.head();
         let context_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&request)?));
         if !retain_reply {
@@ -7015,6 +7062,7 @@ struct PreparedAttempt<'a> {
     dispatch_context: crate::ToolDispatchContext,
     prepared: Option<Box<dyn crate::PreparedToolDispatch + 'a>>,
     transformed: bool,
+    known_loadout: bool,
     configuration: Option<String>,
 }
 
