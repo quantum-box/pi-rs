@@ -293,21 +293,23 @@ fn add_scope_matches(
     }
 }
 
-fn bare_scope_matches<'a>(reference: &str, catalogs: &'a [Catalog]) -> Vec<(&'a Catalog, &'a str)> {
-    let exact = exact_scope_matches(reference, None, catalogs);
-    if !exact.is_empty() {
-        return exact;
-    }
-    // Retain native exact display aliases ahead of other partial scope matches.
-    if let Some(exact_alias) = catalogs.iter().find_map(|catalog| {
+fn exact_scope_alias<'a>(
+    reference: &str,
+    catalogs: &'a [Catalog],
+) -> Option<(&'a Catalog, &'a str)> {
+    catalogs.iter().find_map(|catalog| {
         catalog
             .aliases
             .iter()
             .find(|(_, name)| name.eq_ignore_ascii_case(reference))
             .map(|(id, _)| (catalog, id.as_str()))
-    }) {
-        return vec![exact_alias];
-    }
+    })
+}
+
+fn fuzzy_scope_matches<'a>(
+    reference: &str,
+    catalogs: &'a [Catalog],
+) -> Vec<(&'a Catalog, &'a str)> {
     let query = reference.to_lowercase();
     if query.is_empty() {
         return Vec::new();
@@ -319,7 +321,7 @@ fn bare_scope_matches<'a>(reference: &str, catalogs: &'a [Catalog]) -> Vec<(&'a 
                 .models
                 .iter()
                 .filter(|id| fuzzy_model_matches(id, Some(catalog.display_name(id)), &query))
-                .map(|id| (catalog, id.as_str()))
+                .map(move |id| (catalog, id.as_str()))
         })
         .collect();
     let locale = super::locale::select(|name| std::env::var(name).ok());
@@ -353,7 +355,28 @@ fn add_bare_scope(
     let mut thinking = None;
     let mut invalid = None;
     loop {
-        let matches = bare_scope_matches(reference, catalogs);
+        let mut matches = exact_scope_matches(reference, None, catalogs);
+        let parsed_level = thinking_suffix(reference);
+        if matches.is_empty()
+            && let Some((base, level)) = parsed_level
+        {
+            matches = exact_scope_matches(base, None, catalogs);
+            if !matches.is_empty() {
+                thinking.get_or_insert(level);
+            }
+        }
+        if matches.is_empty() {
+            if let Some(alias) = exact_scope_alias(reference, catalogs) {
+                matches.push(alias);
+            } else if let Some((base, level)) = parsed_level
+                && let Some(alias) = exact_scope_alias(base, catalogs)
+            {
+                matches.push(alias);
+                thinking.get_or_insert(level);
+            } else {
+                matches = fuzzy_scope_matches(reference, catalogs);
+            }
+        }
         if !matches.is_empty() {
             if let Some(suffix) = invalid {
                 warnings.push(format!("Invalid thinking level \"{suffix}\" in pattern \"{pattern}\". Using default instead."));
@@ -957,6 +980,7 @@ mod tests {
                     "literal1",
                     "anthropic/same",
                     "alias-extra",
+                    "alias:high-next",
                     "widget-a",
                     "widget-z-20260101",
                     "duplicate-model",
@@ -1059,6 +1083,7 @@ mod tests {
             ("widget", vec!["anthropic/widget-z"]),
             ("widget:high", vec!["anthropic/widget-z:high"]),
             ("widget:high:low", vec!["anthropic/widget-z:low"]),
+            ("alias:high", vec!["anthropic/exact:high"]),
             (
                 "literal-suffix:high",
                 vec!["ollama/literal-suffix:high-next"],
