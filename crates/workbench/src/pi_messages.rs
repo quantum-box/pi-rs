@@ -897,6 +897,40 @@ fn terminal_metadata(
 
 #[cfg(test)]
 mod tool_status_tests {
+    #[test]
+    fn request_resize_preserves_replay_and_resizes_user_and_tool_images() {
+        use base64::Engine;
+        use std::io::Cursor;
+
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(40, 20)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let encoding = base64::engine::general_purpose::STANDARD;
+        let part = json!({"type":"image", "mimeType":"image/png", "data":encoding.encode(bytes.get_ref())});
+        let mut payload = json!({"context":{"messages":[
+            {"role":"user", "content":[{"type":"text", "text":"prompt"}, part]},
+            {"role":"toolResult", "content":[part]},
+            {"role":"assistant", "content":[part]}
+        ]}});
+        super::resize_request_images(
+            &mut payload,
+            super::ImageResizeProfile {
+                max_width: Some(16),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let messages = &payload["context"]["messages"];
+        for image in [&messages[0]["content"][1], &messages[1]["content"][0]] {
+            let decoded = encoding.decode(image["data"].as_str().unwrap()).unwrap();
+            let image = image::load_from_memory(&decoded).unwrap();
+            assert_eq!((image.width(), image.height()), (16, 8));
+        }
+        assert_eq!(messages[0]["content"][0]["text"], "prompt");
+        assert_eq!(messages[2]["content"][0], part);
+    }
+
     #[tokio::test]
     async fn auth_header_error_literals_are_not_classified() {
         use std::io::{Read, Write};
