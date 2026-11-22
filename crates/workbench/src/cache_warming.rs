@@ -35,10 +35,10 @@ enum Mode {
 
 impl Mode {
     fn from_settings(settings: &super::config::Settings) -> Self {
-        match settings.string("cacheWarming") {
-            Some("off") => Self::Off,
-            Some("idle") => Self::Idle,
-            _ => Self::Streaming,
+        match settings.cache_warming_mode() {
+            "off" => Self::Off,
+            "streaming" => Self::Streaming,
+            _ => Self::Idle,
         }
     }
 

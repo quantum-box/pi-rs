@@ -1414,6 +1414,7 @@ impl Client {
                         .unwrap_or(level)
                         .to_ascii_lowercase();
                     let xhigh = mapped == "xhigh"
+                        && !matches!(args.provider.id(), "google" | "google-vertex")
                         && pi_rs::google::model_thinking_levels(&args.model)
                             .iter()
                             .any(|level| level == "xhigh");
@@ -4150,6 +4151,23 @@ mod estimation_tests {
             let highest = zen.clone().with_model_options(&args, false).unwrap();
             assert!(highest.context_identity().is_some());
             assert_ne!(highest.context_identity(), high.context_identity());
+        }
+    }
+
+    #[test]
+    fn google_gemini_4_xhigh_is_rejected_like_pi_before_dispatch() {
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.thinking = Some("xhigh".into());
+        for provider in [Provider::Google, Provider::named("google-vertex").unwrap()] {
+            args.provider = provider;
+            for model in ["gemini-4-hydrogen", "gemini-4-neon"] {
+                args.model = model.into();
+                let base = Client::Google(Google::new("https://example.com", "fixture").unwrap());
+                let Err(pi_rs::Error::Config(error)) = base.with_model_options(&args, false) else {
+                    panic!("{model} should reject the xhigh mapping");
+                };
+                assert!(error.contains("unsupported Google thinking level mapping \"xhigh\""));
+            }
         }
     }
 

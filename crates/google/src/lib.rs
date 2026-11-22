@@ -3402,6 +3402,20 @@ mod tests {
             ),
             ("gemini-3.1-pro", None, None, Some(false), None),
             (
+                "gemini-4-carbon",
+                Some("medium"),
+                None,
+                Some(true),
+                Some(json!({"thinkingLevel":"MEDIUM","includeThoughts":true})),
+            ),
+            (
+                "gemini-robotics-er-2-preview",
+                Some("low"),
+                None,
+                Some(true),
+                Some(json!({"thinkingBudget":-1,"includeThoughts":true})),
+            ),
+            (
                 "custom-reasoner",
                 None,
                 None,

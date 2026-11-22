@@ -4295,6 +4295,13 @@ is an API base such as `https://generativelanguage.googleapis.com/v1beta`.
 The official endpoint can use `GEMINI_API_KEY`. Custom endpoints can use a
 matching profile key, saved key, or explicit `--api-key`.
 
+The direct Google catalog includes Pi AI 1.6.0's 26 chat models. Gemini 4
+Carbon, Hydrogen and Neon are in both Google catalogs. Gemini Robotics-ER 2
+Preview joins the Vertex catalog and uses a dynamic thinking budget by default.
+Pi AI 1.6.0 lists xhigh for Hydrogen and Neon, but its Gemini adapter rejects
+that mapping before sending a request. The native CLI follows the same
+validation. Live calls to these model additions were unverified.
+
 The adapter discovers chat models through the paginated Models API and
 streams text, thought summaries, and tool calls. It encodes image inputs and
 tool results, records measured usage including thought tokens, and preserves
@@ -5150,8 +5157,8 @@ updated catalogs was unverified.
 
 ### Google Vertex AI
 
-The native Google Vertex AI provider includes the 13 chat models from Pi AI
-1.5.0 and uses the Vertex publisher model endpoint. The Express API route
+The native Google Vertex AI provider includes the 17 chat models from Pi AI
+1.6.0 and uses the Vertex publisher model endpoint. The Express API route
 accepts `GOOGLE_CLOUD_API_KEY` or a saved key. Vertex projects can use
 Application Default Credentials through the installed Google Cloud CLI,
 including Pi-format saved project, location, and service-account file settings.
@@ -5211,10 +5218,10 @@ with a five-minute idle timeout. An ongoing response can finish on its
 existing connection.
 An explicit connection-limit rejection before output opens a new connection
 once. Stream error statuses distinguish retryable service failures from
-terminal account limits. The native HTTP fallback sends uncompressed JSON.
+terminal account limits. Native HTTP SSE uses a zstd-compressed JSON body
+when compression succeeds. The WebSocket request stays a JSON text frame.
 
-OpenAI Responses
-and Codex models with `compat.supportsOpenAIGrammarTools` advertise grammar
+OpenAI Responses and Codex models with `compat.supportsOpenAIGrammarTools` advertise grammar
 tools as custom tools. They choose a nonempty Lark definition before a regex
 definition and map streamed input onto the single required string argument.
 Replay uses the matching call and result item types for the tools advertised
@@ -5702,8 +5709,9 @@ supports `supportsExplicitPromptCacheMode`. Provider and model compatibility
 overrides can disable long retention. Summary requests remove configured cache
 fields and, for explicit-mode models, request explicit caching with no
 breakpoints. ChatGPT plan requests omit these API-specific options. Responses requests use the active session ID as their prompt cache key,
-clamped to 64 Unicode characters, and omit it for summary requests. Pi’s
-Responses session-routing headers remain unsupported.
+clamped to 64 Unicode characters, and omit it for summary requests. Responses
+session-routing headers follow the provider or model's session-affinity format
+and are omitted for summary requests.
 
 ### Native Messages cache control checkpoint
 
@@ -5814,13 +5822,16 @@ remain.
 
 ### Streaming prompt cache refresh checkpoint
 
-Persistent terminal and RPC workers default to warming eligible caches
-while the agent is waiting for the model or running tools. The worker
+Persistent terminal and RPC workers default to Pi 1.6's `idle` mode.
+This warms eligible caches while the agent is waiting for the model or
+running tools and can continue after the run settles. The worker
 records measured refresh usage against the current model request through
 the agent's journal writer. It cancels stale refreshes when context or
-the request changes. In idle mode the same timer or in-flight refresh
-can continue after the run settles. The terminal settings picker cycles
-through streaming, idle, and off.
+the request changes. An explicit `streaming` setting stops warming after
+the run settles. The terminal settings picker cycles through streaming,
+idle, and off. The worker, settings picker and session status all use
+the idle default when the user setting is absent. The native settings
+loader still reports an invalid mode as a configuration error.
 
 Anthropic models with published adaptive thinking can reuse their exact
 thinking options. Budgeted thinking is skipped because the one-token

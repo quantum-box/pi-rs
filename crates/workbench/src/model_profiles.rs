@@ -2127,7 +2127,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn vertex_catalog_and_model_endpoints_match_upstream() {
+    fn google_catalogs_and_vertex_model_endpoints_match_upstream() {
         let profiles = Profiles::parse(&json!({"providers":{"google-vertex":{
             "baseUrl":"https://relay.example/forward",
             "models":[{"id":"custom","baseUrl":"https://relay.example/v1beta1"}]
@@ -2143,16 +2143,46 @@ mod tests {
             profiles.model_endpoint(&provider, "custom"),
             Some("https://relay.example/v1beta1")
         );
-        assert_eq!(profiles.model_ids(&provider).len(), 14);
+        assert_eq!(profiles.model_ids(&provider).len(), 18);
         assert_eq!(
             Profiles::default().model_ids(&provider)[0],
             "gemini-3.1-pro-preview"
         );
-        assert!(
-            profiles
-                .model_ids(&provider)
-                .contains(&"gemini-4-argon".to_owned())
-        );
+        let default = Profiles::default();
+        assert_eq!(default.model_ids(&Provider::Google).len(), 26);
+        assert_eq!(default.model_ids(&provider).len(), 17);
+        for (provider, adapter) in [
+            (&Provider::Google, Adapter::Google),
+            (&provider, Adapter::GoogleVertex),
+        ] {
+            let small_output = if adapter == Adapter::Google {
+                32_768
+            } else {
+                65_536
+            };
+            for (id, cap) in [
+                ("gemini-4-argon", small_output),
+                ("gemini-4-carbon", small_output),
+                ("gemini-4-hydrogen", 65_536),
+                ("gemini-4-neon", 65_536),
+            ] {
+                assert_eq!(default.model_adapter(provider, id), adapter);
+                let model = default.model(provider, id).unwrap();
+                assert_eq!(model.context_window, Some(1_048_576));
+                assert_eq!(model.max_tokens, Some(cap));
+                assert_eq!(model.supports_images(), Some(true));
+                assert!(model.levels(adapter).unwrap().contains(&"medium".into()));
+            }
+        }
+        for provider in [&Provider::Google, &provider] {
+            let id = "gemini-robotics-er-2-preview";
+            assert!(default.model_ids(provider).iter().any(|model| model == id));
+            let model = default.model(provider, id).unwrap();
+            assert_eq!(model.context_window, Some(131_072));
+            assert_eq!(model.max_tokens, Some(65_536));
+            assert_eq!(model.reasoning, Some(true));
+            assert_eq!(model.supports_images(), Some(true));
+        }
     }
 
     #[test]
