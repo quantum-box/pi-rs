@@ -5270,8 +5270,10 @@ from Pi 1.6.0 via `/v1/systemone`. A saved Copilot subscription, a key saved
 for the official Copilot chat endpoint, or `COPILOT_GITHUB_TOKEN` makes it available. Discovery does not refresh the
 subscription or filter this classifier by the subscription's chat model list.
 Requests with a saved subscription use the token's official individual,
-business or enterprise Copilot host. Custom endpoints need their own scoped
-credentials. Live Copilot classifier requests were not verified.
+business or enterprise Copilot host. An unversioned custom base also uses
+`/v1/systemone` relative to its configured path. Native also accepts an
+explicit versioned base or classifier endpoint. Custom endpoints need their
+own scoped credentials. Live Copilot classifier requests were not verified.
 Native
 `models.json` also accepts configured entries with `type: "classifier"` or
 `type: "image"` for supported endpoints.

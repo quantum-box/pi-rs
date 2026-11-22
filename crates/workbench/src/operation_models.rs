@@ -570,15 +570,17 @@ impl Catalogue {
                     && (base.contains("{CLOUDFLARE_ACCOUNT_ID}")
                         || (configured.base_url.is_none() && provider["baseUrl"].is_null()));
                 let endpoint_for = |base: &str| {
-                    let base = if name == "github-copilot"
+                    let (base, endpoint) = operation_endpoints(base, api, cloudflare)?;
+                    if name == "github-copilot"
                         && matches!(api, Api::SystemOne)
-                        && base.trim_end_matches('/') == "https://api.individual.githubcopilot.com"
+                        && !base.path().ends_with("/v1")
+                        && base != endpoint
                     {
-                        official_base(&name).expect("official Copilot base")
+                        let versioned = format!("{}/v1", base.as_str().trim_end_matches('/'));
+                        operation_endpoints(&versioned, api, cloudflare)
                     } else {
-                        base
-                    };
-                    operation_endpoints(base, api, cloudflare)
+                        Ok((base, endpoint))
+                    }
                 };
                 let (base, endpoint) = endpoint_for(base)?;
                 let key_base = match &configured_binding {
@@ -1698,15 +1700,22 @@ mod tests {
             matches!(model.credential_with_env(&Keys::default(), api_key),
             Some(Credential::Literal(token)) if token == "fixture-env")
         );
-        let custom = json!({provider:{"baseUrl":"http://127.0.0.1:1/v1"}});
-        let custom = Catalogue::parse(custom.as_object().unwrap()).unwrap();
-        let custom = custom
-            .0
-            .iter()
-            .find(|model| model.provider == provider)
-            .unwrap();
-        assert!(!custom.is_official());
-        assert!(custom.credential_with_env(&oauth, api_key).is_none());
+        for base in [
+            "http://127.0.0.1:1/proxy/",
+            "http://127.0.0.1:1/proxy/v1",
+            "http://127.0.0.1:1/proxy/v1/systemone",
+        ] {
+            let custom = json!({provider:{"baseUrl":base}});
+            let custom = Catalogue::parse(custom.as_object().unwrap()).unwrap();
+            let custom = custom
+                .0
+                .iter()
+                .find(|model| model.provider == provider)
+                .unwrap();
+            assert_eq!(custom.endpoint.path(), "/proxy/v1/systemone");
+            assert!(!custom.is_official());
+            assert!(custom.credential_with_env(&oauth, api_key).is_none());
+        }
         let canonical = json!({provider:{"baseUrl":"https://api.individual.githubcopilot.com/"}});
         let canonical = Catalogue::parse(canonical.as_object().unwrap()).unwrap();
         assert!(
@@ -1725,13 +1734,13 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let base = format!("http://{}/proxy", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut stream = BufReader::new(stream);
             let mut line = String::new();
             stream.read_line(&mut line).await.unwrap();
-            assert_eq!(line, "POST /v1/systemone HTTP/1.1\r\n");
+            assert_eq!(line, "POST /proxy/v1/systemone HTTP/1.1\r\n");
             let mut headers = BTreeMap::new();
             loop {
                 line.clear();
