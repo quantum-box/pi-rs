@@ -1453,6 +1453,16 @@ impl View {
             .collect();
         self.append_entry(Entry::Notice(text));
     }
+    fn show_status(&mut self, mode: Option<TuiMode>, status: String) {
+        if (mode != Some(TuiMode::Regular) || self.regular.committed < self.lines.len())
+            && let Some(Entry::Status(previous)) = self.lines.last_mut()
+        {
+            *previous = status;
+        } else {
+            self.append_entry(Entry::Status(status));
+        }
+    }
+
     fn append_entry(&mut self, entry: Entry) {
         self.lines.push(entry);
         if self.lines.len() > 4000 {
@@ -3154,8 +3164,8 @@ impl View {
         };
         let modal = self.picker.is_some() || self.dialog().is_some();
         let committing = !busy && !modal;
-        // A trailing cycle notice can still be replaced by another cycle.
-        let trailing_status = matches!(self.lines.last(), Some(Entry::ModelCycleStatus(_)));
+        // A trailing status can still be replaced by another status.
+        let trailing_status = matches!(self.lines.last(), Some(Entry::Status(_)));
         let commit_end = if committing {
             (self.lines.len() - usize::from(trailing_status)).max(self.regular.committed)
         } else {
@@ -6255,19 +6265,37 @@ pub(super) async fn run(
                     }
                     "app.thinking.cycle" if !is_busy(&worker) => {
                         match super::thinking::cycle(&mut args) {
-                            Ok(Some(level)) => view.append(&format!("Thinking level: {level}")),
-                            Ok(None) => view.append("Current model does not support thinking"),
+                            Ok(Some(level)) => {
+                                view.show_status(args.tui_mode, format!("Thinking level: {level}"));
+                            }
+                            Ok(None) => view.show_status(
+                                args.tui_mode,
+                                "Current model does not support thinking".into(),
+                            ),
                             Err(error) => view.append(&error.to_string()),
                         }
                     }
-                    "app.tools.expand" => view.set_expand_tools(!view.expand_tools),
+                    "app.tools.expand" => {
+                        view.set_expand_tools(!view.expand_tools);
+                        let state = if view.expand_tools {
+                            "expanded"
+                        } else {
+                            "collapsed"
+                        };
+                        view.show_status(args.tui_mode, format!("Tool output: {state}"));
+                    }
                     "app.thinking.toggle" => {
                         let hidden = !view.hide_thinking;
                         view.set_hide_thinking(hidden);
-                        if let Err(error) =
-                            args.settings.set_user("hideThinkingBlock", json!(hidden))
-                        {
-                            view.append(&error.to_string());
+                        match args.settings.set_user("hideThinkingBlock", json!(hidden)) {
+                            Ok(()) => {
+                                let state = if hidden { "hidden" } else { "visible" };
+                                view.show_status(
+                                    args.tui_mode,
+                                    format!("Thinking blocks: {state}"),
+                                );
+                            }
+                            Err(error) => view.append(&error.to_string()),
                         }
                     }
                     "app.clipboard.pasteImage" => view.paste_clipboard(&args),
@@ -6863,14 +6891,7 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     } else {
         "Only one model in scope".into()
     };
-    // A normal terminal has already printed committed rows to its scrollback.
-    if (args.tui_mode != Some(TuiMode::Regular) || view.regular.committed < view.lines.len())
-        && let Some(Entry::ModelCycleStatus(previous)) = view.lines.last_mut()
-    {
-        *previous = status;
-    } else {
-        view.append_entry(Entry::ModelCycleStatus(status));
-    }
+    view.show_status(args.tui_mode, status);
     Ok(())
 }
 

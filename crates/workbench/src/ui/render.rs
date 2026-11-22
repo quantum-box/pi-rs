@@ -261,7 +261,7 @@ pub enum SummaryKind {
 #[derive(Clone)]
 pub enum Entry {
     Notice(String),
-    ModelCycleStatus(String),
+    Status(String),
     Warning(String),
     User(String),
     Skill {
@@ -329,7 +329,7 @@ impl Entry {
         let inner = width.saturating_sub(2 * padding).max(1);
         let mut lines = match self {
             Self::Notice(text) => return wrap(&[Span::themed(text, theme, "muted")], width),
-            Self::ModelCycleStatus(text) => {
+            Self::Status(text) => {
                 let mut lines = vec![Line::default()];
                 let inset = usize::from(width >= 3);
                 lines.extend(wrap(&[Span::themed(text, theme, "dim")], width - 2 * inset));
