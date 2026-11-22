@@ -3958,6 +3958,121 @@ fn check_streaming_tree_navigation(mode: &str) {
 }
 
 #[test]
+fn vertex_login_saves_service_account_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let credentials_file = root.path().join("service-account.json");
+    std::fs::write(&credentials_file, "{}").unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: 32,
+        ws_col: 110,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let _process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .args([
+                "--no-trust",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                "fixture",
+                "--tui-mode",
+                "fullscreen",
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| text.contains("Enter to send"));
+    master.write_all(b"/login google-vertex\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Service account credentials file")
+    });
+    master.write_all(b"\r").unwrap();
+    output_until(&mut master, |text| text.contains("google-vertex API key"));
+    master.write_all(b"fixture-key\r").unwrap();
+    output_until(&mut master, |text| {
+        assert!(!text.contains("fixture-key"));
+        text.contains("API key saved for google-vertex")
+    });
+    let auth: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["google-vertex"]["key"], "fixture-key");
+    master.write_all(b"/login google-vertex\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Service account credentials file")
+    });
+    master.write_all(b"\x1b[B\x1b[B\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Enter Google Cloud project ID")
+    });
+    master.write_all(b"project-id\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Enter Google Cloud location")
+    });
+    master.write_all(b"us-central1\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Enter service account credentials file path")
+    });
+    master.write_all(b"service-account.json\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("Google Vertex AI credentials saved")
+    });
+
+    let auth: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("auth.json")).unwrap()).unwrap();
+    let entry = &auth["google-vertex"];
+    let saved_file = std::path::Path::new(
+        entry["env"]["GOOGLE_APPLICATION_CREDENTIALS"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(saved_file.is_absolute());
+    assert_eq!(
+        saved_file.canonicalize().unwrap(),
+        credentials_file.canonicalize().unwrap()
+    );
+    assert_eq!(
+        *entry,
+        serde_json::json!({
+            "type": "api_key",
+            "env": {
+                "GOOGLE_CLOUD_PROJECT": "project-id",
+                "GOOGLE_CLOUD_LOCATION": "us-central1",
+                "GOOGLE_APPLICATION_CREDENTIALS": saved_file,
+            },
+        })
+    );
+}
+
+#[test]
 fn external_editor_ctrl_c_does_not_cancel_active_backend_shell() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
