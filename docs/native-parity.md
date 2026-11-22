@@ -4038,11 +4038,24 @@ native read tool round trip, usage and RPC. Live account sign-in and provider sw
 ### Anthropic thinking checkpoint
 
 Budgeted Anthropic Messages requests use Pi's interleaved-thinking beta by
-default. An explicit `anthropic-beta` header overrides the defaults, including
-for OAuth. Adaptive and disabled thinking do not add the interleaved beta.
+default. An explicit `anthropic-beta` header overrides the optional defaults,
+including for OAuth. Adaptive and disabled thinking do not add the interleaved beta.
 Embedders can opt out of interleaving or request omitted thinking text while
 retaining its replay signature. Loopback requests verified the header and
 payload. Live authenticated interleaved thinking was unverified.
+
+Anthropic Messages uses per-reply effort for the five Anthropic and four
+OpenRouter models marked `supportsMidConvoEffort` in Pi v1.5.0. The top-level
+effort stays low while system messages set the historical and active reply
+levels. Adaptive thinking drops signed blocks whose cached prefix no longer
+matches. Explicit off omits effort messages and block binding on models that
+can disable thinking. For models with an explicit null off mapping, an unset
+level uses Pi's default high effort. Sessions retain effort and signed
+thinking with route-scoped replay. RPC exposes the effort level. Native
+requests include the betas required for managed effort even when a profile
+provides a custom beta header. Loopback
+tests exercised a level change, disabled thinking, and the default effort.
+Live authenticated managed-effort requests were unverified.
 
 Native Anthropic streams expose individual text and thinking block boundaries,
 and show redacted thinking as `[Reasoning redacted]` while retaining its opaque
@@ -4844,7 +4857,8 @@ catalogues are projected from the published
 
 ### Cloudflare Workers AI chat checkpoint
 
-Cloudflare Workers AI exposes the 19 pinned chat models via Chat Completions.
+Cloudflare Workers AI exposes the 20 chat models from Pi AI v1.6.0 via Chat
+Completions, including Inkling 2 Small.
 `CLOUDFLARE_ACCOUNT_ID` selects the account and `CLOUDFLARE_API_KEY` authorizes
 requests. Terminal `/login cloudflare-workers-ai` prompts for a masked API
 key and the account ID for routes derived from login or environment settings. Pi-format saved credentials may declare an account through their
@@ -4856,7 +4870,9 @@ credentials also apply to chat. Live Workers AI inference has not been verified.
 
 ### Cloudflare AI Gateway
 
-Cloudflare AI Gateway includes the 59 pinned Pi AI chat models. It uses
+Cloudflare AI Gateway includes the 63 chat models from Pi AI v1.6.0. New
+entries route Claude Fable 5.2 to Messages, Inkling 2 Small to Chat
+Completions, and GPT-6.2 Astra and Sol to Responses. It uses
 the account and gateway identifiers in `CLOUDFLARE_ACCOUNT_ID` and
 `CLOUDFLARE_GATEWAY_ID`, or their equivalents in a Pi-format saved
 credential. `CLOUDFLARE_API_KEY` supplies the gateway token. The model's API
