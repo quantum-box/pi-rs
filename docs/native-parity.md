@@ -770,10 +770,13 @@ journals without a turn marker retain their prior history projection. Native
 history retains text only, so interrupted thinking and incomplete tool-call
 blocks are not reconstructed after reopen.
 
-`get_last_assistant_text` and `/copy` use the active transcript. Both skip
-empty aborted assistant messages, concatenate the selected message's text
-blocks, and trim the result. The RPC response omits `text` when the selected
-message has no text or the transcript has no eligible assistant message.
+`get_last_assistant_text` and the terminal copy actions use the active
+transcript. They skip assistant replies without visible text after an
+interruption, error, tool call, or token limit. A partial reply with visible
+text remains eligible. A normally completed reply remains the latest reply even
+when it has no text, matching Pi v1.6.0. The selected message's text blocks are
+concatenated and trimmed. The RPC response omits `text` when the result is empty
+or the transcript has no eligible assistant message.
 
 `clone` requires a visible session leaf and returns `cancelled` on success.
 `fork` also returns the selected user text. Pass `includeNative: true` on
