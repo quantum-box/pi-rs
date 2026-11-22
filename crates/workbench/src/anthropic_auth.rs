@@ -318,14 +318,14 @@ where
             return Err(error("cannot refresh credentials in a read-only store"));
         }
     };
-    let stored = super::config::read_object_unlocked(&path)?;
+    let stored = super::config::read_auth_object_locked(&guard)?;
     let value = parse(&stored)?.ok_or_else(|| error("credentials not configured"))?;
     let previous = stored["anthropic"].clone();
     guard.check()?;
     if no_refresh || !expires_soon(&value, window) {
         return Ok(value.access);
     }
-    tokio::task::spawn_blocking(move || {
+    super::model_auth::await_admitted_oauth_refresh(Some("anthropic"), move |admitted| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -333,6 +333,7 @@ where
         let service = service()?;
         let barrier = super::process::refresh_barrier()?;
         let guard = super::process::guard_refresh_auth(barrier, guard);
+        let _ = admitted.send(());
         let value = runtime.block_on(service.refresh(&value))?;
         super::config::update_object_locked(&path, Some(&guard), |data| {
             let current = data
@@ -352,7 +353,6 @@ where
         Ok(value.access)
     })
     .await
-    .map_err(|_| error("refresh task failed"))?
 }
 pub(super) async fn access(
     settings: &super::config::Settings,
