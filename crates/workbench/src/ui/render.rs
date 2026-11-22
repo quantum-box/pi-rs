@@ -574,55 +574,73 @@ impl Entry {
                     })
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                let mut title = Span::themed(format!("{name} {detail}"), theme, "toolTitle");
-                title.bold = true;
-                let mut lines = wrap(&[title], inner);
-                let output_lines: Vec<_> = output.lines().collect();
-                let limit = if expand_tools { output_lines.len() } else { 10 };
-                let render_text = |text: &str, lines: &mut Vec<Line>| {
-                    if *numbered_diff {
-                        lines.extend(super::diff::render_numbered(text, theme, inner));
-                    } else if name == "edit" {
-                        lines.extend(super::diff::render(text, theme, inner));
-                    } else {
-                        for text in text.split('\n') {
-                            lines.extend(wrap(&[Span::themed(text, theme, "toolOutput")], inner));
-                        }
-                    }
-                };
-                if expand_tools
-                    && !parts.is_empty()
-                    && let Some(limit) = options.image_width
-                {
-                    for part in parts {
-                        match part {
-                            ToolPart::Text(text) => render_text(text, &mut lines),
-                            ToolPart::Image(image) => {
-                                lines.extend(image.lines(width, limit, padding))
+                let mut lines = if *numbered_diff {
+                    let mut tool = Span::themed(name, theme, "toolTitle");
+                    tool.bold = true;
+                    let path = arguments
+                        .as_ref()
+                        .and_then(|args| args.get("file_path").and_then(serde_json::Value::as_str))
+                        .unwrap_or(detail);
+                    let path = Span::themed(format!(" {path}"), theme, "accent");
+                    let mut lines = vec![Line::default()];
+                    lines.extend(wrap(&[tool, path], inner));
+                    lines.push(Line::default());
+                    lines.extend(super::diff::render_numbered(output, theme, inner));
+                    lines.push(Line::default());
+                    lines
+                } else {
+                    let mut title = Span::themed(format!("{name} {detail}"), theme, "toolTitle");
+                    title.bold = true;
+                    let mut lines = wrap(&[title], inner);
+                    let output_lines: Vec<_> = output.lines().collect();
+                    let limit = if expand_tools { output_lines.len() } else { 10 };
+                    let render_text = |text: &str, lines: &mut Vec<Line>| {
+                        if name == "edit" {
+                            lines.extend(super::diff::render(text, theme, inner));
+                        } else {
+                            for text in text.split('\n') {
+                                lines.extend(wrap(
+                                    &[Span::themed(text, theme, "toolOutput")],
+                                    inner,
+                                ));
                             }
                         }
+                    };
+                    if expand_tools
+                        && !parts.is_empty()
+                        && let Some(limit) = options.image_width
+                    {
+                        for part in parts {
+                            match part {
+                                ToolPart::Text(text) => render_text(text, &mut lines),
+                                ToolPart::Image(image) => {
+                                    lines.extend(image.lines(width, limit, padding))
+                                }
+                            }
+                        }
+                    } else {
+                        let visible = output_lines
+                            .iter()
+                            .take(limit)
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !visible.is_empty() {
+                            render_text(&visible, &mut lines);
+                        }
                     }
-                } else {
-                    let visible = output_lines
-                        .iter()
-                        .take(limit)
-                        .copied()
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if !visible.is_empty() {
-                        render_text(&visible, &mut lines);
+                    if output_lines.len() > limit {
+                        lines.push(Line::themed(
+                            &format!(
+                                "… {} more lines (ctrl+o to expand)",
+                                output_lines.len() - limit
+                            ),
+                            theme,
+                            "dim",
+                        ));
                     }
-                }
-                if output_lines.len() > limit {
-                    lines.push(Line::themed(
-                        &format!(
-                            "… {} more lines (ctrl+o to expand)",
-                            output_lines.len() - limit
-                        ),
-                        theme,
-                        "dim",
-                    ));
-                }
+                    lines
+                };
                 for line in &mut lines {
                     line.background = Some(theme.color(role));
                 }
@@ -4661,6 +4679,59 @@ mod tests {
             markdown("---", &theme, 120)[0].spans[0].text.len() / "─".len(),
             80
         );
+    }
+
+    #[test]
+    fn completed_numbered_edits_keep_the_pi_panel_layout_when_tools_collapse() {
+        let theme = Theme::system();
+        let output = (1..=14)
+            .map(|number| format!("+{number:>2} content-{number}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry = Entry::Tool {
+            id: "edit-14".into(),
+            name: "edit".into(),
+            arguments: r#"{"file_path":"sample.txt"}"#.into(),
+            output,
+            failed: false,
+            finished: true,
+            numbered_diff: true,
+            parts: Vec::new(),
+        };
+        let render = |expanded| {
+            entry.render(
+                &theme,
+                48,
+                expanded,
+                true,
+                TranscriptOptions {
+                    padding: 1,
+                    ..Default::default()
+                },
+            )
+        };
+        let collapsed = render(false);
+        let expanded = render(true);
+        assert_eq!(collapsed.len(), expanded.len());
+        for (collapsed, expanded) in collapsed.iter().zip(expanded) {
+            assert_eq!(collapsed.spans, expanded.spans);
+            assert_eq!(collapsed.background, expanded.background);
+        }
+        let text = collapsed
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(text[..4], ["", " edit sample.txt", "", " + 1 content-1"]);
+        assert_eq!(text[16..], [" +14 content-14", "", ""]);
+        assert!(collapsed[1].spans[1].bold);
+        assert_eq!(collapsed[1].spans[2].color, theme.color("accent"));
+        assert_eq!(collapsed[17].background, Some(theme.color("toolSuccessBg")));
+        assert!(collapsed[18].background.is_none());
     }
 
     #[test]

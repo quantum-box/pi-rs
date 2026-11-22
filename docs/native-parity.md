@@ -2349,6 +2349,9 @@ and word comparison follows Pi's `diffWords` token grouping and whitespace
 deduplication, including the first changed fragment's indentation treatment.
 Numbered diff gutters use JavaScript's whitespace and line-terminator rules,
 including its treatment of BOM and U+0085.
+Completed edits show the full bounded numbered diff in the call panel,
+separated from the title by a blank row. Tool expansion leaves this diff
+layout intact, as in Pi v1.5.0.
 Comparison has a shared 100 ms budget per render; oversized or unfinished
 comparisons retain line-level highlighting. The Rust word-diff implementation
 derives from jsdiff 8.0.4; its BSD license is in
