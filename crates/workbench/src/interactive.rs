@@ -2263,7 +2263,7 @@ impl View {
             }
             return;
         }
-        let rendered_parts = if self.graphics.enabled() {
+        let mut rendered_parts = if self.graphics.enabled() {
             match outcome {
                 pi_rs::Outcome::Structured { data, .. }
                 | pi_rs::Outcome::StructuredWithDetails { data, .. } => data["content"]
@@ -2307,6 +2307,14 @@ impl View {
             .rev()
             .find(|entry| matches!(entry, Entry::Tool { id, .. } if id == operation))
         {
+            if name == "read"
+                && let pi_rs::Outcome::StructuredWithDetails { details, .. } = outcome
+                && let Some(model) = details["imageUnsupportedByModel"].as_str()
+            {
+                rendered_parts.push(ToolPart::Warning(format!(
+                    "[{model} does not support images; it saw a placeholder instead]"
+                )));
+            }
             *parts = rendered_parts;
             let diff = match outcome {
                 pi_rs::Outcome::SucceededWithDetails { details, .. }
@@ -10307,6 +10315,45 @@ mod tests {
             dialog.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &keys),
             Some(pi_rs::UiResponse::Cancelled)
         );
+    }
+
+    #[test]
+    fn read_image_model_warning_renders_when_collapsed_or_expanded() {
+        use super::{Theme, View, json};
+        let operation_id = uuid::Uuid::new_v4();
+        let mut view = View::default();
+        view.add_tool(&pi_rs::Invocation {
+            operation_id,
+            call: pi_rs::ToolCall {
+                id: "fixture".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"image.png"}"#.into(),
+            },
+        });
+        view.finish_tool(
+            &operation_id.to_string(),
+            &pi_rs::Outcome::StructuredWithDetails {
+                attachments: vec![],
+                data: json!({"content":[{"type":"text", "text":"Read image file [image/png]"}]}),
+                details: json!({"imageUnsupportedByModel":"text-only"}),
+            },
+        );
+        let theme = Theme::system();
+        let entry = view.lines.last().unwrap();
+        for expanded in [false, true] {
+            let lines = entry.render(&theme, 96, expanded, true, Default::default());
+            assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+                span.text == "[text-only does not support images; it saw a placeholder instead]"
+                    && span.color == theme.color("warning")
+            }));
+            assert_eq!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.text.contains("Read image file")),
+                expanded
+            );
+        }
     }
 
     #[test]
