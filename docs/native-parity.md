@@ -3671,16 +3671,24 @@ RPC supports `set_auto_retry` and `abort_retry`, with `auto_retry_start` and
 error. The initial OpenAI Responses (including Azure), OpenAI-compatible Chat
 Completions, and Anthropic Messages HTTP requests honor `retry.provider.maxRetries`
 (default 0), `maxRetryDelayMs` (default 60000, 0 disables the ceiling), and
-`timeoutMs` (to receive response headers on each attempt). They honor `x-should-retry`, `Retry-After-Ms`, and
-`Retry-After` before accepting a response stream. As in Pi 1.6, this opt-in
+`timeoutMs` (to receive response headers on each attempt). They honor
+`x-should-retry`, `Retry-After-Ms`, and `Retry-After` before accepting a response
+stream. As in Pi 1.6, this opt-in
 policy uses HTTP retry hints and status before processing the error body. The
 agent still uses the final provider error to distinguish quota exhaustion and
 other permanent failures. A server delay above the ceiling stops the provider
 retry and can trigger the agent's separately configured retry. Native reports
 the requested delay and ceiling without echoing the provider body. This policy
 also loads legacy
-`retry.maxDelayMs` when the replacement is unset. Google Gemini and Codex-specific
-provider retries and summary-specific retry policy remain open.
+`retry.maxDelayMs` when the replacement is unset.
+
+The Codex HTTP stream applies the same configured attempt count, deadline, and
+delay ceiling using Codex's own policy. It uses exponential backoff from one
+second and handles numeric or HTTP-date retry delays before accepting the stream.
+Native keeps its bounded, redacted error handling and stops immediately for
+permanent quota errors, context overflow, and oversized requests. Codex
+WebSocket timeouts, Google
+Gemini provider retries, and summary-specific retry policy remain open.
 
 Tests cover recovery, request and retry caps, queued input, wait cancellation,
 dropped-wait cleanup and usage-settlement failures. Loopback RPC checks verify
@@ -5491,8 +5499,10 @@ matches the previous conversation. `websocket` sends the full history on
 the connection, and `sse` uses HTTP directly. WebSocket requests omit the
 HTTP-only `stream` flag as specified by the [Responses WebSocket protocol](https://developers.openai.com/api/reference/resources/responses/websocket-events).
 An unavailable WebSocket
-upgrade falls back to HTTP SSE before any inference request is sent. Native
-provider-response hooks receive the sanitized HTTP handshake status and
+upgrade falls back to HTTP SSE before any inference request is sent.
+`websocketConnectTimeoutMs` controls the opening deadline independently of
+`httpIdleTimeoutMs`. It defaults to 15000 and accepts 0 or `"disabled"` to
+remove the opening deadline. Native provider-response hooks receive the sanitized HTTP handshake status and
 headers when a connection is opened. An upgrade failure or interrupted
 WebSocket response makes later attempts use SSE for up to a minute, including
 with prompt-cache retention disabled. With no session key, the cooldown
@@ -6429,11 +6439,17 @@ metadata is forwarded to AWS for service-side validation. The effective options
 are part of the protected prepared-request identity. Published Pi and signed
 loopback requests verified the payload; live AWS verification was unavailable.
 
-Not yet supported: non-image multimodal inputs, workbench-specific thinking
-display controls, guardrails, prompt management ARNs, live account-specific
-model discovery, and workbench proxy/idle-timeout settings. Custom model endpoints in workbench configuration are rejected;
-callers embedding the adapter can pass a configured AWS SDK client, including a
-test endpoint, through `Bedrock::new`.
+The workbench applies `httpProxy`, proxy environment variables, and
+`NO_PROXY` exclusions to Bedrock Runtime and supported AWS credential
+requests. Instance and container metadata endpoints use direct connections.
+Loopback CLI tests cover proxy selection, role assumption, metadata bypass,
+and CONNECT authentication. The AWS SDK retains its own HTTP timeouts.
+
+Additional Bedrock features remain outside this workbench integration,
+including non-image inputs, workbench-specific thinking display controls,
+guardrails, prompt management ARNs, and live account-specific model discovery.
+Workbench model profiles reject custom Bedrock endpoints. Embedders can
+provide a configured AWS SDK client through `Bedrock::new`.
 
 ### External editor result
 
