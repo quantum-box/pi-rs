@@ -30,6 +30,7 @@ pub(super) enum Provider {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Adapter {
     ChatCompletions,
+    MistralConversations,
     OpenAiResponses,
     CodexResponses,
     Anthropic,
@@ -42,6 +43,7 @@ impl Adapter {
     pub fn named(api: &str) -> Option<Self> {
         match api {
             "openai-completions" => Some(Self::ChatCompletions),
+            "mistral-conversations" => Some(Self::MistralConversations),
             "openai-responses" => Some(Self::OpenAiResponses),
             "openai-codex-responses" => Some(Self::CodexResponses),
             "anthropic-messages" => Some(Self::Anthropic),
@@ -55,6 +57,7 @@ impl Adapter {
     pub fn api(self) -> &'static str {
         match self {
             Self::ChatCompletions => "openai-completions",
+            Self::MistralConversations => "mistral-conversations",
             Self::OpenAiResponses => "openai-responses",
             Self::CodexResponses => "openai-codex-responses",
             Self::Anthropic => "anthropic-messages",
@@ -193,7 +196,17 @@ impl Provider {
                     pi_rs::openai::OpenAiResponses::new_api_provider(endpoint, token, self.id())?
                 }))
             }
+            Adapter::MistralConversations => Ok(Client::Ollama(
+                Ollama::new(endpoint, Some(token.ok_or_else(missing_key)?))?
+                    .with_provider(self.id())
+                    .with_mistral(false, false, None),
+            )),
             Adapter::ChatCompletions => {
+                if self.id() == "cloudflare-ai-gateway" && endpoint.is_empty() {
+                    return Err(Error::Config(
+                        "set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_GATEWAY_ID for cloudflare-ai-gateway".into(),
+                    ));
+                }
                 if self.id() == "cloudflare-workers-ai" && endpoint.is_empty() {
                     return Err(Error::Config(
                         "set CLOUDFLARE_ACCOUNT_ID for cloudflare-workers-ai".into(),
@@ -201,7 +214,9 @@ impl Provider {
                 }
                 if token.is_none()
                     && let Some(builtin) = super::builtin_chat::find(self.id())
-                    && (builtin.endpoint() == endpoint
+                    && (builtin.is_default_endpoint(endpoint)
+                        || (self.id() == "cloudflare-ai-gateway"
+                            && super::cloudflare_gateway::Route::is_endpoint(endpoint))
                         || (self.id() == "cloudflare-workers-ai"
                             && super::model_profiles::cloudflare_workers_chat_account(endpoint)
                                 .is_some()))
@@ -218,7 +233,9 @@ impl Provider {
             }
             Adapter::Anthropic => {
                 let token = token.ok_or_else(missing_key)?;
-                let mut client = if self == &Self::Anthropic && token.contains("sk-ant-oat") {
+                let mut client = if self.id() == "cloudflare-ai-gateway" {
+                    Anthropic::with_cloudflare_gateway_token(endpoint, &token)?
+                } else if self == &Self::Anthropic && token.contains("sk-ant-oat") {
                     Anthropic::with_oauth_token(endpoint, &token)?
                 } else if bearer
                     || matches!(
@@ -401,15 +418,7 @@ impl Deferred {
                     Some(settings) => settings.clone(),
                     None => super::config::Settings::load(&std::env::current_dir()?, false)?,
                 };
-                Some(
-                    super::codex_auth::access(
-                        auth_path,
-                        &settings,
-                        std::time::Duration::ZERO,
-                        false,
-                    )
-                    .await?,
-                )
+                Some(super::codex_auth::access(auth_path, &settings, None, false).await?)
             }
             Some(Credential::Copilot) => {
                 let settings = match &self.http_settings {
@@ -510,24 +519,55 @@ impl Client {
             Self::OpenAi(_) | Self::Ollama(_) => true,
             Self::Deferred(client) => matches!(
                 client.adapter,
-                Adapter::OpenAiResponses | Adapter::CodexResponses | Adapter::ChatCompletions
+                Adapter::OpenAiResponses
+                    | Adapter::CodexResponses
+                    | Adapter::ChatCompletions
+                    | Adapter::MistralConversations
             ),
             _ => false,
         }
     }
 
-    pub(super) async fn with_final_strict_support(self, supported: bool) -> Result<Self> {
+    pub(super) async fn with_final_tool_support(
+        self,
+        strict: Option<bool>,
+        grammar: Option<bool>,
+    ) -> Result<Self> {
         Ok(match self {
-            Self::Ollama(client) => Self::Ollama(client.with_strict_tool_support(supported)),
-            Self::OpenAi(client) => Self::OpenAi(client.with_strict_tool_support(supported)),
+            Self::Ollama(mut client) => {
+                if let Some(supported) = strict {
+                    client = client.with_strict_tool_support(supported);
+                }
+                if let Some(supported) = grammar {
+                    client = client.with_grammar_tool_support(supported);
+                }
+                Self::Ollama(client)
+            }
+            Self::OpenAi(mut client) => {
+                if let Some(supported) = strict {
+                    client = client.with_strict_tool_support(supported);
+                }
+                if let Some(supported) = grammar {
+                    client = client.with_grammar_tool_support(supported);
+                }
+                Self::OpenAi(client)
+            }
             Self::Deferred(client)
                 if matches!(
                     client.adapter,
-                    Adapter::OpenAiResponses | Adapter::CodexResponses | Adapter::ChatCompletions
+                    Adapter::OpenAiResponses
+                        | Adapter::CodexResponses
+                        | Adapter::ChatCompletions
+                        | Adapter::MistralConversations
                 ) =>
             {
-                return Box::pin(client.resolve().await?.with_final_strict_support(supported))
-                    .await;
+                return Box::pin(
+                    client
+                        .resolve()
+                        .await?
+                        .with_final_tool_support(strict, grammar),
+                )
+                .await;
             }
             other => other,
         })
@@ -541,6 +581,7 @@ impl Client {
                 Adapter::OpenAiResponses
                     | Adapter::CodexResponses
                     | Adapter::ChatCompletions
+                    | Adapter::MistralConversations
                     | Adapter::Google
                     | Adapter::Anthropic
             ),
@@ -942,6 +983,7 @@ impl Client {
                     Adapter::OpenAiResponses
                         | Adapter::CodexResponses
                         | Adapter::ChatCompletions
+                        | Adapter::MistralConversations
                         | Adapter::Google
                         | Adapter::Anthropic
                 ) =>
@@ -1086,6 +1128,40 @@ impl Client {
         Ok(match self {
             Self::Ollama(client) => {
                 let configured = args.model_profiles.model(&args.provider, &args.model);
+                let mistral = args
+                    .model_profiles
+                    .model_adapter(&args.provider, &args.model)
+                    == Adapter::MistralConversations;
+                let client = if mistral {
+                    let thinking_enabled = thinking.is_some_and(|level| level != "off");
+                    let reasoning_allowed = configured
+                        .as_ref()
+                        .is_some_and(|model| model.reasoning == Some(true));
+                    let has_map = configured
+                        .as_ref()
+                        .is_some_and(|model| model.has_thinking_map());
+                    let effort = configured
+                        .as_ref()
+                        .filter(|_| reasoning_allowed && has_map)
+                        .and_then(|model| {
+                            let level = thinking.unwrap_or("off");
+                            model
+                                .mapped_effort(level)
+                                .flatten()
+                                .or(thinking_enabled.then_some("high"))
+                        });
+                    let images = configured
+                        .as_ref()
+                        .and_then(|model| model.supports_images())
+                        == Some(true);
+                    client.with_mistral(
+                        images,
+                        reasoning_allowed && !has_map && thinking_enabled,
+                        effort,
+                    )
+                } else {
+                    client
+                };
                 let retention = args
                     .model_profiles
                     .chat_cache_support(&args.provider, &args.model, configured.as_ref())
@@ -1100,7 +1176,7 @@ impl Client {
                 );
                 let client = client
                     .with_cache_retention(retention)
-                    .with_prompt_cache_policy(key_enabled, long);
+                    .with_prompt_cache_policy(key_enabled || mistral, long && !mistral);
                 let mapped = configured.as_ref().and_then(|model| {
                     let level = thinking.or((model.reasoning == Some(true)).then_some("off"))?;
                     model.mapped_effort(level)
@@ -1115,6 +1191,8 @@ impl Client {
                 let compatibility = args
                     .model_profiles
                     .chat_compatibility(&args.provider, configured.as_ref());
+                let default_mistral_strict =
+                    mistral && compatibility.supports_strict_mode().is_none();
                 let client = client.with_chat_compatibility(
                     compatibility,
                     super::thinking::adopted_reasoning(args),
@@ -1123,6 +1201,11 @@ impl Client {
                         .as_ref()
                         .is_none_or(|model| model.mapped_effort("off") != Some(None)),
                 );
+                let client = if default_mistral_strict {
+                    client.with_strict_tool_support(true)
+                } else {
+                    client
+                };
                 let sampling = configured
                     .map(|model| model.sampling(thinking.unwrap_or("off")))
                     .unwrap_or_default();
@@ -1144,7 +1227,14 @@ impl Client {
                 let strict = args
                     .model_profiles
                     .anthropic_strict_tool_support(&args.provider, metadata.as_ref());
+                let (eager_default, eager_models) =
+                    args.model_profiles.anthropic_eager_tool_input_policy(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
+                    );
                 let mut client = client
+                    .with_eager_tool_input_streaming(eager_default, eager_models)
                     .with_strict_tool_support(strict)
                     .with_strict_tool_models(args.model_profiles.anthropic_strict_tool_models(
                         &args.provider,
@@ -1345,13 +1435,12 @@ impl Client {
                 let (supports_long, explicit_cache) = args
                     .model_profiles
                     .responses_cache_support(&args.provider, metadata.as_ref());
-                let supports_developer = args
+                let compat = args
                     .model_profiles
-                    .chat_compatibility(&args.provider, metadata.as_ref())
-                    .supports_developer_role();
+                    .chat_compatibility(&args.provider, metadata.as_ref());
                 let use_developer = metadata.as_ref().and_then(|model| model.reasoning)
                     == Some(true)
-                    && supports_developer != Some(false);
+                    && compat.supports_developer_role() != Some(false);
                 let client = if args
                     .model_profiles
                     .model_adapter(&args.provider, &args.model)
@@ -1369,11 +1458,18 @@ impl Client {
                     client
                 };
                 let client = client
+                    .with_max_output_tokens_field(
+                        args.model_profiles
+                            .responses_max_output_tokens(&args.provider, metadata.as_ref()),
+                    )
                     .with_developer_role(use_developer)
                     .with_cache_retention(cache_retention(supports_long), explicit_cache)
                     .with_strict_tool_support(
                         args.model_profiles
                             .responses_strict_tool_support(&args.provider, metadata.as_ref()),
+                    )
+                    .with_grammar_tool_support(
+                        compat.supports_openai_grammar_tools().unwrap_or(false),
                     )
                     .with_prompt_cache_key_enabled(
                         args.model_profiles
@@ -1532,6 +1628,13 @@ pub(super) async fn stream_with_declarations(
 
 #[async_trait::async_trait]
 impl Model for Client {
+    fn minimum_output_tokens(&self) -> u32 {
+        match self {
+            Self::OpenAi(client) => client.minimum_output_tokens(),
+            _ => 1,
+        }
+    }
+
     async fn stream_detailed_with_tool_declarations(
         &self,
         request_id: uuid::Uuid,
@@ -1768,6 +1871,100 @@ mod contention_tests {
             )
             .uses_final_strict_policy()
         );
+    }
+
+    #[tokio::test]
+    async fn openai_grammar_capability_follows_the_final_model() {
+        use clap::Parser;
+
+        let endpoint = "http://localhost:9/responses";
+        let declaration = pi_rs::ToolDeclaration {
+            spec: pi_rs::ToolSpec {
+                name: "write".into(),
+                description: String::new(),
+                parameters: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+            },
+            constrained_sampling: Some(pi_rs::ToolConstraint::Grammar {
+                variants: pi_rs::ToolGrammarVariants {
+                    openai_regex: Some(".+".into()),
+                    ..Default::default()
+                },
+            }),
+        };
+        let context = pi_rs::ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "fixture".into(),
+            summary: false,
+        };
+        for api in ["openai-completions", "openai-responses"] {
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+                "providers":{"fixture":{
+                    "api":api,"baseUrl":endpoint,
+                    "compat":{"supportsOpenAIGrammarTools":true},
+                    "models":[{"id":"grammar"},{"id":"function","compat":{"supportsOpenAIGrammarTools":false}}]
+                }}
+            })).unwrap();
+            args.provider = args.model_profiles.provider("fixture").unwrap();
+            for (selected, model, expected) in [
+                ("grammar", "grammar", true),
+                ("grammar", "function", false),
+                ("grammar", "unknown", false),
+                ("function", "grammar", true),
+            ] {
+                args.model = selected.into();
+                let client = if api == "openai-completions" {
+                    Client::Ollama(Ollama::new(endpoint, None).unwrap())
+                } else {
+                    Client::OpenAi(
+                        pi_rs::openai::OpenAiResponses::new_api(endpoint, "key".into()).unwrap(),
+                    )
+                }
+                .with_model_options(&args, false)
+                .unwrap();
+                let workbench = super::super::image_policy::WorkbenchModel {
+                    strict_policy: Some(Arc::new(super::super::image_policy::FinalStrictPolicy {
+                        profiles: args.model_profiles.clone(),
+                        provider: args.provider.clone(),
+                        selected_model: selected.into(),
+                        explicit_endpoint: false,
+                        bound_support: None,
+                    })),
+                    client,
+                    block_images: false,
+                    supports_images: None,
+                    session_affinity: &[],
+                    price: None,
+                };
+                let request = ModelRequest {
+                    model: model.into(),
+                    messages: vec![],
+                    tools: vec![declaration.spec.clone()],
+                    max_output_tokens: 32,
+                };
+                let bound = workbench.prepare_context(&request).await.unwrap().unwrap();
+                for model_client in [&workbench as &dyn Model, bound.as_ref()] {
+                    let prepared = model_client
+                        .prepare_tool_dispatch(
+                            &request,
+                            std::slice::from_ref(&declaration),
+                            &context,
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        matches!(
+                            prepared.effective_tools()[0].sampling,
+                            pi_rs::EffectiveToolSampling::OpenAiGrammar { .. }
+                        ),
+                        expected,
+                        "{api} {selected} -> {model}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -3914,44 +4111,50 @@ mod estimation_tests {
     }
 
     #[tokio::test]
-    async fn responses_instruction_role_follows_model_capabilities() {
+    async fn responses_wire_fields_follow_model_capabilities() {
         use std::io::{Read, Write};
-        for (models, overrides, provider_compat, expected) in [
+        for (models, overrides, provider_compat, expected, output_limit) in [
             (
                 serde_json::json!([{"id":"m","reasoning":true}]),
                 serde_json::json!({}),
                 serde_json::json!({}),
                 "developer",
+                true,
             ),
             (
                 serde_json::json!([{"id":"m","reasoning":false}]),
                 serde_json::json!({}),
                 serde_json::json!({}),
                 "system",
+                true,
             ),
             (
                 serde_json::json!([{"id":"m","reasoning":true}]),
                 serde_json::json!({}),
-                serde_json::json!({"supportsDeveloperRole":false}),
+                serde_json::json!({"supportsDeveloperRole":false,"supportsMaxOutputTokens":false}),
                 "system",
+                false,
             ),
             (
-                serde_json::json!([{"id":"m","reasoning":true,"compat":{"supportsDeveloperRole":true}}]),
+                serde_json::json!([{"id":"m","reasoning":true,"compat":{"supportsDeveloperRole":true,"supportsMaxOutputTokens":true}}]),
                 serde_json::json!({}),
-                serde_json::json!({"supportsDeveloperRole":false}),
+                serde_json::json!({"supportsDeveloperRole":false,"supportsMaxOutputTokens":false}),
                 "developer",
+                true,
             ),
             (
                 serde_json::json!([]),
                 serde_json::json!({}),
                 serde_json::json!({}),
                 "system",
+                true,
             ),
             (
                 serde_json::json!([]),
-                serde_json::json!({"m":{"name":"partial"}}),
+                serde_json::json!({"m":{"name":"partial","compat":{"supportsMaxOutputTokens":false}}}),
                 serde_json::json!({}),
                 "system",
+                false,
             ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4041,6 +4244,10 @@ mod estimation_tests {
                 .await;
             let body = server.join().unwrap();
             assert_eq!(body["input"][0]["role"], expected);
+            assert_eq!(
+                body["max_output_tokens"].as_u64(),
+                output_limit.then_some(10)
+            );
         }
     }
 
