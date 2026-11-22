@@ -4697,6 +4697,21 @@ A loopback server held the final argument fragment until the RPC client
 observed the first one. The fixture covered stable indexes after
 reasoning, final arguments and tool output, and abort before completion.
 
+### Provider sign-in from the CLI
+
+`pi auth login <provider>` requires a terminal and uses provider IDs or
+display names. It prefers account authorization where supported.
+`--api-key` prompts without echoing the credential, and saves it for the
+configured endpoint. Bedrock also offers an AWS profile or the existing
+credential chain. Vertex also offers ADC or a service account file.
+`--no-browser` selects copy-code or device authorization for Anthropic,
+Codex and Radius respectively. Other account flows print their sign-in
+instructions without opening a browser. The OpenAI subscription continues to
+use pi-rs's separate `openai-chatgpt` provider identity. Saved credentials
+are applied when the next command loads the model configuration.
+Local terminal and CLI fixtures cover masked key input and command parsing.
+Real OAuth sign-in and inference were unverified.
+
 ### Provider credential logout
 
 `pi auth logout <provider>` removes the saved key or OAuth entry from

@@ -10,6 +10,15 @@ use super::{Cli, Provider, model_selection, radius_auth};
 
 #[derive(Clone, Subcommand)]
 pub(super) enum AuthCommand {
+    /// Sign in with a provider account or save an API key.
+    #[command(override_usage = "pi auth login <provider> [--api-key] [--no-browser]")]
+    Login {
+        provider: String,
+        #[arg(long, hide = true, action = clap::ArgAction::SetTrue, overrides_with = "use_api_key")]
+        use_api_key: bool,
+        #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "no_browser")]
+        no_browser: bool,
+    },
     /// Remove a saved credential for a provider.
     Logout { provider: String },
     /// Check whether a provider has usable credentials.
@@ -380,6 +389,14 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
             "omit --api-key when resolving configured credentials".into(),
         ));
     }
+    if let AuthCommand::Login {
+        provider,
+        use_api_key,
+        no_browser,
+    } = command
+    {
+        return super::auth_login::login(&args, &provider, use_api_key, no_browser).await;
+    }
     if let AuthCommand::Logout { provider } = command {
         return logout(&args.settings, &provider).await;
     }
@@ -486,7 +503,7 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
             min_expiry.unwrap_or(Duration::from_secs(30 * 60)),
             "OAuth bearer token",
         ),
-        AuthCommand::Check { .. } | AuthCommand::Logout { .. } => {
+        AuthCommand::Check { .. } | AuthCommand::Login { .. } | AuthCommand::Logout { .. } => {
             unreachable!("credential management already returned")
         }
     };

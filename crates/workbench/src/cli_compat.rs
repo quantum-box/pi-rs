@@ -86,6 +86,7 @@ fn normalize(
     let mut hyphen_values = false;
     let mut trust_flag_index = None;
     let mut selected_subcommand = false;
+    let mut auth_login = false;
     let mut value_owner: Option<usize> = None;
     let mut export_values = false;
     let mut export_waiting_output = false;
@@ -227,6 +228,7 @@ fn normalize(
             if prompt.is_empty()
                 && let Some(subcommand) = command.find_subcommand(&arg)
             {
+                auth_login = command.get_name() == "auth" && subcommand.get_name() == "login";
                 command = subcommand;
                 selected_subcommand = true;
             } else if std::ptr::eq(command, root) {
@@ -248,6 +250,8 @@ fn normalize(
             continue;
         };
         let canonical = match value {
+            // The nested Pi command takes a switch; the root option takes a key.
+            "--api-key" if auth_login => "--use-api-key",
             "-v" => "--version",
             "-nt" => "--no-tools",
             "-nbt" => "--no-builtin-tools",

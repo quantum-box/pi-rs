@@ -193,6 +193,16 @@ pub(super) async fn login(
     control: super::meta_auth::LoginControl,
     announce: impl FnOnce(&reqwest::Url, oneshot::Sender<String>),
 ) -> Result<()> {
+    login_with_browser(settings, method, control, true, announce).await
+}
+
+pub(super) async fn login_with_browser(
+    settings: &super::config::Settings,
+    method: LoginMethod,
+    control: super::meta_auth::LoginControl,
+    open_browser: bool,
+    announce: impl FnOnce(&reqwest::Url, oneshot::Sender<String>),
+) -> Result<()> {
     let listener = bind_listener(method).await;
     login_at(
         super::config::agent_dir().join("auth.json"),
@@ -200,7 +210,7 @@ pub(super) async fn login(
         method,
         control,
         announce,
-        true,
+        open_browser,
         listener,
     )
     .await

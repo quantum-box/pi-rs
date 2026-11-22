@@ -17,6 +17,7 @@ mod anthropic_auth;
 mod attachments;
 mod auth_cli;
 mod auth_lock;
+mod auth_login;
 mod backend;
 mod builtin_chat;
 mod cache_stats;
@@ -1962,99 +1963,16 @@ async fn execute(
             if *copy_code && provider != "anthropic" {
                 return Err(Error::Config("--copy-code requires anthropic".into()));
             }
-            let login = async {
-                if provider == "anthropic" {
-                    if *device_code {
-                        return Err(Error::Config(
-                            "Anthropic uses browser or copy-code authorization".into(),
-                        ));
-                    }
-                    let method = if *copy_code {
-                        anthropic_auth::LoginMethod::CopyCode
-                    } else {
-                        anthropic_auth::LoginMethod::Browser
-                    };
-                    anthropic_auth::login(&args.settings, method, meta_auth::LoginControl::default(), |url, sender| {
-                        eprintln!("Continue in your browser: {url}");
-                        eprintln!("Paste the authorization code or redirect URL if the callback does not complete:");
-                        std::thread::spawn(move || {
-                            let mut line = String::new();
-                            if std::io::stdin().read_line(&mut line).is_ok_and(|count| count > 0) { let _ = sender.send(line); }
-                        });
-                    }).await
-                } else if provider == "openai-chatgpt" {
-                    if *device_code {
-                        return Err(Error::Config("ChatGPT uses browser authorization".into()));
-                    }
-                    chatgpt_auth::login(&args.settings, *new_account, account.as_deref(), |url| {
-                        eprintln!("Continue with ChatGPT in your browser: {url}")
-                    })
-                    .await
-                } else if provider == "openai-codex" {
-                    let method = if *device_code {
-                        codex_auth::Method::Device
-                    } else {
-                        codex_auth::Method::Browser
-                    };
-                    codex_auth::login(
-                        &args.settings, meta_auth::LoginControl::default(), method,
-                        |notice| match notice {
-                            codex_auth::Notice::Device {url, code} => eprintln!("Enter code {code} at {url}"),
-                            codex_auth::Notice::Browser(url, sender) => {
-                                eprintln!("Continue in your browser: {url}");
-                                eprintln!("Paste the authorization code or redirect URL if the callback does not complete:");
-                                std::thread::spawn(move || {
-                                    let mut line = String::new();
-                                    if std::io::stdin().read_line(&mut line).is_ok_and(|count| count > 0) {
-                                        let _ = sender.send(line);
-                                    }
-                                });
-                            }
-                        },
-                    ).await
-                } else if provider == "github-copilot" {
-                    copilot_auth::login(
-                        &args.settings,
-                        meta_auth::LoginControl::default(),
-                        |url, code| eprintln!("Enter code {code} at {url}"),
-                    )
-                    .await
-                } else if provider == "xai" {
-                    xai_auth::login(
-                        &args.settings,
-                        meta_auth::LoginControl::default(),
-                        |url, code| eprintln!("Enter code {code} at {url}"),
-                    )
-                    .await
-                } else if provider == "kimi-coding" {
-                    kimi_auth::login(&args.settings, |url, code| {
-                        eprintln!("Enter code {code} at {url}")
-                    })
-                    .await
-                } else if provider == "openrouter" {
-                    if *device_code {
-                        return Err(Error::Config(
-                            "OpenRouter uses browser authorization".into(),
-                        ));
-                    }
-                    let mut manual_input = None;
-                    let result = openrouter_auth::login(&args.settings, |url, sender| {
-                        eprintln!("Continue in your browser: {url}");
-                        manual_input = Some(sender);
-                    })
-                    .await;
-                    drop(manual_input);
-                    result
-                } else {
-                    let gateway = radius_auth::Gateway::configured_with_settings(&args.settings)?;
-                    let method = if *device_code {
-                        radius_auth::Method::Device
-                    } else {
-                        radius_auth::Method::Browser
-                    };
-                    gateway.login(method, |notice| eprintln!("{notice}")).await
-                }
-            };
+            let login = auth_login::oauth(
+                &args.settings,
+                provider,
+                auth_login::OAuthOptions::legacy(
+                    *device_code,
+                    *copy_code,
+                    *new_account,
+                    account.as_deref(),
+                ),
+            );
             tokio::select! {
                 biased;
                 _ = tokio::signal::ctrl_c() => return Err(Error::Cancelled),

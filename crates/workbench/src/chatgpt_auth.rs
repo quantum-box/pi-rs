@@ -354,6 +354,16 @@ pub(super) async fn login(
     account: Option<&str>,
     announce: impl FnOnce(&Url),
 ) -> Result<()> {
+    login_with_browser(settings, new_account, account, true, announce).await
+}
+
+pub(super) async fn login_with_browser(
+    settings: &super::config::Settings,
+    new_account: bool,
+    account: Option<&str>,
+    open_browser: bool,
+    announce: impl FnOnce(&Url),
+) -> Result<()> {
     let mut chat_lock = Some(lock().await?);
     let store = registrations()?;
     let registered = if new_account {
@@ -432,7 +442,9 @@ pub(super) async fn login(
     };
     let url = auth.url();
     announce(&url);
-    let _ = pi_rs_workbench::oauth_callback::open_browser(url.as_str()).await;
+    if open_browser {
+        let _ = pi_rs_workbench::oauth_callback::open_browser(url.as_str()).await;
+    }
     let redirect = tokio::time::timeout(
         Duration::from_secs(300),
         pi_rs_workbench::oauth_callback::receive(&listener, &callback, auth.state()),
