@@ -342,6 +342,12 @@ struct InitialSelection {
 }
 
 impl Cli {
+    fn theme_setting(&self) -> Option<&str> {
+        self.use_theme
+            .as_deref()
+            .or_else(|| self.settings.string("theme"))
+    }
+
     fn effective_context_window(&self) -> Option<u32> {
         self.context_window.or_else(|| {
             self.model_profiles
@@ -1624,9 +1630,6 @@ async fn run_cli() -> i32 {
                 .settings
                 .string("defaultThinkingLevel")
                 .map(str::to_owned);
-        }
-        if args.use_theme.is_none() {
-            args.use_theme = args.settings.string("theme").map(str::to_owned);
         }
         if args.session_dir.is_none() {
             args.session_dir = std::env::var_os("PI_CODING_AGENT_SESSION_DIR")

@@ -1648,6 +1648,8 @@ request fresh colors, including on terminals that ignore the probe.
 On an appearance notification, the last reported foreground, background, and
 complete palette remain in effect until replacement replies arrive, as in Pi.
 The reported appearance is used when no background is known.
+`/reload` applies changes to the saved theme. An explicit `--use-theme` or a
+theme chosen during the session takes precedence over the reloaded setting.
 When the background is unknown, the system theme retains ANSI-indexed colors
 even if the palette is available, matching Pi's fallback. With a known background,
 the system theme generates Pi's OKHSL color families and contrast-solved roles,
