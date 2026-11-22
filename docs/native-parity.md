@@ -191,8 +191,11 @@ pi-rs waits for the auth lock, pi-rs reuses the currently stored token when
 its lifetime is sufficient. Saved plan credentials are bound to OpenAI's
 official endpoint. Live refresh of an imported Pi entry is unverified.
 
-`pi mcp add` accepts `--cwd` for stdio servers, repeated `--header` for HTTP
-servers, and `--description` for either transport. HTTP headers can be combined
+`pi mcp add` accepts stdio commands with or without a preceding `--`.
+pi-rs passes the arguments after the executable verbatim, including a
+literal `--` immediately after it. The command accepts `--cwd` for stdio
+servers, repeated `--header` for HTTP servers, and `--description` for
+either transport. HTTP headers can be combined
 with `--bearer-token-env-var` unless an Authorization header is already present.
 `--env` is restricted to stdio and requires nonempty names; bearer-token
 environment variables apply to HTTP servers.
@@ -1118,7 +1121,11 @@ Credentials are keyed by server name and normalized URL, so a project server
 with the same name and URL as a global server shares its credentials.
 
 `pi mcp add`, `pi mcp remove`, `pi mcp list` and `/mcp` use user-level
-`mcp.json` and trusted project overrides. The native client uses rmcp 3.9 for
+`mcp.json` and trusted project overrides. `pi mcp add` validates HTTP URLs before
+writing, including when replacing a server. Native applies its existing
+transport policy at that point, allowing HTTPS and loopback HTTP without
+embedded credentials. `pi mcp remove` reports the selected file and suggests
+`--local` or its omission when the other file defines the requested server. The native client uses rmcp 3.9 for
 stdio and streamable HTTP. It exposes namespaced server tools and resource
 listing/reading. Configuration can reference environment variables or bounded
 credential commands. Server processes are isolated into process groups/jobs,
@@ -1301,7 +1308,10 @@ it can replace a read-only file when the parent directory permits replacement,
 requires permission to create and replace entries in that directory, and leaves
 other hard links pointing at the old file. A permission preflight alone cannot
 bind the check to the file that a later pathname replacement will affect.
-RPC user shell commands accept empty and whitespace-only scripts. User shell
+On Unix, unrestricted `write` reports Pi's `EISDIR` open diagnostic for
+directory targets and `EEXIST` or `ENOTDIR` mkdir diagnostics for file
+components in parent paths. These diagnostics name the requested path, including
+when a symlink leads to the directory or file. RPC user shell commands accept empty and whitespace-only scripts. User shell
 output strips terminal escape sequences and control characters before streaming
 and saving the transcript.
 
@@ -1416,6 +1426,27 @@ usable. The caller owns the lifetime of each client and should load the file
 off the UI thread. Unresolved variable or command references and OAuth entries
 leave the route unconfigured. The SDK host controls ambient environment access,
 OAuth, and any credential writes.
+
+### Native SDK model file catalogs
+
+Embedded hosts can build an immutable catalog with
+`pi_rs_workbench::model_file::ModelFileReadGrants`. An explicit file path and
+exact provider, API, and declared base URL grants select custom chat models
+from strict Pi-format JSON. Provider fields are inherited unless the model
+overrides them. The grant supplies the actual request endpoint and the model
+factory supplies its exact credential. The import applies descriptive
+`modelOverrides` to selected declarations, including partial prices. Transport options such as
+configuration headers, provider compatibility and command-based keys stay
+under host control. Codex Responses declarations use the Codex transport.
+The SDK defaults to SSE and uses a host-supplied OAuth access token on the
+exact `openai-codex` route. The typed client lets hosts select another Codex
+transport. ChatGPT plan clients use the separate `openai-responses` API.
+
+Hosts may resolve saved key variables with
+`AuthFileReadGrants::load_with_variables`. The resolver receives the exact
+route and variable name after checking saved inline values, and the loader
+never consults process environment variables itself. Catalog and key reloads
+produce independent snapshots.
 
 ### Regular terminal checkpoint
 
@@ -1816,6 +1847,10 @@ inference; model discovery and resolution remain available while those slots are
 
 Model catalogue search checks provider and ID argument types before dispatch,
 including the sandbox's JSON conversion of omitted and non-finite values.
+Tool discovery also validates string queries and names, string namespace
+filters and positive integer search limits after the same JSON conversion.
+The default limit is eight. Higher limits can return the whole matching
+catalogue.
 
 The native `codemode` tool accepts `{ "code": "..." }` and runs JavaScript in a
 fresh QuickJS context. Scripts can call registered tools through `tools`, use
@@ -1859,7 +1894,12 @@ includes every location.
 MCP tools default to codemode exposure. `--exposure direct`, `deferred`,
 `codemode` and `hidden` select another mode when adding a server. The root
 `autoEnableCodemode` MCP setting controls automatic activation. Explicit tool
-exclusions also prevent script access. Programmatic shell calls return output,
+exclusions also prevent script access. Codemode receives the MCP call result,
+including `content`, `structuredContent`, and `isError` when a server returns
+a tool error. Connection and transport failures reject the script's call.
+The client's tool result omits the server's top-level `_meta`.
+
+Programmatic shell calls return output,
 exit status, truncation and elapsed time, including nonzero exit statuses.
 Nested calls retain their own validation, policy checks and journal entries.
 
@@ -2132,6 +2172,14 @@ session ID validation remain in force, and arguments after `--` remain prompt
 text. Parser regressions cover these cases; a CLI fixture verifies that only
 the last named session is created.
 
+Root CLI invocations report Pi-style argument diagnostics whether or not
+help or version was requested. A missing value for a Pi long option with no
+dedicated parse error is reported along with any unrecognized long options,
+in their first-occurrence order after checking registered extension flags.
+Model listing reports these diagnostics on stderr and still lists the models.
+Native subcommands retain their own argument diagnostics, and an incomplete
+final export leaves any earlier input and the destination untouched.
+
 Repeated `--tools` and `-t` selections use the last value. Each selection is
 checked for mixed names and modifiers or wildcard modifiers, including an
 invalid selection followed by a valid one.
@@ -2180,6 +2228,10 @@ returns after both pipes close or 100 ms without further output. Output from
 an active descendant resets that idle period. Unlike Pi, pi-rs also caps the
 post-exit drain at two seconds to bound continuously writing descendants. Unit and CLI fixtures cover line/byte
 limits, file recovery, Unicode boundaries, timeout output and inherited pipes.
+
+If a local model shell exits before its timeout while background processes
+hold the output pipes open, the diagnostic includes the shell's exit code
+and elapsed time rounded to a tenth of a second, as in Pi 1.6.0.
 
 ### Text paging checkpoint
 
@@ -2266,6 +2318,12 @@ Unrestricted local built-in tools coerce model arguments to their declared
 string, number and boolean types before schema validation. Optional null fields
 are treated as omissions, and edit batches also normalize replacement fields.
 Scoped tools and injected operations retain their argument handling.
+Schema rejections for these local built-ins report Pi-style field diagnostics
+and the received arguments. For oversized diagnostics, native reports up to
+32 issues and limits the argument preview to 64 KiB, with omission notices.
+Edit preparation also reports Pi's messages for
+empty edit arrays and empty replacement targets. These failures produce a tool
+error result before dispatch.
 
 `grep` streams files with the native ripgrep libraries, supports surrounding
 context lines, bounds long displayed lines at 500 UTF-16 units, and reports
@@ -2653,7 +2711,9 @@ executing credential commands or refreshing tokens.
 Unlike upstream's permissive settings loading, pi-rs validates implemented
 settings. When several values in a file are invalid, the diagnostic lists the
 settings file and affected JSON paths, including nested package fields and
-invalid HTTP idle timeout strings. It omits the rejected values and preserves
+invalid HTTP idle timeout strings. Integer-equivalent JSON number forms
+such as `2.0` apply the same editor padding and select the same preset as
+`2`. It omits the rejected values and preserves
 the file. If the editor cannot fit the diagnostic, Page Up and Page Down show
 the other pages without discarding the edit.
 
@@ -2941,6 +3001,12 @@ and resource filters. URL userinfo is not treated as a ref, and credential-helpe
 requirements remain unchanged. Package diagnostics and list output redact URL
 userinfo, including before a configured source is validated; saved declarations
 and internal identity matching are not rewritten.
+
+Captured Git package commands disable terminal prompts and default to SSH batch
+mode, as in the Pi 1.6 interactive UI. An explicit `GIT_SSH_COMMAND` takes
+precedence. Authentication-related failures suggest a credential helper or SSH
+agent and retain the native redaction of subprocess output for sources with
+URL userinfo. The native package CLI also uses captured output.
 
 An explicit native package resource manifest limits loading to its declared
 resource types, including when a declared array is empty. A manifest containing
@@ -4328,6 +4394,26 @@ fails as in Pi. Loopback tests covered the beta header, target order, and
 fallback billing. Live Fable 5.2 inference and server-side fallback were
 unverified.
 
+Anthropic Messages threads are used for cached session requests on the official
+endpoint. Profiles can override support with `compat.supportsMessageThreads`.
+The native adapter scopes an in-memory continuation to the session,
+authenticated route, fixed request settings and replayed message prefix. A
+continuation sends the new messages and keeps the server's system prompt and
+tools. A missing, already continued, or mismatched thread retries once with
+the full transcript in a new thread. A server that rejects threading receives
+the full transcript without the thread field and keeps the threads beta.
+After a successful resend, later requests on that session and route keep the
+beta and omit the thread field. An endpoint that explicitly rejects the beta
+also omits the automatically added beta on that route and session. Each
+rejection gets at most one resend and records its reason before resending. Cache warming uses a full request
+with the same cache and beta options without reading or updating the thread.
+Summary requests use the full transcript. Replies from a fallback model do not supply continuation
+state. An alias resolving to its dated release can still be continued. OAuth
+continuations compare the canonical wire names for tools while keeping local
+tool names in session replay. Loopback exercised creation, continuation after
+an OAuth tool call, and both forms of retry. Live authenticated Anthropic
+threads were unverified.
+
 Native Anthropic streams expose individual text and thinking block boundaries,
 and show redacted thinking as `[Reasoning redacted]` while retaining its opaque
 payload for provider replay. Live Pi RPC thinking-start partial messages include
@@ -4902,6 +4988,12 @@ handlers with the updated declaration list. Only the owner can replace or
 remove a registration. The SDK reports notification and follow-up errors
 through its session events after applying the registration change. The executable protocol negotiates that event
 independently of ordinary lifecycle events.
+Lifecycle handlers that opt in to the MCP registry host can read, register
+and remove declarations during their callback. The host binds operations to
+the running extension and delivers the resulting snapshots in mutation
+order. An executable negotiates this access through
+`mcp_registry_host_calls` and the duplex capability advertisement. SDK forks
+have their own snapshot of the active MCP registrations.
 
 Native extensions can subscribe to `after_provider_response` to observe the
 HTTP status and normalized headers from an agent turn. The OpenAI Responses,
@@ -4914,9 +5006,12 @@ response remains under the adapter's control. Executable extensions advertise
 `after_provider_response_hook` and receive an `after_provider_response`
 request with `event.status`, `event.headers`, and their branch state. Response
 metadata is ephemeral. Credential headers, cookies, sensitive header values and
-reflected configured credentials are withheld. Bedrock and custom transports
-without response metadata reporting do not emit this event. Summary and catalog
-requests remain outside the turn hook.
+reflected configured credentials are withheld. The Bedrock adapter captures
+successful ConverseStream HTTP status and raw Smithy headers, including custom
+gateway fields. It services the hook as soon as the SDK reports those headers,
+even if the SDK waits for the stream before returning. HTTP errors follow Pi's
+Bedrock behavior and produce no callback. Custom transports opt in by reporting metadata.
+Summary and catalog requests remain outside the turn hook.
 
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
@@ -5092,6 +5187,12 @@ and the host's typed message projection. A requested continuation consumes
 the existing run budget. Cancellation during the hook commits any valid
 proposals and stops the continuation.
 
+The actionable `turn_end` callback runs after the assistant and tool
+results are durable and before the observing lifecycle callback. It carries
+the assistant message and tool-result record IDs. Its plan survives reopening
+and can require one more provider request. A tool result or accepted queued
+input that already starts the next request satisfies that decision.
+
 ### Native modal components
 
 A Rust extension can request a custom modal component with styled
@@ -5244,7 +5345,16 @@ Models advertising `decisions` output use `/v1/systemone`; other models use
 next-token classification. Explicit model entries take precedence and inherit
 the router's credentials or keyless access only when their operation endpoint
 matches the configured router.
-`--offline` skips discovery. This refresh is scoped to the native Codemode
+The last successful catalog is restored when the same router and credential
+are used offline or the router's `/models` request fails. As in Pi, a
+successful model listing with an unavailable `/props` response is cached with
+autoload treated as disabled. The cache contains classifier metadata and
+a scope fingerprint. It stores no raw credential or endpoint.
+When a refresh omits the runtime and configured context windows, it reuses
+a cached runtime window. A newly reported training window takes precedence
+over a cached estimate.
+Offline discovery uses a configured literal key or a keyless router without
+resolving credential commands. This refresh is scoped to the native Codemode
 classifier catalog. Pi also refreshes its chat catalog. A llama-server 1.0.0
 router run discovered an unloaded preset and exercised autoload and
 classification via Codemode. An authenticated run verified saved endpoint and
@@ -5363,7 +5473,15 @@ Google Cloud credential was available for acceptance testing.
 
 ### OpenAI Codex
 
-`openai-codex` exposes the eight pinned models through the ChatGPT Codex
+The direct OpenAI and Codex catalogs include the Pi v1.6.0 entries.
+Codex models advertising mid-conversation effort use configuration updates
+before earlier replies and for the current reply. This includes switching
+thinking off when the model maps that setting to `none`. The request keeps
+its top-level reasoning effort stable for prompt-cache reuse. System text is
+sent at the beginning of the ordered input, using the model's instruction
+role. This keeps the system prefix stable as turns are appended on GPT-6.2.
+
+`openai-codex` exposes ten pinned models through the ChatGPT Codex
 Responses route. It supports native HTTP streaming, model-specific reasoning
 levels, image inputs, tool calls, and endpoint-bound response replay.
 Codex's provider-side output limit starts at 16 tokens. With that limit enabled,
@@ -5551,30 +5669,22 @@ renewal for this change was unverified.
 As in Pi v1.6.0, a symbolic link to an auth file shares the target's lock.
 Credential updates keep the link and atomically replace the target file.
 pi-rs does not automatically remove stale `auth.json.lock` directories.
-After a worker admits a protected OAuth refresh, pi-rs retains its worker
-refresh barrier until the auth lock is released, including on errors. A worker
-terminated while holding the auth lock but waiting to enter that barrier can
-still leave a stale directory, as can a crash or external termination.
-To recover one safely, stop **all** Pi and pi-rs processes that can access
-that credential store, including background or waiting processes on other
-hosts sharing the filesystem. Once they have exited, either remove the stale
-directory or run a single Pi process to recover it; wait for recovery to
-finish before restarting any other process.
+On macOS, Linux, and Windows filesystems that support exclusive directory
+renames, pi-rs publishes the lock with a marker already inside it. Pi still
+recognizes the same lock directory and heartbeat. Its delayed stale-lock
+cleanup cannot remove a nonempty live pi-rs lock. On release, pi-rs takes the
+directory off the shared path before removing its marker. Filesystems without
+exclusive directory renames retain the previous empty-directory behavior,
+where a delayed Pi reclaimer can remove a replacement lock.
 
-This restriction matters even when no process currently holds the lock. Pi's
-`proper-lockfile` can observe a stale directory, pause, and later remove by
-path after another process has replaced it with a live pi-rs lock. Concurrent
-Pi stale recovery can therefore still compromise a pi-rs credential refresh
-and lose a rotated token. pi-rs cannot serialize an already-running Pi
-reclaimer with a separate lock or a path identity check; a complete fix
-must prevent Pi's delayed removal from deleting a live lock. The current
-protocol provides no such guarantee.
-
-One possible defense to investigate is publishing a prepopulated lock
-directory with an atomic no-replace operation, so a delayed `rmdir` fails while
-the directory is held. That approach would change crash recovery and depends
-on operating-system and filesystem behavior; it has not been implemented or
-validated and is not protection in the current release.
+The worker keeps its refresh barrier until it releases the auth lock, including
+on errors. A crash or forced termination can still leave a stale lock and a
+staging directory. Before removing a stale lock, stop all Pi and pi-rs
+processes that can access the credential store, including processes on other
+hosts sharing it. Remove the stale lock directory and its marker if present.
+For an empty legacy lock, a single Pi process can also recover it. Wait for
+recovery to finish before restarting other processes. The marker does not
+change the OAuth exchange or its recovery rules.
 
 Loopback checks covered expired and refreshed Radius credentials,
 model-specific key selection, OpenRouter's OAuth key type, and invalid
@@ -5856,19 +5966,21 @@ with later system instructions were unverified.
 
 ### Responses effort history
 
-The five OpenAI API-key models marked `supportsMidConvoEffort` in Pi v1.5.0
-keep their top-level reasoning effort at `medium` when a thinking level is
-active. Configuration updates apply the stored level before each recorded
-reply and the current level at the end of the request, including after a
-tool result. Pi session imports retain the recorded effort and replay the
+The OpenAI API-key and Codex models marked `supportsMidConvoEffort` in
+Pi v1.6.0 keep their top-level reasoning effort at `medium` while sending
+the selected effort in configuration updates. A configuration update applies
+the stored effort before each recorded reply and the current effort at the
+end of the request, including after a tool result. Compatible Codex models
+that map off to `none` also use an update for that setting. API-key requests
+with thinking off and the pi-rs ChatGPT plan adapter keep their usual
+reasoning options. Pi session imports retain the recorded effort and replay
 portable assistant history. Compatible custom profiles retain their own
 effort mappings. RPC exposes the recorded level. With API-key Responses,
 `off` uses top-level reasoning and leaves no configuration update to replay
 when thinking resumes, as in Pi 1.5.0 and 1.6.0. For example, switching from
 `low` through `off` to `high` sends only `low` and `high` configuration updates
-on the final request. ChatGPT and Codex subscriptions
-use their existing reasoning options. Local request fixtures covered the
-payload and replay. Live authenticated configuration updates were unverified.
+on the final request. Local request fixtures covered the payload and replay.
+Live authenticated configuration updates were unverified.
 
 ### Responses prompt cache key configuration
 
