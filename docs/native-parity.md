@@ -3496,7 +3496,10 @@ error. The initial OpenAI Responses (including Azure), OpenAI-compatible Chat
 Completions, and Anthropic Messages HTTP requests honor `retry.provider.maxRetries`
 (default 0), `maxRetryDelayMs` (default 60000, 0 disables the ceiling), and
 `timeoutMs` (to receive response headers on each attempt). They honor `x-should-retry`, `Retry-After-Ms`, and
-`Retry-After` before accepting a response stream. This policy also loads legacy
+`Retry-After` before accepting a response stream. As in Pi 1.6, this opt-in
+policy uses HTTP retry hints and status before processing the error body. The
+agent still uses the final provider error to distinguish quota exhaustion and
+other permanent failures. This policy also loads legacy
 `retry.maxDelayMs` when the replacement is unset. Google Gemini and Codex-specific
 provider retries and summary-specific retry policy remain open.
 
