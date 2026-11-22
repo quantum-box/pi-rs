@@ -66,6 +66,17 @@ type CachedCommand = Arc<tokio::sync::OnceCell<CommandResult>>;
 static STORED_COMMANDS: LazyLock<Mutex<BTreeMap<String, CachedCommand>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
+pub(super) fn anthropic_env_credential(env: impl Fn(&str) -> Option<String>) -> Option<Credential> {
+    let read = |name| env(name).filter(|value| !value.trim().is_empty());
+    read("ANTHROPIC_AUTH_TOKEN")
+        .map(Credential::Bearer)
+        .or_else(|| {
+            read("ANTHROPIC_OAUTH_TOKEN")
+                .or_else(|| read("ANTHROPIC_API_KEY"))
+                .map(Credential::Literal)
+        })
+}
+
 impl Credential {
     pub fn configured(value: &str) -> Option<Self> {
         Self::configured_with_env(value, None)
@@ -849,6 +860,36 @@ pub(super) use pi_rs_workbench::auth_factory::valid_api_key as valid_key;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn anthropic_environment_credentials_follow_pi_precedence() {
+        use super::{Credential, anthropic_env_credential};
+
+        let mut env = [
+            ("ANTHROPIC_AUTH_TOKEN", "header-token"),
+            ("ANTHROPIC_OAUTH_TOKEN", "sk-ant-oat-fixture"),
+            ("ANTHROPIC_API_KEY", "api-key"),
+        ];
+        let resolve = |values: &[(&str, &str)]| {
+            anthropic_env_credential(|name| {
+                values
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).into())
+            })
+        };
+        assert!(
+            matches!(resolve(&env), Some(Credential::Bearer(value)) if value == "header-token")
+        );
+        env[0].1 = " ";
+        assert!(
+            matches!(resolve(&env), Some(Credential::Literal(value)) if value == "sk-ant-oat-fixture")
+        );
+        assert!(
+            matches!(resolve(&env[2..]), Some(Credential::Literal(value)) if value == "api-key")
+        );
+        assert!(resolve(&[]).is_none());
+    }
+
     #[tokio::test]
     async fn refresh_wait_times_out_without_interrupting_admitted_credential_persistence() {
         let (started, ready) = tokio::sync::oneshot::channel();

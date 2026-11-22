@@ -13,6 +13,23 @@ use std::sync::{Arc, OnceLock};
 
 use super::{Cli, model_auth::Credential, model_profiles::RequestHeaders, pi_messages::PiMessages};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RequestAuth {
+    Automatic,
+    Bearer,
+    HeaderBearer,
+}
+
+impl RequestAuth {
+    fn for_credential(credential: Option<&Credential>) -> Self {
+        match credential {
+            Some(Credential::Bearer(_)) => Self::HeaderBearer,
+            Some(credential) if credential.is_bearer() => Self::Bearer,
+            _ => Self::Automatic,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) enum Provider {
     #[default]
@@ -159,7 +176,28 @@ impl Provider {
         token: Option<String>,
         bearer: bool,
     ) -> Result<Client> {
-        self.connect_prechecked(adapter, endpoint, token, bearer, false)
+        let auth = if bearer {
+            RequestAuth::Bearer
+        } else {
+            RequestAuth::Automatic
+        };
+        self.connect_prechecked(adapter, endpoint, token, auth, false)
+    }
+
+    pub(super) fn connect_for_credential(
+        &self,
+        adapter: Adapter,
+        endpoint: &str,
+        token: Option<String>,
+        credential: Option<&Credential>,
+    ) -> Result<Client> {
+        self.connect_prechecked(
+            adapter,
+            endpoint,
+            token,
+            RequestAuth::for_credential(credential),
+            false,
+        )
     }
 
     fn connect_prechecked(
@@ -167,7 +205,7 @@ impl Provider {
         adapter: Adapter,
         endpoint: &str,
         token: Option<String>,
-        bearer: bool,
+        auth: RequestAuth,
         radius_checked: bool,
     ) -> Result<Client> {
         let missing_key = || {
@@ -245,9 +283,12 @@ impl Provider {
                 let token = token.ok_or_else(missing_key)?;
                 let mut client = if self.id() == "cloudflare-ai-gateway" {
                     Anthropic::with_cloudflare_gateway_token(endpoint, &token)?
-                } else if self == &Self::Anthropic && token.contains("sk-ant-oat") {
+                } else if self == &Self::Anthropic
+                    && auth != RequestAuth::HeaderBearer
+                    && token.contains("sk-ant-oat")
+                {
                     Anthropic::with_oauth_token(endpoint, &token)?
-                } else if bearer
+                } else if auth != RequestAuth::Automatic
                     || matches!(
                         self.id(),
                         "fireworks" | "openrouter" | "minimax" | "minimax-cn" | "github-copilot"
@@ -468,7 +509,7 @@ impl Deferred {
             .headers
             .resolve(&self.provider, token.as_deref())
             .await?;
-        let bearer = self.credential.as_ref().is_some_and(Credential::is_bearer);
+        let auth = RequestAuth::for_credential(self.credential.as_ref());
         let mut radius_checked = false;
         if self.provider == Provider::Radius
             && self.adapter == Adapter::PiMessages
@@ -494,7 +535,7 @@ impl Deferred {
         };
         let mut client = self
             .provider
-            .connect_prechecked(self.adapter, &endpoint, token, bearer, radius_checked)?
+            .connect_prechecked(self.adapter, &endpoint, token, auth, radius_checked)?
             .with_headers(headers.clone())
             .with_context_probes(self.probe_context);
         match (&self.credential, &mut client) {
@@ -3762,6 +3803,45 @@ mod contention_tests {
                 !summary && path != 0
             );
         }
+    }
+
+    #[tokio::test]
+    async fn anthropic_header_bearer_accepts_subscription_shaped_token_without_subscription_mode() {
+        let provider = Provider::Anthropic;
+        let endpoint = "http://127.0.0.1:1/v1/messages";
+        let token = "sk-ant-oat-fixture";
+        let expected = Client::Anthropic(Anthropic::with_bearer_token(endpoint, token).unwrap());
+        let subscription = provider.connect_for_credential(
+            Adapter::Anthropic,
+            endpoint,
+            Some(token.into()),
+            Some(&Credential::Literal(token.into())),
+        );
+        assert!(
+            matches!(subscription, Err(Error::Config(message)) if message.contains("OAuth requires"))
+        );
+
+        let credential = Credential::Bearer(token.into());
+        let explicit = provider
+            .connect_for_credential(
+                Adapter::Anthropic,
+                endpoint,
+                Some(token.into()),
+                Some(&credential),
+            )
+            .unwrap();
+        let (deferred, _) = Client::deferred(
+            provider,
+            Adapter::Anthropic,
+            endpoint,
+            Some(credential),
+            RequestHeaders::default(),
+        )
+        .resolve_affinity_headers()
+        .await
+        .unwrap();
+        assert_eq!(expected.context_identity(), explicit.context_identity());
+        assert_eq!(expected.context_identity(), deferred.context_identity());
     }
 
     #[tokio::test]

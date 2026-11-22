@@ -511,15 +511,10 @@ impl Cli {
                 if endpoint != provider.default_endpoint() {
                     return None;
                 }
-                if provider == &Provider::Anthropic
-                    && let Some(token) = std::env::var("ANTHROPIC_AUTH_TOKEN")
-                        .ok()
-                        .filter(|token| !token.trim().is_empty())
-                {
-                    return Some(model_auth::Credential::Bearer(token));
+                if provider == &Provider::Anthropic {
+                    return model_auth::anthropic_env_credential(|name| std::env::var(name).ok());
                 }
                 let variable = match provider {
-                    Provider::Anthropic => "ANTHROPIC_API_KEY",
                     Provider::Google => "GEMINI_API_KEY",
                     _ => return None,
                 };
@@ -573,11 +568,8 @@ impl Cli {
             .and_then(model_auth::Credential::literal)
             .map(str::to_owned);
         let headers = settings.static_headers(provider, token.as_deref())?;
-        let bearer = credential
-            .as_ref()
-            .is_some_and(model_auth::Credential::is_bearer);
         provider
-            .connect(adapter, endpoint, token, bearer)?
+            .connect_for_credential(adapter, endpoint, token, credential.as_ref())?
             .with_headers(headers)
             .with_http_settings_and_env(&self.settings, settings.environment())
     }
