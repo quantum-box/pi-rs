@@ -842,27 +842,35 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("the cache refresh never reached its endpoint")
-                .unwrap();
-            let mut socket = BufReader::new(socket);
-            let mut line = String::new();
-            socket.read_line(&mut line).await.unwrap();
-            assert!(line.starts_with("POST /v1/messages "), "{line:?}");
-            let mut length = None;
-            loop {
-                line.clear();
-                assert!(socket.read_line(&mut line).await.unwrap() > 0);
-                if line.trim().is_empty() {
-                    break;
+            let (mut socket, body) = loop {
+                let (socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("the cache refresh never reached its endpoint")
+                    .unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                let path = line.clone();
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
                 }
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = Some(value.trim().parse::<usize>().unwrap());
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                if path.starts_with("GET /v1/models/") {
+                    socket.get_mut().write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    continue;
                 }
-            }
-            let mut body = vec![0; length.expect("missing request content length")];
-            socket.read_exact(&mut body).await.unwrap();
+                assert!(path.starts_with("POST /v1/messages "), "{path:?}");
+                break (socket, body);
+            };
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["max_tokens"], 1);
             socket
