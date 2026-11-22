@@ -127,7 +127,13 @@ that scope and to a configured `enabledModels` list. Legacy qualified defaults
 without `defaultProvider` are still accepted. When the selected built-in
 provider needs a model and no saved, explicit or scoped selection applies,
 pi-rs prefers Pi's default model if it is in the effective catalog. It uses
-the first available entry when that default is missing. Cycling models shows
+the first available entry when that default is missing. When no model, provider,
+endpoint or inline credential is specified and no scope or saved default
+selects the model, startup considers authenticated models in Pi's provider
+preference order. Automatic selection uses the known catalog and existing
+endpoint bindings, without refreshing OAuth or invoking credential commands
+to choose a model. Native Ollama remains the fallback when the known catalog
+has no authenticated model. Cycling models shows
 the selected display name and the active thinking level for reasoning models. Consecutive notices
 reuse the trailing status in both fullscreen and regular mode, before it enters
 scrollback. The tool-output, thinking-visibility, and thinking-level shortcuts

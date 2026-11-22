@@ -39,52 +39,148 @@ pub fn qualified_model<'a>(
     Some((profiles.provider(provider)?, model))
 }
 
+// The order is Pi's startup preference across authenticated providers.
+const PROVIDER_DEFAULTS: &[(&str, &str)] = &[
+    ("amazon-bedrock", "us.anthropic.claude-opus-5-5"),
+    ("ant-ling", "Ring-2.6-1T"),
+    ("anthropic", "claude-opus-5-5"),
+    ("openai", "gpt-6.2-sol"),
+    ("azure", "gpt-6.2-sol"),
+    ("openai-codex", "gpt-6.2-sol"),
+    ("radius", "balanced"),
+    ("nvidia", "nvidia/nemotron-3.5-super-vl-120b-a12b"),
+    ("deepseek", "deepseek-v4-pro"),
+    ("google", "gemini-4-argon"),
+    ("google-vertex", "gemini-4-argon"),
+    ("github-copilot", "gpt-6.1-sol"),
+    ("openrouter", "moonshotai/kimi-k2.7-code"),
+    ("vercel-ai-gateway", "zai/glm-5.3"),
+    ("xai", "grok-4.7"),
+    ("groq", "openai/gpt-oss-120b"),
+    ("cerebras", "gpt-oss-120b"),
+    ("zai", "glm-5.3"),
+    ("zai-coding-cn", "glm-5.3"),
+    ("mistral", "devstral-medium-latest"),
+    ("minimax", "MiniMax-M3"),
+    ("minimax-cn", "MiniMax-M3"),
+    ("moonshotai", "kimi-k2.7-code"),
+    ("moonshotai-cn", "kimi-k2.7-code"),
+    ("huggingface", "moonshotai/Kimi-K2.7-Code"),
+    ("fireworks", "accounts/fireworks/models/kimi-k3"),
+    ("together", "moonshotai/Kimi-K3"),
+    ("baseten", "zai-org/GLM-5.3"),
+    ("opencode", "kimi-k2.7-code"),
+    ("opencode-go", "kimi-k3.1-pro"),
+    ("kimi-coding", "kimi-for-coding"),
+    ("meta", "muse-spark-1.3"),
+    ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.7-code"),
+    (
+        "cloudflare-ai-gateway",
+        "workers-ai/@cf/moonshotai/kimi-k2.7-code",
+    ),
+    ("qwen-token-plan", "qwen3.8-max"),
+    ("qwen-token-plan-cn", "qwen3.8-max"),
+    ("qwen-token-plan-individual", "qwen3.8-max"),
+    ("qwen-token-plan-individual-cn", "qwen3.8-max"),
+    ("xiaomi", "mimo-v2.6-pro"),
+    ("xiaomi-token-plan-cn", "mimo-v2.6-pro"),
+    ("xiaomi-token-plan-ams", "mimo-v2.6-pro"),
+    ("xiaomi-token-plan-sgp", "mimo-v2.6-pro"),
+];
+
 /// Use the pinned Pi default when it is present in the effective catalog.
 pub(super) fn default_for_provider<'a>(
     provider: &Provider,
     models: &'a [String],
 ) -> Option<&'a String> {
-    let preferred = match provider.id() {
-        "amazon-bedrock" => "us.anthropic.claude-opus-5-5",
-        "ant-ling" => "Ring-2.6-1T",
-        "anthropic" => "claude-opus-5-5",
-        "openai" | "azure" | "openai-codex" => "gpt-6.2-sol",
-        "radius" => "balanced",
-        "nvidia" => "nvidia/nemotron-3.5-super-vl-120b-a12b",
-        "deepseek" => "deepseek-v4-pro",
-        "google" | "google-vertex" => "gemini-4-argon",
-        "github-copilot" => "gpt-6.1-sol",
-        "openrouter" => "moonshotai/kimi-k2.7-code",
-        "vercel-ai-gateway" => "zai/glm-5.3",
-        "xai" => "grok-4.7",
-        "groq" => "openai/gpt-oss-120b",
-        "cerebras" => "gpt-oss-120b",
-        "zai" | "zai-coding-cn" => "glm-5.3",
-        "mistral" => "devstral-medium-latest",
-        "minimax" | "minimax-cn" => "MiniMax-M3",
-        "moonshotai" | "moonshotai-cn" | "opencode" => "kimi-k2.7-code",
-        "huggingface" => "moonshotai/Kimi-K2.7-Code",
-        "fireworks" => "accounts/fireworks/models/kimi-k3",
-        "together" => "moonshotai/Kimi-K3",
-        "baseten" => "zai-org/GLM-5.3",
-        "opencode-go" => "kimi-k3.1-pro",
-        "kimi-coding" => "kimi-for-coding",
-        "meta" => "muse-spark-1.3",
-        "cloudflare-workers-ai" => "@cf/moonshotai/kimi-k2.7-code",
-        "cloudflare-ai-gateway" => "workers-ai/@cf/moonshotai/kimi-k2.7-code",
-        "qwen-token-plan"
-        | "qwen-token-plan-cn"
-        | "qwen-token-plan-individual"
-        | "qwen-token-plan-individual-cn" => "qwen3.8-max",
-        "xiaomi" | "xiaomi-token-plan-cn" | "xiaomi-token-plan-ams" | "xiaomi-token-plan-sgp" => {
-            "mimo-v2.6-pro"
-        }
-        _ => return models.first(),
-    };
-    models
+    PROVIDER_DEFAULTS
         .iter()
-        .find(|id| id.as_str() == preferred)
+        .find(|(id, _)| *id == provider.id())
+        .and_then(|(_, preferred)| models.iter().find(|model| model == preferred))
         .or_else(|| models.first())
+}
+
+/// Choose from known catalog entries without resolving credential commands
+/// or refreshing OAuth on startup. Native Ollama remains the local fallback.
+pub(super) async fn automatic_startup_model(args: &Cli) -> Option<ScopedChoice> {
+    use super::{model_auth::Credential, providers::Client};
+
+    let profiles = &args.model_profiles;
+    let bedrock_ambient = bedrock_environment_configured(|key| {
+        std::env::var_os(key).is_some_and(|value| !value.is_empty())
+    });
+    let mut candidates = Vec::new();
+    for provider in profiles
+        .providers()
+        .filter(|provider| *provider != Provider::Ollama)
+    {
+        let radius = if provider == Provider::Radius {
+            match args.connect_provider(&provider, None) {
+                Ok(Client::PiMessages(client)) => client
+                    .with_context_probe(false)
+                    .models()
+                    .await
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let base_endpoint = profiles.endpoint(&provider);
+        let mut models = profiles.model_ids(&provider);
+        for id in &radius {
+            if !models.contains(id) {
+                models.push(id.clone());
+            }
+        }
+        for model in models {
+            let endpoint = profiles
+                .model_endpoint(&provider, &model)
+                .unwrap_or(base_endpoint);
+            if args
+                .model_keys
+                .available_model_ids(&provider, endpoint)
+                .is_some_and(|available| !available.contains(&model))
+            {
+                continue;
+            }
+            let credential = args.configured_model_credential(&provider, endpoint);
+            let usable = match credential {
+                Some(Credential::Invalid) => false,
+                Some(credential) => credential
+                    .literal()
+                    .is_none_or(super::model_auth::valid_key),
+                None => {
+                    (provider == Provider::Bedrock && endpoint.is_empty() && bedrock_ambient)
+                        || (provider == Provider::Radius
+                            && endpoint == base_endpoint
+                            && radius.contains(&model))
+                }
+            };
+            if usable {
+                let priority = PROVIDER_DEFAULTS
+                    .iter()
+                    .position(|(id, preferred)| *id == provider.id() && *preferred == model)
+                    .unwrap_or(PROVIDER_DEFAULTS.len());
+                candidates.push((
+                    priority,
+                    ScopedChoice {
+                        provider: provider.clone(),
+                        model,
+                        thinking: None,
+                    },
+                ));
+            }
+        }
+    }
+    candidates.sort_by_key(|(priority, _)| *priority);
+    candidates
+        .into_iter()
+        .map(|(_, choice)| choice)
+        .find(|choice| {
+            args.connect_provider(&choice.provider, Some(&choice.model))
+                .is_ok()
+        })
 }
 
 pub struct Catalog {
