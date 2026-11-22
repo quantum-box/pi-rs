@@ -316,6 +316,12 @@ impl<'a> Capture<'a> {
         match event {
             Notification::SummaryRequest => self.summary = true,
             Notification::Committed(record) => match &record.event {
+                Event::ModelSelected { .. } if record.run_id.is_some() => {
+                    // A live change can alter the provider, credentials or
+                    // request options. The capture was built for the old route.
+                    self.cancel("model selection changed");
+                    self.enabled = false;
+                }
                 Event::ModelRequested { request_id, .. } => {
                     self.cancel("conversation context changed");
                     self.request_id = *request_id;

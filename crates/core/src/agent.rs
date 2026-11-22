@@ -1732,6 +1732,7 @@ impl Agent<'_> {
         let lifecycle = crate::lifecycle::enabled(self.registry);
         let mut turn_index = completed_run_turns(session, run_id);
         let mut next_request_index = requests_used;
+        let mut selected = None;
         while next_request_index < self.limits.model_requests {
             let request_index = next_request_index;
             next_request_index += 1;
@@ -1753,13 +1754,19 @@ impl Agent<'_> {
             // Use one adapter and its limits for the entire request and tool
             // dispatch. A selection received during streaming is used only
             // once this turn reaches a new request boundary.
-            let selected = session.live_model.selection().filter(|_| {
-                pending.is_none()
-                    && overflow_recovery_state(session, run_id)
-                        .is_none_or(|recovery| recovery.compacted)
-            });
-            if let Some(selected) = &selected {
-                session.apply_live_model_selection(selected, observer)?;
+            if let Some(next) = session
+                .live_model
+                .as_ref()
+                .and_then(crate::LiveModelControl::selection)
+                && selected
+                    .as_ref()
+                    .is_none_or(|current| !Arc::ptr_eq(current, &next))
+                && pending.is_none()
+                && overflow_recovery_state(session, run_id)
+                    .is_none_or(|recovery| recovery.compacted)
+            {
+                session.apply_live_model_selection(&next, observer)?;
+                selected = Some(next);
             }
             let active = Agent {
                 registry: &runtime_registry,
@@ -2430,9 +2437,9 @@ impl Agent<'_> {
                     let compact_agent = Agent {
                         registry: &runtime_registry,
                         system_prompt: &runtime_prompt,
-                        model: self.model,
-                        model_name: self.model_name,
-                        limits: self.limits.clone(),
+                        model: active.model,
+                        model_name: active.model_name,
+                        limits: active.limits.clone(),
                     };
                     compact_agent
                         .compact_silent_overflow(
@@ -12826,17 +12833,22 @@ mod queue_tests {
             release.notify_one();
         };
         let cancel = CancellationToken::new();
-        let (result, ()) = tokio::join!(
-            agent.run_correlated(
-                &mut session,
-                Uuid::new_v4(),
-                Some("initial".into()),
-                &mut inputs,
-                &cancel,
-                &mut |_| {}
-            ),
-            switch,
-        );
+        let mut observer = |_: Notification<'_>| {};
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(
+                agent.run_correlated(
+                    &mut session,
+                    Uuid::new_v4(),
+                    Some("initial".into()),
+                    &mut inputs,
+                    &cancel,
+                    &mut observer
+                ),
+                switch,
+            )
+        })
+        .await
+        .expect("live selection should settle");
         assert_eq!(result.unwrap(), "beta");
         assert_eq!(*seen.lock().unwrap(), ["alpha", "beta"]);
         assert_eq!(

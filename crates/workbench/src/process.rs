@@ -540,7 +540,10 @@ impl Worker {
         Ok(())
     }
     pub(super) fn adopt_live_model(&mut self, args: &Cli) {
-        self.configuration = configuration(args);
+        let route = configuration(args);
+        for key in ["provider", "endpoint", "token_fingerprint"] {
+            self.configuration[key] = route[key].clone();
+        }
     }
 
     pub(super) fn matches(&self, args: &Cli) -> bool {

@@ -1925,6 +1925,9 @@ impl View {
         selected: Cli,
         status: String,
     ) -> Result<()> {
+        if self.live_model_choices.len() >= 32 {
+            return Err(Error::Config("Model selection is still pending".into()));
+        }
         let id = uuid::Uuid::new_v4();
         worker.send(json!({
             "type": "select_live_model",
@@ -5267,6 +5270,8 @@ pub(super) async fn run(
                 if let Some(pending) = view.pending_share.take() {
                     start_share_upload(&mut view, pending, None);
                 }
+                view.live_model_choices.clear();
+                view.live_model_applied = None;
                 view.settle();
                 view.cache_warming_status = None;
                 cancel_running_extension_editor(&mut external_editor, None);

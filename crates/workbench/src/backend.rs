@@ -1680,7 +1680,7 @@ async fn run_worker(
             state.token = None;
             state.live_model.take()
         };
-        if let Some(mut live) = live
+        let adopted = if let Some(mut live) = live
             && let Some((selection, adapter)) = live.latest.take()
         {
             let persist = |session: &mut Session| {
@@ -1697,15 +1697,15 @@ async fn run_worker(
                 || Session::open(&args.session).and_then(|mut session| persist(&mut session)),
                 persist,
             ) {
-                Ok(()) => {
-                    args = live.args;
-                    runtime.provider = adapter;
-                }
+                Ok(()) => Some((live.args, adapter)),
                 Err(error) => {
-                    output(json!({"type":"live_model_reverted","error":error.to_string()}))
+                    output(json!({"type":"live_model_reverted","error":error.to_string()}));
+                    None
                 }
             }
-        }
+        } else {
+            None
+        };
         snapshot
             .lock()
             .expect("session snapshot")
@@ -1719,8 +1719,13 @@ async fn run_worker(
         cache_capture.settle(
             run_session
                 .as_ref()
-                .filter(|_| result.is_ok() && completed_shells.is_empty()),
+                .filter(|_| result.is_ok() && completed_shells.is_empty() && adopted.is_none()),
         );
+        drop(cache_capture);
+        if let Some((selected, adapter)) = adopted {
+            args = selected;
+            runtime.provider = adapter;
+        }
         for execution in completed_shells {
             let recorded = match run_session.as_mut() {
                 Some(session) => record_shell(session, &execution, &args, &snapshot),

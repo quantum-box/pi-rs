@@ -34,13 +34,21 @@ impl Session {
         selection: &LiveModelSelection,
         observe: &mut dyn FnMut(Notification<'_>),
     ) -> Result<()> {
-        let before = self.records().len();
-        if self
-            .model_selection()
-            .is_some_and(|(model, _)| model == selection.model)
-            && self.model_provider() == selection.provider.as_deref()
-            && let Some(thinking) = selection.thinking.as_deref()
+        let existing = self.model_selection();
+        let same_model = existing
+            .as_ref()
+            .is_some_and(|(model, _)| model == &selection.model)
+            && self.model_provider() == selection.provider.as_deref();
+        if same_model
+            && existing
+                .as_ref()
+                .and_then(|(_, thinking)| thinking.as_deref())
+                == selection.thinking.as_deref()
         {
+            return Ok(());
+        }
+        let before = self.records().len();
+        if same_model && let Some(thinking) = selection.thinking.as_deref() {
             self.select_thinking_level(selection.provider.as_deref(), &selection.model, thinking)?;
         } else {
             self.select_provider_model(
