@@ -108,6 +108,28 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
         )
         .await
         .unwrap();
+    let tool_results: std::collections::HashMap<_, _> = session
+        .operations()
+        .into_iter()
+        .map(|(invocation, state)| (invocation.call.id, state))
+        .collect();
+    for call_id in ["ls-missing", "grep-missing", "read-offset", "find-fraction"]
+        .into_iter()
+        .chain(cfg!(unix).then_some("bash-timeout"))
+    {
+        assert!(
+            matches!(
+                &tool_results[call_id],
+                OperationState::Finished(Outcome::TextResult {
+                    details: Some(details),
+                    is_error: true,
+                    ..
+                }) if *details == json!({})
+            ),
+            "{call_id}: {:?}",
+            tool_results[call_id]
+        );
+    }
     let requests = model.0.lock().unwrap();
     let replies: std::collections::HashMap<_, _> = requests[1]
         .messages

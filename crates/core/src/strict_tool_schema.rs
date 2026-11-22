@@ -32,6 +32,14 @@ pub struct ToolGrammarVariants {
     pub openai_regex: Option<String>,
 }
 
+/// Grammar formats recognized by OpenAI custom tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolGrammarSyntax {
+    Lark,
+    Regex,
+}
+
 /// An optional tool constraint; `Disabled` preserves Pi's explicit `false`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolConstraint {
@@ -91,11 +99,65 @@ pub struct ToolDeclaration {
     pub constrained_sampling: Option<ToolConstraint>,
 }
 
+/// Pick the OpenAI grammar variant and the argument that carries its raw input.
+pub fn resolve_openai_tool_grammar(
+    tool: &ToolDeclaration,
+) -> Result<Option<(ToolGrammarSyntax, &str, &str)>, StrictSchemaError> {
+    let Some(ToolConstraint::Grammar { variants }) = &tool.constrained_sampling else {
+        return Ok(None);
+    };
+    let failure = |reason: &str| {
+        StrictSchemaError(format!(
+            "tool {:?} cannot use grammar constrained sampling: {reason}",
+            tool.spec.name
+        ))
+    };
+    let (syntax, definition) = variants
+        .openai_lark
+        .as_deref()
+        .filter(|definition| !definition.trim().is_empty())
+        .map(|definition| (ToolGrammarSyntax::Lark, definition))
+        .or_else(|| {
+            variants
+                .openai_regex
+                .as_deref()
+                .filter(|definition| !definition.trim().is_empty())
+                .map(|definition| (ToolGrammarSyntax::Regex, definition))
+        })
+        .ok_or_else(|| failure("no supported grammar variant was provided"))?;
+    let schema = &tool.spec.parameters;
+    if schema["type"] != "object" {
+        return Err(failure("the parameter schema must be an object"));
+    }
+    let property = schema["required"]
+        .as_array()
+        .and_then(|required| match required.as_slice() {
+            [property] => property.as_str(),
+            _ => None,
+        })
+        .ok_or_else(|| failure("the parameter schema must have exactly one required property"))?;
+    if schema["properties"][property]["type"] != "string" {
+        return Err(failure("the required property must have type string"));
+    }
+    Ok(Some((syntax, definition, property)))
+}
+
+/// Recover raw grammar input only if representing it as a string loses no arguments.
+pub fn lossless_openai_grammar_input(arguments: &str, property: &str) -> Option<String> {
+    let parsed = crate::parse_tool_arguments(arguments).ok()?;
+    let object = parsed.as_object().filter(|object| object.len() == 1)?;
+    object.get(property)?.as_str().map(str::to_owned)
+}
+
 /// The actual sampling decision for one advertised tool.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EffectiveToolSampling {
     Unconstrained,
+    OpenAiGrammar {
+        syntax: ToolGrammarSyntax,
+        input_property: String,
+    },
     StrictJsonSchema {
         original_schema: Value,
         normalization_version: u32,
@@ -152,6 +214,17 @@ impl ValidatedToolDecisionSnapshot<'_> {
             .map_err(|error| StrictSchemaError(format!("invalid tool arguments: {error}")))?;
         match &decision.sampling {
             EffectiveToolSampling::Unconstrained => Ok(arguments),
+            EffectiveToolSampling::OpenAiGrammar { input_property, .. } => {
+                if arguments.as_object().is_some_and(|object| {
+                    object.len() == 1 && object.get(input_property).is_some_and(Value::is_string)
+                }) {
+                    Ok(arguments)
+                } else {
+                    Err(StrictSchemaError(
+                        "invalid OpenAI grammar tool input".into(),
+                    ))
+                }
+            }
             EffectiveToolSampling::StrictJsonSchema {
                 original_schema,
                 normalization_version: STRICT_TOOL_NORMALIZATION_VERSION,
@@ -417,6 +490,22 @@ pub fn validate_effective_tool_declarations(
                     "unrequested strict constraint for tool {:?}",
                     spec.name
                 )));
+            }
+            (
+                _,
+                EffectiveToolSampling::OpenAiGrammar {
+                    syntax,
+                    input_property,
+                },
+            ) => {
+                if !resolve_openai_tool_grammar(declaration)?.is_some_and(
+                    |(format, _, property)| format == *syntax && property == input_property,
+                ) {
+                    return Err(StrictSchemaError(format!(
+                        "invalid grammar decision for tool {:?}",
+                        spec.name
+                    )));
+                }
             }
             (_, EffectiveToolSampling::Unconstrained) => {}
         }

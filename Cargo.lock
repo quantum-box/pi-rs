@@ -2821,6 +2821,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "hmac",
+ "http 1.5.0",
  "js-sys",
  "jsonschema",
  "libc",

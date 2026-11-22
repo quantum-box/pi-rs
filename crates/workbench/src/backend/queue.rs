@@ -79,6 +79,7 @@ impl Processor {
             },
             Request::ClearQueue { id } => self.clear(id),
             Request::SetSessionName { name, id } => self.rename(name, id),
+            Request::SetSessionLabel { target, label, id } => self.set_label(target, label, id),
             Request::SetQueueMode { kind, mode, id } => {
                 // The direct path runs on the dedicated stdin reader thread.
                 // Its coordinator dies with that thread and is never reused by
@@ -225,6 +226,29 @@ impl Processor {
         }
     }
 
+    fn set_label(&self, target: u64, label: Option<String>, id: Option<Value>) {
+        let (reply, receiver) = oneshot::channel();
+        if self
+            .inputs
+            .try_send(AgentInput::SetSessionLabel {
+                target,
+                label,
+                reply,
+            })
+            .is_err()
+        {
+            control_response("set_session_label", id, Err(queue_full()));
+            return;
+        }
+        tokio::spawn(async move {
+            let result = receiver
+                .await
+                .map_err(|_| channel_closed())
+                .and_then(|result| result);
+            control_response("set_session_label", id, result.map(|()| Value::Null));
+        });
+    }
+
     fn rename(&self, name: String, id: Option<Value>) {
         let (reply, receiver) = oneshot::channel();
         if self
@@ -346,6 +370,9 @@ pub(super) fn reject(request: Request) {
         Request::ClearQueue { id } => control_response("clear_queue", id, Err(queue_full())),
         Request::SetSessionName { id, .. } => {
             control_response("set_session_name", id, Err(queue_full()))
+        }
+        Request::SetSessionLabel { id, .. } => {
+            control_response("set_session_label", id, Err(queue_full()))
         }
         Request::SetQueueMode { kind, id, .. } => {
             control_response(mode_command(kind), id, Err(queue_full()))
