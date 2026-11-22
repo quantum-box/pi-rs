@@ -530,12 +530,14 @@ enum ThinkingFamily {
 fn family(id: &str) -> Option<ThinkingFamily> {
     let normalized = id.to_ascii_lowercase();
     let id = normalized.as_str();
-    if gemini_major(id).is_some_and(|version| version >= 3)
+    let gemini = gemini_version(id);
+    if gemini.is_some_and(|(version, _)| version >= 3)
         || matches!(id, "gemini-flash-latest" | "gemini-flash-lite-latest")
         || id.starts_with("gemma-4")
         || id.starts_with("gemma4-")
     {
-        Some(if id.contains("-pro") {
+        let model = gemini.map_or(id, |(_, model)| model);
+        Some(if model.contains("-pro") {
             ThinkingFamily::LevelPro
         } else {
             ThinkingFamily::LevelFlash
@@ -552,20 +554,27 @@ fn family(id: &str) -> Option<ThinkingFamily> {
 }
 
 fn gemini_major(id: &str) -> Option<u32> {
-    let id = id.to_ascii_lowercase();
-    let version = id.strip_prefix("gemini-")?;
-    let version = version.strip_prefix("live-").unwrap_or(version);
-    version
-        .bytes()
-        .take_while(u8::is_ascii_digit)
-        .fold(None, |value: Option<u32>, digit| {
-            Some(
-                value
-                    .unwrap_or(0)
-                    .saturating_mul(10)
-                    .saturating_add((digit - b'0') as u32),
-            )
-        })
+    gemini_version(&id.to_ascii_lowercase()).map(|(version, _)| version)
+}
+
+fn gemini_version(id: &str) -> Option<(u32, &str)> {
+    id.match_indices("gemini-").find_map(|(start, marker)| {
+        let model = &id[start..];
+        let version = &model[marker.len()..];
+        let version = version.strip_prefix("live-").unwrap_or(version);
+        version
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .fold(None, |value: Option<u32>, digit| {
+                Some(
+                    value
+                        .unwrap_or(0)
+                        .saturating_mul(10)
+                        .saturating_add((digit - b'0') as u32),
+                )
+            })
+            .map(|major| (major, model))
+    })
 }
 
 /// Whether the model expects call IDs in both function calls and their responses.
@@ -859,7 +868,9 @@ fn wire_request(
     let mut calls = BTreeMap::new();
     let mut tool_images = Vec::new();
     for message in &request.messages {
-        if !matches!(message, Message::Tool { .. }) && !tool_images.is_empty() {
+        if !matches!(message, Message::Tool { .. } | Message::System { .. })
+            && !tool_images.is_empty()
+        {
             push_content(
                 &mut contents,
                 "user",
@@ -868,7 +879,11 @@ fn wire_request(
             );
         }
         match message {
-            Message::System { content } => system.push(content.as_str()),
+            Message::System { content } => {
+                if !content.is_empty() {
+                    system.push(content.as_str());
+                }
+            }
             Message::User { content } => {
                 push_content(&mut contents, "user", vec![json!({"text":content})], true)
             }
@@ -1108,7 +1123,7 @@ impl Model for Google {
         }
         pi_rs_core::protected_model_fingerprint(&(
             headers,
-            "google-v3-tool-errors",
+            "google-v5",
             self.endpoint.as_str(),
             self.provider.as_ref(),
             self.replay_scope.as_ref(),
@@ -1371,7 +1386,7 @@ impl Model for Google {
             metadata.finish_reason = Some(match finish.as_deref() {
                 Some("STOP") if calls.is_empty() => "stop",
                 Some("STOP") => "tool_calls",
-                Some("MAX_TOKENS") => {
+                Some("MAX_TOKENS" | "CONTINUATION") => {
                     calls.clear();
                     blocks.retain(|part| part.get("functionCall").is_none());
                     "length"
@@ -1641,7 +1656,7 @@ mod tests {
         let headers: Vec<(&str, &[u8])> = vec![];
         let old = pi_rs_core::protected_model_fingerprint(&(
             headers,
-            "google-v2-const-enum",
+            "google-v3-tool-errors",
             google.endpoint.as_str(),
             google.provider.as_ref(),
             google.replay_scope.as_ref(),
@@ -2681,6 +2696,8 @@ mod tests {
         .to_string();
         for (model, nested) in [
             ("gemini-2.5-flash", false),
+            ("gateway-gemini-2.5-flash", false),
+            ("gateway-gemini-4-argon", true),
             ("Gemini-2.5-flash", false),
             ("GeMiNi-LiVe-2.5-flash", false),
             ("gemini-2_flash", false),
@@ -2694,6 +2711,9 @@ mod tests {
             let request = ModelRequest {
                 model: model.into(),
                 messages: vec![
+                    Message::System {
+                        content: "Initial instructions".into(),
+                    },
                     Message::Assistant {
                         content: String::new(),
                         calls: ["a", "b"]
@@ -2712,6 +2732,12 @@ mod tests {
                         call_id: "a".into(),
                         content: image_result.clone(),
                     },
+                    Message::System {
+                        content: String::new(),
+                    },
+                    Message::System {
+                        content: "Later instructions".into(),
+                    },
                     Message::Tool {
                         is_structured: Some(false),
                         is_error: true,
@@ -2726,6 +2752,10 @@ mod tests {
                 max_output_tokens: 32,
             };
             let body = wire_request(&request, None, "google", "google").unwrap();
+            assert_eq!(
+                body["systemInstruction"]["parts"][0]["text"],
+                "Initial instructions\n\nLater instructions"
+            );
             let contents = body["contents"].as_array().unwrap();
             if model.to_ascii_lowercase().starts_with("gemini") {
                 let call = &contents[0]["parts"][0];
@@ -2781,6 +2811,9 @@ mod tests {
             ("gemini-_2", None),
             ("gemini-live-", None),
             ("gemini-live2", None),
+            ("gateway-gemini-4-argon", Some(4)),
+            ("gateway-gemini-LIVE-03preview", Some(3)),
+            ("gemini-proxy-gemini-12", Some(12)),
         ] {
             assert_eq!(gemini_major(id), expected, "{id}");
         }
@@ -2791,6 +2824,15 @@ mod tests {
         assert_eq!(
             thinking_config("gemini-3_flash", Some("low")),
             thinking_config("gemini-3-flash", Some("low"))
+        );
+        assert_eq!(
+            thinking_config("gateway-gemini-4-argon", Some("high")),
+            thinking_config("gemini-4-argon", Some("high"))
+        );
+        assert!(uses_tool_call_ids("gateway-gemini-4-argon"));
+        assert_eq!(
+            model_thinking_levels("provider-proxy-gemini-4-argon"),
+            model_thinking_levels("gemini-4-argon")
         );
         assert_eq!(model_thinking_levels("gemini-2_flash"), vec!["off"]);
         assert_eq!(thinking_config("gemini-2_flash", Some("low")), None);
@@ -2812,8 +2854,67 @@ mod tests {
                 thinking_config(mixed, Some("minimal"))
             );
         }
-        assert_eq!(gemini_major("not-gemini-2"), None);
+        assert_eq!(gemini_major("not-gemini-2"), Some(2));
         assert_eq!(gemini_major("gemini-unknown"), None);
+    }
+
+    #[tokio::test]
+    async fn continuation_is_truncated_and_drops_unfinished_tool_calls() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.read(&mut [0; 8192]).unwrap();
+            let event = json!({"candidates":[{
+                "content":{"parts":[
+                    {"text":"partial answer","thoughtSignature":"signed-text"},
+                    {"functionCall":{"name":"read","id":"unfinished","args":{"path":"file"}}}
+                ]},
+                "finishReason":"CONTINUATION",
+                "continuationToken":"unconsumed-token"
+            }]});
+            let body = format!("data: {event}\n\n");
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let model = Google::new(&format!("http://{address}"), "key")
+            .unwrap()
+            .with_context_probe(false);
+        let mut stream = model
+            .stream(ModelRequest {
+                model: "gateway-gemini-4-argon".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 32,
+            })
+            .await
+            .unwrap();
+        let mut text = String::new();
+        let mut finish = None;
+        let mut replay = None;
+        let mut complete = false;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                ModelEvent::Text(delta) => text.push_str(&delta),
+                ModelEvent::Metadata(metadata) => {
+                    finish = metadata.finish_reason;
+                    replay = metadata.replay;
+                }
+                ModelEvent::Complete { calls, .. } => {
+                    assert!(calls.is_empty());
+                    complete = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(complete);
+        assert_eq!(finish.as_deref(), Some("length"));
+        assert_eq!(text, "partial answer");
+        assert_eq!(
+            replay.unwrap().blocks,
+            vec![json!({"text":"partial answer","thoughtSignature":"signed-text"})]
+        );
+        worker.join().unwrap();
     }
 
     #[tokio::test]

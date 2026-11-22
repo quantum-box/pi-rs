@@ -214,7 +214,7 @@ impl Provider {
                 }
                 if token.is_none()
                     && let Some(builtin) = super::builtin_chat::find(self.id())
-                    && (builtin.endpoint() == endpoint
+                    && (builtin.is_default_endpoint(endpoint)
                         || (self.id() == "cloudflare-ai-gateway"
                             && super::cloudflare_gateway::Route::is_endpoint(endpoint))
                         || (self.id() == "cloudflare-workers-ai"
@@ -528,10 +528,30 @@ impl Client {
         }
     }
 
-    pub(super) async fn with_final_strict_support(self, supported: bool) -> Result<Self> {
+    pub(super) async fn with_final_tool_support(
+        self,
+        strict: Option<bool>,
+        grammar: Option<bool>,
+    ) -> Result<Self> {
         Ok(match self {
-            Self::Ollama(client) => Self::Ollama(client.with_strict_tool_support(supported)),
-            Self::OpenAi(client) => Self::OpenAi(client.with_strict_tool_support(supported)),
+            Self::Ollama(mut client) => {
+                if let Some(supported) = strict {
+                    client = client.with_strict_tool_support(supported);
+                }
+                if let Some(supported) = grammar {
+                    client = client.with_grammar_tool_support(supported);
+                }
+                Self::Ollama(client)
+            }
+            Self::OpenAi(mut client) => {
+                if let Some(supported) = strict {
+                    client = client.with_strict_tool_support(supported);
+                }
+                if let Some(supported) = grammar {
+                    client = client.with_grammar_tool_support(supported);
+                }
+                Self::OpenAi(client)
+            }
             Self::Deferred(client)
                 if matches!(
                     client.adapter,
@@ -541,8 +561,13 @@ impl Client {
                         | Adapter::MistralConversations
                 ) =>
             {
-                return Box::pin(client.resolve().await?.with_final_strict_support(supported))
-                    .await;
+                return Box::pin(
+                    client
+                        .resolve()
+                        .await?
+                        .with_final_tool_support(strict, grammar),
+                )
+                .await;
             }
             other => other,
         })
@@ -1202,13 +1227,27 @@ impl Client {
                 let strict = args
                     .model_profiles
                     .anthropic_strict_tool_support(&args.provider, metadata.as_ref());
+                let (eager_default, eager_models) =
+                    args.model_profiles.anthropic_eager_tool_input_policy(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
+                    );
                 let mut client = client
+                    .with_eager_tool_input_streaming(eager_default, eager_models)
                     .with_strict_tool_support(strict)
                     .with_strict_tool_models(args.model_profiles.anthropic_strict_tool_models(
                         &args.provider,
                         &args.model,
                         args.explicit_endpoint_for(&args.provider),
                     ))
+                    .with_managed_effort_models(
+                        args.model_profiles.anthropic_managed_effort_models(
+                            &args.provider,
+                            &args.model,
+                            args.explicit_endpoint_for(&args.provider),
+                        ),
+                    )
                     .with_thinking(thinking)
                     .with_thinking_budget_settings(
                         args.settings.value().get("thinkingBudgets").cloned(),
@@ -1830,19 +1869,10 @@ mod contention_tests {
     }
 
     #[tokio::test]
-    async fn responses_grammar_capability_follows_the_selected_model() {
+    async fn openai_grammar_capability_follows_the_final_model() {
         use clap::Parser;
 
         let endpoint = "http://localhost:9/responses";
-        let mut args = super::super::Cli::parse_from(["pi"]);
-        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
-            "providers":{"fixture":{
-                "api":"openai-responses","baseUrl":endpoint,
-                "compat":{"supportsOpenAIGrammarTools":true},
-                "models":[{"id":"grammar"},{"id":"function","compat":{"supportsOpenAIGrammarTools":false}}]
-            }}
-        })).unwrap();
-        args.provider = args.model_profiles.provider("fixture").unwrap();
         let declaration = pi_rs::ToolDeclaration {
             spec: pi_rs::ToolSpec {
                 name: "write".into(),
@@ -1862,31 +1892,73 @@ mod contention_tests {
             external_id: "fixture".into(),
             summary: false,
         };
-        for (model, support) in [("grammar", true), ("function", false)] {
-            args.model = model.into();
-            let client = Client::OpenAi(
-                pi_rs::openai::OpenAiResponses::new_api(endpoint, "key".into()).unwrap(),
-            )
-            .with_model_options(&args, false)
-            .unwrap();
-            let request = ModelRequest {
-                model: model.into(),
-                messages: vec![],
-                tools: vec![declaration.spec.clone()],
-                max_output_tokens: 32,
-            };
-            let prepared = client
-                .prepare_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
-                .await
-                .unwrap()
+        for api in ["openai-completions", "openai-responses"] {
+            let mut args = super::super::Cli::parse_from(["pi"]);
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+                "providers":{"fixture":{
+                    "api":api,"baseUrl":endpoint,
+                    "compat":{"supportsOpenAIGrammarTools":true},
+                    "models":[{"id":"grammar"},{"id":"function","compat":{"supportsOpenAIGrammarTools":false}}]
+                }}
+            })).unwrap();
+            args.provider = args.model_profiles.provider("fixture").unwrap();
+            for (selected, model, expected) in [
+                ("grammar", "grammar", true),
+                ("grammar", "function", false),
+                ("grammar", "unknown", false),
+                ("function", "grammar", true),
+            ] {
+                args.model = selected.into();
+                let client = if api == "openai-completions" {
+                    Client::Ollama(Ollama::new(endpoint, None).unwrap())
+                } else {
+                    Client::OpenAi(
+                        pi_rs::openai::OpenAiResponses::new_api(endpoint, "key".into()).unwrap(),
+                    )
+                }
+                .with_model_options(&args, false)
                 .unwrap();
-            assert_eq!(
-                matches!(
-                    prepared.effective_tools()[0].sampling,
-                    pi_rs::EffectiveToolSampling::OpenAiGrammar { .. }
-                ),
-                support
-            );
+                let workbench = super::super::image_policy::WorkbenchModel {
+                    strict_policy: Some(Arc::new(super::super::image_policy::FinalStrictPolicy {
+                        profiles: args.model_profiles.clone(),
+                        provider: args.provider.clone(),
+                        selected_model: selected.into(),
+                        explicit_endpoint: false,
+                        bound_support: None,
+                    })),
+                    client,
+                    block_images: false,
+                    supports_images: None,
+                    session_affinity: &[],
+                    price: None,
+                };
+                let request = ModelRequest {
+                    model: model.into(),
+                    messages: vec![],
+                    tools: vec![declaration.spec.clone()],
+                    max_output_tokens: 32,
+                };
+                let bound = workbench.prepare_context(&request).await.unwrap().unwrap();
+                for model_client in [&workbench as &dyn Model, bound.as_ref()] {
+                    let prepared = model_client
+                        .prepare_tool_dispatch(
+                            &request,
+                            std::slice::from_ref(&declaration),
+                            &context,
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        matches!(
+                            prepared.effective_tools()[0].sampling,
+                            pi_rs::EffectiveToolSampling::OpenAiGrammar { .. }
+                        ),
+                        expected,
+                        "{api} {selected} -> {model}"
+                    );
+                }
+            }
         }
     }
 

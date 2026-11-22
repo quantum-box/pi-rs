@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 #[serde(default, rename_all = "camelCase")]
 pub struct ChatCompatibility {
     supports_store: Option<bool>,
+    supports_mid_convo_system_messages: Option<bool>,
     pub(super) supports_developer_role: Option<bool>,
     supports_usage_in_streaming: Option<bool>,
     pub(super) supports_finish_reason: Option<bool>,
@@ -265,6 +266,10 @@ impl ChatCompatibility {
         self.supports_openai_grammar_tools
     }
 
+    pub(super) fn set_openai_grammar_tool_support(&mut self, supported: bool) {
+        self.supports_openai_grammar_tools = Some(supported);
+    }
+
     /// Whether the configured model accepts the developer instruction role.
     pub fn supports_developer_role(&self) -> Option<bool> {
         self.supports_developer_role
@@ -282,6 +287,9 @@ impl ChatCompatibility {
             };
         Self {
             supports_store: model.supports_store.or(self.supports_store),
+            supports_mid_convo_system_messages: model
+                .supports_mid_convo_system_messages
+                .or(self.supports_mid_convo_system_messages),
             supports_developer_role: model
                 .supports_developer_role
                 .or(self.supports_developer_role),
@@ -323,6 +331,26 @@ impl ChatCompatibility {
 
     pub(super) fn preserves_reasoning_details(&self) -> bool {
         matches!(self.thinking_format, Some(ThinkingFormat::Openrouter))
+    }
+
+    pub(super) fn leading_system_message(
+        &self,
+        messages: &[pi_rs_core::Message],
+    ) -> Option<pi_rs_core::Message> {
+        if self.supports_mid_convo_system_messages == Some(true) {
+            return None;
+        }
+        let mut contents = messages.iter().filter_map(|message| match message {
+            pi_rs_core::Message::System { content } => Some(content.as_str()),
+            _ => None,
+        });
+        let first = contents.next()?;
+        let content = std::iter::once(first)
+            .chain(contents)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        Some(pi_rs_core::Message::System { content })
     }
 
     pub(super) fn request_options(&self, body: &mut Value, max_tokens: u32, has_tools: bool) {
