@@ -3588,16 +3588,24 @@ RPC supports `set_auto_retry` and `abort_retry`, with `auto_retry_start` and
 error. The initial OpenAI Responses (including Azure), OpenAI-compatible Chat
 Completions, and Anthropic Messages HTTP requests honor `retry.provider.maxRetries`
 (default 0), `maxRetryDelayMs` (default 60000, 0 disables the ceiling), and
-`timeoutMs` (to receive response headers on each attempt). They honor `x-should-retry`, `Retry-After-Ms`, and
-`Retry-After` before accepting a response stream. As in Pi 1.6, this opt-in
+`timeoutMs` (to receive response headers on each attempt). They honor
+`x-should-retry`, `Retry-After-Ms`, and `Retry-After` before accepting a response
+stream. As in Pi 1.6, this opt-in
 policy uses HTTP retry hints and status before processing the error body. The
 agent still uses the final provider error to distinguish quota exhaustion and
 other permanent failures. A server delay above the ceiling stops the provider
 retry and can trigger the agent's separately configured retry. Native reports
 the requested delay and ceiling without echoing the provider body. This policy
 also loads legacy
-`retry.maxDelayMs` when the replacement is unset. Google Gemini and Codex-specific
-provider retries and summary-specific retry policy remain open.
+`retry.maxDelayMs` when the replacement is unset.
+
+The Codex HTTP stream applies the same configured attempt count, deadline, and
+delay ceiling using Codex's own policy. It uses exponential backoff from one
+second and handles numeric or HTTP-date retry delays before accepting the stream.
+Native keeps its bounded, redacted error handling and stops immediately for
+permanent quota errors, context overflow, and oversized requests. Codex
+WebSocket timeouts, Google
+Gemini provider retries, and summary-specific retry policy remain open.
 
 Tests cover recovery, request and retry caps, queued input, wait cancellation,
 dropped-wait cleanup and usage-settlement failures. Loopback RPC checks verify

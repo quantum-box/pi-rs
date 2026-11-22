@@ -32,28 +32,7 @@ where
             let chunk = chunk.as_ref();
             bytes.extend_from_slice(&chunk[..chunk.len().min(LIMIT - bytes.len())]);
         }
-        let value: serde_json::Value = serde_json::from_slice(&bytes)
-            .ok()
-            .or_else(|| (!complete).then(|| provider_prefix_value(&bytes)).flatten())
-            .unwrap_or_default();
-        let value = sanitized_provider_error(&value, secrets);
-        let error = value.get("error").unwrap_or(&value);
-        let recognized_code = match error["code"].as_str() {
-            Some("subscription_sharing_usage_limit_exceeded") => {
-                Some("subscription_sharing_usage_limit_exceeded")
-            }
-            Some("subscription_sharing_user_not_eligible") => {
-                Some("subscription_sharing_user_not_eligible")
-            }
-            Some("subscription_sharing_usage_unavailable") => {
-                Some("subscription_sharing_usage_unavailable")
-            }
-            _ => None,
-        };
-        Some(ProviderLimitInfo {
-            permanent: permanent_limit_body(&bytes, complete, secrets),
-            recognized_code,
-        })
+        Some(provider_limit_info_from_bytes(&bytes, complete, secrets))
     })
     .await
     .ok()
@@ -62,6 +41,36 @@ where
         permanent: false,
         recognized_code: None,
     })
+}
+
+#[doc(hidden)]
+pub fn provider_limit_info_from_bytes(
+    bytes: &[u8],
+    complete: bool,
+    secrets: &[String],
+) -> ProviderLimitInfo {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .ok()
+        .or_else(|| (!complete).then(|| provider_prefix_value(bytes)).flatten())
+        .unwrap_or_default();
+    let value = sanitized_provider_error(&value, secrets);
+    let error = value.get("error").unwrap_or(&value);
+    let recognized_code = match error["code"].as_str() {
+        Some("subscription_sharing_usage_limit_exceeded") => {
+            Some("subscription_sharing_usage_limit_exceeded")
+        }
+        Some("subscription_sharing_user_not_eligible") => {
+            Some("subscription_sharing_user_not_eligible")
+        }
+        Some("subscription_sharing_usage_unavailable") => {
+            Some("subscription_sharing_usage_unavailable")
+        }
+        _ => None,
+    };
+    ProviderLimitInfo {
+        permanent: permanent_limit_body(bytes, complete, secrets),
+        recognized_code,
+    }
 }
 
 #[doc(hidden)]
