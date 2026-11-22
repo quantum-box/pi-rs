@@ -2013,8 +2013,10 @@ For CLI attachments, image detection does not infer a format from the file
 extension. Malformed PNG headers and animated PNGs detected within the first
 4,100 bytes are treated as text. JPEG, GIF, WebP and BMP content detection
 also follows Pi; unsupported image formats are treated as text.
-Images are referenced by a single-line file tag and sent as separate image
-content. The TUI, print and JSON modes send separate positional messages as
+Image tags contain only conversion or resize hints, or the image omission
+notice if processing fails. Conversion hints are retained when automatic
+resizing is disabled. Successful images are sent as separate image content.
+The TUI, print and JSON modes send separate positional messages as
 successive turns in the same session. Attachments belong to the first turn.
 The TUI remains available for input after the startup turns. Text output
 prints the final answer, and JSON emits each turn. Piped stdin is decoded as
