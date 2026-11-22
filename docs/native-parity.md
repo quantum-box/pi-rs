@@ -5328,7 +5328,9 @@ from Pi 1.6.0 via `/v1/systemone`. A saved Copilot subscription, a key saved
 for the official Copilot chat endpoint, or `COPILOT_GITHUB_TOKEN` makes it available. Discovery does not refresh the
 subscription or filter this classifier by the subscription's chat model list.
 Requests with a saved subscription use the token's official individual,
-business or enterprise Copilot host. An unversioned custom base also uses
+business or enterprise Copilot host. A saved Enterprise domain also scopes
+the account's classifier route, just as it scopes the chat route.
+An unversioned custom base also uses
 `/v1/systemone` relative to its configured path. Native also accepts an
 explicit versioned base or classifier endpoint. Custom endpoints need their
 own scoped credentials. Live Copilot classifier requests were not verified.
@@ -5691,11 +5693,18 @@ on `slow_down` and adds five seconds when it supplies no interval. Saved OAuth
 tokens can route to individual, business, or enterprise Copilot inference hosts. Requests carry the Copilot initiator and
 vision headers.
 
-Native sign-in leaves account model policies as configured. Authentication
-through private GitHub Enterprise domains remains unsupported. The published
-Pi AI package and local HTTP fixtures were used to compare the catalog and
-wire behavior. Live GitHub device authorization and Copilot inference were
-unverified because no subscription credentials were available.
+Native sign-in leaves account model policies as configured. Use
+`pi login github-copilot --enterprise-url company.ghe.com` or
+`/login github-copilot company.ghe.com` for an Enterprise account. The
+terminal sign-in picker prompts for the domain and accepts a blank entry
+for github.com. The saved domain directs future refreshes, including for
+credentials imported
+from Pi. The inference token can select an official Copilot proxy or an
+API host bound to that Enterprise domain. Sign-in and refresh use HTTPS,
+and the verification link must belong to the selected GitHub host.
+Local fixtures cover Enterprise endpoints, polling, refresh and routing.
+Live GitHub device authorization and Copilot inference were unverified
+because no subscription credentials were available.
 
 ### OpenRouter browser authorization
 

@@ -1416,9 +1416,10 @@ impl Operations {
         let mut headers = HeaderMap::new();
         if let Some(credential) = entry.credential(keys) {
             let key = if matches!(credential, Credential::Copilot) {
-                let key = super::copilot_auth::access(&self.args.settings, None, false).await?;
-                endpoint = super::copilot_auth::routed_classifier_endpoint(&endpoint, &key)?;
-                key
+                let credential =
+                    super::copilot_auth::credential(&self.args.settings, None, false).await?;
+                endpoint = super::copilot_auth::routed_classifier_endpoint(&endpoint, &credential)?;
+                credential.access
             } else {
                 credential.resolve().await?
             };
