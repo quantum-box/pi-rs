@@ -34,17 +34,20 @@ impl pi_rs::Model for PageModel {
 }
 
 #[tokio::test]
-async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_pages() {
+async fn http_mcp_resources_and_tool_retries_match_pi() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let calls = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
     let server_calls = calls.clone();
     let initialize_attempts = Arc::new(AtomicUsize::new(0));
     let server_initialize_attempts = initialize_attempts.clone();
+    let tool_requests = Arc::new(Mutex::new(Vec::new()));
+    let server_tool_requests = tool_requests.clone();
     let server = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             let calls = server_calls.clone();
             let attempts = server_initialize_attempts.clone();
+            let tool_requests = server_tool_requests.clone();
             tokio::spawn(async move {
                 let mut socket = BufReader::new(socket);
                 let mut line = String::new();
@@ -53,6 +56,7 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                 }
                 let templates_unimplemented = line.starts_with("POST /without-templates ");
                 let mut length = 0;
+                let mut session = String::new();
                 loop {
                     line.clear();
                     if socket.read_line(&mut line).await.is_err()
@@ -61,8 +65,12 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                     {
                         break;
                     }
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        length = value.trim().parse().unwrap();
+                    if let Some((header, value)) = line.split_once(':') {
+                        if header.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        } else if header.eq_ignore_ascii_case("mcp-session-id") {
+                            session = value.trim().to_owned();
+                        }
                     }
                 }
                 let mut bytes = vec![0; length];
@@ -72,6 +80,8 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                 let request: Value = serde_json::from_slice(&bytes).unwrap_or_default();
                 let method = request["method"].as_str().unwrap_or_default();
                 let cursor = request["params"]["cursor"].as_str();
+                let scenario = request["params"]["arguments"]["scenario"].as_str();
+                let mut session_header = String::new();
                 let mut status = None;
                 if method.starts_with("resources/") || method == "tools/call" {
                     let mut calls = calls.lock().unwrap();
@@ -91,15 +101,31 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                             Some("501 Not Implemented")
                         }
                         ("resources/list", Some("always-503"), _) => Some("503 Unavailable"),
-                        ("tools/call", _, _) => Some("503 Unavailable"),
+                        ("tools/call", _, _) => {
+                            tool_requests
+                                .lock()
+                                .unwrap()
+                                .push((session.clone(), request["params"].clone()));
+                            match (scenario, session.as_str()) {
+                                (Some("always-expired"), _) | (Some("recover"), "3") => {
+                                    Some("404 Not Found")
+                                }
+                                (Some("recover"), _) => None,
+                                _ => Some("503 Unavailable"),
+                            }
+                        }
                         _ => None,
                     };
                 }
                 if method == "initialize" {
-                    status = match attempts.fetch_add(1, Ordering::Relaxed) {
-                        0 => Some("503 Unavailable"),
-                        1 => Some("429 Too Many Requests"),
-                        _ => None,
+                    let attempt = attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                    status = match attempt {
+                        1 => Some("503 Unavailable"),
+                        2 => Some("429 Too Many Requests"),
+                        _ => {
+                            session_header = format!("Mcp-Session-Id: {attempt}\r\n");
+                            None
+                        }
                     };
                 }
                 if let Some(status) = status {
@@ -123,6 +149,9 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                     Some("tools/list") => Some(
                         json!({"tools":[{"name":"write_fixture","inputSchema":{"type":"object"}}]}),
                     ),
+                    Some("tools/call") => {
+                        Some(json!({"content":[{"type":"text","text":"confirmed"}]}))
+                    }
                     Some("resources/list")
                         if matches!(
                             request["params"]["cursor"].as_str(),
@@ -175,7 +204,7 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                     ),
                     None => ("202 Accepted", String::new()),
                 };
-                let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
+                let _ = socket.write_all(format!("HTTP/1.1 {status}\r\n{session_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
             });
         }
     });
@@ -450,6 +479,50 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
     let page: Value = serde_json::from_str(&page).unwrap();
     assert_eq!(page["nextCursor"], "after-large");
     assert_eq!(page["resources"][0]["description"], "猫\n".repeat(300_000));
+
+    let writer = tools
+        .iter()
+        .find(|tool| tool.spec().name == "mcp__fixture__write_fixture")
+        .unwrap();
+    assert_eq!(initialize_attempts.load(Ordering::Relaxed), 4);
+    for (scenario, sessions, succeeds) in [
+        ("recover", ["3", "5"], true),
+        ("always-expired", ["5", "6"], false),
+    ] {
+        let before = tool_requests.lock().unwrap().len();
+        let operation_id = uuid::Uuid::new_v4();
+        let arguments = json!({"scenario": scenario});
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            writer.invoke(
+                arguments.clone(),
+                ToolContext {
+                    operation_id,
+                    cancellation: CancellationToken::new(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        if succeeds {
+            let Outcome::Structured { data, .. } = outcome else {
+                panic!("MCP session did not recover: {outcome:?}");
+            };
+            assert_eq!(data["content"][0]["text"], "confirmed");
+        } else {
+            assert!(matches!(outcome, Outcome::Unknown(_)), "{outcome:?}");
+        }
+        let requests = tool_requests.lock().unwrap();
+        assert_eq!(requests.len() - before, sessions.len());
+        for ((session, params), expected_session) in requests[before..].iter().zip(sessions) {
+            assert_eq!(session, expected_session);
+            assert_eq!(params["name"], "write_fixture");
+            assert_eq!(params["arguments"], arguments);
+            assert_eq!(params["_meta"]["operationId"], operation_id.to_string());
+        }
+    }
+    assert_eq!(initialize_attempts.load(Ordering::Relaxed), 6);
+
     let legacy_config: ServerConfig = serde_json::from_value(json!({
         "url":format!("http://{address}/without-templates"),
         "oauth":false
