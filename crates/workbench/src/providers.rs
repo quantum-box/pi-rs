@@ -1637,7 +1637,21 @@ impl Client {
                         ),
                 )
             }
-            Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
+            Self::PiMessages(client) => {
+                let mut client = client.with_thinking(thinking);
+                if args.provider == Provider::Radius
+                    && args.settings.resize_model_images()
+                    && args
+                        .model_credential_for(
+                            &args.provider,
+                            args.model_endpoint_for(&args.provider, Some(&args.model)),
+                        )
+                        .is_some_and(|credential| credential.is_command())
+                {
+                    client = client.with_radius_request_profiles(args.model_profiles.clone());
+                }
+                Self::PiMessages(client)
+            }
             Self::OpenAi(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
                 let azure = client.is_azure();

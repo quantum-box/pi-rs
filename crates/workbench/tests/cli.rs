@@ -4961,7 +4961,7 @@ fn radius_attachments_use_only_the_current_accounts_cached_resize_profile() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let origin = format!("http://{}/", listener.local_addr().unwrap());
-    let models =
+    let mut models =
         json!({"providers":{"radius":{"models":[{"id":"fixture","input":["text","image"]}]}}});
     std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
     let account = format!("key:{:x}", Sha256::digest(b"matching-key"));
@@ -4975,7 +4975,7 @@ fn radius_attachments_use_only_the_current_accounts_cached_resize_profile() {
     let worker = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(40);
         let mut dimensions = Vec::new();
-        while dimensions.len() < 2 && Instant::now() < deadline {
+        while dimensions.len() < 3 && Instant::now() < deadline {
             let (mut socket, _) = match listener.accept() {
                 Ok(connection) => connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -5020,12 +5020,20 @@ fn radius_attachments_use_only_the_current_accounts_cached_resize_profile() {
         dimensions
     });
 
-    for key in ["matching-key", "different-key"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+    for key in [Some("matching-key"), Some("different-key"), None] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
             .current_dir(root.path())
             .env("PI_RS_HOME", root.path())
             .env("PI_RADIUS_GATEWAY", &origin)
-            .env("RADIUS_API_KEY", key)
+            .env_remove("RADIUS_API_KEY");
+        if let Some(key) = key {
+            command.env("RADIUS_API_KEY", key);
+        } else {
+            models["providers"]["radius"]["apiKey"] = json!("!echo matching-key");
+            std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+        }
+        let output = command
             .args([
                 "--offline",
                 "--no-trust",
@@ -5048,7 +5056,8 @@ fn radius_attachments_use_only_the_current_accounts_cached_resize_profile() {
         worker.join().unwrap(),
         [
             ("/v1/messages".into(), (16, 8)),
-            ("/messages".into(), (40, 20))
+            ("/messages".into(), (40, 20)),
+            ("/v1/messages".into(), (16, 8)),
         ]
     );
 }
