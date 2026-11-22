@@ -2702,8 +2702,11 @@ finishes. Settings, theme and hotkey commands are handled before streaming
 input is queued. Tests cover schema diagnostics and dialog error layout.
 The terminal lists shared settings in Pi's order and uses Pi's labels and
 boolean values for those rows. Native controls and JSON editors remain
-available after the shared settings. The transport, changelog, installation
-telemetry controls are still open. The Warnings submenu includes the default-on
+available after the shared settings. The Transport row cycles through SSE,
+WebSocket, cached WebSocket, and automatic selection in Pi's order. It updates
+the next request in a running Codex session and retains the normal settings
+precedence. Native providers without multiple transports retain their existing
+connection behavior. The changelog and installation telemetry controls are still open. The Warnings submenu includes the default-on
 Anthropic extra-usage warning. The terminal shows it once when the active model
 uses Anthropic subscription OAuth or a configured subscription token on the
 official endpoint. The warning check uses configured credentials without

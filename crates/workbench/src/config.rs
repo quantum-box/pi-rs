@@ -163,6 +163,9 @@ impl Settings {
         &self.diagnostics
     }
     pub(super) fn apply_queue_reload(&mut self, reloaded: &Self) {
+        self.apply_worker_settings(reloaded, &["steeringMode", "followUpMode"]);
+    }
+    pub(super) fn apply_worker_settings(&mut self, reloaded: &Self, keys: &[&str]) {
         for (base, layer) in &mut self.resource_layers {
             let Some((_, incoming)) = reloaded
                 .resource_layers
@@ -174,7 +177,7 @@ impl Settings {
             let Some(object) = layer.as_object_mut() else {
                 continue;
             };
-            for key in ["steeringMode", "followUpMode"] {
+            for &key in keys {
                 if let Some(value) = incoming.get(key) {
                     object.insert(key.into(), value.clone());
                 } else {
@@ -192,7 +195,7 @@ impl Settings {
                 let Some(object) = layer.as_object_mut() else {
                     continue;
                 };
-                for key in ["steeringMode", "followUpMode"] {
+                for &key in keys {
                     if let Some(value) = incoming.get(key) {
                         object.insert(key.into(), value.clone());
                     } else {
@@ -359,6 +362,11 @@ impl Settings {
                 Ok((base, entries))
             })
             .collect()
+    }
+    pub(super) fn codex_transport(&self) -> pi_rs::openai::CodexTransport {
+        self.string("transport")
+            .and_then(pi_rs::openai::CodexTransport::named)
+            .unwrap_or_default()
     }
     pub fn value(&self) -> &Value {
         &self.value

@@ -8209,6 +8209,19 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         },
         queue_setting("steeringMode", "Steering mode", pi_rs::InputKind::Steer),
         queue_setting("followUpMode", "Follow-up mode", pi_rs::InputKind::FollowUp),
+        {
+            let transport = args.settings.string("transport").unwrap_or("auto");
+            let next = match transport {
+                "sse" => "websocket",
+                "websocket" => "websocket-cached",
+                "websocket-cached" => "auto",
+                _ => "sse",
+            };
+            Item {
+                label: format!("Transport · {transport}"),
+                selection: Selection::Setting("transport".into(), json!(next)),
+            }
+        },
         Item {
             label: format!("Session share destination · {share}"),
             selection: Selection::Setting(
@@ -8749,10 +8762,12 @@ fn select(
             } else {
                 args.settings.set_user(&key, value.clone())?;
             }
-            if key == "cacheWarming"
-                && let Some(worker) = worker
-            {
-                worker.send(json!({"type":"cache_warming_changed"}))?;
+            if let Some(worker) = worker {
+                match key.as_str() {
+                    "cacheWarming" => worker.send(json!({"type":"cache_warming_changed"}))?,
+                    "transport" => worker.send(json!({"type":"transport_changed"}))?,
+                    _ => {}
+                }
             }
             match key.as_str() {
                 "expandTools" => view.set_expand_tools(value.as_bool().unwrap_or(false)),
