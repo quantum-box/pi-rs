@@ -4903,14 +4903,12 @@ Current-model RPC responses reuse discovered metadata when the discovery
 credential can be identified. Missing or
 invalid optional metadata leaves the model available, including when loading
 an older cache.
-Image preparation also uses the matching cached Radius profile, or the bundled
-profile on the official gateway when no matching cache is available. Other
-accounts' caches and custom model endpoints do not supply resize limits.
-Explicit resize settings still take precedence, and `images.autoResize`
-continues to control whether the profile is used. The outgoing request uses
-the catalog resolved for its credentials, including limits discovered after
-initial attachment preparation. Live authenticated Radius image requests were
-unverified.
+Radius applies catalog resize limits to outgoing images after resolving the
+account and route. When discovery is unavailable, the matching account cache
+or the official gateway's bundled profile supplies the limits. Initial image
+preparation uses the normal attachment limits and explicit resize settings.
+`images.autoResize` controls both stages. Live authenticated Radius image
+requests were unverified.
 
 ### Single-shot JSON event stream
 

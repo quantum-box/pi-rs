@@ -9,7 +9,6 @@ use pi_rs::{ChatPrice, Error, Result, ollama::ModelDetails};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use super::model_profiles::{InputLimits, ModelMetadata};
 
@@ -211,16 +210,6 @@ pub(super) fn baseline(gateway: &Url) -> Option<Arc<Catalog>> {
         Arc::new(parse(config, &gateway).expect("valid public Radius catalog"))
     });
     (gateway.as_str() == super::radius_auth::DEFAULT_GATEWAY).then(|| PUBLIC.clone())
-}
-
-pub(super) fn key_binding(token: &str) -> String {
-    format!("key:{:x}", Sha256::digest(token.as_bytes()))
-}
-
-pub(super) fn cached_or_baseline(gateway: &Url, account: Option<&str>) -> Option<Arc<Catalog>> {
-    account
-        .and_then(|account| cached(gateway, account))
-        .or_else(|| baseline(gateway))
 }
 
 fn cache_path() -> PathBuf {

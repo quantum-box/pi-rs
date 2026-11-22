@@ -4971,7 +4971,7 @@ fn radius_attachments_use_the_current_accounts_resize_profile() {
             "contextWindow":131072,"maxTokens":4096,"inputLimits":{"images":{"resize":{"maxWidth":16}}}}]
     });
     std::fs::write(root.path().join("radius-models.json"), catalog.to_string()).unwrap();
-    catalog["models"][0]["inputLimits"]["images"]["resize"]["maxWidth"] = json!(12);
+    catalog["models"][0]["inputLimits"]["images"]["resize"]["maxWidth"] = json!(24);
     let discovered = catalog.to_string();
 
     let worker = std::thread::spawn(move || {
@@ -5073,7 +5073,7 @@ fn radius_attachments_use_the_current_accounts_resize_profile() {
             ("/v1/messages".into(), (16, 8)),
             ("/messages".into(), (40, 20)),
             ("/v1/messages".into(), (16, 8)),
-            ("/v1/messages".into(), (12, 6)),
+            ("/v1/messages".into(), (24, 12)),
         ]
     );
 }

@@ -397,39 +397,8 @@ impl Cli {
         if !self.settings.resize_model_images() {
             return None;
         }
-        let configured = self.model_profiles.model(&self.provider, &self.model);
-        self.radius_image_resize(configured.as_ref())
-            .or_else(|| configured.as_ref()?.image_resize())
-    }
-
-    fn radius_image_resize(
-        &self,
-        configured: Option<&model_profiles::ModelMetadata>,
-    ) -> Option<pi_rs_workbench::image_profile::ImageResizeProfile> {
-        if self.provider != Provider::Radius
-            || self
-                .model_profiles
-                .model_adapter(&self.provider, &self.model)
-                != providers::Adapter::PiMessages
-        {
-            return None;
-        }
-        let gateway = radius_auth::Gateway::configured_origin().ok()?;
-        let endpoint = self.model_endpoint_for(&self.provider, Some(&self.model));
-        if radius_auth::model_endpoint(&gateway).as_str() != endpoint {
-            return None;
-        }
-        let account = match self.model_credential_for(&self.provider, endpoint) {
-            Some(credential) => credential.literal().map(radius_catalog::key_binding),
-            None => radius_auth::Gateway::configured()
-                .ok()
-                .and_then(|gateway| gateway.cached_login_id().ok().flatten())
-                .map(|login| format!("oauth:{login}")),
-        };
-        let catalog = radius_catalog::cached_or_baseline(&gateway, account.as_deref())?;
-        catalog
-            .metadata(&self.model)?
-            .input_limits(configured)?
+        self.model_profiles
+            .model(&self.provider, &self.model)?
             .image_resize()
     }
 
