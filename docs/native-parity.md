@@ -132,7 +132,9 @@ report the new state using the same status row, as in Pi.
 During a streamed prompt, model and thinking shortcuts acknowledge a prepared
 selection without changing the request in flight. A queued follow-up uses the
 new route and effort. The worker commits the selection before the next request,
-or at settlement when the current prompt finishes without a follow-up.
+or at settlement when the current prompt finishes without a follow-up. pi-rs
+uses the accepted model's configured image resize profile for new clipboard
+pastes and queued attachments.
 Model scopes (`--models` and `enabledModels`) add all available providers that
 share an exact unqualified model ID and warn about the ambiguity. A literal ID
 containing glob characters takes precedence over glob expansion across providers,

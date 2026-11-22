@@ -492,8 +492,17 @@ impl Worker {
             Ok(())
         }
     }
-    pub(super) fn control(slot: &mut Option<Self>, args: &Cli, mut request: Value) -> Result<()> {
-        prepare_images(args, &mut request)?;
+    pub(super) fn control(slot: &mut Option<Self>, args: &Cli, request: Value) -> Result<()> {
+        Self::control_with_image_model(slot, args, args, request)
+    }
+
+    pub(super) fn control_with_image_model(
+        slot: &mut Option<Self>,
+        args: &Cli,
+        image_model: &Cli,
+        mut request: Value,
+    ) -> Result<()> {
+        prepare_images(image_model, &mut request)?;
         if slot
             .as_ref()
             .is_none_or(|worker| !worker.matches(args) || worker.session != args.session)

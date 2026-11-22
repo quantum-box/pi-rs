@@ -1466,7 +1466,7 @@ impl View {
         let (sender, receiver) = std::sync::mpsc::channel();
         self.clipboard = Some(receiver);
         let auto_resize = args.settings.resize_model_images();
-        let profile = args.model_image_resize();
+        let profile = self.accepted_model(args).model_image_resize();
         std::thread::spawn(move || {
             let _ = sender.send(super::clipboard::read(auto_resize, profile));
         });
@@ -1902,8 +1902,12 @@ impl View {
         }
     }
 
+    fn accepted_model<'a>(&'a self, args: &'a Cli) -> &'a Cli {
+        self.live_model_applied.as_ref().unwrap_or(args)
+    }
+
     fn model_display(&self, args: &Cli) -> String {
-        let selected = self.live_model_applied.as_ref().unwrap_or(args);
+        let selected = self.accepted_model(args);
         format!(
             "{} · {}",
             selected.configured_model_name(&selected.model),
@@ -1915,8 +1919,7 @@ impl View {
         self.live_model_choices
             .back()
             .map(|choice| &choice.selected)
-            .or(self.live_model_applied.as_ref())
-            .unwrap_or(args)
+            .unwrap_or_else(|| self.accepted_model(args))
     }
 
     fn stage_model_choice(
@@ -6701,9 +6704,10 @@ pub(super) async fn run(
                             } else {
                                 "steer"
                             };
-                            match Worker::control(
+                            match Worker::control_with_image_model(
                                 &mut worker,
                                 &args,
+                                view.accepted_model(&args),
                                 json!({"type":kind,"content":input,"images":view.draft_images}),
                             ) {
                                 Ok(()) => view.draft_images.clear(),
