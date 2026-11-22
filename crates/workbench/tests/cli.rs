@@ -4223,6 +4223,92 @@ fn rpc_replacement_worker_keeps_retry_disabled() {
 }
 
 #[test]
+fn provider_retry_recovers_chat_completions_with_agent_retry_disabled() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        r#"{"retry":{"enabled":false,"provider":{"maxRetries":1}}}"#,
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = std::thread::spawn(move || {
+        let mut bodies = Vec::new();
+        for attempt in 0..2 {
+            let (mut socket, mut reader, first) =
+                accept_proxy_request(listener.try_clone().unwrap());
+            assert!(first.starts_with("POST /v1/chat/completions "), "{first}");
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            bodies.push(serde_json::from_slice::<Value>(&body).unwrap());
+            let (status, headers, body) = if attempt == 0 {
+                ("429 Too Many Requests", "Retry-After-Ms: 0\r\n", "")
+            } else {
+                (
+                    "200 OK",
+                    "Content-Type: text/event-stream\r\n",
+                    concat!(
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"retried answer\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    ),
+                )
+            };
+            write!(
+                socket,
+                "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .unwrap();
+        }
+        assert_eq!(bodies[0], bodies[1]);
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "kimi-coding",
+            "--model",
+            "k3.1-pro",
+            "--api-key",
+            "fixture",
+            "--endpoint",
+            &endpoint,
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("retried answer"));
+}
+
+#[test]
 fn json_mode_reports_a_failed_assistant_message() {
     let root = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
