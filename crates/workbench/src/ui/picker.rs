@@ -1212,8 +1212,9 @@ impl Picker {
             return None;
         }
         let prefix = self.tree_input_prefix()?;
-        let query = &self.query.text[..self.query.cursor.min(self.query.text.len())];
-        let column = (prefix.width() + super::render::clean(query).width()).min(width - 1);
+        // Tree search and labels edit at the end of the input.
+        let column =
+            (prefix.width() + super::render::clean(&self.query.text).width()).min(width - 1);
         Some((0, column))
     }
 
@@ -2827,7 +2828,10 @@ mod tests {
             TreeFilter::Default,
         );
         let keys = Keys::default();
-        picker.paste("猫");
+        picker.input(
+            KeyEvent::new(KeyCode::Char('猫'), KeyModifiers::NONE),
+            &keys,
+        );
         assert_eq!(
             picker.tree_input_cursor(80, 12),
             Some((0, "Session tree · default · 猫".width()))
