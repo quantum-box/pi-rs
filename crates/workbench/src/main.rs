@@ -1809,17 +1809,17 @@ async fn execute(
     if let Some(search) = &args.list_models {
         return model_listing::list(&args, search).await;
     }
-    let needs_default_model = args.model.is_empty()
-        && matches!(
-            args.command,
-            None | Some(
-                Command::Run { .. }
-                    | Command::Resume
-                    | Command::Interactive
-                    | Command::Compact { .. }
-                    | Command::Review { .. }
-            )
-        );
+    let starts_model_session = matches!(
+        args.command,
+        None | Some(
+            Command::Run { .. }
+                | Command::Resume
+                | Command::Interactive
+                | Command::Compact { .. }
+                | Command::Review { .. }
+        )
+    );
+    let needs_default_model = args.model.is_empty() && starts_model_session;
     let has_patterns = patterns.iter().any(|pattern| !pattern.trim().is_empty());
     let catalogs = if has_patterns {
         if matches!(&args.command, Some(Command::Mcp { command }) if matches!(command.as_ref(), mcp_config::McpCommand::Login { .. }))
@@ -1895,10 +1895,23 @@ async fn execute(
                     .find(|choice| !args.connection_explicit || choice.provider == args.provider)
             })
             .cloned();
+        let selected = if selected.is_none()
+            && starts_model_session
+            && !args.connection_explicit
+            && args.settings.string("defaultProvider").is_none()
+            && args.settings.string("defaultModel").is_none()
+            && args.api_key.is_none()
+            && std::env::var_os("PI_RS_MODEL_TOKEN").is_none()
+        {
+            model_selection::automatic_startup_model(&args).await
+        } else {
+            selected
+        };
         if let Some(choice) = selected {
             let previous_thinking = args.thinking.clone();
             args.activate_provider(choice.provider, Some(&choice.model))?;
             args.model = choice.model;
+            args.model_is_literal = true;
             if args.thinking_explicit {
                 args.thinking = previous_thinking;
             } else if choice.thinking.is_some() {

@@ -7836,6 +7836,83 @@ fn default_model_and_provider_are_read_as_separate_fields() {
 }
 
 #[test]
+fn startup_chooses_authenticated_models_in_pi_provider_order() {
+    let root = tempfile::tempdir().unwrap();
+    let route = "https://example.invalid/v1";
+    let models = json!({"providers":{"relay":{
+        "api":"openai-completions", "baseUrl":route, "apiKey":"relay-fixture", "models":[{"id":"local-model"}]
+    }}});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    for (anthropic, google, extra, expected_provider, expected_model) in [
+        (true, true, vec![], "anthropic", "claude-opus-5-5"),
+        (false, true, vec![], "google", "gemini-4-argon"),
+        (false, false, vec![], "relay", "local-model"),
+        (
+            true,
+            true,
+            vec!["--provider", "ollama"],
+            "ollama",
+            "qwen2.5:7b",
+        ),
+        (
+            true,
+            true,
+            vec!["--api-key", "inline-fixture"],
+            "ollama",
+            "qwen2.5:7b",
+        ),
+        (
+            true,
+            true,
+            vec!["--models", "google/gemini-4-argon"],
+            "google",
+            "gemini-4-argon",
+        ),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command.env_clear();
+        for name in ["PATH", "SystemRoot", "HOME", "USERPROFILE", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        if anthropic {
+            command.env("ANTHROPIC_API_KEY", "anthropic-fixture");
+        }
+        if google {
+            command.env("GEMINI_API_KEY", "google-fixture");
+        }
+        let mut process = command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["--mode", "rpc", "--no-session", "--no-mcp", "--offline"])
+            .args(extra)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
+        let output = process.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for id in ["state", "after"] {
+            let event = events.iter().find(|event| event["id"] == id).unwrap();
+            assert_eq!(event["data"]["model"]["provider"], expected_provider);
+            assert_eq!(event["data"]["model"]["id"], expected_model);
+        }
+    }
+}
+
+#[test]
 fn selected_builtin_provider_uses_its_pi_default_without_a_model() {
     for (settings, provider_args) in [
         (json!({}), vec!["--provider", "google"]),
