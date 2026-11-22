@@ -2920,8 +2920,9 @@ checkpoint placement. If a hook edits system messages on a route that needs
 one prompt, the adapter joins the hook's current system text in order.
 
 Tests cover branch restoration, section order, replacement/removal, current tool
-schemas and permission boundaries. A CLI import-and-resume fixture verified the
-actual model request and retained the original source file. Workspace tests and
+schemas and permission boundaries. A CLI import-and-resume fixture checked
+Anthropic Messages, Responses, and Chat Completions requests, and retained
+the original source file. Workspace tests and
 all-target Clippy passed on Rust 1.89, along with direct/deferred live MCP updates
 and form elicitation after the serialization change. A local qwen3.5:4b CLI call
 also returned the requested `OK` response.

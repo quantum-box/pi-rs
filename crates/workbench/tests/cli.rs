@@ -5596,6 +5596,12 @@ fn resumed_pi_system_updates_follow_the_selected_provider_capability() {
             "/v1/chat/completions",
             "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
         ),
+        (
+            "anthropic-messages",
+            "messages",
+            "/v1/messages",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+        ),
     ] {
         for supports_updates in [true, false] {
             let directory = tempfile::tempdir().unwrap();
@@ -5688,13 +5694,21 @@ fn resumed_pi_system_updates_follow_the_selected_provider_capability() {
                 .iter()
                 .map(|message| message["role"].as_str().unwrap())
                 .collect();
-            if supports_updates {
+            let update = "Additional\n\nUpdated system prompt section \"state\":\n\nNew state\n\nRemoved system prompt section \"keep\".";
+            if api == "anthropic-messages" && supports_updates {
+                assert_eq!(roles, ["user", "system"], "{body}");
+                assert_eq!(body["system"][0]["text"], "Original\n\nKeep\n\nOld state");
+                assert_eq!(messages[1]["content"][0]["text"], update);
+            } else if api == "anthropic-messages" {
+                assert_eq!(roles, ["user"], "{body}");
+                assert_eq!(
+                    body["system"][0]["text"],
+                    "Original\n\nAdditional\n\nNew state"
+                );
+            } else if supports_updates {
                 assert_eq!(roles, ["system", "user", "system", "user", "user"], "{api}");
                 assert_eq!(messages[0]["content"], "Original\n\nKeep\n\nOld state");
-                assert_eq!(
-                    messages[2]["content"],
-                    "Additional\n\nUpdated system prompt section \"state\":\n\nNew state\n\nRemoved system prompt section \"keep\"."
-                );
+                assert_eq!(messages[2]["content"], update);
             } else {
                 assert_eq!(roles, ["system", "user", "user", "user"], "{api}");
                 assert_eq!(

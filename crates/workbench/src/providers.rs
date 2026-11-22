@@ -1699,6 +1699,7 @@ impl Model for Client {
         match self {
             Self::Ollama(client) => client.supports_mid_conversation_system_messages(model),
             Self::OpenAi(client) => client.supports_mid_conversation_system_messages(model),
+            Self::Anthropic(client) => client.supports_mid_conversation_system_messages(model),
             Self::Deferred(client) => client
                 .estimation_client()
                 .is_some_and(|client| client.supports_mid_conversation_system_messages(model)),
