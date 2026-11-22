@@ -37,6 +37,7 @@ struct Candidate {
 enum AuthType {
     ApiKey,
     OAuth,
+    UnresolvedAuthorization,
 }
 
 struct Resolved {
@@ -149,6 +150,7 @@ async fn resolve(
                     .map(|value| value.to_str().expect("validated Anthropic header"));
                 let (kind, value) = match (name.as_str(), value) {
                     ("x-api-key", value) => (AuthType::ApiKey, value.map(str::trim)),
+                    ("authorization", None) => (AuthType::UnresolvedAuthorization, None),
                     ("authorization", Some(value)) => {
                         let mut parts = value.split_ascii_whitespace();
                         match (parts.next(), parts.next(), parts.next()) {
@@ -394,11 +396,11 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
                     } else {
                         status = "ready";
                         reason = None;
-                        auth_type = Some(if value.kind == AuthType::OAuth {
-                            "oauth"
-                        } else {
-                            "api_key"
-                        });
+                        auth_type = match value.kind {
+                            AuthType::ApiKey => Some("api_key"),
+                            AuthType::OAuth => Some("oauth"),
+                            AuthType::UnresolvedAuthorization => None,
+                        };
                         if credentials {
                             output_credential = value.value;
                         }

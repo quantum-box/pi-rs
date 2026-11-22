@@ -9314,7 +9314,7 @@ fn anthropic_federation_auth_check_without_refresh_uses_only_the_identity_file()
     let output = check();
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let status: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(status["authType"], "api_key");
+    assert!(status.get("authType").is_none());
 
     std::fs::write(
         root.path().join("models.json"),
