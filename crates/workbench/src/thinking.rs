@@ -99,7 +99,9 @@ pub(super) fn available(args: &mut Cli) -> Vec<String> {
                 )
             }
         }
-        super::providers::Adapter::Google => pi_rs::google::model_thinking_levels(&args.model),
+        super::providers::Adapter::Google | super::providers::Adapter::GoogleVertex => {
+            pi_rs::google::model_thinking_levels(&args.model)
+        }
     };
     // A capability can be known even when the server did not enumerate levels.
     // Reuse that discovery without treating fallback levels as server-reported.

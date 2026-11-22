@@ -5135,6 +5135,24 @@ Users can configure additional NVIDIA deployments by ID. Catalog entries that
 use other upstream APIs still need their own adapters. Live inference on the
 updated catalogs was unverified.
 
+### Google Vertex AI
+
+The native Google Vertex AI provider includes the 13 chat models from Pi AI
+1.5.0 and uses the Vertex publisher model endpoint. The Express API route
+accepts `GOOGLE_CLOUD_API_KEY` or a saved key. Vertex projects can use
+Application Default Credentials through the installed Google Cloud CLI,
+including Pi-format saved project, location, and service-account file settings.
+ADC attaches only to the official endpoint. Use `GOOGLE_CLOUD_PROJECT` or
+`GCLOUD_PROJECT`, and `GOOGLE_CLOUD_LOCATION` to configure it without a saved
+credential. Google-authenticated calls use the quota project from the credentials
+file when it supplies one. Vertex SDK clients scope signed replay to their
+Vertex endpoint by default. Explicit provider replay scopes remain available.
+
+Native ADC discovery checks the explicitly configured file or the local gcloud
+credentials file. The Vertex sign-in wizard and metadata-only ambient credentials
+remain unsupported. Loopback tests cover Express and project-scoped routes. No real
+Google Cloud credential was available for acceptance testing.
+
 ### OpenAI Codex
 
 `openai-codex` exposes the eight pinned models through the ChatGPT Codex
