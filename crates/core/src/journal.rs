@@ -1644,6 +1644,11 @@ impl Session {
         project_message_entries(&branch, operations(&branch))
     }
 
+    pub(crate) fn current_message_entries_at(&self, target: u64) -> Vec<(u64, Message)> {
+        let path = self.path(target);
+        project_message_entries(&path, operations(&path))
+    }
+
     /// Measured context when usable, otherwise a visible-content estimate.
     pub fn estimated_context_tokens(&self) -> u64 {
         self.context_usage_estimate().tokens

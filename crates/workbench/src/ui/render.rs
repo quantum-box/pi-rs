@@ -249,6 +249,7 @@ impl Line {
 #[derive(Clone)]
 pub enum ToolPart {
     Text(String),
+    Warning(String),
     Image(std::sync::Arc<super::images::InlineImage>),
 }
 
@@ -593,7 +594,16 @@ impl Entry {
                     title.bold = true;
                     let mut lines = wrap(&[title], inner);
                     let output_lines: Vec<_> = output.lines().collect();
-                    let limit = if expand_tools { output_lines.len() } else { 10 };
+                    let has_warning = parts
+                        .iter()
+                        .any(|part| matches!(part, ToolPart::Warning(_)));
+                    let limit = if expand_tools {
+                        output_lines.len()
+                    } else if has_warning {
+                        0
+                    } else {
+                        10
+                    };
                     let render_text = |text: &str, lines: &mut Vec<Line>| {
                         if name == "edit" {
                             lines.extend(super::diff::render(text, theme, inner));
@@ -607,12 +617,15 @@ impl Entry {
                         }
                     };
                     if expand_tools
-                        && !parts.is_empty()
+                        && parts
+                            .iter()
+                            .any(|part| !matches!(part, ToolPart::Warning(_)))
                         && let Some(limit) = options.image_width
                     {
                         for part in parts {
                             match part {
                                 ToolPart::Text(text) => render_text(text, &mut lines),
+                                ToolPart::Warning(_) => {}
                                 ToolPart::Image(image) => {
                                     lines.extend(image.lines(width, limit, padding))
                                 }
@@ -629,7 +642,7 @@ impl Entry {
                             render_text(&visible, &mut lines);
                         }
                     }
-                    if output_lines.len() > limit {
+                    if output_lines.len() > limit && !has_warning {
                         lines.push(Line::themed(
                             &format!(
                                 "… {} more lines (ctrl+o to expand)",
@@ -641,6 +654,11 @@ impl Entry {
                     }
                     lines
                 };
+                for part in parts {
+                    if let ToolPart::Warning(warning) = part {
+                        lines.extend(wrap(&[Span::themed(warning, theme, "warning")], inner));
+                    }
+                }
                 for line in &mut lines {
                     line.background = Some(theme.color(role));
                 }
