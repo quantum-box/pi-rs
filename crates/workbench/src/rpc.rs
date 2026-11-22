@@ -1378,7 +1378,10 @@ mod jsonl_framing_tests {
 
         let input = r#""\uDC00\x""#;
         let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
-        assert_eq!(super::json_syntax_diagnostic(input, &error), error.to_string());
+        assert_eq!(
+            super::json_syntax_diagnostic(input, &error),
+            error.to_string()
+        );
     }
 
     #[test]
