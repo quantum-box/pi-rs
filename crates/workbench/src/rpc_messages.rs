@@ -156,20 +156,24 @@ pub(super) fn count(session: &Session) -> usize {
 
 pub(super) fn last_assistant_text(session: &Session) -> Option<String> {
     let (messages, _) = snapshot(session);
-    let message = messages.iter().rev().find(|message| {
-        message["role"] == "assistant"
-            && !(message["stopReason"] == "aborted"
-                && message["content"].as_array().is_some_and(Vec::is_empty))
-    })?;
-    let blocks = message["content"].as_array()?;
-    let text: String = blocks
+    messages
         .iter()
-        .filter(|block| block["type"] == "text")
-        .filter_map(|block| block["text"].as_str())
-        .collect();
-    let text =
-        text.trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}');
-    (!text.is_empty()).then(|| text.to_owned())
+        .rev()
+        .filter(|message| message["role"] == "assistant")
+        .find_map(|message| {
+            let text: String = message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect();
+            let text = text
+                .trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}');
+            // A normal stop is the last reply even if it has no text.
+            (message["stopReason"] == "stop" || !text.is_empty()).then(|| text.to_owned())
+        })
+        .filter(|text| !text.is_empty())
 }
 
 pub(super) fn snapshot(session: &Session) -> (Vec<Value>, Vec<Message>) {
@@ -956,6 +960,66 @@ pub(super) fn compaction_tokens(session: &Session, record: &Record) -> u64 {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn last_assistant_text_skips_nonfinal_messages_without_visible_text() {
+        for (reason, content, expected) in [
+            (
+                "error",
+                json!([{"type":"thinking","thinking":"diagnostic"},{"type":"text","text":" \n"}]),
+                Some("Previous answer"),
+            ),
+            (
+                "aborted",
+                json!([{"type":"thinking","thinking":"diagnostic"}]),
+                Some("Previous answer"),
+            ),
+            (
+                "toolUse",
+                json!([{"type":"toolCall","id":"one","name":"read","arguments":{"path":"example.txt"}}]),
+                Some("Previous answer"),
+            ),
+            (
+                "length",
+                json!([{"type":"text","text":"\u{feff}\u{a0}"}]),
+                Some("Previous answer"),
+            ),
+            (
+                "aborted",
+                json!([{"type":"text","text":" New "},{"type":"text","text":"partial "}]),
+                Some("New partial"),
+            ),
+            ("stop", json!([]), None),
+        ] {
+            let mut fixture = tempfile::NamedTempFile::new().unwrap();
+            writeln!(fixture, "{}", json!({"type":"session","version":3})).unwrap();
+            for (id, parent, reason, blocks) in [
+                (
+                    "first",
+                    None,
+                    "stop",
+                    json!([{"type":"text","text":"Previous answer"}]),
+                ),
+                ("latest", Some("first"), reason, content),
+            ] {
+                writeln!(
+                    fixture,
+                    "{}",
+                    json!({
+                        "type":"message","id":id,"parentId":parent,
+                        "message":{"role":"assistant","content":blocks,"stopReason":reason}
+                    })
+                )
+                .unwrap();
+            }
+            let session = super::super::session_import::read(fixture.path()).unwrap();
+            assert_eq!(
+                last_assistant_text(&session).as_deref(),
+                expected,
+                "{reason}"
+            );
+        }
+    }
 
     #[test]
     fn cancelled_turn_partial_is_display_only_and_not_duplicated() {

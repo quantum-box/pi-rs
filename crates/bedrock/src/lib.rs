@@ -21,6 +21,19 @@ use pi_rs_core::{
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Select how ConverseStream uses the tools in a request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolChoice {
+    /// Let the model select a tool or return text.
+    Auto,
+    /// Require at least one tool.
+    Any,
+    /// Omit tool configuration for this request.
+    None,
+    /// Require the named tool, for models that support named selection.
+    Tool { name: String },
+}
+
 /// A client configured with the AWS SDK's region and refreshing credential provider chain.
 #[derive(Clone)]
 pub struct Bedrock {
@@ -42,6 +55,7 @@ pub struct Bedrock {
     configured_thinking_budgets: Option<Value>,
     thinking_display: ThinkingDisplay,
     interleaved_thinking: bool,
+    tool_choice: Option<ToolChoice>,
     cache_retention: CacheRetention,
     long_cache_support: Option<bool>,
     force_cache: bool,
@@ -69,6 +83,7 @@ impl Bedrock {
             configured_thinking_budgets: None,
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
+            tool_choice: None,
             cache_retention: default_cache_retention(),
             long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
@@ -96,6 +111,7 @@ impl Bedrock {
             configured_thinking_budgets: None,
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
+            tool_choice: None,
             cache_retention: default_cache_retention(),
             long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
@@ -127,6 +143,7 @@ impl Bedrock {
             configured_thinking_budgets: None,
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
+            tool_choice: None,
             cache_retention: default_cache_retention(),
             long_cache_support: None,
             force_cache: std::env::var("AWS_BEDROCK_FORCE_CACHE").is_ok_and(|v| v == "1"),
@@ -335,6 +352,17 @@ impl Bedrock {
             self.force_cache,
             self.summary,
         ));
+        let identity = if let Some(choice) = &self.tool_choice {
+            identity.and_then(|identity| {
+                pi_rs_core::protected_model_fingerprint(&(
+                    "bedrock-tool-choice-v1",
+                    identity,
+                    format!("{choice:?}"),
+                ))
+            })
+        } else {
+            identity
+        };
         let mut builder = aws_sdk_bedrockruntime::config::Builder::from(&frozen)
             .identity_cache(aws_sdk_bedrockruntime::config::IdentityCache::no_cache());
         // Freeze the endpoint selected above instead of consulting service
@@ -391,6 +419,16 @@ impl Bedrock {
     /// Control Pi's interleaved-thinking beta for budgeted Claude requests.
     pub fn with_interleaved_thinking(mut self, enabled: bool) -> Self {
         self.interleaved_thinking = enabled;
+        self.prepared_identity = None;
+        self
+    }
+    fn has_tools(&self, request: &ModelRequest) -> bool {
+        !request.tools.is_empty() && self.tool_choice != Some(ToolChoice::None)
+    }
+
+    /// Set Pi's tool-choice behavior for ConverseStream requests.
+    pub fn with_tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.tool_choice = Some(choice);
         self.prepared_identity = None;
         self
     }
@@ -925,6 +963,18 @@ impl Model for Bedrock {
         self.prepared_identity.clone()
     }
 
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        let mut base = request.clone();
+        base.messages.clear();
+        if self.tool_choice == Some(ToolChoice::None) {
+            base.tools.clear();
+        }
+        request.messages.iter().fold(
+            pi_rs_core::estimate_request_tokens(&base),
+            |total, message| total.saturating_add(self.estimate_message_tokens(request, message)),
+        )
+    }
+
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
         fn text_tokens(text: &str) -> u64 {
             (text.encode_utf16().count() as u64).div_ceil(4)
@@ -949,7 +999,7 @@ impl Model for Bedrock {
                     } else {
                         (content.clone(), Vec::new())
                     };
-                let text = if request.tools.is_empty() {
+                let text = if !self.has_tools(request) {
                     format!(
                         "Historical tool result ({}; {}):\n{}",
                         call_id,
@@ -973,7 +1023,7 @@ impl Model for Bedrock {
                 calls,
                 replay,
             } => {
-                let tool_free = request.tools.is_empty();
+                let tool_free = !self.has_tools(request);
                 let mut visible = if content.trim().is_empty() {
                     String::new()
                 } else {
@@ -1038,7 +1088,7 @@ impl Model for Bedrock {
         if request.max_output_tokens == 0 || request.model.contains(":prompt/") {
             return Err(Error::Config("Bedrock requires a positive max output token limit and does not support managed prompt ARNs".into()));
         }
-        let tool_free = request.tools.is_empty();
+        let tool_free = !self.has_tools(&request);
         let is_claude = self.is_claude(&request.model);
         let model_name = self
             .model_name
@@ -1222,20 +1272,46 @@ impl Model for Bedrock {
                 last.content.push(ContentBlock::CachePoint(point.clone()));
             }
         }
-        let tools: Vec<_> = request
-            .tools
-            .into_iter()
-            .map(|t| {
-                Ok(types::Tool::ToolSpec(
-                    types::ToolSpecification::builder()
-                        .name(t.name)
-                        .description(t.description)
-                        .input_schema(types::ToolInputSchema::Json(doc(t.parameters)))
+        let tool_config = if tool_free {
+            None
+        } else {
+            let tools = request
+                .tools
+                .into_iter()
+                .map(|tool| {
+                    Ok(types::Tool::ToolSpec(
+                        types::ToolSpecification::builder()
+                            .name(tool.name)
+                            .description(tool.description)
+                            .input_schema(types::ToolInputSchema::Json(doc(tool.parameters)))
+                            .build()
+                            .map_err(build_error)?,
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            let choice = match &self.tool_choice {
+                Some(ToolChoice::Auto) => Some(types::ToolChoice::Auto(
+                    types::AutoToolChoice::builder().build(),
+                )),
+                Some(ToolChoice::Any) => Some(types::ToolChoice::Any(
+                    types::AnyToolChoice::builder().build(),
+                )),
+                Some(ToolChoice::Tool { name }) => Some(types::ToolChoice::Tool(
+                    types::SpecificToolChoice::builder()
+                        .name(name)
                         .build()
                         .map_err(build_error)?,
-                ))
-            })
-            .collect::<Result<_>>()?;
+                )),
+                Some(ToolChoice::None) | None => None,
+            };
+            Some(
+                types::ToolConfiguration::builder()
+                    .set_tools(Some(tools))
+                    .set_tool_choice(choice)
+                    .build()
+                    .map_err(build_error)?,
+            )
+        };
         let client = self
             .client
             .get_or_init(|| async {
@@ -1297,12 +1373,27 @@ impl Model for Bedrock {
                 interleaved: self.interleaved_thinking,
             },
         )?;
+        if !tool_free
+            && matches!(
+                self.tool_choice,
+                Some(ToolChoice::Any | ToolChoice::Tool { .. })
+            )
+            && fields
+                .as_ref()
+                .is_some_and(|fields| fields["thinking"]["type"] == "enabled")
+        {
+            return Err(Error::Config(
+                "Bedrock Claude extended thinking requires automatic tool selection or no tools"
+                    .into(),
+            ));
+        }
         let requested_model = request.model.clone();
         let mut command = client
             .converse_stream()
             .model_id(request.model)
             .set_messages(Some(messages))
             .set_system((!system.is_empty()).then_some(system))
+            .set_tool_config(tool_config)
             .inference_config(
                 types::InferenceConfiguration::builder()
                     .max_tokens(i32::try_from(request.max_output_tokens).map_err(build_error)?)
@@ -1310,14 +1401,6 @@ impl Model for Bedrock {
             );
         if let Some(fields) = fields {
             command = command.additional_model_request_fields(doc(fields));
-        }
-        if !tools.is_empty() {
-            command = command.tool_config(
-                types::ToolConfiguration::builder()
-                    .set_tools(Some(tools))
-                    .build()
-                    .map_err(build_error)?,
-            );
         }
         let headers = self.headers.clone();
         let mut secrets: Vec<_> = self
@@ -2006,6 +2089,7 @@ mod tests {
                 .with_thinking_budget_settings(serde_json::json!({"low": 1500})),
             base.clone().with_thinking_display(ThinkingDisplay::Omitted),
             base.clone().with_interleaved_thinking(false),
+            base.clone().with_tool_choice(ToolChoice::Any),
             base.clone().with_cache_retention(CacheRetention::None),
             base.clone().with_long_cache_support(Some(false)),
             base.clone().with_force_cache(true),
