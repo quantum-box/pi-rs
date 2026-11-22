@@ -1879,7 +1879,9 @@ also rejected. Pi instead drops a retained boundary that is not on the current
 path; native import rejects it rather than silently retaining unrelated history.
 
 Context edits are projected onto future model context while the imported raw
-entries remain available. Remaining specialized message variants and system
+entries remain available. Imported system messages appear as `[system]` in the
+default session tree, where their text can be searched and copied.
+Remaining specialized message variants and system
 prompt checkpoints still need parity work. Images currently appear as
 attachment notices in the terminal.
 
