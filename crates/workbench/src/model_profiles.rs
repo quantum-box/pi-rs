@@ -206,6 +206,7 @@ struct ModelCompatibility {
     allow_empty_signature: Option<bool>,
     supports_strict_tools: Option<bool>,
     supports_max_output_tokens: Option<bool>,
+    supports_mid_convo_effort: Option<bool>,
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
     session_affinity_format: Option<AffinityFormat>,
@@ -226,6 +227,9 @@ impl ModelCompatibility {
             supports_max_output_tokens: newer
                 .supports_max_output_tokens
                 .or(self.supports_max_output_tokens),
+            supports_mid_convo_effort: newer
+                .supports_mid_convo_effort
+                .or(self.supports_mid_convo_effort),
             force_adaptive_thinking: newer
                 .force_adaptive_thinking
                 .or(self.force_adaptive_thinking),
@@ -1366,6 +1370,28 @@ impl Profiles {
         .collect()
     }
 
+    pub fn anthropic_managed_effort_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> BTreeMap<String, bool> {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+            self.cache_compatibility(provider, metadata)
+                .supports_mid_convo_effort
+                .unwrap_or(false)
+        })
+        .into_iter()
+        .filter(|(_, supported)| *supported)
+        .map(|(id, _)| {
+            let can_disable = self
+                .model(provider, &id)
+                .is_none_or(|metadata| metadata.mapped_effort("off") != Some(None));
+            (id, can_disable)
+        })
+        .collect()
+    }
+
     fn anthropic_route_models(
         &self,
         provider: &Provider,
@@ -1867,8 +1893,23 @@ mod tests {
             endpoint,
             "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
         );
-        assert_eq!(profiles.model_ids(&provider).len(), 19);
+        assert_eq!(profiles.model_ids(&provider).len(), 20);
         assert_eq!(profiles.model_ids(&provider)[0], "@cf/moonshotai/kimi-k2.6");
+        let inkling = "@cf/thinkingmachines/inkling-2-small";
+        assert!(
+            profiles
+                .model_ids(&provider)
+                .iter()
+                .any(|model| model == inkling)
+        );
+        assert_eq!(
+            profiles.model_adapter(&provider, inkling),
+            Adapter::ChatCompletions
+        );
+        let model = profiles.model(&provider, inkling).unwrap();
+        assert_eq!(model.context_window, Some(1_048_576));
+        assert_eq!(model.max_tokens, Some(1_048_576));
+        assert_eq!(model.supports_images(), Some(true));
         assert_eq!(
             keys.custom_credential(&provider, endpoint, &profiles)
                 .and_then(|key| key.literal()),
@@ -1920,7 +1961,7 @@ mod tests {
             "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
         );
         assert!(profiles.credential(&provider, endpoint).is_none());
-        assert_eq!(profiles.model_ids(&provider).len(), 19);
+        assert_eq!(profiles.model_ids(&provider).len(), 20);
     }
 
     #[test]
@@ -2084,6 +2125,39 @@ mod tests {
                 "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
             );
         }
+    }
+
+    #[test]
+    fn anthropic_managed_effort_uses_catalog_and_effective_model_route() {
+        let profiles = Profiles::default();
+        let native =
+            profiles.anthropic_managed_effort_models(&Provider::Anthropic, "claude-opus-5", None);
+        assert_eq!(native.len(), 5);
+        assert_eq!(native.get("claude-opus-5"), Some(&true));
+        assert_eq!(native.get("claude-opus-5-5"), Some(&false));
+        assert!(!native.contains_key("claude-opus-4-8"));
+        let openrouter = Provider::named("openrouter").unwrap();
+        let gateway = profiles.anthropic_managed_effort_models(
+            &openrouter,
+            "anthropic/claude-opus-5.5",
+            None,
+        );
+        assert_eq!(gateway.len(), 4);
+        let profiles = Profiles::parse(&json!({"providers":{"custom":{
+            "api":"anthropic-messages","baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMidConvoEffort":true},
+            "models":[
+                {"id":"selected","compat":{"supportsMidConvoEffort":false}},
+                {"id":"rewritten"},
+                {"id":"other-route","baseUrl":"http://localhost:2/v1"}
+            ]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("custom").unwrap();
+        assert_eq!(
+            profiles.anthropic_managed_effort_models(&provider, "selected", None),
+            BTreeMap::from([("rewritten".into(), true)])
+        );
     }
 
     #[test]
