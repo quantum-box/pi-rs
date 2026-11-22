@@ -328,7 +328,7 @@ pub(super) async fn login(
     let path = super::config::agent_dir().join("auth.json");
     let previous = {
         let guard = super::auth_lock::acquire_async(&path).await?;
-        let value = super::config::read_object_unlocked(&path)?
+        let value = super::config::read_auth_object_locked(&guard)?
             .get("meta")
             .cloned();
         guard.check()?;
@@ -356,7 +356,7 @@ async fn access_at(
             return Err(error("cannot refresh credentials in a read-only store"));
         }
     };
-    let stored = super::config::read_object_unlocked(&path)?;
+    let stored = super::config::read_auth_object_locked(&guard)?;
     let value = parse(&stored)?;
     guard.check()?;
     if no_refresh || !expires_soon(&value, window) {
