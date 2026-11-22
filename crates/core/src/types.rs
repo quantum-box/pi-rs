@@ -568,6 +568,15 @@ pub enum AssistantDiagnostic {
         timestamp: i64,
         details: AnthropicInputTransformations,
     },
+    AnthropicThreadFallback {
+        timestamp: i64,
+        details: AnthropicThreadFallbackDetails,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnthropicThreadFallbackDetails {
+    pub reason: String,
 }
 
 impl AssistantDiagnostic {
@@ -578,15 +587,35 @@ impl AssistantDiagnostic {
             .flatten()
             .take(16)
             .filter_map(|diagnostic| {
-                if diagnostic["type"] != "anthropic_input_transformations" {
-                    return None;
+                let timestamp = diagnostic["timestamp"].as_i64()?;
+                match diagnostic["type"].as_str()? {
+                    "anthropic_input_transformations" => {
+                        Some(Self::AnthropicInputTransformations {
+                            timestamp,
+                            details: AnthropicInputTransformations::from_value(
+                                &diagnostic["details"]["transformations"],
+                            )?,
+                        })
+                    }
+                    "anthropic_thread_fallback" => {
+                        let reason = diagnostic["details"]["reason"].as_str()?;
+                        if reason.len() > 64
+                            || reason.is_empty()
+                            || !reason
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                        {
+                            return None;
+                        }
+                        Some(Self::AnthropicThreadFallback {
+                            timestamp,
+                            details: AnthropicThreadFallbackDetails {
+                                reason: reason.into(),
+                            },
+                        })
+                    }
+                    _ => None,
                 }
-                Some(Self::AnthropicInputTransformations {
-                    timestamp: diagnostic["timestamp"].as_i64()?,
-                    details: AnthropicInputTransformations::from_value(
-                        &diagnostic["details"]["transformations"],
-                    )?,
-                })
             })
             .collect()
     }
@@ -598,6 +627,7 @@ impl AssistantDiagnostic {
                 .iter()
                 .filter(|transformation| transformation.kind == "thinking_dropped")
                 .count(),
+            Self::AnthropicThreadFallback { .. } => 0,
         }
     }
 }
