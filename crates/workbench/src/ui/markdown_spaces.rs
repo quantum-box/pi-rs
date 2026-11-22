@@ -138,17 +138,15 @@ pub(super) fn inline_indented_comments(source: &str) -> Cow<'_, str> {
             Event::Start(tag) => {
                 if depth == 0
                     && let Some(end) = paragraph_end.take()
+                    && matches!(tag, Tag::HtmlBlock)
+                    && end < range.start
+                    && source.as_bytes()[end..range.start]
+                        .iter()
+                        .all(|&byte| byte == b' ')
+                    && source[range.start..].starts_with("<!--")
                 {
-                    if matches!(tag, Tag::HtmlBlock)
-                        && end < range.start
-                        && source.as_bytes()[end..range.start]
-                            .iter()
-                            .all(|&byte| byte == b' ')
-                        && source[range.start..].starts_with("<!--")
-                    {
-                        rewritten.get_or_insert_with(|| source.as_bytes().to_vec())[end] = b'x';
-                        paragraph_end = Some(range.end);
-                    }
+                    rewritten.get_or_insert_with(|| source.as_bytes().to_vec())[end] = b'x';
+                    paragraph_end = Some(range.end);
                 }
                 depth += 1;
             }
