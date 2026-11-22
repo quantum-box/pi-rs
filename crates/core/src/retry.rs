@@ -115,6 +115,7 @@ pub(crate) fn is_provider_auth_header(name: &str) -> bool {
             | "x-auth-token"
             | "x-access-token"
             | "x-goog-api-key"
+            | "x-amz-security-token"
     ) || name.ends_with("-api-key")
         || name.ends_with("-auth-token")
 }

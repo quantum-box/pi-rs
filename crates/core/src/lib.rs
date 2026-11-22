@@ -41,6 +41,7 @@ pub use context_replay::endpoint_replay_scope;
 pub use extension::*;
 pub use extension_boundary::{
     AgentActivityOutcome, AgentBeforeSettle, BoundaryContext, BoundaryDecision, BoundaryDraft,
+    TurnEndBoundary,
 };
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use host_auth::*;
@@ -53,11 +54,13 @@ pub use lifecycle::{
     notify_in_session as notify_extension_lifecycle_in_session,
 };
 pub use live_model::{LiveModelControl, LiveModelSelection};
-pub use mcp_registration::{McpServerDeclaration, RegisteredMcpServer};
+pub use mcp_registration::{McpRegistryHost, McpServerDeclaration, RegisteredMcpServer};
 pub use model_catalog::*;
 pub use model_price::ChatPrice;
 pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};
-pub use provider_response::{ProviderResponseEvent, observe_provider_response};
+pub use provider_response::{
+    ProviderResponseEvent, observe_provider_response, observes_provider_response,
+};
 pub use provider_retry::ProviderRetry;
 pub use resource::Resource;
 pub use retry::*;
