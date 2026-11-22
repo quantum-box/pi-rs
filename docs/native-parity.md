@@ -3468,9 +3468,12 @@ implementation applies the same fail-closed rule to direct callers.
 
 For a byte-truncated final shell line, the displayed line size follows Pi's
 streaming accumulator: a trailing newline resets the current-line byte count
-to zero, while an unterminated line retains its UTF-8 byte count. The retained
-tail and truncation metadata are unchanged. A regression covers both cases
-with chunked multibyte output; other local-tool parity gaps remain open.
+to zero, while an unterminated line retains its UTF-8 byte count. A long line followed only
+by blank lines keeps its final UTF-8 characters and any blank lines that fit
+in the display limit. The notice gives the number of the first displayed line.
+Regressions cover chunked multibyte output, trailing whitespace, and both
+progress snapshots and completed results, using upstream
+`780bf31fcaeb252fa9b68df3964c735eae75bde3` as the reference.
 
 ### Grep context and line-limit checkpoint
 
