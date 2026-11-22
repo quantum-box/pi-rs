@@ -5770,8 +5770,18 @@ named tool choices locally. The option is covered by signed loopback requests
 and a comparison with published Pi payloads. Live Bedrock tool selection with
 account credentials was unverified.
 
+Prepared ConverseStream dispatch supports Pi's strict JSON Schema tool
+sampling. Workbench resolves `compat.supportsStrictMode` against the final
+Bedrock model and its overrides. Supported constraints send `strict: true`
+with the normalized schema. Unsupported required constraints fail before
+dispatch and preferred constraints fall back to the original schema. The
+adapter retains the prepared decision if AWS rejects a request. Pi can retry
+some preferred constraints without strict mode after a service rejection.
+Signed loopback requests verified the wire and reservation schemas. Live
+strict tool sampling with an authenticated AWS account was unverified.
+
 Not yet supported: non-image multimodal inputs, workbench-specific thinking
-display controls, strict tool sampling, guardrails, prompt management ARNs, live account-specific
+display controls, guardrails, prompt management ARNs, live account-specific
 model discovery, and workbench proxy/idle-timeout settings. Custom model endpoints in workbench configuration are rejected;
 callers embedding the adapter can pass a configured AWS SDK client, including a
 test endpoint, through `Bedrock::new`.
