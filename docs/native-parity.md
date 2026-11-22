@@ -4870,7 +4870,8 @@ use pi-rs's separate `openai-chatgpt` provider identity. Its CLI sign-in
 also accepts the full redirect URL from a browser on another device after
 checking the same callback URL, state, and client ID as loopback sign-in.
 Saved credentials are applied when the next command loads the model configuration.
-Local terminal and CLI fixtures cover masked key input and command parsing.
+Local terminal and CLI fixtures cover masked key input, command parsing, and
+cancelling a pending browser sign-in with Ctrl-C.
 Real OAuth sign-in and inference were unverified.
 
 ### Provider credential logout
