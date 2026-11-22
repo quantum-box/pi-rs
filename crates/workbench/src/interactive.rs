@@ -1922,6 +1922,21 @@ impl View {
         }
     }
 
+    fn remember_prompt(&mut self, prompt: &str) {
+        const LIMIT: usize = 100;
+        let prompt = prompt
+            .trim_matches(|ch: char| ch == '\u{feff}' || (ch.is_whitespace() && ch != '\u{0085}'));
+        if prompt.is_empty() {
+            return;
+        }
+        if let Some(index) = self.history.iter().position(|entry| entry == prompt) {
+            self.history.remove(index);
+        } else if self.history.len() == LIMIT {
+            self.history.remove(0);
+        }
+        self.history.push(prompt.to_owned());
+    }
+
     fn restore(&mut self, args: &Cli) -> Result<()> {
         let session = Session::open(&args.session)?;
         if session.host_binding().is_some() {
@@ -1963,7 +1978,6 @@ impl View {
         self.restoring_queue = false;
         self.ui_status.clear();
         self.widgets.clear();
-        self.history.clear();
         self.history_index = None;
         self.tokens = 0;
         self.cache_stats = super::cache_stats::Tracker::default();
@@ -1999,7 +2013,7 @@ impl View {
                 }
                 pi_rs::Event::User { content, .. }
                 | pi_rs::Event::UserWithImages { content, .. } => {
-                    self.history.push(content.clone());
+                    self.remember_prompt(content);
                     self.lines.push(Entry::user(content.clone()));
                     if let pi_rs::Event::UserWithImages { images, .. } = &record.event {
                         self.append(&format!("{} attached image(s)", images.len()));
@@ -5290,7 +5304,7 @@ pub(super) async fn run(
                     };
                     view.lines
                         .push(Entry::user(display.unwrap_or_else(|| prompt.clone())));
-                    view.history.push(prompt);
+                    view.remember_prompt(&prompt);
                 }
                 Err(error) => view.append(&error.to_string()),
             }
@@ -6464,7 +6478,7 @@ pub(super) async fn run(
                         let auth_command =
                             matches!(input.split_whitespace().next(), Some("/login" | "/logout"));
                         if !auth_command {
-                            view.history.push(input.clone());
+                            view.remember_prompt(&input);
                         }
                         view.history_index = None;
                         if input.trim() == "/theme" {
@@ -13951,6 +13965,50 @@ exit {exit}
         assert_eq!(wrap("日本abc", 4), vec!["日本", "abc"]);
         assert!(!clean("hello\x1b[31m\x07").contains('\x1b'));
     }
+    #[test]
+    fn prompt_history_moves_repeated_prompts_to_the_most_recent_position() {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = dir.path().join("session.jsonl");
+        let mut session = Session::open(&args.session).unwrap();
+        for prompt in ["p1", "p2", "p3", "p4", "p5"] {
+            session
+                .append_user_with_images(prompt.to_owned(), Vec::new(), None)
+                .unwrap();
+        }
+        let third = session
+            .records()
+            .iter()
+            .find(|record| matches!(&record.event, pi_rs::Event::User { content, .. } if content == "p3"))
+            .unwrap()
+            .id;
+        drop(session);
+
+        let mut view = View::default();
+        view.restore(&args).unwrap();
+        assert_eq!(view.history, ["p1", "p2", "p3", "p4", "p5"]);
+        view.remember_prompt(" \u{feff}p1 ");
+        view.remember_prompt("  ");
+        assert_eq!(view.history, ["p2", "p3", "p4", "p5", "p1"]);
+
+        let mut session = Session::open(&args.session).unwrap();
+        session.checkout(third).unwrap();
+        drop(session);
+        view.restore(&args).unwrap();
+        assert_eq!(view.history, ["p4", "p5", "p1", "p2", "p3"]);
+        view.restore(&args).unwrap();
+        assert_eq!(view.history, ["p4", "p5", "p1", "p2", "p3"]);
+        for id in 0..100 {
+            view.remember_prompt(&format!("entry {id}"));
+        }
+        view.remember_prompt("entry 0");
+        assert_eq!(view.history.len(), 100);
+        assert_eq!(view.history.first().unwrap(), "entry 1");
+        assert_eq!(view.history.last().unwrap(), "entry 0");
+    }
+
     #[test]
     fn regular_history_eviction_preserves_the_uncommitted_entry_boundary() {
         let mut view = View::default();
