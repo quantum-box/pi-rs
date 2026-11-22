@@ -119,7 +119,7 @@ impl PiMessages {
 
     async fn access(&self) -> Result<(String, String)> {
         if let Some(token) = &self.token {
-            return Ok((token.clone(), key_binding(token)));
+            return Ok((token.clone(), radius_catalog::key_binding(token)));
         }
         let radius = self.radius.as_ref().expect("OAuth is only used by Radius");
         radius
@@ -136,7 +136,7 @@ impl PiMessages {
         };
         if !self.probe_catalog {
             let binding = match &self.token {
-                Some(token) => Some(key_binding(token)),
+                Some(token) => Some(radius_catalog::key_binding(token)),
                 None => radius
                     .gateway
                     .cached_login_id()?
@@ -167,9 +167,7 @@ impl PiMessages {
             return Ok(Some(cached.value.clone()));
         }
         let gateway = radius.gateway.url("/");
-        let fallback = || {
-            radius_catalog::cached(&gateway, binding).or_else(|| radius_catalog::baseline(&gateway))
-        };
+        let fallback = || radius_catalog::cached_or_baseline(&gateway, Some(binding));
         let value = if let Some(token) = token {
             match radius_catalog::load(&self.client, &gateway, token).await {
                 Ok(catalog) => {
@@ -422,10 +420,6 @@ impl PiMessages {
             "options":options
         })
     }
-}
-
-fn key_binding(token: &str) -> String {
-    format!("key:{:x}", Sha256::digest(token.as_bytes()))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1104,7 +1098,7 @@ mod tool_status_tests {
         .unwrap();
         let cache = &client.radius.as_ref().unwrap().catalog;
         let update = |endpoint: &str| CachedCatalog {
-            binding: key_binding("token"),
+            binding: radius_catalog::key_binding("token"),
             token_hash: Some(Sha256::digest(b"token").into()),
             value: Arc::new(radius_catalog::Catalog {
                 endpoint: Url::parse(endpoint).unwrap(),

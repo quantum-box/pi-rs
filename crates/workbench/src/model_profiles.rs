@@ -301,6 +301,10 @@ impl InputLimits {
     pub(super) fn valid(self) -> bool {
         self.max_request_bytes != Some(0) && self.images.is_none_or(ImageLimits::valid)
     }
+
+    pub(super) fn image_resize(self) -> Option<ImageResizeProfile> {
+        self.images?.resize
+    }
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
@@ -533,7 +537,7 @@ impl ModelMetadata {
     }
 
     pub fn image_resize(&self) -> Option<ImageResizeProfile> {
-        self.input_limits.as_ref()?.images.as_ref()?.resize
+        self.input_limits?.image_resize()
     }
 
     pub(super) fn input_limits(&self) -> Option<InputLimits> {

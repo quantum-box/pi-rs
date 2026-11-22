@@ -4949,6 +4949,98 @@ fn read_rpc_model_fixture_request(
 }
 
 #[test]
+fn radius_attachments_use_only_the_current_accounts_cached_resize_profile() {
+    use base64::Engine;
+    use image::GenericImageView;
+    use sha2::{Digest, Sha256};
+
+    let root = tempfile::tempdir().unwrap();
+    image::RgbImage::new(40, 20)
+        .save(root.path().join("fixture.png"))
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let origin = format!("http://{}/", listener.local_addr().unwrap());
+    let models =
+        json!({"providers":{"radius":{"models":[{"id":"fixture","input":["text","image"]}]}}});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    let account = format!("key:{:x}", Sha256::digest(b"matching-key"));
+    let catalog = json!({
+        "origin":origin,"account":account,"baseUrl":format!("{origin}v1"),
+        "models":[{"id":"fixture","name":"Fixture","reasoning":false,"input":["text","image"],
+            "contextWindow":131072,"maxTokens":4096,"inputLimits":{"images":{"resize":{"maxWidth":16}}}}]
+    });
+    std::fs::write(root.path().join("radius-models.json"), catalog.to_string()).unwrap();
+
+    let worker = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let mut dimensions = Vec::new();
+        while dimensions.len() < 2 && Instant::now() < deadline {
+            let (mut socket, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("Radius fixture failed: {error}"),
+            };
+            let (request, body) = read_rpc_model_fixture_request(&socket, |_| Ok(())).unwrap();
+            if request.starts_with("GET /v1/config ") {
+                socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                continue;
+            }
+            assert!(request.starts_with("POST /v1/messages "), "{request}");
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let image = request["context"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+                .find(|part| part["type"] == "image")
+                .unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(image["data"].as_str().unwrap())
+                .unwrap();
+            dimensions.push(image::load_from_memory(&bytes).unwrap().dimensions());
+            let reply = concat!(
+                "data: {\"type\":\"text_start\",\"contentIndex\":0}\n\n",
+                "data: {\"type\":\"text_end\",\"contentIndex\":0,\"content\":\"ok\"}\n\n",
+                "data: {\"type\":\"done\",\"reason\":\"stop\"}\n\n",
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        }
+        dimensions
+    });
+
+    for key in ["matching-key", "different-key"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("PI_RADIUS_GATEWAY", &origin)
+            .env("RADIUS_API_KEY", key)
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-session",
+                "--provider",
+                "radius",
+                "--model",
+                "fixture",
+                "--print",
+                "describe",
+                "@fixture.png",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    assert_eq!(worker.join().unwrap(), [(16, 8), (40, 20)]);
+}
+
+#[test]
 fn rpc_model_fixture_waits_for_request_on_nonblocking_accepted_socket() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
