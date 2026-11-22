@@ -1675,6 +1675,11 @@ pub trait BashOperations: Send + Sync {
     fn is_local(&self) -> bool {
         false
     }
+    /// Whether the backend owns the requested timeout and reports its own
+    /// diagnostic. Other backends also receive a deadline from the tool.
+    fn owns_timeout(&self) -> bool {
+        false
+    }
     async fn exec(
         &self,
         context: ShellSpawnContext,
@@ -1720,6 +1725,9 @@ impl BashOperations for LocalBashOperations {
     fn is_local(&self) -> bool {
         true
     }
+    fn owns_timeout(&self) -> bool {
+        true
+    }
     async fn exec(
         &self,
         context: ShellSpawnContext,
@@ -1737,7 +1745,21 @@ impl BashOperations for LocalBashOperations {
         } = self
             .shell
             .launch(&context.cwd, false, true, &context.command, false)?;
-        check_local_shell_cwd(&cwd, "bash", &cancellation).await?;
+        // The backend owns the deadline so it can report a shell that has
+        // already exited. The same deadline bounds the directory check.
+        let deadline = async {
+            match timeout {
+                Some(value) => tokio::time::sleep(value).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(deadline);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            _ = &mut deadline => return Err(operation_timeout(timeout.expect("timeout"), None)),
+            result = check_local_shell_cwd(&cwd, "bash", &cancellation) => result?,
+        }
         command
             .current_dir(cwd)
             .env_clear()
@@ -1753,6 +1775,7 @@ impl BashOperations for LocalBashOperations {
         #[cfg(unix)]
         command.process_group(0);
         let mut process = ProcessGroup::spawn(command)?;
+        let spawned_at = tokio::time::Instant::now();
         let input_task = input.map(|input| {
             let mut stdin = process.stdin();
             tokio::spawn(async move {
@@ -1765,23 +1788,21 @@ impl BashOperations for LocalBashOperations {
         let mut stderr_open = true;
         let mut stdout_buffer = [0u8; 8192];
         let mut stderr_buffer = [0u8; 8192];
-        let mut status = None;
+        let mut shell_exit = None;
         let mut drain_deadline = None;
         let mut drain_max = None;
-        let deadline = async {
-            match timeout {
-                Some(value) => tokio::time::sleep(value).await,
-                None => std::future::pending().await,
-            }
-        };
-        tokio::pin!(deadline);
-        'drain: while status.is_none() || stdout_open || stderr_open {
+        'drain: while shell_exit.is_none() || stdout_open || stderr_open {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
-                _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
-                result = process.wait(), if status.is_none() => {
-                    status = Some(result?);
+                _ = &mut deadline => {
+                    let timeout = timeout.expect("timeout");
+                    let shell_exit = shell_exit.filter(|_| stdout_open || stderr_open);
+                    process.terminate();
+                    return Err(operation_timeout(timeout, shell_exit));
+                },
+                result = process.wait(), if shell_exit.is_none() => {
+                    shell_exit = Some((result?, spawned_at.elapsed()));
                     drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
                     drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
                 },
@@ -1790,14 +1811,19 @@ impl BashOperations for LocalBashOperations {
                 count = stdout.read(&mut stdout_buffer), if stdout_open => {
                     let count = count?; stdout_open = count != 0;
                     if count != 0 {
-                        if status.is_some() { drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE); }
+                        if shell_exit.is_some() { drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE); }
                         loop {
                             tokio::select! {
                                 biased;
                                 _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
-                                _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
-                                result = process.wait(), if status.is_none() => {
-                                    status = Some(result?);
+                                _ = &mut deadline => {
+                                    let timeout = timeout.expect("timeout");
+                                    let shell_exit = shell_exit.filter(|_| stdout_open || stderr_open);
+                                    process.terminate();
+                                    return Err(operation_timeout(timeout, shell_exit));
+                                },
+                                result = process.wait(), if shell_exit.is_none() => {
+                                    shell_exit = Some((result?, spawned_at.elapsed()));
                                     drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
                                     drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
                                 },
@@ -1813,14 +1839,19 @@ impl BashOperations for LocalBashOperations {
                 count = stderr.read(&mut stderr_buffer), if stderr_open => {
                     let count = count?; stderr_open = count != 0;
                     if count != 0 {
-                        if status.is_some() { drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE); }
+                        if shell_exit.is_some() { drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE); }
                         loop {
                             tokio::select! {
                                 biased;
                                 _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
-                                _ = &mut deadline => { process.terminate(); return Err(Error::Config(format!("Command timed out after {} seconds", timeout.expect("timeout").as_secs_f64()))); },
-                                result = process.wait(), if status.is_none() => {
-                                    status = Some(result?);
+                                _ = &mut deadline => {
+                                    let timeout = timeout.expect("timeout");
+                                    let shell_exit = shell_exit.filter(|_| stdout_open || stderr_open);
+                                    process.terminate();
+                                    return Err(operation_timeout(timeout, shell_exit));
+                                },
+                                result = process.wait(), if shell_exit.is_none() => {
+                                    shell_exit = Some((result?, spawned_at.elapsed()));
                                     drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
                                     drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
                                 },
@@ -1839,7 +1870,8 @@ impl BashOperations for LocalBashOperations {
             task.abort();
         }
         process.finished = true;
-        Ok(Some(exit_code(status.expect("shell status observed"))))
+        let (status, _) = shell_exit.expect("shell status observed");
+        Ok(Some(exit_code(status)))
     }
 }
 
@@ -1936,6 +1968,7 @@ impl RemoteShellTool {
             }
         };
         tokio::pin!(deadline);
+        let backend_owns_timeout = self.operations.owns_timeout();
         let (code, cancelled, timed_out) = {
             let operation = self
                 .operations
@@ -1946,7 +1979,7 @@ impl RemoteShellTool {
                 tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => { child.cancel(); break (Ok(None), true, false); }
-                    _ = &mut deadline => { child.cancel(); break (Ok(None), true, true); }
+                    _ = &mut deadline, if !backend_owns_timeout => { child.cancel(); break (Ok(None), true, true); }
                     chunk = receiver.recv(), if open => match chunk {
                         Some(chunk) => { output.append(&chunk)?; if let Some((sender, _)) = &progress { let _ = sender.send_replace(Some(output.partial_result())); } },
                         None => open = false,
@@ -1999,6 +2032,12 @@ impl RemoteShellTool {
                     Error::Config(message)
                         if self.operations.is_local()
                             && message.starts_with("Working directory does not exist: ") =>
+                    {
+                        message
+                    }
+                    Error::Config(message)
+                        if backend_owns_timeout
+                            && message.starts_with("Command timed out after ") =>
                     {
                         message
                     }
@@ -3695,7 +3734,10 @@ impl CodingTool {
                     .to_string()
             };
             let status = format!("Command timed out after {seconds} seconds");
-            return Err(Error::Config(shell_status(&result.output.display, &status)));
+            return Err(Error::Config(shell_status(
+                &result.output.display,
+                &append_shell_exit_status(status, result.exit_before_timeout),
+            )));
         }
         if result.cancelled {
             return Err(Error::Config(shell_status(
@@ -3752,6 +3794,7 @@ impl CodingTool {
         #[cfg(unix)]
         command.process_group(0);
         let mut process = ProcessGroup::spawn(command)?;
+        let spawned_at = tokio::time::Instant::now();
         let input_task = input.map(|input| {
             let mut stdin = process.stdin();
             tokio::spawn(async move {
@@ -3788,37 +3831,42 @@ impl CodingTool {
         });
         let mut stdout_open = true;
         let mut stderr_open = true;
-        let mut status = None;
+        let mut shell_exit = None;
         let mut stdout_chunk = [0; 8192];
         let mut stderr_chunk = [0; 8192];
         let mut drain_deadline = None;
         let mut drain_max = None;
         let mut cancelled = false;
         let mut timed_out = false;
+        let mut exit_before_timeout = None;
         #[cfg(all(test, unix))]
         let mut drain_reason = "pipes closed";
         let mut stdout_text = ShellStream::default();
         let mut stderr_text = ShellStream::default();
         let mut stdout_filter = UserShellFilter::default();
-        while status.is_none() || stdout_open || stderr_open {
+        while shell_exit.is_none() || stdout_open || stderr_open {
             tokio::select! {
                 _ = cancellation.cancelled(), if !cancelled => {
                     cancelled = true;
                     process.terminate();
-                    if status.is_some() {
+                    if shell_exit.is_some() {
                         drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
                     }
                 }
                 _ = &mut deadline, if !cancelled => {
                     timed_out = true;
                     cancelled = true;
+                    // Pi captures its exit event before the deadline callback.
+                    // Only describe inherited pipes when the exit was observed
+                    // and the output loop was still draining at the deadline.
+                    exit_before_timeout = shell_exit.filter(|_| stdout_open || stderr_open);
                     process.terminate();
-                    if status.is_some() {
+                    if shell_exit.is_some() {
                         drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
                     }
                 }
-                result = process.wait(), if status.is_none() => {
-                    status = Some(result?);
+                result = process.wait(), if shell_exit.is_none() => {
+                    shell_exit = Some((result?, spawned_at.elapsed()));
                     process.finished = true;
                     // Descendants may retain inherited pipes after the shell exits.
                     drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
@@ -3827,7 +3875,7 @@ impl CodingTool {
                 count = stdout.read(&mut stdout_chunk), if stdout_open => {
                     let count = count?;
                     stdout_open = count != 0;
-                    if count != 0 && status.is_some() && !cancelled {
+                    if count != 0 && shell_exit.is_some() && !cancelled {
                         drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
                     }
                     if sanitize_user_output {
@@ -3849,7 +3897,7 @@ impl CodingTool {
                 count = stderr.read(&mut stderr_chunk), if stderr_open => {
                     let count = count?;
                     stderr_open = count != 0;
-                    if count != 0 && status.is_some() && !cancelled {
+                    if count != 0 && shell_exit.is_some() && !cancelled {
                         drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
                     }
                     if sanitize_user_output {
@@ -3912,11 +3960,13 @@ impl CodingTool {
                 worker.abort();
             }
         }
+        let (status, _) = shell_exit.expect("shell status observed");
         Ok(ShellResult {
             cancelled,
             timed_out,
+            exit_before_timeout,
             output: output.finish()?,
-            status: status.expect("shell status observed"),
+            status,
             elapsed: started.elapsed().as_secs_f64(),
             #[cfg(all(test, unix))]
             drain_reason,
@@ -4050,6 +4100,7 @@ fn prepare_image_with_resize_cancellable(
 struct ShellResult {
     cancelled: bool,
     timed_out: bool,
+    exit_before_timeout: Option<(std::process::ExitStatus, Duration)>,
     output: crate::shell_output::Output,
     status: std::process::ExitStatus,
     elapsed: f64,
@@ -4258,6 +4309,32 @@ fn bounded(mut output: String) -> String {
         output.push_str("\n[Output truncated at 50 KiB]");
     }
     output
+}
+
+fn operation_timeout(
+    timeout: Duration,
+    shell_exit: Option<(std::process::ExitStatus, Duration)>,
+) -> Error {
+    let message = format!("Command timed out after {} seconds", timeout.as_secs_f64());
+    Error::Config(append_shell_exit_status(message, shell_exit))
+}
+
+fn append_shell_exit_status(
+    mut message: String,
+    shell_exit: Option<(std::process::ExitStatus, Duration)>,
+) -> String {
+    if let Some((status, elapsed)) = shell_exit {
+        use std::fmt::Write as _;
+        let code = exit_code(status);
+        let seconds = (elapsed.as_secs_f64() * 10.0).round() / 10.0;
+        // Pi uses this wording whenever inherited pipes remain open at the
+        // deadline, including when the descendant did not write to them.
+        let _ = write!(
+            message,
+            ". The shell exited with code {code} after {seconds} seconds, but background processes it started kept writing output until the timeout."
+        );
+    }
+    message
 }
 
 fn shell_status(output: &str, status: &str) -> String {
@@ -8326,6 +8403,75 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Config(message)) if message.contains("timed out after 120 seconds"))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_timeout_reports_an_exit_before_inherited_pipes_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let local: Arc<dyn Tool> = Arc::new(CodingTool {
+            root: directory.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        });
+        let installed = create_bash_tool(
+            directory.path(),
+            ShellConfig::default(),
+            create_local_bash_operations(None),
+        )
+        .unwrap();
+
+        for tool in [local, installed] {
+            let pid_file = directory.path().join("shell-pid");
+            let cancellation = pi_rs::CancellationToken::new();
+            let _cleanup = cancellation.clone().drop_guard();
+            tokio::time::pause();
+            let task = tokio::spawn(async move {
+                tool.invoke(
+                    json!({
+                        "command": "printf before; printf '%s' \"$$\" > shell-pid; sleep 300 & exit 7",
+                        "timeout": 0.05
+                    }),
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation,
+                    },
+                )
+                .await
+            });
+            let readiness_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = pid.parse::<i32>()
+                    && pid > 0
+                    && unsafe { libc::kill(pid, 0) } != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    // The shell has been reaped while the background sleep
+                    // still holds the pipes. The idle deadline is at 100 ms.
+                    break;
+                }
+                assert!(!task.is_finished(), "shell finished before its deadline");
+                assert!(
+                    std::time::Instant::now() < readiness_deadline,
+                    "shell exit not observed"
+                );
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_millis(60)).await;
+            tokio::time::resume();
+            let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(outcome.is_error(), "{outcome:?}");
+            assert_eq!(
+                outcome.tool_content(),
+                "Tool failed: before\n\nCommand timed out after 0.05 seconds. The shell exited with code 7 after 0 seconds, but background processes it started kept writing output until the timeout."
+            );
+            std::fs::remove_file(pid_file).unwrap();
+        }
     }
 
     #[cfg(unix)]
