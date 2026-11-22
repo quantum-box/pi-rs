@@ -109,6 +109,15 @@ struct SourceBlock {
     pending: bool,
 }
 
+pub(super) fn include_line_indent(source: &str, start: usize) -> usize {
+    let line = source[..start].rfind('\n').map_or(0, |index| index + 1);
+    if source[line..start].bytes().all(|byte| byte == b' ') {
+        line
+    } else {
+        start
+    }
+}
+
 fn parse_blocks(
     source: &str,
     base: usize,
@@ -124,13 +133,16 @@ fn parse_blocks(
         match event {
             Event::Start(tag) => {
                 if depth == 0 {
-                    // Pulldown reports an indented code block after its
-                    // indentation, but Marked includes that indentation in
-                    // the block token rather than a separate space token.
-                    let start = if matches!(tag, Tag::CodeBlock(CodeBlockKind::Indented)) {
-                        source[..local.start]
-                            .rfind('\n')
-                            .map_or(0, |index| index + 1)
+                    // Marked consumes indentation with these block markers.
+                    // A space token here would add a spurious blank line.
+                    let start = if matches!(
+                        tag,
+                        Tag::Paragraph
+                            | Tag::Heading { .. }
+                            | Tag::BlockQuote(_)
+                            | Tag::CodeBlock(_)
+                    ) {
+                        include_line_indent(source, local.start)
                     } else {
                         local.start
                     };
@@ -153,17 +165,24 @@ fn parse_blocks(
                 depth += 1;
             }
             Event::End(_) => depth = depth.checked_sub(1)?,
-            _ if depth == 0 => blocks.push(SourceBlock {
-                range: base + local.start..base + local.end,
-                fenced_unclosed: false,
-                kind: if matches!(event, Event::Html(_) | Event::InlineHtml(_)) {
-                    BlockTokenKind::Block(BlockFlavor::Html)
+            _ if depth == 0 => {
+                let start = if matches!(event, Event::Rule) {
+                    include_line_indent(source, local.start)
                 } else {
-                    BlockTokenKind::Block(BlockFlavor::Other)
-                },
-                math_content: None,
-                pending: false,
-            }),
+                    local.start
+                };
+                blocks.push(SourceBlock {
+                    range: base + start..base + local.end,
+                    fenced_unclosed: false,
+                    kind: if matches!(event, Event::Html(_) | Event::InlineHtml(_)) {
+                        BlockTokenKind::Block(BlockFlavor::Html)
+                    } else {
+                        BlockTokenKind::Block(BlockFlavor::Other)
+                    },
+                    math_content: None,
+                    pending: false,
+                });
+            }
             _ => {}
         }
     }

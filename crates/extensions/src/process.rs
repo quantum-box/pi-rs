@@ -199,11 +199,19 @@ enum ProtocolRequest {
         event: pi_rs_core::ProviderStreamEvent,
         state: Option<ExtensionState>,
     },
+    AgentBeforeSettle {
+        event: pi_rs_core::AgentBeforeSettle,
+        state: Option<ExtensionState>,
+    },
     CompactionLifecycleV1 {
         event: LifecycleEvent,
         trigger: pi_rs_core::CompactionTrigger,
         metadata: Option<Value>,
         state: Option<ExtensionState>,
+    },
+    RenderCustomMessage {
+        message: pi_rs_core::CustomMessage,
+        options: pi_rs_core::CustomMessageRenderOptions,
     },
     DiscoverResources {
         event: pi_rs_core::ResourceDiscoveryEvent,
@@ -335,6 +343,8 @@ struct Envelope {
 struct Description {
     id: String,
     dependencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    custom_message_renderers: Vec<String>,
     commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     flags: Vec<ExtensionFlag>,
@@ -370,8 +380,14 @@ struct Description {
     user_bash_hook: bool,
     #[serde(default)]
     user_bash_operations_hook: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mcp_server_declarations: Vec<pi_rs_core::McpServerDeclaration>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    mcp_servers_change_hook: bool,
     #[serde(default)]
     lifecycle_hook: bool,
+    #[serde(default)]
+    agent_before_settle_hook: bool,
     #[serde(default)]
     lifecycle_host_calls: bool,
     #[serde(default)]
@@ -804,6 +820,22 @@ impl ExecutableExtension {
 
 #[async_trait::async_trait]
 impl Extension for ExecutableExtension {
+    fn handles_agent_before_settle(&self) -> bool {
+        self.description.agent_before_settle_hook
+    }
+
+    async fn agent_before_settle(
+        &self,
+        event: &pi_rs_core::AgentBeforeSettle,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<pi_rs_core::BoundaryDecision> {
+        self.request_async(ProtocolRequest::AgentBeforeSettle {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+
     fn id(&self) -> &str {
         &self.description.id
     }
@@ -1003,6 +1035,12 @@ impl Extension for ExecutableExtension {
             .await
             .map_err(|error| error.to_string())?
     }
+    fn mcp_server_declarations(&self) -> Vec<pi_rs_core::McpServerDeclaration> {
+        self.description.mcp_server_declarations.clone()
+    }
+    fn handles_mcp_servers_change(&self) -> bool {
+        self.description.mcp_servers_change_hook
+    }
     fn handles_lifecycle(&self) -> bool {
         self.description.lifecycle_hook
     }
@@ -1012,6 +1050,25 @@ impl Extension for ExecutableExtension {
     fn handles_tool_execution_updates(&self) -> bool {
         self.description.tool_execution_update_hook
     }
+    fn custom_message_renderer_types(&self) -> Vec<&str> {
+        self.description
+            .custom_message_renderers
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+    async fn render_custom_message(
+        &self,
+        message: &pi_rs_core::CustomMessage,
+        options: &pi_rs_core::CustomMessageRenderOptions,
+    ) -> ExtensionResult<Option<pi_rs_core::RenderedCustomMessage>> {
+        self.request_async(ProtocolRequest::RenderCustomMessage {
+            message: message.clone(),
+            options: options.clone(),
+        })
+        .await
+    }
+
     fn handles_ui_prompt_lifecycle(&self) -> bool {
         self.description.ui_prompt_lifecycle_hook
     }
@@ -1095,6 +1152,12 @@ impl Extension for ExecutableExtension {
         event: &LifecycleEvent,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<()> {
+        if matches!(event, LifecycleEvent::McpServersChange { .. })
+            && !self.handles_mcp_servers_change()
+        {
+            return Ok(());
+        }
+
         use pi_rs_core::{SessionShutdownReason as Shutdown, SessionStartReason as Start};
         if matches!(event, LifecycleEvent::SessionInfoChanged { .. })
             && !self.description.session_info_hook
@@ -1133,6 +1196,12 @@ impl Extension for ExecutableExtension {
         state: Option<&ExtensionState>,
         host: Arc<dyn ToolHost>,
     ) -> ExtensionResult<()> {
+        if matches!(event, LifecycleEvent::McpServersChange { .. })
+            && !self.handles_mcp_servers_change()
+        {
+            return Ok(());
+        }
+
         if !self.description.lifecycle_host_calls {
             return self.lifecycle(event, state).await;
         }
@@ -3622,6 +3691,11 @@ async fn dispatch_inner(
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            custom_message_renderers: extension
+                .custom_message_renderer_types()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             flags: extension.cli_flags(),
             host_calls: true,
             command_entries: extension.supports_command_entries(),
@@ -3638,7 +3712,10 @@ async fn dispatch_inner(
             tool_call_hook: extension.handles_tool_call(),
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
+            mcp_server_declarations: extension.mcp_server_declarations(),
+            mcp_servers_change_hook: extension.handles_mcp_servers_change(),
             lifecycle_hook: extension.handles_lifecycle(),
+            agent_before_settle_hook: extension.handles_agent_before_settle(),
             lifecycle_host_calls: true,
             tool_hook_host_calls: true,
             before_tool_host_calls: true,
@@ -3815,6 +3892,9 @@ async fn dispatch_inner(
                 .provider_stream_event(&event, state.as_ref())
                 .await,
         ),
+        ProtocolRequest::AgentBeforeSettle { event, state } => {
+            encode(extension.agent_before_settle(&event, state.as_ref()).await)
+        }
         ProtocolRequest::CompactionLifecycleV1 {
             event,
             trigger,
@@ -3831,6 +3911,16 @@ async fn dispatch_inner(
                 )
                 .await,
         ),
+        ProtocolRequest::RenderCustomMessage { message, options } => {
+            if !message.display
+                || !extension
+                    .custom_message_renderer_types()
+                    .contains(&message.custom_type.as_str())
+            {
+                return encode(Ok(Option::<pi_rs_core::RenderedCustomMessage>::None));
+            }
+            encode(extension.render_custom_message(&message, &options).await)
+        }
         ProtocolRequest::DiscoverResources { event, state } => {
             if host.supports_custom_messages()
                 || host.supports_custom_entries()
@@ -4392,6 +4482,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_mcp_registration_negotiates_declarations_and_change_events() {
+        use std::sync::Mutex;
+        let legacy: Description = serde_json::from_value(serde_json::json!({
+            "id":"legacy","dependencies":[],"commands":[],"tools":[],"lifecycle_hook":true,
+        }))
+        .unwrap();
+        assert!(!legacy.mcp_servers_change_hook);
+        assert!(legacy.mcp_server_declarations.is_empty());
+
+        struct Owner(Arc<Mutex<Vec<String>>>);
+        #[async_trait::async_trait]
+        impl Extension for Owner {
+            fn id(&self) -> &str {
+                "mcp-owner"
+            }
+            fn mcp_server_declarations(&self) -> Vec<pi_rs_core::McpServerDeclaration> {
+                vec![pi_rs_core::McpServerDeclaration {
+                    name: "example".into(),
+                    config: serde_json::json!({"command":"mcp-fixture"}),
+                }]
+            }
+            fn handles_mcp_servers_change(&self) -> bool {
+                true
+            }
+            async fn lifecycle(
+                &self,
+                event: &LifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                if let LifecycleEvent::McpServersChange { servers } = event {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .extend(servers.iter().map(|server| server.server.name.clone()));
+                }
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let extension: Arc<dyn Extension> = Arc::new(Owner(seen.clone()));
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["mcp_servers_change_hook"], true);
+        assert_eq!(description["mcp_server_declarations"][0]["name"], "example");
+        let request = serde_json::from_value(serde_json::json!({
+            "type":"lifecycle",
+            "event":{"type":"mcp_servers_change","servers":[{
+                "name":"example","config":{"command":"mcp-fixture"},"extensionId":"mcp-owner",
+            }]},
+        }))
+        .unwrap();
+        dispatch(extension, request).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["example"]);
+    }
+
+    #[tokio::test]
     async fn detailed_compaction_protocol_preserves_trigger_and_metadata() {
         use std::sync::Mutex;
         struct Hook(Arc<Mutex<Option<Value>>>);
@@ -4737,6 +4884,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_message_renderer_capability_and_request_round_trip() {
+        struct Renderer;
+        #[async_trait::async_trait]
+        impl Extension for Renderer {
+            fn id(&self) -> &str {
+                "renderer"
+            }
+            fn custom_message_renderer_types(&self) -> Vec<&str> {
+                vec!["card"]
+            }
+            async fn render_custom_message(
+                &self,
+                message: &pi_rs_core::CustomMessage,
+                options: &pi_rs_core::CustomMessageRenderOptions,
+            ) -> ExtensionResult<Option<pi_rs_core::RenderedCustomMessage>> {
+                assert_eq!(
+                    message.details,
+                    Some(serde_json::json!({"label":"rendered"}))
+                );
+                assert!(options.expanded);
+                Ok(Some(pi_rs_core::RenderedCustomMessage {
+                    lines: vec![],
+                    padding: options.output_pad,
+                    background: None,
+                }))
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Renderer);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(
+            description["custom_message_renderers"],
+            serde_json::json!(["card"])
+        );
+        let mut legacy = description;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("custom_message_renderers");
+        assert!(
+            serde_json::from_value::<Description>(legacy)
+                .unwrap()
+                .custom_message_renderers
+                .is_empty()
+        );
+        let mut message = serde_json::json!({
+            "type":"render_custom_message",
+            "message":{"customType":"card","content":"model context","display":true,"details":{"label":"rendered"}},
+            "options":{"expanded":true,"outputPad":3}
+        });
+        let request = serde_json::from_value(message.clone()).unwrap();
+        assert_eq!(
+            dispatch(extension.clone(), request).await.unwrap()["padding"],
+            3
+        );
+        message["message"]["display"] = false.into();
+        let request = serde_json::from_value(message).unwrap();
+        assert!(dispatch(extension, request).await.unwrap().is_null());
+    }
+
+    #[tokio::test]
     async fn ui_prompt_lifecycle_capability_and_payload_round_trip() {
         struct Hook;
         #[async_trait::async_trait]
@@ -4786,6 +4996,56 @@ mod tests {
         }))
         .unwrap();
         dispatch(extension, request).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_before_settle_capability_carries_structural_decisions() {
+        struct Hook;
+
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "boundary-hook"
+            }
+
+            fn handles_agent_before_settle(&self) -> bool {
+                true
+            }
+
+            async fn agent_before_settle(
+                &self,
+                event: &pi_rs_core::AgentBeforeSettle,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<pi_rs_core::BoundaryDecision> {
+                assert!(event.context.can_continue);
+                assert_eq!(event.context.context_messages[0].record_id, 4);
+                Ok(pi_rs_core::BoundaryDecision {
+                    entries: Some(event.entries.clone()),
+                    should_continue: Some(false),
+                })
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["agent_before_settle_hook"], true);
+        let entry = serde_json::json!({"type":"context_edit","targetId":4,"replacement":null});
+        let request = serde_json::from_value(serde_json::json!({
+            "type": "agent_before_settle",
+            "event": {
+                "outcome": "completed", "entries": [entry], "continue": true,
+                "context": {
+                    "contextMessages": [{"recordId":4,"message":{"role":"user","content":"hello"}}],
+                    "pendingMessages": [], "canContinue": true
+                }
+            }
+        }))
+        .unwrap();
+        let response = dispatch(extension, request).await.unwrap();
+        assert_eq!(response["entries"][0], entry);
+        assert_eq!(response["continue"], false);
     }
 
     #[tokio::test]

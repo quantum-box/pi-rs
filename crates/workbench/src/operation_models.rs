@@ -15,6 +15,8 @@ use super::{
 };
 
 mod decisions;
+mod llama_cpp;
+mod llama_discovery;
 mod wire;
 use wire::{
     classifier_answers, classifier_payload, classifier_response, image_output, image_payload, usage,
@@ -45,12 +47,17 @@ enum Api {
     WorkersAiSystemOne,
     #[serde(rename = "openrouter-images")]
     OpenRouterImages,
+    #[serde(rename = "llama-cpp-classify")]
+    LlamaCppClassifier,
 }
 
 impl Api {
     fn kind(self) -> Kind {
         match self {
-            Self::SystemOne | Self::WorkersAiSystemOne | Self::OpenAiDecisions => Kind::Classifier,
+            Self::SystemOne
+            | Self::WorkersAiSystemOne
+            | Self::OpenAiDecisions
+            | Self::LlamaCppClassifier => Kind::Classifier,
             Self::OpenRouterImages => Kind::Image,
         }
     }
@@ -61,6 +68,7 @@ impl Api {
             Self::SystemOne => "systemone",
             Self::WorkersAiSystemOne => "run",
             Self::OpenRouterImages => "chat/completions",
+            Self::LlamaCppClassifier => "completion",
         }
     }
 }
@@ -121,9 +129,12 @@ fn classifier_retry_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     if let Ok(date) = chrono::DateTime::parse_from_rfc2822(value) {
         return Some(date.to_utc());
     }
+    let value = value.trim();
+    let Some((weekday, rest)) = value.split_once(',') else {
+        return classifier_retry_asctime(value);
+    };
     // Date.parse also accepts the obsolete RFC 850 HTTP-date form. Use
     // JavaScript's 1950/2049 pivot for its two-digit year.
-    let (weekday, rest) = value.trim().split_once(',')?;
     if ![
         "Monday",
         "Tuesday",
@@ -161,6 +172,42 @@ fn classifier_retry_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     .map(|date| date.and_utc())
 }
 
+fn classifier_retry_asctime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{Local, LocalResult, TimeZone};
+
+    let explicit_zone = value
+        .rsplit_once(char::is_whitespace)
+        .filter(|(_, zone)| zone.eq_ignore_ascii_case("GMT") || zone.eq_ignore_ascii_case("UTC"));
+    let date = explicit_zone.map_or(value, |(date, _)| date);
+    let (weekday, date) = date.split_once(char::is_whitespace)?;
+    // Date.parse recognizes the weekday but does not use it to check the date.
+    weekday.parse::<chrono::Weekday>().ok()?;
+    let date =
+        chrono::NaiveDateTime::parse_from_str(date.trim_start(), "%b %d %H:%M:%S %Y").ok()?;
+    if explicit_zone.is_some() {
+        Some(date.and_utc())
+    } else {
+        // Pi's Date.parse treats an asctime value with no zone as local time.
+        let offset = match Local.offset_from_local_datetime(&date) {
+            LocalResult::Single(offset) => offset,
+            LocalResult::Ambiguous(first, second) => {
+                // The larger offset maps the repeated wall time to its first instant.
+                std::cmp::max_by_key(first, second, |offset| offset.local_minus_utc())
+            }
+            LocalResult::None => {
+                // JavaScript moves through forward clock changes using the
+                // offset from before the gap. Look up that offset the day before.
+                let previous = date.checked_sub_days(chrono::Days::new(1))?;
+                Local.offset_from_local_datetime(&previous).earliest()?
+            }
+        };
+        offset
+            .from_local_datetime(&date)
+            .single()
+            .map(|date| date.to_utc())
+    }
+}
+
 fn classifier_retry_delay(
     headers: &HeaderMap,
     retry_index: usize,
@@ -172,17 +219,19 @@ fn classifier_retry_delay(
             .and_then(|value| value.to_str().ok())
             .and_then(retry_number)
     };
-    let delay_ms = numeric("retry-after-ms").or_else(|| {
-        numeric("retry-after")
-            .map(|seconds| seconds * 1000.0)
-            .or_else(|| {
-                headers
-                    .get("retry-after")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(classifier_retry_date)
-                    .map(|date| date.signed_duration_since(now).num_milliseconds() as f64)
-            })
-    });
+    let delay_ms = numeric("retry-after-ms")
+        .or_else(|| {
+            numeric("retry-after")
+                .map(|seconds| seconds * 1000.0)
+                .or_else(|| {
+                    headers
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(classifier_retry_date)
+                        .map(|date| date.signed_duration_since(now).num_milliseconds() as f64)
+                })
+        })
+        .filter(|delay| delay.is_finite());
     if let Some(delay_ms) = delay_ms {
         if delay_ms > MAX_SERVER_RETRY_DELAY.as_millis() as f64 {
             return Err(Error::Model(
@@ -359,6 +408,7 @@ struct Entry {
     endpoint: Url,
     api_key: Option<String>,
     cloudflare_default: bool,
+    llama_root: Option<Url>,
 }
 
 #[derive(Clone, Default)]
@@ -422,7 +472,9 @@ impl Catalogue {
                         .find(|(key, _)| key.eq_ignore_ascii_case(&name))
                         .and_then(|(_, configured)| {
                             if name == "cloudflare-workers-ai" {
-                                cloudflare_model_binding(configured)
+                                configured["models"]
+                                    .as_array()
+                                    .and_then(|models| cloudflare_model_binding(models))
                             } else {
                                 configured["models"]
                                     .as_array()
@@ -514,7 +566,7 @@ impl Catalogue {
                 let cloudflare_default = cloudflare
                     && (base.contains("{CLOUDFLARE_ACCOUNT_ID}")
                         || (configured.base_url.is_none() && provider["baseUrl"].is_null()));
-                let (base, endpoint) = operation_endpoints(base, api.route(), cloudflare)?;
+                let (base, endpoint) = operation_endpoints(base, api, cloudflare)?;
                 let key_base = match &configured_binding {
                     Some(binding) => binding.as_deref(),
                     None => provider["baseUrl"]
@@ -523,7 +575,7 @@ impl Catalogue {
                         .or(inferred_base.as_deref()),
                 };
                 let key_endpoint = key_base
-                    .map(|base| operation_endpoints(base, api.route(), cloudflare))
+                    .map(|base| operation_endpoints(base, api, cloudflare))
                     .transpose()?
                     .map(|(_, endpoint)| endpoint);
                 let inherited: BTreeMap<String, String> = if provider["headers"].is_null() {
@@ -578,6 +630,7 @@ impl Catalogue {
                     endpoint,
                     api_key,
                     cloudflare_default,
+                    llama_root: None,
                 });
             }
         }
@@ -601,7 +654,13 @@ impl Catalogue {
                 continue;
             }
             if available {
-                let key = (model.provider.as_str(), model.endpoint.as_str());
+                let allows_keyless = model.allows_keyless(keys);
+                let key = (
+                    model.provider.as_str(),
+                    model.endpoint.as_str(),
+                    allows_keyless,
+                    model.llama_root.is_some(),
+                );
                 let usable = match resolved.get(&key) {
                     Some(usable) => *usable,
                     None => {
@@ -611,7 +670,7 @@ impl Catalogue {
                             .and_then(|model| model.credential(keys))
                         {
                             Some(credential) => credential.resolve().await.is_ok(),
-                            None => false,
+                            None => allows_keyless,
                         };
                         resolved.insert(key, usable);
                         usable
@@ -629,8 +688,7 @@ impl Catalogue {
 
 // None means no model-level endpoint was configured. Some(None) means that
 // endpoints were configured but cannot be bound unambiguously.
-fn cloudflare_model_binding(provider: &Value) -> Option<Option<String>> {
-    let models = provider["models"].as_array()?;
+pub(super) fn cloudflare_model_binding(models: &[Value]) -> Option<Option<String>> {
     if !models
         .iter()
         .any(|model| model["baseUrl"].as_str().is_some())
@@ -639,10 +697,16 @@ fn cloudflare_model_binding(provider: &Value) -> Option<Option<String>> {
     }
     let binding = (|| {
         let first = models.first()?["baseUrl"].as_str()?;
-        let expected = operation_endpoints(first, "run", true).ok()?.1;
+        let expected = operation_endpoints(first, Api::WorkersAiSystemOne, true)
+            .ok()?
+            .1;
         for model in models {
             let base = model["baseUrl"].as_str()?;
-            if operation_endpoints(base, "run", true).ok()?.1 != expected {
+            if operation_endpoints(base, Api::WorkersAiSystemOne, true)
+                .ok()?
+                .1
+                != expected
+            {
                 return None;
             }
         }
@@ -728,7 +792,15 @@ pub(super) fn valid_cloudflare_account(account: &str) -> bool {
         && account.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
-fn operation_endpoints(value: &str, route: &str, cloudflare: bool) -> Result<(Url, Url)> {
+fn operation_endpoints(value: &str, api: Api, cloudflare: bool) -> Result<(Url, Url)> {
+    let route = api.route();
+    if matches!(api, Api::LlamaCppClassifier) {
+        let value = value.trim_end_matches('/');
+        let root = value.strip_suffix("/v1").unwrap_or(value);
+        let (base, _) = endpoints(root, route)?;
+        let endpoint = llama_cpp::endpoint(&base, route);
+        return Ok((base, endpoint));
+    }
     const PLACEHOLDER: &str = "{CLOUDFLARE_ACCOUNT_ID}";
     if value.contains(PLACEHOLDER) {
         if !cloudflare || value.matches(PLACEHOLDER).count() != 1 {
@@ -757,6 +829,28 @@ async fn resolve_header(value: &str, env: Option<&Map<String, Value>>) -> Option
 }
 
 impl Entry {
+    fn allows_keyless(&self, keys: &Keys) -> bool {
+        self.llama_root.is_some()
+            || matches!(self.api, Api::LlamaCppClassifier)
+            || matches!(
+                self.router_credential(keys, |name| std::env::var(name).ok()),
+                Some(None)
+            )
+    }
+
+    fn router_credential(
+        &self,
+        keys: &Keys,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Option<Option<Credential>> {
+        if self.provider != "llama.cpp" {
+            return None;
+        }
+        let (root, key) = llama_discovery::configured_server(keys, env)?;
+        let (_, endpoint) = llama_discovery::classifier_endpoints(&root, self.api)?;
+        (endpoint == self.endpoint).then_some(key)
+    }
+
     fn is_official(&self) -> bool {
         self.cloudflare_default
             || (self.provider == "cloudflare-workers-ai"
@@ -830,6 +924,12 @@ impl Entry {
         keys: &Keys,
         env: impl Fn(&str) -> Option<String>,
     ) -> Option<Credential> {
+        if let Some(root) = &self.llama_root {
+            return match llama_discovery::configured_server(keys, env) {
+                Some((configured, key)) if configured == *root => key,
+                _ => Some(Credential::Invalid),
+            };
+        }
         let official = self.is_official();
         if let Some(key) =
             keys.operation_credential(&self.provider, self.endpoint.as_str(), official)
@@ -844,6 +944,9 @@ impl Entry {
                 Some(credential @ Credential::Command(_)) => credential,
                 _ => Credential::Invalid,
             });
+        }
+        if let Some(key) = self.router_credential(keys, &env) {
+            return key;
         }
         {
             let key = match (self.provider.as_str(), official) {
@@ -917,6 +1020,36 @@ impl Operations {
                 Error::Config("could not initialize model operation HTTP client".into())
             })?,
         })
+    }
+
+    pub async fn discover_llama(&mut self) {
+        if self.args.offline {
+            return;
+        }
+        let keys = Keys::load_async().await.unwrap_or_default();
+        let Some((root, key)) =
+            llama_discovery::configured_server(&keys, |name| std::env::var(name).ok())
+        else {
+            return;
+        };
+        let key = match key {
+            Some(key) => match tokio::time::timeout(Duration::from_secs(2), key.resolve()).await {
+                Ok(Ok(secret)) => Some(secret),
+                _ => return,
+            },
+            None => None,
+        };
+        let discovered = llama_discovery::discover(&self.client, &root, key.as_deref()).await;
+        let configured = &mut self.args.model_profiles.operations_mut().0;
+        for entry in discovered {
+            if !configured.iter().any(|model| {
+                model.provider == entry.provider
+                    && model.api.kind() == entry.api.kind()
+                    && model.model.id == entry.model.id
+            }) {
+                configured.push(entry);
+            }
+        }
     }
 }
 
@@ -1192,36 +1325,18 @@ impl Operations {
         let entry = &resolved;
         initialize_result(entry, data);
         let (payload, image_opt_in) = match entry.api {
+            Api::LlamaCppClassifier => {
+                let questions = llama_cpp::prepare(context)?;
+                let headers = self.request_headers(entry, keys).await?;
+                data["answers"] =
+                    llama_cpp::classify(&self.client, entry, &headers, questions).await?;
+                return Ok(());
+            }
             Api::SystemOne | Api::WorkersAiSystemOne => classifier_payload(entry, context)?,
             Api::OpenAiDecisions => (decisions::payload(entry, context)?, false),
             Api::OpenRouterImages => (image_payload(entry, context)?, false),
         };
-        let credential = entry
-            .credential(keys)
-            .ok_or_else(|| Error::Config(format!("No API key for provider: {}", entry.provider)))?;
-        let key = credential.resolve().await?;
-        let credential_env = keys.operation_environment(
-            &entry.provider,
-            entry.endpoint.as_str(),
-            entry.is_official(),
-        );
-        let mut headers = HeaderMap::new();
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {key}"))
-            .map_err(|_| Error::Config("invalid model operation credential".into()))?;
-        authorization.set_sensitive(true);
-        headers.insert(reqwest::header::AUTHORIZATION, authorization);
-        for (name, value) in &entry.model.headers {
-            let value = resolve_header(value, credential_env).await.ok_or_else(|| {
-                Error::Config(format!("could not resolve operation model header {name}"))
-            })?;
-            let mut value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::Config(format!("invalid operation model header {name}")))?;
-            value.set_sensitive(true);
-            headers.insert(
-                HeaderName::from_bytes(name.as_bytes()).expect("validated header name"),
-                value,
-            );
-        }
+        let mut headers = self.request_headers(entry, keys).await?;
         // Pi adds the automatic classifier image opt-in as request options,
         // after provider and model headers have been combined.
         if image_opt_in {
@@ -1230,17 +1345,14 @@ impl Operations {
                 HeaderValue::from_static("true"),
             );
         }
-        let request = self
-            .client
-            .post(entry.endpoint.clone())
-            .headers(headers)
-            .header("content-type", "application/json")
-            .body(serde_json::to_vec(&payload)?)
-            .build()
-            .map_err(|_| Error::Config("invalid model operation request".into()))?;
-        let body = send_model_request(&self.client, request, entry.api).await?;
-        let body: Value = serde_json::from_slice(&body)
-            .map_err(|_| Error::Model("model operation response is not valid JSON".into()))?;
+        let body = send_model_json(
+            &self.client,
+            entry.endpoint.clone(),
+            &headers,
+            &payload,
+            entry.api,
+        )
+        .await?;
         let result_body = if matches!(entry.api, Api::WorkersAiSystemOne) {
             classifier_response(&body)?
         } else {
@@ -1268,14 +1380,155 @@ impl Operations {
                     .expect("image operation output is initialized as an array");
                 image_output(&body, output)?;
             }
+            Api::LlamaCppClassifier => unreachable!("handled before the single request"),
         }
         Ok(())
     }
+
+    async fn request_headers(&self, entry: &Entry, keys: &Keys) -> Result<HeaderMap> {
+        let credential_env = keys.operation_environment(
+            &entry.provider,
+            entry.endpoint.as_str(),
+            entry.is_official(),
+        );
+        let mut headers = HeaderMap::new();
+        if let Some(credential) = entry.credential(keys) {
+            let key = credential.resolve().await?;
+            let mut authorization = HeaderValue::from_str(&format!("Bearer {key}"))
+                .map_err(|_| Error::Config("invalid model operation credential".into()))?;
+            authorization.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, authorization);
+        } else if !entry.allows_keyless(keys) {
+            return Err(Error::Config(format!(
+                "No API key for provider: {}",
+                entry.provider
+            )));
+        }
+        for (name, value) in &entry.model.headers {
+            let value = resolve_header(value, credential_env).await.ok_or_else(|| {
+                Error::Config(format!("could not resolve operation model header {name}"))
+            })?;
+            let mut value = HeaderValue::from_str(&value)
+                .map_err(|_| Error::Config(format!("invalid operation model header {name}")))?;
+            value.set_sensitive(true);
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("validated header name"),
+                value,
+            );
+        }
+        Ok(headers)
+    }
+}
+
+async fn send_model_json(
+    client: &reqwest::Client,
+    endpoint: Url,
+    headers: &HeaderMap,
+    payload: &Value,
+    api: Api,
+) -> Result<Value> {
+    let request = client
+        .post(endpoint)
+        .headers(headers.clone())
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(payload)?)
+        .build()
+        .map_err(|_| Error::Config("invalid model operation request".into()))?;
+    let body = send_model_request(client, request, api).await?;
+    serde_json::from_slice(&body)
+        .map_err(|_| Error::Model("model operation response is not valid JSON".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_llama_classifiers_inherit_keys_only_for_the_matching_router() {
+        let providers = json!({
+            "llama.cpp": {
+                "models": [
+                    {"id":"chat","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://router.example/prefix/v1/v1"},
+                    {"id":"decisions","type":"classifier","api":"typesafe-system-one",
+                     "baseUrl":"https://router.example/prefix/v1/v1"},
+                    {"id":"other-path","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://router.example/prefix/v1"},
+                    {"id":"other-host","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://other.example/prefix/v1/v1"}
+                ]
+            }
+        });
+        let catalogue = Catalogue::parse(providers.as_object().unwrap()).unwrap();
+        let keys = Keys::default();
+        let env = |name: &str| match name {
+            "LLAMA_BASE_URL" => Some("https://router.example/prefix/v1/v1/".into()),
+            "LLAMA_API_KEY" => Some("router-key".into()),
+            _ => None,
+        };
+        for entry in catalogue
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "llama.cpp")
+        {
+            let credential = entry.credential_with_env(&keys, env);
+            match entry.model.id.as_str() {
+                "chat" | "decisions" => {
+                    assert_eq!(credential.unwrap().literal(), Some("router-key"));
+                }
+                "other-path" | "other-host" => assert!(credential.is_none()),
+                id => panic!("unexpected fixture model {id}"),
+            }
+        }
+        assert_eq!(
+            catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == "llama.cpp")
+                .count(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_system_one_classifier_can_use_only_the_matching_keyless_router() {
+        use clap::Parser;
+
+        let providers = json!({"llama.cpp":{"models":[
+            {"id":"decision","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://router.example/prefix/v1"},
+            {"id":"other-path","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://router.example/other/v1"},
+            {"id":"other-host","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://other.example/prefix/v1"}
+        ]}});
+        let catalogue = Catalogue::parse(providers.as_object().unwrap()).unwrap();
+        let keys = Keys::parse(&json!({"llama.cpp":{
+            "type":"api_key","env":{"LLAMA_BASE_URL":"https://router.example/prefix"}
+        }}));
+        let available = catalogue
+            .list(Kind::Classifier, Some("llama.cpp"), None, true, &keys)
+            .await;
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0]["id"], "decision");
+        let operations = Operations::new(&Cli::parse_from(["pi"])).unwrap();
+        for entry in catalogue
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "llama.cpp")
+        {
+            let headers = operations.request_headers(entry, &keys).await;
+            if entry.model.id == "decision" {
+                assert!(
+                    !headers
+                        .unwrap()
+                        .contains_key(reqwest::header::AUTHORIZATION)
+                );
+            } else {
+                assert!(headers.is_err());
+            }
+        }
+    }
 
     #[tokio::test]
     async fn unfiltered_catalogue_does_not_read_auth_file() {
@@ -1776,7 +2029,10 @@ mod tests {
             "https://api.cloudflare.com/client/v4/accounts/x{CLOUDFLARE_ACCOUNT_ID}/ai",
             "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/other",
         ] {
-            assert!(operation_endpoints(url, "run", true).is_err(), "{url}");
+            assert!(
+                operation_endpoints(url, Api::WorkersAiSystemOne, true).is_err(),
+                "{url}"
+            );
         }
         for url in [
             "https://evil.example/client/v4/accounts/explicit123/ai",
@@ -2976,6 +3232,12 @@ mod tests {
                 "over 60 seconds",
             ),
             (
+                Api::SystemOne,
+                vec![(429, "retry-after: Mon Nov  6 08:51:00 2095\r\n")],
+                false,
+                "over 60 seconds",
+            ),
+            (
                 Api::OpenRouterImages,
                 vec![(429, "retry-after-ms: 0\r\n")],
                 false,
@@ -3088,6 +3350,15 @@ mod tests {
             classifier_retry_delay(&headers, 0, now).unwrap(),
             Duration::from_millis(1500)
         );
+        headers.insert("retry-after", HeaderValue::from_static("61"));
+        assert!(classifier_retry_delay(&headers, 0, now).is_err());
+        for value in ["1e308", "-1e308"] {
+            headers.insert("retry-after", HeaderValue::from_static(value));
+            assert!(
+                (Duration::from_millis(375)..=Duration::from_millis(500))
+                    .contains(&classifier_retry_delay(&headers, 0, now).unwrap())
+            );
+        }
         assert_eq!(retry_number("1e+seconds"), Some(1.0));
         assert_eq!(retry_number(".25e2 seconds"), Some(25.0));
         assert_eq!(retry_number("Wed, 21 Oct 2015 07:28:05 GMT"), None);
@@ -3107,6 +3378,35 @@ mod tests {
             HeaderValue::from_static("Sunday, 06-Nov-94 08:51:00 GMT"),
         );
         assert!(classifier_retry_delay(&headers, 0, old_now).is_err());
+        for zone in ["GMT", "UTC"] {
+            headers.insert(
+                "retry-after",
+                HeaderValue::from_str(&format!("Mon Nov  6 08:49:37 1994 {zone}")).unwrap(),
+            );
+            assert_eq!(
+                classifier_retry_delay(&headers, 0, old_now).unwrap(),
+                Duration::from_secs(5)
+            );
+        }
+        use chrono::TimeZone;
+        let local_now = chrono::Local
+            .with_ymd_and_hms(1994, 11, 6, 8, 49, 32)
+            .earliest()
+            .unwrap()
+            .to_utc();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sun Nov  6 08:49:37 1994"),
+        );
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, local_now).unwrap(),
+            Duration::from_secs(5)
+        );
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sun Nov  6 08:51:00 1994"),
+        );
+        assert!(classifier_retry_delay(&headers, 0, local_now).is_err());
         assert_eq!(
             classifier_retry_date("Sunday, 06-Nov-50 08:49:37 GMT")
                 .unwrap()
@@ -3119,6 +3419,38 @@ mod tests {
                 .to_rfc3339(),
             "2049-11-06T08:49:37+00:00"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifier_retry_asctime_follows_local_clock_changes() {
+        const CHILD: &str = "PI_RS_CLASSIFIER_RETRY_CLOCK_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "operation_models::tests::classifier_retry_asctime_follows_local_clock_changes",
+                ])
+                .env(CHILD, "1")
+                .env("TZ", "America/New_York")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        for (header, expected) in [
+            ("Sun Mar 10 02:00:05 2024", "2024-03-10T07:00:05+00:00"),
+            ("Sun Nov  3 01:00:05 2024", "2024-11-03T05:00:05+00:00"),
+        ] {
+            assert_eq!(
+                classifier_retry_date(header).unwrap().to_rfc3339(),
+                expected
+            );
+        }
     }
 
     #[tokio::test]
