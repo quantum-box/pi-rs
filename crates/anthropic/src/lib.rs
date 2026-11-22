@@ -3890,36 +3890,36 @@ mod tests {
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let worker =
-            std::thread::spawn(move || {
-                for (path, status) in [
-                    ("/v1/models?limit=100", "401 Unauthorized"),
-                    ("/v1/models/claude", "401 Unauthorized"),
-                    ("/v1/models?limit=100", "403 Forbidden"),
-                ] {
-                    let (mut socket, _) = listener.accept().unwrap();
-                    socket
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .unwrap();
-                    let mut reader = BufReader::new(&mut socket);
-                    let mut first = String::new();
-                    reader.read_line(&mut first).unwrap();
-                    assert_eq!(first.trim_end(), format!("GET {path} HTTP/1.1"));
-                    let headers: Vec<_> = reader
-                        .lines()
-                        .map(|line| line.unwrap())
-                        .take_while(|line| !line.is_empty())
-                        .collect();
-                    assert!(headers.iter().any(|line| {
-                        line.eq_ignore_ascii_case("authorization: Bearer fixture-token")
-                    }));
-                    write!(
-                        socket,
-                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    )
+        let exchanges = [
+            ("/v1/models?limit=100", "401 Unauthorized"),
+            ("/v1/models/claude", "401 Unauthorized"),
+            ("/v1/models?limit=100", "403 Forbidden"),
+        ];
+        let worker = std::thread::spawn(move || {
+            for (path, status) in exchanges {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
-                }
-            });
+                let mut reader = BufReader::new(&mut socket);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                assert_eq!(first.trim_end(), format!("GET {path} HTTP/1.1"));
+                let headers: Vec<_> = reader
+                    .lines()
+                    .map(|line| line.unwrap())
+                    .take_while(|line| !line.is_empty())
+                    .collect();
+                assert!(headers.iter().any(|line| {
+                    line.eq_ignore_ascii_case("authorization: Bearer fixture-token")
+                }));
+                let status_line = format!("HTTP/1.1 {status}\r\n");
+                socket.write_all(status_line.as_bytes()).unwrap();
+                socket
+                    .write_all(b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            }
+        });
         let rejected = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&rejected);
         let mut client =
