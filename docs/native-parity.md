@@ -935,7 +935,8 @@ Authorization header or provider authentication. An explicit
 
 MCP server `timeout` accepts fractional seconds. Native request deadlines
 range from 1 ms to one hour. A legacy explicit zero keeps the one-second
-timeout, and an omitted timeout defaults to 60 seconds.
+timeout, and an omitted timeout defaults to 60 seconds. Logout accepts the
+same fractional settings when it selects an HTTP server.
 
 `--timeout SECONDS` bounds discovery, sign-in, and preparation to save
 (default 300 seconds). Before publishing credentials, login locks the

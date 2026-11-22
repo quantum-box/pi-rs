@@ -388,7 +388,7 @@ fn mcp_logout_local_targets_trusted_project_credentials() {
     assert!(!global.exists());
     std::fs::write(
         project.join("mcp.json"),
-        json!({"mcpServers":{"service":{"url":global_url,"timeout":0}}}).to_string(),
+        json!({"mcpServers":{"service":{"url":global_url,"timeout":0.25}}}).to_string(),
     )
     .unwrap();
     std::fs::write(&global, "global").unwrap();
@@ -400,6 +400,19 @@ fn mcp_logout_local_targets_trusted_project_credentials() {
     );
     assert!(!global.exists());
     std::fs::write(&global, "global").unwrap();
+    for invalid in [json!(null), json!(-0.25), json!("0.25")] {
+        std::fs::write(
+            project.join("mcp.json"),
+            json!({"mcpServers":{"service":{"url":global_url,"timeout":invalid}}}).to_string(),
+        )
+        .unwrap();
+        assert!(
+            !run(&["--trust", "mcp", "logout", "service", "--local"])
+                .status
+                .success()
+        );
+        assert!(global.exists());
+    }
     std::fs::write(home.join("mcp.json"), json!({"mcpServers":{"service":{"url":global_url,"headers":{"authorization":"Bearer static"}}}}).to_string()).unwrap();
     assert!(
         !run(&["--no-trust", "mcp", "logout", "service"])
