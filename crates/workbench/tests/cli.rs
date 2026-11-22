@@ -1529,6 +1529,9 @@ fn new_rpc_session_uses_latest_worker_queue_fallback() {
                 "--no-session",
                 "--mode",
                 "rpc",
+                // Switch providers below to start a new worker with the updated queue settings.
+                "--provider",
+                "ollama",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
