@@ -4215,7 +4215,7 @@ mod tests {
                 provider: "anthropic".into(),
                 model: "fixture".into(),
             },
-            blocks: vec![text_block("finished").unwrap()],
+            blocks: vec![text_block("finished".into()).unwrap()],
         };
         reply.record_anthropic_effort("low");
         let request = ModelRequest {
