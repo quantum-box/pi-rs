@@ -2110,7 +2110,9 @@ when larger output is omitted, and a `full_output_path` for recovery. UTF-8
 boundaries remain intact. Nonzero exits continue to return structured status to
 scripts and errors to direct callers.
 
-Fractional explicit timeouts retain output already received. Shell execution
+Unrestricted local Bash and PowerShell use Pi's separate diagnostics for
+nonpositive timeouts and timeouts above 2,147,483.647 seconds. Fractional
+explicit timeouts retain output already received. Shell execution
 has no separate default timeout, while the caller's configured tool deadline
 continues to apply. A shell that exits while descendants hold its output pipes
 returns after both pipes close or 100 ms without further output. Output from

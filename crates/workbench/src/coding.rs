@@ -1860,7 +1860,7 @@ impl RemoteShellTool {
             };
         }
         let started = std::time::Instant::now();
-        let timeout = shell_timeout(args)?;
+        let timeout = shell_timeout(args, false)?;
         let context = self.tool.shell.spawn_context(
             &self.tool.root,
             true,
@@ -1981,7 +1981,9 @@ impl RemoteShellTool {
 #[async_trait::async_trait]
 impl Tool for RemoteShellTool {
     fn spec(&self) -> ToolSpec {
-        self.tool.spec()
+        let mut spec = self.tool.spec();
+        spec.parameters["properties"]["timeout"] = shell_timeout_schema(false);
+        spec
     }
     fn constrained_sampling(&self) -> Option<ToolConstraint> {
         self.tool.constrained_sampling()
@@ -2140,7 +2142,7 @@ impl Tool for CodingTool {
                     "bash"
                 },
                 "Run a shell command in the workspace. Returns the last 2000 lines or 50 KiB and saves complete output to a temporary file when truncated.",
-                json!({"command":{"type":"string"},"timeout":{"type":"number","exclusiveMinimum":0,"maximum":2147483.647}}),
+                json!({"command":{"type":"string"},"timeout":shell_timeout_schema(self.unrestricted)}),
                 vec!["command"],
             ),
             Kind::Grep => (
@@ -3578,10 +3580,15 @@ impl CodingTool {
             .shell_stream(args, cancellation, &mut |_| {}, false, host)
             .await?;
         if result.timed_out {
-            let status = format!(
-                "Command timed out after {} seconds",
-                shell_timeout(args)?.expect("elapsed timeout").as_secs_f64()
-            );
+            let seconds = if self.unrestricted {
+                js_number(args["timeout"].as_f64().expect("validated timeout"))
+            } else {
+                shell_timeout(args, false)?
+                    .expect("elapsed timeout")
+                    .as_secs_f64()
+                    .to_string()
+            };
+            let status = format!("Command timed out after {seconds} seconds");
             return Err(Error::Config(shell_status(&result.output.display, &status)));
         }
         if result.cancelled {
@@ -3601,7 +3608,7 @@ impl CodingTool {
         host: Option<Arc<dyn ToolHost>>,
     ) -> Result<ShellResult> {
         let started = std::time::Instant::now();
-        let timeout = shell_timeout(args)?;
+        let timeout = shell_timeout(args, self.unrestricted && !sanitize_user_output)?;
         let crate::shell_config::Launch {
             mut command,
             input,
@@ -4145,18 +4152,46 @@ fn shell_status(output: &str, status: &str) -> String {
     }
 }
 
-fn shell_timeout(args: &Value) -> Result<Option<Duration>> {
+const MAX_SHELL_TIMEOUT_MILLIS: f64 = 2_147_483_647.0;
+const MAX_SHELL_TIMEOUT_SECONDS: f64 = MAX_SHELL_TIMEOUT_MILLIS / 1_000.0;
+
+fn shell_timeout_schema(pi_diagnostics: bool) -> Value {
+    if pi_diagnostics {
+        // Pi's tool code distinguishes nonpositive values from excessive timeouts.
+        json!({"type":"number"})
+    } else {
+        json!({"type":"number","exclusiveMinimum":0,"maximum":MAX_SHELL_TIMEOUT_SECONDS})
+    }
+}
+
+fn shell_timeout(args: &Value, pi_diagnostics: bool) -> Result<Option<Duration>> {
     let Some(value) = args.get("timeout") else {
         return Ok(None);
     };
-    let seconds = value
+    let native_error = || {
+        Error::Config(
+            "timeout must be a positive number no greater than 2147483.647 seconds".into(),
+        )
+    };
+    let Some(seconds) = value
         .as_f64()
-        .filter(|seconds| seconds.is_finite() && *seconds > 0.0 && *seconds <= 2_147_483.647)
-        .ok_or_else(|| {
-            Error::Config(
-                "timeout must be a positive number no greater than 2147483.647 seconds".into(),
-            )
-        })?;
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+    else {
+        return Err(if pi_diagnostics {
+            Error::Config("Invalid timeout: must be a finite number of seconds".into())
+        } else {
+            native_error()
+        });
+    };
+    if pi_diagnostics {
+        if seconds * 1_000.0 > MAX_SHELL_TIMEOUT_MILLIS {
+            return Err(Error::Config(format!(
+                "Invalid timeout: maximum is {MAX_SHELL_TIMEOUT_SECONDS} seconds"
+            )));
+        }
+    } else if seconds > MAX_SHELL_TIMEOUT_SECONDS {
+        return Err(native_error());
+    }
     Ok(Some(Duration::from_secs_f64(seconds)))
 }
 
@@ -7882,9 +7917,40 @@ mod tests {
         };
         assert!(error.contains("before"));
         assert!(error.contains(&format!("timed out after {timeout}")));
-        assert_eq!(shell_timeout(&json!({})).unwrap(), None);
+        assert_eq!(shell_timeout(&json!({}), false).unwrap(), None);
         for value in [json!(0), json!(-1), json!(null), json!("1"), json!(2147484)] {
-            assert!(shell_timeout(&json!({"timeout":value})).is_err());
+            assert!(shell_timeout(&json!({"timeout":value}), false).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn unrestricted_local_shell_reports_pi_numeric_timeout_diagnostics() {
+        let root = tempfile::tempdir().unwrap();
+        for kind in [Kind::Bash, Kind::PowerShell] {
+            let tool = CodingTool {
+                root: root.path().to_path_buf(),
+                unrestricted: true,
+                shell: ShellConfig::default(),
+                kind,
+            };
+            let validator = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+            for (value, expected) in [
+                (0.0, "Invalid timeout: must be a finite number of seconds"),
+                (-0.5, "Invalid timeout: must be a finite number of seconds"),
+                (
+                    2147483.648,
+                    "Invalid timeout: maximum is 2147483.647 seconds",
+                ),
+                (1e100, "Invalid timeout: maximum is 2147483.647 seconds"),
+            ] {
+                let args = json!({"command":"exit 99", "timeout":value});
+                assert!(validator.is_valid(&args));
+                let outcome = tool.bash(&args, &pi_rs::CancellationToken::new()).await;
+                assert!(
+                    matches!(&outcome, Outcome::Failed(actual) if actual == expected),
+                    "{outcome:?}"
+                );
+            }
         }
     }
 
