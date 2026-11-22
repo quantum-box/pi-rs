@@ -375,6 +375,149 @@ fn selected_assume_role_profile_uses_proxy_for_sts_and_bedrock() {
 }
 
 #[test]
+fn sso_profile_credentials_and_refresh_use_https_proxy() {
+    for (profile_source, refresh) in [
+        ("environment", false),
+        ("workbench", false),
+        ("workbench", true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("pi");
+        let config = root.path().join("config");
+        let cache = root.path().join(".aws/sso/cache");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut profile = String::from(
+            "[profile selected]\nregion=us-east-1\nsso_account_id=123456789012\nsso_role_name=Example\n",
+        );
+        let mut token = json!({
+            "startUrl":"https://example.awsapps.com/start",
+            "region":"us-east-1",
+            "accessToken":"fixture-token",
+            "expiresAt":"2099-01-01T00:00:00Z"
+        });
+        // Cache names are SHA-1 hashes of the session name (modern) or start URL (legacy).
+        let cache_name = if refresh {
+            profile.push_str("sso_session=fixture\n[sso-session fixture]\n");
+            token["expiresAt"] = json!("2000-01-01T00:00:00Z");
+            token["registrationExpiresAt"] = json!("2099-01-01T00:00:00Z");
+            token["refreshToken"] = json!("fixture-refresh-token");
+            token["clientId"] = json!("fixture-client-id");
+            token["clientSecret"] = json!("fixture-client-secret");
+            "51cff3c1f0bc59f6187e7040cc12a4e9b1eca7aa.json"
+        } else {
+            "e8be5486177c5b5392bd9aa76563515b29358e6e.json"
+        };
+        profile.push_str("sso_region=us-east-1\nsso_start_url=https://example.awsapps.com/start\n");
+        std::fs::write(&config, profile).unwrap();
+        std::fs::write(cache.join(cache_name), token.to_string()).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            json!({"retry":{"enabled":false}}).to_string(),
+        )
+        .unwrap();
+
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        // Never contact AWS, even if the SDK bypasses the proxy.
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = target.local_addr().unwrap();
+        drop(target);
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, request) = accept_proxy_request(proxy);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            write!(
+                socket,
+                "HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+            request
+        });
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("HOME", root.path())
+            .env("USERPROFILE", root.path())
+            .env("PI_RS_HOME", &home)
+            .env("AWS_CONFIG_FILE", config)
+            .env(
+                "AWS_SHARED_CREDENTIALS_FILE",
+                root.path().join("credentials"),
+            )
+            .env("AWS_ENDPOINT_URL", "https://127.0.0.1:1")
+            .env("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "https://127.0.0.1:1")
+            .env("AWS_ENDPOINT_URL_SSO", "https://127.0.0.1:1")
+            .env("AWS_ENDPOINT_URL_SSO_OIDC", "https://127.0.0.1:1")
+            .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("AWS_MAX_ATTEMPTS", "1")
+            .env("HTTPS_PROXY", proxy_url)
+            .env_remove("https_proxy")
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .env_remove("AWS_ACCESS_KEY_ID")
+            .env_remove("AWS_SECRET_ACCESS_KEY")
+            .env_remove("AWS_SESSION_TOKEN")
+            .env_remove("AWS_WEB_IDENTITY_TOKEN_FILE")
+            .env_remove("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+            .env_remove("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+            .env_remove("AWS_BEARER_TOKEN_BEDROCK")
+            .env_remove("AWS_BEDROCK_SKIP_AUTH")
+            .env_remove("AWS_PROFILE");
+        let endpoint = if refresh {
+            "AWS_ENDPOINT_URL_SSO_OIDC"
+        } else {
+            "AWS_ENDPOINT_URL_SSO"
+        };
+        command.env(endpoint, format!("https://{target_addr}"));
+        if profile_source == "workbench" {
+            std::fs::write(
+                home.join("auth.json"),
+                json!({"amazon-bedrock":{"type":"api_key","env":{"AWS_PROFILE":"selected"}}})
+                    .to_string(),
+            )
+            .unwrap();
+        } else {
+            command.env("AWS_PROFILE", "selected");
+        }
+        let output = command
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--no-tools",
+                "--offline",
+                "--provider",
+                "amazon-bedrock",
+                "--model",
+                "amazon.nova-2-lite-v1:0",
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        let request = server.join().unwrap_or_else(|_| {
+            panic!(
+                "{profile_source} profile did not use the proxy for {endpoint}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        assert_eq!(
+            request.trim_end(),
+            format!("CONNECT {target_addr} HTTP/1.1")
+        );
+        assert!(!output.status.success());
+    }
+}
+
+#[test]
 fn instance_metadata_bypasses_proxy_but_bedrock_uses_it() {
     for configured_in_profile in [false, true] {
         let root = tempfile::tempdir().unwrap();
