@@ -6343,8 +6343,9 @@ conservative estimate. Other token-estimator differences remain open.
 
 `--list-models` searches provider and model IDs with Pi's tokenized fuzzy
 matching, including the ASCII letter/number swap (for example `p2` matches
-`nova-2p`). Display names alone do not match. The native JSON listing remains
-available; model scope and picker selection retain their existing behavior.
+`nova-2p`). Display names alone do not match. The text table sorts provider
+names and model IDs using locale collation and uses Pi's UTF-16 padding and
+token-count rounding. The native JSON listing remains available.
 
 ### Messages quota retry classification
 
