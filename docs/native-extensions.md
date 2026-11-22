@@ -83,6 +83,25 @@ errors remain failures because their origin is unknown. The standard extension
 server advertises the capability and propagates typed errors from extensions it
 hosts, including executable extensions.
 
+## Render tool calls and results in an SDK host
+
+A Rust tool can implement `Tool::tool_renderers` to provide separate call
+and result callbacks. An extension can wrap or replace renderers for any
+tool by implementing `Extension::resolve_tool_renderers`. Call `next()`
+to keep the rest of the chain, which follows extension registration order
+and ends with the registered tool's callbacks and the embedding
+application's defaults for unspecified sections. Return `None` to stop resolution and use the host's ordinary presentation.
+
+A Rust host can snapshot the chain with `AgentSession::tool_renderers` and
+resolve it before rendering. Supply a `ToolRenderContext` with the current
+arguments, result and view state. Callbacks return semantic theme roles
+and styled rows for the host to lay out. The call renderer runs before
+the result renderer. Each has its own deadline and fallback. The host also owns
+the tool panel framing and image display. These callbacks do not execute
+tools or change their recorded results. This SDK API is in-process.
+Terminal integration and executable renderer registration are tracked
+separately.
+
 ## Customize the header and footer
 
 Extensions can send `UiRequest::SetHeader` and `UiRequest::SetFooter` through
@@ -247,6 +266,13 @@ The host validates the full list before writing its plan or any of its
 entries. A continuation runs within the original run's request and token
 limits. Cancelling during delivery of this callback preserves valid entries
 and suppresses continuation.
+
+Use `handles_turn_end_boundary` and `turn_end_boundary` for structural
+changes to the completed turn. The callback sees the assistant record and
+tool-result IDs before observational `turn_end` delivery. It uses the same
+draft types and ordered validation as settlement. Continuing shares the
+existing turn loop with tool results and queued input, so a natural next
+provider request also satisfies the decision.
 
 Executable extensions negotiate the callback capability in their description.
 `AgentSession::resume` recovers a saved plan under the original run ID,

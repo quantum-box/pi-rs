@@ -26,6 +26,7 @@ type ReasoningObserver = Arc<dyn Fn(&str) + Send + Sync>;
 #[derive(Clone)]
 pub struct Ollama {
     client: Client,
+    provider_retry: pi_rs_core::ProviderRetry,
     http_proxies: Vec<reqwest::Proxy>,
     endpoint: Url,
     provider: String,
@@ -231,6 +232,7 @@ impl Ollama {
         Ok(Self {
             client,
             http_proxies: Vec::new(),
+            provider_retry: pi_rs_core::ProviderRetry::default(),
             endpoint,
             provider: "ollama".into(),
             token,
@@ -289,6 +291,12 @@ impl Ollama {
     }
 
     /// Configure the per-read deadline and explicit HTTP proxies.
+    /// Configure provider-level retries before a response stream starts.
+    pub fn with_provider_retry(mut self, policy: pi_rs_core::ProviderRetry) -> Self {
+        self.provider_retry = policy;
+        self
+    }
+
     pub fn with_http_options(
         mut self,
         timeout: Option<Duration>,
@@ -878,6 +886,13 @@ fn running_context_window(value: &Value, model: &str) -> Option<u32> {
 
 #[async_trait::async_trait]
 impl Model for Ollama {
+    fn supports_mid_conversation_system_messages(&self, _model: &str) -> bool {
+        self.mistral.is_none()
+            && self
+                .compatibility
+                .supports_mid_conversation_system_messages()
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,
@@ -1299,6 +1314,11 @@ impl Ollama {
         } else {
             request
         };
+        let retry = if mistral {
+            pi_rs_core::ProviderRetry::default()
+        } else {
+            self.provider_retry
+        };
         let builder = self.authenticate(request).json(&body);
         let monitor_loading = self.progress.is_some()
             && !requested_model.ends_with(":cloud")
@@ -1307,23 +1327,39 @@ impl Ollama {
                 self.endpoint.host_str(),
                 Some("localhost" | "127.0.0.1" | "[::1]")
             );
-        let response = builder.send();
-        tokio::pin!(response);
-        let mut poll = tokio::time::interval(Duration::from_secs(1));
-        let response = loop {
-            tokio::select! {
-                result = &mut response => break result.map_err(|error| Error::RetryableModel(if error.is_timeout() && !error.is_connect() { "HTTP idle timeout" } else { "HTTP connection failed" }.into()))?,
-                _ = poll.tick(), if monitor_loading => {
-                    if let Some(loaded) = self.model_loaded(&requested_model).await {
-                        report_progress(&self.progress, &mut last_progress, if loaded {
-                            ModelProgress::WaitingForModel
-                        } else {
-                            ModelProgress::LoadingModel
-                        });
+        let loading =
+            tokio::sync::Mutex::new((tokio::time::interval(Duration::from_secs(1)), last_progress));
+        let loading_state = &loading;
+        let model = &requested_model;
+        let response = retry.send(
+            || {
+                let builder = builder.try_clone().ok_or_else(|| {
+                    Error::Config("Chat Completions request cannot be replayed".into())
+                });
+                async move {
+                let response = builder?.send();
+                tokio::pin!(response);
+                let mut loading = loading_state.lock().await;
+                let (poll, last_progress) = &mut *loading;
+                loop {
+                    tokio::select! {
+                        result = &mut response => break result.map_err(|error| Error::RetryableModel(if error.is_timeout() && !error.is_connect() { "HTTP idle timeout" } else { "HTTP connection failed" }.into())),
+                        _ = poll.tick(), if monitor_loading => {
+                            if let Some(loaded) = self.model_loaded(model).await {
+                                report_progress(&self.progress, last_progress, if loaded {
+                                    ModelProgress::WaitingForModel
+                                } else {
+                                    ModelProgress::LoadingModel
+                                });
+                            }
+                        }
                     }
                 }
-            }
-        };
+                }
+            },
+            |response| (response.status().as_u16(), response.headers()),
+        ).await?;
+        let (mut poll, mut last_progress) = loading.into_inner();
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),

@@ -2,7 +2,6 @@
 use pi_rs::Result;
 use pi_rs::ollama::ModelDetails;
 use serde_json::{Value, json};
-use unicode_width::UnicodeWidthStr;
 
 use super::{Cli, OutputMode, model_selection, output};
 
@@ -17,7 +16,21 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
             .await
             .unwrap_or_default()
     };
-    catalogs.sort_by(|left, right| left.provider.id().cmp(right.provider.id()));
+    let json_mode = args.mode == Some(OutputMode::Json);
+    let collator = if json_mode {
+        None
+    } else {
+        let locale = super::locale::select(|key| std::env::var(key).ok());
+        Some(super::locale::collator(&locale).map_err(|error| {
+            pi_rs::Error::Config(format!("Cannot initialize model collation: {error}"))
+        })?)
+    };
+    let compare = |left: &str, right: &str| {
+        collator
+            .as_ref()
+            .map_or_else(|| left.cmp(right), |collator| collator.compare(left, right))
+    };
+    catalogs.sort_by(|left, right| compare(left.provider.id(), right.provider.id()));
     let catalog_empty = catalogs.iter().all(|catalog| catalog.models.is_empty());
     let mut rows = Vec::new();
     for catalog in catalogs {
@@ -28,11 +41,11 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
             .filter(|model| list_matches(search, provider, model))
             .cloned()
             .collect();
-        models.sort();
+        models.sort_by(|left, right| compare(left, right));
         let mut details = catalog.details(&models, &args.model_profiles).await;
         for model in models {
             let detail = details.remove(&model);
-            if args.mode == Some(OutputMode::Json) {
+            if json_mode {
                 let mut row = json!({
                     "type":"model", "model":model, "name":catalog.display_name(&model),
                     "provider":provider,
@@ -46,7 +59,7 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
             }
         }
     }
-    if args.mode != Some(OutputMode::Json) {
+    if !json_mode {
         if catalog_empty {
             println!("No models available.");
         } else if rows.is_empty() {
@@ -107,7 +120,14 @@ fn format_tokens(tokens: u32) -> String {
     if tokens % scale == 0 {
         format!("{}{unit}", tokens / scale)
     } else {
-        format!("{:.1}{unit}", f64::from(tokens) / f64::from(scale))
+        let scaled = f64::from(tokens) / f64::from(scale);
+        // JavaScript toFixed rounds exact ties up. Rust already rounds .75 up.
+        let scaled = if scaled.fract() == 0.25 {
+            scaled.next_up()
+        } else {
+            scaled
+        };
+        format!("{scaled:.1}{unit}")
     }
 }
 
@@ -143,14 +163,16 @@ fn table(mut rows: Vec<[String; 6]>) -> String {
     let mut widths = [0; 6];
     for row in &rows {
         for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(cell.width());
+            widths[index] = widths[index].max(cell.encode_utf16().count());
         }
     }
     rows.iter()
         .map(|row| {
             row.iter()
                 .zip(widths)
-                .map(|(cell, width)| format!("{cell}{}", " ".repeat(width - cell.width())))
+                .map(|(cell, width)| {
+                    format!("{cell}{}", " ".repeat(width - cell.encode_utf16().count()))
+                })
                 .collect::<Vec<_>>()
                 .join("  ")
         })
@@ -176,6 +198,19 @@ mod tests {
     }
 
     #[test]
+    fn token_format_uses_pi_decimal_rounding() {
+        for (tokens, expected) in [
+            (1_250, "1.3K"),
+            (1_150, "1.1K"),
+            (1_750, "1.8K"),
+            (1_250_000, "1.3M"),
+            (131_072, "131.1K"),
+        ] {
+            assert_eq!(format_tokens(tokens), expected, "{tokens}");
+        }
+    }
+
+    #[test]
     fn table_distinguishes_missing_metadata_from_reported_capabilities() {
         let details = ModelDetails {
             context_window: Some(131_072),
@@ -193,6 +228,9 @@ mod tests {
         assert!(rows[1].contains("131.1K"));
         assert!(rows[1].contains("yes") && rows[1].contains("no"));
         assert_eq!(rows[2].matches('?').count(), 4);
-        assert!(rows.iter().all(|row| row.width() == rows[0].width()));
+        assert!(
+            rows.iter()
+                .all(|row| row.encode_utf16().count() == rows[0].encode_utf16().count())
+        );
     }
 }
