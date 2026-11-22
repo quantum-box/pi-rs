@@ -7836,6 +7836,45 @@ fn default_model_and_provider_are_read_as_separate_fields() {
 }
 
 #[test]
+fn selected_builtin_provider_uses_its_pi_default_without_a_model() {
+    for (settings, provider_args) in [
+        (json!({}), vec!["--provider", "google"]),
+        (json!({"defaultProvider":"google"}), vec![]),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("settings.json"), settings.to_string()).unwrap();
+        let mut process = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("GEMINI_API_KEY", "fixture")
+            .args(["--mode", "rpc", "--no-session", "--no-mcp", "--offline"])
+            .args(provider_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
+        let output = process.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for id in ["state", "after"] {
+            let event = events.iter().find(|event| event["id"] == id).unwrap();
+            assert_eq!(event["data"]["model"]["provider"], "google");
+            assert_eq!(event["data"]["model"]["id"], "gemini-4-argon");
+        }
+    }
+}
+
+#[test]
 fn provider_flag_without_model_survives_workspace_refresh_and_new_session() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("models.json"), json!({"providers":{

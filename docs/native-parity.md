@@ -124,8 +124,11 @@ and discards that typeahead.
 Saving a default model writes Pi's `defaultProvider` and literal `defaultModel`
 together. If a saved model falls outside a nonempty model scope, it is added to
 that scope and to a configured `enabledModels` list. Legacy qualified defaults
-without `defaultProvider` are still accepted. Cycling models shows the selected display
-name and the active thinking level for reasoning models. Consecutive notices
+without `defaultProvider` are still accepted. When the selected built-in
+provider needs a model and no saved, explicit or scoped selection applies,
+pi-rs prefers Pi's default model if it is in the effective catalog. It uses
+the first available entry when that default is missing. Cycling models shows
+the selected display name and the active thinking level for reasoning models. Consecutive notices
 reuse the trailing status in both fullscreen and regular mode, before it enters
 scrollback. The tool-output, thinking-visibility, and thinking-level shortcuts
 report the new state using the same status row, as in Pi.

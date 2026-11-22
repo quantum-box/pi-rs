@@ -39,6 +39,54 @@ pub fn qualified_model<'a>(
     Some((profiles.provider(provider)?, model))
 }
 
+/// Use the pinned Pi default when it is present in the effective catalog.
+pub(super) fn default_for_provider<'a>(
+    provider: &Provider,
+    models: &'a [String],
+) -> Option<&'a String> {
+    let preferred = match provider.id() {
+        "amazon-bedrock" => "us.anthropic.claude-opus-5-5",
+        "ant-ling" => "Ring-2.6-1T",
+        "anthropic" => "claude-opus-5-5",
+        "openai" | "azure" | "openai-codex" => "gpt-6.2-sol",
+        "radius" => "balanced",
+        "nvidia" => "nvidia/nemotron-3.5-super-vl-120b-a12b",
+        "deepseek" => "deepseek-v4-pro",
+        "google" | "google-vertex" => "gemini-4-argon",
+        "github-copilot" => "gpt-6.1-sol",
+        "openrouter" => "moonshotai/kimi-k2.7-code",
+        "vercel-ai-gateway" => "zai/glm-5.3",
+        "xai" => "grok-4.7",
+        "groq" => "openai/gpt-oss-120b",
+        "cerebras" => "gpt-oss-120b",
+        "zai" | "zai-coding-cn" => "glm-5.3",
+        "mistral" => "devstral-medium-latest",
+        "minimax" | "minimax-cn" => "MiniMax-M3",
+        "moonshotai" | "moonshotai-cn" | "opencode" => "kimi-k2.7-code",
+        "huggingface" => "moonshotai/Kimi-K2.7-Code",
+        "fireworks" => "accounts/fireworks/models/kimi-k3",
+        "together" => "moonshotai/Kimi-K3",
+        "baseten" => "zai-org/GLM-5.3",
+        "opencode-go" => "kimi-k3.1-pro",
+        "kimi-coding" => "kimi-for-coding",
+        "meta" => "muse-spark-1.3",
+        "cloudflare-workers-ai" => "@cf/moonshotai/kimi-k2.7-code",
+        "cloudflare-ai-gateway" => "workers-ai/@cf/moonshotai/kimi-k2.7-code",
+        "qwen-token-plan"
+        | "qwen-token-plan-cn"
+        | "qwen-token-plan-individual"
+        | "qwen-token-plan-individual-cn" => "qwen3.8-max",
+        "xiaomi" | "xiaomi-token-plan-cn" | "xiaomi-token-plan-ams" | "xiaomi-token-plan-sgp" => {
+            "mimo-v2.6-pro"
+        }
+        _ => return models.first(),
+    };
+    models
+        .iter()
+        .find(|id| id.as_str() == preferred)
+        .or_else(|| models.first())
+}
+
 pub struct Catalog {
     pub provider: Provider,
     pub client: super::providers::Client,
