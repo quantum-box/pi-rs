@@ -1054,6 +1054,7 @@ fn detect_hyperlinks(get: impl Fn(&str) -> Option<String>, tmux: impl Fn() -> bo
         return true;
     }
     term.contains("ghostty")
+        || term.starts_with("alacritty")
         || [
             "KITTY_WINDOW_ID",
             "GHOSTTY_RESOURCES_DIR",
@@ -1062,6 +1063,7 @@ fn detect_hyperlinks(get: impl Fn(&str) -> Option<String>, tmux: impl Fn() -> bo
             "WARP_TERMINAL_SESSION_UUID",
             "ITERM_SESSION_ID",
             "WT_SESSION",
+            "ALACRITTY_WINDOW_ID",
         ]
         .iter()
         .any(|name| present(name))
@@ -5646,6 +5648,16 @@ mod tests {
             )
         };
         assert!(detect(&[("TERM_PROGRAM", "iTerm.app")], false));
+        assert!(detect(&[("TERM", "alacritty")], false));
+        assert!(detect(&[("TERM", "alacritty-direct")], false));
+        assert!(detect(
+            &[("TERM", "xterm-256color"), ("ALACRITTY_WINDOW_ID", "0")],
+            false
+        ));
+        assert!(!detect(
+            &[("TERM", "screen-256color"), ("ALACRITTY_WINDOW_ID", "0")],
+            true
+        ));
         assert!(!detect(
             &[("TERM", "screen-256color"), ("TERM_PROGRAM", "iTerm.app")],
             true
@@ -5669,6 +5681,7 @@ mod tests {
             "WARP_TERMINAL_SESSION_UUID",
             "ITERM_SESSION_ID",
             "WT_SESSION",
+            "ALACRITTY_WINDOW_ID",
         ] {
             assert!(!detect(&[(key, "")], false), "{key}");
         }
