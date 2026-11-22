@@ -211,6 +211,7 @@ struct ModelCompatibility {
     supports_max_output_tokens: Option<bool>,
     supports_mid_convo_effort: Option<bool>,
     supports_temperature: Option<bool>,
+    supports_message_threads: Option<bool>,
     allowed_fallback_models: Option<Vec<AnthropicFallbackModel>>,
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
@@ -242,6 +243,9 @@ impl ModelCompatibility {
                 .supports_mid_convo_effort
                 .or(self.supports_mid_convo_effort),
             supports_temperature: newer.supports_temperature.or(self.supports_temperature),
+            supports_message_threads: newer
+                .supports_message_threads
+                .or(self.supports_message_threads),
             allowed_fallback_models: newer
                 .allowed_fallback_models
                 .or(self.allowed_fallback_models),
@@ -1448,6 +1452,26 @@ impl Profiles {
         .collect()
     }
 
+    pub fn anthropic_thread_support(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> (Option<bool>, BTreeMap<String, bool>) {
+        let default = self
+            .cache_compatibility(provider, None)
+            .supports_message_threads;
+        let models = self
+            .anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+                self.cache_compatibility(provider, metadata)
+                    .supports_message_threads
+            })
+            .into_iter()
+            .filter_map(|(id, support)| support.map(|support| (id, support)))
+            .collect();
+        (default, models)
+    }
+
     pub fn anthropic_fallback_models(
         &self,
         provider: &Provider,
@@ -2392,6 +2416,29 @@ mod tests {
                 "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
             );
         }
+    }
+
+    #[test]
+    fn anthropic_thread_support_follows_the_effective_model_route() {
+        let profiles = Profiles::parse(&json!({"providers":{"proxy":{
+            "api":"anthropic-messages",
+            "baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMessageThreads":true},
+            "models":[
+                {"id":"selected","compat":{"supportsMessageThreads":false}},
+                {"id":"rewritten"},
+                {"id":"other-route","baseUrl":"http://localhost:2/v1"}
+            ]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("proxy").unwrap();
+        assert_eq!(
+            profiles.anthropic_thread_support(&provider, "selected", None),
+            (
+                Some(true),
+                BTreeMap::from([("selected".into(), false), ("rewritten".into(), true)])
+            )
+        );
     }
 
     #[test]

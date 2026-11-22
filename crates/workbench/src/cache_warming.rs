@@ -270,9 +270,11 @@ impl<'a> Capture<'a> {
             Err("waiting for first request")
         };
         let model = policy.as_ref().ok().and_then(|_| {
-            runtime::model_client(args, super::thinking::reported(args).is_some(), false)
-                .ok()
-                .map(Arc::new)
+            let mut model =
+                runtime::model_client(args, super::thinking::reported(args).is_some(), false)
+                    .ok()?;
+            model.client = model.client.without_message_thread_continuation();
+            Some(Arc::new(model))
         });
         Self {
             args,

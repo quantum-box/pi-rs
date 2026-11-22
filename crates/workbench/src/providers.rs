@@ -372,6 +372,7 @@ pub(super) struct Deferred {
     http_settings: Option<super::config::Settings>,
     options: Option<(Box<Cli>, bool)>,
     probe_context: bool,
+    disable_message_thread_continuation: bool,
     observed: bool,
     estimator: Arc<OnceLock<Option<Box<Client>>>>,
 }
@@ -567,6 +568,9 @@ impl Deferred {
         if let Some((args, reported)) = &self.options {
             client = client.with_model_options(args, *reported)?;
         }
+        if self.disable_message_thread_continuation {
+            client = client.without_message_thread_continuation();
+        }
         Ok((
             if self.observed {
                 client.observe()
@@ -699,9 +703,23 @@ impl Client {
             http_settings: None,
             options: None,
             probe_context: true,
+            disable_message_thread_continuation: false,
             observed: false,
             estimator: Arc::new(OnceLock::new()),
         }))
+    }
+
+    pub(super) fn without_message_thread_continuation(self) -> Self {
+        match self {
+            Self::Anthropic(client) => {
+                Self::Anthropic(client.without_message_thread_continuation())
+            }
+            Self::Deferred(mut client) if client.adapter == Adapter::Anthropic => {
+                client.disable_message_thread_continuation = true;
+                Self::Deferred(client)
+            }
+            other => other,
+        }
     }
 
     pub fn with_http_settings(self, settings: &super::config::Settings) -> Result<Self> {
@@ -1338,6 +1356,11 @@ impl Client {
                         &args.model,
                         args.explicit_endpoint_for(&args.provider),
                     );
+                let (thread_default, thread_models) = args.model_profiles.anthropic_thread_support(
+                    &args.provider,
+                    &args.model,
+                    args.explicit_endpoint_for(&args.provider),
+                );
                 let mut client = client
                     .with_eager_tool_input_streaming(eager_default, eager_models)
                     .with_strict_tool_support(strict)
@@ -1367,6 +1390,7 @@ impl Client {
                             args.explicit_endpoint_for(&args.provider),
                         ),
                     )
+                    .with_message_thread_support(thread_default, thread_models)
                     .with_fallback_models(args.model_profiles.anthropic_fallback_models(
                         &args.provider,
                         &args.model,
@@ -2521,11 +2545,12 @@ mod contention_tests {
     async fn prepared_anthropic_dispatch_preserves_config_wire_and_routing() {
         use clap::Parser;
         use std::io::{Read, Write};
-        for (deferred, summary, direct) in [
-            (false, false, false),
-            (true, false, false),
-            (true, true, false),
-            (true, false, true),
+        for (deferred, summary, direct, warming) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, true),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -2584,7 +2609,7 @@ mod contention_tests {
             let endpoint = format!("http://{address}/v1/messages");
             let mut args = super::super::Cli::parse_from(["pi"]);
             args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
-                "api":"anthropic-messages","baseUrl":endpoint,"models":[{"id":"m-base","compat":{"supportsStrictTools":false}},{"id":"m","compat":{"supportsStrictTools":true}}]
+                "api":"anthropic-messages","baseUrl":endpoint,"compat":{"supportsMessageThreads":true},"models":[{"id":"m-base","compat":{"supportsStrictTools":false}},{"id":"m","compat":{"supportsStrictTools":true}}]
             }}})).unwrap();
             args.provider = args.model_profiles.provider("test").unwrap();
             args.model = "m-base".into();
@@ -2606,6 +2631,11 @@ mod contention_tests {
             .with_context_probes(false)
             .with_model_options(&args, false)
             .unwrap();
+            let client = if warming {
+                client.without_message_thread_continuation()
+            } else {
+                client
+            };
             let model = super::super::image_policy::WorkbenchModel {
                 strict_policy: None,
                 client: client.clone(),
@@ -2672,6 +2702,8 @@ mod contention_tests {
                 !summary && !direct
             );
             assert_eq!(body["tools"][0].get("cache_control").is_some(), !summary);
+            assert_eq!(headers.contains("message-threads-2026-08-12"), !summary);
+            assert_eq!(body.get("thread").is_some(), !summary && !warming);
         }
     }
 

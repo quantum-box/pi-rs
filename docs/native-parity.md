@@ -4313,6 +4313,26 @@ fails as in Pi. Loopback tests covered the beta header, target order, and
 fallback billing. Live Fable 5.2 inference and server-side fallback were
 unverified.
 
+Anthropic Messages threads are used for cached session requests on the official
+endpoint. Profiles can override support with `compat.supportsMessageThreads`.
+The native adapter scopes an in-memory continuation to the session,
+authenticated route, fixed request settings and replayed message prefix. A
+continuation sends the new messages and keeps the server's system prompt and
+tools. A missing, already continued, or mismatched thread retries once with
+the full transcript in a new thread. A server that rejects threading receives
+the full transcript without the thread field and keeps the threads beta.
+After a successful resend, later requests on that session and route keep the
+beta and omit the thread field. An endpoint that explicitly rejects the beta
+also omits the automatically added beta on that route and session. Each
+rejection gets at most one resend and records its reason before resending. Cache warming uses a full request
+with the same cache and beta options without reading or updating the thread.
+Summary requests use the full transcript. Replies from a fallback model do not supply continuation
+state. An alias resolving to its dated release can still be continued. OAuth
+continuations compare the canonical wire names for tools while keeping local
+tool names in session replay. Loopback exercised creation, continuation after
+an OAuth tool call, and both forms of retry. Live authenticated Anthropic
+threads were unverified.
+
 Native Anthropic streams expose individual text and thinking block boundaries,
 and show redacted thinking as `[Reasoning redacted]` while retaining its opaque
 payload for provider replay. Live Pi RPC thinking-start partial messages include
