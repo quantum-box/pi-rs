@@ -168,7 +168,7 @@ async fn resolve(
                     .is_none_or(|wanted| wanted == kind)
                     .then(|| Resolved {
                         kind,
-                        value: value.filter(|_| !no_refresh).map(str::to_owned),
+                        value: value.map(str::to_owned),
                     }));
             }
             if wanted == Some(AuthType::ApiKey) {

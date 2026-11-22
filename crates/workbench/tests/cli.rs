@@ -9279,6 +9279,15 @@ fn anthropic_federation_auth_check_without_refresh_uses_only_the_identity_file()
     assert_eq!(status["authType"], "oauth");
     assert!(status.get("credentials").is_none());
 
+    let output = command()
+        .args(["check", "--json", "--credentials", "--no-refresh"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["authType"], "oauth");
+    assert_eq!(status["credentials"], "fixture-header");
+
     let export = command().arg("print-bearer-token").output().unwrap();
     assert!(export.status.success(), "{export:?}");
     assert_eq!(
