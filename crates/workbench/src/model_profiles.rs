@@ -2300,7 +2300,7 @@ mod tests {
         assert!(default);
         assert_eq!(models.get(forced_eager), None);
         assert_eq!(
-            models.get("accounts/fireworks/models/gpt-oss-120b"),
+            models.get("accounts/fireworks/models/deepseek-v4p1-flash-1017"),
             Some(&false)
         );
     }
