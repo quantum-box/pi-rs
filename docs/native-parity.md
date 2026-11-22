@@ -502,9 +502,11 @@ and the six Pi 1.6 Kimi chat models. K3, K3.1 Pro and K3.1 Pro HighSpeed
 advertise a 1,048,576-token output limit, and K3 256K advertises 262,144.
 Image limits, prices, context windows and reasoning settings remain
 model-specific. The high-speed coding model uses its DeepSeek-style thinking
-switch. Subscription OAuth supports device
-login, refresh, and Pi-compatible credential storage. Live Kimi acceptance
-remains open.
+switch. Subscription OAuth supports device login, refresh, and Pi-compatible
+credential storage. A caller can wait for refresh for up to Pi's 15-second
+deadline. After the deadline the worker cannot start a new attempt. An admitted
+request can still persist a rotated credential after timeout or cancellation. Live Kimi acceptance remains
+open.
 
 On terminals without OSC 8 support, Markdown links use the reference's text
 fallback: link text is underlined and destinations appear in parentheses only
