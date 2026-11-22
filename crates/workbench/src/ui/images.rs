@@ -1,13 +1,15 @@
 //! Terminal image placements for the Kitty and iTerm2 protocols used by Pi.
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Write};
+use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use base64::Engine;
 use crossterm::{
-    cursor::{MoveToColumn, MoveUp, RestorePosition, SavePosition},
+    cursor::{MoveTo, MoveToColumn, MoveUp, RestorePosition, SavePosition},
     queue,
+    terminal::{Clear, ClearType},
 };
 
 use super::render::Line;
@@ -215,6 +217,20 @@ pub struct Placement {
     rows: usize,
     offset: usize,
 }
+
+impl Placement {
+    pub fn intersects(&self, row: usize, rows: &Range<usize>, columns: &Range<usize>) -> bool {
+        let top = row.saturating_sub(self.offset);
+        let bottom = row + (self.rows - self.offset);
+        !rows.is_empty()
+            && !columns.is_empty()
+            && rows.start < bottom
+            && top < rows.end
+            && columns.start < self.column + self.columns
+            && self.column < columns.end
+    }
+}
+
 /// Count the contiguous visible portion of one image, excluding following text or widgets.
 pub fn visible_rows(lines: &[Line]) -> usize {
     let Some(first) = lines.first().and_then(|line| line.image.as_ref()) else {
@@ -293,8 +309,27 @@ impl Renderer {
         self.placed.clear();
         self.crops.clear();
     }
-    pub fn clear_placements(&mut self, out: &mut impl Write) -> std::io::Result<()> {
-        self.clear_region(out, None)
+    pub fn clear_fullscreen_frame(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        self.clear_region(out, None)?;
+        // Kitty's erase-entire-display also frees image data with no placements.
+        // Erasing from the origin clears the text while preserving cached uploads.
+        let clear = if self.protocol == Some(Protocol::Kitty) {
+            ClearType::FromCursorDown
+        } else {
+            ClearType::All
+        };
+        queue!(out, MoveTo(0, 0), Clear(clear))
+    }
+    pub fn purge_regular_transcript(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        self.clear_region(out, None)?;
+        queue!(
+            out,
+            Clear(ClearType::All),
+            MoveTo(0, 0),
+            Clear(ClearType::Purge)
+        )?;
+        self.uploaded.clear();
+        Ok(())
     }
     pub fn clear_active(&mut self, out: &mut impl Write) -> std::io::Result<()> {
         self.clear_region(out, Some(2))
@@ -519,6 +554,24 @@ mod tests {
             crops: BTreeMap::new(),
         }
     }
+
+    #[test]
+    fn image_intersection_includes_clipped_placements_but_excludes_adjacent_cells() {
+        let mut placement = Placement {
+            image: fixture(),
+            columns: 10,
+            column: 3,
+            rows: 8,
+            offset: 5,
+        };
+        assert!(placement.intersects(0, &(1..2), &(12..20)));
+        assert!(!placement.intersects(0, &(3..4), &(12..20)));
+        assert!(!placement.intersects(0, &(1..2), &(13..20)));
+        placement.offset += 2;
+        assert!(placement.intersects(2, &(0..1), &(3..4)));
+        let empty_rows = Range { start: 1, end: 1 };
+        assert!(!placement.intersects(2, &empty_rows, &(3..4)));
+    }
     #[test]
     fn capability_detection_is_conservative_and_accepts_explicit_override() {
         let from = |entries: &[(&str, &str)]| {
@@ -645,13 +698,51 @@ mod tests {
         renderer.paint(&line, &mut duplicate, 1, 1).unwrap();
         assert!(duplicate.is_empty());
         let mut next = Vec::new();
-        renderer.clear_placements(&mut next).unwrap();
+        renderer.clear_region(&mut next, None).unwrap();
         renderer.paint(&line, &mut next, 2, 2).unwrap();
         let next = String::from_utf8(next).unwrap();
         assert!(next.contains("a=d,d=i"));
         assert!(!next.contains("a=t,f=100"));
         assert!(next.contains("C=1,q=2"));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn kitty_fullscreen_clear_preserves_uploads_and_scrollback_purge_reloads_them() {
+        let mut renderer = renderer(Protocol::Kitty);
+        let line = Line {
+            image: Some(Placement {
+                image: fixture(),
+                columns: 2,
+                column: 0,
+                rows: 2,
+                offset: 1,
+            }),
+            ..Default::default()
+        };
+        renderer.paint(&line, &mut Vec::new(), 0, 1).unwrap();
+
+        let mut next = Vec::new();
+        renderer.clear_fullscreen_frame(&mut next).unwrap();
+        renderer.paint(&line, &mut next, 0, 1).unwrap();
+        let next = String::from_utf8(next).unwrap();
+        assert!(next.contains("\x1b[1;1H\x1b[J"));
+        assert!(!next.contains("\x1b[2J"));
+        assert!(!next.contains("a=t,f=100"));
+        assert!(next.contains("r=1,y=18,h=18"));
+
+        let mut rebuilt = Vec::new();
+        renderer.purge_regular_transcript(&mut rebuilt).unwrap();
+        renderer.paint(&line, &mut rebuilt, usize::MAX, 1).unwrap();
+        let rebuilt = String::from_utf8(rebuilt).unwrap();
+        assert!(rebuilt.contains("\x1b[2J\x1b[1;1H\x1b[3J"));
+        assert!(
+            rebuilt.contains("a=t,f=100"),
+            "scrollback purge discarded the terminal's uploaded image"
+        );
+        assert!(rebuilt.contains("a=p,"));
+    }
+
     #[test]
     fn active_placements_preserve_committed_scrollback_images() {
         let mut renderer = renderer(Protocol::Kitty);
@@ -684,7 +775,7 @@ mod tests {
             .paint(&line, &mut unchanged, usize::MAX, 2)
             .unwrap();
         assert!(unchanged.is_empty());
-        renderer.clear_placements(&mut unchanged).unwrap();
+        renderer.clear_region(&mut unchanged, None).unwrap();
         assert!(
             String::from_utf8(unchanged)
                 .unwrap()
