@@ -1,8 +1,11 @@
 //! A bounded QuickJS runner that reaches external effects only through ToolHost.
 #[cfg(test)]
 use pi_rs_core::ModelRequest;
+use std::collections::BTreeSet;
+use std::future::{Future, poll_fn};
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -91,7 +94,8 @@ fn worker_limit() -> usize {
 }
 
 fn parse_worker_limit(value: &str) -> Option<usize> {
-    let value = value.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let value =
+        value.trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}');
     let radix_number = |digits: &str, radix| {
         (!digits.is_empty() && digits.chars().all(|c| c.is_ascii() && c.is_digit(radix)))
             .then(|| u64::from_str_radix(digits, radix).ok().map(|n| n as f64))
@@ -120,14 +124,46 @@ fn parse_worker_limit(value: &str) -> Option<usize> {
         .then_some(number as usize)
 }
 
+#[derive(Debug)]
+enum WorkerAdmissionError {
+    Cancelled,
+    Deadline,
+    Busy,
+    Closed,
+}
+
+impl WorkerAdmissionError {
+    fn reply(self, elapsed: Duration, timeout: Option<Duration>, worker_count: usize) -> ToolReply {
+        let reason = match self {
+            Self::Cancelled => "Script aborted: Execution aborted".into(),
+            Self::Deadline => format!(
+                "Script timed out: Execution timed out after {} ms while waiting for a free codemode worker",
+                timeout
+                    .expect("admission deadline requires a timeout")
+                    .as_millis()
+            ),
+            Self::Busy => format!(
+                "No codemode worker became free within {} seconds. All {worker_count} workers, shared by every session in this process, are held by other scripts. Retry after they finish.",
+                WORKER_WAIT_LIMIT.as_secs()
+            ),
+            Self::Closed => "Codemode worker pool closed".into(),
+        };
+        Outcome::Failed(format!(
+            "Script failed\nWall time {:.1} seconds\nOutput:\n\nScript error:\n{reason}\n\nThe script did not start.",
+            elapsed.as_secs_f64()
+        ))
+        .into()
+    }
+}
+
 async fn acquire_worker(
     workers: &Arc<WorkerPool>,
     cancellation: &pi_rs_core::CancellationToken,
     deadline: Option<Duration>,
     wait_limit: Duration,
-) -> Result<WorkerPermit, &'static str> {
+) -> Result<WorkerPermit, WorkerAdmissionError> {
     if cancellation.is_cancelled() {
-        return Err("Script cancelled while waiting for a worker");
+        return Err(WorkerAdmissionError::Cancelled);
     }
     workers.resize();
     let wait = deadline.map_or(wait_limit, |limit| limit.min(wait_limit));
@@ -152,12 +188,12 @@ async fn acquire_worker(
     };
     tokio::select! {
         biased;
-        _ = cancellation.cancelled() => Err("Script cancelled while waiting for a worker"),
+        _ = cancellation.cancelled() => Err(WorkerAdmissionError::Cancelled),
         result = tokio::time::timeout(wait, acquire) => match result {
             Ok(Ok(permit)) => Ok(permit),
-            Ok(Err(_)) => Err("Codemode worker pool closed"),
-            Err(_) if deadline.is_some_and(|limit| limit <= wait_limit) => Err("Script timed out while waiting for a codemode worker"),
-            Err(_) => Err("No codemode worker became free within 60 seconds; retry after other scripts finish"),
+            Ok(Err(_)) => Err(WorkerAdmissionError::Closed),
+            Err(_) if deadline.is_some_and(|limit| limit <= wait_limit) => Err(WorkerAdmissionError::Deadline),
+            Err(_) => Err(WorkerAdmissionError::Busy),
         },
     }
 }
@@ -304,10 +340,11 @@ impl Tool for ScriptTool {
             {
                 Some(remaining) => Some(remaining),
                 None => {
-                    return Outcome::Failed(
-                        "Script timed out while waiting for a codemode worker".into(),
-                    )
-                    .into();
+                    return WorkerAdmissionError::Deadline.reply(
+                        started.elapsed(),
+                        options.timeout,
+                        (workers.limit)(),
+                    );
                 }
             },
             None => None,
@@ -321,7 +358,9 @@ impl Tool for ScriptTool {
         .await
         {
             Ok(permit) => permit,
-            Err(error) => return Outcome::Failed(error.into()).into(),
+            Err(error) => {
+                return error.reply(started.elapsed(), options.timeout, (workers.limit)());
+            }
         };
         let store = previous
             .map(|state| state.data.clone())
@@ -612,6 +651,21 @@ async fn evaluate(
             format!("{error} {detail}")
         })
     });
+    let mut operation = std::pin::pin!(operation);
+    let operation = poll_fn(|cx| match operation.as_mut().poll(cx) {
+        Poll::Ready(result) => Poll::Ready(result),
+        Poll::Pending => {
+            // async_with polls host futures and drains QuickJS jobs before it
+            // yields. This runtime belongs to this script, and a pending host
+            // future keeps the scheduler nonempty even between I/O wakeups.
+            let mut pending_jobs = std::pin::pin!(runtime.is_job_pending());
+            if pending_jobs.as_mut().poll(cx) == Poll::Ready(false) {
+                Poll::Ready(Err("The script is waiting on a promise that can never settle: no tool call is pending, and timers do not exist here.".into()))
+            } else {
+                Poll::Pending
+            }
+        }
+    });
     let result = tokio::select! {
         _ = context.cancellation.cancelled() => return Err("Script cancelled".into()),
         result = async {
@@ -828,35 +882,103 @@ fn describe(tool: &ToolSpec) -> String {
     )
 }
 fn typescript(schema: &Value) -> String {
-    match schema["type"].as_str() {
-        Some("string") => "string".into(),
-        Some("number" | "integer") => "number".into(),
-        Some("boolean") => "boolean".into(),
-        Some("array") => format!("{}[]", typescript(&schema["items"])),
-        Some("object") => {
-            let fields = schema["properties"]
-                .as_object()
-                .map(|properties| {
-                    properties
-                        .iter()
-                        .map(|(name, value)| {
-                            let required = schema["required"]
-                                .as_array()
-                                .is_some_and(|names| names.iter().any(|value| value == name));
-                            format!(
-                                "{}{}: {}",
-                                serde_json::to_string(name).unwrap(),
-                                if required { "" } else { "?" },
-                                typescript(value)
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })
-                .unwrap_or_default();
-            format!("{{ {fields} }}")
+    let mut renderer = SchemaRenderer {
+        root: schema,
+        resolving: BTreeSet::new(),
+        text: String::new(),
+        units: 0,
+    };
+    match renderer.write_type(schema) {
+        Some(()) => renderer.text,
+        None => "unknown".into(),
+    }
+}
+
+struct SchemaRenderer<'a> {
+    root: &'a Value,
+    resolving: BTreeSet<*const Value>,
+    text: String,
+    units: usize,
+}
+
+impl SchemaRenderer<'_> {
+    fn write(&mut self, text: &str) -> Option<()> {
+        self.units += text.encode_utf16().count();
+        if self.units > 16_000 {
+            return None;
         }
-        _ => "unknown".into(),
+        self.text.push_str(text);
+        Some(())
+    }
+
+    fn write_type(&mut self, schema: &Value) -> Option<()> {
+        if let Some(reference) = schema["$ref"].as_str() {
+            let Some(target) = crate::schema_ref::resolve(self.root, reference) else {
+                return self.write_type_without_ref(schema);
+            };
+            let pointer = std::ptr::from_ref(target);
+            if self.resolving.len() >= 32 || !self.resolving.insert(pointer) {
+                return self.write_type_without_ref(schema);
+            }
+            let has_sibling_type = matches!(
+                schema["type"].as_str(),
+                Some("string" | "number" | "integer" | "boolean" | "array" | "object")
+            );
+            let initial_bytes = self.text.len();
+            let initial_units = self.units;
+            if has_sibling_type {
+                self.write("(")?;
+            }
+            let target_start = self.text.len();
+            let result = self.write_type(target);
+            self.resolving.remove(&pointer);
+            result?;
+            if has_sibling_type {
+                if &self.text[target_start..] == "unknown" {
+                    self.text.truncate(initial_bytes);
+                    self.units = initial_units;
+                    return self.write_type_without_ref(schema);
+                }
+                self.write(" & ")?;
+                self.write_type_without_ref(schema)?;
+                self.write(")")?;
+            }
+            return Some(());
+        }
+        self.write_type_without_ref(schema)
+    }
+
+    fn write_type_without_ref(&mut self, schema: &Value) -> Option<()> {
+        match schema["type"].as_str() {
+            Some("string") => self.write("string"),
+            Some("number" | "integer") => self.write("number"),
+            Some("boolean") => self.write("boolean"),
+            Some("array") => {
+                self.write_type(&schema["items"])?;
+                self.write("[]")
+            }
+            Some("object") => self.write_object(schema),
+            _ if schema == &Value::Bool(false) => self.write("never"),
+            _ => self.write("unknown"),
+        }
+    }
+
+    fn write_object(&mut self, schema: &Value) -> Option<()> {
+        self.write("{ ")?;
+        if let Some(properties) = schema["properties"].as_object() {
+            let required = schema["required"].as_array();
+            for (index, (name, field)) in properties.iter().enumerate() {
+                if index != 0 {
+                    self.write("; ")?;
+                }
+                self.write(&serde_json::to_string(name).unwrap())?;
+                let name_is_required =
+                    required.is_some_and(|names| names.iter().any(|value| value == name));
+                self.write(if name_is_required { ": " } else { "?: " })?;
+                self.write_type(field)?;
+            }
+        }
+        self.write(" }")
     }
 }
 
@@ -1002,6 +1124,19 @@ fn visit_chunks(
         value = &value[end..];
     }
 }
+fn utf16_prefix_bytes(chars: impl Iterator<Item = char>, mut units: usize) -> usize {
+    chars
+        .take_while(|character| {
+            let Some(remaining) = units.checked_sub(character.len_utf16()) else {
+                return false;
+            };
+            units = remaining;
+            true
+        })
+        .map(char::len_utf8)
+        .sum()
+}
+
 impl Output {
     fn unshown_images_note(&self) -> Option<String> {
         let count = self.generated_images;
@@ -1117,7 +1252,7 @@ impl Output {
         elapsed: Duration,
         error: Option<&str>,
         maximum: usize,
-        chars: usize,
+        units: usize,
         cancellation: &pi_rs_core::CancellationToken,
     ) -> Option<FormattedOutput> {
         let mut file = tempfile::Builder::new()
@@ -1130,7 +1265,7 @@ impl Output {
         let mut newlines = 0usize;
         let mut last = None;
         let head_limit = maximum / 2;
-        let tail_start = chars - (maximum - head_limit);
+        let tail_start = units - (maximum - head_limit);
         self.visit_report(success, elapsed, error, |part| {
             visit_chunks(part, cancellation, |part| {
                 if let Ok(output) = &mut file
@@ -1138,14 +1273,21 @@ impl Output {
                 {
                     file = Err(error);
                 }
-                let part_chars = part.chars().count();
-                if offset < head_limit {
-                    head.extend(part.chars().take(head_limit - offset));
+                let part_units = part.encode_utf16().count();
+                let end = offset + part_units;
+                if end <= head_limit {
+                    head.push_str(part);
+                } else if offset < head_limit {
+                    let bytes = utf16_prefix_bytes(part.chars(), head_limit - offset);
+                    head.push_str(&part[..bytes]);
                 }
-                if offset + part_chars > tail_start {
-                    tail.extend(part.chars().skip(tail_start.saturating_sub(offset)));
+                if offset >= tail_start {
+                    tail.push_str(part);
+                } else if end > tail_start {
+                    let bytes = utf16_prefix_bytes(part.chars().rev(), end - tail_start);
+                    tail.push_str(&part[part.len() - bytes..]);
                 }
-                offset += part_chars;
+                offset = end;
                 newlines += part.bytes().filter(|byte| *byte == b'\n').count();
                 if !part.is_empty() {
                     last = part.chars().next_back();
@@ -1169,8 +1311,8 @@ impl Output {
         };
         let report = format!(
             "Warning: truncated output (original token count: {})\nTotal output lines: {lines}\n\n{head}…{} tokens truncated…{tail}\n\n[{location}]",
-            chars.div_ceil(4),
-            (chars - maximum).div_ceil(4)
+            units.div_ceil(4),
+            (units - maximum).div_ceil(4)
         );
         let text_block = json!({"type":"text","text":report});
         let mut budget = (7 * 1024 * 1024_usize).saturating_sub(text_block.to_string().len());
@@ -1265,17 +1407,17 @@ impl Output {
         cancellation: &pi_rs_core::CancellationToken,
     ) -> Option<FormattedOutput> {
         let maximum = tokens.saturating_mul(4).min(100 * 1024);
-        let mut chars = 0usize;
+        let mut units = 0usize;
         self.visit_report(success, elapsed, error, |part| {
             visit_chunks(part, cancellation, |chunk| {
-                chars = chars.saturating_add(chunk.chars().count())
+                units = units.saturating_add(chunk.encode_utf16().count())
             })
         });
         if cancellation.is_cancelled() {
             return None;
         }
-        if chars > maximum {
-            return self.finish_truncated(success, elapsed, error, maximum, chars, cancellation);
+        if units > maximum {
+            return self.finish_truncated(success, elapsed, error, maximum, units, cancellation);
         }
         let mut content = vec![json!({"type":"text","text":format!(
             "Script {}\nWall time: {:.3}s\n",
@@ -1381,12 +1523,117 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_declarations_expand_local_refs_without_recursing_forever() {
+        let tool = ToolSpec {
+            name: "read-record".into(),
+            description: "Read a record".into(),
+            parameters: json!({
+                "$ref": "#/$defs/a~1b~0%20c",
+                "$defs": {
+                    "a/b~ c": {
+                        "type": "object",
+                        "required": ["amount"],
+                        "properties": {
+                            "amount": {"$ref": "#/$defs/cost"},
+                            "cycle": {"$ref": "#/$defs/a~1b~0%20c"},
+                            "denied": {"$ref": "#/$defs/never"},
+                            "mystery": {"$ref": "https://example.com/schema"}
+                        }
+                    },
+                    "cost": {"type": "number"},
+                    "never": false
+                }
+            }),
+        };
+        let declaration = describe(&tool);
+        assert!(declaration.contains("read_record(args: {"));
+        for field in [
+            "\"amount\": number",
+            "\"cycle\"?: unknown",
+            "\"denied\"?: never",
+            "\"mystery\"?: unknown",
+        ] {
+            assert!(declaration.contains(field), "{declaration}");
+        }
+        let property_name = "x".repeat(16_000);
+        let oversized = json!({"type":"object","properties": {(property_name):{"type":"string"}}});
+        assert_eq!(typescript(&oversized), "unknown");
+    }
+
+    #[test]
+    fn tool_declarations_retain_argument_types_alongside_references() {
+        let generic = json!({"$ref": "#/$defs/base", "type": "string", "$defs": {"base": true}});
+        assert_eq!(typescript(&generic), "string");
+        let missing = json!({"$ref": "#/$defs/absent", "type": "number"});
+        assert_eq!(typescript(&missing), "number");
+        let array = json!({
+            "type": "array",
+            "items": {
+                "$ref": "#/$defs/base",
+                "type": "object",
+                "properties": {"label": {"type": "string"}}
+            },
+            "$defs": {"base": {"type": "object", "properties": {"count": {"type": "number"}}}}
+        });
+        assert_eq!(
+            typescript(&array),
+            "({ \"count\"?: number } & { \"label\"?: string })[]"
+        );
+    }
+
+    #[test]
+    fn tool_declarations_bound_reference_depth_without_dropping_siblings() {
+        let properties: serde_json::Map<_, _> = (0..40)
+            .map(|index| (format!("field{index}"), json!({"$ref": "#/$defs/shared"})))
+            .collect();
+        let wide = json!({
+            "type": "object",
+            "$defs": {"shared": {"type": "string"}},
+            "properties": properties
+        });
+        assert_eq!(typescript(&wide).matches(": string").count(), 40);
+        let mut chain: serde_json::Map<_, _> = (0..40)
+            .map(|index| {
+                (
+                    index.to_string(),
+                    json!({"$ref": format!("#/$defs/{}", index + 1)}),
+                )
+            })
+            .collect();
+        chain.insert("40".into(), json!({"type": "string"}));
+        assert_eq!(
+            typescript(&json!({"$ref": "#/$defs/0", "$defs": chain})),
+            "unknown"
+        );
+    }
+
+    #[test]
     fn worker_limit_accepts_pi_numeric_forms_with_native_ceiling() {
-        for value in ["3", " 3 ", "3.0", "3e0", "+3", "0x3", "0o3", "0b11"] {
+        for value in [
+            "3",
+            " 3 ",
+            "\u{feff}3\u{00a0}",
+            "3.0",
+            "3e0",
+            "+3",
+            "0x3",
+            "0o3",
+            "0b11",
+        ] {
             assert_eq!(parse_worker_limit(value), Some(3), "{value:?}");
         }
         for value in [
-            "", "0", "-1", "1.5", "NaN", "Infinity", "1025", "3workers", "+0x3", "0x+3",
+            "",
+            "0",
+            "-1",
+            "1.5",
+            "NaN",
+            "Infinity",
+            "1025",
+            "3workers",
+            "+0x3",
+            "0x+3",
+            "\u{0085}3",
         ] {
             assert_eq!(parse_worker_limit(value), None, "{value:?}");
         }
@@ -1407,21 +1654,41 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(result, Err(error) if error.contains("No codemode worker")));
+        let Err(error @ WorkerAdmissionError::Busy) = result else {
+            panic!("expected the worker wait limit");
+        };
+        let elapsed = WORKER_WAIT_LIMIT;
+        let reply = error.reply(elapsed, None, 1);
+        assert!(matches!(reply.outcome, Outcome::Failed(message) if message
+                == "Script failed\nWall time 60.0 seconds\nOutput:\n\nScript error:\nNo codemode worker became free within 60 seconds. All 1 workers, shared by every session in this process, are held by other scripts. Retry after they finish.\n\nThe script did not start."));
+        assert!(reply.state.is_none());
         let result = tokio::time::timeout(
             overall,
             acquire_worker(&workers, &cancellation, Some(short), Duration::from_secs(1)),
         )
         .await
         .unwrap();
-        assert!(matches!(result, Err(error) if error.contains("Script timed out")));
+        let Err(error @ WorkerAdmissionError::Deadline) = result else {
+            panic!("expected the script deadline");
+        };
+        let timeout = Duration::from_millis(37);
+        let reply = error.reply(timeout, Some(timeout), 1);
+        assert!(matches!(reply.outcome, Outcome::Failed(message) if message
+                == "Script failed\nWall time 0.0 seconds\nOutput:\n\nScript error:\nScript timed out: Execution timed out after 37 ms while waiting for a free codemode worker\n\nThe script did not start."));
+        assert!(reply.state.is_none());
 
         let waiting = acquire_worker(&workers, &cancellation, None, overall);
         tokio::pin!(waiting);
         assert!(tokio::time::timeout(short, &mut waiting).await.is_err());
         cancellation.cancel();
         let result = tokio::time::timeout(overall, waiting).await.unwrap();
-        assert!(matches!(result, Err(error) if error.contains("cancelled")));
+        let Err(error @ WorkerAdmissionError::Cancelled) = result else {
+            panic!("expected cancellation");
+        };
+        let reply = error.reply(short, None, 1);
+        assert!(matches!(reply.outcome, Outcome::Failed(message) if message
+                == "Script failed\nWall time 0.0 seconds\nOutput:\n\nScript error:\nScript aborted: Execution aborted\n\nThe script did not start."));
+        assert!(reply.state.is_none());
         drop(held);
         assert_eq!(workers.semaphore.available_permits(), 1);
         let fresh = pi_rs_core::CancellationToken::new();
@@ -1963,7 +2230,12 @@ mod tests {
             vec![ToolSpec {
                 name: "echo".into(),
                 description: "Echo a value".into(),
-                parameters: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"text": {"$ref": "#/$defs/echoText"}},
+                    "required": ["text"],
+                    "$defs": {"echoText": {"type": "string", "description": "Reconciliation"}}
+                }),
             }]
         }
         async fn call(&self, name: &str, arguments: Value) -> Outcome {
@@ -2046,31 +2318,40 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn unbounded_script_honors_cancellation() {
+    async fn unbounded_script_honors_cancellation_during_host_call() {
         let cancellation = pi_rs_core::CancellationToken::new();
-        let trigger = cancellation.clone();
-        let task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            trigger.cancel();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let host = Arc::new(StartedHost {
+            started: started.clone(),
+            wait_for_cancellation: true,
         });
-        let reply = tokio::time::timeout(
-            Duration::from_secs(1),
-            ScriptTool { timeout: None }.invoke_transaction(
-                json!({"code":"await new Promise(() => {})"}),
-                ToolContext {
-                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
-                    cancellation,
-                },
-                None,
-                Arc::new(Host),
-            ),
-        )
+        let run = ScriptTool { timeout: None };
+        let (reply, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                run.invoke_transaction(
+                    json!({"code":"await tools.started({})"}),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation: cancellation.clone(),
+                    },
+                    None,
+                    host,
+                ),
+                async {
+                    started.notified().await;
+                    cancellation.cancel();
+                }
+            )
+        })
         .await
-        .unwrap();
-        task.await.unwrap();
+        .expect("expected pending host call to be cancelled");
         assert!(matches!(reply.outcome, Outcome::Failed(message) if message.contains("cancelled")));
     }
-    struct StartedHost(Arc<tokio::sync::Notify>);
+
+    struct StartedHost {
+        started: Arc<tokio::sync::Notify>,
+        wait_for_cancellation: bool,
+    }
     #[async_trait::async_trait]
     impl ToolHost for StartedHost {
         fn cancellation_safe_calls(&self) -> bool {
@@ -2084,7 +2365,10 @@ mod tests {
             }]
         }
         async fn call(&self, _: &str, _: Value) -> Outcome {
-            self.0.notify_one();
+            self.started.notify_one();
+            if self.wait_for_cancellation {
+                std::future::pending::<()>().await;
+            }
             Outcome::Succeeded("ready".into())
         }
     }
@@ -2110,7 +2394,10 @@ mod tests {
             })
         };
         let script_cancel = cancellation.clone();
-        let host = Arc::new(StartedHost(started.clone()));
+        let host = Arc::new(StartedHost {
+            started: started.clone(),
+            wait_for_cancellation: false,
+        });
         let script = tokio::spawn(async move {
             ScriptTool { timeout: None }.invoke_transaction(
                 json!({"code":"await tools.started({}); store('uncommitted', true); while (true) {}"}),
@@ -2138,7 +2425,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn dropping_invocation_stops_busy_worker() {
         let started = Arc::new(tokio::sync::Notify::new());
-        let host = Arc::new(StartedHost(started.clone()));
+        let host = Arc::new(StartedHost {
+            started: started.clone(),
+            wait_for_cancellation: false,
+        });
         let weak_host = Arc::downgrade(&host);
         let cancellation = pi_rs_core::CancellationToken::new();
         let watchdog_cancel = cancellation.clone();
@@ -2521,10 +2811,67 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(1));
         }
     }
+    #[tokio::test]
+    async fn unresolved_promise_fails_without_a_deadline() {
+        struct DelayedHost;
+
+        #[async_trait::async_trait]
+        impl ToolHost for DelayedHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: "fixture".into(),
+                    description: "Wait for a fixture response".into(),
+                    parameters: json!({"type": "object"}),
+                }]
+            }
+
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Outcome::Succeeded("fixture returned".into())
+            }
+        }
+
+        for source in [
+            "text('before stall'); await new Promise(() => {});",
+            "text(await tools.fixture({})); await new Promise(() => {});",
+        ] {
+            let reply = tokio::time::timeout(
+                Duration::from_secs(5),
+                ScriptTool { timeout: None }.invoke_transaction(
+                    json!({"code":source}),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation: Default::default(),
+                    },
+                    None,
+                    Arc::new(DelayedHost),
+                ),
+            )
+            .await
+            .expect("an idle script must release its worker with no configured deadline");
+            let Outcome::Failed(error) = reply.outcome else {
+                panic!("unresolved script unexpectedly completed");
+            };
+            let output = if source.contains("tools.fixture") {
+                "fixture returned"
+            } else {
+                "before stall"
+            };
+            assert!(
+                error.contains(output) && error.contains("promise that can never settle"),
+                "{error}"
+            );
+        }
+    }
+
     #[test]
     fn metadata_helpers_and_output_truncation_are_available() {
         let reply = run(
-            "const found = await searchTools('echo'); text(found[0].name); text((await describeTool('echo')).declaration); return (await describeNamespace('builtin')).tools.length;",
+            "const found = await searchTools('reconciliation'); if (found[0]?.name !== 'echo') throw new Error('missing referenced tool'); const declaration = (await describeTool('echo')).declaration; if (!declaration.includes('string')) throw new Error('missing referenced type'); text(declaration); return (await describeNamespace('builtin')).tools.length;",
             None,
         );
         assert!(reply.outcome.tool_content().contains("Echo a value"));
@@ -2684,6 +3031,55 @@ mod tests {
             .deliver();
         let path = truncated["full_output_path"].as_str().unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn output_budget_counts_utf16_and_keeps_supplementary_characters_intact() {
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let header = "Script completed\nWall time: 0.000s\n";
+        let header_units = header.encode_utf16().count();
+        let budget = 40;
+        let fits = "😀".repeat((budget - header_units) / 2);
+        let output = |text| Output {
+            items: vec![Item::Text(text)],
+            ..Output::default()
+        };
+        let fitting = output(fits.clone())
+            .finish(true, Duration::ZERO, None, budget / 4, &cancellation)
+            .unwrap()
+            .deliver();
+        assert!(fitting["full_output_path"].is_null());
+        let overflowing = format!("{fits}😀");
+        assert!(header_units + overflowing.chars().count() <= budget);
+        let truncated = output(overflowing)
+            .finish(true, Duration::ZERO, None, budget / 4, &cancellation)
+            .unwrap()
+            .deliver();
+        let path = truncated["full_output_path"].as_str().unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        let budget = 80;
+        let prefix = "x".repeat(budget / 2 - header_units - 1);
+        let suffix = "z".repeat(budget / 2 - 1);
+        let text = format!("{prefix}😀{}😀{suffix}", "mid".repeat(20));
+        let units = header_units + text.encode_utf16().count();
+        let result = output(text.clone())
+            .finish(true, Duration::ZERO, None, budget / 4, &cancellation)
+            .unwrap()
+            .deliver();
+        let report = result["content"][0]["text"].as_str().unwrap();
+        let omitted = (units - budget).div_ceil(4);
+        assert!(report.contains(&format!("original token count: {}", units.div_ceil(4))));
+        assert!(report.contains(&format!(
+            "{header}{prefix}…{omitted} tokens truncated…{suffix}"
+        )));
+        assert!(!report.contains('😀'));
+        let path = result["full_output_path"].as_str().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            format!("{header}{text}")
+        );
         std::fs::remove_file(path).unwrap();
     }
 

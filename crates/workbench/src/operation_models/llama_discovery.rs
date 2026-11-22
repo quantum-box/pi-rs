@@ -415,7 +415,7 @@ mod tests {
         assert_eq!(entries[0].model.context_window, Some(8192));
         assert_eq!(entries[1].endpoint.path(), "/prefix/v1/systemone");
         assert!(matches!(entries[1].api, Api::SystemOne));
-        assert!(entries[1].allows_keyless());
+        assert!(entries[1].allows_keyless(&Keys::default()));
         assert_eq!(entries[2].model.context_window, Some(2048));
         let expected = entries.iter().map(Entry::descriptor).collect::<Vec<_>>();
         for connection in [None, Some(&client)] {

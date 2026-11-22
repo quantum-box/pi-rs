@@ -61,14 +61,26 @@ async fn list_json_reports_servers_tools_sources_and_failures() {
                     ),
                     _ => None,
                 };
-                let (status, body) = match result {
-                    Some(result) => (
-                        "200 OK",
-                        json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string(),
-                    ),
-                    None => ("202 Accepted", String::new()),
+                let (status, content_type, body) = match result {
+                    Some(result) => {
+                        let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                        if request["method"] == "tools/list" {
+                            let notification = json!({
+                                "jsonrpc":"2.0","method":"notifications/message",
+                                "params":{"level":"warning","logger":"test","data":"fixture log\nsecond line"}
+                            });
+                            (
+                                "200 OK",
+                                "text/event-stream",
+                                format!("data: {notification}\n\ndata: {reply}\n\n"),
+                            )
+                        } else {
+                            ("200 OK", "application/json", reply.to_string())
+                        }
+                    }
+                    None => ("202 Accepted", "application/json", String::new()),
                 };
-                let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
             });
         }
     });
@@ -126,6 +138,10 @@ async fn list_json_reports_servers_tools_sources_and_failures() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("private-argument"));
     assert!(!stdout.contains("private-query"));
+    assert!(!stdout.contains("fixture log"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture log"));
+    let log = std::fs::read_to_string(home.join("mcp.log")).unwrap();
+    assert!(log.contains("[fixture] warning test: fixture log\n    second line\n"));
     let find = |name: &str| {
         reports
             .iter()
@@ -455,4 +471,53 @@ fn list_reports_invalid_auto_enable_codemode_in_each_trusted_scope() {
         "{stderr}"
     );
     assert!(!stderr.contains("private-value"), "{stderr}");
+}
+
+#[test]
+fn text_list_reports_bad_configuration_and_continues_with_the_other_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join(".pi");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let user_file = home.join("mcp.json");
+    let project_file = project.join("mcp.json");
+
+    for (bad_file, good_file, invalid, diagnostic) in [
+        (
+            &user_file,
+            &project_file,
+            r#"{"mcpServers":[]}"#,
+            "mcpServers must be an object",
+        ),
+        (
+            &project_file,
+            &user_file,
+            r#"{"mcpServers":"private-value""#,
+            "could not read or parse MCP configuration",
+        ),
+    ] {
+        std::fs::write(bad_file, invalid).unwrap();
+        std::fs::write(
+            good_file,
+            r#"{"mcpServers":{"retired":{"command":"unused","enabled":false}}}"#,
+        )
+        .unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(["--trust", "--offline", "mcp", "list"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected = format!("mcp.json: {diagnostic}");
+        assert!(stderr.contains(&expected), "{stderr}");
+        assert!(!stderr.contains("private-value"), "{stderr}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("retired") && stdout.contains("disabled"),
+            "{stdout}"
+        );
+    }
 }

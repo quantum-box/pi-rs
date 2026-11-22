@@ -22,6 +22,7 @@ pub struct Runtime {
     resource_origins: ResourceOrigins,
     catalog: Arc<LiveMcpCatalog>,
     mcp_sign_in: std::collections::VecDeque<mcp_config::PendingSignIn>,
+    mcp_inspection: Vec<mcp_config::Inspection>,
 }
 
 #[derive(Clone, Debug)]
@@ -392,6 +393,15 @@ impl Runtime {
         }
         Ok(())
     }
+    pub async fn inspect_mcp(
+        &self,
+        ui: &dyn ExtensionUi,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let servers = self.catalog.servers.lock().expect("MCP catalogs").clone();
+        mcp_config::inspect_servers(&self.mcp_inspection, &servers, ui, cancel).await
+    }
+
     pub async fn refresh_mcp(&mut self, _args: &Cli) -> Result<()> {
         if let Some(update) =
             pi_rs::RegistryRefresher::refresh(self.catalog.as_ref(), &self.registry).await?
@@ -987,6 +997,10 @@ async fn configure_after(
             .collect();
         let mut registry = Registry::compose(extensions, &disabled)?;
         registry.omit_default_tool_timeout(args.tool_timeout_secs.is_none());
+        registry.publish_tool_attempts(matches!(
+            args.mode,
+            Some(super::OutputMode::Json | super::OutputMode::Rpc)
+        ));
         registry.register(Arc::new(LocalCommandPolicy(CommandPolicy {
             allow_commands: args.allow_commands,
         })))?;
@@ -1056,6 +1070,7 @@ async fn configure_after(
             resource_origins: ResourceOrigins::default(),
             catalog,
             mcp_sign_in: discovered.sign_in.into(),
+            mcp_inspection: discovered.inspection,
         })
     }
     .await;
@@ -1523,7 +1538,7 @@ mod resource_origin_tests {
     use super::*;
 
     #[test]
-    fn runtime_final_strict_policy_is_limited_to_openai_adapters() {
+    fn runtime_final_strict_policy_tracks_adapter_support() {
         use clap::Parser;
         for (api, path, expected) in [
             ("openai-responses", "v1", true),
@@ -1545,6 +1560,17 @@ mod resource_origin_tests {
             let model = model_client(&args, false, false).unwrap();
             assert_eq!(model.strict_policy.is_some(), expected, "{api}");
         }
+
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.provider = args.model_profiles.provider("amazon-bedrock").unwrap();
+        args.model = "anthropic.claude-fable-5-2".into();
+        args.endpoint.clear();
+        assert!(
+            model_client(&args, false, false)
+                .unwrap()
+                .strict_policy
+                .is_some()
+        );
     }
 
     struct InlineCommand;

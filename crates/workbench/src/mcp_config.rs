@@ -1,7 +1,10 @@
 //! MCP configuration overlay and command-line management.
 use super::{Cli, config, output};
 use clap::Subcommand;
-use pi_rs::{Error, Result};
+use pi_rs::{
+    CancellationToken, Error, ExtensionUi, Result, UiComponentAction, UiComponentSpan, UiRequest,
+    UiResponse,
+};
 use pi_rs_workbench::mcp::{McpExtension, ServerConfig};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -120,13 +123,19 @@ enum ConfigurationRead {
     TextReport,
 }
 
+impl ConfigurationRead {
+    fn validates_file_shape(self) -> bool {
+        self != Self::Runtime
+    }
+}
+
 fn validate_mcp_file_fields(
     file: &Value,
     path: &std::path::Path,
     mode: ConfigurationRead,
     errors: &mut Vec<String>,
 ) {
-    if matches!(mode, ConfigurationRead::Share | ConfigurationRead::Report)
+    if mode.validates_file_shape()
         && file
             .get("mcpServers")
             .is_some_and(|value| !value.is_object())
@@ -151,7 +160,7 @@ fn configurations_with_project_scope(
     args: &Cli,
     mode: ConfigurationRead,
 ) -> Result<ScopedConfigurations> {
-    let validate_shape = matches!(mode, ConfigurationRead::Share | ConfigurationRead::Report);
+    let validate_shape = mode.validates_file_shape();
     if args.no_mcp || !super::resource_paths::builtin_enabled(args, "builtin:mcp")? {
         return Ok((
             BTreeMap::new(),
@@ -486,6 +495,7 @@ pub(super) struct Discovery {
     pub connected: Vec<Arc<McpExtension>>,
     pub sign_in: Vec<PendingSignIn>,
     pub skipped_disabled: BTreeSet<String>,
+    pub inspection: Vec<Inspection>,
     failed: bool,
 }
 
@@ -510,14 +520,18 @@ pub(super) async fn discover(
     } else {
         ConfigurationRead::Runtime
     };
-    let (servers, _, _, _, configuration_errors) = configurations_with_project_scope(args, mode)?;
+    let (servers, project, overrides, _, configuration_errors) =
+        configurations_with_project_scope(args, mode)?;
     if !configuration_errors.is_empty() && require_complete {
         return Err(Error::Config(format!(
             "Invalid MCP configuration for Radius share: {}",
             configuration_errors.join("\n"),
         )));
     }
-    let mut discovery = Discovery::default();
+    let mut discovery = Discovery {
+        inspection: inspection_entries(&servers, &project, &overrides),
+        ..Discovery::default()
+    };
     let mut failed = report && !configuration_errors.is_empty();
     if report {
         for error in configuration_errors {
@@ -642,8 +656,8 @@ async fn connect_for_discovery(
             let share_refresh = share_refresh.clone();
             let cleanup = cleanup.clone();
             Box::pin(async move {
-                args.model_profiles = super::model_profiles::Profiles::load()?;
                 args.model_keys = super::model_auth::Keys::load_async().await?;
+                args.model_profiles = super::model_profiles::Profiles::load(&args.model_keys)?;
                 let provider = args.model_profiles.provider(&provider).ok_or_else(|| {
                     Error::Config("MCP auth.provider does not name an installed provider".into())
                 })?;
@@ -888,6 +902,229 @@ async fn list_json(args: &Cli) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[derive(Clone)]
+pub(super) struct Inspection {
+    name: String,
+    status: &'static str,
+    exposure: String,
+    scope: &'static str,
+    description: String,
+    tools: Vec<String>,
+}
+
+fn inspection_entries(
+    servers: &BTreeMap<String, Value>,
+    project: &BTreeSet<String>,
+    overrides: &BTreeSet<String>,
+) -> Vec<Inspection> {
+    servers
+        .iter()
+        .map(|(name, config)| {
+            let status = if report_server_config(config).is_none() {
+                "invalid"
+            } else if config["enabled"] == false {
+                "disabled"
+            } else {
+                "disconnected"
+            };
+            let scope = if project.contains(name) {
+                "project"
+            } else if overrides.contains(name) {
+                "global · project override"
+            } else {
+                "global"
+            };
+            Inspection {
+                name: name.clone(),
+                status,
+                exposure: report_exposure(config["exposure"].as_str().unwrap_or("codemode")).into(),
+                scope,
+                description: inspection_description(
+                    config["description"].as_str().unwrap_or_default(),
+                ),
+                tools: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+fn inspection_description(description: &str) -> String {
+    description
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(512)
+        .collect()
+}
+
+pub(super) async fn inspect_servers(
+    configured: &[Inspection],
+    connected: &[Arc<McpExtension>],
+    ui: &dyn ExtensionUi,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let mut entries = configured.to_vec();
+    for entry in &mut entries {
+        if let Some(server) = connected
+            .iter()
+            .find(|server| server.server_name == entry.name)
+        {
+            entry.status = "connected";
+            entry.description = inspection_description(&server.description);
+            entry.tools = server
+                .remote_tool_names()
+                .iter()
+                .map(|tool| {
+                    format!(
+                        "{tool} · {}",
+                        report_exposure(server.remote_tool_exposure(tool))
+                    )
+                })
+                .collect();
+        }
+    }
+    // Put disconnected and invalid entries first, as the Pi manager does.
+    entries.sort_by_key(|entry| !matches!(entry.status, "disconnected" | "invalid"));
+    let options = entries
+        .iter()
+        .map(|entry| {
+            let count = entry.tools.len();
+            let tool_label = if count == 1 { "tool" } else { "tools" };
+            format!(
+                "{} · {} · {count} {tool_label} · {} · {}",
+                entry.name, entry.status, entry.exposure, entry.scope,
+            )
+        })
+        .collect::<Vec<_>>();
+    if options.is_empty() {
+        let _ = show_inspection(
+            "MCP servers".into(),
+            vec!["No MCP servers configured.".into()],
+            false,
+            ui,
+            cancel,
+        )
+        .await?;
+        return Ok(());
+    }
+    let mut page = 0;
+    while let Some(index) =
+        select_inspection("MCP servers", &options, &mut page, ui, cancel).await?
+    {
+        let entry = &entries[index];
+        let mut lines = vec![
+            format!("Status · {}", entry.status),
+            format!("Scope · {}", entry.scope),
+            format!("Exposure · {}", entry.exposure),
+            format!("Tools · {}", entry.tools.len()),
+        ];
+        if !entry.description.is_empty() {
+            lines.push(entry.description.clone());
+        }
+        while show_inspection(
+            format!("MCP server · {}", entry.name),
+            lines.clone(),
+            !entry.tools.is_empty(),
+            ui,
+            cancel,
+        )
+        .await?
+        {
+            let title = format!("MCP tools · {}", entry.name);
+            let mut tool_page = 0;
+            let _ = select_inspection(&title, &entry.tools, &mut tool_page, ui, cancel).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn show_inspection(
+    title: String,
+    lines: Vec<String>,
+    tools: bool,
+    ui: &dyn ExtensionUi,
+    cancel: &CancellationToken,
+) -> Result<bool> {
+    let mut actions = vec![UiComponentAction {
+        key: "enter".into(),
+        value: "back".into(),
+        label: Some("Back".into()),
+    }];
+    if tools {
+        actions.push(UiComponentAction {
+            key: "t".into(),
+            value: "tools".into(),
+            label: Some("Tools".into()),
+        });
+    }
+    let request = UiRequest::Custom {
+        title,
+        lines: lines
+            .into_iter()
+            .map(|text| {
+                vec![UiComponentSpan {
+                    text,
+                    ..Default::default()
+                }]
+            })
+            .collect(),
+        actions,
+        timeout: None,
+    };
+    let response = ui
+        .request(request, cancel.clone())
+        .await
+        .map_err(|error| Error::Config(format!("MCP inspector UI failed: {error}")))?;
+    Ok(matches!(response, UiResponse::Text(action) if action == "tools"))
+}
+
+async fn select_inspection(
+    title: &str,
+    items: &[String],
+    page: &mut usize,
+    ui: &dyn ExtensionUi,
+    cancel: &CancellationToken,
+) -> Result<Option<usize>> {
+    // Leave room for both pagination actions in the native dialog.
+    const PAGE_SIZE: usize = 126;
+    const PREVIOUS: &str = "← Previous page";
+    const NEXT: &str = "Next page →";
+    loop {
+        let start = *page * PAGE_SIZE;
+        let end = (start + PAGE_SIZE).min(items.len());
+        let mut options = items[start..end].to_vec();
+        if *page > 0 {
+            options.push(PREVIOUS.into());
+        }
+        if end < items.len() {
+            options.push(NEXT.into());
+        }
+        let response = ui
+            .request(
+                UiRequest::Select {
+                    title: title.into(),
+                    options,
+                    timeout: None,
+                },
+                cancel.clone(),
+            )
+            .await
+            .map_err(|error| Error::Config(format!("MCP inspector UI failed: {error}")))?;
+        match response {
+            UiResponse::Text(value) if value == PREVIOUS && *page > 0 => *page -= 1,
+            UiResponse::Text(value) if value == NEXT && end < items.len() => *page += 1,
+            UiResponse::Text(value) => {
+                return Ok(items[start..end]
+                    .iter()
+                    .position(|item| item == &value)
+                    .map(|index| start + index));
+            }
+            _ => return Ok(None),
+        }
+    }
 }
 
 pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
@@ -1228,9 +1465,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             if value
                 .get("description")
                 .is_some_and(|field| !(field.is_string() || inherited_global && field.is_null()))
-                || value.get("timeout").is_some_and(|field| {
-                    !(inherited_global && field.is_null()) && field.as_u64().is_none()
-                })
+                || !inherited_global && value.get("timeout").is_some_and(Value::is_null)
             {
                 return Err(Error::Config("invalid MCP server configuration".into()));
             }
