@@ -26,6 +26,11 @@ const ID: &str = "codemode";
 const MODEL_OPERATION: &str = "pi_model_operation";
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_ITEMS: usize = 100_000;
+const MAX_PREVIEW_UNITS: usize = 100 * 1024;
+const MAX_INLINE_BYTES: usize = 7 * 1024 * 1024;
+// A code unit uses at most six bytes in a JSON string. Reserve space for
+// the preview and its warning before adding image metadata.
+const MAX_INLINE_IMAGE_LABEL_BYTES: usize = MAX_INLINE_BYTES - 6 * MAX_PREVIEW_UNITS - 4096;
 const WORKER_WAIT_LIMIT: Duration = Duration::from_secs(60);
 
 // Resizing never revokes a running worker. Excess permits are retired when
@@ -1154,23 +1159,50 @@ impl Output {
         ))
     }
 
-    // Visit the same text that finish() merges, without copying large outputs.
-    fn visit_report(
-        &self,
-        success: bool,
-        elapsed: Duration,
-        error: Option<&str>,
-        mut visit: impl FnMut(&str),
-    ) {
+    fn header(success: bool, elapsed: Duration) -> String {
+        format!(
+            "Script {}\nWall time: {:.3}s\n",
+            if success { "completed" } else { "failed" },
+            elapsed.as_secs_f64()
+        )
+    }
+
+    fn image_label(path: &Result<String, String>) -> String {
+        match path {
+            Ok(path) => format!("Image saved to {path}"),
+            Err(error) => format!("Image could not be saved: {error}"),
+        }
+    }
+
+    fn inline_image_label(path: &Result<String, String>, budget: &mut usize) -> Option<Value> {
+        let label = json!({"type":"text","text":Self::image_label(path)});
+        *budget = budget.checked_sub(label.to_string().len() + 1)?;
+        Some(label)
+    }
+
+    fn append_image_omissions(content: &mut Vec<Value>, omitted: usize, omitted_locations: usize) {
+        if omitted != 0 {
+            content.push(json!({"type":"text","text":format!("{omitted} image(s) omitted from inline output because of the result size limit. Image locations and save errors are included in the text output.")}));
+        }
+        if omitted_locations != 0 {
+            content.push(json!({"type":"text","text":format!("{omitted_locations} image(s) and their locations omitted from inline output because of the result size limit.")}));
+        }
+    }
+
+    // With a header, visit the native transcript. Without one, visit the text
+    // charged to the preview budget, joining text groups across images once.
+    fn visit_report(&self, header: Option<&str>, error: Option<&str>, mut visit: impl FnMut(&str)) {
         struct State {
             has_text: bool,
             after_image: bool,
             ends_newline: bool,
+            transcript: bool,
         }
         fn block(state: &mut State, visit: &mut impl FnMut(&str), parts: &[&str]) {
             let first = parts.iter().find(|s| !s.is_empty()).copied().unwrap_or("");
             if state.has_text
-                && (state.after_image || (!state.ends_newline && !first.starts_with('\n')))
+                && (state.after_image
+                    || (!state.ends_newline && (!state.transcript || !first.starts_with('\n'))))
             {
                 visit("\n");
                 if !state.after_image {
@@ -1183,7 +1215,7 @@ impl Output {
             if let Some(last) = parts.iter().rev().find(|s| !s.is_empty()) {
                 state.ends_newline = last.ends_with('\n');
             } else if state.after_image || !state.has_text {
-                state.ends_newline = false;
+                state.ends_newline = !state.transcript;
             }
             state.has_text = true;
             state.after_image = false;
@@ -1192,13 +1224,11 @@ impl Output {
             has_text: false,
             after_image: false,
             ends_newline: false,
+            transcript: header.is_some(),
         };
-        let header = format!(
-            "Script {}\nWall time: {:.3}s\n",
-            if success { "completed" } else { "failed" },
-            elapsed.as_secs_f64()
-        );
-        block(&mut state, &mut visit, &[&header]);
+        if let Some(header) = header {
+            block(&mut state, &mut visit, &[header]);
+        }
         let count = self
             .items
             .iter()
@@ -1217,11 +1247,9 @@ impl Output {
                     block(&mut state, &mut visit, &[&label, text]);
                 }
                 Item::Image { path, .. } => {
-                    let label = match path {
-                        Ok(path) => format!("Image saved to {path}"),
-                        Err(error) => format!("Image could not be saved: {error}"),
-                    };
-                    block(&mut state, &mut visit, &[&label]);
+                    if state.transcript {
+                        block(&mut state, &mut visit, &[&Self::image_label(path)]);
+                    }
                     state.after_image = true;
                 }
             }
@@ -1246,6 +1274,40 @@ impl Output {
         }
     }
 
+    fn spill_report(
+        &self,
+        header: &str,
+        error: Option<&str>,
+        cancellation: &pi_rs_core::CancellationToken,
+    ) -> (String, Option<String>, Option<tempfile::NamedTempFile>) {
+        let mut file = tempfile::Builder::new()
+            .prefix("pi-output-")
+            .suffix(".txt")
+            .tempfile();
+        if file.is_ok() {
+            self.visit_report(Some(header), error, |part| {
+                visit_chunks(part, cancellation, |part| {
+                    if let Ok(output) = &mut file
+                        && let Err(error) = output.write_all(part.as_bytes())
+                    {
+                        file = Err(error);
+                    }
+                });
+            });
+        }
+        match file {
+            Ok(file) => {
+                let path = file.path().to_string_lossy().into_owned();
+                (format!("Full output: {path}"), Some(path), Some(file))
+            }
+            Err(error) => (
+                format!("Could not save the full output: {error}"),
+                None,
+                None,
+            ),
+        }
+    }
+
     fn finish_truncated(
         &self,
         success: bool,
@@ -1255,24 +1317,14 @@ impl Output {
         units: usize,
         cancellation: &pi_rs_core::CancellationToken,
     ) -> Option<FormattedOutput> {
-        let mut file = tempfile::Builder::new()
-            .prefix("pi-output-")
-            .suffix(".txt")
-            .tempfile();
         let mut head = String::new();
         let mut tail = String::new();
         let mut offset = 0usize;
         let mut newlines = 0usize;
-        let mut last = None;
         let head_limit = maximum / 2;
         let tail_start = units - (maximum - head_limit);
-        self.visit_report(success, elapsed, error, |part| {
+        self.visit_report(None, error, |part| {
             visit_chunks(part, cancellation, |part| {
-                if let Ok(output) = &mut file
-                    && let Err(error) = output.write_all(part.as_bytes())
-                {
-                    file = Err(error);
-                }
                 let part_units = part.encode_utf16().count();
                 let end = offset + part_units;
                 if end <= head_limit {
@@ -1289,53 +1341,55 @@ impl Output {
                 }
                 offset = end;
                 newlines += part.bytes().filter(|byte| *byte == b'\n').count();
-                if !part.is_empty() {
-                    last = part.chars().next_back();
-                }
             })
         });
+        let header = Self::header(success, elapsed);
+        let (location, path, transcript) = self.spill_report(&header, error, cancellation);
         if cancellation.is_cancelled() {
             return None;
         }
-        let lines = newlines + usize::from(last.is_some_and(|last| last != '\n'));
-        let (location, path, transcript) = match file {
-            Ok(file) => {
-                let path = file.path().to_string_lossy().into_owned();
-                (format!("Full output: {path}"), Some(path), Some(file))
-            }
-            Err(error) => (
-                format!("Could not save the full output: {error}"),
-                None,
-                None,
-            ),
-        };
+        let lines = newlines + 1;
         let report = format!(
-            "Warning: truncated output (original token count: {})\nTotal output lines: {lines}\n\n{head}…{} tokens truncated…{tail}\n\n[{location}]",
+            "{header}Warning: truncated output (original token count: {})\nTotal output lines: {lines}\n\n{head}…{} tokens truncated…{tail}\n\n[{location}]",
             units.div_ceil(4),
             (units - maximum).div_ceil(4)
         );
         let text_block = json!({"type":"text","text":report});
-        let mut budget = (7 * 1024 * 1024_usize).saturating_sub(text_block.to_string().len());
+        let mut omitted_locations = 0;
+        let mut label_budget = MAX_INLINE_IMAGE_LABEL_BYTES;
+        let images = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                let Item::Image { mime, data, path } = item else {
+                    return None;
+                };
+                let label = Self::inline_image_label(path, &mut label_budget);
+                omitted_locations += usize::from(label.is_none());
+                label.map(|label| (mime, data, label))
+            })
+            .collect::<Vec<_>>();
+        let label_size = MAX_INLINE_IMAGE_LABEL_BYTES - label_budget;
+        let mut budget = MAX_INLINE_BYTES
+            .saturating_sub(text_block.to_string().len())
+            .saturating_sub(label_size);
         let mut content = vec![text_block];
         let mut omitted = 0;
-        for item in &self.items {
-            if let Item::Image { mime, data, .. } = item {
-                // Image data is validated base64 (ASCII), so JSON adds no escaping.
-                let size = json!({"type":"image","mimeType":mime,"data":""})
-                    .to_string()
-                    .len()
-                    .saturating_add(data.len());
-                if size > budget {
-                    omitted += 1;
-                } else {
-                    budget -= size;
-                    content.push(json!({"type":"image","mimeType":mime,"data":data}));
-                }
+        for (mime, data, label) in images {
+            content.push(label);
+            // Image data is validated base64 (ASCII), so JSON adds no escaping.
+            let size = json!({"type":"image","mimeType":mime,"data":""})
+                .to_string()
+                .len()
+                .saturating_add(data.len() + 1);
+            if size > budget {
+                omitted += 1;
+            } else {
+                budget -= size;
+                content.push(json!({"type":"image","mimeType":mime,"data":data}));
             }
         }
-        if omitted != 0 {
-            content.push(json!({"type":"text","text":format!("{omitted} image(s) omitted from inline output because of the result size limit. Image locations and save errors are included in the text output.")}));
-        }
+        Self::append_image_omissions(&mut content, omitted, omitted_locations);
         let mut result = json!({"content":content,"isError":!success,"full_output_path":path,"wall_time_seconds":elapsed.as_secs_f64()});
         if self.model_usage.measured() {
             result["usage"] = json!(self.model_usage);
@@ -1406,9 +1460,9 @@ impl Output {
         tokens: usize,
         cancellation: &pi_rs_core::CancellationToken,
     ) -> Option<FormattedOutput> {
-        let maximum = tokens.saturating_mul(4).min(100 * 1024);
+        let maximum = tokens.saturating_mul(4).min(MAX_PREVIEW_UNITS);
         let mut units = 0usize;
-        self.visit_report(success, elapsed, error, |part| {
+        self.visit_report(None, error, |part| {
             visit_chunks(part, cancellation, |chunk| {
                 units = units.saturating_add(chunk.encode_utf16().count())
             })
@@ -1419,15 +1473,15 @@ impl Output {
         if units > maximum {
             return self.finish_truncated(success, elapsed, error, maximum, units, cancellation);
         }
-        let mut content = vec![json!({"type":"text","text":format!(
-            "Script {}\nWall time: {:.3}s\n",
-            if success { "completed" } else { "failed" }, elapsed.as_secs_f64()
-        )})];
+        let header = Self::header(success, elapsed);
+        let mut content = vec![json!({"type":"text","text":header})];
         let text_count = self
             .items
             .iter()
             .filter(|item| matches!(item, Item::Text(_)))
             .count();
+        let mut label_budget = MAX_INLINE_IMAGE_LABEL_BYTES;
+        let mut omitted_locations = 0;
         let mut index = 0;
         for item in &self.items {
             match item {
@@ -1441,12 +1495,12 @@ impl Output {
                     content.push(json!({"type":"text","text":text}));
                 }
                 Item::Image { mime, data, path } => {
-                    let label = match path {
-                        Ok(path) => format!("Image saved to {path}"),
-                        Err(error) => format!("Image could not be saved: {error}"),
-                    };
-                    content.push(json!({"type":"text","text":label}));
-                    content.push(json!({"type":"image","mimeType":mime,"data":data}));
+                    if let Some(label) = Self::inline_image_label(path, &mut label_budget) {
+                        content.push(label);
+                        content.push(json!({"type":"image","mimeType":mime,"data":data}));
+                    } else {
+                        omitted_locations += 1;
+                    }
                 }
             }
         }
@@ -1478,15 +1532,15 @@ impl Output {
         let text_size = content
             .iter()
             .filter(|block| block["type"] == "text")
-            .map(|block| block.to_string().len())
+            .map(|block| block.to_string().len() + 1)
             .sum::<usize>();
-        let mut image_budget = (7 * 1024 * 1024_usize).saturating_sub(text_size);
+        let mut image_budget = MAX_INLINE_BYTES.saturating_sub(text_size);
         let mut omitted = 0;
         content.retain(|block| {
             if block["type"] != "image" {
                 return true;
             }
-            let size = block.to_string().len();
+            let size = block.to_string().len() + 1;
             if size > image_budget {
                 omitted += 1;
                 return false;
@@ -1494,16 +1548,27 @@ impl Output {
             image_budget -= size;
             true
         });
-        if omitted != 0 {
-            content.push(json!({"type":"text","text":format!("{omitted} image(s) omitted from inline output because of the result size limit. Image locations and save errors are included in the text output.")}));
+        Self::append_image_omissions(&mut content, omitted, omitted_locations);
+        let (path, transcript) = if omitted_locations == 0 {
+            (None, None)
+        } else {
+            let (location, path, transcript) = self.spill_report(&header, error, cancellation);
+            // Publication updates the spill location in the first text block
+            // if keeping the temporary file fails.
+            let report = content[0]["text"].as_str().unwrap_or_default();
+            content[0]["text"] = json!(format!("{report}\n\n[{location}]"));
+            (path, transcript)
+        };
+        if cancellation.is_cancelled() {
+            return None;
         }
-        let mut result = json!({"content":content,"isError":!success,"full_output_path":null,"wall_time_seconds":elapsed.as_secs_f64()});
+        let mut result = json!({"content":content,"isError":!success,"full_output_path":path,"wall_time_seconds":elapsed.as_secs_f64()});
         if self.model_usage.measured() {
             result["usage"] = json!(self.model_usage);
         }
         Some(FormattedOutput {
             value: result,
-            transcript: None,
+            transcript,
         })
     }
 }
@@ -2998,9 +3063,11 @@ mod tests {
             ..Output::default()
         };
         let mut streamed = String::new();
-        output.visit_report(false, Duration::ZERO, Some("failure"), |part| {
-            streamed.push_str(part)
-        });
+        output.visit_report(
+            Some(&Output::header(false, Duration::ZERO)),
+            Some("failure"),
+            |part| streamed.push_str(part),
+        );
         let result = output
             .finish(
                 false,
@@ -3035,12 +3102,106 @@ mod tests {
     }
 
     #[test]
+    fn preview_budget_excludes_status_and_image_locations() {
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let mut output = Output::default();
+        let preview = |output: &Output, tokens| {
+            output
+                .finish(true, Duration::ZERO, None, tokens, &cancellation)
+                .unwrap()
+                .deliver()
+        };
+        let silent = preview(&output, 0);
+        assert!(silent["full_output_path"].is_null());
+        assert_eq!(
+            silent["content"][0]["text"],
+            Output::header(true, Duration::ZERO)
+        );
+
+        let label = "Image saved to /tmp/a-lengthy-image-path.png";
+        output.items.push(Item::Image {
+            mime: "image/png".into(),
+            data: "image".into(),
+            path: Ok("/tmp/a-lengthy-image-path.png".into()),
+        });
+        let image_only = preview(&output, 0);
+        assert!(image_only["full_output_path"].is_null());
+        assert!(
+            image_only["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with(label)
+        );
+        assert_eq!(image_only["content"][1]["type"], "image");
+
+        output.items.insert(0, Item::Text("abcd".into()));
+        assert!(preview(&output, 1)["full_output_path"].is_null());
+        let Item::Text(text) = &mut output.items[0] else {
+            unreachable!()
+        };
+        text.push('\n');
+        let truncated = preview(&output, 1);
+        let content = truncated["content"].as_array().unwrap();
+        let report = content[0]["text"].as_str().unwrap();
+        assert!(report.starts_with(&Output::header(true, Duration::ZERO)));
+        assert!(report.contains("original token count: 2"));
+        assert!(report.contains("Total output lines: 2\n\nab…1 tokens truncated…d\n"));
+        assert_eq!(content[1]["text"], label);
+        assert_eq!(content[2]["type"], "image");
+        let path = truncated["full_output_path"].as_str().unwrap();
+        let transcript = std::fs::read_to_string(path).unwrap();
+        assert!(transcript.ends_with(&format!("abcd\n{label}")));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn repeated_image_locations_respect_the_native_result_limit() {
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let path = format!("/tmp/{}/image.png", "folder/".repeat(130));
+        let mut output = Output::default();
+        let images = MAX_INLINE_IMAGE_LABEL_BYTES / path.len() + 1;
+        for _ in 0..images {
+            output.items.push(Item::Image {
+                mime: "image/png".into(),
+                data: "iVBORw0KGgo=".into(),
+                path: Ok(path.clone()),
+            });
+        }
+
+        for text in [None, Some("text exceeds a one-token budget")] {
+            if let Some(text) = text {
+                output.items.push(Item::Text(text.into()));
+            }
+            let result = output
+                .finish(true, Duration::ZERO, None, 1, &cancellation)
+                .unwrap()
+                .deliver();
+            assert!(result.to_string().len() <= MAX_INLINE_BYTES);
+            let content = result["content"].as_array().unwrap();
+            assert!(content.iter().any(|block| {
+                block["text"]
+                    .as_str()
+                    .is_some_and(|line| line.contains("and their locations omitted"))
+            }));
+            let transcript_path = result["full_output_path"].as_str().unwrap();
+            assert!(
+                content[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("[Full output: {transcript_path}]"))
+            );
+            let transcript = std::fs::read_to_string(transcript_path).unwrap();
+            assert_eq!(transcript.matches(&path).count(), images);
+            std::fs::remove_file(transcript_path).unwrap();
+        }
+    }
+
+    #[test]
     fn output_budget_counts_utf16_and_keeps_supplementary_characters_intact() {
         let cancellation = pi_rs_core::CancellationToken::new();
         let header = "Script completed\nWall time: 0.000s\n";
-        let header_units = header.encode_utf16().count();
         let budget = 40;
-        let fits = "😀".repeat((budget - header_units) / 2);
+        let fits = "😀".repeat(budget / 2);
         let output = |text| Output {
             items: vec![Item::Text(text)],
             ..Output::default()
@@ -3051,7 +3212,7 @@ mod tests {
             .deliver();
         assert!(fitting["full_output_path"].is_null());
         let overflowing = format!("{fits}😀");
-        assert!(header_units + overflowing.chars().count() <= budget);
+        assert!(overflowing.chars().count() <= budget);
         let truncated = output(overflowing)
             .finish(true, Duration::ZERO, None, budget / 4, &cancellation)
             .unwrap()
@@ -3060,10 +3221,10 @@ mod tests {
         std::fs::remove_file(path).unwrap();
 
         let budget = 80;
-        let prefix = "x".repeat(budget / 2 - header_units - 1);
+        let prefix = "x".repeat(budget / 2 - 1);
         let suffix = "z".repeat(budget / 2 - 1);
         let text = format!("{prefix}😀{}😀{suffix}", "mid".repeat(20));
-        let units = header_units + text.encode_utf16().count();
+        let units = text.encode_utf16().count();
         let result = output(text.clone())
             .finish(true, Duration::ZERO, None, budget / 4, &cancellation)
             .unwrap()
@@ -3071,9 +3232,7 @@ mod tests {
         let report = result["content"][0]["text"].as_str().unwrap();
         let omitted = (units - budget).div_ceil(4);
         assert!(report.contains(&format!("original token count: {}", units.div_ceil(4))));
-        assert!(report.contains(&format!(
-            "{header}{prefix}…{omitted} tokens truncated…{suffix}"
-        )));
+        assert!(report.contains(&format!("{prefix}…{omitted} tokens truncated…{suffix}")));
         assert!(!report.contains('😀'));
         let path = result["full_output_path"].as_str().unwrap();
         assert_eq!(

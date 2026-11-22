@@ -1819,9 +1819,13 @@ its default `Duration::MAX` means no deadline, while other values set a limit.
 to `SessionBuilder::limits` enforces that timeout for Codemode too. Direct
 `Agent` users retain their configured timeout unless they explicitly opt out
 through the registry. Nested tools retain their own limits. Large text output
-is saved to a local file. The preview counts UTF-16 code units, as in Pi
-1.6.0. When a head or tail boundary falls inside a supplementary character,
-the preview omits that whole character and the saved output keeps it.
+is saved to a local file. Like Pi 1.6.0, the preview counts UTF-16 code units
+in script output and keeps the status header and image locations outside
+the preview budget. When a head or tail boundary falls inside a supplementary
+character, the preview omits that whole character and the saved output keeps it.
+The native full transcript also records the status header and image locations.
+If the native result size limit omits inline image locations, a transcript
+includes every location.
 
 MCP tools default to codemode exposure. `--exposure direct`, `deferred`,
 `codemode` and `hidden` select another mode when adding a server. The root
