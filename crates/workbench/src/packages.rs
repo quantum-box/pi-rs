@@ -2618,19 +2618,36 @@ async fn capture(mut stream: impl AsyncRead + Unpin, limit: usize) -> Result<(Ve
     }
     Ok((output, overflow))
 }
-fn package_command_failed(source: &str, status: &str, stderr: &[u8]) -> Error {
+fn package_command_failed(source: &str, status: &str, stderr: &[u8], git: bool) -> Error {
+    let stderr = String::from_utf8_lossy(stderr);
+    let hint = if git && git_needs_credentials(&stderr) {
+        "\nGit cannot ask for a password or passphrase while pi runs. Set up a Git credential helper or an SSH agent."
+    } else {
+        ""
+    };
     // Subprocesses can echo the whole URL or just part of its userinfo.
     // Keep status but never expose their stderr for such sources.
     if display_source(source) != source {
         Error::Config(format!(
-            "package command failed ({status}); subprocess output redacted"
+            "package command failed ({status}); subprocess output redacted{hint}"
         ))
     } else {
-        Error::Config(format!(
-            "package command failed ({status}): {}",
-            String::from_utf8_lossy(stderr)
-        ))
+        Error::Config(format!("package command failed ({status}): {stderr}{hint}"))
     }
+}
+
+fn git_needs_credentials(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    [
+        "terminal prompts disabled",
+        "could not read username",
+        "could not read password",
+        "permission denied (publickey",
+        "host key verification failed",
+        "passphrase",
+    ]
+    .iter()
+    .any(|message| stderr.contains(message))
 }
 
 // Tokio's kill-on-drop only terminates the direct child on Unix. Keep the
@@ -2659,6 +2676,15 @@ async fn run(
     source: &str,
     cleanup: Option<&Children>,
 ) -> Result<Vec<u8>> {
+    // Package commands are captured in both the terminal UI and native CLI.
+    // Git and ssh therefore have no prompt the caller can answer.
+    let git = command.as_std().get_program() == "git";
+    if git {
+        command.env("GIT_TERMINAL_PROMPT", "0");
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+            command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+        }
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2691,7 +2717,12 @@ async fn run(
         .map_err(|_| Error::Config("package command timed out".into()))??;
     process.child.take();
     if !status.success() {
-        return Err(package_command_failed(source, &status.to_string(), &stderr));
+        return Err(package_command_failed(
+            source,
+            &status.to_string(),
+            &stderr,
+            git,
+        ));
     }
     if overflow {
         return Err(Error::Config("package command output exceeds limit".into()));
@@ -5142,7 +5173,8 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         let error = package_command_failed(
             "git:ssh://private-user@example.invalid/org/repo",
             "exit status: 1",
-            b"helper echoed private-user",
+            b"private-user@example.invalid: Permission denied (publickey).",
+            true,
         )
         .to_string();
         assert!(!error.contains("private-user"), "{error}");
@@ -5150,13 +5182,19 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
             error.contains("exit status: 1") && error.contains("redacted"),
             "{error}"
         );
+        assert!(
+            error.contains("credential helper or an SSH agent"),
+            "{error}"
+        );
         let error = package_command_failed(
             "git:https://example.invalid/org/repo",
             "exit status: 1",
             b"useful error",
+            true,
         )
         .to_string();
         assert!(error.contains("useful error"), "{error}");
+        assert!(!error.contains("credential helper"), "{error}");
     }
 
     #[tokio::test]
@@ -5172,6 +5210,34 @@ printf '%s\n' '{"version":1,"response":{"Ok":{"id":"single","dependencies":[],"c
         );
         assert!(error.contains("[redacted]@example.invalid"), "{error}");
         assert!(!error.contains("ssh://git@"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn captured_git_package_commands_disable_prompts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let git = root.path().join("git");
+        std::fs::write(
+            &git,
+            "#!/bin/sh\nprintf '%s\\n%s' \"$GIT_TERMINAL_PROMPT\" \"$GIT_SSH_COMMAND\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = tokio::process::Command::new("git");
+        command
+            .current_dir(root.path())
+            .env("PATH", root.path())
+            .env("GIT_TERMINAL_PROMPT", "1");
+        let output = run(command, "git:https://example.invalid/org/repo", None)
+            .await
+            .unwrap();
+        let expected_ssh =
+            std::env::var_os("GIT_SSH_COMMAND").unwrap_or_else(|| "ssh -o BatchMode=yes".into());
+        let mut expected = b"0\n".to_vec();
+        expected.extend_from_slice(expected_ssh.as_encoded_bytes());
+        assert_eq!(output, expected);
     }
 
     #[tokio::test]

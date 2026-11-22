@@ -344,6 +344,7 @@ impl OpenAiResponses {
         })?;
         let mut client = Self::new_api_provider(endpoint, token, provider)?;
         client.codex_account = Some(account);
+        client.use_developer_role = true;
         client.codex_off_effort = Some("none".into());
         client.strict_tool_support = true;
         Ok(client)
@@ -494,17 +495,23 @@ impl OpenAiResponses {
     }
 
     fn configuration_update_effort(&self, model: &str) -> Option<&str> {
-        if !self.configuration_update_thinking
-            || !self.configuration_update_models.contains(model)
-            || self.codex_account.is_some()
+        if !self.configuration_update_models.contains(model)
             || self.provider == "openai-chatgpt"
+            || (self.codex_account.is_none() && !self.configuration_update_thinking)
             || (self.provider == "openai"
                 && self.endpoint.as_str() == DEFAULT_ENDPOINT
                 && !self.token.starts_with("sk-"))
         {
             return None;
         }
-        self.thinking.as_deref().filter(|effort| !effort.is_empty())
+        let codex_off = self
+            .codex_account
+            .as_ref()
+            .and(self.codex_off_effort.as_deref());
+        self.thinking
+            .as_deref()
+            .or(codex_off)
+            .filter(|effort| !effort.is_empty())
     }
 
     /// Set endpoint-wide strict JSON Schema tool support for this client.
@@ -537,8 +544,8 @@ impl OpenAiResponses {
         self
     }
 
-    /// Select whether model instructions use the developer role. Defaults to
-    /// the system role when model reasoning capability is not supplied.
+    /// Select whether model instructions use the developer role. Codex defaults
+    /// to developer; ordinary Responses defaults to system.
     pub fn with_developer_role(mut self, enabled: bool) -> Self {
         self.use_developer_role = enabled;
         self
@@ -914,6 +921,89 @@ fn responses_transcript(
             })
             .map(Cow::Borrowed),
     )
+}
+
+fn codex_sse_error_details(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    complete: bool,
+    secrets: &[String],
+) -> Result<(Value, pi_rs_core::ProviderLimitInfo)> {
+    let info = pi_rs_core::provider_limit_info_from_bytes(body, complete, secrets);
+    if info.permanent {
+        return Err(responses_limit_error(status, info));
+    }
+    let error = serde_json::from_slice(body).unwrap_or_else(|_| {
+        let text = String::from_utf8_lossy(body);
+        if !complete || text.trim_start().starts_with(['{', '[']) {
+            Value::Null
+        } else {
+            Value::String(text.into_owned())
+        }
+    });
+    if status.is_client_error()
+        && status.as_u16() != 429
+        && pi_rs_core::provider_context_overflow(&error, secrets)
+    {
+        return Err(Error::Model("context window exceeded".into()));
+    }
+    Ok((error, info))
+}
+
+fn responses_limit_error(
+    status: reqwest::StatusCode,
+    info: pi_rs_core::ProviderLimitInfo,
+) -> Error {
+    if info.permanent {
+        match info.recognized_code {
+            Some(code @ "subscription_sharing_usage_limit_exceeded") => {
+                response_error(Some(code), Some(status))
+            }
+            _ => Error::Model("OpenAI account quota or billing limit reached".into()),
+        }
+    } else if info.recognized_code.is_some() {
+        response_error(info.recognized_code, Some(status))
+    } else {
+        Error::RetryableModel(format!("OpenAI request failed ({status})"))
+    }
+}
+
+fn codex_sse_transient_message(error: &Value, secrets: &[String]) -> bool {
+    static PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            "(?i)rate.?limit|overloaded|service.?unavailable|upstream.?connect|connection.?refused",
+        )
+        .expect("valid Codex retry pattern")
+    });
+    let sanitized = pi_rs_core::sanitized_provider_error(error, secrets);
+    let error = sanitized.get("error").unwrap_or(&sanitized);
+    if let Some(message) = error.as_str() {
+        return PATTERN.is_match(message);
+    }
+    ["message", "code", "type", "errorMessage"]
+        .into_iter()
+        .filter_map(|key| error[key].as_str())
+        .any(|message| PATTERN.is_match(message))
+}
+
+async fn read_codex_retry_error(mut response: reqwest::Response) -> (Vec<u8>, bool) {
+    const LIMIT: usize = 64 * 1024;
+    let mut body = Vec::new();
+    let complete = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while body.len() < LIMIT {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    body.extend_from_slice(&chunk[..chunk.len().min(LIMIT - body.len())]);
+                }
+                Ok(None) => return true,
+                Err(_) => break,
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    (body, complete)
 }
 
 fn configuration_update(effort: &str) -> Value {
@@ -1646,6 +1736,60 @@ impl OpenAiResponses {
         self.stream_enriched_with_tools(request, None).await
     }
 
+    async fn send_codex_sse<Attempt>(
+        &self,
+        mut attempt: impl FnMut() -> Attempt,
+        error_secrets: &[String],
+    ) -> Result<reqwest::Response>
+    where
+        Attempt: Future<Output = Result<reqwest::Response>>,
+    {
+        let retry = self.provider_retry;
+        for index in 0..=retry.max_retries {
+            let result = match retry.timeout.filter(|timeout| !timeout.is_zero()) {
+                Some(timeout) => tokio::time::timeout(timeout, attempt())
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Error::RetryableModel(format!(
+                            "Codex SSE response headers timed out after {}ms",
+                            timeout.as_millis()
+                        )))
+                    }),
+                None => attempt().await,
+            };
+            if index == retry.max_retries {
+                return result;
+            }
+            let delay = match result {
+                Ok(response) if response.status().is_success() => return Ok(response),
+                Ok(response) => {
+                    let status = response.status();
+                    let headers = response.headers().clone();
+                    pi_rs_core::observe_provider_response(
+                        status,
+                        &headers,
+                        error_secrets,
+                        &self.headers,
+                    )
+                    .await;
+                    if status.as_u16() == 413 {
+                        return Err(Error::Model("413 request too large".into()));
+                    }
+                    let (body, complete) = read_codex_retry_error(response).await;
+                    let (error, _) =
+                        codex_sse_error_details(status, &body, complete, error_secrets)?;
+                    let use_server_delay = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+                        || codex_sse_transient_message(&error, error_secrets);
+                    retry.codex_sse_delay(use_server_delay.then_some(&headers), index)?
+                }
+                Err(Error::RetryableModel(_)) => retry.codex_sse_delay(None, index)?,
+                Err(error) => return Err(error),
+            };
+            tokio::time::sleep(delay).await;
+        }
+        unreachable!("the last request returns its result")
+    }
+
     async fn open_sse(
         &self,
         body: &Value,
@@ -1693,27 +1837,31 @@ impl OpenAiResponses {
             None => request.json(body),
         };
         let request = request.header(reqwest::header::ACCEPT, "text/event-stream");
-        let retry = if self.codex_account.is_some() || self.provider == "openai-chatgpt" {
-            pi_rs_core::ProviderRetry::default()
-        } else {
-            self.provider_retry
+        let attempt = || {
+            let request = request
+                .try_clone()
+                .ok_or_else(|| Error::Config("OpenAI request cannot be replayed".into()));
+            async {
+                request?
+                    .send()
+                    .await
+                    .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))
+            }
         };
-        let mut response = retry
-            .send(
-                || {
-                    let request = request
-                        .try_clone()
-                        .ok_or_else(|| Error::Config("OpenAI request cannot be replayed".into()));
-                    async {
-                        request?
-                            .send()
-                            .await
-                            .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))
-                    }
-                },
-                |response| (response.status().as_u16(), response.headers()),
-            )
-            .await?;
+        let mut response = if self.codex_account.is_some() {
+            self.send_codex_sse(attempt, error_secrets).await?
+        } else {
+            let retry = if self.provider == "openai-chatgpt" {
+                pi_rs_core::ProviderRetry::default()
+            } else {
+                self.provider_retry
+            };
+            retry
+                .send(attempt, |response| {
+                    (response.status().as_u16(), response.headers())
+                })
+                .await?
+        };
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
@@ -1726,20 +1874,23 @@ impl OpenAiResponses {
             if status.as_u16() == 413 {
                 return Err(Error::Model("413 request too large".into()));
             }
+            if self.codex_account.is_some() {
+                let (body, complete) = read_codex_retry_error(response).await;
+                let (error, info) =
+                    codex_sse_error_details(status, &body, complete, error_secrets)?;
+                if status.as_u16() == 429 || status.is_server_error() {
+                    return Err(responses_limit_error(status, info));
+                }
+                let error = pi_rs_core::sanitized_provider_error(&error, error_secrets);
+                return Err(response_error(
+                    error["error"]["code"].as_str(),
+                    Some(status),
+                ));
+            }
             if status.as_u16() == 429 || status.is_server_error() {
                 let info =
                     pi_rs_core::provider_limit_info(response.bytes_stream(), error_secrets).await;
-                return Err(if info.permanent {
-                    if info.recognized_code == Some("subscription_sharing_usage_limit_exceeded") {
-                        response_error(info.recognized_code, Some(status))
-                    } else {
-                        Error::Model("OpenAI account quota or billing limit reached".into())
-                    }
-                } else if info.recognized_code.is_some() {
-                    response_error(info.recognized_code, Some(status))
-                } else {
-                    Error::RetryableModel(format!("OpenAI request failed ({status})"))
-                });
+                return Err(responses_limit_error(status, info));
             }
             let mut bytes = Vec::new();
             while let Ok(Some(chunk)) = response.chunk().await {
@@ -1870,12 +2021,11 @@ impl OpenAiResponses {
             };
         }
         let provider = self.provider.clone();
-        if let Some(thinking) = &self.thinking {
-            let effort = if active_effort.is_some() {
-                "medium"
-            } else {
-                thinking
-            };
+        if let Some(effort) = active_effort
+            .as_ref()
+            .map(|_| "medium")
+            .or(self.thinking.as_deref())
+        {
             body["reasoning"] = json!({"effort":effort,"summary":"auto"});
             body["include"] = json!(["reasoning.encrypted_content"]);
         } else if let Some(off) = self
@@ -2166,6 +2316,200 @@ impl OpenAiResponses {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn codex_sse_retries_transient_errors_and_preserves_terminal_limits() {
+        for (max_retries, status, retry_headers, body, attempts) in [
+            (
+                0,
+                503,
+                "Retry-After-Ms: 0\r\n",
+                r#"{"error":{"code":"server_error"}}"#,
+                1,
+            ),
+            (
+                1,
+                503,
+                "Retry-After-Ms: 0\r\nX-Should-Retry: false\r\n",
+                r#"{"error":{"code":"server_error"}}"#,
+                2,
+            ),
+            (
+                1,
+                503,
+                "Retry-After: 61\r\n",
+                r#"{"error":{"code":"server_error"}}"#,
+                1,
+            ),
+            (
+                1,
+                429,
+                "Retry-After-Ms: 0\r\n",
+                r#"{"error":{"code":"insufficient_quota"}}"#,
+                1,
+            ),
+            (
+                1,
+                401,
+                "Retry-After: 61\r\n",
+                r#"{"error":{"code":"server_error"}}"#,
+                2,
+            ),
+        ] {
+            assert_codex_sse_retry(max_retries, status, retry_headers, body, attempts).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_sse_limits_preserve_bounded_quota_and_error_message_hints() {
+        let oversized = format!(
+            r#"{{"error":{{"code":"insufficient_quota"}},"metadata":"{}"}}"#,
+            "X".repeat(64 * 1024),
+        );
+        assert_codex_sse_retry(1, 429, "Retry-After-Ms: 0\r\n", &oversized, 1).await;
+        assert_codex_sse_retry(
+            1,
+            400,
+            "Retry-After: 61\r\n",
+            r#"{"error":{"errorMessage":"service unavailable"}}"#,
+            1,
+        )
+        .await;
+        assert_codex_sse_retry(
+            1, 429, "Retry-After-Ms: 0\r\n",
+            r#"{"error":{"code":"subscription_sharing_usage_unavailable","message":"billing limit reached"}}"#,
+            1,
+        ).await;
+        assert_codex_sse_retry(
+            1,
+            400,
+            "Retry-After-Ms: 0\r\n",
+            r#"{"error":{"code":"context_length_exceeded"}}"#,
+            1,
+        )
+        .await;
+        assert_codex_sse_retry(
+            0, 400, "",
+            r#"{"error":{"code":"subscription_sharing_usage_unavailable","message":"billing limit reached"}}"#,
+            1,
+        ).await;
+        assert_codex_sse_retry(0, 400, "", "prompt is too long", 1).await;
+    }
+
+    #[tokio::test]
+    async fn codex_sse_attempt_timeout_does_not_require_retries() {
+        let account = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}"#);
+        let client = OpenAiResponses::new_codex(
+            "http://127.0.0.1:1/backend-api/codex/responses",
+            format!("e30.{account}.fixture"),
+            "openai-codex",
+        )
+        .unwrap()
+        .with_provider_retry(pi_rs_core::ProviderRetry {
+            timeout: Some(std::time::Duration::from_millis(1)),
+            ..Default::default()
+        });
+        let error = client
+            .send_codex_sse(std::future::pending, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableModel(message) if message.contains("response headers timed out"))
+        );
+    }
+
+    async fn assert_codex_sse_retry(
+        max_retries: u32,
+        status: u16,
+        retry_headers: &str,
+        error_body: &str,
+        expected_requests: usize,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/backend-api/codex/responses",
+            listener.local_addr().unwrap()
+        );
+        let first_reply = format!(
+            "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\n{retry_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{error_body}",
+            error_body.len(),
+        );
+        let server = tokio::spawn(async move {
+            let answer = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+            let second_reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+            for index in 0..expected_requests {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let reply = if index == 0 {
+                    &first_reply
+                } else {
+                    &second_reply
+                };
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+            // Keep the listener open long enough to catch an unexpected request.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let account = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}"#);
+        let client =
+            OpenAiResponses::new_codex(&endpoint, format!("e30.{account}.fixture"), "openai-codex")
+                .unwrap()
+                .with_codex_transport(CodexTransport::Sse)
+                .with_provider_retry(pi_rs_core::ProviderRetry {
+                    max_retries,
+                    ..Default::default()
+                });
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::User {
+                content: "hello".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 32,
+        };
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(4), client.stream(request))
+                .await
+                .unwrap();
+        if expected_requests == 2 {
+            let events = result.unwrap().collect::<Vec<_>>().await;
+            assert!(
+                events
+                    .into_iter()
+                    .any(|event| matches!(event, Ok(ModelEvent::Complete { .. })))
+            );
+        } else {
+            let Err(error) = result else {
+                panic!("expected to fail before streaming");
+            };
+            if retry_headers.contains("61") {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Server requested 61s retry delay")
+                );
+            } else if status == 429 || error_body.contains("billing limit reached") {
+                assert!(
+                    matches!(error, Error::Model(message) if message.contains("quota or billing"))
+                );
+            } else if error_body.contains("context_length_exceeded")
+                || error_body == "prompt is too long"
+            {
+                assert!(error.to_string().contains("context window exceeded"));
+            }
+        }
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn codex_sse_uses_subscription_headers_payload_and_completion_alias() {
         use std::io::{BufRead, BufReader, Read, Write};
@@ -4831,18 +5175,27 @@ mod tests {
 
     #[tokio::test]
     async fn responses_configuration_updates_preserve_effort_across_replies() {
+        assert_configuration_updates_preserve_effort(false).await;
+    }
+
+    #[tokio::test]
+    async fn codex_configuration_updates_keep_the_request_effort_stable_when_thinking_is_off() {
+        assert_configuration_updates_preserve_effort(true).await;
+    }
+
+    async fn assert_configuration_updates_preserve_effort(codex: bool) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             for (level, previous, incomplete) in [
                 ("low", None, false),
                 ("xhigh", Some("low"), true),
-                ("none", None, false),
+                ("none", codex.then_some("low"), false),
                 ("high", Some("low"), false),
             ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
-                let offset = loop {
+                let (offset, compressed) = loop {
                     let mut chunk = [0; 4096];
                     let read = socket.read(&mut chunk).await.unwrap();
                     assert!(read > 0);
@@ -4856,15 +5209,24 @@ mod tests {
                             })
                             .unwrap();
                         if bytes.len() >= pos + 4 + length {
-                            break pos + 4;
+                            break (
+                                pos + 4,
+                                headers.lines().any(|line| line == "content-encoding: zstd"),
+                            );
                         }
                     }
                 };
-                let body: Value = serde_json::from_slice(&bytes[offset..]).unwrap();
+                assert_eq!(compressed, codex);
+                let body: Value = if compressed {
+                    let decoded = zstd::bulk::decompress(&bytes[offset..], 65536).unwrap();
+                    serde_json::from_slice(&decoded).unwrap()
+                } else {
+                    serde_json::from_slice(&bytes[offset..]).unwrap()
+                };
                 let input = body["input"].as_array().unwrap();
                 assert_eq!(input[0]["role"], "user");
                 assert!(!body.to_string().contains("_pi_openai_effort"));
-                if level == "none" {
+                if level == "none" && !codex {
                     assert_eq!(body["reasoning"]["effort"], "none");
                     assert!(
                         !input
@@ -4886,11 +5248,17 @@ mod tests {
                         .iter()
                         .filter(|item| item["type"] == "configuration_update")
                         .collect();
+                    let mut expected = vec![configuration_update("low")];
+                    if codex {
+                        expected.push(configuration_update("none"));
+                    }
+                    expected.push(configuration_update("high"));
+                    assert!(updates.into_iter().eq(&expected));
+                    let reply_index = if codex { 6 } else { 5 };
                     assert_eq!(
-                        updates,
-                        [&configuration_update("low"), &configuration_update("high")]
+                        input[reply_index]["content"][0]["text"],
+                        "reply with thinking off"
                     );
-                    assert_eq!(input[5]["content"][0]["text"], "reply with thinking off");
                 }
                 let state = if incomplete {
                     "incomplete"
@@ -4931,9 +5299,17 @@ mod tests {
                 socket.write_all(reply.as_bytes()).await.unwrap();
             }
         });
-        let client = OpenAiResponses::new_api(&endpoint, "sk-fixture".into())
-            .unwrap()
-            .with_configuration_update_models(BTreeSet::from(["gpt-6-luna".into()]));
+        let client = if codex {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}"#,
+            );
+            OpenAiResponses::new_codex(&endpoint, format!("e30.{payload}.fixture"), "openai-codex")
+        } else {
+            OpenAiResponses::new_api(&endpoint, "sk-fixture".into())
+        }
+        .unwrap()
+        .with_codex_transport(CodexTransport::Sse)
+        .with_configuration_update_models(BTreeSet::from(["gpt-6-luna".into()]));
         let mut request = ModelRequest {
             model: "gpt-6-luna".into(),
             messages: vec![Message::User {
@@ -4947,9 +5323,10 @@ mod tests {
             max_output_tokens: 64,
         };
         for level in ["low", "xhigh", "off", "high"] {
+            let thinking = (!codex || level != "off").then_some(level);
             let mut stream = client
                 .clone()
-                .with_thinking(Some(level))
+                .with_thinking(thinking)
                 .stream(request.clone())
                 .await
                 .unwrap();
@@ -4966,7 +5343,11 @@ mod tests {
             }
             assert_eq!(
                 replay.as_deref().and_then(ProviderReplay::openai_effort),
-                (level != "off").then_some(level),
+                if level == "off" {
+                    codex.then_some("none")
+                } else {
+                    Some(level)
+                },
             );
             if level == "low" {
                 request.messages.extend([
@@ -5045,6 +5426,71 @@ mod tests {
                 .configuration_update_effort("gpt-6-luna"),
             None
         );
+    }
+
+    #[test]
+    fn codex_effort_requires_a_configured_mapping_and_model() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}"#);
+        let client = OpenAiResponses::new_codex(
+            CODEX_ENDPOINT,
+            format!("e30.{payload}.fixture"),
+            "openai-codex",
+        )
+        .unwrap()
+        .with_configuration_update_models(BTreeSet::from(["gpt-6-luna".into()]));
+        assert_eq!(
+            client.configuration_update_effort("gpt-6-luna"),
+            Some("none")
+        );
+        assert_eq!(client.configuration_update_effort("unlisted"), None);
+        assert_eq!(
+            client
+                .clone()
+                .with_codex_off_effort(None)
+                .configuration_update_effort("gpt-6-luna"),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_uses_the_selected_instruction_role_and_omits_empty_system_text() {
+        let request = ModelRequest {
+            model: "gpt-6.2-sol".into(),
+            tools: vec![],
+            max_output_tokens: 32,
+            messages: vec![
+                Message::System {
+                    content: String::new(),
+                },
+                Message::User {
+                    content: "prompt".into(),
+                },
+                Message::System {
+                    content: "follow-up instruction".into(),
+                },
+            ],
+        };
+        for role in ["developer", "system"] {
+            let body = responses_payload(
+                &request,
+                "openai-codex",
+                "route",
+                role,
+                pi_rs_core::ModelApi::OpenaiCodexResponses,
+                true,
+                Some("high"),
+            );
+            assert!(body.get("instructions").is_none());
+            assert_eq!(
+                body["input"],
+                json!([
+                    {"role":"user","content":"prompt"},
+                    {"role":role,"content":"follow-up instruction"},
+                    configuration_update("high")
+                ])
+            );
+        }
     }
 
     #[test]
