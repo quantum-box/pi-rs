@@ -126,6 +126,73 @@ fn output_until_with_timeout(
 }
 
 #[test]
+fn auth_login_uses_a_hidden_prompt_and_saves_the_selected_endpoint() {
+    let root = tempfile::tempdir().unwrap();
+    let models = serde_json::json!({"providers":{"relay":{
+        "name":"Fixture Relay", "api":"openai-completions",
+        "baseUrl":"https://example.test/v1", "models":[{"id":"chat"}]
+    }}});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("TERM", "xterm-256color")
+            .args(["auth", "login", "--api-key", "  fIXTURE Relay  "])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    output_until(&mut master, |text| {
+        text.contains("Enter Fixture Relay API key: ")
+    });
+    master.write_all(b"private-fixture-value\r").unwrap();
+    output_until(&mut master, |text| {
+        assert!(!text.contains("private-fixture-value"), "credential echoed");
+        text.contains("Saved API key for Fixture Relay.")
+    });
+    assert!(process.0.wait().unwrap().success());
+    let auth: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["relay"]["type"], "api_key");
+    assert_eq!(auth["relay"]["key"], "private-fixture-value");
+    assert_eq!(
+        auth["relay"]["endpoint"],
+        "https://example.test/v1/chat/completions"
+    );
+    let mut settings = std::mem::MaybeUninit::<libc::termios>::uninit();
+    assert_eq!(
+        unsafe { libc::tcgetattr(slave.as_raw_fd(), settings.as_mut_ptr()) },
+        0
+    );
+    let settings = unsafe { settings.assume_init() };
+    assert_ne!(settings.c_lflag & libc::ECHO, 0);
+}
+
+#[test]
 fn typing_redraws_in_a_synchronized_frame() {
     for mode in ["regular", "fullscreen"] {
         let root = tempfile::tempdir().unwrap();

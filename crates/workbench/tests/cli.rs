@@ -9855,6 +9855,69 @@ fn anthropic_federation_auth_check_without_refresh_uses_only_the_identity_file()
 }
 
 #[test]
+fn auth_login_distinguishes_the_key_switch_from_the_global_key_option() {
+    let root = tempfile::tempdir().unwrap();
+    let invoke = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        ["auth", "login", "--api-key", "Anthropic"],
+        ["auth", "login", "Anthropic", "--api-key"],
+    ] {
+        let output = invoke(&args);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("requires an interactive terminal")
+        );
+    }
+    let output = invoke(&["auth", "login", "Anthropic", "--api-key", "--no-browser"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--no-browser only applies to account sign-in")
+    );
+    let output = invoke(&["--api-key", "unused-fixture", "auth", "login", "Anthropic"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("omit --api-key when resolving configured credentials")
+    );
+    assert!(!root.path().join("auth.json").exists());
+}
+
+#[test]
+fn legacy_enterprise_login_passes_the_domain_to_copilot_only() {
+    let root = tempfile::tempdir().unwrap();
+    for (provider, expected) in [
+        ("github-copilot", "invalid GitHub Enterprise domain"),
+        ("anthropic", "--enterprise-url requires github-copilot"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "login",
+                provider,
+                "--enterprise-url",
+                "http://insecure.example",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{output:?}"
+        );
+    }
+    assert!(!root.path().join("auth.json").exists());
+}
+
+#[test]
 fn auth_logout_resolves_provider_names_and_preserves_other_credential_sources() {
     let root = tempfile::tempdir().unwrap();
     let config = root.path().join("models.json");
