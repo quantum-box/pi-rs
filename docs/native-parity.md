@@ -2832,6 +2832,8 @@ terminal height, with a five-row minimum when space allows, and uses the
 visible row capacity for page movement.
 Searching includes records inside folded branches. Shift+L edits or removes a
 record label and returns to the current search, filter, and label-time setting.
+The terminal cursor follows the focused tree search or label input, including
+wide characters, so input methods anchor to that field as in Pi 1.6.
 Label edits made during a response are saved by the active session worker.
 Direct `/checkout` releases its journal lock before restoring the view.
 After tree navigation, the selected user message fills an empty editor. A draft

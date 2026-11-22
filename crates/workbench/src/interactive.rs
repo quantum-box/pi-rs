@@ -2893,19 +2893,20 @@ impl View {
         if let Some(picker) = &self.picker {
             lines = picker.render_in_terminal(theme, width, body_height, height, keys);
         }
-        let dialog_cursor = self
-            .dialog()
-            .and_then(|dialog| dialog.cursor(width, body_height));
-        if let Some(dialog) = self.dialog() {
+        let modal_cursor = if let Some(dialog) = self.dialog() {
             lines = dialog.render(theme, width, body_height, keys);
-            if !hardware_cursor
-                && let Some((row, column)) = dialog_cursor
-                && let Some(line) = lines.get_mut(row)
-            {
-                line.mark_cursor(column);
-            }
+            dialog.cursor(width, body_height)
         } else {
             lines.extend(self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor));
+            self.picker
+                .as_ref()
+                .and_then(|picker| picker.tree_input_cursor(width, body_height))
+        };
+        if !hardware_cursor
+            && let Some((row, column)) = modal_cursor
+            && let Some(line) = lines.get_mut(row)
+        {
+            line.mark_cursor(column);
         }
         let modal = self.picker.is_some() || self.dialog().is_some();
         let start = if modal {
@@ -3107,7 +3108,7 @@ impl View {
                     queue!(out, Show)?;
                 }
             }
-        } else if let Some((row, column)) = dialog_cursor {
+        } else if let Some((row, column)) = modal_cursor {
             queue!(out, MoveTo(column as u16, (row + header_rows) as u16))?;
             if hardware_cursor {
                 queue!(out, Show)?;
@@ -3400,26 +3401,26 @@ impl View {
             }
         }
         let dialog_height = height - prompt_height - 4 - below.len();
-        let dialog_cursor = self
-            .dialog()
-            .and_then(|dialog| dialog.cursor(width, dialog_height));
-        if let Some(dialog) = self.dialog() {
+        let modal_cursor = if let Some(dialog) = self.dialog() {
             active = dialog.render(theme, width, dialog_height, keys);
-            if !hardware_cursor
-                && let Some((row, column)) = dialog_cursor
-                && let Some(line) = active.get_mut(row)
-            {
-                line.mark_cursor(column);
-            }
+            dialog.cursor(width, dialog_height)
         } else {
-            let available = height - prompt_height - 4 - below.len();
             let mut widgets = self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor);
-            widgets.truncate(available);
-            let keep = available.saturating_sub(widgets.len());
-            if active.len() > keep {
-                active.drain(..active.len() - keep);
-            }
+            widgets.truncate(dialog_height);
+            let keep = dialog_height.saturating_sub(widgets.len());
+            let hidden = active.len().saturating_sub(keep);
+            active.drain(..hidden);
             active.extend(widgets);
+            self.picker
+                .as_ref()
+                .and_then(|picker| picker.tree_input_cursor(width, keep))
+                .and_then(|(row, column)| row.checked_sub(hidden).map(|row| (row, column)))
+        };
+        if !hardware_cursor
+            && let Some((row, column)) = modal_cursor
+            && let Some(line) = active.get_mut(row)
+        {
+            line.mark_cursor(column);
         }
         let region_height = active.len() + prompt_height + 4 + below.len();
         let rows_to_match = self
@@ -3555,12 +3556,12 @@ impl View {
         .draw(&mut out, width)?;
         self.regular.cursor_row = active.len() + 1 + cursor;
         self.regular.region_height = region_height;
-        let (column, show_cursor) = if self.dialog().is_some() {
-            self.regular.cursor_row = dialog_cursor.map_or(0, |(row, _)| row);
-            (
-                dialog_cursor.map_or(0, |(_, column)| column),
-                dialog_cursor.is_some(),
-            )
+        let (column, show_cursor) = if let Some((row, column)) = modal_cursor {
+            self.regular.cursor_row = row;
+            (column, true)
+        } else if self.dialog().is_some() {
+            self.regular.cursor_row = 0;
+            (0, false)
         } else {
             (column, self.picker.is_none())
         };
