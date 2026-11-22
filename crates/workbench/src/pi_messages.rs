@@ -5,15 +5,17 @@ use std::sync::Arc;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use pi_rs::{
-    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
-    ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
+    Error, ImageContent, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
+    ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
 };
 use reqwest::{Client, Url, header::HeaderMap};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{radius_auth::Gateway, radius_catalog};
+use pi_rs_workbench::image_profile::{ImageResizeProfile, normalize_content};
+
+use super::{Provider, model_profiles::Profiles, radius_auth::Gateway, radius_catalog};
 
 const MAX_STREAM: usize = 32 * 1024 * 1024;
 const MAX_BLOCKS: usize = 256;
@@ -45,6 +47,8 @@ pub(super) struct PiMessages {
     probe_catalog: bool,
     identity_safe_transport: bool,
     prepared_limits: Option<(Option<u32>, Option<u32>)>,
+    request_image_profiles: Option<Arc<Profiles>>,
+    prepared_image_resize: Option<ImageResizeProfile>,
 }
 
 #[derive(Clone)]
@@ -109,12 +113,34 @@ impl PiMessages {
             probe_catalog: true,
             identity_safe_transport: true,
             prepared_limits: None,
+            request_image_profiles: None,
+            prepared_image_resize: None,
         })
     }
 
     pub(super) fn with_context_probe(mut self, enabled: bool) -> Self {
         self.probe_catalog = enabled;
         self
+    }
+
+    pub(super) fn with_radius_request_profiles(mut self, profiles: Profiles) -> Self {
+        if self.radius.is_some() {
+            self.request_image_profiles = Some(Arc::new(profiles));
+        }
+        self
+    }
+
+    fn catalog_image_resize(
+        &self,
+        catalog: &radius_catalog::Catalog,
+        model: &str,
+    ) -> Option<ImageResizeProfile> {
+        let profiles = self.request_image_profiles.as_ref()?;
+        let configured = profiles.model(&Provider::Radius, model);
+        catalog
+            .metadata(model)?
+            .input_limits(configured.as_ref())?
+            .image_resize()
     }
 
     async fn access(&self) -> Result<(String, String)> {
@@ -216,6 +242,7 @@ impl PiMessages {
         if let Some(catalog) = catalog {
             prepared.endpoint = catalog.endpoint.clone();
             prepared.origin_hash = format!("{:x}", Sha256::digest(prepared.endpoint.as_str()));
+            prepared.prepared_image_resize = self.catalog_image_resize(&catalog, model);
         }
         prepared.prepared_limits = Some((
             details.as_ref().and_then(|d| d.context_window),
@@ -252,6 +279,11 @@ impl PiMessages {
                 )
             })
             .unwrap_or_default()
+    }
+
+    pub(super) async fn discovered_catalog(&self) -> Option<Arc<radius_catalog::Catalog>> {
+        let cache = self.radius.as_ref()?.catalog.lock().await;
+        cache.as_ref().map(|entry| entry.value.clone())
     }
 
     pub(super) async fn model_details(
@@ -423,6 +455,31 @@ fn key_binding(token: &str) -> String {
     format!("key:{:x}", Sha256::digest(token.as_bytes()))
 }
 
+fn resize_request_images(payload: &mut Value, profile: ImageResizeProfile) -> Result<()> {
+    let Some(messages) = payload["context"]["messages"].as_array_mut() else {
+        return Ok(());
+    };
+    for message in messages
+        .iter_mut()
+        .filter(|message| matches!(message["role"].as_str(), Some("user" | "toolResult")))
+    {
+        for part in message["content"].as_array_mut().into_iter().flatten() {
+            if part["type"] == "image" {
+                let content = normalize_content(
+                    ImageContent {
+                        mime_type: field(part, "mimeType")?.into(),
+                        data: field(part, "data")?.into(),
+                    },
+                    profile,
+                )?;
+                part["mimeType"] = json!(content.mime_type);
+                part["data"] = json!(content.data);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Text,
@@ -502,7 +559,7 @@ impl Model for PiMessages {
             .map(|(name, value)| (name.as_str(), value.as_bytes()))
             .collect();
         headers.sort();
-        pi_rs::protected_model_fingerprint(&(
+        let identity = pi_rs::protected_model_fingerprint(&(
             headers,
             "pi-messages-v1",
             self.endpoint.as_str(),
@@ -510,7 +567,11 @@ impl Model for PiMessages {
             &self.token,
             &self.thinking,
             self.cache_disabled,
-        ))
+        ))?;
+        match self.prepared_image_resize {
+            Some(profile) => pi_rs::protected_model_fingerprint(&(identity, profile)),
+            None => Some(identity),
+        }
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
@@ -561,6 +622,7 @@ impl Model for PiMessages {
         if let Some(catalog) = catalog {
             client.endpoint = catalog.endpoint.clone();
             client.origin_hash = format!("{:x}", Sha256::digest(client.endpoint.as_str()));
+            client.prepared_image_resize = self.catalog_image_resize(&catalog, &request.model);
             if let Some(model) = catalog
                 .models
                 .iter()
@@ -577,7 +639,10 @@ impl Model for PiMessages {
             }),
         );
         let requested_model = request.model.clone();
-        let payload = client.encode(request);
+        let mut payload = client.encode(request);
+        if let Some(profile) = client.prepared_image_resize {
+            resize_request_images(&mut payload, profile)?;
+        }
         let response = self
             .client
             .post(client.endpoint.clone())
@@ -832,6 +897,40 @@ fn terminal_metadata(
 
 #[cfg(test)]
 mod tool_status_tests {
+    #[test]
+    fn request_resize_preserves_replay_and_resizes_user_and_tool_images() {
+        use base64::Engine;
+        use std::io::Cursor;
+
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(40, 20)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let encoding = base64::engine::general_purpose::STANDARD;
+        let part = json!({"type":"image", "mimeType":"image/png", "data":encoding.encode(bytes.get_ref())});
+        let mut payload = json!({"context":{"messages":[
+            {"role":"user", "content":[{"type":"text", "text":"prompt"}, part]},
+            {"role":"toolResult", "content":[part]},
+            {"role":"assistant", "content":[part]}
+        ]}});
+        super::resize_request_images(
+            &mut payload,
+            super::ImageResizeProfile {
+                max_width: Some(16),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let messages = &payload["context"]["messages"];
+        for image in [&messages[0]["content"][1], &messages[1]["content"][0]] {
+            let decoded = encoding.decode(image["data"].as_str().unwrap()).unwrap();
+            let image = image::load_from_memory(&decoded).unwrap();
+            assert_eq!((image.width(), image.height()), (16, 8));
+        }
+        assert_eq!(messages[0]["content"][0]["text"], "prompt");
+        assert_eq!(messages[2]["content"][0], part);
+    }
+
     #[tokio::test]
     async fn auth_header_error_literals_are_not_classified() {
         use std::io::{Read, Write};

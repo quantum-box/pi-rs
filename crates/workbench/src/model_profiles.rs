@@ -335,7 +335,7 @@ impl ModelCompatibility {
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct InputLimits {
+pub(super) struct InputLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_request_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -343,7 +343,7 @@ struct InputLimits {
 }
 
 impl InputLimits {
-    fn overlay(self, newer: Self) -> Self {
+    pub(super) fn overlay(self, newer: Self) -> Self {
         Self {
             max_request_bytes: newer.max_request_bytes.or(self.max_request_bytes),
             images: match (self.images, newer.images) {
@@ -353,8 +353,12 @@ impl InputLimits {
         }
     }
 
-    fn valid(self) -> bool {
+    pub(super) fn valid(self) -> bool {
         self.max_request_bytes != Some(0) && self.images.is_none_or(ImageLimits::valid)
+    }
+
+    pub(super) fn image_resize(self) -> Option<ImageResizeProfile> {
+        self.images?.resize
     }
 }
 
@@ -588,7 +592,11 @@ impl ModelMetadata {
     }
 
     pub fn image_resize(&self) -> Option<ImageResizeProfile> {
-        self.input_limits.as_ref()?.images.as_ref()?.resize
+        self.input_limits?.image_resize()
+    }
+
+    pub(super) fn input_limits(&self) -> Option<InputLimits> {
+        self.input_limits
     }
 
     pub fn supports_images(&self) -> Option<bool> {
