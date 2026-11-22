@@ -5415,6 +5415,16 @@ Responses model compatibility accepts `promptCacheKeyMode` as `auto`,
 supply a key, matching the upstream request merge order. The setting does not
 disable session routing headers or prompt caching itself.
 
+### Responses service tier and cache usage
+
+Responses and Codex SSE keep the cached-read and cache-write counts reported
+by the service. Estimated costs use the service tier returned by Responses, or
+the configured `samplingParams.service_tier` when the response omits it. Like
+Pi 1.6, Codex uses a requested `flex` or `priority` tier when the service echoes
+`default`. The multiplier applies to input, output, cache reads and cache
+writes. Loopback SSE fixtures cover both APIs. Live pricing and
+account acceptance were unverified.
+
 ### Responses cache retention checkpoint
 
 For API-key Responses models, `PI_CACHE_RETENTION=long` requests Pi's
