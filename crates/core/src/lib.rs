@@ -56,7 +56,9 @@ pub use lifecycle::{
 pub use mcp_registration::{McpRegistryHost, McpServerDeclaration, RegisteredMcpServer};
 pub use model_catalog::*;
 pub use model_price::ChatPrice;
-pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};
+pub use pi_rs_tool_arguments::{
+    JSON_DIAGNOSTIC_RETRY_LIMIT, StreamingJson, json_syntax_diagnostic, parse_tool_arguments,
+};
 pub use provider_response::{
     ProviderResponseEvent, observe_provider_response, observes_provider_response,
 };
