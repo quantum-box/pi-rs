@@ -56,9 +56,9 @@ fn open_locks(paths: Vec<PathBuf>, credential_lock: Option<&File>) -> Result<Vec
     for (index, path) in paths.into_iter().enumerate() {
         let path = path.with_extension("lock");
         let exclusive = editing && index == 0;
-        // A global edit should not need to create or write a project
-        // directory. When the other scope has a lock, read it shared.
-        let optional = editing && !exclusive;
+        // Use an existing secondary lock when possible. A read-only project
+        // without one can still be validated under the primary login lock.
+        let optional = index > 0;
         let open_writer = || {
             OpenOptions::new()
                 .read(true)
@@ -76,19 +76,22 @@ fn open_locks(paths: Vec<PathBuf>, credential_lock: Option<&File>) -> Result<Vec
             match File::open(&path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == ErrorKind::NotFound => {
-                    if !optional && let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    match open_writer() {
+                    let create = || {
+                        if (!editing || !optional)
+                            && let Some(parent) = path.parent()
+                        {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        open_writer()
+                    };
+                    match create() {
                         Ok(file) => file,
                         Err(error)
                             if optional
-                                && matches!(
+                                && (matches!(
                                     error.kind(),
-                                    ErrorKind::NotFound
-                                        | ErrorKind::PermissionDenied
-                                        | ErrorKind::ReadOnlyFilesystem
-                                ) =>
+                                    ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+                                ) || (editing && error.kind() == ErrorKind::NotFound)) =>
                         {
                             continue;
                         }
@@ -156,6 +159,30 @@ mod tests {
         assert!(matches!(writer.try_lock(), Err(TryLockError::WouldBlock)));
         drop(held);
         writer.try_lock().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn login_accepts_a_read_only_project_without_a_secondary_lock() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let project_config = project.join(".pi/mcp.json");
+        let global_config = dir.path().join("mcp.json");
+        let credential = Arc::new(File::create(dir.path().join("credential.lock")).unwrap());
+
+        let result = lock(vec![global_config, project_config.clone()], credential).await;
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let locks = result.unwrap();
+        assert!(!locks.is_empty());
+        assert_eq!(
+            locks.len(),
+            1 + usize::from(project_config.with_extension("lock").exists())
+        );
     }
 
     #[tokio::test]

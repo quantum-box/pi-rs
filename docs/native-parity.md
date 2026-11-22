@@ -1124,7 +1124,8 @@ retain precedence. Extension-registered servers retain their extension scope
 and their extension controls their enabled state and exposure. The manager offers Sign in for a server requiring OAuth
 and Sign out for a live OAuth connection. Sign-in opens the browser, checks
 the applied configuration before saving credentials, and reconnects the
-server. Sign-out clears the selected server's stored credentials and removes
+server. Sign-in can validate a read-only trusted project without creating
+a project lock file there. Sign-out clears the selected server's stored credentials and removes
 its live tools. The sign-in panel shows the authorization URL and can accept
 a pasted redirect URL if the browser cannot reach the loopback callback.
 Both routes validate the callback origin, path and OAuth state. Loopback
