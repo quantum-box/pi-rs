@@ -119,11 +119,17 @@ pub(super) fn include_line_indent(source: &str, start: usize) -> usize {
     }
 }
 
+pub(super) const INLINE_COMMENT_PREFIX: char = '\u{1}';
+
 // Pulldown lets an indented comment interrupt a paragraph. Marked treats it
 // as inline HTML. Give the continuation a text prefix in the parser input
 // while retaining source offsets for indentation and rendered spans.
 pub(super) fn inline_indented_comments(source: &str) -> Cow<'_, str> {
-    if source.len() > 256 * 1024 || !source.contains("<!--") || !source.contains("\n ") {
+    if source.len() > 256 * 1024
+        || source.contains(INLINE_COMMENT_PREFIX)
+        || !source.contains("<!--")
+        || !source.contains("\n ")
+    {
         return Cow::Borrowed(source);
     }
     let mut rewritten = None;
@@ -145,7 +151,8 @@ pub(super) fn inline_indented_comments(source: &str) -> Cow<'_, str> {
                         .all(|&byte| byte == b' ')
                     && source[range.start..].starts_with("<!--")
                 {
-                    rewritten.get_or_insert_with(|| source.as_bytes().to_vec())[end] = b'x';
+                    rewritten.get_or_insert_with(|| source.as_bytes().to_vec())[end] =
+                        INLINE_COMMENT_PREFIX as u8;
                     paragraph_end = Some(range.end);
                 }
                 depth += 1;

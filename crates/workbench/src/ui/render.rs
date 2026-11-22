@@ -2134,6 +2134,8 @@ fn markdown_plain_at_depth(
     let mut last_heading_separator = None;
     let mut last_code_separator = None;
     let mut last_rule_separator = None;
+    let comment_prefix = super::markdown_spaces::INLINE_COMMENT_PREFIX;
+    let restore_comment_spaces = parsed.contains(comment_prefix) && !text.contains(comment_prefix);
     let protected_text = protect_bare_links(parsed, options, reference_source);
     let list_math = super::math_blocks::list_blocks(parsed);
     let mut events = insert_list_math(
@@ -2320,7 +2322,13 @@ fn markdown_plain_at_depth(
                 }
             }
             Event::Start(Tag::Link { dest_url, id, .. }) => {
-                let raw_label = id.strip_prefix("\0pi-marked-label:").map(str::to_owned);
+                let raw_label = id.strip_prefix("\0pi-marked-label:").map(|label| {
+                    if restore_comment_spaces {
+                        label.replace(comment_prefix, " ")
+                    } else {
+                        label.to_owned()
+                    }
+                });
                 links.push((dest_url.into_string(), String::new(), raw_label));
             }
             Event::End(TagEnd::Link) => {
@@ -2711,6 +2719,9 @@ fn markdown_plain_at_depth(
                             merged = text[range.clone()].to_owned();
                         }
                     }
+                    if restore_comment_spaces && merged.contains(comment_prefix) {
+                        merged = merged.replace(comment_prefix, " ");
+                    }
                     let preceding = text.as_bytes()[..range.start]
                         .iter()
                         .rev()
@@ -2888,6 +2899,11 @@ fn markdown_plain_at_depth(
                 }
             }
             Event::Code(text) => {
+                let text = if restore_comment_spaces && text.contains(comment_prefix) {
+                    text.replace(comment_prefix, " ").into()
+                } else {
+                    text
+                };
                 if let Some((_, label, _)) = links.last_mut() {
                     label.push_str(&text);
                 }
@@ -3130,6 +3146,14 @@ mod tests {
             ("one\n  <!-- hidden -->\nnext", vec!["one", "", "next"]),
             ("one\n\n  <!-- hidden --> text", vec!["one", "", "text"]),
             ("  <!-- hidden --> text", vec!["text"]),
+            (
+                "[one\n  <!-- hidden --> text](https://example.com)",
+                vec!["one", "  text (https://example.com)"],
+            ),
+            (
+                "first `one\n  <!-- hidden --> text` end",
+                vec!["first one   <!-- hidden --> text end"],
+            ),
             (
                 "> - one\n\n>   <!-- hidden --> text",
                 vec!["│ - one", "", "│ text"],
