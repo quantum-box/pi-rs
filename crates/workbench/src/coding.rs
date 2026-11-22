@@ -44,8 +44,15 @@ impl ReadImageModel {
 /// The prompt-visible name and contents of an explicit CLI file attachment.
 pub struct CliAttachment {
     pub name: PathBuf,
-    pub text: String,
-    pub images: Vec<pi_rs::ImageContent>,
+    pub content: AttachmentContent,
+}
+
+pub enum AttachmentContent {
+    Text(String),
+    Image {
+        note: String,
+        images: Vec<pi_rs::ImageContent>,
+    },
 }
 
 pub struct CodingTools {
@@ -471,8 +478,15 @@ impl CodingTools {
         if metadata.is_file() && metadata.len() == 0 {
             return Ok(None);
         }
-        let (text, images) = tool.read_attachment_at(&path, true)?;
-        Ok(Some(CliAttachment { name, text, images }))
+        let mut content = tool.read_attachment_at(&path, true)?;
+        if let AttachmentContent::Image { note, .. } = &mut content {
+            // The first line is the read tool's MIME summary. Prompt tags contain only hints.
+            *note = note
+                .split_once('\n')
+                .map_or("", |(_, hints)| hints)
+                .to_owned();
+        }
+        Ok(Some(CliAttachment { name, content }))
     }
 
     fn read_attachment_inner(
@@ -485,7 +499,10 @@ impl CodingTools {
             .to_str()
             .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?;
         let path = tool.path(name)?;
-        tool.read_attachment_at(&path, lossy)
+        match tool.read_attachment_at(&path, lossy)? {
+            AttachmentContent::Text(text) => Ok((text, Vec::new())),
+            AttachmentContent::Image { note, images } => Ok((note, images)),
+        }
     }
 
     fn attachment_reader(&self) -> CodingTool {
@@ -503,11 +520,7 @@ impl CodingTools {
 }
 
 impl CodingTool {
-    fn read_attachment_at(
-        &self,
-        path: &Path,
-        lossy: bool,
-    ) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+    fn read_attachment_at(&self, path: &Path, lossy: bool) -> Result<AttachmentContent> {
         let image = if lossy && !crate::cli_attachment_sniff::is_image_file(path)? {
             Ok(None)
         } else if lossy {
@@ -543,7 +556,7 @@ impl CodingTool {
 fn finish_attachment(
     image: Result<Option<Value>>,
     read_text: impl FnOnce() -> Result<String>,
-) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+) -> Result<AttachmentContent> {
     if let Some(image) = image? {
         let blocks = image["content"].as_array().expect("image content");
         let images = blocks
@@ -552,14 +565,14 @@ fn finish_attachment(
             .cloned()
             .map(serde_json::from_value)
             .collect::<std::result::Result<_, _>>()?;
-        let hints = blocks
+        let note = blocks
             .iter()
             .filter_map(|block| block["text"].as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        Ok((hints, images))
+        Ok(AttachmentContent::Image { note, images })
     } else {
-        Ok((read_text()?, Vec::new()))
+        Ok(AttachmentContent::Text(read_text()?))
     }
 }
 
