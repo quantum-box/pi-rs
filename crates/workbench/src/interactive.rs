@@ -10641,14 +10641,17 @@ mod tests {
         use super::{Theme, View, json};
         let operation_id = uuid::Uuid::new_v4();
         let mut view = View::default();
-        view.add_tool(&pi_rs::Invocation {
-            operation_id,
-            call: pi_rs::ToolCall {
-                id: "fixture".into(),
-                name: "read".into(),
-                arguments: r#"{"path":"image.png"}"#.into(),
+        view.add_tool(
+            &pi_rs::Invocation {
+                operation_id,
+                call: pi_rs::ToolCall {
+                    id: "fixture".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"image.png"}"#.into(),
+                },
             },
-        });
+            None,
+        );
         view.finish_tool(
             &operation_id.to_string(),
             &pi_rs::Outcome::StructuredWithDetails {
