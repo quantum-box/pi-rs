@@ -47,6 +47,26 @@ enum ThinkingMode {
     Budgeted,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum ThinkingDisplay {
+    #[default]
+    Summarized,
+    Omitted,
+}
+
+impl ThinkingDisplay {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Summarized => "summarized",
+            Self::Omitted => "omitted",
+        }
+    }
+}
+
+const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
+const OAUTH_BETAS: &str = "claude-code-20250219,oauth-2025-04-20";
+
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Progress {
@@ -74,6 +94,10 @@ pub struct Anthropic {
     probe_context: bool,
     thinking_level: Option<String>,
     thinking_budgets: Option<Value>,
+    thinking_display: ThinkingDisplay,
+    interleaved_thinking: bool,
+    eager_tool_input_streaming: bool,
+    eager_tool_input_models: Arc<BTreeMap<String, bool>>,
     configured_thinking: Option<CatalogEntry>,
     configured_thinking_is_fallback: bool,
     allow_empty_signature: bool,
@@ -179,6 +203,10 @@ impl Anthropic {
             probe_context: true,
             thinking_level: None,
             thinking_budgets: None,
+            thinking_display: ThinkingDisplay::default(),
+            interleaved_thinking: true,
+            eager_tool_input_streaming: true,
+            eager_tool_input_models: Arc::default(),
             configured_thinking: None,
             configured_thinking_is_fallback: false,
             allow_empty_signature: false,
@@ -189,6 +217,17 @@ impl Anthropic {
             progress: None,
             reasoning: None,
         })
+    }
+
+    /// Use per-tool eager input streaming, or the legacy beta when disabled.
+    pub fn with_eager_tool_input_streaming(
+        mut self,
+        enabled: bool,
+        models: BTreeMap<String, bool>,
+    ) -> Self {
+        self.eager_tool_input_streaming = enabled;
+        self.eager_tool_input_models = Arc::new(models);
+        self
     }
 
     /// Set the selected model's JSON Schema strict-tool capability.
@@ -319,6 +358,18 @@ impl Anthropic {
         self
     }
 
+    /// Choose whether the model returns readable thinking or only its replay signature.
+    pub fn with_thinking_display(mut self, display: ThinkingDisplay) -> Self {
+        self.thinking_display = display;
+        self
+    }
+
+    /// Enable the interleaved beta for budgeted thinking when no beta header is specified.
+    pub fn with_interleaved_thinking(mut self, enabled: bool) -> Self {
+        self.interleaved_thinking = enabled;
+        self
+    }
+
     /// Use known thinking capabilities for a gateway that lacks a Models API.
     pub fn with_configured_thinking(mut self, level: &str, adaptive: bool, disable: bool) -> Self {
         self.thinking_level = Some(level.into());
@@ -379,7 +430,7 @@ impl Anthropic {
         url.path_segments_mut().ok()?.push(model);
         let details = tokio::time::timeout(Duration::from_secs(2), async {
             let response = send(
-                self.authenticate(self.client.get(url)),
+                self.authenticate(self.client.get(url), false, false),
                 &self.error_secrets(),
             )
             .await
@@ -438,25 +489,80 @@ impl Anthropic {
         secrets
     }
 
-    fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let request = request
+    fn authenticate(
+        &self,
+        mut request: reqwest::RequestBuilder,
+        interleaved: bool,
+        legacy_tool_streaming: bool,
+    ) -> reqwest::RequestBuilder {
+        request = request
             .header("anthropic-version", API_VERSION)
             .header(self.auth.0.clone(), self.auth.1.clone());
-        let request = if self.oauth {
-            let request = request
+        if self.oauth {
+            request = request
                 .header("accept", "application/json")
                 .header("anthropic-dangerous-direct-browser-access", "true")
                 .header("user-agent", "claude-cli/2.1.280")
                 .header("x-app", "cli");
-            if self.headers.contains_key("anthropic-beta") {
-                request
-            } else {
-                request.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+        }
+        if !self.headers.contains_key("anthropic-beta") {
+            let betas: Vec<_> = [
+                self.oauth.then_some(OAUTH_BETAS),
+                legacy_tool_streaming.then_some(FINE_GRAINED_TOOL_STREAMING_BETA),
+                interleaved.then_some(INTERLEAVED_THINKING_BETA),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if !betas.is_empty() {
+                request = request.header("anthropic-beta", betas.join(","));
             }
-        } else {
-            request
-        };
+        }
         request.headers(self.headers.clone())
+    }
+
+    fn configure_tool_input_streaming(&self, model: &str, body: &mut Value) -> bool {
+        let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+            return false;
+        };
+        let eager = self
+            .eager_tool_input_models
+            .get(model)
+            .copied()
+            .unwrap_or(self.eager_tool_input_streaming);
+        if eager {
+            for tool in tools {
+                tool["eager_input_streaming"] = json!(true);
+            }
+            false
+        } else {
+            !tools.is_empty()
+        }
+    }
+
+    fn configure_request_thinking(
+        &self,
+        body: &mut Value,
+        details: Option<&CatalogEntry>,
+        max_output_tokens: u32,
+    ) -> Result<bool> {
+        if let Some(level) = self.thinking_level.as_deref() {
+            configure_thinking(
+                body,
+                details,
+                level,
+                max_output_tokens,
+                self.thinking_budgets.as_ref(),
+            )?;
+        }
+        let mode = body["thinking"]["type"].as_str();
+        let interleaved = mode == Some("enabled") && self.interleaved_thinking;
+        if matches!(mode, Some("enabled" | "adaptive"))
+            && self.thinking_display != ThinkingDisplay::Summarized
+        {
+            body["thinking"]["display"] = json!(self.thinking_display.as_str());
+        }
+        Ok(interleaved)
     }
 
     /// Return paginated models in server order and retain their metadata for this client.
@@ -478,7 +584,7 @@ impl Anthropic {
                 url.query_pairs_mut().append_pair("after_id", cursor);
             }
             let response = send(
-                self.authenticate(self.client.get(url)),
+                self.authenticate(self.client.get(url), false, false),
                 &self.error_secrets(),
             )
             .await?;
@@ -1540,6 +1646,38 @@ impl Model for Anthropic {
         } else {
             pi_rs_core::protected_model_fingerprint(&identity)
         }?;
+        let base = if self.eager_tool_input_streaming && self.eager_tool_input_models.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "tool-input-streaming",
+                self.eager_tool_input_streaming,
+                self.eager_tool_input_models.as_ref(),
+            ))?
+        };
+        let active_thinking = self
+            .thinking_level
+            .as_deref()
+            .is_some_and(|level| level != "off");
+        let interleaved = active_thinking
+            && self.interleaved_thinking
+            && !self.headers.contains_key("anthropic-beta")
+            && self
+                .configured_thinking
+                .as_ref()
+                .is_some_and(|details| matches!(details.thinking, Some(ThinkingMode::Budgeted)));
+        let omitted = active_thinking && self.thinking_display == ThinkingDisplay::Omitted;
+        let base = if interleaved || omitted {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "thinking-request-options-v1",
+                interleaved,
+                omitted,
+            ))?
+        } else {
+            base
+        };
         match &self.strict_tool_models {
             // A map containing only unsupported models cannot change any
             // successful request's sampling compared with the default.
@@ -1748,19 +1886,14 @@ impl Anthropic {
         {
             body["tools"] = json!(tools);
         }
+        let legacy_tool_streaming =
+            self.configure_tool_input_streaming(&requested_model, &mut body);
         apply_cache_control(&mut body, self.cache_retention, self.cache_tools);
         if self.oauth {
             prepare_oauth_request(&mut body, self.cache_retention);
         }
-        if let Some(level) = self.thinking_level.as_deref() {
-            configure_thinking(
-                &mut body,
-                details.as_ref(),
-                level,
-                max_output_tokens,
-                self.thinking_budgets.as_ref(),
-            )?;
-        }
+        let interleaved =
+            self.configure_request_thinking(&mut body, details.as_ref(), max_output_tokens)?;
         if let Some(progress) = &self.progress {
             progress(Progress::WaitingForModel);
         }
@@ -1779,7 +1912,9 @@ impl Anthropic {
                 }
             }
         }
-        let response = send_http(self.authenticate(request.json(&body))).await?;
+        let response =
+            send_http(self.authenticate(request.json(&body), interleaved, legacy_tool_streaming))
+                .await?;
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
@@ -2726,9 +2861,15 @@ mod tests {
             let pos = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
             let headers = String::from_utf8_lossy(&request[..pos]).to_ascii_lowercase();
             assert!(headers.contains("authorization: bearer fixture-oauth"));
-            assert!(headers.contains("anthropic-beta: claude-code-20250219,oauth-2025-04-20"));
+            assert!(headers.lines().any(|line| {
+                line == "anthropic-beta: claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"
+            }));
             let body: Value = serde_json::from_slice(&request[pos + 4..]).unwrap();
             assert_eq!(body["tools"][0]["name"], "Read");
+            assert_eq!(
+                body["thinking"],
+                json!({"type":"enabled","budget_tokens":2048,"display":"omitted"})
+            );
             assert_eq!(
                 body["system"][0]["text"],
                 "You are Claude Code, Anthropic's official CLI for Claude."
@@ -2749,7 +2890,9 @@ mod tests {
         let model =
             Anthropic::with_oauth_token(&format!("http://{address}/v1/messages"), "fixture-oauth")
                 .unwrap()
-                .with_context_probe(false);
+                .with_context_probe(false)
+                .with_configured_thinking("low", false, true)
+                .with_thinking_display(ThinkingDisplay::Omitted);
         let request = ModelRequest {
             model: "m".into(),
             messages: vec![Message::User {
@@ -2760,7 +2903,7 @@ mod tests {
                 description: "read".into(),
                 parameters: json!({"type":"object"}),
             }],
-            max_output_tokens: 16,
+            max_output_tokens: 4096,
         };
         let mut stream = model.stream(request).await.unwrap();
         let mut observed = false;
@@ -3765,6 +3908,147 @@ mod tests {
             })
         );
         assert!(AnthropicInputTransformations::from_value(&json!([])).is_none());
+    }
+
+    #[test]
+    fn tool_input_streaming_uses_eager_flags_or_the_legacy_beta() {
+        let base = Anthropic::new(DEFAULT_ENDPOINT, "fixture").unwrap();
+        let legacy = base
+            .clone()
+            .with_eager_tool_input_streaming(false, BTreeMap::new());
+        assert_ne!(base.context_identity(), legacy.context_identity());
+        let routed = base
+            .clone()
+            .with_eager_tool_input_streaming(true, BTreeMap::from([("rewritten".into(), false)]));
+        let mut body = json!({"tools":[{"name":"read"}]});
+        assert!(routed.configure_tool_input_streaming("rewritten", &mut body));
+        assert!(body["tools"][0].get("eager_input_streaming").is_none());
+
+        let explicit = legacy.clone().with_headers(
+            [(
+                HeaderName::from_static("anthropic-beta"),
+                HeaderValue::from_static("custom-beta"),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        for (client, tools, eager, beta) in [
+            (base, json!([{"name":"read"}]), Some(true), None),
+            (
+                legacy.clone(),
+                json!([{"name":"read"}]),
+                None,
+                Some(FINE_GRAINED_TOOL_STREAMING_BETA),
+            ),
+            (legacy, json!([]), None, None),
+            (
+                explicit,
+                json!([{"name":"read"}]),
+                None,
+                Some("custom-beta"),
+            ),
+        ] {
+            let mut body = json!({"tools":tools});
+            let legacy_streaming = client.configure_tool_input_streaming("fixture", &mut body);
+            let request = client
+                .authenticate(
+                    client.client.post(DEFAULT_ENDPOINT),
+                    false,
+                    legacy_streaming,
+                )
+                .build()
+                .unwrap();
+            assert_eq!(body["tools"][0]["eager_input_streaming"].as_bool(), eager);
+            assert_eq!(
+                request
+                    .headers()
+                    .get("anthropic-beta")
+                    .and_then(|value| value.to_str().ok()),
+                beta
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_request_uses_interleaved_beta_for_budgeted_thinking_only() {
+        let base = Anthropic::new(DEFAULT_ENDPOINT, "fixture")
+            .unwrap()
+            .with_context_probe(false);
+        let budgeted = base.clone().with_configured_thinking("low", false, true);
+        let adaptive = base.clone().with_configured_thinking("low", true, true);
+        let disabled = budgeted.clone().with_thinking(Some("off"));
+        let explicit = budgeted.clone().with_headers(
+            [(
+                HeaderName::from_static("anthropic-beta"),
+                HeaderValue::from_static("custom-feature"),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        for (client, thinking, beta) in [
+            (base, Value::Null, None),
+            (disabled, json!({"type":"disabled"}), None),
+            (
+                budgeted.clone(),
+                json!({"type":"enabled","budget_tokens":2048,"display":"summarized"}),
+                Some(INTERLEAVED_THINKING_BETA),
+            ),
+            (
+                budgeted.clone().with_interleaved_thinking(false),
+                json!({"type":"enabled","budget_tokens":2048,"display":"summarized"}),
+                None,
+            ),
+            (
+                adaptive
+                    .clone()
+                    .with_thinking_display(ThinkingDisplay::Omitted),
+                json!({"type":"adaptive","display":"omitted"}),
+                None,
+            ),
+            (
+                explicit,
+                json!({"type":"enabled","budget_tokens":2048,"display":"summarized"}),
+                Some("custom-feature"),
+            ),
+        ] {
+            let mut body = json!({});
+            let interleaved = client
+                .configure_request_thinking(&mut body, client.configured_thinking.as_ref(), 4096)
+                .unwrap();
+            assert_eq!(body["thinking"], thinking);
+            let request = client
+                .authenticate(client.client.post(DEFAULT_ENDPOINT), interleaved, false)
+                .build()
+                .unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get("anthropic-beta")
+                    .and_then(|value| value.to_str().ok()),
+                beta,
+            );
+        }
+        assert_ne!(
+            budgeted.context_identity(),
+            budgeted
+                .clone()
+                .with_interleaved_thinking(false)
+                .context_identity(),
+        );
+        assert_eq!(
+            adaptive.context_identity(),
+            adaptive
+                .clone()
+                .with_interleaved_thinking(false)
+                .context_identity(),
+        );
+        assert_ne!(
+            adaptive.context_identity(),
+            adaptive
+                .clone()
+                .with_thinking_display(ThinkingDisplay::Omitted)
+                .context_identity(),
+        );
     }
 
     #[test]

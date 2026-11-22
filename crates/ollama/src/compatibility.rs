@@ -220,6 +220,10 @@ impl ChatCompatibility {
         self.supports_openai_grammar_tools
     }
 
+    pub(super) fn set_openai_grammar_tool_support(&mut self, supported: bool) {
+        self.supports_openai_grammar_tools = Some(supported);
+    }
+
     /// Whether the configured model accepts the developer instruction role.
     pub fn supports_developer_role(&self) -> Option<bool> {
         self.supports_developer_role
