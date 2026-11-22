@@ -650,12 +650,25 @@ where
     let auth = directory.join("auth.json");
     let guard = super::auth_lock::acquire_async(&auth).await?;
     let data = super::config::read_auth_object_locked(&guard)?;
-    let credential = parse_credential(&data)?;
+    let credential = match parse_credential(&data) {
+        Ok(Some(credential)) => credential,
+        Ok(None) => return Ok(false),
+        Err(_) => {
+            // An unusable entry cannot be revoked. Clear the active local
+            // credential, plus its native session if the client ID is intact.
+            if let Some(id) = data[PROVIDER]["credential"]["client_id"].as_str() {
+                clear_session_locked(&directory, &guard, id)?;
+            } else {
+                super::config::update_object_locked(&auth, Some(&guard), |entries| {
+                    entries.remove(PROVIDER);
+                    Ok(())
+                })?;
+            }
+            return Ok(true);
+        }
+    };
     let from_pi = pi_entry(&data);
     guard.check()?;
-    let Some(credential) = credential else {
-        return Ok(false);
-    };
     let state = control.0;
     let _cancellation = LogoutCancellation(state.clone());
     tokio::task::spawn_blocking(move || {

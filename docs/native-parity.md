@@ -4707,7 +4707,9 @@ or `models.json` cannot be read. An exact stored ID or configured provider ID
 takes precedence over a display name. Ambiguous display names require an
 explicit ID. Environment and model-file credentials are
 unchanged. Native ChatGPT plan revocation and Radius gateway isolation still
-apply. Tests use local credentials without calling live OAuth endpoints.
+apply. A malformed ChatGPT plan credential can be removed locally when it
+cannot be used for revocation. Tests use local credentials without calling
+live OAuth endpoints.
 
 ### Radius OAuth
 

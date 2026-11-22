@@ -9346,6 +9346,52 @@ fn auth_logout_prioritizes_exact_stored_ids_and_works_with_invalid_model_config(
 }
 
 #[test]
+fn auth_logout_removes_unusable_oauth_for_the_selected_local_provider() {
+    let root = tempfile::tempdir().unwrap();
+    let auth = root.path().join("auth.json");
+    std::fs::write(
+        &auth,
+        json!({
+            "openai-chatgpt":{"type":"oauth", "credential":{"client_id":"broken-client"}},
+            "radius":{"type":"oauth", "gateway":"https://configured-gateway.example.test/"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let sessions = root.path().join("chatgpt-sessions.json");
+    std::fs::write(
+        &sessions,
+        json!({"broken-client":{}, "other-client":{}}).to_string(),
+    )
+    .unwrap();
+    for provider in ["openai-chatgpt", "radius"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env(
+                "PI_RADIUS_GATEWAY",
+                "https://configured-gateway.example.test/",
+            )
+            .args(["auth", "logout", provider])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&auth).unwrap()).unwrap(),
+        json!({})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&sessions).unwrap()).unwrap(),
+        json!({"other-client":{}})
+    );
+}
+
+#[test]
 fn auth_logout_keeps_radius_credentials_for_a_different_gateway() {
     let root = tempfile::tempdir().unwrap();
     let auth = root.path().join("auth.json");

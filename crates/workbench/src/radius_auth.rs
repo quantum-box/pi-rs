@@ -269,10 +269,9 @@ impl Gateway {
         let _guard = auth_lock_at(path.parent().expect("auth parent")).await?;
         let mut removed = false;
         super::config::update_auth_object(path, |data| {
-            if self.pending_for_gateway(&data.get("radius").cloned().unwrap_or(Value::Null))?
-                || self
-                    .credential_from_value(&Value::Object(data.clone()))?
-                    .is_some()
+            let entry = data.get("radius").unwrap_or(&Value::Null);
+            if self.pending_for_gateway(entry)?
+                || (entry["type"] == "oauth" && entry["gateway"] == self.origin.as_str())
             {
                 data.remove("radius");
                 removed = true;
