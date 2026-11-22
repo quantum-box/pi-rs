@@ -4898,7 +4898,9 @@ discovery for this release was unverified.
 
 The bundled and account-scoped Radius catalogs retain advertised prices and
 image input limits. JSON model listings and RPC model discovery expose those
-fields when available. Explicit model settings take precedence. Missing or
+fields when available. Partial explicit settings override matching fields.
+Current-model RPC responses reuse discovered metadata when the discovery
+credential can be identified. Missing or
 invalid optional metadata leaves the model available, including when loading
 an older cache.
 

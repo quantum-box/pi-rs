@@ -288,7 +288,7 @@ pub(super) struct InputLimits {
 }
 
 impl InputLimits {
-    fn overlay(self, newer: Self) -> Self {
+    pub(super) fn overlay(self, newer: Self) -> Self {
         Self {
             max_request_bytes: newer.max_request_bytes.or(self.max_request_bytes),
             images: match (self.images, newer.images) {
@@ -534,6 +534,10 @@ impl ModelMetadata {
 
     pub fn image_resize(&self) -> Option<ImageResizeProfile> {
         self.input_limits.as_ref()?.images.as_ref()?.resize
+    }
+
+    pub(super) fn input_limits(&self) -> Option<InputLimits> {
+        self.input_limits
     }
 
     pub fn supports_images(&self) -> Option<bool> {

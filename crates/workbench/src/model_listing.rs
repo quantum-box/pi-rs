@@ -55,11 +55,12 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
                     "type":"model", "model":model, "name":catalog.display_name(&model),
                     "provider":provider,
                 });
-                if let Some(metadata) = args.model_profiles.model(&catalog.provider, &model) {
+                let configured = args.model_profiles.model(&catalog.provider, &model);
+                if let Some(metadata) = &configured {
                     metadata.apply_catalog_metadata(&mut row);
                 }
-                if let Some(radius) = &radius {
-                    radius.apply_metadata(&model, &mut row);
+                if let Some(metadata) = radius.as_ref().and_then(|radius| radius.metadata(&model)) {
+                    metadata.apply(configured.as_ref(), &mut row);
                 }
                 output(with_details(row, detail.as_ref()));
             } else {

@@ -2158,18 +2158,27 @@ fn command_cancellable(
                     let details = catalog
                         .details(std::slice::from_ref(&candidate), &current.model_profiles)
                         .await;
-                    remember_model_images(
+                    let radius = catalog.client.discovered_radius_catalog().await;
+                    let metadata = radius
+                        .as_ref()
+                        .and_then(|radius| radius.metadata(&candidate));
+                    remember_model_metadata(
                         &current,
                         &catalog.provider,
                         &candidate,
                         details.get(&candidate),
+                        metadata,
                         generation,
                     );
                     let mut model =
                         model_value_without_cache(&current, &catalog.provider, &candidate);
-                    if let Some(radius) = catalog.client.discovered_radius_catalog().await {
-                        radius.apply_metadata(&candidate, &mut model);
-                    }
+                    apply_radius_metadata(
+                        &current,
+                        &catalog.provider,
+                        &candidate,
+                        metadata,
+                        &mut model,
+                    );
                     Ok(Some(model_with_input_details(
                         model,
                         details.get(&candidate),
@@ -2433,29 +2442,47 @@ pub(super) fn snapshot_response(
 }
 
 pub(super) fn model_value(args: &Cli, provider: &super::Provider, model: &str) -> Value {
-    let value = model_value_without_cache(args, provider, model);
-    if value.get("input").is_some() {
-        return value;
-    }
+    let mut value = model_value_without_cache(args, provider, model);
     let Some(key) = model_cache_key(args, provider, model) else {
         return value;
     };
-    let images = args
+    let entry = args
         .rpc_model_images
         .lock()
         .unwrap()
         .entries
         .get(&key)
-        .and_then(|entry| entry.images);
+        .cloned();
+    let Some(entry) = entry else {
+        return value;
+    };
+    apply_radius_metadata(args, provider, model, entry.radius.as_ref(), &mut value);
+    if value.get("input").is_some() {
+        return value;
+    }
     model_with_input_details(
         value,
-        images
+        entry
+            .images
             .map(|images| pi_rs::ollama::ModelDetails {
                 images: Some(images),
                 ..Default::default()
             })
             .as_ref(),
     )
+}
+
+fn apply_radius_metadata(
+    args: &Cli,
+    provider: &super::Provider,
+    model: &str,
+    metadata: Option<&super::radius_catalog::Metadata>,
+    value: &mut Value,
+) {
+    if let Some(metadata) = metadata {
+        let configured = args.model_profiles.model(provider, model);
+        metadata.apply(configured.as_ref(), value);
+    }
 }
 
 fn model_value_without_cache(args: &Cli, provider: &super::Provider, model: &str) -> Value {
@@ -2505,9 +2532,11 @@ struct ModelCacheScope {
     discovery_credential_hash: Option<String>,
 }
 
+#[derive(Clone)]
 struct ModelImageEntry {
     generation: u64,
     images: Option<bool>,
+    radius: Option<super::radius_catalog::Metadata>,
 }
 
 const MAX_MODEL_IMAGE_ENTRIES: usize = 1024;
@@ -2599,11 +2628,23 @@ fn model_cache_key(args: &Cli, provider: &super::Provider, model: &str) -> Optio
     })
 }
 
+#[cfg(test)]
 fn remember_model_images(
     args: &Cli,
     provider: &super::Provider,
     model: &str,
     details: Option<&pi_rs::ollama::ModelDetails>,
+    generation: u64,
+) {
+    remember_model_metadata(args, provider, model, details, None, generation);
+}
+
+fn remember_model_metadata(
+    args: &Cli,
+    provider: &super::Provider,
+    model: &str,
+    details: Option<&pi_rs::ollama::ModelDetails>,
+    radius: Option<&super::radius_catalog::Metadata>,
     generation: u64,
 ) {
     let Some(key) = model_cache_key(args, provider, model) else {
@@ -2626,11 +2667,17 @@ fn remember_model_images(
         .is_none_or(|entry| entry.generation <= generation)
     {
         // Keep unknown as a tombstone so an older discovery cannot revive it.
+        // Radius OAuth is resolved outside model_credential_for. Only reuse
+        // account metadata when the discovery credential is identified here.
+        let radius = radius
+            .filter(|_| key.scope.discovery_credential_hash.is_some())
+            .cloned();
         cache.entries.insert(
             key,
             ModelImageEntry {
                 generation,
                 images: details.and_then(|details| details.images),
+                radius,
             },
         );
         cache.evict();
@@ -2719,17 +2766,17 @@ fn available_models_at(
             }
             for model in catalog.models {
                 if include_details {
-                    remember_model_images(
+                    let metadata = radius.as_ref().and_then(|radius| radius.metadata(&model));
+                    remember_model_metadata(
                         &args,
                         &catalog.provider,
                         &model,
                         details.get(&model),
+                        metadata,
                         generation,
                     );
                     let mut row = model_value_without_cache(&args, &catalog.provider, &model);
-                    if let Some(radius) = &radius {
-                        radius.apply_metadata(&model, &mut row);
-                    }
+                    apply_radius_metadata(&args, &catalog.provider, &model, metadata, &mut row);
                     rows.push(model_with_input_details(row, details.get(&model)));
                 }
                 choices.push(ScopedChoice {
@@ -3454,6 +3501,37 @@ mod tests {
                 .is_none()
         );
         assert!(args.rpc_model_images.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn current_radius_model_reuses_metadata_only_for_the_same_credential() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        let provider = super::super::Provider::Radius;
+        let key = |value: &str| {
+            super::super::model_auth::Keys::parse(&json!({"radius":{"type":"api_key","key":value}}))
+        };
+        args.model_keys = key("first-fixture-key");
+        let metadata = serde_json::from_value(json!({
+            "cost":{"input":3}, "inputLimits":{"images":{"resize":{"maxWidth":512}}}
+        }))
+        .unwrap();
+        remember_model_metadata(
+            &args,
+            &provider,
+            "balanced",
+            None,
+            Some(&metadata),
+            next_model_generation(&args),
+        );
+        let model = model_value(&args, &provider, "balanced");
+        assert_eq!(model["cost"]["input"], 3.0);
+        assert_eq!(model["inputLimits"]["images"]["resize"]["maxWidth"], 512);
+        args.model_keys = key("second-fixture-key");
+        assert!(
+            model_value(&args, &provider, "balanced")
+                .get("cost")
+                .is_none()
+        );
     }
 
     #[test]

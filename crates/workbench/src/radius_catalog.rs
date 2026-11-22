@@ -10,7 +10,7 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-use super::model_profiles::InputLimits;
+use super::model_profiles::{InputLimits, ModelMetadata};
 
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 pub(super) struct Catalog {
@@ -19,19 +19,11 @@ pub(super) struct Catalog {
 }
 
 impl Catalog {
-    pub(super) fn apply_metadata(&self, id: &str, row: &mut Value) {
-        let (Some(model), Some(row)) = (
-            self.models.iter().find(|model| model.id == id),
-            row.as_object_mut(),
-        ) else {
-            return;
-        };
-        if let Some(cost) = &model.cost {
-            row.entry("cost").or_insert_with(|| cost.value());
-        }
-        if let Some(limits) = model.input_limits {
-            row.entry("inputLimits").or_insert_with(|| json!(limits));
-        }
+    pub(super) fn metadata(&self, id: &str) -> Option<&Metadata> {
+        self.models
+            .iter()
+            .find(|model| model.id == id)
+            .map(|model| &model.metadata)
     }
 }
 
@@ -46,6 +38,13 @@ pub(super) struct Model {
     max_tokens: u32,
     #[serde(default)]
     thinking_level_map: BTreeMap<String, Option<String>>,
+    #[serde(flatten)]
+    metadata: Metadata,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Metadata {
     #[serde(
         default,
         deserialize_with = "optional_metadata",
@@ -58,6 +57,23 @@ pub(super) struct Model {
         skip_serializing_if = "Option::is_none"
     )]
     input_limits: Option<InputLimits>,
+}
+
+impl Metadata {
+    pub(super) fn apply(&self, configured: Option<&ModelMetadata>, row: &mut Value) {
+        if let Some(mut price) = self.cost.clone() {
+            if let Some(overrides) = configured.and_then(|metadata| metadata.cost.clone()) {
+                price = price.overlay(overrides);
+            }
+            row["cost"] = price.value();
+        }
+        if let Some(mut limits) = self.input_limits {
+            if let Some(overrides) = configured.and_then(ModelMetadata::input_limits) {
+                limits = limits.overlay(overrides);
+            }
+            row["inputLimits"] = json!(limits);
+        }
+    }
 }
 
 fn optional_metadata<'de, D: Deserializer<'de>, T: DeserializeOwned>(
@@ -169,8 +185,9 @@ fn parse(config: Config, gateway: &Url) -> Result<Catalog> {
                 && seen.insert(model.id.clone())
         })
         .map(|mut model| {
-            model.cost = model.cost.filter(ChatPrice::valid);
-            model.input_limits = model.input_limits.filter(|limits| limits.valid());
+            model.metadata.cost = model.metadata.cost.filter(ChatPrice::valid);
+            model.metadata.input_limits =
+                model.metadata.input_limits.filter(|limits| limits.valid());
             model
         })
         .collect();
@@ -244,7 +261,7 @@ mod tests {
         assert!(baseline(&Url::parse("https://other.example/").unwrap()).is_none());
 
         let mut row = json!({});
-        public.apply_metadata("balanced", &mut row);
+        public.metadata("balanced").unwrap().apply(None, &mut row);
         assert_eq!(
             row["cost"],
             json!({"input":3.0,"output":15.0,"cacheRead":0.3,"cacheWrite":0.0})
@@ -277,16 +294,28 @@ mod tests {
         };
         let fresh = catalog(vec![model.clone(), invalid]);
         let restored = catalog(serde_json::from_value(json!(fresh.models)).unwrap());
-        let mut row = json!({"cost":{"input":2}});
-        restored.apply_metadata("fixture", &mut row);
-        assert_eq!(row["cost"], json!({"input":2}));
-        assert_eq!(row["inputLimits"]["images"]["resize"]["maxWidth"], 512);
+        let configured = serde_json::from_value(json!({
+            "cost":{"input":2}, "inputLimits":{"images":{"resize":{"maxHeight":2048}}}
+        }))
+        .unwrap();
         let mut row = json!({});
-        restored.apply_metadata("fixture", &mut row);
+        restored
+            .metadata("fixture")
+            .unwrap()
+            .apply(Some(&configured), &mut row);
+        assert_eq!(row["cost"]["input"], 2.0);
+        assert_eq!(row["cost"]["output"], 3.0);
+        assert_eq!(row["inputLimits"]["images"]["resize"]["maxWidth"], 512);
+        assert_eq!(row["inputLimits"]["images"]["resize"]["maxHeight"], 2048);
+        let mut row = json!({});
+        restored.metadata("fixture").unwrap().apply(None, &mut row);
         assert_eq!(row["cost"]["input"], 1.5);
         assert_eq!(restored.models.len(), 2);
         let mut row = json!({});
-        restored.apply_metadata("invalid-metadata", &mut row);
+        restored
+            .metadata("invalid-metadata")
+            .unwrap()
+            .apply(None, &mut row);
         assert_eq!(row, json!({}));
 
         model.as_object_mut().unwrap().remove("inputLimits");
