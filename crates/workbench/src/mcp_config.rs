@@ -1125,10 +1125,11 @@ pub(super) fn check_manager_connection(
     name: &str,
     expected: &ServerConfig,
 ) -> Result<()> {
-    let current = registered_configurations(args, registered)?
-        .remove(name)
-        .map(serde_json::from_value::<ServerConfig>)
-        .transpose()?;
+    let current = if mcp_enabled(args)? {
+        manager_server_configuration(configurations(args)?, registered, name)?
+    } else {
+        None
+    };
     if current.as_ref() != Some(expected)
         || args
             .disable_extension
@@ -1140,6 +1141,26 @@ pub(super) fn check_manager_connection(
         ));
     }
     Ok(())
+}
+
+fn manager_server_configuration(
+    mut configured: BTreeMap<String, Value>,
+    registered: &[pi_rs::RegisteredMcpServer],
+    name: &str,
+) -> Result<Option<ServerConfig>> {
+    let current = if let Some(config) = configured.get(name) {
+        Some(config.clone())
+    } else {
+        add_registered_servers(&mut configured, registered);
+        let declared = configured.remove(name);
+        if declared.as_ref().is_some_and(uses_host_mcp_credentials) {
+            return Err(Error::Config(
+                "MCP host credential references require an explicit MCP configuration".into(),
+            ));
+        }
+        declared
+    };
+    Ok(current.map(serde_json::from_value).transpose()?)
 }
 
 pub(super) async fn manager_login(
@@ -1609,11 +1630,13 @@ async fn show_inspection(
     }
     let can_edit = entry.is_some_and(|entry| entry.scope != InspectionScope::Extension);
     if enabled == Some(true) {
-        actions.push(UiComponentAction {
-            key: "r".into(),
-            value: "reconnect".into(),
-            label: Some("Reconnect".into()),
-        });
+        if entry.is_some_and(|entry| entry.status != "disabled") {
+            actions.push(UiComponentAction {
+                key: "r".into(),
+                value: "reconnect".into(),
+                label: Some("Reconnect".into()),
+            });
+        }
         if can_edit {
             actions.push(UiComponentAction {
                 key: "x".into(),
@@ -2144,6 +2167,20 @@ mod tests {
             json!({"command":"fixture","env":{"KEY":"${TOKEN}"}}),
         ] {
             assert!(uses_host_mcp_credentials(&config));
+            let registered = [pi_rs::RegisteredMcpServer {
+                server: pi_rs::McpServerDeclaration {
+                    name: "fixture".into(),
+                    config: config.clone(),
+                },
+                extension_id: "fixture-extension".into(),
+                extension_path: None,
+            }];
+            assert!(manager_server_configuration(BTreeMap::new(), &registered, "fixture").is_err());
+            let configured = BTreeMap::from([("fixture".into(), config.clone())]);
+            assert_eq!(
+                manager_server_configuration(configured, &registered, "fixture").unwrap(),
+                Some(serde_json::from_value(config).unwrap())
+            );
         }
         assert!(!uses_host_mcp_credentials(
             &json!({"url":"https://example.invalid","headers":{"User-Agent":"fixture"}})
