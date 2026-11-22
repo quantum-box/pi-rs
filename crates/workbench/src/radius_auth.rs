@@ -377,7 +377,7 @@ impl Gateway {
         let guard = admission
             .until_cancelled(super::auth_lock::acquire_async(&path))
             .await?;
-        let value = super::config::read_object_unlocked(&path)?;
+        let value = super::config::read_auth_object_locked(&guard)?;
         let Some(credential) = self.credential_from_value(&value)? else {
             return Ok(None);
         };
@@ -409,11 +409,17 @@ impl Gateway {
             guard.check().map_err(|_| ambiguous_refresh_error())?;
             #[cfg(test)]
             pause_crash_fixture("before-send");
-            let result = runtime.block_on(gateway.token(&[
+            let token_form = [
                 ("grant_type", "refresh_token"),
                 ("client_id", CLIENT_ID),
                 ("refresh_token", &credential.refresh),
-            ])).map_err(|_| ambiguous_refresh_error())?;
+            ];
+            let result = runtime
+                .block_on(super::model_auth::with_oauth_refresh_deadline(
+                    "radius",
+                    gateway.token(&token_form),
+                ))
+                .map_err(|_| ambiguous_refresh_error())?;
             let TokenResult::Granted(token) = result else {
                 return Err(ambiguous_refresh_error());
             };

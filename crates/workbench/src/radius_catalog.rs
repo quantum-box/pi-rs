@@ -136,7 +136,7 @@ fn parse(config: Config, gateway: &Url) -> Result<Catalog> {
 
 pub(super) fn baseline(gateway: &Url) -> Option<Arc<Catalog>> {
     static PUBLIC: LazyLock<Arc<Catalog>> = LazyLock::new(|| {
-        let source = include_str!("../assets/radius-models-v1.5.0.json");
+        let source = include_str!("../assets/radius-models-v1.6.0.json");
         let config = serde_json::from_str(source).expect("bundled Radius catalog");
         let gateway =
             Url::parse(super::radius_auth::DEFAULT_GATEWAY).expect("public Radius gateway");
@@ -180,4 +180,24 @@ pub(super) fn remember(gateway: &Url, account: &str, catalog: &Catalog) -> Resul
             "baseUrl":catalog.endpoint.as_str(), "models":catalog.models,
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_radius_baseline_contains_the_pinned_chat_catalog() {
+        let gateway = Url::parse(super::super::radius_auth::DEFAULT_GATEWAY).unwrap();
+        let public = baseline(&gateway).unwrap();
+        assert_eq!(public.models.len(), 39);
+        let fable = public
+            .models
+            .iter()
+            .find(|model| model.id == "claude-fable-5-2")
+            .unwrap();
+        assert!(fable.details().images.unwrap());
+        assert!(public.models.iter().any(|model| model.id == "gpt-6.2-sol"));
+        assert!(baseline(&Url::parse("https://other.example/").unwrap()).is_none());
+    }
 }

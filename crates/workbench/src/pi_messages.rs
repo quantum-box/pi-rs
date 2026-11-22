@@ -834,6 +834,7 @@ fn terminal_metadata(
         cached_input_tokens: read,
         cache_creation_input_tokens: write,
         cache_write_1h_tokens: stats["cacheWrite1h"].as_u64(),
+        reasoning_output_tokens: stats["reasoning"].as_u64(),
         cost_usd: stats["cost"]["total"].as_number().cloned(),
         cost_breakdown: pi_rs::UsageCostBreakdown::from_value(&stats["cost"]),
         cost_from_provider: stats["cost"]["totalFromProvider"].as_bool(),

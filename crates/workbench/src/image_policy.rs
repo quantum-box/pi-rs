@@ -33,16 +33,47 @@ pub(super) struct FinalStrictPolicy {
     pub provider: super::providers::Provider,
     pub selected_model: String,
     pub explicit_endpoint: bool,
-    pub bound_support: Option<bool>,
+    pub bound_support: Option<(bool, bool)>,
 }
 
 impl FinalStrictPolicy {
     fn baseline(&self) -> Result<bool> {
         match self.bound_support {
-            Some(value) => Ok(value),
+            Some((strict, _)) => Ok(strict),
             None => self.support(&self.selected_model),
         }
     }
+    fn grammar_support(&self, model: &str) -> bool {
+        if model != self.selected_model
+            && !self.profiles.has_model_definition(&self.provider, model)
+        {
+            return false;
+        }
+        let metadata = self.profiles.model(&self.provider, model);
+        self.profiles
+            .chat_compatibility(&self.provider, metadata.as_ref())
+            .supports_openai_grammar_tools()
+            .unwrap_or(false)
+    }
+
+    fn tool_support(&self, model: &str) -> Result<(bool, bool)> {
+        Ok((self.support(model)?, self.grammar_support(model)))
+    }
+
+    fn changed_support(
+        &self,
+        (strict, grammar): (bool, bool),
+    ) -> Result<(Option<bool>, Option<bool>)> {
+        let baseline_grammar = self.bound_support.map_or_else(
+            || self.grammar_support(&self.selected_model),
+            |(_, grammar)| grammar,
+        );
+        Ok((
+            (strict != self.baseline()?).then_some(strict),
+            (grammar != baseline_grammar).then_some(grammar),
+        ))
+    }
+
     fn support(&self, model: &str) -> Result<bool> {
         let metadata = self.profiles.model(&self.provider, model);
         let adapter = self.profiles.model_adapter(&self.provider, model);
@@ -72,15 +103,25 @@ impl FinalStrictPolicy {
         {
             return Ok(false);
         }
-        Ok(if adapter == super::providers::Adapter::OpenAiResponses {
-            self.profiles
-                .responses_strict_tool_support(&self.provider, metadata.as_ref())
-        } else {
-            self.profiles
-                .chat_compatibility(&self.provider, metadata.as_ref())
-                .supports_strict_mode()
-                == Some(true)
-        })
+        Ok(
+            if matches!(
+                adapter,
+                super::providers::Adapter::OpenAiResponses
+                    | super::providers::Adapter::AzureResponses
+                    | super::providers::Adapter::CodexResponses
+            ) {
+                self.profiles.responses_strict_tool_support(
+                    &self.provider,
+                    adapter,
+                    metadata.as_ref(),
+                )
+            } else {
+                self.profiles
+                    .chat_compatibility(&self.provider, metadata.as_ref())
+                    .supports_strict_mode()
+                    .unwrap_or(adapter == super::providers::Adapter::MistralConversations)
+            },
+        )
     }
 }
 
@@ -123,6 +164,10 @@ pub(super) fn session_affinity_headers(
 
 #[async_trait::async_trait]
 impl Model for WorkbenchModel {
+    fn minimum_output_tokens(&self) -> u32 {
+        self.client.minimum_output_tokens()
+    }
+
     async fn stream_detailed_with_tool_declarations(
         &self,
         request_id: Uuid,
@@ -213,8 +258,12 @@ impl Model for WorkbenchModel {
         let support = self
             .strict_policy
             .as_ref()
-            .map(|policy| policy.support(&request.model))
+            .map(|policy| policy.tool_support(&request.model))
             .transpose()?;
+        let (strict, grammar) = match (&self.strict_policy, support) {
+            (Some(policy), Some(support)) => policy.changed_support(support)?,
+            _ => (None, None),
+        };
         let external_id = pi_rs::provider_header_session_id();
         let prepared = if let Some(external_id) = &external_id {
             self.client
@@ -229,23 +278,20 @@ impl Model for WorkbenchModel {
         let Some((client, identity)) = prepared else {
             return Ok(None);
         };
-        let changed_support = match (&self.strict_policy, support) {
-            (Some(policy), Some(final_support)) => {
-                (policy.baseline()? != final_support).then_some(final_support)
+        let client = if strict.is_some() || grammar.is_some() {
+            client.with_final_tool_support(strict, grammar).await?
+        } else {
+            client
+        };
+        let identity = identity.and_then(|mut identity| {
+            if let Some(supported) = strict {
+                identity =
+                    pi_rs::fingerprint_model_context(&("final-strict-v1", identity, supported))?;
             }
-            _ => None,
-        };
-        let client = match changed_support {
-            Some(supported) => client.with_final_strict_support(supported).await?,
-            None => client,
-        };
-        let identity = identity.and_then(|identity| {
-            let identity = match changed_support {
-                Some(supported) => {
-                    pi_rs::fingerprint_model_context(&("final-strict-v1", identity, supported))?
-                }
-                None => identity,
-            };
+            if let Some(supported) = grammar {
+                identity =
+                    pi_rs::fingerprint_model_context(&("final-grammar-v1", identity, supported))?;
+            }
             pi_rs::fingerprint_model_context(&(
                 "workbench-policy-v2",
                 identity,
@@ -479,6 +525,10 @@ impl pi_rs::PreparedToolDispatch for PreparedWorkbenchToolDispatch {
 
 #[async_trait::async_trait]
 impl Model for PreparedWorkbenchModel {
+    fn minimum_output_tokens(&self) -> u32 {
+        self.inner.minimum_output_tokens()
+    }
+
     async fn prepare_context<'a>(
         &'a self,
         request: &ModelRequest,
@@ -656,9 +706,9 @@ impl WorkbenchModel {
     async fn final_client(&self, client: Client, model: &str) -> Result<Client> {
         match &self.strict_policy {
             Some(policy) => {
-                let support = policy.support(model)?;
-                if support != policy.baseline()? {
-                    client.with_final_strict_support(support).await
+                let (strict, grammar) = policy.changed_support(policy.tool_support(model)?)?;
+                if strict.is_some() || grammar.is_some() {
+                    client.with_final_tool_support(strict, grammar).await
                 } else {
                     Ok(client)
                 }
@@ -1641,6 +1691,49 @@ mod final_strict_policy_tests {
                 "{id}"
             );
         }
+    }
+
+    #[test]
+    fn codex_final_model_policy_uses_the_responses_strict_default() {
+        let profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers":{"openai-codex":{
+                "models":[{"id":"without-strict","compat":{"supportsStrictMode":false}}]
+            }}
+        }))
+        .unwrap();
+        let policy = FinalStrictPolicy {
+            provider: profiles.provider("openai-codex").unwrap(),
+            profiles,
+            selected_model: "gpt-6.1-sol".into(),
+            explicit_endpoint: false,
+            bound_support: None,
+        };
+        assert!(policy.baseline().unwrap());
+        assert!(!policy.support("without-strict").unwrap());
+        assert!(!policy.support("unknown").unwrap());
+    }
+
+    #[test]
+    fn bedrock_final_model_policy_respects_bundled_capability_and_overrides() {
+        let profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers":{"amazon-bedrock":{
+                "modelOverrides":{
+                    "anthropic.claude-sonnet-4-6":{"compat":{"supportsStrictMode":false}}
+                }
+            }}
+        }))
+        .unwrap();
+        let policy = FinalStrictPolicy {
+            provider: profiles.provider("amazon-bedrock").unwrap(),
+            profiles,
+            selected_model: "anthropic.claude-fable-5-2".into(),
+            explicit_endpoint: false,
+            bound_support: None,
+        };
+        assert!(policy.baseline().unwrap());
+        assert!(!policy.support("anthropic.claude-sonnet-4-6").unwrap());
+        assert!(!policy.support("amazon.nova-micro-v1:0").unwrap());
+        assert!(!policy.support("unlisted").unwrap());
     }
 
     #[test]

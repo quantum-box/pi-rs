@@ -2,6 +2,55 @@ use pi_rs::{HostAuthBuilder, HostCredential, HostCredentialKind, ModelCatalogBui
 use pi_rs_workbench::model_factory::{ModelClientFactory, NativeModelApi};
 
 #[test]
+fn model_factory_builds_an_exact_catalog_with_host_metadata() {
+    use pi_rs::CatalogModelInfo;
+    use pi_rs_workbench::model_factory::NativeModelDefinition;
+
+    let endpoint = "https://api.example.test/v1/chat/completions";
+    let mut auth = HostAuthBuilder::new();
+    auth.register(
+        "example",
+        endpoint,
+        HostCredential::new(HostCredentialKind::ApiKey, "fixture-key").unwrap(),
+    )
+    .unwrap();
+    let factory = ModelClientFactory::new(auth.build());
+    let definition = NativeModelDefinition {
+        api: NativeModelApi::OpenAiChat,
+        provider: "example",
+        endpoint,
+        model: "demo",
+        info: Some(CatalogModelInfo {
+            display_name: Some("Demo model".into()),
+            ..Default::default()
+        }),
+    };
+    let catalog = factory.catalog([definition.clone()]).unwrap();
+    assert_eq!(
+        catalog
+            .info("example", "demo")
+            .unwrap()
+            .display_name
+            .as_deref(),
+        Some("Demo model")
+    );
+    assert!(
+        factory
+            .catalog([definition.clone(), definition.clone()])
+            .is_err()
+    );
+    assert!(
+        factory
+            .catalog([NativeModelDefinition {
+                endpoint: "https://ungranted.example.test/v1/chat/completions",
+                ..definition
+            }])
+            .is_err()
+    );
+    assert!(catalog.session_builder("example", "demo").is_ok());
+}
+
+#[test]
 fn factory_uses_only_exact_host_authorized_routes_and_credential_kinds() {
     let mut auth = HostAuthBuilder::new();
     auth.register(
@@ -408,6 +457,7 @@ fn auth_file_snapshot_binds_only_granted_routes() {
     let other = "https://other.example.test/v1/chat/completions";
     let keys = serde_json::json!({
         "compatible": { "type": "api_key", "key": "prefix-${TOKEN}-$!$$", "env": { "TOKEN": "saved" } },
+        "malformed": { "type": "api_key", "key": "${bad-$INNER}-${TOKEN}-${open-$TOKEN", "env": { "INNER": "private", "TOKEN": "saved" } },
         "bound": { "type": "api_key", "key": "$LITERAL", "literal": true, "endpoint": endpoint },
         "command": { "type": "api_key", "key": "!printf should-not-be-read" },
         "process_env": { "type": "api_key", "key": "$PATH" },
@@ -419,6 +469,7 @@ fn auth_file_snapshot_binds_only_granted_routes() {
         file: file.clone(),
         routes: [
             ("compatible", endpoint),
+            ("malformed", endpoint),
             ("bound", endpoint),
             ("bound", other),
             ("command", endpoint),
@@ -438,6 +489,10 @@ fn auth_file_snapshot_binds_only_granted_routes() {
         "prefix-saved-!$"
     );
     assert_eq!(auth.get("bound", endpoint).unwrap().secret(), "$LITERAL");
+    assert_eq!(
+        auth.get("malformed", endpoint).unwrap().secret(),
+        "${bad-$INNER}-saved-${open-saved"
+    );
     for provider in ["command", "process_env", "login", "ungranted"] {
         assert!(auth.get(provider, endpoint).is_none());
     }

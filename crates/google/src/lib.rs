@@ -43,6 +43,8 @@ pub struct Google {
     client: Client,
     http_proxies: Vec<reqwest::Proxy>,
     endpoint: Url,
+    vertex: bool,
+    vertex_bearer: Option<HeaderValue>,
     api_key: HeaderValue,
     provider: Arc<str>,
     replay_scope: Arc<str>,
@@ -94,6 +96,8 @@ impl Google {
             client,
             http_proxies: Vec::new(),
             endpoint,
+            vertex: false,
+            vertex_bearer: None,
             api_key,
             provider: Arc::from("google"),
             replay_scope: Arc::from("google"),
@@ -114,7 +118,45 @@ impl Google {
         })
     }
 
-    /// Set the per-read HTTP idle timeout; `None` disables it.
+    /// Use Vertex AI's publisher model collection with a Cloud API key or access token.
+    pub fn with_vertex(mut self, bearer: bool) -> Result<Self> {
+        self.vertex = true;
+        self.probe_context = false;
+        if self.provider.as_ref() == "google" {
+            self.provider = Arc::from("google-vertex");
+        }
+        if self.replay_scope.as_ref() == "google" {
+            self.replay_scope =
+                pi_rs_core::endpoint_replay_scope("google-vertex", self.endpoint.as_str()).into();
+        }
+        if bearer {
+            let mut auth = HeaderValue::from_str(&format!(
+                "Bearer {}",
+                self.api_key.to_str().unwrap_or_default(),
+            ))
+            .map_err(|_| Error::Config("invalid Google Vertex access token".into()))?;
+            auth.set_sensitive(true);
+            self.vertex_bearer = Some(auth);
+        }
+        Ok(self)
+    }
+
+    fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let request = match &self.vertex_bearer {
+            Some(bearer) => request.header(reqwest::header::AUTHORIZATION, bearer.clone()),
+            None => request.header("x-goog-api-key", self.api_key.clone()),
+        };
+        request.headers(self.headers.clone())
+    }
+
+    fn api(&self) -> ModelApi {
+        if self.vertex {
+            ModelApi::GoogleVertex
+        } else {
+            ModelApi::GoogleGenerativeAi
+        }
+    }
+
     pub fn with_http_idle_timeout(self, timeout: Option<Duration>) -> Result<Self> {
         let proxies = self.http_proxies.clone();
         self.with_http_options(timeout, &proxies)
@@ -178,7 +220,7 @@ impl Google {
     }
 
     pub fn with_context_probe(mut self, enabled: bool) -> Self {
-        self.probe_context = enabled;
+        self.probe_context = enabled && !self.vertex;
         self
     }
     pub fn with_thinking(mut self, thinking: Option<&str>) -> Self {
@@ -379,7 +421,11 @@ impl Google {
     fn url(&self, resource: Option<&str>) -> Url {
         let mut url = self.endpoint.clone();
         let mut segments = url.path_segments_mut().expect("HTTP base URL");
-        segments.pop_if_empty().push("models");
+        segments.pop_if_empty();
+        if self.vertex {
+            segments.extend(["publishers", "google"]);
+        }
+        segments.push("models");
         if let Some(resource) = resource {
             segments.push(resource);
         }
@@ -389,10 +435,7 @@ impl Google {
 
     async fn read_model(&self, url: Url) -> Result<Value> {
         let response = self
-            .client
-            .get(url)
-            .header("x-goog-api-key", self.api_key.clone())
-            .headers(self.headers.clone())
+            .authenticate(self.client.get(url))
             .timeout(Duration::from_secs(10))
             .send()
             .await
@@ -537,12 +580,14 @@ enum ThinkingFamily {
 fn family(id: &str) -> Option<ThinkingFamily> {
     let normalized = id.to_ascii_lowercase();
     let id = normalized.as_str();
-    if gemini_major(id).is_some_and(|version| version >= 3)
+    let gemini = gemini_version(id);
+    if gemini.is_some_and(|(version, _)| version >= 3)
         || matches!(id, "gemini-flash-latest" | "gemini-flash-lite-latest")
         || id.starts_with("gemma-4")
         || id.starts_with("gemma4-")
     {
-        Some(if id.contains("-pro") {
+        let model = gemini.map_or(id, |(_, model)| model);
+        Some(if model.contains("-pro") {
             ThinkingFamily::LevelPro
         } else {
             ThinkingFamily::LevelFlash
@@ -559,20 +604,27 @@ fn family(id: &str) -> Option<ThinkingFamily> {
 }
 
 fn gemini_major(id: &str) -> Option<u32> {
-    let id = id.to_ascii_lowercase();
-    let version = id.strip_prefix("gemini-")?;
-    let version = version.strip_prefix("live-").unwrap_or(version);
-    version
-        .bytes()
-        .take_while(u8::is_ascii_digit)
-        .fold(None, |value: Option<u32>, digit| {
-            Some(
-                value
-                    .unwrap_or(0)
-                    .saturating_mul(10)
-                    .saturating_add((digit - b'0') as u32),
-            )
-        })
+    gemini_version(&id.to_ascii_lowercase()).map(|(version, _)| version)
+}
+
+fn gemini_version(id: &str) -> Option<(u32, &str)> {
+    id.match_indices("gemini-").find_map(|(start, marker)| {
+        let model = &id[start..];
+        let version = &model[marker.len()..];
+        let version = version.strip_prefix("live-").unwrap_or(version);
+        version
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .fold(None, |value: Option<u32>, digit| {
+                Some(
+                    value
+                        .unwrap_or(0)
+                        .saturating_mul(10)
+                        .saturating_add((digit - b'0') as u32),
+                )
+            })
+            .map(|major| (major, model))
+    })
 }
 
 /// Whether the model expects call IDs in both function calls and their responses.
@@ -591,9 +643,22 @@ pub fn model_thinking_levels(id: &str) -> Vec<String> {
         .collect()
 }
 
+fn supports_xhigh(id: &str) -> bool {
+    gemini_version(&id.to_ascii_lowercase()).is_some_and(|(_, model)| {
+        ["gemini-4-hydrogen", "gemini-4-neon"].iter().any(|name| {
+            model
+                .strip_prefix(name)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('-'))
+        })
+    })
+}
+
 fn available_thinking(id: &str, enabled: bool) -> Vec<&'static str> {
     if !enabled {
         return vec!["off"];
+    }
+    if supports_xhigh(id) {
+        return vec!["low", "medium", "high", "xhigh"];
     }
     match family(id) {
         Some(ThinkingFamily::LevelPro) => vec!["low", "high"],
@@ -628,6 +693,7 @@ fn thinking_config(id: &str, level: Option<&str>) -> Option<Value> {
                 "minimal" => "MINIMAL",
                 "low" => "LOW",
                 "medium" => "MEDIUM",
+                "xhigh" if supports_xhigh(id) => "XHIGH",
                 _ => "HIGH",
             };
             Some(json!({"thinkingLevel":native,"includeThoughts":true}))
@@ -851,11 +917,28 @@ impl pi_rs_core::PreparedToolDispatch for PreparedGoogleDispatch {
     }
 }
 
+#[cfg(test)]
 fn wire_request(
     request: &ModelRequest,
     thinking: Option<&str>,
     replay_scope: &str,
     edited_scope: &str,
+) -> Result<Value> {
+    wire_request_for_api(
+        request,
+        thinking,
+        replay_scope,
+        edited_scope,
+        ModelApi::GoogleGenerativeAi,
+    )
+}
+
+fn wire_request_for_api(
+    request: &ModelRequest,
+    thinking: Option<&str>,
+    replay_scope: &str,
+    edited_scope: &str,
+    api: ModelApi,
 ) -> Result<Value> {
     let identity = identity(replay_scope, model_id(&request.model));
     let gemini_v3 = gemini_major(&identity.model).is_some_and(|version| version >= 3);
@@ -866,7 +949,9 @@ fn wire_request(
     let mut calls = BTreeMap::new();
     let mut tool_images = Vec::new();
     for message in &request.messages {
-        if !matches!(message, Message::Tool { .. }) && !tool_images.is_empty() {
+        if !matches!(message, Message::Tool { .. } | Message::System { .. })
+            && !tool_images.is_empty()
+        {
             push_content(
                 &mut contents,
                 "user",
@@ -875,7 +960,11 @@ fn wire_request(
             );
         }
         match message {
-            Message::System { content } => system.push(content.as_str()),
+            Message::System { content } => {
+                if !content.is_empty() {
+                    system.push(content.as_str());
+                }
+            }
             Message::User { content } => {
                 push_content(&mut contents, "user", vec![json!({"text":content})], true)
             }
@@ -903,7 +992,7 @@ fn wire_request(
                         } else {
                             identity.clone()
                         }
-                        && replay.supports_api(ModelApi::GoogleGenerativeAi)
+                        && replay.supports_api(api)
                 }) {
                     let mut first_call = true;
                     replay
@@ -1128,7 +1217,13 @@ impl Model for Google {
         }
         pi_rs_core::protected_model_fingerprint(&(
             headers,
-            "google-v3-tool-errors",
+            if self.vertex_bearer.is_some() {
+                "google-vertex-adc-v3"
+            } else if self.vertex {
+                "google-vertex-v3"
+            } else {
+                "google-v5"
+            },
             self.endpoint.as_str(),
             self.provider.as_ref(),
             self.replay_scope.as_ref(),
@@ -1191,7 +1286,9 @@ impl Model for Google {
         let thinking = self.thinking.as_deref();
         let edited_scope =
             pi_rs_core::endpoint_replay_scope(&self.replay_scope, self.endpoint.as_str());
-        let mut body = wire_request(&request, thinking, &self.replay_scope, &edited_scope)?;
+        let api = self.api();
+        let mut body =
+            wire_request_for_api(&request, thinking, &self.replay_scope, &edited_scope, api)?;
         if let Some((schemas, validated)) = &self.bound_tools
             && let Some(tools) = body
                 .pointer_mut("/tools/0/functionDeclarations")
@@ -1239,10 +1336,7 @@ impl Model for Google {
             Progress::WaitingForModel,
         );
         let response = self
-            .client
-            .post(url)
-            .header("x-goog-api-key", self.api_key.clone())
-            .headers(self.headers.clone())
+            .authenticate(self.client.post(url))
             .json(&body)
             .send()
             .await
@@ -1275,7 +1369,7 @@ impl Model for Google {
         Ok(Box::pin(async_stream::try_stream! {
             let mut stream = response.bytes_stream().eventsource();
             let mut metadata = ModelMetadata {
-                provider_api: Some(ModelApi::GoogleGenerativeAi),
+                provider_api: Some(api),
                 replay_identity: Some(identity(&edited_scope, &model)),
                 ..ModelMetadata::default()
             };
@@ -1327,12 +1421,18 @@ impl Model for Google {
                     metadata.resolved_model = Some(identity(&provider, version));
                 }
                 if let Some(stats) = value.get("usageMetadata") {
-                    let count = |key: &str| stats[key].as_u64().unwrap_or_default();
+                    let previous: Usage = usage.unwrap_or_default();
+                    let previous_thoughts = metadata.reasoning_output_tokens.unwrap_or_default();
+                    let candidates = stats["candidatesTokenCount"].as_u64()
+                        .unwrap_or_else(|| previous.output_tokens.saturating_sub(previous_thoughts));
+                    metadata.reasoning_output_tokens = stats["thoughtsTokenCount"].as_u64()
+                        .or(metadata.reasoning_output_tokens);
+                    metadata.cached_input_tokens = stats["cachedContentTokenCount"].as_u64()
+                        .or(metadata.cached_input_tokens);
                     usage = Some(Usage {
-                        input_tokens: count("promptTokenCount"),
-                        output_tokens: count("candidatesTokenCount").saturating_add(count("thoughtsTokenCount")),
+                        input_tokens: stats["promptTokenCount"].as_u64().unwrap_or(previous.input_tokens),
+                        output_tokens: candidates.saturating_add(metadata.reasoning_output_tokens.unwrap_or_default()),
                     });
-                    metadata.cached_input_tokens = stats["cachedContentTokenCount"].as_u64();
                 }
                 if value["promptFeedback"]["blockReason"].as_str().is_some_and(|reason| !reason.is_empty() && reason != "BLOCK_REASON_UNSPECIFIED") {
                     Err(Error::Model("Google Gemini blocked the prompt".into()))?;
@@ -1399,7 +1499,7 @@ impl Model for Google {
             metadata.finish_reason = Some(match finish.as_deref() {
                 Some("STOP") if calls.is_empty() => "stop",
                 Some("STOP") => "tool_calls",
-                Some("MAX_TOKENS") => {
+                Some("MAX_TOKENS" | "CONTINUATION") => {
                     calls.clear();
                     blocks.retain(|part| part.get("functionCall").is_none());
                     "length"
@@ -1500,6 +1600,91 @@ mod tests {
             fallback.reservation_request().tools[0].parameters["properties"]["x"]["enum"],
             json!(["a"])
         );
+    }
+
+    #[tokio::test]
+    async fn vertex_uses_publisher_resources_and_separates_key_from_bearer_auth() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        for bearer in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let base = if bearer {
+                "/v1/projects/fixture/locations/us-central1"
+            } else {
+                "/v1"
+            };
+            let worker = std::thread::spawn(move || {
+                let (socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).unwrap();
+                assert_eq!(
+                    line.trim(),
+                    format!(
+                        "POST {base}/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse HTTP/1.1"
+                    )
+                );
+                let mut headers = String::new();
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    socket.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    let line = line.to_ascii_lowercase();
+                    if let Some(value) = line.strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    headers.push_str(&line);
+                }
+                assert_eq!(
+                    headers.contains("authorization: bearer vertex-fixture"),
+                    bearer
+                );
+                assert_eq!(headers.contains("x-goog-api-key: vertex-fixture"), !bearer);
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["contents"][0]["parts"][0]["text"], "hello");
+                let body = format!(
+                    "data: {}\n\n",
+                    json!({
+                        "responseId":"vertex-fixture",
+                        "candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[{"text":"result"}]}}]
+                    }),
+                );
+                write!(
+                    socket.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                ).unwrap();
+            });
+            let client = Google::new(&format!("http://{address}{base}"), "vertex-fixture")
+                .unwrap()
+                .with_vertex(bearer)
+                .unwrap();
+            let request = ModelRequest {
+                model: "gemini-2.5-flash".into(),
+                messages: vec![Message::User {
+                    content: "hello".into(),
+                }],
+                tools: vec![],
+                max_output_tokens: 64,
+            };
+            let mut stream = client.stream(request).await.unwrap();
+            let mut saw_vertex = false;
+            while let Some(event) = stream.next().await {
+                if let ModelEvent::Metadata(metadata) = event.unwrap() {
+                    saw_vertex |= metadata.provider_api == Some(ModelApi::GoogleVertex);
+                }
+            }
+            assert!(saw_vertex);
+            worker.join().unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1669,7 +1854,7 @@ mod tests {
         let headers: Vec<(&str, &[u8])> = vec![];
         let old = pi_rs_core::protected_model_fingerprint(&(
             headers,
-            "google-v2-const-enum",
+            "google-v3-tool-errors",
             google.endpoint.as_str(),
             google.provider.as_ref(),
             google.replay_scope.as_ref(),
@@ -2514,6 +2699,58 @@ mod tests {
     }
 
     #[test]
+    fn default_vertex_sdk_replay_is_bound_to_its_provider_and_endpoint() {
+        let endpoint = "https://vertex.example/v1/projects/one/locations/global";
+        let gemini = Google::new(endpoint, "fixture").unwrap();
+        let vertex = gemini.clone().with_vertex(false).unwrap();
+        let other_vertex = Google::new(
+            "https://vertex.example/v1/projects/two/locations/global",
+            "fixture",
+        )
+        .unwrap()
+        .with_vertex(false)
+        .unwrap();
+        let custom = gemini
+            .clone()
+            .with_provider("configured", "configured-route")
+            .with_vertex(false)
+            .unwrap();
+        assert_eq!(custom.provider.as_ref(), "configured");
+        assert_eq!(custom.replay_scope.as_ref(), "configured-route");
+        assert_eq!(vertex.provider.as_ref(), "google-vertex");
+        for (origin, target, matching) in [
+            (&gemini, &gemini, true),
+            (&vertex, &vertex, true),
+            (&gemini, &vertex, false),
+            (&vertex, &gemini, false),
+            (&vertex, &other_vertex, false),
+        ] {
+            let request = ModelRequest {
+                model: "gemini-3-pro".into(),
+                messages: vec![Message::Assistant {
+                    content: String::new(),
+                    calls: vec![ToolCall {
+                        id: "call".into(),
+                        name: "test".into(),
+                        arguments: "{}".into(),
+                    }],
+                    replay: Some(Box::new(ProviderReplay {
+                        identity: identity(&origin.replay_scope, "gemini-3-pro"),
+                        blocks: vec![
+                            json!({"functionCall":{"name":"test","args":{}},"thoughtSignature":"fixture-signature"}),
+                        ],
+                    })),
+                }],
+                tools: vec![],
+                max_output_tokens: 32,
+            };
+            let body = wire_request_for_api(&request, None, &target.replay_scope, "", target.api())
+                .unwrap();
+            assert_eq!(body.to_string().contains("fixture-signature"), matching);
+        }
+    }
+
+    #[test]
     fn edited_replay_is_endpoint_bound_and_gemini_calls_keep_or_gain_signature() {
         let scope_a = pi_rs_core::endpoint_replay_scope("google", "https://a.example/v1");
         let scope_b = pi_rs_core::endpoint_replay_scope("google", "https://b.example/v1");
@@ -2709,6 +2946,8 @@ mod tests {
         .to_string();
         for (model, nested) in [
             ("gemini-2.5-flash", false),
+            ("gateway-gemini-2.5-flash", false),
+            ("gateway-gemini-4-argon", true),
             ("Gemini-2.5-flash", false),
             ("GeMiNi-LiVe-2.5-flash", false),
             ("gemini-2_flash", false),
@@ -2722,6 +2961,9 @@ mod tests {
             let request = ModelRequest {
                 model: model.into(),
                 messages: vec![
+                    Message::System {
+                        content: "Initial instructions".into(),
+                    },
                     Message::Assistant {
                         content: String::new(),
                         calls: ["a", "b"]
@@ -2740,6 +2982,12 @@ mod tests {
                         call_id: "a".into(),
                         content: image_result.clone(),
                     },
+                    Message::System {
+                        content: String::new(),
+                    },
+                    Message::System {
+                        content: "Later instructions".into(),
+                    },
                     Message::Tool {
                         is_structured: Some(false),
                         is_error: true,
@@ -2754,6 +3002,10 @@ mod tests {
                 max_output_tokens: 32,
             };
             let body = wire_request(&request, None, "google", "google").unwrap();
+            assert_eq!(
+                body["systemInstruction"]["parts"][0]["text"],
+                "Initial instructions\n\nLater instructions"
+            );
             let contents = body["contents"].as_array().unwrap();
             if model.to_ascii_lowercase().starts_with("gemini") {
                 let call = &contents[0]["parts"][0];
@@ -2809,6 +3061,9 @@ mod tests {
             ("gemini-_2", None),
             ("gemini-live-", None),
             ("gemini-live2", None),
+            ("gateway-gemini-4-argon", Some(4)),
+            ("gateway-gemini-LIVE-03preview", Some(3)),
+            ("gemini-proxy-gemini-12", Some(12)),
         ] {
             assert_eq!(gemini_major(id), expected, "{id}");
         }
@@ -2819,6 +3074,15 @@ mod tests {
         assert_eq!(
             thinking_config("gemini-3_flash", Some("low")),
             thinking_config("gemini-3-flash", Some("low"))
+        );
+        assert_eq!(
+            thinking_config("gateway-gemini-4-argon", Some("high")),
+            thinking_config("gemini-4-argon", Some("high"))
+        );
+        assert!(uses_tool_call_ids("gateway-gemini-4-argon"));
+        assert_eq!(
+            model_thinking_levels("provider-proxy-gemini-4-argon"),
+            model_thinking_levels("gemini-4-argon")
         );
         assert_eq!(model_thinking_levels("gemini-2_flash"), vec!["off"]);
         assert_eq!(thinking_config("gemini-2_flash", Some("low")), None);
@@ -2840,8 +3104,67 @@ mod tests {
                 thinking_config(mixed, Some("minimal"))
             );
         }
-        assert_eq!(gemini_major("not-gemini-2"), None);
+        assert_eq!(gemini_major("not-gemini-2"), Some(2));
         assert_eq!(gemini_major("gemini-unknown"), None);
+    }
+
+    #[tokio::test]
+    async fn continuation_is_truncated_and_drops_unfinished_tool_calls() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.read(&mut [0; 8192]).unwrap();
+            let event = json!({"candidates":[{
+                "content":{"parts":[
+                    {"text":"partial answer","thoughtSignature":"signed-text"},
+                    {"functionCall":{"name":"read","id":"unfinished","args":{"path":"file"}}}
+                ]},
+                "finishReason":"CONTINUATION",
+                "continuationToken":"unconsumed-token"
+            }]});
+            let body = format!("data: {event}\n\n");
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let model = Google::new(&format!("http://{address}"), "key")
+            .unwrap()
+            .with_context_probe(false);
+        let mut stream = model
+            .stream(ModelRequest {
+                model: "gateway-gemini-4-argon".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 32,
+            })
+            .await
+            .unwrap();
+        let mut text = String::new();
+        let mut finish = None;
+        let mut replay = None;
+        let mut complete = false;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                ModelEvent::Text(delta) => text.push_str(&delta),
+                ModelEvent::Metadata(metadata) => {
+                    finish = metadata.finish_reason;
+                    replay = metadata.replay;
+                }
+                ModelEvent::Complete { calls, .. } => {
+                    assert!(calls.is_empty());
+                    complete = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(complete);
+        assert_eq!(finish.as_deref(), Some("length"));
+        assert_eq!(text, "partial answer");
+        assert_eq!(
+            replay.unwrap().blocks,
+            vec![json!({"text":"partial answer","thoughtSignature":"signed-text"})]
+        );
+        worker.join().unwrap();
     }
 
     #[tokio::test]
@@ -2879,7 +3202,19 @@ mod tests {
                     json!({"candidates":[{"content":{"parts":[part]}}]})
                 ));
             }
-            body.push_str("data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n");
+            body.push_str(&format!(
+                "data: {}\n\n",
+                json!({
+                    "usageMetadata":{"promptTokenCount":12,"thoughtsTokenCount":4}
+                })
+            ));
+            body.push_str(&format!(
+                "data: {}\n\n",
+                json!({
+                    "candidates":[{"finishReason":"STOP"}],
+                    "usageMetadata":{"candidatesTokenCount":5}
+                })
+            ));
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
         });
         let model = Google::new(&endpoint, "test")
@@ -2900,7 +3235,11 @@ mod tests {
             match event.unwrap() {
                 ModelEvent::Reasoning(s) => events.push(format!("thinking:{s}")),
                 ModelEvent::Text(s) => events.push(format!("text:{s}")),
-                ModelEvent::Metadata(metadata) => replay = metadata.replay,
+                ModelEvent::Metadata(metadata) => {
+                    assert_eq!(metadata.reasoning_output_tokens, Some(4));
+                    replay = metadata.replay;
+                }
+                ModelEvent::Complete { usage, .. } => assert_eq!(usage.unwrap().output_tokens, 9),
                 _ => {}
             }
         }
@@ -3002,6 +3341,29 @@ mod tests {
     }
 
     #[test]
+    fn gemini_4_hydrogen_and_neon_use_native_xhigh() {
+        for model in ["gemini-4-hydrogen", "gateway-gemini-4-neon-preview"] {
+            assert_eq!(
+                model_thinking_levels(model),
+                ["low", "medium", "high", "xhigh"]
+            );
+            assert_eq!(
+                thinking_config(model, Some("xhigh")),
+                Some(json!({"thinkingLevel":"XHIGH","includeThoughts":true}))
+            );
+        }
+        assert!(
+            !model_thinking_levels("gemini-4-argon")
+                .iter()
+                .any(|level| level == "xhigh")
+        );
+        assert_eq!(
+            thinking_config("gemini-4-argon", Some("xhigh")),
+            Some(json!({"thinkingLevel":"HIGH","includeThoughts":true}))
+        );
+    }
+
+    #[test]
     fn thinking_config_uses_the_models_native_control() {
         assert_eq!(
             thinking_config("gemini-3.1-pro", Some("low")),
@@ -3067,6 +3429,20 @@ mod tests {
                 Some(json!({"thinkingBudget":0})),
             ),
             ("gemini-3.1-pro", None, None, Some(false), None),
+            (
+                "gemini-4-carbon",
+                Some("medium"),
+                None,
+                Some(true),
+                Some(json!({"thinkingLevel":"MEDIUM","includeThoughts":true})),
+            ),
+            (
+                "gemini-robotics-er-2-preview",
+                Some("low"),
+                None,
+                Some(true),
+                Some(json!({"thinkingBudget":-1,"includeThoughts":true})),
+            ),
             (
                 "custom-reasoner",
                 None,

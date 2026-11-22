@@ -1358,6 +1358,7 @@ impl SessionBuilder {
         }
         // Session::open already recovers interrupted handoffs, but callers can
         // also supply a custom store whose temporary branch is still checked out.
+        crate::extension_boundary::repair_plan_on_open(&mut session)?;
         if self.historical_model_resolver.is_some() {
             session.recover_tree_trigger_handoff()?;
         }
@@ -1798,6 +1799,11 @@ impl AgentSession {
     pub fn registered_tool_info(&self) -> Vec<crate::RegisteredToolInfo> {
         self.registry.registered_tool_info()
     }
+    /// Snapshot configured custom-message renderers for the host presentation.
+    pub fn custom_message_renderers(&self) -> crate::CustomMessageRenderers {
+        self.registry.custom_message_renderers()
+    }
+
     /// Inspect configured extension commands, including collision-resolved
     /// invocation names and extension provenance. Prompt templates, skills and
     /// built-in host commands remain the host's responsibility. Per-request
@@ -2161,6 +2167,86 @@ impl AgentSession {
         self.refresh_input_hooks()?;
         Ok(())
     }
+    /// Server declarations owned by the loaded extensions.
+    pub fn registered_mcp_servers(&self) -> &[crate::RegisteredMcpServer] {
+        self.registry.registered_mcp_servers()
+    }
+
+    /// Register or update an MCP declaration for a loaded extension and notify subscribers.
+    pub async fn register_mcp_server(
+        &mut self,
+        extension_id: &str,
+        server: crate::McpServerDeclaration,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        let mut journal = self
+            .session
+            .try_lock()
+            .map_err(|_| Error::Session("session journal is in use".into()))?;
+        let mut registry = self.registry.as_ref().clone();
+        registry.register_mcp_server(extension_id, server)?;
+        self.registry = Arc::new(registry);
+        self.refresh_run_config();
+        self.notify_mcp_servers_changed(&mut journal, extension_id)
+            .await;
+        drop(journal);
+        if let Err(error) = self.drain_idle_triggers().await {
+            self.report_mcp_change_error(extension_id, &error);
+        }
+        Ok(())
+    }
+
+    /// Remove a declaration owned by the given extension and notify subscribers if it existed.
+    pub async fn unregister_mcp_server(&mut self, extension_id: &str, name: &str) -> Result<bool> {
+        self.ensure_open()?;
+        let mut journal = self
+            .session
+            .try_lock()
+            .map_err(|_| Error::Session("session journal is in use".into()))?;
+        let mut registry = self.registry.as_ref().clone();
+        if !registry.unregister_mcp_server(extension_id, name) {
+            return Ok(false);
+        }
+        self.registry = Arc::new(registry);
+        self.refresh_run_config();
+        self.notify_mcp_servers_changed(&mut journal, extension_id)
+            .await;
+        drop(journal);
+        if let Err(error) = self.drain_idle_triggers().await {
+            self.report_mcp_change_error(extension_id, &error);
+        }
+        Ok(true)
+    }
+
+    async fn notify_mcp_servers_changed(&self, session: &mut Session, extension_id: &str) {
+        let events = self.events.as_ref().expect("open session");
+        if let Err(error) = crate::lifecycle::notify_idle_with_host(
+            &self.registry,
+            session,
+            crate::LifecycleEvent::McpServersChange {
+                servers: self.registry.registered_mcp_servers().to_vec(),
+            },
+            self.limits.tool_timeout,
+            &mut |notification| emit(events, &notification),
+        )
+        .await
+        {
+            self.report_mcp_change_error(extension_id, &error);
+        }
+    }
+
+    fn report_mcp_change_error(&self, extension_id: &str, error: &Error) {
+        let events = self.events.as_ref().expect("open session");
+        emit(
+            events,
+            &Notification::ExtensionLifecycleError {
+                extension: extension_id,
+                event: "mcp_servers_change",
+                message: &error.to_string(),
+            },
+        );
+    }
+
     /// Check out a branch after validating that its selected model is registered.
     pub fn checkout(&mut self, record: u64) -> Result<()> {
         self.ensure_open()?;
@@ -2567,6 +2653,11 @@ impl AgentSession {
         let order = self.control.input_order.acquire().await?;
         let session = self.session.clone();
         let mut journal = session.lock().await;
+        if !defer_startup && journal.pending_extension_boundary_run().is_some() {
+            return Err(Error::Session(
+                "pending extension boundary recovery must be resumed before startup".into(),
+            ));
+        }
         if !defer_startup && crate::agent::resumable_compaction_run(&journal).is_some() {
             return Err(Error::Session(
                 "pending compaction recovery must be resumed before startup".into(),
@@ -3161,12 +3252,15 @@ impl AgentSession {
         .await
     }
     pub async fn resume(&mut self) -> Result<String> {
-        let recovery = {
+        let (recovery, boundary_run) = {
             let journal = self.journal_async().await;
-            crate::agent::resumable_compaction_run(&journal)
+            (
+                crate::agent::resumable_compaction_run(&journal),
+                journal.pending_extension_boundary_run(),
+            )
         };
         let (_, startup_error) = self
-            .start_with_fallback(None, false, recovery.is_some())
+            .start_with_fallback(None, false, recovery.is_some() || boundary_run.is_some())
             .await?;
         if let Some(error) = startup_error {
             return Err(error);
@@ -3199,7 +3293,7 @@ impl AgentSession {
                     .into(),
             ));
         }
-        let run_id = recovery.map(|(run_id, _, _)| run_id);
+        let run_id = recovery.map(|(run_id, _, _)| run_id).or(boundary_run);
         if run_id.is_none() {
             self.drain_idle_triggers().await?;
         }
