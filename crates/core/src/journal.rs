@@ -4658,7 +4658,7 @@ pub(crate) fn system_transcript(
             .collect::<Vec<_>>()
             .join("\n\n")
     } else {
-        String::new()
+        fallback.to_owned()
     };
     let updates = checkpoints
         .filter_map(|(source, content, sections)| {
@@ -6384,6 +6384,40 @@ mod system_checkpoint_tests {
         assert_eq!(
             system_context(&session.branch(), "fallback", vec![read, old.clone()]),
             ("old base\n\nold section".into(), vec![old])
+        );
+    }
+
+    #[test]
+    fn system_transcript_keeps_fallback_before_the_first_mid_conversation_checkpoint() {
+        let checkpoint = Record {
+            version: FORMAT_VERSION,
+            id: 2,
+            parent: Some(1),
+            timestamp: None,
+            run_id: None,
+            event: Event::SystemCheckpoint {
+                content: "update".into(),
+                sections: vec![],
+                tools_added: vec![],
+                tools_removed: vec![],
+            },
+        };
+        let conversation = vec![(
+            1,
+            Message::User {
+                content: "first".into(),
+            },
+        )];
+        let transcript = system_transcript(&[&checkpoint], &conversation, 1, "fallback").unwrap();
+        assert_eq!(transcript.leading, "fallback");
+        assert_eq!(
+            transcript.updates,
+            vec![(
+                2,
+                Message::System {
+                    content: "update".into()
+                }
+            )]
         );
     }
 
