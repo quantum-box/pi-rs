@@ -145,8 +145,8 @@ or custom models through the native fallback.
 | CLI modes | Interactive, `--print`, `--mode json`, `--mode rpc` commands with streamed message, turn, and tool lifecycle events, existing subcommands | Full Pi argument, session response, and event compatibility |
 | Local tools | Text and image read, paging, write, batch/legacy exact edits with diff output and file mutation locks, configurable Bash and Windows PowerShell with session metadata and Pi-style exit and truncation text, structured read, search, listing and shell truncation details, grep, find, ls, concurrent user shell and model execution | Complete output/error/truncation parity |
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors and toggleable label timestamps, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks |
-| Model access | Ollama, configurable OpenAI-compatible chat endpoint, native OpenAI Responses, Anthropic Messages, Google Gemini Generate Content, Radius Pi Messages, and Amazon Bedrock Converse streaming, named profiles for those APIs, API keys and bearer tokens, searchable built-in chat model catalog, including native OpenAI, Anthropic and Gemini catalogs and the Fireworks and OpenRouter Messages models, model declarations and overrides including model-specific APIs and endpoints, cross-provider switching and scoped cycling, branch-local model/thinking selection, capability-aware thinking levels, catalog pricing and usage estimates, agent retry configuration | Additional provider catalogs and native adapters, remaining model configuration fields |
-| Authentication | Host-supplied model token; masked terminal `/login` and `/logout` for native provider API keys; endpoint-bound private storage, Radius browser and device OAuth with refresh, OpenRouter browser OAuth with manual redirect fallback, ChatGPT plan browser OAuth with token refresh and account selection, Kimi Code device OAuth with refresh | OAuth and refresh for other model providers; ChatGPT live acceptance |
+| Model access | Ollama, OpenAI-compatible Chat Completions, OpenAI and Codex Responses, Anthropic Messages, Google Gemini Generate Content, Radius Pi Messages, and Amazon Bedrock Converse streaming. The searchable chat catalog includes pinned first-party and gateway models. Named profiles support model-specific APIs and endpoints, scoped cycling, branch-local model and thinking choices, catalog costs, usage estimates, and retry settings. | Provider-specific transport and configuration limits are recorded in the model checkpoints below. |
+| Authentication | Host-supplied tokens, credential commands, endpoint-bound API keys, and Pi-compatible OAuth storage. Native sign-in supports Anthropic, Radius, OpenRouter, ChatGPT, OpenAI Codex, GitHub Copilot, Kimi Code, Meta, and xAI. Expiring subscription credentials can refresh or mint a replacement key when the provider supports it. | Live sign-in, refresh, and inference coverage is recorded in each provider checkpoint. |
 | Native extensions | Rust tool, prompt input, direct process execution, command-created branch-local custom entries and model-context messages, durable custom messages from native tools and supported callbacks during runs or while idle, user-shell result replacement and streaming operations, in-process shell spawn hooks, injectable model read, write, edit, shell, grep, find and ls operations, model and thinking selection, context and full-system context hooks, policy, command, state/migration, compaction, resource discovery and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, typed command-line flags, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, styled modal components and custom message renderers | Remaining Pi events and selection paths, custom entries and messages from all callbacks, custom entry and other renderers, resource provenance in other surfaces and general component render callbacks |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts with per-server resource pagination; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; automatic selection of configured hosted client metadata; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Live acceptance with a hosted pi-rs client identity |
@@ -379,6 +379,30 @@ execution time. Rust tools with a host can emit bounded progress while running;
 the built-in shell tool emits bounded cumulative output updates. Other built-in
 tool progress and completion-order notifications remain open.
 
+### Azure OpenAI checkpoint
+
+Azure exposes the 45 pinned chat models and chooses Responses or Chat
+Completions per model. Configure the account with `AZURE_OPENAI_BASE_URL`
+or `AZURE_OPENAI_RESOURCE_NAME` and authenticate with `AZURE_OPENAI_API_KEY`
+or a saved key. An explicit `models.json` provider base URL takes precedence
+over the environment. `AZURE_OPENAI_API_VERSION` configures the Responses
+query parameter, and `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` replaces the wire
+model name while preserving the catalog ID. Responses uses an `api-key`
+header. For Chat Completions, Pi 1.6 sends the API key as `Authorization: Bearer`
+to `/openai/v1/chat/completions`. This is an accepted Azure v1 authentication
+form for Foundry models. [Microsoft Foundry endpoint authentication](https://learn.microsoft.com/en-us/azure/ai-studio/ai-services/concepts/endpoints).
+Model discovery on named Responses relays uses the same API key, version
+and URL prefix. A positive output budget under 16 tokens ends the run before
+an Azure Responses request is sent. The bundled
+o-series entries support low, medium and high effort. Named Azure relays
+inherit the bundled effort map for matching model IDs unless configured with
+their own. Azure reasoning models without either map, including Daybreak, use
+Pi's default off, minimal, low, medium and high levels. With thinking off and no
+explicit model mapping, the original GPT-5 reasoning models and o-series
+leave effort unset so Azure can apply its default. This differs from Pi's
+`none` fallback and follows [Azure's model support documentation](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning).
+Live Azure inference has not been verified.
+
 ### Meta Responses API-key checkpoint
 
 The `meta` provider includes Pi 1.6.0's seven Muse models. Muse Ember supports
@@ -459,13 +483,19 @@ The pinned Pi CLI defaults to Kimi K2.6 for Zen and Kimi K3 for Go.
 OpenCode Zen's two pinned Jev classifiers are discoverable through Codemode,
 using its official System One endpoint and `OPENCODE_API_KEY`.
 
-OpenCode Zen and Go expose their 79 and 30 pinned chat models, respectively,
-using `OPENCODE_API_KEY`. The model selects the Messages, Gemini, Chat
+OpenCode Zen and Go expose the 84 and 33 chat models from Pi AI v1.6.0,
+respectively, using `OPENCODE_API_KEY`. The model selects the Messages, Gemini, Chat
 Completions or Responses route. Session requests include `x-opencode-session`
 unless configuration supplies the header explicitly. Endpointless saved keys
 apply to the official routes for the corresponding provider. Gemini prepared
-requests also accept an empty tool list. Live inference
-with a Zen or Go account has not been verified.
+requests also accept an empty tool list. Zen's Gemini 4 Hydrogen and Neon
+send the documented `XHIGH` level when selected. Pi v1.6.0 publishes that
+catalog mapping but its Google client rejects it before sending a request.
+Zen and Go use per-reply effort on
+the Anthropic models marked `supportsMidConvoEffort` in that catalog. Native
+requests include Anthropic's thinking block binding with
+`prefix_mismatch_behavior: drop_block`. Live inference with a Zen or Go
+account has not been verified.
 
 ### Vercel AI Gateway checkpoint
 
@@ -2328,9 +2358,10 @@ Recursive quote rendering stops at 32 levels and preserves deeper content as tex
 Horizontal rules use the reference 80-column maximum.
 Top-level horizontal rules separate following blocks with one blank line and
 do not add a trailing blank line at the end of the rendered message.
-Consecutive paragraphs retain a single separating blank line, including inside
-block quotes. Paragraphs preserve source indentation on their first line and
-after soft and hard line breaks.
+A paragraph is separated from a following paragraph, heading, or quote by one
+blank line, including inside block quotes. Tight list items keep these blocks
+compact. Paragraphs preserve source indentation on their first line and after
+soft and hard line breaks.
 Source-level blank blocks are retained after visible blocks and between link
 reference definitions. List items retain block separators and continuation
 indentation for code and quotes. A pinned Pi fixture checks these layouts,
@@ -4135,9 +4166,9 @@ Embedders can opt out of interleaving or request omitted thinking text while
 retaining its replay signature. Loopback requests verified the header and
 payload. Live authenticated interleaved thinking was unverified.
 
-Anthropic Messages uses per-reply effort for the six direct Anthropic and four
-OpenRouter catalog models marked `supportsMidConvoEffort`. The top-level
-effort stays low while system messages set the historical and active reply
+Anthropic Messages uses per-reply effort for Anthropic and OpenRouter catalog
+models marked `supportsMidConvoEffort`. The top-level effort stays low while
+system messages set the historical and active reply
 levels. Adaptive thinking drops signed blocks whose cached prefix no longer
 matches. Explicit off omits effort messages and block binding on models that
 can disable thinking. For models with an explicit null off mapping, an unset
@@ -5366,14 +5397,23 @@ Live provider acceptance was unverified.
 
 ### Fireworks and OpenRouter Messages catalogs checkpoint
 
-The offline catalog includes 19 Fireworks and 19 OpenRouter models using
-Messages alongside the existing Chat Completions models. The official
-Messages routes use bearer authentication. Environment credentials and
-imported provider-wide keys or OpenRouter OAuth work on the official routes.
+The offline Fireworks catalog matches the Pi 1.6.0 release. It includes
+16 Messages models and 11 Chat Completions models. DeepSeek V4.1 Flash
+1017 Ultra-fast uses adaptive thinking and image input on the Messages
+route. Kimi K3.1 Pro uses Chat Completions with model-specific reasoning
+and image support. The OpenRouter catalog follows Pi AI v1.6.0 and includes
+20 Messages models and 397 Chat Completions models. OpenRouter Chat Completions
+uses the system instruction role by default. Profiles can override the role or
+disable session affinity. OpenRouter Fable 5.2 uses Messages with per-reply
+effort. The official Messages routes use bearer authentication. Environment
+credentials, imported provider-wide keys, and OpenRouter OAuth work on those
+routes.
 Explicitly stored keys remain bound to their saved endpoints. Loopback tests
 covered adaptive thinking, effort mapping and replay with Fireworks empty
-signatures and OpenRouter signed blocks. Additional cache warming and
-mid-conversation options remain to be matched.
+signatures and OpenRouter signed blocks. Fireworks Kimi models retain
+mid-conversation system messages. Tool additions within those messages
+and additional cache warming remain open. Live Fireworks inference was
+unverified.
 
 ### Terminal output padding checkpoint
 
