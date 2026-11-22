@@ -866,6 +866,18 @@ retain the details supplied by the tool.
 - Compare each remaining surface against the pinned reference before marking
   that row complete. Existing core acceptance is recorded in [acceptance.md](acceptance.md).
 
+### Native SDK tool renderers
+
+Rust embedding hosts can resolve call and result renderers for owned,
+built-in, and historical tools with `AgentSession::tool_renderers`.
+Extension resolvers wrap the next renderer in registration order. The base
+combines the registered tool's callbacks with host defaults. A callback receives
+arguments and tool presentation state and returns styled rows that the host
+can theme. Missing or failed sections fall back independently. Pi returns
+live TUI components with local state and invalidation callbacks. Native
+hosts own framing, image handling, component state and redraws. Terminal
+integration and executable renderer registration remain pending.
+
 ### Native custom message renderers
 
 Native Rust and executable extensions can match a visible custom message by
