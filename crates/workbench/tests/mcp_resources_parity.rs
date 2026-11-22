@@ -335,7 +335,11 @@ async fn http_mcp_resources_and_tool_retries_match_pi() {
             let Outcome::Structured { data, .. } = result else {
                 panic!("unexpected cursor page {result:?}")
             };
-            assert_eq!(data["nextCursor"], cursor);
+            if cursor.is_empty() {
+                assert!(data.get("nextCursor").is_none());
+            } else {
+                assert_eq!(data["nextCursor"], cursor);
+            }
             assert_eq!(
                 calls.lock().unwrap().last().unwrap().1.as_deref(),
                 Some(cursor)
