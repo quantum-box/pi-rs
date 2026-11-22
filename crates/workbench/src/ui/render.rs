@@ -5237,6 +5237,8 @@ mod tests {
             failed: false,
             finished: true,
             numbered_diff: true,
+            render_records: None,
+            rendered: None,
             parts: Vec::new(),
         };
         let render = |expanded| {
