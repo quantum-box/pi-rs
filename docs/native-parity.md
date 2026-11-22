@@ -4126,8 +4126,8 @@ Embedders can opt out of interleaving or request omitted thinking text while
 retaining its replay signature. Loopback requests verified the header and
 payload. Live authenticated interleaved thinking was unverified.
 
-Anthropic Messages uses per-reply effort for the five Anthropic and four
-OpenRouter models marked `supportsMidConvoEffort` in Pi v1.5.0. The top-level
+Anthropic Messages uses per-reply effort for the six direct Anthropic and four
+OpenRouter catalog models marked `supportsMidConvoEffort`. The top-level
 effort stays low while system messages set the historical and active reply
 levels. Adaptive thinking drops signed blocks whose cached prefix no longer
 matches. Explicit off omits effort messages and block binding on models that
@@ -4138,6 +4138,17 @@ requests include the betas required for managed effort even when a profile
 provides a custom beta header. Loopback
 tests exercised a level change, disabled thinking, and the default effort.
 Live authenticated managed-effort requests were unverified.
+
+The direct Anthropic catalog includes Claude Fable 5.2 from Pi v1.6.0.
+The model accepts text and images, has a one-million-token context window
+and a 128,000-token model output limit, and adds xhigh and max to its standard
+effort levels.
+The catalog records Pi 1.6.0's mid-conversation system and tool-change
+capability flags for the direct Messages route. Using both capabilities in
+direct Messages requests still requires separate adapter support.
+The catalog includes Pi's model-specific pricing, prompt-cache lifetimes,
+and image limits. Provider-side model fallback requests and fallback pricing
+remain open. Live Fable 5.2 inference was unverified.
 
 Native Anthropic streams expose individual text and thinking block boundaries,
 and show redacted thinking as `[Reasoning redacted]` while retaining its opaque
@@ -5900,8 +5911,17 @@ During requests and stream reads with custom values, SDK and HTTP transport
 events are suppressed because signing and error traces can contain unredacted
 headers or echoed response frames; application tracing remains enabled.
 
-Not yet supported: non-image multimodal inputs, workbench-specific thinking display controls, tool
-choice/strict sampling, guardrails, prompt management ARNs, live account-specific
+The Rust adapter exposes Pi's optional ConverseStream tool choice through
+`Bedrock::with_tool_choice`. It supports automatic, required and named tool
+selection on compatible models. Disabling tools omits tool configuration and
+keeps historical calls and results as text, using the existing tool-free
+request behavior. Budget-based Claude extended thinking rejects required and
+named tool choices locally. The option is covered by signed loopback requests
+and a comparison with published Pi payloads. Live Bedrock tool selection with
+account credentials was unverified.
+
+Not yet supported: non-image multimodal inputs, workbench-specific thinking
+display controls, strict tool sampling, guardrails, prompt management ARNs, live account-specific
 model discovery, and workbench proxy/idle-timeout settings. Custom model endpoints in workbench configuration are rejected;
 callers embedding the adapter can pass a configured AWS SDK client, including a
 test endpoint, through `Bedrock::new`.

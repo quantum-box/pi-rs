@@ -39,7 +39,7 @@ pub struct Ollama {
     template_reasoning_effort: Option<String>,
     thinking_budget_level: Option<String>,
     thinking_budgets: Option<Value>,
-    compatibility: ChatCompatibility,
+    compatibility: Arc<ChatCompatibility>,
     supports_reasoning: Option<bool>,
     reasoning_enabled: bool,
     allow_reasoning_off: bool,
@@ -243,7 +243,7 @@ impl Ollama {
             template_reasoning_effort: None,
             thinking_budget_level: None,
             thinking_budgets: None,
-            compatibility: ChatCompatibility::default(),
+            compatibility: Arc::default(),
             supports_reasoning: None,
             reasoning_enabled: false,
             allow_reasoning_off: true,
@@ -267,7 +267,9 @@ impl Ollama {
             prompt_mode,
             effort: effort.map(str::to_owned),
         });
-        self.compatibility.supports_strict_mode.get_or_insert(true);
+        Arc::make_mut(&mut self.compatibility)
+            .supports_strict_mode
+            .get_or_insert(true);
         self.native_probes = false;
         self
     }
@@ -420,7 +422,7 @@ impl Ollama {
         enabled: bool,
         allow_off: bool,
     ) -> Self {
-        self.compatibility = compatibility;
+        self.compatibility = Arc::new(compatibility);
         self.supports_reasoning = reasoning;
         self.reasoning_enabled = enabled;
         self.allow_reasoning_off = allow_off;
@@ -430,14 +432,13 @@ impl Ollama {
     /// Set endpoint-wide strict tool support; callers must ensure it applies to
     /// every model dispatched through this client.
     pub fn with_strict_tool_support(mut self, supported: bool) -> Self {
-        self.compatibility.supports_strict_mode = Some(supported);
+        Arc::make_mut(&mut self.compatibility).supports_strict_mode = Some(supported);
         self
     }
 
     /// Set custom grammar tool support for the routed model.
     pub fn with_grammar_tool_support(mut self, supported: bool) -> Self {
-        self.compatibility
-            .set_openai_grammar_tool_support(supported);
+        Arc::make_mut(&mut self.compatibility).set_openai_grammar_tool_support(supported);
         self
     }
 
@@ -3264,8 +3265,26 @@ mod constrained_chat_tests {
 
     fn model(support: Option<bool>, endpoint: &str) -> Ollama {
         let mut model = Ollama::new(endpoint, None).unwrap();
-        model.compatibility.supports_strict_mode = support;
+        Arc::make_mut(&mut model.compatibility).supports_strict_mode = support;
         model
+    }
+
+    #[test]
+    fn chat_compatibility_overrides_are_local_to_each_client_clone() {
+        let base = Ollama::new("http://127.0.0.1:11434", None).unwrap();
+        let configured = base
+            .clone()
+            .with_strict_tool_support(false)
+            .with_grammar_tool_support(true);
+        let mistral = base.clone().with_mistral(false, false, None);
+        assert_eq!(configured.compatibility.supports_strict_mode, Some(false));
+        assert_eq!(
+            configured.compatibility.supports_openai_grammar_tools(),
+            Some(true)
+        );
+        assert_eq!(mistral.compatibility.supports_strict_mode, Some(true));
+        assert_eq!(base.compatibility.supports_strict_mode, None);
+        assert_eq!(base.compatibility.supports_openai_grammar_tools(), None);
     }
 
     #[test]
