@@ -2885,6 +2885,12 @@ requirements remain unchanged. Package diagnostics and list output redact URL
 userinfo, including before a configured source is validated; saved declarations
 and internal identity matching are not rewritten.
 
+Captured Git package commands disable terminal prompts and default to SSH batch
+mode, as in the Pi 1.6 interactive UI. An explicit `GIT_SSH_COMMAND` takes
+precedence. Authentication-related failures suggest a credential helper or SSH
+agent and retain the native redaction of subprocess output for sources with
+URL userinfo. The native package CLI also uses captured output.
+
 An explicit native package resource manifest limits loading to its declared
 resource types, including when a declared array is empty. A manifest containing
 only metadata retains automatic directory and native executable discovery.
