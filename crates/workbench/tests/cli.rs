@@ -4949,7 +4949,7 @@ fn read_rpc_model_fixture_request(
 }
 
 #[test]
-fn radius_attachments_use_only_the_current_accounts_cached_resize_profile() {
+fn radius_attachments_use_the_current_accounts_resize_profile() {
     use base64::Engine;
     use image::GenericImageView;
     use sha2::{Digest, Sha256};
@@ -4965,17 +4965,19 @@ fn radius_attachments_use_only_the_current_accounts_cached_resize_profile() {
         json!({"providers":{"radius":{"models":[{"id":"fixture","input":["text","image"]}]}}});
     std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
     let account = format!("key:{:x}", Sha256::digest(b"matching-key"));
-    let catalog = json!({
+    let mut catalog = json!({
         "origin":origin,"account":account,"baseUrl":format!("{origin}v1"),
         "models":[{"id":"fixture","name":"Fixture","reasoning":false,"input":["text","image"],
             "contextWindow":131072,"maxTokens":4096,"inputLimits":{"images":{"resize":{"maxWidth":16}}}}]
     });
     std::fs::write(root.path().join("radius-models.json"), catalog.to_string()).unwrap();
+    catalog["models"][0]["inputLimits"]["images"]["resize"]["maxWidth"] = json!(12);
+    let discovered = catalog.to_string();
 
     let worker = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(40);
         let mut dimensions = Vec::new();
-        while dimensions.len() < 3 && Instant::now() < deadline {
+        while dimensions.len() < 4 && Instant::now() < deadline {
             let (mut socket, _) = match listener.accept() {
                 Ok(connection) => connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -4986,7 +4988,11 @@ fn radius_attachments_use_only_the_current_accounts_cached_resize_profile() {
             };
             let (request, body) = read_rpc_model_fixture_request(&socket, |_| Ok(())).unwrap();
             if request.starts_with("GET /v1/config ") {
-                socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                if dimensions.len() == 3 {
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{discovered}", discovered.len()).unwrap();
+                } else {
+                    socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
                 continue;
             }
             let path = request.split_ascii_whitespace().nth(1).unwrap();
@@ -5020,7 +5026,12 @@ fn radius_attachments_use_only_the_current_accounts_cached_resize_profile() {
         dimensions
     });
 
-    for key in [Some("matching-key"), Some("different-key"), None] {
+    for key in [
+        Some("matching-key"),
+        Some("different-key"),
+        None,
+        Some("matching-key"),
+    ] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
         command
             .current_dir(root.path())
@@ -5029,10 +5040,14 @@ fn radius_attachments_use_only_the_current_accounts_cached_resize_profile() {
             .env_remove("RADIUS_API_KEY");
         if let Some(key) = key {
             command.env("RADIUS_API_KEY", key);
+            models["providers"]["radius"]
+                .as_object_mut()
+                .unwrap()
+                .remove("apiKey");
         } else {
             models["providers"]["radius"]["apiKey"] = json!("!echo matching-key");
-            std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
         }
+        std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
         let output = command
             .args([
                 "--offline",
@@ -5058,6 +5073,7 @@ fn radius_attachments_use_only_the_current_accounts_cached_resize_profile() {
             ("/v1/messages".into(), (16, 8)),
             ("/messages".into(), (40, 20)),
             ("/v1/messages".into(), (16, 8)),
+            ("/v1/messages".into(), (12, 6)),
         ]
     );
 }
