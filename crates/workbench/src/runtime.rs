@@ -356,7 +356,7 @@ impl Runtime {
                 );
             }
         }
-        self.set_shell_context(
+        self.shell.set_context_with_external_id(
             shell_session_context(args, session),
             session.external_session_id(),
         );
@@ -372,14 +372,44 @@ impl Runtime {
             limits: effective_limits(args),
         }
     }
-    pub(super) fn set_shell_context(&self, context: ShellContext, external_id: String) {
-        self.shell
-            .set_context_with_external_id(context, external_id);
+    pub(super) fn refresh_read_image_policy(&self, args: &Cli) {
+        set_read_image_policy(
+            &self.read_image_policy,
+            &args.model_profiles,
+            &args.provider,
+            &args.model,
+        );
     }
 
-    pub(super) fn refresh_read_image_policy(&self, args: &Cli, provider: &str, model: &str) {
-        if let Some(provider) = args.model_profiles.provider(provider) {
-            set_read_image_policy(&self.read_image_policy, args, &provider, model);
+    pub(super) fn live_tool_model_context<'a>(
+        &self,
+        args: &'a Cli,
+        session: &Session,
+    ) -> impl FnMut(&pi_rs::Record) + use<'a> {
+        let shell = self.shell.clone();
+        let policy = self.read_image_policy.clone();
+        let profiles = &args.model_profiles;
+        let mut context = shell_session_context(args, session);
+        let external_id = session.external_session_id();
+        move |record| {
+            let pi_rs::Event::ModelSelected {
+                model,
+                provider,
+                thinking,
+            } = &record.event
+            else {
+                return;
+            };
+            let provider = provider
+                .as_deref()
+                .unwrap_or(super::providers::Provider::Ollama.id());
+            if let Some(provider) = profiles.provider(provider) {
+                set_read_image_policy(&policy, profiles, &provider, model);
+            }
+            context.provider = provider.into();
+            context.model = model.clone();
+            context.reasoning_level = Some(thinking.clone().unwrap_or_else(|| "off".into()));
+            shell.set_context_with_external_id(context.clone(), external_id.clone());
         }
     }
 
@@ -521,7 +551,7 @@ impl Runtime {
 
     pub fn configure_model_options(&mut self, args: &Cli, reported: bool) -> Result<()> {
         self.provider = model_client(args, reported, true)?;
-        set_read_image_policy(&self.read_image_policy, args, &args.provider, &args.model);
+        self.refresh_read_image_policy(args);
         Ok(())
     }
     pub async fn session_lifecycle(
@@ -1044,7 +1074,12 @@ async fn configure_after(
         registry.register(Arc::new(Tools::new(&args.workspace, order_config)?))?;
         let shell = shell_config(args);
         let read_image_policy = Arc::new(LiveReadImagePolicy::default());
-        set_read_image_policy(&read_image_policy, args, &args.provider, &args.model);
+        set_read_image_policy(
+            &read_image_policy,
+            &args.model_profiles,
+            &args.provider,
+            &args.model,
+        );
         registry.register(Arc::new(
             CodingTools::local(&args.workspace)?
                 .with_shell_config(shell.clone())
@@ -1136,18 +1171,18 @@ async fn configure_after(
 
 fn set_read_image_policy(
     policy: &LiveReadImagePolicy,
-    args: &Cli,
+    profiles: &super::model_profiles::Profiles,
     provider: &super::providers::Provider,
     model: &str,
 ) {
-    let model = args.model_profiles.model(provider, model);
+    let model = profiles.model(provider, model);
     policy.set(
         model.as_ref().and_then(|model| model.image_resize()),
         model.as_ref().and_then(|model| model.supports_images()),
     );
 }
 
-pub(super) fn shell_session_context(args: &Cli, session: &Session) -> ShellContext {
+fn shell_session_context(args: &Cli, session: &Session) -> ShellContext {
     ShellContext {
         id: session.session_id(),
         path: (!args.no_session && !args.ephemeral_worker_session).then(|| args.session.clone()),

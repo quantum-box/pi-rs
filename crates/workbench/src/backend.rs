@@ -1288,30 +1288,15 @@ async fn run_worker(
             emit_refreshed_entries(refreshed);
             cache_capture.initialize(session, &runtime.registry);
             let agent = runtime.agent(&args, session);
-            let mut live_shell_context = live_model.as_ref().map(|_| {
-                (
-                    runtime::shell_session_context(&args, session),
-                    session.external_session_id(),
-                )
-            });
+            let mut tool_model_context = live_model
+                .as_ref()
+                .map(|_| runtime.live_tool_model_context(&args, session));
             let mut summary_request = false;
             let mut observer = |event: pi_rs::Notification<'_>| {
-                if let Some((context, external_id)) = live_shell_context.as_mut()
+                if let Some(update) = tool_model_context.as_mut()
                     && let pi_rs::Notification::Committed(record) = &event
-                    && let pi_rs::Event::ModelSelected {
-                        model,
-                        provider,
-                        thinking,
-                    } = &record.event
                 {
-                    context.provider = provider
-                        .clone()
-                        .unwrap_or_else(|| super::providers::Provider::Ollama.id().into());
-                    context.model = model.clone();
-                    context.reasoning_level =
-                        Some(thinking.clone().unwrap_or_else(|| "off".into()));
-                    runtime.refresh_read_image_policy(&args, &context.provider, model);
-                    runtime.set_shell_context(context.clone(), external_id.clone());
+                    update(record);
                 }
                 snapshot
                     .lock()
@@ -1747,7 +1732,7 @@ async fn run_worker(
         drop(cache_capture);
         if let Some((selected, adapter)) = adopted {
             args = selected;
-            runtime.refresh_read_image_policy(&args, args.provider.id(), &args.model);
+            runtime.refresh_read_image_policy(&args);
             runtime.provider = adapter;
         }
         for execution in completed_shells {
