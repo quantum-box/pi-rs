@@ -41,6 +41,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","thinkingFormat":"ant-ling","supportsStrictMode":true}),
     },
     Builtin {
+        id: "azure",
+        endpoint: "",
+        env: "AZURE_OPENAI_API_KEY",
+        compatibility: standard,
+    },
+    Builtin {
         id: "baseten",
         endpoint: "https://inference.baseten.co/v1/chat/completions",
         env: "BASETEN_API_KEY",
@@ -78,7 +84,7 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         id: "fireworks",
         endpoint: "https://api.fireworks.ai/inference/v1/chat/completions",
         env: "FIREWORKS_API_KEY",
-        compatibility: standard,
+        compatibility: || json!({"supportsStore":true,"maxTokensField":"max_completion_tokens"}),
     },
     Builtin {
         id: "github-copilot",
@@ -297,6 +303,7 @@ impl Builtin {
                 "openai" | "xai" | "meta" => Adapter::OpenAiResponses,
                 "google-vertex" => Adapter::GoogleVertex,
                 "mistral" => Adapter::MistralConversations,
+                "azure" => Adapter::AzureResponses,
                 "openai-codex" => Adapter::CodexResponses,
                 "minimax" | "minimax-cn" | "vercel-ai-gateway" => Adapter::Anthropic,
                 _ => Adapter::ChatCompletions,
@@ -310,6 +317,7 @@ impl Builtin {
 
     pub fn endpoint_for(&self, adapter: Adapter) -> Option<&'static str> {
         match (adapter, self.id) {
+            (_, "azure") => None,
             (
                 Adapter::ChatCompletions | Adapter::Anthropic | Adapter::OpenAiResponses,
                 "cloudflare-ai-gateway",

@@ -178,6 +178,7 @@ impl Policy {
             | Adapter::GoogleVertex
             | Adapter::Bedrock
             | Adapter::OpenAiResponses
+            | Adapter::AzureResponses
             | Adapter::CodexResponses
             | Adapter::MistralConversations => {
                 return Err("cache lifetime unavailable");

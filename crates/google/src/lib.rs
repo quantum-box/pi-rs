@@ -636,9 +636,22 @@ pub fn model_thinking_levels(id: &str) -> Vec<String> {
         .collect()
 }
 
+fn supports_xhigh(id: &str) -> bool {
+    gemini_version(&id.to_ascii_lowercase()).is_some_and(|(_, model)| {
+        ["gemini-4-hydrogen", "gemini-4-neon"].iter().any(|name| {
+            model
+                .strip_prefix(name)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('-'))
+        })
+    })
+}
+
 fn available_thinking(id: &str, enabled: bool) -> Vec<&'static str> {
     if !enabled {
         return vec!["off"];
+    }
+    if supports_xhigh(id) {
+        return vec!["low", "medium", "high", "xhigh"];
     }
     match family(id) {
         Some(ThinkingFamily::LevelPro) => vec!["low", "high"],
@@ -673,6 +686,7 @@ fn thinking_config(id: &str, level: Option<&str>) -> Option<Value> {
                 "minimal" => "MINIMAL",
                 "low" => "LOW",
                 "medium" => "MEDIUM",
+                "xhigh" if supports_xhigh(id) => "XHIGH",
                 _ => "HIGH",
             };
             Some(json!({"thinkingLevel":native,"includeThoughts":true}))
@@ -3273,6 +3287,29 @@ mod tests {
         assert_eq!(
             other["contents"][1]["parts"][0]["functionResponse"]["id"],
             "logical-call"
+        );
+    }
+
+    #[test]
+    fn gemini_4_hydrogen_and_neon_use_native_xhigh() {
+        for model in ["gemini-4-hydrogen", "gateway-gemini-4-neon-preview"] {
+            assert_eq!(
+                model_thinking_levels(model),
+                ["low", "medium", "high", "xhigh"]
+            );
+            assert_eq!(
+                thinking_config(model, Some("xhigh")),
+                Some(json!({"thinkingLevel":"XHIGH","includeThoughts":true}))
+            );
+        }
+        assert!(
+            !model_thinking_levels("gemini-4-argon")
+                .iter()
+                .any(|level| level == "xhigh")
+        );
+        assert_eq!(
+            thinking_config("gemini-4-argon", Some("xhigh")),
+            Some(json!({"thinkingLevel":"HIGH","includeThoughts":true}))
         );
     }
 
