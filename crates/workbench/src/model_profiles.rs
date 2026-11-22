@@ -372,13 +372,22 @@ impl ChatPrice {
             .cache_write_1h_tokens
             .unwrap_or_default()
             .min(writes);
+        let multiplier = metadata
+            .catalog_cost_multiplier
+            .as_ref()
+            .and_then(serde_json::Number::as_f64)
+            .filter(|multiplier| multiplier.is_finite() && *multiplier > 0.0)
+            .unwrap_or(1.0);
         let input_rate = rates.input.unwrap_or_default();
         pi_rs::UsageCostBreakdown::new(
-            (input_rate / 1_000_000.0) * (other_input - writes) as f64,
-            (rates.output.unwrap_or_default() / 1_000_000.0) * usage.output_tokens as f64,
-            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64,
-            (rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
-                + (input_rate / 500_000.0) * long as f64,
+            (input_rate / 1_000_000.0) * (other_input - writes) as f64 * multiplier,
+            (rates.output.unwrap_or_default() / 1_000_000.0)
+                * usage.output_tokens as f64
+                * multiplier,
+            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64 * multiplier,
+            ((rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
+                + (input_rate / 500_000.0) * long as f64)
+                * multiplier,
         )
     }
 }
@@ -1333,6 +1342,49 @@ impl Profiles {
             .supports_long_cache_retention
     }
 
+    pub fn responses_mid_conversation_system_policy(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> (bool, BTreeMap<String, bool>) {
+        let adapter = self.model_adapter(provider, selected);
+        let endpoint = |id: &str| {
+            explicit_endpoint
+                .or_else(|| self.model_endpoint(provider, id))
+                .unwrap_or_else(|| self.endpoint(provider))
+        };
+        let selected_endpoint = endpoint(selected);
+        let default = self
+            .chat_compatibility(provider, None)
+            .supports_mid_conversation_system_messages();
+        let overrides = self
+            .entries
+            .get(provider.id())
+            .into_iter()
+            .flat_map(|profile| profile.overrides.keys().cloned());
+        let ids: BTreeSet<_> = self
+            .model_ids(provider)
+            .into_iter()
+            .chain(overrides)
+            .chain(std::iter::once(selected.into()))
+            .collect();
+        let models = ids
+            .into_iter()
+            .map(|id| {
+                let same_route = self.model_adapter(provider, &id) == adapter
+                    && endpoint(&id) == selected_endpoint;
+                let supported = same_route
+                    && self
+                        .chat_compatibility(provider, self.model(provider, &id).as_ref())
+                        .supports_mid_conversation_system_messages();
+                (id, supported)
+            })
+            .filter(|(_, supported)| *supported != default)
+            .collect();
+        (default, models)
+    }
+
     pub fn anthropic_strict_tool_support(
         &self,
         provider: &Provider,
@@ -1876,6 +1928,35 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::json;
+
+    #[test]
+    fn service_tier_scales_all_catalog_cost_components() {
+        let price: ChatPrice = serde_json::from_value(json!({
+            "input":10, "output":20, "cacheRead":2, "cacheWrite":4
+        }))
+        .unwrap();
+        let usage = pi_rs::Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+        };
+        for (tier, multiplier) in [(None, 1.0), (Some(0.5), 0.5), (Some(2.5), 2.5)] {
+            let metadata = pi_rs::ModelMetadata {
+                cached_input_tokens: Some(200_000),
+                cache_creation_input_tokens: Some(300_000),
+                catalog_cost_multiplier: tier.and_then(serde_json::Number::from_f64),
+                ..Default::default()
+            };
+            let cost = price.estimate(usage, &metadata).unwrap();
+            for (actual, base) in [
+                (cost.input, 5.0),
+                (cost.output, 2.0),
+                (cost.cache_read, 0.4),
+                (cost.cache_write, 1.2),
+            ] {
+                assert!((actual.as_f64().unwrap() - base * multiplier).abs() < 1e-10);
+            }
+        }
+    }
 
     #[test]
     fn cloudflare_worker_chats_and_classifiers_keep_saved_account_scope() {
@@ -2730,6 +2811,47 @@ mod tests {
             profiles
                 .session_affinity(&chatgpt, "gpt", "https://example.test")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn responses_system_updates_follow_the_catalog_and_active_route() {
+        let profiles = Profiles::default();
+        let provider = Provider::named("openai").unwrap();
+        let (default, models) =
+            profiles.responses_mid_conversation_system_policy(&provider, "gpt-6-luna", None);
+        assert!(!default);
+        assert_eq!(models.get("gpt-6-luna"), Some(&true));
+        assert!(!models.contains_key("gpt-5-mini"));
+        let provider = Provider::named("openai-codex").unwrap();
+        let (_, codex) =
+            profiles.responses_mid_conversation_system_policy(&provider, "gpt-6.1-sol", None);
+        assert_eq!(codex.len(), 8);
+
+        let profiles = Profiles::parse(&json!({"providers":{"fixture":{
+            "api":"openai-responses","baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMidConvoSystemMessages":true},
+            "models":[
+                {"id":"selected","compat":{"supportsMidConvoSystemMessages":false}},
+                {"id":"enabled"},
+                {"id":"other-api","api":"openai-completions"},
+                {"id":"other-endpoint","baseUrl":"http://localhost:2/v1"}
+            ],
+            "modelOverrides":{"rewritten-unknown":{"compat":{"supportsMidConvoSystemMessages":false}}}
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("fixture").unwrap();
+        assert_eq!(
+            profiles.responses_mid_conversation_system_policy(&provider, "selected", None),
+            (
+                true,
+                BTreeMap::from([
+                    ("selected".into(), false),
+                    ("other-api".into(), false),
+                    ("other-endpoint".into(), false),
+                    ("rewritten-unknown".into(), false),
+                ])
+            )
         );
     }
 
