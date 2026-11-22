@@ -1050,9 +1050,11 @@ impl LiveMcpCatalog {
         servers: &[Arc<pi_rs_workbench::mcp::McpExtension>],
     ) -> Result<String> {
         let (selection, documents, hidden) = tool_discovery(&self.args, servers)?;
-        registry.replace(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
-            documents,
-        )))?;
+        if self.builtin_tool_search {
+            registry.replace(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
+                documents,
+            )))?;
+        }
         let resources = self.resources.lock().expect("resource catalog");
         select_tools(
             registry, &selection, &hidden, &resources, &self.args, servers,
