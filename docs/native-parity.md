@@ -2968,9 +2968,22 @@ object order is preserved during import so named sections retain their declared
 order. Tool declarations resolve to current enabled native implementations and
 schemas. An imported declaration cannot enable an unavailable or disabled tool.
 
+On ordinary turns, models that support mid-conversation instructions receive
+the original system prompt followed by checkpoint updates at their conversation
+positions, with named sections rendered as replacements or removals. An imported
+compaction snapshot supplies the leading prompt. Native compaction preserves
+checkpoint positions among retained messages when it has no prompt snapshot.
+A checkpoint inside a tool batch follows its results to preserve provider
+tool-call pairing. Models
+without that capability receive the fully resolved leading prompt. Extension
+message hooks see the ordered checkpoints. Edits to other messages preserve
+checkpoint placement. If a hook edits system messages on a route that needs
+one prompt, the adapter joins the hook's current system text in order.
+
 Tests cover branch restoration, section order, replacement/removal, current tool
-schemas and permission boundaries. A CLI import-and-resume fixture verified the
-actual model request and retained the original source file. Workspace tests and
+schemas and permission boundaries. A CLI import-and-resume fixture checked
+Anthropic Messages, Responses, and Chat Completions requests, and retained
+the original source file. Workspace tests and
 all-target Clippy passed on Rust 1.89, along with direct/deferred live MCP updates
 and form elicitation after the serialization change. A local qwen3.5:4b CLI call
 also returned the requested `OK` response.
@@ -5743,6 +5756,16 @@ and model overrides merge for that compatibility setting. When capabilities
 are unavailable, the standalone adapter defaults to `system`; SDK hosts can
 explicitly select the developer role. This is also the fallback for unknown
 workbench models, whose upstream capabilities cannot be inferred.
+
+Responses and Codex honor Pi's `supportsMidConvoSystemMessages` catalog
+setting and resolve overrides for the final request model. Compatible models
+keep later system instructions in place. Other models send one combined initial instruction.
+As in Pi v1.6.0, Codex sends the initial instruction in the input transcript,
+using the same selected role as later instructions. This keeps the initial
+instruction at the start of the prompt for cache reuse. Token estimates use
+the outgoing instruction text. Request fixtures covered
+both projections and the Codex wire payload. Live authenticated requests
+with later system instructions were unverified.
 
 ### Responses effort history
 
