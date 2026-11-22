@@ -261,7 +261,7 @@ pub(super) async fn login(
     let path = auth_path();
     let previous = {
         let guard = super::auth_lock::acquire_async(&path).await?;
-        let value = super::config::read_object_unlocked(&path)?
+        let value = super::config::read_auth_object_locked(&guard)?
             .get("xai")
             .cloned();
         guard.check()?;
@@ -316,7 +316,7 @@ async fn access_at(
             return Err(error("cannot refresh credentials in a read-only store"));
         }
     };
-    let stored = super::config::read_object_unlocked(&path)?;
+    let stored = super::config::read_auth_object_locked(&guard)?;
     let value = parse_credential(&stored)?.ok_or_else(|| error("credentials not configured"))?;
     let previous = stored["xai"].clone();
     guard.check()?;
@@ -325,13 +325,14 @@ async fn access_at(
     }
     // Tokio waits for started blocking tasks on runtime shutdown. The separate
     // runtime keeps the exchange alive even when the caller's runtime stops.
-    tokio::task::spawn_blocking(move || {
+    super::model_auth::await_admitted_oauth_refresh(Some("xai"), move |admitted| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| error("cannot start refresh runtime"))?;
         let barrier = super::process::refresh_barrier()?;
         let guard = super::process::guard_refresh_auth(barrier, guard);
+        let _ = admitted.send(());
         let value = runtime.block_on(service.refresh(&value.refresh))?;
         super::config::update_object_locked(&path, Some(&guard), |data| {
             let current = data
@@ -353,7 +354,6 @@ async fn access_at(
         Ok(value.access)
     })
     .await
-    .map_err(|_| error("refresh task failed"))?
 }
 pub(super) async fn access(
     settings: &super::config::Settings,
