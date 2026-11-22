@@ -124,8 +124,11 @@ and discards that typeahead.
 Saving a default model writes Pi's `defaultProvider` and literal `defaultModel`
 together. If a saved model falls outside a nonempty model scope, it is added to
 that scope and to a configured `enabledModels` list. Legacy qualified defaults
-without `defaultProvider` are still accepted. Cycling models shows the selected display
-name and the active thinking level for reasoning models. Consecutive notices
+without `defaultProvider` are still accepted. When the selected built-in
+provider needs a model and no saved, explicit or scoped selection applies,
+pi-rs prefers Pi's default model if it is in the effective catalog. It uses
+the first available entry when that default is missing. Cycling models shows
+the selected display name and the active thinking level for reasoning models. Consecutive notices
 reuse the trailing status in both fullscreen and regular mode, before it enters
 scrollback. The tool-output, thinking-visibility, and thinking-level shortcuts
 report the new state using the same status row, as in Pi.
@@ -135,7 +138,11 @@ containing glob characters takes precedence over glob expansion across providers
 with an optional thinking suffix applied to the selected models.
 With no explicit provider or endpoint, a known `--model` ID can select the only
 authenticated matching provider across catalogs, including a gateway model
-whose literal ID starts with another provider's name. Bedrock environment
+whose literal ID starts with another provider's name. Unqualified partial IDs
+and display names also search the known catalogs. Pi ranks whole and partial
+display-name matches together. When the matches span providers, configured credentials narrow the matches before Pi's alias and
+model ID ordering is applied. A best model ID shared across eligible
+providers requires an explicit provider. Bedrock environment
 credentials count during provider selection. When no matching provider has
 visible credentials, a configured default Bedrock provider can use the SDK
 credential chain. An inline key does not
@@ -1154,11 +1161,21 @@ is a known Pi-fidelity limitation rather than exact profile matching. Native
 resource tools remain namespaced per server and aggregate that server's pages.
 If a resource or template omits its name, native uses its URI or URI template
 in full and paged listings, matching Pi. Explicit empty names are preserved.
+Tool and resource discovery treat an empty next cursor as the end of the list.
+Full listings stop with an error on a repeated cursor or a continuation beyond
+1,000 pages, matching Pi. Native also applies the bound to its prompt listings
+and omits opaque cursor values from duplicate-cursor errors.
 Within the existing initialization deadline, HTTP connections retry after
 250 ms and 1 second on transient network errors, HTTP 408, 429, and 5xx
 other than 501. Remote resource reads and listings, including paged listings
 and templates, retry once on those HTTP statuses. Cancellation interrupts the
 resource retry wait, and ordinary tool calls are sent once on these failures.
+For stdio and streamable HTTP tool calls, progress notifications matching the
+request's MCP progress token renew its idle timeout. The live tool result shows
+the server's message or `Progress N[/total]` when no message was supplied.
+Progress for another request does not extend the deadline. The CLI can cancel
+an active tool call even while progress is arriving. Resource requests retain
+their fixed deadlines.
 
 Loopback fixtures verified stdio discovery and tool execution, HTTP bearer
 headers, resource reading, and the model/tool/model round trip. Credentials
@@ -5674,6 +5691,9 @@ split it into separate output lines. Scoped `find` preserves its filename spelli
 
 `pi auth check` reports configured credential readiness for a provider
 or model. It supports JSON output and a read-only `--no-refresh` check.
+A bare model reference uses the CLI catalog resolver without using stored
+credentials to break ties, as Pi does for auth checks. Native qualified uncatalogued model IDs
+remain usable for checking their provider route.
 `print-api-key` and `print-bearer-token` explicitly resolve their own
 credential type. Model-specific endpoints are respected. Radius bearer
 tokens use the normal refresh path and accept `--min-expiry`. Kimi bearer
@@ -6139,9 +6159,10 @@ before dispatch, uses the original affinity and tool definitions, and
 stops on a changed context or the 30-minute limit. A completed cache miss
 retains its billed usage and schedules another decision on the normal cadence,
 measured from the refresh request's start to protect the cache lifetime.
-Failed refreshes and local model timeouts stop warming without
-recording usage because the provider may still be processing the request. Pi
-waits for the refresh to settle and also retries errors.
+Like Pi, each cache refresh disables provider HTTP retries while preserving
+the configured HTTP attempt timeout. Failed refreshes and local model timeouts
+stop native warming without recording usage because the provider may still be
+processing the request. Pi can schedule another refresh after the first settles.
 Refresh usage is journaled and projected as a Pi usage entry. Response
 content stays out of the conversation. This checkpoint covers idle
 requests with thinking off. Streaming warming and extension decisions
