@@ -1443,6 +1443,41 @@ impl Profiles {
             .supports_long_cache_retention
     }
 
+    pub fn responses_effort_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> BTreeSet<String> {
+        let endpoint = |id: &str| {
+            explicit_endpoint
+                .or_else(|| self.model_endpoint(provider, id))
+                .unwrap_or_else(|| self.endpoint(provider))
+        };
+        let selected_endpoint = endpoint(selected);
+        let mut ids = self.model_ids(provider);
+        if !ids.iter().any(|id| id == selected) {
+            ids.push(selected.into());
+        }
+        ids.into_iter()
+            .filter(|id| {
+                if self.model_adapter(provider, id) != Adapter::OpenAiResponses
+                    || endpoint(id) != selected_endpoint
+                {
+                    return false;
+                }
+                let metadata = self.model(provider, id);
+                metadata
+                    .as_ref()
+                    .is_none_or(|model| model.reasoning != Some(false))
+                    && self
+                        .cache_compatibility(provider, metadata.as_ref())
+                        .supports_mid_convo_effort
+                        .unwrap_or(false)
+            })
+            .collect()
+    }
+
     pub fn anthropic_strict_tool_support(
         &self,
         provider: &Provider,
@@ -3045,6 +3080,34 @@ mod tests {
             profiles
                 .session_affinity(&chatgpt, "gpt", "https://example.test")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn responses_effort_capabilities_follow_the_api_and_route() {
+        let profiles = Profiles::default();
+        let openai = Provider::named("openai").unwrap();
+        let native = profiles.responses_effort_models(&openai, "gpt-6-luna", None);
+        assert_eq!(native.len(), 5);
+        assert!(native.contains("gpt-6-luna"));
+        assert!(!native.contains("gpt-5.4"));
+
+        let profiles = Profiles::parse(&json!({"providers":{"fixture":{
+            "api":"openai-responses","baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMidConvoEffort":true},
+            "models":[
+                {"id":"selected","reasoning":true,"compat":{"supportsMidConvoEffort":false}},
+                {"id":"enabled","reasoning":true},
+                {"id":"unsupported","reasoning":false},
+                {"id":"other-api","reasoning":true,"api":"openai-completions"},
+                {"id":"other-endpoint","reasoning":true,"baseUrl":"http://localhost:2/v1"}
+            ]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("fixture").unwrap();
+        assert_eq!(
+            profiles.responses_effort_models(&provider, "selected", None),
+            BTreeSet::from(["enabled".into()])
         );
     }
 

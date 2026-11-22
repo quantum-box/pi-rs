@@ -13,8 +13,10 @@ use pi_rs_core::{
 };
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 pub const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -79,6 +81,8 @@ pub struct OpenAiResponses {
     codex_account: Option<String>,
     codex_off_effort: Option<String>,
     thinking: Option<String>,
+    configuration_update_models: BTreeSet<String>,
+    configuration_update_thinking: bool,
     provider: String,
     headers: reqwest::header::HeaderMap,
     sampling: BTreeMap<String, Value>,
@@ -350,6 +354,8 @@ impl OpenAiResponses {
             codex_account: None,
             codex_off_effort: None,
             thinking: None,
+            configuration_update_models: BTreeSet::new(),
+            configuration_update_thinking: false,
             identity_safe_transport: true,
             provider: if plan { "openai-chatgpt" } else { "openai" }.into(),
             headers: reqwest::header::HeaderMap::new(),
@@ -393,9 +399,37 @@ impl OpenAiResponses {
         }
     }
 
-    pub fn with_thinking(mut self, level: Option<&str>) -> Self {
-        self.thinking = level.map(|level| if level == "off" { "none" } else { level }.to_owned());
+    pub fn with_thinking(self, level: Option<&str>) -> Self {
+        self.with_mapped_thinking(level, level)
+    }
+
+    /// Keep the selected thinking level distinct from its provider-specific effort.
+    pub fn with_mapped_thinking(mut self, level: Option<&str>, effort: Option<&str>) -> Self {
+        self.thinking =
+            effort.map(|effort| if effort == "off" { "none" } else { effort }.to_owned());
+        self.configuration_update_thinking =
+            level.is_some_and(|level| !matches!(level, "off" | "none"));
         self
+    }
+
+    /// Let these models carry reasoning effort in Responses configuration updates.
+    pub fn with_configuration_update_models(mut self, models: BTreeSet<String>) -> Self {
+        self.configuration_update_models = models;
+        self
+    }
+
+    fn configuration_update_effort(&self, model: &str) -> Option<&str> {
+        if !self.configuration_update_thinking
+            || !self.configuration_update_models.contains(model)
+            || self.codex_account.is_some()
+            || self.provider == "openai-chatgpt"
+            || (self.provider == "openai"
+                && self.endpoint.as_str() == DEFAULT_ENDPOINT
+                && !self.token.starts_with("sk-"))
+        {
+            return None;
+        }
+        self.thinking.as_deref().filter(|effort| !effort.is_empty())
     }
 
     /// Set endpoint-wide strict JSON Schema tool support for this client.
@@ -780,6 +814,10 @@ pub fn codex_account_id(token: &str) -> Option<String> {
     .then(|| account.to_owned())
 }
 
+fn configuration_update(effort: &str) -> Value {
+    json!({"type":"configuration_update","reasoning":{"effort":effort}})
+}
+
 #[cfg(test)]
 fn payload(
     request: &ModelRequest,
@@ -793,6 +831,7 @@ fn payload(
         edited_scope,
         instruction_role,
         pi_rs_core::ModelApi::OpenaiResponses,
+        None,
     )
 }
 
@@ -802,6 +841,7 @@ fn responses_payload(
     edited_scope: &str,
     instruction_role: &str,
     api: pi_rs_core::ModelApi,
+    active_effort: Option<&str>,
 ) -> Value {
     let codex = api == pi_rs_core::ModelApi::OpenaiCodexResponses;
     let mut input = Vec::new();
@@ -827,7 +867,7 @@ fn responses_payload(
                 calls,
                 replay,
             } => {
-                if let Some(replay) = replay.as_deref().filter(|r| {
+                let matched_replay = replay.as_deref().filter(|r| {
                     r.identity.provider
                         == if codex || r.is_context_edit() {
                             edited_scope
@@ -836,27 +876,29 @@ fn responses_payload(
                         }
                         && r.identity.model == request.model
                         && r.supports_api(api)
-                }) {
-                    let edited = replay
-                        .blocks
-                        .iter()
-                        .any(|block| block.get("_pi_context_edit_api").is_some());
-                    input.extend(
-                        replay
-                            .blocks
-                            .iter()
-                            .filter(|block| block.get("_pi_context_edit_api").is_none())
-                            .cloned()
-                            .map(|mut block| {
-                                if edited
-                                    && provider == "openai-chatgpt"
-                                    && block["type"] == "function_call"
-                                {
-                                    block["namespace"] = json!(NAMESPACE);
-                                }
-                                block
-                            }),
-                    );
+                });
+                let before = input.len();
+                let wire_blocks = matched_replay
+                    .into_iter()
+                    .flat_map(|r| r.blocks.iter())
+                    .filter(|block| {
+                        block.get("_pi_context_edit_api").is_none()
+                            && block.get("_pi_openai_effort").is_none()
+                    });
+                let metadata_only = matched_replay.is_some_and(|r| {
+                    r.openai_effort().is_some() && wire_blocks.clone().next().is_none()
+                });
+                if let Some(replay) = matched_replay.filter(|_| !metadata_only) {
+                    let edited = replay.is_context_edit();
+                    input.extend(wire_blocks.cloned().map(|mut block| {
+                        if edited
+                            && provider == "openai-chatgpt"
+                            && block["type"] == "function_call"
+                        {
+                            block["namespace"] = json!(NAMESPACE);
+                        }
+                        block
+                    }));
                 } else {
                     if !content.is_empty() {
                         input.push(json!({"role":"assistant", "content":content}));
@@ -866,6 +908,14 @@ fn responses_payload(
                         if provider == "openai-chatgpt" { item["namespace"] = json!(NAMESPACE); }
                         item
                     }));
+                }
+                if active_effort.is_some()
+                    && input.len() > before
+                    && let Some(effort) = matched_replay
+                        .filter(|r| !r.is_context_edit())
+                        .and_then(ProviderReplay::openai_effort)
+                {
+                    input.insert(before, configuration_update(effort));
                 }
             }
             Message::Tool {
@@ -892,6 +942,9 @@ fn responses_payload(
                 );
             }
         }
+    }
+    if let Some(effort) = active_effort {
+        input.push(configuration_update(effort));
     }
     let mut body = if codex {
         json!({"model":request.model, "input":input, "store":false, "stream":true,
@@ -1157,6 +1210,21 @@ impl Model for OpenAiResponses {
             base.and_then(|base| {
                 pi_rs_core::protected_model_fingerprint(&(base, "system-instruction-role"))
             })
+        };
+        let base = if self
+            .configuration_update_models
+            .iter()
+            .any(|model| self.configuration_update_effort(model).is_some())
+        {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    "configuration-update-effort-v1",
+                    &self.configuration_update_models,
+                ))
+            })
+        } else {
+            base
         };
         let base = if self.strict_tool_support {
             base.and_then(|base| {
@@ -1453,6 +1521,7 @@ impl OpenAiResponses {
         if (1..self.minimum_output_tokens()).contains(&max_output_tokens) {
             return Err(Error::Budget);
         }
+        let active_effort = self.configuration_update_effort(&model).map(str::to_owned);
         let mut body = responses_payload(
             &request,
             &replay_provider,
@@ -1463,6 +1532,7 @@ impl OpenAiResponses {
                 "system"
             },
             api,
+            active_effort.as_deref(),
         );
         if self.azure_api_version.is_some() {
             if let Some(deployment) = self.deployments.get(&model) {
@@ -1490,7 +1560,12 @@ impl OpenAiResponses {
         }
         let provider = self.provider.clone();
         if let Some(thinking) = &self.thinking {
-            body["reasoning"] = json!({"effort":thinking, "summary":"auto"});
+            let effort = if active_effort.is_some() {
+                "medium"
+            } else {
+                thinking
+            };
+            body["reasoning"] = json!({"effort":effort,"summary":"auto"});
             body["include"] = json!(["reasoning.encrypted_content"]);
         } else if let Some(off) = self
             .codex_off_effort
@@ -1793,12 +1868,19 @@ impl OpenAiResponses {
                         let usage = response["usage"]["input_tokens"].as_u64().zip(response["usage"]["output_tokens"].as_u64()).map(|(input_tokens,output_tokens)| Usage { input_tokens, output_tokens });
                         let identity = ResolvedModelIdentity { provider:provider.clone(), model:model.clone() };
                         let reasoning: String = reasoning.into_values().collect();
-                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(api), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay {
-                            identity: if api == pi_rs_core::ModelApi::OpenaiCodexResponses {
-                                ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }
-                            } else { ResolvedModelIdentity { provider: replay_provider.clone(), model: model.clone() } },
-                            blocks:output.clone()
-                        })), ..response_usage_metadata(api, &model, requested_service_tier.as_deref(), response) }));
+                        let replay = (finish_reason != "length" || active_effort.is_some()).then(|| {
+                            let mut replay = ProviderReplay {
+                                identity: if api == pi_rs_core::ModelApi::OpenaiCodexResponses {
+                                    ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }
+                                } else { ResolvedModelIdentity { provider: replay_provider.clone(), model: model.clone() } },
+                                blocks: if finish_reason == "length" { Vec::new() } else { output.clone() },
+                            };
+                            if let Some(effort) = active_effort.as_deref() {
+                                replay.record_openai_effort(effort);
+                            }
+                            Box::new(replay)
+                        });
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(api), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay, ..response_usage_metadata(api, &model, requested_service_tier.as_deref(), response) }));
                         yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls:calls.into_values().collect(), usage });
                         return;
                     }
@@ -4324,6 +4406,305 @@ mod tests {
             };
             assert!(body.get(other).is_none());
         }
+    }
+
+    #[test]
+    fn responses_reencode_anthropic_replies_when_provider_and_model_are_reused() {
+        let mut request = request();
+        let signed = json!({"type":"thinking","thinking":"hidden","signature":"signed"});
+        let effort = json!({"_pi_anthropic_effort":"xhigh"});
+        let bedrock = json!({"type":"reasoning","text":"hidden","signature":"signed"});
+        let pi_messages = json!({"type":"pi-rs:pi-messages-origin"});
+        for private_block in [signed, effort, bedrock, pi_messages] {
+            request.messages = vec![
+                Message::User {
+                    content: "question".into(),
+                },
+                Message::Assistant {
+                    content: "portable reply".into(),
+                    calls: vec![],
+                    replay: Some(Box::new(ProviderReplay {
+                        identity: ResolvedModelIdentity {
+                            provider: "fixture".into(),
+                            model: request.model.clone(),
+                        },
+                        blocks: vec![private_block],
+                    })),
+                },
+            ];
+            let body = responses_payload(
+                &request,
+                "fixture",
+                "fixture",
+                "system",
+                pi_rs_core::ModelApi::OpenaiResponses,
+                Some("low"),
+            );
+            assert_eq!(
+                body["input"],
+                json!([
+                    {"role":"user","content":"question"},
+                    {"role":"assistant","content":"portable reply"},
+                    configuration_update("low"),
+                ])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_configuration_updates_preserve_effort_across_replies() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (level, previous, incomplete) in [
+                ("low", None, false),
+                ("xhigh", Some("low"), true),
+                ("none", None, false),
+                ("high", Some("low"), false),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let offset = loop {
+                    let mut chunk = [0; 4096];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..pos]).to_ascii_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length: ")?.parse::<usize>().ok()
+                            })
+                            .unwrap();
+                        if bytes.len() >= pos + 4 + length {
+                            break pos + 4;
+                        }
+                    }
+                };
+                let body: Value = serde_json::from_slice(&bytes[offset..]).unwrap();
+                let input = body["input"].as_array().unwrap();
+                assert_eq!(input[0]["role"], "user");
+                assert!(!body.to_string().contains("_pi_openai_effort"));
+                if level == "none" {
+                    assert_eq!(body["reasoning"]["effort"], "none");
+                    assert!(
+                        !input
+                            .iter()
+                            .any(|item| item["type"] == "configuration_update")
+                    );
+                } else {
+                    assert_eq!(body["reasoning"]["effort"], "medium");
+                    assert_eq!(input.last().unwrap(), &configuration_update(level));
+                }
+                if let Some(previous) = previous {
+                    assert_eq!(input[1], configuration_update(previous));
+                    assert_eq!(input[2]["content"][0]["text"], "reply");
+                    assert_eq!(input[3]["type"], "function_call");
+                    assert_eq!(input[4]["type"], "function_call_output");
+                }
+                if level == "high" {
+                    let updates: Vec<_> = input
+                        .iter()
+                        .filter(|item| item["type"] == "configuration_update")
+                        .collect();
+                    assert_eq!(
+                        updates,
+                        [&configuration_update("low"), &configuration_update("high")]
+                    );
+                    assert_eq!(input[5]["content"][0]["text"], "reply with thinking off");
+                }
+                let state = if incomplete {
+                    "incomplete"
+                } else {
+                    "completed"
+                };
+                let text = if level == "none" {
+                    "reply with thinking off"
+                } else {
+                    "reply"
+                };
+                let mut response = json!({
+                    "status":state,"output":[{"type":"message","role":"assistant","content":[
+                        {"type":"output_text","text":text}
+                    ]}],"usage":{"input_tokens":3,"output_tokens":1}
+                });
+                if incomplete {
+                    response["incomplete_details"] = json!({"reason":"max_output_tokens"});
+                }
+                let mut reply = String::new();
+                if level == "low" {
+                    let item = json!({"type":"function_call","call_id":"call","name":"read","arguments":"{}"});
+                    response["output"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(item.clone());
+                    let event =
+                        json!({"type":"response.output_item.added","output_index":1,"item":item});
+                    reply.push_str(&format!("data: {event}\n\n"));
+                }
+                let event = json!({"type":format!("response.{state}"),"response":response});
+                reply.push_str(&format!("data: {event}\n\n"));
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.len()
+                );
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let client = OpenAiResponses::new_api(&endpoint, "sk-fixture".into())
+            .unwrap()
+            .with_configuration_update_models(BTreeSet::from(["gpt-6-luna".into()]));
+        let mut request = ModelRequest {
+            model: "gpt-6-luna".into(),
+            messages: vec![Message::User {
+                content: "prompt".into(),
+            }],
+            tools: vec![pi_rs_core::ToolSpec {
+                name: "read".into(),
+                description: "Read a fixture".into(),
+                parameters: json!({"type":"object"}),
+            }],
+            max_output_tokens: 64,
+        };
+        for level in ["low", "xhigh", "off", "high"] {
+            let mut stream = client
+                .clone()
+                .with_thinking(Some(level))
+                .stream(request.clone())
+                .await
+                .unwrap();
+            let mut replay = None;
+            let mut calls = Vec::new();
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    ModelEvent::Metadata(metadata) => replay = metadata.replay.or(replay),
+                    ModelEvent::Complete {
+                        calls: completed, ..
+                    } => calls = completed,
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                replay.as_deref().and_then(ProviderReplay::openai_effort),
+                (level != "off").then_some(level),
+            );
+            if level == "low" {
+                request.messages.extend([
+                    Message::Assistant {
+                        content: "reply".into(),
+                        calls,
+                        replay,
+                    },
+                    Message::Tool {
+                        call_id: "call".into(),
+                        content: "result".into(),
+                        is_error: false,
+                        is_structured: None,
+                    },
+                ]);
+            } else if level == "xhigh" {
+                assert_eq!(replay.unwrap().blocks.len(), 1);
+            } else if level == "off" {
+                request.messages.extend([
+                    Message::Assistant {
+                        content: "reply with thinking off".into(),
+                        calls,
+                        replay,
+                    },
+                    Message::User {
+                        content: "resume thinking".into(),
+                    },
+                ]);
+            }
+        }
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn responses_effort_never_uses_configuration_items_with_subscription_credentials() {
+        let enable = |client: OpenAiResponses| {
+            client
+                .with_thinking(Some("high"))
+                .with_configuration_update_models(BTreeSet::from(["gpt-6-luna".into()]))
+        };
+        let api_key =
+            enable(OpenAiResponses::new_api(DEFAULT_ENDPOINT, "sk-fixture".into()).unwrap());
+        assert_eq!(
+            api_key.configuration_update_effort("gpt-6-luna"),
+            Some("high")
+        );
+        assert_eq!(api_key.configuration_update_effort("unlisted"), None);
+        assert_eq!(
+            api_key
+                .clone()
+                .with_mapped_thinking(Some("low"), Some("none"))
+                .configuration_update_effort("gpt-6-luna"),
+            Some("none")
+        );
+        assert_eq!(
+            api_key
+                .clone()
+                .with_mapped_thinking(Some("off"), Some("none"))
+                .configuration_update_effort("gpt-6-luna"),
+            None
+        );
+        assert_eq!(
+            api_key
+                .clone()
+                .with_thinking(Some("strong"))
+                .configuration_update_effort("gpt-6-luna"),
+            Some("strong")
+        );
+        assert_eq!(
+            enable(OpenAiResponses::new_api(DEFAULT_ENDPOINT, "access-token".into()).unwrap())
+                .configuration_update_effort("gpt-6-luna"),
+            None
+        );
+        assert_eq!(
+            enable(OpenAiResponses::new(DEFAULT_ENDPOINT, "sk-fixture".into()).unwrap())
+                .configuration_update_effort("gpt-6-luna"),
+            None
+        );
+    }
+
+    #[test]
+    fn imported_responses_effort_keeps_portable_assistant_content() {
+        let mut replay = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "openai".into(),
+                model: "m".into(),
+            },
+            blocks: vec![],
+        };
+        replay.record_openai_effort("low");
+        let request = ModelRequest {
+            model: "m".into(),
+            tools: vec![],
+            max_output_tokens: 32,
+            messages: vec![Message::Assistant {
+                content: "reply".into(),
+                calls: vec![],
+                replay: Some(Box::new(replay)),
+            }],
+        };
+        let body = responses_payload(
+            &request,
+            "openai",
+            "route",
+            "developer",
+            pi_rs_core::ModelApi::OpenaiResponses,
+            Some("high"),
+        );
+        assert_eq!(
+            body["input"],
+            json!([
+                configuration_update("low"),
+                {"role":"assistant","content":"reply"},
+                configuration_update("high")
+            ])
+        );
     }
 
     #[tokio::test]
