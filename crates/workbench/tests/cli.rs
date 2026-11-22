@@ -4989,9 +4989,13 @@ fn radius_attachments_use_only_the_current_accounts_cached_resize_profile() {
                 socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                 continue;
             }
-            assert!(request.starts_with("POST /v1/messages "), "{request}");
-            let request: Value = serde_json::from_slice(&body).unwrap();
-            let image = request["context"]["messages"]
+            let path = request.split_ascii_whitespace().nth(1).unwrap();
+            assert!(
+                request.starts_with("POST ") && matches!(path, "/v1/messages" | "/messages"),
+                "{request}"
+            );
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            let image = payload["context"]["messages"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -5002,7 +5006,10 @@ fn radius_attachments_use_only_the_current_accounts_cached_resize_profile() {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(image["data"].as_str().unwrap())
                 .unwrap();
-            dimensions.push(image::load_from_memory(&bytes).unwrap().dimensions());
+            dimensions.push((
+                path.to_owned(),
+                image::load_from_memory(&bytes).unwrap().dimensions(),
+            ));
             let reply = concat!(
                 "data: {\"type\":\"text_start\",\"contentIndex\":0}\n\n",
                 "data: {\"type\":\"text_end\",\"contentIndex\":0,\"content\":\"ok\"}\n\n",
@@ -5037,7 +5044,13 @@ fn radius_attachments_use_only_the_current_accounts_cached_resize_profile() {
             .unwrap();
         assert!(output.status.success(), "{output:?}");
     }
-    assert_eq!(worker.join().unwrap(), [(16, 8), (40, 20)]);
+    assert_eq!(
+        worker.join().unwrap(),
+        [
+            ("/v1/messages".into(), (16, 8)),
+            ("/messages".into(), (40, 20))
+        ]
+    );
 }
 
 #[test]
