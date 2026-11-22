@@ -704,15 +704,52 @@ impl ProviderReplay {
         {
             return name == api.as_str();
         }
-        // These metadata keys identify the producing adapter even when a
-        // legacy journal does not have a context-edit API marker.
+        // Pi Messages uses Anthropic-shaped content with its own marker.
+        if self
+            .blocks
+            .first()
+            .is_some_and(|block| block["type"] == "pi-rs:pi-messages-origin")
+        {
+            return api == ModelApi::PiMessages;
+        }
         self.blocks.iter().all(|block| {
-            (block.get("_pi_anthropic_effort").is_none() || api == ModelApi::AnthropicMessages)
-                && (block.get("_pi_openai_effort").is_none()
-                    || matches!(
+            if block.get("_pi_anthropic_effort").is_some() {
+                return api == ModelApi::AnthropicMessages;
+            }
+            if block.get("_pi_openai_effort").is_some() {
+                return matches!(
+                    api,
+                    ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses
+                );
+            }
+            if block.get("mistral_content").is_some() {
+                return api == ModelApi::MistralConversations;
+            }
+            match block["type"].as_str() {
+                Some("thinking" | "redacted_thinking") => api == ModelApi::AnthropicMessages,
+                // Older Bedrock and Anthropic journals share these block types.
+                Some("text" | "tool_use") => {
+                    matches!(
+                        api,
+                        ModelApi::AnthropicMessages | ModelApi::BedrockConverseStream
+                    )
+                }
+                Some("reasoning")
+                    if block.get("text").is_some()
+                        || block.get("redacted").is_some()
+                        || block.get("signature").is_some() =>
+                {
+                    api == ModelApi::BedrockConverseStream
+                }
+                Some("reasoning" | "function_call" | "custom_tool_call") => {
+                    matches!(
                         api,
                         ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses
-                    ))
+                    )
+                }
+                Some("reasoning_content") => api == ModelApi::OpenaiCompletions,
+                _ => true,
+            }
         })
     }
 }

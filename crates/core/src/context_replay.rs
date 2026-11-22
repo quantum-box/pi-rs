@@ -229,6 +229,45 @@ pub(crate) fn replacement_replay(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_provider_blocks_stay_on_compatible_transports() {
+        use crate::ModelApi::*;
+
+        let replay = |blocks| crate::ProviderReplay {
+            identity: crate::ResolvedModelIdentity {
+                provider: "reused-provider".into(),
+                model: "reused-model".into(),
+            },
+            blocks,
+        };
+        let anthropic =
+            serde_json::json!({"type":"thinking","thinking":"private","signature":"sig"});
+        let bedrock = serde_json::json!({"type":"reasoning","text":"private","signature":"sig"});
+        let shared = serde_json::json!({"type":"tool_use","name":"read","input":{}});
+        let mistral = serde_json::json!({"mistral_content":[{"type":"thinking","thinking":[]}]});
+        let responses =
+            serde_json::json!({"type":"reasoning","summary":[],"encrypted_content":"opaque"});
+
+        assert!(replay(vec![anthropic.clone(), shared.clone()]).supports_api(AnthropicMessages));
+        assert!(replay(vec![bedrock.clone(), shared]).supports_api(BedrockConverseStream));
+        assert!(
+            replay(vec![
+                serde_json::json!({"type":"pi-rs:pi-messages-origin"}),
+                anthropic.clone()
+            ])
+            .supports_api(PiMessages)
+        );
+        assert!(replay(vec![mistral.clone()]).supports_api(MistralConversations));
+        assert!(replay(vec![responses.clone()]).supports_api(OpenaiResponses));
+        for foreign in [anthropic, bedrock, mistral, responses] {
+            assert!(!replay(vec![foreign]).supports_api(GoogleGenerativeAi));
+        }
+        assert!(
+            replay(vec![serde_json::json!({"thought":true,"text":"gemini"})])
+                .supports_api(GoogleGenerativeAi)
+        );
+    }
+
     use super::*;
     use crate::{Event, MemoryStore, Message, ResolvedModelIdentity, Session, UsageReport};
     use uuid::Uuid;

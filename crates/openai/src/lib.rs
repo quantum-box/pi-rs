@@ -750,30 +750,6 @@ fn payload(
     )
 }
 
-fn accepts_responses_replay(replay: &ProviderReplay, api: pi_rs_core::ModelApi) -> bool {
-    replay.supports_api(api)
-        && replay.blocks.iter().all(|block| {
-            // Older journals key replay by provider/model only. Keep known
-            // non-Responses block formats out of this adapter when routes change.
-            match block["type"].as_str() {
-                Some(
-                    "thinking"
-                    | "redacted_thinking"
-                    | "text"
-                    | "tool_use"
-                    | "reasoning_content"
-                    | "pi-rs:pi-messages-origin",
-                ) => false,
-                Some("reasoning") => {
-                    block.get("signature").is_none()
-                        && block.get("text").is_none()
-                        && block.get("redacted").is_none()
-                }
-                _ => block.get("mistral_content").is_none(),
-            }
-        })
-}
-
 fn responses_payload(
     request: &ModelRequest,
     provider: &str,
@@ -814,7 +790,7 @@ fn responses_payload(
                             provider
                         }
                         && r.identity.model == request.model
-                        && accepts_responses_replay(r, api)
+                        && r.supports_api(api)
                 });
                 let before = input.len();
                 let wire_blocks = matched_replay
@@ -1183,7 +1159,7 @@ impl Model for OpenAiResponses {
                     self.provider.clone()
                 }
                 && replay.identity.model == request.model
-                && accepts_responses_replay(replay, self.api()) =>
+                && replay.supports_api(self.api()) =>
             {
                 pi_rs_core::estimate_replay_tokens(&replay.blocks)
                     .max(pi_rs_core::estimate_message_tokens(message))
