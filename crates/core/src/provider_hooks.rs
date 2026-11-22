@@ -927,6 +927,8 @@ mod tests {
                     "x-reflected",
                     "x-gateway-echo",
                     "x-proxy-echo",
+                    "chatgpt-account-id",
+                    "x-codex-echo",
                 ] {
                     assert!(!headers.contains_key(hidden));
                 }
@@ -937,7 +939,7 @@ mod tests {
                         headers.insert("x-delete".into(), None);
                     }
                     "blocked" => {
-                        headers.insert("AUTHORIZATION".into(), Some("bad".into()));
+                        headers.insert("ChatGPT-Account-ID".into(), Some("bad".into()));
                         headers.insert("x-rejected".into(), Some("bad".into()));
                     }
                     "later" => {
@@ -977,6 +979,10 @@ mod tests {
             "x-gateway-echo",
             HeaderValue::from_static("reflected gateway-key"),
         );
+        headers.insert(
+            "x-codex-echo",
+            HeaderValue::from_static("reflected codex-account"),
+        );
         headers.insert("x-trace", HeaderValue::from_static("initial"));
         headers.insert("x-delete", HeaderValue::from_static("delete"));
         headers.insert("x-reflected", HeaderValue::from_static("echo credential"));
@@ -992,12 +998,14 @@ mod tests {
                 provider_header_session_id().as_deref(),
                 Some(session.external_session_id().as_str())
             );
-            prepare_provider_headers(&headers, &["first, second".into()])
+            prepare_provider_headers(&headers, &["first, second".into(), "codex-account".into()])
                 .await
                 .unwrap()
         })
         .await;
         assert_eq!(edited["authorization"], " \tBearer credential \t");
+        assert!(!edited.contains_key("chatgpt-account-id"));
+        assert_eq!(edited["x-codex-echo"], "reflected codex-account");
         assert_eq!(edited["x-reflected"], "echo credential");
         assert_eq!(edited["x-private"], "hidden");
         assert_eq!(edited["x-trace"], "edited");

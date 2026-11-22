@@ -110,6 +110,7 @@ pub(crate) fn is_provider_auth_header(name: &str) -> bool {
         name.as_str(),
         "authorization"
             | "proxy-authorization"
+            | "chatgpt-account-id"
             | "api-key"
             | "x-api-key"
             | "x-auth-token"
