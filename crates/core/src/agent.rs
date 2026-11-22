@@ -12768,6 +12768,7 @@ mod queue_tests {
         use futures_util::StreamExt;
 
         struct Route {
+            id: &'static str,
             started: Option<Arc<tokio::sync::Notify>>,
             release: Arc<tokio::sync::Notify>,
             seen: Arc<std::sync::Mutex<Vec<String>>>,
@@ -12776,13 +12777,14 @@ mod queue_tests {
         #[async_trait::async_trait]
         impl Model for Route {
             async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
-                self.seen.lock().unwrap().push(request.model.clone());
+                assert_eq!(request.model, "shared-model");
+                self.seen.lock().unwrap().push(self.id.to_owned());
                 if let Some(started) = &self.started {
                     started.notify_one();
                     self.release.notified().await;
                 }
                 Ok(futures_util::stream::iter([
-                    Ok(crate::ModelEvent::Text(request.model)),
+                    Ok(crate::ModelEvent::Text(self.id.to_owned())),
                     Ok(crate::ModelEvent::Complete {
                         calls: Vec::new(),
                         usage: Some(Usage {
@@ -12796,6 +12798,9 @@ mod queue_tests {
         }
 
         let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .record_request_identity("first-provider", "shared-model")
+            .unwrap();
         let control = crate::LiveModelControl::default();
         session.set_live_model_control(control.clone());
         let started = Arc::new(tokio::sync::Notify::new());
@@ -12803,11 +12808,12 @@ mod queue_tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let agent = Agent {
             model: &Route {
+                id: "alpha",
                 started: Some(started.clone()),
                 release: release.clone(),
                 seen: seen.clone(),
             },
-            model_name: "alpha",
+            model_name: "shared-model",
             registry: &Registry::default(),
             system_prompt: "",
             limits: Limits::default(),
@@ -12817,12 +12823,14 @@ mod queue_tests {
             started.notified().await;
             control.select(Arc::new(crate::LiveModelSelection {
                 adapter: Arc::new(Route {
+                    id: "beta",
                     started: None,
                     release: release.clone(),
                     seen: seen.clone(),
                 }),
-                provider: Some("fixture".into()),
-                model: "beta".into(),
+                provider: Some("second-provider".into()),
+                request_provider: "second-provider".into(),
+                model: "shared-model".into(),
                 thinking: Some("high".into()),
                 limits: Limits::default(),
             }));
@@ -12855,9 +12863,24 @@ mod queue_tests {
         .expect("live selection should settle");
         assert_eq!(result.unwrap(), "beta");
         assert_eq!(*seen.lock().unwrap(), ["alpha", "beta"]);
+        let mut provider = None;
+        let mut request_providers = Vec::new();
+        for record in session.records() {
+            match &record.event {
+                Event::SourceEntry { format, entry } if format == "pi-rs:request-identity" => {
+                    provider = entry["provider"].as_str();
+                }
+                Event::ModelRequested { .. } => request_providers.push(provider),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            request_providers,
+            [Some("first-provider"), Some("second-provider")]
+        );
         assert_eq!(
             session.model_selection(),
-            Some(("beta".into(), Some("high".into())))
+            Some(("shared-model".into(), Some("high".into())))
         );
     }
 

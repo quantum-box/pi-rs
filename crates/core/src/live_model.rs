@@ -7,6 +7,7 @@ use crate::{Limits, Model, Notification, Result, Session};
 pub struct LiveModelSelection {
     pub adapter: Arc<dyn Model>,
     pub provider: Option<String>,
+    pub request_provider: String,
     pub model: String,
     pub thinking: Option<String>,
     pub limits: Limits,
@@ -39,24 +40,25 @@ impl Session {
             .as_ref()
             .is_some_and(|(model, _)| model == &selection.model)
             && self.model_provider() == selection.provider.as_deref();
-        if same_model
-            && existing
-                .as_ref()
-                .and_then(|(_, thinking)| thinking.as_deref())
-                == selection.thinking.as_deref()
-        {
-            return Ok(());
-        }
+        let same_thinking = existing.as_ref().and_then(|(_, level)| level.as_deref())
+            == selection.thinking.as_deref();
         let before = self.records().len();
-        if same_model && let Some(thinking) = selection.thinking.as_deref() {
-            self.select_thinking_level(selection.provider.as_deref(), &selection.model, thinking)?;
-        } else {
-            self.select_provider_model(
-                selection.provider.as_deref(),
-                &selection.model,
-                selection.thinking.as_deref(),
-            )?;
+        if !(same_model && same_thinking) {
+            if same_model && let Some(thinking) = selection.thinking.as_deref() {
+                self.select_thinking_level(
+                    selection.provider.as_deref(),
+                    &selection.model,
+                    thinking,
+                )?;
+            } else {
+                self.select_provider_model(
+                    selection.provider.as_deref(),
+                    &selection.model,
+                    selection.thinking.as_deref(),
+                )?;
+            }
         }
+        self.record_request_identity(&selection.request_provider, &selection.model)?;
         for record in &self.records()[before..] {
             observe(Notification::Committed(record));
         }

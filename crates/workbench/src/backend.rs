@@ -2334,6 +2334,7 @@ fn select_live_model(
     let selection = Arc::new(pi_rs::LiveModelSelection {
         adapter: Arc::new(adapter.clone()),
         provider: args.recorded_provider().map(str::to_owned),
+        request_provider: args.provider.id().into(),
         model: args.model.clone(),
         thinking: args.thinking.clone(),
         limits: pi_rs::Limits {
