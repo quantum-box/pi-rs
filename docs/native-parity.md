@@ -4787,6 +4787,17 @@ extension callback finishes, including initial-prompt input hooks. Host scopes
 are bound to their session owner, so nested sessions cannot write to the
 caller’s journal. Ordinary control clones used by independently spawned tasks
 enter the normal FIFO queue.
+Native extensions can declare MCP servers during loading. Workbench connects
+them through its existing MCP catalog. Explicit configuration takes precedence
+over extension declarations in the same normalized namespace. Provider
+tokens and host credential references require explicit configuration. Embedded hosts can
+read the declarations and choose a connector. The SDK can register and
+unregister a server for a loaded extension and awaits `mcp_servers_change`
+handlers with the updated declaration list. Only the owner can replace or
+remove a registration. The SDK reports notification and follow-up errors
+through its session events after applying the registration change. The executable protocol negotiates that event
+independently of ordinary lifecycle events.
+
 Native extensions can subscribe to `after_provider_response` to observe the
 HTTP status and normalized headers from an agent turn. The OpenAI Responses,
 OpenAI-compatible chat, Anthropic Messages, Google Gemini, and Ollama adapters

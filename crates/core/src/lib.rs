@@ -11,6 +11,7 @@ mod extension_boundary;
 mod host_auth;
 mod journal;
 mod lifecycle;
+mod mcp_registration;
 mod model_catalog;
 mod model_price;
 mod persistent_map;
@@ -48,6 +49,7 @@ pub use lifecycle::{
     notify as notify_extension_lifecycle, notify_filtered as notify_extension_lifecycle_filtered,
     notify_in_session as notify_extension_lifecycle_in_session,
 };
+pub use mcp_registration::{McpServerDeclaration, RegisteredMcpServer};
 pub use model_catalog::*;
 pub use model_price::ChatPrice;
 pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};
