@@ -63,3 +63,4 @@ jobs:
         run: |
           bash examples/browser-preview/build.sh
           node crates/browser-sdk/tests/browser-sdk.cjs examples/browser-preview/dist/pkg "$CHROME_BIN"
+          node examples/browser-preview/preview-smoke.mjs examples/browser-preview/dist "$CHROME_BIN"
