@@ -539,6 +539,10 @@ impl Worker {
         slot.as_mut().expect("shell worker").bashing = true;
         Ok(())
     }
+    pub(super) fn adopt_live_model(&mut self, args: &Cli) {
+        self.configuration = configuration(args);
+    }
+
     pub(super) fn matches(&self, args: &Cli) -> bool {
         self.persistent && self.configuration == configuration(args)
     }

@@ -13,7 +13,7 @@ use std::time::Duration;
 pub struct Runtime {
     pub auto_compaction: pi_rs::AutoCompactionControl,
     pub retry: pi_rs::RetryControl,
-    provider: super::image_policy::WorkbenchModel,
+    pub(super) provider: super::image_policy::WorkbenchModel,
     pub registry: Registry,
     pub extension_sources: std::collections::BTreeMap<String, std::path::PathBuf>,
     shell: ShellConfig,
@@ -1130,7 +1130,7 @@ async fn configure_after(
     result
 }
 
-fn effective_limits(args: &Cli) -> Limits {
+pub(super) fn effective_limits(args: &Cli) -> Limits {
     Limits {
         model_requests: args.max_requests,
         output_tokens_per_request: args.effective_max_output_tokens(),

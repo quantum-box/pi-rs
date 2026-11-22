@@ -1136,8 +1136,16 @@ struct CustomMessageRenderPending {
     options: pi_rs::CustomMessageRenderOptions,
 }
 
+struct LiveModelChoice {
+    id: uuid::Uuid,
+    selected: Cli,
+    status: String,
+}
+
 #[derive(Default)]
 struct View {
+    live_model_choices: VecDeque<LiveModelChoice>,
+    live_model_applied: Option<Cli>,
     async_transitions: bool,
     pending_transition: Option<std::sync::mpsc::Receiver<Result<Cli>>>,
     regular: RegularState,
@@ -1894,7 +1902,100 @@ impl View {
         }
     }
 
+    fn model_display(&self, args: &Cli) -> String {
+        let selected = self.live_model_applied.as_ref().unwrap_or(args);
+        format!(
+            "{} · {}",
+            selected.configured_model_name(&selected.model),
+            selected.thinking.as_deref().unwrap_or("default")
+        )
+    }
+
+    fn model_choice<'a>(&'a self, args: &'a Cli) -> &'a Cli {
+        self.live_model_choices
+            .back()
+            .map(|choice| &choice.selected)
+            .or(self.live_model_applied.as_ref())
+            .unwrap_or(args)
+    }
+
+    fn stage_model_choice(
+        &mut self,
+        worker: &mut Worker,
+        selected: Cli,
+        status: String,
+    ) -> Result<()> {
+        let id = uuid::Uuid::new_v4();
+        worker.send(json!({
+            "type": "select_live_model",
+            "id": id,
+            "provider": selected.provider.id(),
+            "model": selected.model,
+            "thinking": selected.thinking,
+            "reported_thinking": super::thinking::reported(&selected).is_some(),
+            "reported_reasoning": super::thinking::adopted_reasoning(&selected),
+        }))?;
+        self.live_model_choices.push_back(LiveModelChoice {
+            id,
+            selected,
+            status,
+        });
+        Ok(())
+    }
+
+    fn accept_model_choice(&mut self, value: &Value, mode: Option<TuiMode>) {
+        let Some(index) = self
+            .live_model_choices
+            .iter()
+            .position(|choice| value["id"] == json!(choice.id))
+        else {
+            return;
+        };
+        let Some(mut choice) = self.live_model_choices.remove(index) else {
+            return;
+        };
+        if value["success"] == true {
+            if let Some(previous) = self.live_model_applied.take() {
+                choice
+                    .selected
+                    .selection_events
+                    .splice(0..0, previous.selection_events);
+            }
+            self.live_model_applied = Some(choice.selected);
+            self.show_status(mode, choice.status);
+        } else {
+            self.append(value["error"].as_str().unwrap_or("Could not switch models"));
+        }
+    }
+
+    fn finish_model_choice(&mut self, args: &mut Cli) -> bool {
+        let Some(mut selected) = self.live_model_applied.take() else {
+            return false;
+        };
+
+        args.provider = selected.provider;
+        args.model = selected.model;
+        args.endpoint = selected.endpoint;
+        args.thinking = selected.thinking;
+        args.thinking_profile = selected.thinking_profile;
+        args.selection_events.append(&mut selected.selection_events);
+        true
+    }
+
     fn receive_worker(&mut self, mut value: Value, args: &mut Cli) {
+        if value["type"] == "response" && value["command"] == "select_live_model" {
+            self.accept_model_choice(&value, args.tui_mode);
+            return;
+        }
+        if value["type"] == "live_model_reverted" {
+            self.live_model_applied = None;
+            self.append(
+                value["error"]
+                    .as_str()
+                    .unwrap_or("Could not save model selection"),
+            );
+            return;
+        }
         if value["type"] == "response" && value["command"] == "set_session_label" {
             if let Ok(request) = serde_json::from_value(value["id"].take())
                 && let Some(picker) = &mut self.picker
@@ -3076,11 +3177,7 @@ impl View {
         queue!(out, MoveTo(0, (height - 2) as u16))?;
         Line::themed(&args.workspace.display().to_string(), theme, "dim").draw(&mut out, width)?;
         queue!(out, MoveTo(0, (height - 1) as u16))?;
-        let model = format!(
-            "{} · {}",
-            args.configured_model_name(&args.model),
-            args.thinking.as_deref().unwrap_or("default")
-        );
+        let model = self.model_display(args);
         let model_width = UnicodeWidthStr::width(model.as_str());
         let usage = format!("↑↓ 確定 {} tokens", self.tokens);
         let usage = clip(&usage, width.saturating_sub(model_width + 1));
@@ -3235,15 +3332,7 @@ impl View {
             theme,
             "dim",
         ));
-        lines.push(Line::themed(
-            &format!(
-                "{} · {}",
-                args.configured_model_name(&args.model),
-                args.thinking.as_deref().unwrap_or("default")
-            ),
-            theme,
-            "dim",
-        ));
+        lines.push(Line::themed(&self.model_display(args), theme, "dim"));
         let session = Session::snapshot(&args.session)?;
         let (messages, _) = super::rpc_messages::snapshot(&session);
         let mut output = format!(
@@ -3543,12 +3632,7 @@ impl View {
             queue!(out, Print("\r\n"))?;
         }
         Line::themed(
-            &format!(
-                "↑↓ {} tokens · {} · {}",
-                self.tokens,
-                args.configured_model_name(&args.model),
-                args.thinking.as_deref().unwrap_or("default")
-            ),
+            &format!("↑↓ {} tokens · {}", self.tokens, self.model_display(args)),
             theme,
             "dim",
         )
@@ -4928,7 +5012,9 @@ pub(super) async fn run(
                             }
                             ModelListIntent::Cycle { reverse } => {
                                 view.available_models = models;
-                                if let Err(error) = cycle_model(&mut args, &mut view, reverse) {
+                                if let Err(error) =
+                                    cycle_model(&mut args, &mut view, &mut worker, reverse)
+                                {
                                     view.append(&error.to_string());
                                 }
                             }
@@ -5135,6 +5221,9 @@ pub(super) async fn run(
                     }
                 }
                 if settled {
+                    if view.finish_model_choice(&mut args) {
+                        active.adopt_live_model(&args);
+                    }
                     active.busy = false;
                     cancel_running_extension_editor(&mut external_editor, None);
                     view.dialogs.clear();
@@ -6442,23 +6531,19 @@ pub(super) async fn run(
                             Err(error) => view.append(&error.to_string()),
                         }
                     }
-                    "app.model.cycleForward" | "app.model.cycleBackward" if !is_busy(&worker) => {
-                        if let Err(error) =
-                            cycle_model(&mut args, &mut view, action == "app.model.cycleBackward")
-                        {
+                    "app.model.cycleForward" | "app.model.cycleBackward" => {
+                        if let Err(error) = cycle_model(
+                            &mut args,
+                            &mut view,
+                            &mut worker,
+                            action == "app.model.cycleBackward",
+                        ) {
                             view.append(&error.to_string());
                         }
                     }
-                    "app.thinking.cycle" if !is_busy(&worker) => {
-                        match super::thinking::cycle(&mut args) {
-                            Ok(Some(level)) => {
-                                view.show_status(args.tui_mode, format!("Thinking level: {level}"));
-                            }
-                            Ok(None) => view.show_status(
-                                args.tui_mode,
-                                "Current model does not support thinking".into(),
-                            ),
-                            Err(error) => view.append(&error.to_string()),
+                    "app.thinking.cycle" => {
+                        if let Err(error) = cycle_thinking(&mut args, &mut view, &mut worker) {
+                            view.append(&error.to_string());
                         }
                     }
                     "app.tools.expand" => {
@@ -7047,10 +7132,16 @@ fn save_default_model(args: &mut Cli) -> Result<()> {
     Ok(())
 }
 
-fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
+fn cycle_model(
+    args: &mut Cli,
+    view: &mut View,
+    worker: &mut Option<Worker>,
+    reverse: bool,
+) -> Result<()> {
     use super::model_selection::{ScopedChoice, next_model, qualified_model};
+    let current = view.model_choice(args);
     let discovered;
-    let choices = if args.model_scope.is_empty() {
+    let choices = if current.model_scope.is_empty() {
         if view.available_models.is_empty() {
             start_model_picker(args, view, ModelListIntent::Cycle { reverse });
             return Ok(());
@@ -7058,7 +7149,7 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
         discovered = view
             .available_models
             .iter()
-            .filter_map(|model| qualified_model(model, &args.model_profiles))
+            .filter_map(|model| qualified_model(model, &current.model_profiles))
             .map(|(provider, model)| ScopedChoice {
                 provider,
                 model: model.to_owned(),
@@ -7067,34 +7158,74 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
             .collect::<Vec<_>>();
         discovered.as_slice()
     } else {
-        args.model_scope.as_slice()
+        current.model_scope.as_slice()
     };
-    let status = if let Some(choice) = next_model(args, choices, reverse) {
-        args.change_model(
+    let Some(choice) = next_model(current, choices, reverse) else {
+        let text = if current.model_scope.is_empty() {
+            "Only one model available"
+        } else {
+            "Only one model in scope"
+        };
+        view.show_status(args.tui_mode, text.into());
+        return Ok(());
+    };
+    if let Some(worker) = worker.as_mut().filter(|worker| worker.busy) {
+        let mut current = current.clone();
+        current.selection_events.clear();
+        let selected = current.prepare_model_change(
             choice.provider,
             choice.model,
             choice.thinking,
             pi_rs::ModelSelectSource::Cycle,
         )?;
-        let name = args
-            .model_profiles
-            .model(&args.provider, &args.model)
-            .and_then(|model| model.name)
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| args.model.clone());
-        let mut status = format!("Switched to {name}");
-        if let Some(level) = args.thinking.as_deref().filter(|level| *level != "off")
-            && super::thinking::adopted_reasoning(args) == Some(true)
-        {
-            status.push_str(&format!(" (thinking: {level})"));
+        let status = model_cycle_status(&selected);
+        return view.stage_model_choice(worker, selected, status);
+    }
+    args.change_model(
+        choice.provider,
+        choice.model,
+        choice.thinking,
+        pi_rs::ModelSelectSource::Cycle,
+    )?;
+    view.show_status(args.tui_mode, model_cycle_status(args));
+    Ok(())
+}
+
+fn model_cycle_status(args: &Cli) -> String {
+    let name = args
+        .model_profiles
+        .model(&args.provider, &args.model)
+        .and_then(|model| model.name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| args.model.clone());
+    let mut status = format!("Switched to {name}");
+    if let Some(level) = args.thinking.as_deref().filter(|level| *level != "off")
+        && super::thinking::adopted_reasoning(args) == Some(true)
+    {
+        status.push_str(&format!(" (thinking: {level})"));
+    }
+    status
+}
+
+fn cycle_thinking(args: &mut Cli, view: &mut View, worker: &mut Option<Worker>) -> Result<()> {
+    let level = if let Some(worker) = worker.as_mut().filter(|worker| worker.busy) {
+        let mut selected = view.model_choice(args).clone();
+        selected.selection_events.clear();
+        if let Some(level) = super::thinking::next_level(&mut selected) {
+            super::thinking::select(&mut selected, &level);
+            return view.stage_model_choice(worker, selected, format!("Thinking level: {level}"));
         }
-        status
-    } else if args.model_scope.is_empty() {
-        "Only one model available".into()
+        None
     } else {
-        "Only one model in scope".into()
+        super::thinking::cycle(args)?
     };
-    view.show_status(args.tui_mode, status);
+    view.show_status(
+        args.tui_mode,
+        level.map_or_else(
+            || "Current model does not support thinking".into(),
+            |level| format!("Thinking level: {level}"),
+        ),
+    );
     Ok(())
 }
 

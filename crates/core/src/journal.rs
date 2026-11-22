@@ -698,6 +698,7 @@ impl SessionStore for BoundaryPreviewStore {
 pub struct Session {
     auto_compaction: crate::AutoCompactionControl,
     retry: crate::RetryControl,
+    pub(crate) live_model: crate::LiveModelControl,
     store: Box<dyn SessionStore>,
     records: Vec<Record>,
     record_metadata: BTreeMap<u64, serde_json::Value>,
@@ -713,6 +714,7 @@ impl Session {
         Self {
             auto_compaction: self.auto_compaction.clone(),
             retry: self.retry.clone(),
+            live_model: crate::LiveModelControl::default(),
             store: Box::new(BoundaryPreviewStore {
                 metadata: self.supports_record_metadata(),
                 record_limit: self.store.encoded_record_limit(),
@@ -782,6 +784,11 @@ impl Session {
     /// Attach a host-owned control across successive openings of this session.
     pub fn set_auto_compaction_control(&mut self, control: crate::AutoCompactionControl) {
         self.auto_compaction = control;
+    }
+
+    /// Attach a control for changing the configured route between model requests.
+    pub fn set_live_model_control(&mut self, control: crate::LiveModelControl) {
+        self.live_model = control;
     }
 
     /// Hold an exclusive OS lock for the lifetime of the session.
@@ -875,6 +882,7 @@ impl Session {
         let mut session = Self {
             auto_compaction: crate::AutoCompactionControl::default(),
             retry: crate::RetryControl::default(),
+            live_model: crate::LiveModelControl::default(),
             store: Box::new(store),
             records,
             record_metadata,

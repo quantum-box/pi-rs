@@ -186,30 +186,42 @@ pub(super) fn set(args: &mut Cli, requested: &str) -> Result<()> {
 }
 
 pub(super) fn cycle(args: &mut Cli) -> Result<Option<String>> {
+    let next = next_level(args);
+    if let Some(next) = next
+        .as_ref()
+        .filter(|next| args.thinking.as_ref() != Some(next))
+    {
+        persist(args, next)?;
+    }
+    Ok(next)
+}
+
+pub(super) fn next_level(args: &mut Cli) -> Option<String> {
     let levels = available(args);
     let reasoning = adopted_reasoning(args);
     if levels.is_empty() || (reasoning != Some(true) && levels.iter().all(|level| level == "off")) {
-        return Ok(None);
+        return None;
     }
     let current = args.thinking.as_deref().unwrap_or("off");
     let index = levels
         .iter()
         .position(|level| level == current)
         .map_or(0, |index| (index + 1) % levels.len());
-    let next = levels[index].clone();
-    if args.thinking.as_deref() != Some(next.as_str()) {
-        persist(args, &next)?;
-    }
-    Ok(Some(next))
+    Some(levels[index].clone())
 }
 
 fn persist(args: &mut Cli, level: &str) -> Result<()> {
-    let previous_level = args.thinking.as_deref().unwrap_or("off").to_owned();
     Session::open(&args.session)?.select_thinking_level(
         args.recorded_provider(),
         &args.model,
         level,
     )?;
+    select(args, level);
+    Ok(())
+}
+
+pub(super) fn select(args: &mut Cli, level: &str) {
+    let previous_level = args.thinking.as_deref().unwrap_or("off").to_owned();
     args.thinking = Some(level.into());
     if previous_level != level {
         args.selection_events
@@ -218,7 +230,6 @@ fn persist(args: &mut Cli, level: &str) -> Result<()> {
                 previous_level,
             });
     }
-    Ok(())
 }
 
 #[cfg(test)]

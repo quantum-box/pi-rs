@@ -1746,18 +1746,34 @@ impl Agent<'_> {
                     runtime_prompt = prompt;
                 }
             }
-            let active = Agent {
-                registry: &runtime_registry,
-                system_prompt: &runtime_prompt,
-                model: self.model,
-                model_name: self.model_name,
-                limits: self.limits.clone(),
-            };
-
             queue_inputs(session, followups, observer)?;
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
+            // Use one adapter and its limits for the entire request and tool
+            // dispatch. A selection received during streaming is used only
+            // once this turn reaches a new request boundary.
+            let selected = session.live_model.selection().filter(|_| {
+                pending.is_none()
+                    && overflow_recovery_state(session, run_id)
+                        .is_none_or(|recovery| recovery.compacted)
+            });
+            if let Some(selected) = &selected {
+                session.apply_live_model_selection(selected, observer)?;
+            }
+            let active = Agent {
+                registry: &runtime_registry,
+                system_prompt: &runtime_prompt,
+                model: selected
+                    .as_ref()
+                    .map_or(self.model, |selection| selection.adapter.as_ref()),
+                model_name: selected
+                    .as_ref()
+                    .map_or(self.model_name, |selection| &selection.model),
+                limits: selected
+                    .as_ref()
+                    .map_or_else(|| self.limits.clone(), |selection| selection.limits.clone()),
+            };
             // A recorded provider overflow survives process interruption. The
             // marker is committed before compaction so recovery is attempted at
             // most once, including after reopening the journal.
@@ -12734,6 +12750,99 @@ mod queue_tests {
         let old_branch =
             Session::from_records(restored.fork_records(before_clear).unwrap()).unwrap();
         assert_eq!(old_branch.queued_custom_messages().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_live_selection_is_applied_before_the_queued_followup_request() {
+        use futures_util::StreamExt;
+
+        struct Route {
+            started: Option<Arc<tokio::sync::Notify>>,
+            release: Arc<tokio::sync::Notify>,
+            seen: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Model for Route {
+            async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+                self.seen.lock().unwrap().push(request.model.clone());
+                if let Some(started) = &self.started {
+                    started.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(futures_util::stream::iter([
+                    Ok(crate::ModelEvent::Text(request.model)),
+                    Ok(crate::ModelEvent::Complete {
+                        calls: Vec::new(),
+                        usage: Some(Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        }),
+                    }),
+                ])
+                .boxed())
+            }
+        }
+
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let control = crate::LiveModelControl::default();
+        session.set_live_model_control(control.clone());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = Agent {
+            model: &Route {
+                started: Some(started.clone()),
+                release: release.clone(),
+                seen: seen.clone(),
+            },
+            model_name: "alpha",
+            registry: &Registry::default(),
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let (sender, mut inputs) = mpsc::channel(2);
+        let switch = async {
+            started.notified().await;
+            control.select(Arc::new(crate::LiveModelSelection {
+                adapter: Arc::new(Route {
+                    started: None,
+                    release: release.clone(),
+                    seen: seen.clone(),
+                }),
+                provider: Some("fixture".into()),
+                model: "beta".into(),
+                thinking: Some("high".into()),
+                limits: Limits::default(),
+            }));
+            sender
+                .send(QueuedInput {
+                    id: Uuid::new_v4(),
+                    kind: InputKind::FollowUp,
+                    content: "follow-up".into(),
+                })
+                .await
+                .unwrap();
+            release.notify_one();
+        };
+        let cancel = CancellationToken::new();
+        let (result, ()) = tokio::join!(
+            agent.run_correlated(
+                &mut session,
+                Uuid::new_v4(),
+                Some("initial".into()),
+                &mut inputs,
+                &cancel,
+                &mut |_| {}
+            ),
+            switch,
+        );
+        assert_eq!(result.unwrap(), "beta");
+        assert_eq!(*seen.lock().unwrap(), ["alpha", "beta"]);
+        assert_eq!(
+            session.model_selection(),
+            Some(("beta".into(), Some("high".into())))
+        );
     }
 
     struct WaitingModel(Arc<tokio::sync::Notify>);

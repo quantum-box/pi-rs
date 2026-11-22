@@ -129,6 +129,10 @@ name and the active thinking level for reasoning models. Consecutive notices
 reuse the trailing status in both fullscreen and regular mode, before it enters
 scrollback. The tool-output, thinking-visibility, and thinking-level shortcuts
 report the new state using the same status row, as in Pi.
+During a streamed prompt, model and thinking shortcuts acknowledge a prepared
+selection without changing the request in flight. A queued follow-up uses the
+new route and effort. The worker commits the selection before the next request,
+or at settlement when the current prompt finishes without a follow-up.
 Model scopes (`--models` and `enabledModels`) add all available providers that
 share an exact unqualified model ID and warn about the ambiguity. A literal ID
 containing glob characters takes precedence over glob expansion across providers,

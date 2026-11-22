@@ -677,6 +677,19 @@ impl Cli {
         thinking: Option<String>,
         source: pi_rs::ModelSelectSource,
     ) -> Result<()> {
+        let selected = self.prepare_model_change(provider, model, thinking, source)?;
+        selected.record_model_selection(&mut Session::open(&selected.session)?)?;
+        *self = selected;
+        Ok(())
+    }
+
+    fn prepare_model_change(
+        &self,
+        provider: Provider,
+        model: String,
+        thinking: Option<String>,
+        source: pi_rs::ModelSelectSource,
+    ) -> Result<Self> {
         let previous_model = rpc::model_value(self, &self.provider, &self.model);
         let previous_level = self.thinking.as_deref().unwrap_or("off").to_owned();
         let mut selected = self.clone();
@@ -689,7 +702,6 @@ impl Cli {
             selected.apply_model_thinking_defaults();
         }
         thinking::adjust(&mut selected);
-        selected.record_model_selection(&mut Session::open(&selected.session)?)?;
         let level = selected.thinking.as_deref().unwrap_or("off");
         if previous_level != level {
             selected
@@ -708,8 +720,7 @@ impl Cli {
                     source,
                 });
         }
-        *self = selected;
-        Ok(())
+        Ok(selected)
     }
     fn configured_model_name(&self, model: &str) -> String {
         match &self.provider {
