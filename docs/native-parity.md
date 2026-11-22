@@ -5170,7 +5170,32 @@ the effective minimum validity after the saved refresh. Loopback fixtures
 covered early refresh and persistence. Live Codex and Copilot refresh was
 unverified.
 
-The native transport sends uncompressed JSON over HTTP SSE. OpenAI Responses
+Codex also accepts Pi's `transport` setting. `auto` and `websocket-cached`
+can reuse a direct connection and send a transcript suffix when the request
+matches the previous conversation. `websocket` sends the full history on
+the connection, and `sse` uses HTTP directly. WebSocket requests omit the
+HTTP-only `stream` flag as specified by the [Responses WebSocket protocol](https://developers.openai.com/api/reference/resources/responses/websocket-events).
+An unavailable WebSocket
+upgrade falls back to HTTP SSE before any inference request is sent. Native
+provider-response hooks receive the sanitized HTTP handshake status and
+headers when a connection is opened. An upgrade failure or interrupted
+WebSocket response makes later attempts use SSE for up to a minute, including
+with prompt-cache retention disabled. With no session key, the cooldown
+applies to the route. An interrupted response returns its error without
+issuing another inference request for that attempt. A server that loses the previous response
+ID receives the full transcript on retry.
+Explicit `session-id` and `x-client-request-id` headers take precedence in
+native WebSocket handshakes. These values also scope connection reuse and SSE
+cooldown. The client checks an idle connection with a WebSocket ping before
+sending the next request and replaces the connection if the check fails.
+As in Pi v1.6.0, a socket can be reused for up to 45 minutes after connecting,
+with a five-minute idle timeout. An ongoing response can finish on its
+existing connection.
+An explicit connection-limit rejection before output opens a new connection
+once. Stream error statuses distinguish retryable service failures from
+terminal account limits. The native HTTP fallback sends uncompressed JSON.
+
+OpenAI Responses
 and Codex models with `compat.supportsOpenAIGrammarTools` advertise grammar
 tools as custom tools. They choose a nonempty Lark definition before a regex
 definition and map streamed input onto the single required string argument.
@@ -5179,7 +5204,7 @@ on the current request. Historical function arguments retain their full JSON
 when they cannot be represented as a single string. Models without the
 capability and the pi-rs ChatGPT plan namespace use function tools.
 
-OpenAI Codex WebSocket transport and provider tool search remain open.
+Provider tool search remains open.
 Authentication and grammar tool streaming were exercised with fixtures.
 Live sign-in and inference were unverified because no account was available
 for acceptance.
