@@ -157,6 +157,13 @@ struct ColorQuery {
 }
 
 #[cfg(any(unix, windows))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppearanceProbe {
+    WaitingForColors,
+    WaitingForMarker,
+}
+
+#[cfg(any(unix, windows))]
 #[derive(Default)]
 struct ColorQueries {
     initial_started: Option<Instant>,
@@ -165,6 +172,7 @@ struct ColorQueries {
     disabled: bool,
     last_appearance_report: Option<bool>,
     refresh_after_subscription: bool,
+    appearance_probe: Option<AppearanceProbe>,
 }
 
 impl Terminal {
@@ -226,6 +234,8 @@ impl Terminal {
             return Ok(false);
         }
         self.appearance_notifications = enabled;
+        self.colors.appearance_probe =
+            (enabled && !self.colors.disabled).then_some(AppearanceProbe::WaitingForColors);
         let command = if enabled {
             "\x1b[?2031h\x1b[?996n"
         } else {
@@ -362,6 +372,9 @@ impl ColorQueries {
             quarantined: false,
             batch: crate::ui::terminal_color_batch::ColorBatch::new(started),
         });
+        if self.appearance_probe == Some(AppearanceProbe::WaitingForColors) {
+            self.appearance_probe = Some(AppearanceProbe::WaitingForMarker);
+        }
         let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
         for index in 0..16 {
             query.push_str(&format!("\x1b]4;{index};?\x07"));
@@ -381,14 +394,9 @@ impl ColorQueries {
 
     fn appearance_report(&mut self, dark: bool, output: &mut dyn Write) -> Result<bool> {
         let previous = self.last_appearance_report.replace(dark);
-        // The first report may be the response to ?996n sent at startup.
-        // It cannot be distinguished from a simultaneous notification.
-        let initial_report = previous.is_none()
-            && self
-                .color_queries
-                .front()
-                .is_some_and(|query| Some(query.started) == self.initial_started);
-        if !initial_report {
+        // The first report before the matching color query's DA1 may answer
+        // the explicit appearance probe. That query already refreshes colors.
+        if self.appearance_probe.take().is_none() {
             self.query_terminal_colors(output)?;
         }
         Ok(std::mem::take(&mut self.refresh_after_subscription)
@@ -450,6 +458,9 @@ impl ColorQueries {
 
     fn finish_color_query(&mut self, output: &mut dyn Write) -> Result<()> {
         self.color_queries.pop_front();
+        if self.appearance_probe == Some(AppearanceProbe::WaitingForMarker) {
+            self.appearance_probe = None;
+        }
         if std::mem::take(&mut self.color_requery) {
             self.query_terminal_colors(output)?;
         }
@@ -480,6 +491,7 @@ impl ColorQueries {
         // Neither can be attributed reliably once ownership has changed.
         self.color_queries.clear();
         self.color_requery = false;
+        self.appearance_probe = None;
         self.disabled = true;
     }
 
@@ -13039,10 +13051,7 @@ exit {exit}
                 quarantined: false,
                 batch: crate::ui::terminal_color_batch::ColorBatch::new(std::time::Instant::now()),
             }]),
-            color_requery: false,
-            disabled: false,
-            last_appearance_report: None,
-            refresh_after_subscription: false,
+            ..Default::default()
         };
         assert!(!super::expire_initial_terminal_colors(
             &terminal, &mut theme
@@ -13160,6 +13169,7 @@ exit {exit}
     fn initial_appearance_report_does_not_discard_initial_colors() {
         let mut colors = super::ColorQueries::default();
         let mut output = Vec::new();
+        colors.appearance_probe = Some(super::AppearanceProbe::WaitingForColors);
         colors.query_terminal_colors(&mut output).unwrap();
         let initial_len = output.len();
         // A late initial appearance response may follow an OSC reply.
@@ -13175,6 +13185,39 @@ exit {exit}
         assert!(colors.appearance_report(false, &mut output).unwrap());
         assert!(colors.color_requery);
         assert!(!colors.accepts_color_reply(1, &mut output).unwrap());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn appearance_subscription_probe_does_not_repeat_the_color_query() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+
+        // The old color query is still in flight when notifications turn on.
+        // Its marker cannot expire the probe for the next query.
+        colors.appearance_probe = Some(super::AppearanceProbe::WaitingForColors);
+        colors
+            .refresh_after_appearance_subscription(&mut output)
+            .unwrap();
+        assert!(colors.color_requery);
+        colors.receive_color_marker(&mut output).unwrap();
+        assert!(!colors.color_requery);
+        let subscription_len = output.len();
+        assert!(!colors.appearance_report(false, &mut output).unwrap());
+        assert_eq!(output.len(), subscription_len);
+        assert!(!colors.color_requery);
+        colors.receive_color_marker(&mut output).unwrap();
+
+        // A terminal can ignore the explicit probe and still notify later.
+        colors.appearance_probe = Some(super::AppearanceProbe::WaitingForColors);
+        colors
+            .refresh_after_appearance_subscription(&mut output)
+            .unwrap();
+        colors.receive_color_marker(&mut output).unwrap();
+        let before_change = output.len();
+        assert!(colors.appearance_report(true, &mut output).unwrap());
+        assert!(output.len() > before_change);
     }
 
     #[cfg(any(unix, windows))]
