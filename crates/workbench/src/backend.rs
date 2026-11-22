@@ -1310,6 +1310,7 @@ async fn run_worker(
                     context.model = model.clone();
                     context.reasoning_level =
                         Some(thinking.clone().unwrap_or_else(|| "off".into()));
+                    runtime.refresh_read_image_policy(&args, &context.provider, model);
                     runtime.set_shell_context(context.clone(), external_id.clone());
                 }
                 snapshot
@@ -1746,6 +1747,7 @@ async fn run_worker(
         drop(cache_capture);
         if let Some((selected, adapter)) = adopted {
             args = selected;
+            runtime.refresh_read_image_policy(&args, args.provider.id(), &args.model);
             runtime.provider = adapter;
         }
         for execution in completed_shells {

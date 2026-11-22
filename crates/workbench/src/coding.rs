@@ -26,7 +26,27 @@ const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 #[derive(Clone, Default)]
 pub struct ShellOutputStore(Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>);
 
+/// Model-specific image settings shared with this runtime's local read tool.
+#[derive(Default)]
+pub struct LiveReadImagePolicy(
+    std::sync::RwLock<(
+        Option<crate::image_profile::ImageResizeProfile>,
+        Option<bool>,
+    )>,
+);
+
+impl LiveReadImagePolicy {
+    pub fn set(
+        &self,
+        profile: Option<crate::image_profile::ImageResizeProfile>,
+        supports_images: Option<bool>,
+    ) {
+        *self.0.write().expect("image read policy") = (profile, supports_images);
+    }
+}
+
 pub struct CodingTools {
+    live_read_image_policy: Option<Arc<LiveReadImagePolicy>>,
     root: PathBuf,
     unrestricted: bool,
     shell: ShellConfig,
@@ -55,6 +75,7 @@ impl CodingTools {
             auto_resize_images: true,
             image_profile: None,
             model_supports_images: None,
+            live_read_image_policy: None,
             read_operations: None,
             write_operations: None,
             bash_operations: None,
@@ -190,6 +211,11 @@ impl CodingTools {
         profile: Option<crate::image_profile::ImageResizeProfile>,
     ) -> Self {
         self.image_profile = profile;
+        self
+    }
+
+    pub fn with_live_read_image_policy(mut self, policy: Arc<LiveReadImagePolicy>) -> Self {
+        self.live_read_image_policy = Some(policy);
         self
     }
 
@@ -595,11 +621,99 @@ impl Extension for CodingTools {
                         operations: operations.clone(),
                         shell_outputs: self.shell_outputs.clone(),
                     }) as Arc<dyn Tool>
+                } else if matches!(kind, Kind::Read { .. })
+                    && let Some(policy) = &self.live_read_image_policy
+                {
+                    Arc::new(LiveReadTool {
+                        tool,
+                        policy: policy.clone(),
+                    }) as Arc<dyn Tool>
                 } else {
                     Arc::new(tool) as Arc<dyn Tool>
                 }
             })
             .collect()
+    }
+}
+
+struct LiveReadTool {
+    tool: CodingTool,
+    policy: Arc<LiveReadImagePolicy>,
+}
+
+impl LiveReadTool {
+    fn snapshot(&self) -> CodingTool {
+        let (profile, model_supports_images) = *self.policy.0.read().expect("image read policy");
+        let auto_resize = matches!(
+            self.tool.kind,
+            Kind::Read {
+                auto_resize: true,
+                ..
+            }
+        );
+        CodingTool {
+            kind: Kind::Read {
+                auto_resize,
+                profile,
+                model_supports_images,
+            },
+            ..self.tool.clone()
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for LiveReadTool {
+    fn spec(&self) -> ToolSpec {
+        self.tool.spec()
+    }
+
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        self.tool.constrained_sampling()
+    }
+
+    fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
+        self.tool.event_structured_content(outcome)
+    }
+
+    fn execution(&self) -> ToolExecution {
+        self.tool.execution()
+    }
+
+    fn output_limit(&self) -> usize {
+        self.tool.output_limit()
+    }
+
+    async fn prepare_arguments(&self, arguments: Value) -> pi_rs::ExtensionResult<Value> {
+        self.tool.prepare_arguments(arguments).await
+    }
+
+    async fn invoke(&self, arguments: Value, context: ToolContext) -> Outcome {
+        self.snapshot().invoke(arguments, context).await
+    }
+
+    async fn invoke_with_host(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&pi_rs::ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> Outcome {
+        self.snapshot()
+            .invoke_with_host(arguments, context, state, host)
+            .await
+    }
+
+    async fn invoke_programmatic(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&pi_rs::ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ToolReply {
+        self.snapshot()
+            .invoke_programmatic(arguments, context, state, host)
+            .await
     }
 }
 
@@ -6282,6 +6396,45 @@ mod tests {
                 .to_string()
                 .contains("invalid model image resize profile")
         );
+    }
+
+    #[test]
+    fn live_read_policy_preserves_in_flight_image_limits_and_updates_the_next_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sample.png");
+        image::RgbImage::from_pixel(64, 32, image::Rgb([12, 34, 56]))
+            .save(&path)
+            .unwrap();
+        let policy = Arc::new(LiveReadImagePolicy::default());
+        let read = LiveReadTool {
+            tool: CodingTool {
+                root: directory.path().into(),
+                unrestricted: true,
+                shell: ShellConfig::default(),
+                kind: Kind::Read {
+                    auto_resize: true,
+                    profile: None,
+                    model_supports_images: None,
+                },
+            },
+            policy: policy.clone(),
+        };
+        let profile = |width| crate::image_profile::ImageResizeProfile {
+            max_width: Some(width),
+            ..Default::default()
+        };
+        policy.set(Some(profile(32)), Some(true));
+        let in_flight = read.snapshot();
+        policy.set(Some(profile(16)), Some(true));
+        for (tool, dimensions) in [(in_flight, "32x16"), (read.snapshot(), "16x8")] {
+            let result = tool.read_image(&path).unwrap().unwrap();
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(dimensions)
+            );
+        }
     }
 
     #[test]

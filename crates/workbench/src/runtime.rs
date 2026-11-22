@@ -4,7 +4,7 @@ use pi_rs::{
     Agent, CancellationToken, Extension, ExtensionUi, Limits, ProjectResources, Registry, Result,
     Session, UiRequest, UiResponse,
 };
-use pi_rs_workbench::coding::{CodingTools, ShellConfig, ShellContext};
+use pi_rs_workbench::coding::{CodingTools, LiveReadImagePolicy, ShellConfig, ShellContext};
 use pi_rs_workbench::{CommandPolicy, ProjectInstructions, Tools, WorkbenchContext};
 use serde_json::json;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ pub struct Runtime {
     pub registry: Registry,
     pub extension_sources: std::collections::BTreeMap<String, std::path::PathBuf>,
     shell: ShellConfig,
+    read_image_policy: Arc<LiveReadImagePolicy>,
     system_prompt: String,
     pub resources: resources::Resources,
     resource_origins: ResourceOrigins,
@@ -376,6 +377,12 @@ impl Runtime {
             .set_context_with_external_id(context, external_id);
     }
 
+    pub(super) fn refresh_read_image_policy(&self, args: &Cli, provider: &str, model: &str) {
+        if let Some(provider) = args.model_profiles.provider(provider) {
+            set_read_image_policy(&self.read_image_policy, args, &provider, model);
+        }
+    }
+
     pub fn mcp_status(&self, args: &Cli) -> Result<()> {
         let servers = self.catalog.servers.lock().expect("MCP catalogs");
         for (name, value) in
@@ -514,6 +521,7 @@ impl Runtime {
 
     pub fn configure_model_options(&mut self, args: &Cli, reported: bool) -> Result<()> {
         self.provider = model_client(args, reported, true)?;
+        set_read_image_policy(&self.read_image_policy, args, &args.provider, &args.model);
         Ok(())
     }
     pub async fn session_lifecycle(
@@ -1035,16 +1043,13 @@ async fn configure_after(
             .map(|url| (url, std::env::var("PI_RS_ORDERS_TOKEN").ok()));
         registry.register(Arc::new(Tools::new(&args.workspace, order_config)?))?;
         let shell = shell_config(args);
+        let read_image_policy = Arc::new(LiveReadImagePolicy::default());
+        set_read_image_policy(&read_image_policy, args, &args.provider, &args.model);
         registry.register(Arc::new(
             CodingTools::local(&args.workspace)?
                 .with_shell_config(shell.clone())
                 .with_image_resize(args.settings.resize_model_images())
-                .with_image_profile(args.model_image_resize())
-                .with_model_image_support(
-                    args.model_profiles
-                        .model(&args.provider, &args.model)
-                        .and_then(|model| model.supports_images()),
-                ),
+                .with_live_read_image_policy(read_image_policy.clone()),
         ))?;
         let extra = mcp_config::discover_registered(
             args,
@@ -1112,6 +1117,7 @@ async fn configure_after(
             registry,
             extension_sources,
             shell,
+            read_image_policy,
             system_prompt,
             resources: local_resources,
             resource_origins: ResourceOrigins::default(),
@@ -1126,6 +1132,19 @@ async fn configure_after(
             .await;
     }
     result
+}
+
+fn set_read_image_policy(
+    policy: &LiveReadImagePolicy,
+    args: &Cli,
+    provider: &super::providers::Provider,
+    model: &str,
+) {
+    let model = args.model_profiles.model(provider, model);
+    policy.set(
+        model.as_ref().and_then(|model| model.image_resize()),
+        model.as_ref().and_then(|model| model.supports_images()),
+    );
 }
 
 pub(super) fn shell_session_context(args: &Cli, session: &Session) -> ShellContext {
