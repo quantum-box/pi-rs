@@ -141,7 +141,10 @@ report the new state using the same status row, as in Pi.
 Model scopes (`--models` and `enabledModels`) add all available providers that
 share an exact unqualified model ID and warn about the ambiguity. A literal ID
 containing glob characters takes precedence over glob expansion across providers,
-with an optional thinking suffix applied to the selected models.
+with an optional thinking suffix applied to the selected models. Bare partial
+scope matches are ranked across the available catalogs. If the winning ID is
+shared, all matching providers are included and a warning names them.
+The native exact display-name shortcut remains available for scopes.
 With no explicit provider or endpoint, a known `--model` ID can select the only
 authenticated matching provider across catalogs, including a gateway model
 whose literal ID starts with another provider's name. Unqualified partial IDs
@@ -5633,6 +5636,18 @@ their full JSON. This covers compatible Kimi routes in the bundled catalog. Rout
 without both flags send the active top-level declarations. Compared the
 published Pi Moonshot request payloads and exercised native request projection
 with fixtures. Live Kimi tool additions were unverified.
+
+Chat Completions sends consecutive tool results before a single user message
+containing their attached images. The shared caption and image order match Pi.
+An automatic tool-list update anchored within
+that group is sent after the results and their images. Synthetic assistant
+messages include any reasoning field required by the configured provider. The native adapter keeps structured tool
+output in the result text and moves its image bytes to that user message.
+Custom model compatibility settings can
+include tool names on results, insert an assistant turn before the next user
+message, preserve empty assistant content, or send an empty tools array when
+the transcript has tool history. Loopback checks covered grouped images and
+the configured payload. Live verification on compatible servers remains open.
 
 ### GitHub Copilot
 
