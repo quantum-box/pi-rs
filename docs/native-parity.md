@@ -4822,8 +4822,9 @@ Bedrock behavior and produce no callback. Custom transports opt in by reporting 
 Summary and catalog requests remain outside the turn hook.
 
 Native `provider_stream_event` callbacks see parsed events from OpenAI
-Responses, OpenAI-compatible chat, Anthropic Messages, Google Gemini, Ollama
-and Pi Messages before those transports normalize them into model events.
+Responses, Codex Responses over SSE and WebSocket, OpenAI-compatible chat,
+Anthropic Messages, Google Gemini, Ollama and Pi Messages before those
+transports normalize them into model events.
 Events include the provider, API, requested model and parsed data. Callbacks
 run in registration order and their results cannot rewrite the stream. The
 observer copy withholds known reflected credentials and authentication fields
