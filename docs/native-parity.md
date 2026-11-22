@@ -1379,6 +1379,8 @@ factory. The caller supplies one absolute file path and exact provider and
 endpoint grants. An endpointless entry is usable only on granted routes. A
 pi-rs entry with a saved endpoint must also match that endpoint. File contents
 can supply variables for key expansion, including Pi's `$$` and `$!` escapes.
+Closed braced references with invalid names are preserved verbatim. A missing
+closing brace leaves the opening dollar sign literal and scanning continues.
 The pi-rs `literal` flag preserves the key verbatim.
 
 Each load reads the file afresh and leaves existing clients and snapshots
