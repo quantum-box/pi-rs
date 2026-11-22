@@ -111,26 +111,29 @@ impl RequestHeaders {
         Ok((headers, None))
     }
 
-    pub(super) async fn has_anthropic_auth_without_refresh(&self) -> Result<bool> {
+    pub(super) async fn anthropic_auth_without_refresh(
+        &self,
+    ) -> Result<Option<(HeaderName, Option<HeaderValue>)>> {
         for name in ANTHROPIC_AUTH_HEADERS {
             let Some(value) = self.values.get(name.as_str()) else {
                 continue;
             };
             if let Some(command) = value.strip_prefix('!') {
                 if !command.trim().is_empty() {
-                    return Ok(true);
+                    return Ok(Some((name, None)));
                 }
                 continue;
             }
             let value = self.resolve_value(name.as_str(), value).await?;
             if !value.trim().is_empty() {
-                sensitive_header(name.as_str(), &value)?
+                let header = sensitive_header(name.as_str(), &value)?;
+                header
                     .to_str()
                     .map_err(|_| Error::Config("invalid Anthropic authentication header".into()))?;
-                return Ok(true);
+                return Ok(Some((name, Some(header))));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     async fn resolve_values(&self) -> Result<HeaderMap> {

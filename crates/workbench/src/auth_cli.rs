@@ -134,38 +134,40 @@ async fn resolve(
                     endpoint,
                     &args.model_profiles,
                 ));
-            if no_refresh {
-                if headers.has_anthropic_auth_without_refresh().await? {
-                    return Ok(Some(Resolved {
-                        kind: AuthType::ApiKey,
-                        value: None,
-                    }));
-                }
+            let selected = if no_refresh {
+                headers.anthropic_auth_without_refresh().await?
             } else {
-                let (resolved, selected) = headers.resolve_anthropic_auth().await?;
-                if let Some(selected) = selected {
-                    let value = resolved[&selected]
-                        .to_str()
-                        .expect("validated Anthropic header");
-                    let (kind, value) = match selected.as_str() {
-                        "x-api-key" => (AuthType::ApiKey, Some(value.trim().to_owned())),
-                        "authorization" => {
-                            let mut parts = value.split_ascii_whitespace();
-                            match (parts.next(), parts.next(), parts.next()) {
-                                (Some(scheme), Some(token), None)
-                                    if scheme.eq_ignore_ascii_case("bearer") =>
-                                {
-                                    (AuthType::OAuth, Some(token.to_owned()))
-                                }
-                                _ => (AuthType::ApiKey, None),
+                let (headers, selected) = headers.resolve_anthropic_auth().await?;
+                selected.map(|name| {
+                    let value = headers[&name].clone();
+                    (name, Some(value))
+                })
+            };
+            if let Some((name, value)) = selected {
+                let value = value
+                    .as_ref()
+                    .map(|value| value.to_str().expect("validated Anthropic header"));
+                let (kind, value) = match (name.as_str(), value) {
+                    ("x-api-key", value) => (AuthType::ApiKey, value.map(str::trim)),
+                    ("authorization", Some(value)) => {
+                        let mut parts = value.split_ascii_whitespace();
+                        match (parts.next(), parts.next(), parts.next()) {
+                            (Some(scheme), Some(token), None)
+                                if scheme.eq_ignore_ascii_case("bearer") =>
+                            {
+                                (AuthType::OAuth, Some(token))
                             }
+                            _ => (AuthType::ApiKey, None),
                         }
-                        _ => (AuthType::ApiKey, None),
-                    };
-                    return Ok(wanted
-                        .is_none_or(|wanted| wanted == kind)
-                        .then_some(Resolved { kind, value }));
-                }
+                    }
+                    _ => (AuthType::ApiKey, None),
+                };
+                return Ok(wanted
+                    .is_none_or(|wanted| wanted == kind)
+                    .then(|| Resolved {
+                        kind,
+                        value: value.filter(|_| !no_refresh).map(str::to_owned),
+                    }));
             }
             if wanted == Some(AuthType::ApiKey) {
                 return Ok(None);
