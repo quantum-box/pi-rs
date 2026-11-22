@@ -482,15 +482,22 @@ impl Cli {
                     return None;
                 }
                 if let Some(builtin) = builtin_chat::find(provider.id()) {
-                    let official = if provider.id() == "cloudflare-workers-ai" {
-                        model_profiles::cloudflare_workers_chat_account(endpoint).is_some()
-                            && self
-                                .model_profiles
-                                .has_provider_endpoint(provider, endpoint)
-                    } else {
-                        builtin.is_official_endpoint(endpoint)
+                    let eligible = match provider.id() {
+                        "azure" => {
+                            !endpoint.is_empty()
+                                && self
+                                    .model_profiles
+                                    .has_provider_endpoint(provider, endpoint)
+                        }
+                        "cloudflare-workers-ai" => {
+                            model_profiles::cloudflare_workers_chat_account(endpoint).is_some()
+                                && self
+                                    .model_profiles
+                                    .has_provider_endpoint(provider, endpoint)
+                        }
+                        _ => builtin.is_official_endpoint(endpoint),
                     };
-                    return official
+                    return eligible
                         .then(|| {
                             builtin.env_names().find_map(|name| {
                                 std::env::var(name)
@@ -2564,13 +2571,15 @@ async fn execute(
                     observe_with_stream(event, args.trace, stream.is_some());
                 }
                 event => {
-                    let event = reasoning_event_json(event);
+                    let event = agent_stream_event_json(event);
                     if let Some(stream) = &mut stream {
                         let mut rpc_event = event.clone();
                         attach_redacted_reasoning(&mut rpc_event);
                         for output_event in stream.observe(&rpc_event, &args) { output(output_event); }
                     }
-                    if args.trace { output(trace_agent_event_json(event)); }
+                    if args.trace || (stream.is_some() && matches!(event["type"].as_str(), Some("compaction_start" | "compaction_end"))) {
+                        output(trace_agent_event_json(event));
+                    }
                 }
             }
         };
@@ -2636,10 +2645,9 @@ async fn execute(
         ).await;
         if let Some(stream) = &mut stream {
             let aborted = matches!(&answer, Err(Error::Cancelled));
-            for event in stream.settle(aborted) {
+            for event in stream.settle(aborted, answer.is_ok()) {
                 output(event);
             }
-            output(json!({"type":"agent_end","success":answer.is_ok(),"messages":stream.messages,"willRetry":false}));
             output(json!({"type":"agent_settled","aborted":stream.aborted()}));
         }
         let answer = answer?;
@@ -2714,8 +2722,11 @@ fn observe(event: Notification<'_>, trace: bool) {
     observe_with_stream(event, trace, false);
 }
 
-fn reasoning_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
+fn agent_stream_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
     match event {
+        pi_rs::AgentEvent::AutoCompaction { reason, update } => {
+            rpc_events::auto_compaction_value(reason, update)
+        }
         pi_rs::AgentEvent::TextStart { index } => json!({"type":"text_item_start","index":index}),
         pi_rs::AgentEvent::TextDelta { index, delta } => {
             json!({"type":"text_item_delta","index":index,"delta":delta})
@@ -2732,7 +2743,7 @@ fn reasoning_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
         pi_rs::AgentEvent::ReasoningEnd { index, content } => {
             json!({"type":"reasoning_item_end","index":index,"content":content})
         }
-        pi_rs::AgentEvent::Notification(_) => unreachable!("expected a reasoning item event"),
+        pi_rs::AgentEvent::Notification(_) => unreachable!("expected an enriched agent event"),
     }
 }
 
@@ -2763,7 +2774,9 @@ fn trace_agent_event_json(mut event: serde_json::Value) -> serde_json::Value {
 
 fn observe_with_stream(event: Notification<'_>, trace: bool, json_stream: bool) {
     match event {
-        Notification::Retry(event) => output(serde_json::to_value(event).expect("retry event")),
+        Notification::Retry(event) if !json_stream => {
+            output(serde_json::to_value(event).expect("retry event"))
+        }
         Notification::SummaryRequest if trace => output(json!({"type":"summary_request_start"})),
         Notification::QueueUpdated {
             steering,

@@ -89,9 +89,19 @@ impl ServerConfig {
 
 #[derive(Clone, Default)]
 struct NativeClient {
+    server_name: Option<Arc<str>>,
     interaction: Arc<std::sync::Mutex<Option<Interaction>>>,
     catalog: Arc<CatalogSignal>,
     dispatch_closed: Arc<std::sync::Mutex<crate::mcp_oauth_client::DispatchState>>,
+}
+
+impl NativeClient {
+    fn for_server(name: &str) -> Self {
+        Self {
+            server_name: Some(Arc::from(name)),
+            ..Self::default()
+        }
+    }
 }
 
 struct AbandonedCall {
@@ -629,13 +639,25 @@ impl McpExtension {
             let initialize = async {
                 let service = match owned_stdio {
                     Some(owner) => {
-                        NativeClient::default()
-                            .serve_with_lifecycle(owned_stdio_transport(wrapped, owner)?, lifecycle)
+                        NativeClient::for_server(name)
+                            .serve_with_lifecycle(
+                                crate::mcp_log::LoggingTransport::new(
+                                    owned_stdio_transport(wrapped, owner)?,
+                                    Some(Arc::from(name)),
+                                ),
+                                lifecycle,
+                            )
                             .await
                     }
                     None => {
-                        NativeClient::default()
-                            .serve_with_lifecycle(TokioChildProcess::new(wrapped)?, lifecycle)
+                        NativeClient::for_server(name)
+                            .serve_with_lifecycle(
+                                crate::mcp_log::LoggingTransport::new(
+                                    TokioChildProcess::new(wrapped)?,
+                                    Some(Arc::from(name)),
+                                ),
+                                lifecycle,
+                            )
                             .await
                     }
                 };
@@ -724,7 +746,7 @@ impl McpExtension {
                         })?);
                     let native = NativeClient {
                         dispatch_closed: client.dispatch_state.clone(),
-                        ..Default::default()
+                        ..NativeClient::for_server(name)
                     };
                     start_http_service(native, client, transport_config, lifecycle).await
                 } else if let Some(resolver) = provider_token.clone() {
@@ -733,11 +755,21 @@ impl McpExtension {
                         endpoint: Arc::from(url.as_str()),
                         resolver,
                     };
-                    start_http_service(NativeClient::default(), client, transport_config, lifecycle)
-                        .await
+                    start_http_service(
+                        NativeClient::for_server(name),
+                        client,
+                        transport_config,
+                        lifecycle,
+                    )
+                    .await
                 } else {
-                    start_http_service(NativeClient::default(), client, transport_config, lifecycle)
-                        .await
+                    start_http_service(
+                        NativeClient::for_server(name),
+                        client,
+                        transport_config,
+                        lifecycle,
+                    )
+                    .await
                 }
                 .map_err(|error| {
                     let challenge = error.auth_challenge().filter(|challenge| {
@@ -1238,7 +1270,10 @@ async fn start_http_service<C: StreamableHttpClient + Clone>(
     lifecycle: ClientLifecycleMode,
 ) -> std::result::Result<RunningService<RoleClient, NativeClient>, ClientInitializeError> {
     for delay in [Some(250), Some(1000), None] {
-        let transport = StreamableHttpClientTransport::with_client(client.clone(), config.clone());
+        let transport = crate::mcp_log::LoggingTransport::new(
+            StreamableHttpClientTransport::with_client(client.clone(), config.clone()),
+            native.server_name.clone(),
+        );
         let result = native
             .clone()
             .serve_with_lifecycle(transport, lifecycle.clone())

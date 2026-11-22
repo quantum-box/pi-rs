@@ -1613,20 +1613,10 @@ impl Tool for RemoteEditTool {
 fn edit_success(display_path: &str, original: &str, output: &str, count: usize) -> Outcome {
     let original = crate::text_edit::normalized_content(original);
     let edited = crate::text_edit::normalized_content(output);
-    let diff = similar::TextDiff::from_lines(&original, &edited);
-    let first_changed_line = diff
-        .ops()
-        .iter()
-        .find(|op| !matches!(op, similar::DiffOp::Equal { .. }))
-        .map(|op| op.new_range().start + 1);
-    let digits = original
-        .split('\n')
-        .count()
-        .max(edited.split('\n').count())
-        .to_string()
-        .len();
-    let display = crate::text_edit::numbered_diff(&diff, digits);
-    let patch = crate::text_edit::unified_patch(display_path, &diff);
+    let diff = crate::text_edit::EditDiff::new(&original, &edited);
+    let first_changed_line = diff.first_changed_line();
+    let display = diff.numbered_diff();
+    let patch = diff.unified_patch(display_path);
     Outcome::SucceededWithDetails {
         output: format!("Successfully replaced {count} block(s) in {display_path}."),
         details: json!({"diff":bounded(display),"patch":bounded(patch),"firstChangedLine":first_changed_line}),
