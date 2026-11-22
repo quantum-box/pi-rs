@@ -216,6 +216,21 @@ pub enum ToolInventoryPhase {
     Dispatch,
 }
 
+/// Progress of an automatic threshold or overflow summary.
+pub enum AutoCompactionUpdate {
+    Started,
+    Completed {
+        compaction_entry: Box<Record>,
+        details: Option<serde_json::Value>,
+        estimated_tokens_after: u64,
+        will_retry: bool,
+    },
+    Failed {
+        aborted: bool,
+        error_message: Option<String>,
+    },
+}
+
 pub enum Notification<'a> {
     RunStarted {
         run_id: Uuid,
@@ -255,7 +270,7 @@ pub enum Notification<'a> {
     Reasoning(&'a str),
     /// Transient tool call fragments. Tool dispatch uses only the completed response.
     ToolCallDelta(&'a crate::ToolCallDelta),
-    /// A transient partial result from a running tool.
+    /// A transient tool update, or a start when the host enables tool attempts.
     ToolProgress(&'a crate::LifecycleEvent),
     /// A non-fatal failure in an observing extension hook.
     ExtensionLifecycleError {
@@ -271,12 +286,32 @@ pub type Observer<'a> = dyn for<'event> FnMut(Notification<'event>) + Send + 'a;
 /// Reasoning item events are transient and are not journal records.
 pub enum AgentEvent<'a> {
     Notification(Notification<'a>),
-    TextStart { index: u64 },
-    TextDelta { index: u64, delta: &'a str },
-    TextEnd { index: u64, content: &'a str },
-    ReasoningStart { index: u64 },
-    ReasoningDelta { index: u64, delta: &'a str },
-    ReasoningEnd { index: u64, content: &'a str },
+    AutoCompaction {
+        reason: crate::CompactionTrigger,
+        update: &'a AutoCompactionUpdate,
+    },
+    TextStart {
+        index: u64,
+    },
+    TextDelta {
+        index: u64,
+        delta: &'a str,
+    },
+    TextEnd {
+        index: u64,
+        content: &'a str,
+    },
+    ReasoningStart {
+        index: u64,
+    },
+    ReasoningDelta {
+        index: u64,
+        delta: &'a str,
+    },
+    ReasoningEnd {
+        index: u64,
+        content: &'a str,
+    },
 }
 
 pub type AgentObserver<'a> = dyn for<'event> FnMut(AgentEvent<'event>) + Send + 'a;
@@ -284,6 +319,16 @@ pub type AgentObserver<'a> = dyn for<'event> FnMut(AgentEvent<'event>) + Send + 
 // The metadata is scoped to the synchronous call, never across an await. The
 // internal adapter preserves all non-reasoning notifications and their order.
 fn dispatch_agent_event(event: Notification<'_>, observer: &mut AgentObserver<'_>) {
+    if matches!(event, Notification::SummaryRequest)
+        && let Some((reason, update)) =
+            AUTO_COMPACTION_EVENT.with(|stack| stack.borrow().last().cloned())
+    {
+        observer(AgentEvent::AutoCompaction {
+            reason,
+            update: &update,
+        });
+        return;
+    }
     if let Notification::Text(delta) = &event {
         match text_event_metadata() {
             Some(TextEventMetadata::Start { index }) => {
@@ -328,6 +373,11 @@ fn dispatch_agent_event(event: Notification<'_>, observer: &mut AgentObserver<'_
 }
 
 fn dispatch_legacy_event(event: Notification<'_>, observer: &mut Observer<'_>) {
+    if matches!(event, Notification::SummaryRequest)
+        && AUTO_COMPACTION_EVENT.with(|stack| !stack.borrow().is_empty())
+    {
+        return;
+    }
     if matches!(&event, Notification::Text(_))
         && matches!(
             text_event_metadata(),
@@ -1829,19 +1879,9 @@ impl Agent<'_> {
                             return Err(Error::Budget);
                         }
                         active
-                            .commit_compaction_with_host(
-                                session,
-                                Compaction {
-                                    summary,
-                                    keep_turns: retention.keep_turns,
-                                },
-                                &states,
-                                billing,
-                                Some(retention),
-                                None,
-                                cancel,
-                                observer,
-                                Some(followups),
+                            .commit_recovered_overflow(
+                                session, summary, retention, &states, billing, cancel, observer,
+                                followups, true,
                             )
                             .await?;
                         budget -= spent;
@@ -1870,9 +1910,7 @@ impl Agent<'_> {
                     active.compaction_tokens(session).keep_recent_tokens,
                     1,
                 )?;
-                let model_summary_available =
-                    budget > 1 && next_request_index < active.limits.model_requests;
-                let summary_limit = if model_summary_available {
+                let summary_limit = if next_request_index < active.limits.model_requests {
                     active
                         .limits
                         .output_tokens_per_request
@@ -2146,8 +2184,10 @@ impl Agent<'_> {
                     .extensions
                     .iter()
                     .any(|extension| extension.handles_before_summary_compaction());
-                let model_summary_available =
-                    budget > 1 && request_index + 1 < active.limits.model_requests;
+                let summary_budget = max_output_tokens.min(512).min(budget / 2);
+                let model_summary_available = summary_budget
+                    >= active.model.minimum_output_tokens()
+                    && request_index + 1 < active.limits.model_requests;
                 if exceeds
                     || (control.enabled()
                         && !compacted
@@ -2166,7 +2206,7 @@ impl Agent<'_> {
                         ));
                     }
                     let summary_limit = if model_summary_available {
-                        max_output_tokens.min(512).min(budget / 2)
+                        summary_budget
                     } else {
                         0
                     };
@@ -2522,19 +2562,9 @@ impl Agent<'_> {
                     )
             {
                 self.settle_usage(request_id, &usage, &metadata).await?;
-                self.commit_compaction_with_host(
-                    session,
-                    Compaction {
-                        summary,
-                        keep_turns: retention.keep_turns,
-                    },
-                    states,
-                    billing,
-                    Some(retention),
-                    None,
-                    cancel,
-                    observer,
-                    Some(followups),
+                self.commit_recovered_overflow(
+                    session, summary, retention, states, billing, cancel, observer, followups,
+                    false,
                 )
                 .await?;
                 return Ok(());
@@ -2757,6 +2787,60 @@ impl Agent<'_> {
             .await?;
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_recovered_overflow<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        summary: String,
+        retention: RetentionPlan,
+        states: &ExtensionStates,
+        billing: Option<(Usage, Option<Box<crate::SummaryUsageMetadata>>)>,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        followups: &mut mpsc::Receiver<T>,
+        will_retry: bool,
+    ) -> Result<()> {
+        let reason = crate::CompactionTrigger::Overflow;
+        notify_auto_compaction(reason, AutoCompactionUpdate::Started, observer);
+        let result = self
+            .commit_compaction_with_host(
+                session,
+                Compaction {
+                    summary,
+                    keep_turns: retention.keep_turns,
+                },
+                states,
+                billing,
+                Some(retention),
+                None,
+                cancel,
+                observer,
+                Some(followups),
+            )
+            .await;
+        let event = match &result {
+            Ok(from_extension) => crate::LifecycleEvent::SessionCompact {
+                compaction_entry: Box::new(
+                    session
+                        .records()
+                        .last()
+                        .expect("compaction was committed")
+                        .clone(),
+                ),
+                from_extension: *from_extension,
+                reason: reason.legacy_reason(),
+                will_retry,
+            },
+            Err(error) => compaction_failed_event(reason, error, cancel),
+        };
+        notify_auto_compaction(
+            reason,
+            auto_compaction_update(session, event, will_retry),
+            observer,
+        );
+        result.map(|_| ())
     }
 
     fn migrate(
@@ -3911,10 +3995,15 @@ impl Agent<'_> {
                                 .map_err(|_| Error::PendingOperation(invocation.operation_id))?;
                             if !validated.effective_tools().iter().any(|entry| {
                                 entry.spec.name == invocation.call.name
-                                    && matches!(
-                                        entry.sampling,
-                                        crate::EffectiveToolSampling::Unconstrained
-                                    )
+                                    && match entry.sampling {
+                                        crate::EffectiveToolSampling::Unconstrained => true,
+                                        crate::EffectiveToolSampling::OpenAiGrammar { .. } => {
+                                            validated.normalized_arguments(&invocation.call).is_ok()
+                                        }
+                                        crate::EffectiveToolSampling::StrictJsonSchema {
+                                            ..
+                                        } => false,
+                                    }
                             }) {
                                 return Err(Error::PendingOperation(invocation.operation_id));
                             }
@@ -4010,6 +4099,7 @@ impl Agent<'_> {
                 observer,
                 replies,
                 false,
+                None,
             )?;
         }
         Ok(())
@@ -4047,6 +4137,7 @@ impl Agent<'_> {
         observer: &mut Observer<'_>,
         replies: Option<&HashMap<Uuid, ReplySnapshot>>,
         allow_event_metadata: bool,
+        duration_ms: Option<u64>,
     ) -> Result<()> {
         let ToolReply {
             outcome,
@@ -4154,6 +4245,7 @@ impl Agent<'_> {
                 },
                 observer,
                 replies,
+                duration_ms,
             )
         })?;
         if let Some(error) = waiting {
@@ -5209,16 +5301,9 @@ impl Agent<'_> {
         let reason = scope.reason;
         let will_retry = scope.will_retry;
         let cancellation = scope.cancellation;
-        let supplied_without_model = std::sync::atomic::AtomicBool::new(false);
+        let mut progress = SummaryProgress::default();
         let result = self
-            .summarize_prefix_inner(
-                session,
-                states,
-                scope,
-                observer,
-                inputs,
-                &supplied_without_model,
-            )
+            .summarize_prefix_inner(session, states, scope, observer, inputs, &mut progress)
             .await;
         if matches!(result, Ok(None)) {
             return Ok(None);
@@ -5244,11 +5329,12 @@ impl Agent<'_> {
                     ..
                 } = &mut event
                 {
-                    *value = supplied_without_model.load(std::sync::atomic::Ordering::Relaxed);
+                    *value = progress.supplied_without_model;
                 }
                 event
             }
         };
+        let reported_event = progress.reported.then(|| event.clone());
         let idle = session.current_run_id().is_none();
         let metadata = match &event {
             crate::LifecycleEvent::SessionCompact {
@@ -5266,6 +5352,15 @@ impl Agent<'_> {
             Some((reason, metadata)),
         )
         .await;
+        if let Some(mut event) = reported_event {
+            if result.is_ok()
+                && let Err(error) = &notification
+            {
+                event = compaction_failed_event(reason, error, cancellation);
+            }
+            let update = auto_compaction_update(session, event, will_retry);
+            notify_auto_compaction(reason, update, observer);
+        }
         if let Err(notification_error) = notification {
             if result.is_ok() {
                 return Err(notification_error);
@@ -5277,14 +5372,7 @@ impl Agent<'_> {
                 message: &message,
             });
         }
-        result.map(|value| {
-            value.map(|(spent, _)| {
-                (
-                    spent,
-                    supplied_without_model.load(std::sync::atomic::Ordering::Relaxed),
-                )
-            })
-        })
+        result.map(|value| value.map(|(spent, _)| (spent, progress.supplied_without_model)))
     }
 
     async fn summarize_prefix_inner<T: Into<AgentInput> + Send>(
@@ -5294,7 +5382,7 @@ impl Agent<'_> {
         scope: SummaryScope<'_>,
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
-        supplied_without_model: &std::sync::atomic::AtomicBool,
+        progress: &mut SummaryProgress,
     ) -> Result<Option<(u32, bool)>> {
         let SummaryScope {
             retention,
@@ -5310,7 +5398,10 @@ impl Agent<'_> {
             .extensions
             .iter()
             .any(|extension| extension.handles_before_summary_compaction());
-        if !has_pre_summary_hook && (limit == 0 || self.limits.model_requests == 0) {
+        let minimum_output_tokens = self.model.minimum_output_tokens().max(1);
+        let model_summary_available =
+            limit >= minimum_output_tokens && self.limits.model_requests > 0;
+        if !has_pre_summary_hook && !model_summary_available {
             return Err(Error::Budget);
         }
         let before = retention.boundary;
@@ -5318,6 +5409,9 @@ impl Agent<'_> {
             return Err(Error::Config(
                 "Nothing to compact (session too small)".into(),
             ));
+        }
+        if !skip_without_model {
+            progress.start(reason, observer);
         }
         let preparation = crate::CompactionPreparation {
             branch_entries: if has_pre_summary_hook {
@@ -5368,7 +5462,8 @@ impl Agent<'_> {
             }
         }
         if let Some(result) = supplied {
-            supplied_without_model.store(true, std::sync::atomic::Ordering::Relaxed);
+            progress.start(reason, observer);
+            progress.supplied_without_model = true;
             let boundary = result.first_kept_entry.ok_or_else(|| {
                 Error::Config("extension compaction requires a retained branch entry".into())
             })?;
@@ -5409,7 +5504,7 @@ impl Agent<'_> {
             .await?;
             return Ok(Some((0, true)));
         }
-        if limit == 0 || self.limits.model_requests == 0 {
+        if !model_summary_available {
             if skip_without_model {
                 return Ok(None);
             }
@@ -5428,7 +5523,7 @@ impl Agent<'_> {
             )
             .await?;
         request.max_output_tokens = request.max_output_tokens.min(limit);
-        if request.max_output_tokens == 0 {
+        if request.max_output_tokens < minimum_output_tokens {
             return Err(Error::Budget);
         }
         request.tools.clear();
@@ -6385,6 +6480,21 @@ struct SummaryScope<'a> {
     skip_without_model: bool,
 }
 
+#[derive(Default)]
+struct SummaryProgress {
+    reported: bool,
+    supplied_without_model: bool,
+}
+
+impl SummaryProgress {
+    fn start(&mut self, reason: crate::CompactionTrigger, observer: &mut Observer<'_>) {
+        if !self.reported && !matches!(reason, crate::CompactionTrigger::Manual) {
+            self.reported = true;
+            notify_auto_compaction(reason, AutoCompactionUpdate::Started, observer);
+        }
+    }
+}
+
 fn abandon_turn_request_for_summary(
     session: &mut Session,
     observer: &mut Observer<'_>,
@@ -6395,6 +6505,38 @@ fn abandon_turn_request_for_summary(
         commit(session, Event::RequestCallbackAbandoned { id }, observer)?;
     }
     Ok(())
+}
+
+fn auto_compaction_update(
+    session: &Session,
+    event: crate::LifecycleEvent,
+    will_retry: bool,
+) -> AutoCompactionUpdate {
+    match event {
+        crate::LifecycleEvent::SessionCompact {
+            compaction_entry, ..
+        } => {
+            let details = session
+                .record_metadata(compaction_entry.id)
+                .and_then(|metadata| metadata.get("details"))
+                .cloned();
+            AutoCompactionUpdate::Completed {
+                compaction_entry,
+                details,
+                estimated_tokens_after: session.estimated_context_tokens(),
+                will_retry,
+            }
+        }
+        crate::LifecycleEvent::SessionCompactFailed {
+            aborted,
+            error_message,
+            ..
+        } => AutoCompactionUpdate::Failed {
+            aborted,
+            error_message,
+        },
+        _ => unreachable!("summary result must have a compaction lifecycle event"),
+    }
 }
 
 fn compaction_failed_event(
@@ -7047,12 +7189,52 @@ fn branch_excerpt(entry: Message) -> String {
     }
 }
 
+// The existing summary notification carries the enriched update only through
+// the synchronous adapter. Legacy observers still receive one SummaryRequest
+// at provider dispatch, with no additional notification variants.
+fn notify_auto_compaction(
+    reason: crate::CompactionTrigger,
+    update: AutoCompactionUpdate,
+    observer: &mut Observer<'_>,
+) {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            AUTO_COMPACTION_EVENT.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    AUTO_COMPACTION_EVENT.with(|stack| stack.borrow_mut().push((reason, Arc::new(update))));
+    let _guard = Pop;
+    observer(Notification::SummaryRequest);
+}
+
 thread_local! {
+    static TOOL_ATTEMPT_OPERATION_ID: std::cell::Cell<Option<Uuid>> = const { std::cell::Cell::new(None) };
+    static AUTO_COMPACTION_EVENT: std::cell::RefCell<Vec<(crate::CompactionTrigger, Arc<AutoCompactionUpdate>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static TOOL_EVENT_METADATA: std::cell::RefCell<Vec<(Uuid, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static RECORD_EVENT_METADATA: std::cell::RefCell<Vec<(u64, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static TEXT_EVENT_METADATA: std::cell::RefCell<Vec<TextEventMetadata>> = const { std::cell::RefCell::new(Vec::new()) };
     static REASONING_EVENT_METADATA: std::cell::RefCell<Vec<ReasoningEventMetadata>> = const { std::cell::RefCell::new(Vec::new()) };
     static REDACTED_REASONING_START: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Operation identity for the tool attempt being delivered to this observer.
+#[doc(hidden)]
+pub fn tool_attempt_operation_id() -> Option<Uuid> {
+    TOOL_ATTEMPT_OPERATION_ID.get()
+}
+
+fn with_tool_attempt<T>(id: Uuid, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Uuid>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TOOL_ATTEMPT_OPERATION_ID.set(self.0);
+        }
+    }
+    let _restore = Restore(TOOL_ATTEMPT_OPERATION_ID.replace(Some(id)));
+    f()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7230,6 +7412,23 @@ mod metadata_scope_tests {
     }
 
     #[test]
+    fn legacy_observers_only_receive_the_dispatch_summary_request() {
+        let mut summary_requests = 0;
+        let mut observer = |event: Notification<'_>| {
+            if matches!(event, Notification::SummaryRequest) {
+                summary_requests += 1;
+            }
+        };
+        notify_auto_compaction(
+            crate::CompactionTrigger::Threshold,
+            AutoCompactionUpdate::Started,
+            &mut |event| dispatch_legacy_event(event, &mut observer),
+        );
+        dispatch_legacy_event(Notification::SummaryRequest, &mut observer);
+        assert_eq!(summary_requests, 1);
+    }
+
+    #[test]
     fn reasoning_metadata_is_nested_and_observer_scoped() {
         assert_eq!(reasoning_event_metadata(), None);
         with_reasoning_event_metadata(ReasoningEventMetadata::Delta { index: 2 }, || {
@@ -7351,27 +7550,36 @@ fn commit_with_reply(
     event: Event,
     observer: &mut Observer<'_>,
     replies: Option<&HashMap<Uuid, ReplySnapshot>>,
+    duration_ms: Option<u64>,
 ) -> Result<()> {
-    let snapshot = match &event {
-        Event::ToolFinished { operation_id, .. } => {
-            replies.and_then(|replies| replies.get(operation_id))
-        }
+    let reply = match &event {
+        Event::ToolFinished {
+            operation_id,
+            outcome,
+            ..
+        } => replies
+            .and_then(|replies| replies.get(operation_id))
+            .map(|snapshot| {
+                (
+                    snapshot.lock().expect("nested reply snapshot"),
+                    outcome.clone(),
+                )
+            }),
         _ => None,
     };
-    if let Some(snapshot) = snapshot {
-        let mut snapshot = snapshot.lock().expect("nested reply snapshot");
-        let outcome = match &event {
-            Event::ToolFinished { outcome, .. } => outcome.clone(),
-            _ => unreachable!(),
-        };
-        let record = session.append(event)?;
-        *snapshot = Some(outcome);
-        drop(snapshot);
-        observer(Notification::Committed(record));
-        Ok(())
+    let metadata = duration_ms.map(|duration| serde_json::json!({"durationMs":duration}));
+    let record = if metadata.is_some() {
+        session.append_with_advisory_metadata(event, metadata.clone())?
     } else {
-        commit(session, event, observer)
+        session.append(event)?
+    };
+    if let Some((mut snapshot, outcome)) = reply {
+        *snapshot = Some(outcome);
     }
+    with_record_event_metadata(record.id, metadata, || {
+        observer(Notification::Committed(record));
+    });
+    Ok(())
 }
 
 async fn receive_input<T>(inputs: &mut Option<&mut mpsc::Receiver<T>>) -> Option<T> {
@@ -7486,6 +7694,18 @@ fn queue_input(
             }
             let count = session.records().len();
             let result = session.set_name(&name);
+            for record in &session.records()[count..] {
+                observer(Notification::Committed(record));
+            }
+            return reply_to_control(result, reply);
+        }
+        AgentInput::SetSessionLabel {
+            target,
+            label,
+            reply,
+        } => {
+            let count = session.records().len();
+            let result = session.set_label(target, label);
             for record in &session.records()[count..] {
                 observer(Notification::Committed(record));
             }
@@ -9084,6 +9304,77 @@ mod tree_tests {
         );
     }
 
+    #[tokio::test]
+    async fn automatic_compaction_skips_summary_below_the_adapter_output_minimum() {
+        struct MinimumBudgetModel;
+        #[async_trait::async_trait]
+        impl Model for MinimumBudgetModel {
+            fn minimum_output_tokens(&self) -> u32 {
+                16
+            }
+
+            async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+                assert_eq!(request.max_output_tokens, 16);
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text("answer".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+        let agent = Agent {
+            model: &MinimumBudgetModel,
+            model_name: "fixture",
+            registry: &Registry::default(),
+            system_prompt: "",
+            limits: Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                output_tokens_per_run: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(1000),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        let result = agent
+            .run(
+                &mut session,
+                Some("new".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, "answer");
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
+    }
+
     struct OverflowSummaryHook {
         provide: bool,
         seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
@@ -9121,10 +9412,16 @@ mod tree_tests {
     struct OverflowModel {
         calls: std::sync::atomic::AtomicUsize,
         always_fail: bool,
+        minimum_output_tokens: u32,
     }
     #[async_trait::async_trait]
     impl Model for OverflowModel {
+        fn minimum_output_tokens(&self) -> u32 {
+            self.minimum_output_tokens
+        }
+
         async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+            assert!(request.max_output_tokens >= self.minimum_output_tokens);
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 || self.always_fail {
                 return Err(Error::Model(
@@ -9145,7 +9442,14 @@ mod tree_tests {
     }
     #[tokio::test]
     async fn explicit_overflow_compacts_and_retries_once_without_exposing_failure() {
-        for (provide, always_fail) in [(true, false), (false, false), (true, true)] {
+        let default_budget = Limits::default().output_tokens_per_run;
+        for (provide, always_fail, minimum_output_tokens, run_budget) in [
+            (true, false, 1, default_budget),
+            (false, false, 1, default_budget),
+            (true, true, 1, default_budget),
+            (true, false, 16, 16),
+            (false, false, 16, 16),
+        ] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let mut registry = Registry::default();
             registry
@@ -9157,6 +9461,7 @@ mod tree_tests {
             let model = OverflowModel {
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 always_fail,
+                minimum_output_tokens,
             };
             let agent = Agent {
                 model: &model,
@@ -9167,6 +9472,7 @@ mod tree_tests {
                     model_requests: if provide { 2 } else { 3 },
                     context_window: Some(1000),
                     output_tokens_per_request: 16,
+                    output_tokens_per_run: run_budget,
                     compaction_tokens: Some(crate::CompactionTokens {
                         reserve_tokens: Some(0),
                         keep_recent_tokens: None,
@@ -9199,6 +9505,12 @@ mod tree_tests {
                     &mut |_| {},
                 )
                 .await;
+            if !provide && run_budget == 16 {
+                assert!(matches!(result, Err(Error::Budget)));
+                assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(seen.lock().unwrap().len(), 1);
+                continue;
+            }
             if always_fail {
                 assert!(result.is_err());
             } else {
@@ -9237,6 +9549,7 @@ mod tree_tests {
         let model = OverflowModel {
             calls: std::sync::atomic::AtomicUsize::new(0),
             always_fail: true,
+            minimum_output_tokens: 1,
         };
         let agent = Agent {
             model: &model,
@@ -10594,17 +10907,29 @@ mod tree_tests {
                 .iter()
                 .any(|record| matches!(record.event, Event::Compacted { .. }))
         );
+        let mut compaction_events = Vec::new();
         let answer = agent
-            .run_correlated(
+            .run_correlated_with_events(
                 &mut session,
                 run_id,
                 None,
                 &mut inputs,
                 &CancellationToken::new(),
-                &mut |_| {},
+                &mut |event| match event {
+                    AgentEvent::AutoCompaction {
+                        reason: crate::CompactionTrigger::Overflow,
+                        update: AutoCompactionUpdate::Started,
+                    } => compaction_events.push(None),
+                    AgentEvent::AutoCompaction {
+                        reason: crate::CompactionTrigger::Overflow,
+                        update: AutoCompactionUpdate::Completed { will_retry, .. },
+                    } => compaction_events.push(Some(*will_retry)),
+                    _ => {}
+                },
             )
             .await
             .unwrap();
+        assert_eq!(compaction_events, [None, Some(true)]);
         assert_eq!(answer, "answer");
         assert_eq!(*model.allowances.lock().unwrap(), vec![10]);
         let settlements = model.settlements.lock().unwrap();
@@ -10846,17 +11171,29 @@ mod tree_tests {
                 .iter()
                 .any(|record| matches!(record.event, Event::Compacted { .. }))
         );
+        let mut compaction_events = Vec::new();
         let answer = agent
-            .run_correlated(
+            .run_correlated_with_events(
                 &mut session,
                 run_id,
                 None,
                 &mut inputs,
                 &CancellationToken::new(),
-                &mut |_| {},
+                &mut |event| match event {
+                    AgentEvent::AutoCompaction {
+                        reason: crate::CompactionTrigger::Overflow,
+                        update: AutoCompactionUpdate::Started,
+                    } => compaction_events.push(None),
+                    AgentEvent::AutoCompaction {
+                        reason: crate::CompactionTrigger::Overflow,
+                        update: AutoCompactionUpdate::Completed { will_retry, .. },
+                    } => compaction_events.push(Some(*will_retry)),
+                    _ => {}
+                },
             )
             .await
             .unwrap();
+        assert_eq!(compaction_events, [None, Some(false)]);
         assert_eq!(answer, "answer");
         let settlements = model.settlements.lock().unwrap();
         assert_eq!(settlements.len(), 2);
@@ -10902,6 +11239,32 @@ mod tree_tests {
         }
     }
 
+    struct CompactionCompletionHook(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl crate::Extension for CompactionCompletionHook {
+        fn id(&self) -> &str {
+            "compaction-completion-hook"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionCompact { .. }) {
+                tokio::task::yield_now().await;
+                self.0.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn legacy_summary_edits_still_count_model_requests_for_automatic_compaction() {
         for reason in [
@@ -10912,6 +11275,10 @@ mod tree_tests {
             let mut registry = Registry::default();
             registry
                 .register(Arc::new(LegacyCompaction(events)))
+                .unwrap();
+            let hook_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            registry
+                .register(Arc::new(CompactionCompletionHook(hook_finished.clone())))
                 .unwrap();
             let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
             let agent = Agent {
@@ -10943,6 +11310,39 @@ mod tree_tests {
                 })
                 .unwrap();
             let retention = RetentionPlan::turns(&session, 1);
+            let mut updates = Vec::new();
+            let mut observe = |event: AgentEvent<'_>| match event {
+                AgentEvent::AutoCompaction {
+                    reason: observed,
+                    update,
+                } => {
+                    assert_eq!(
+                        serde_json::to_value(observed).unwrap(),
+                        serde_json::to_value(reason).unwrap()
+                    );
+                    match update {
+                        AutoCompactionUpdate::Started => updates.push("start"),
+                        AutoCompactionUpdate::Completed {
+                            compaction_entry,
+                            will_retry,
+                            ..
+                        } => {
+                            assert!(
+                                matches!(&compaction_entry.event, Event::Compacted { summary, .. } if summary == "answer [legacy]")
+                            );
+                            assert_eq!(
+                                *will_retry,
+                                matches!(reason, crate::CompactionTrigger::Overflow)
+                            );
+                            assert!(hook_finished.load(Ordering::SeqCst));
+                            updates.push("end");
+                        }
+                        _ => panic!("automatic compaction failed"),
+                    }
+                }
+                AgentEvent::Notification(Notification::SummaryRequest) => updates.push("request"),
+                _ => {}
+            };
             let result = agent
                 .summarize_prefix::<AgentInput>(
                     &mut session,
@@ -10956,12 +11356,13 @@ mod tree_tests {
                         will_retry: matches!(reason, crate::CompactionTrigger::Overflow),
                         skip_without_model: false,
                     },
-                    &mut |_| {},
+                    &mut |event| dispatch_agent_event(event, &mut observe),
                     None,
                 )
                 .await
                 .unwrap()
                 .unwrap();
+            assert_eq!(updates, ["start", "request", "end"]);
             assert!(!result.1, "a legacy edit must not refund the model request");
             assert_eq!(model.0.load(Ordering::SeqCst), 1);
             let record = session.records().iter().find(|r| matches!(&r.event, Event::Compacted { summary, .. } if summary == "answer [legacy]")).unwrap();
@@ -10983,6 +11384,7 @@ mod tree_tests {
         let model = OverflowModel {
             calls: std::sync::atomic::AtomicUsize::new(0),
             always_fail: false,
+            minimum_output_tokens: 1,
         };
         let agent = Agent {
             model: &model,

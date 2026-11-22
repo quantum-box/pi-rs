@@ -1,21 +1,61 @@
 //! OpenAI Responses transport for ChatGPT plan OAuth credentials.
 //!
 //! Credential acquisition and renewal are the responsibility of the caller.
+mod codex_ws;
+mod grammar;
 pub mod oauth;
 
+use base64::Engine;
 use eventsource_stream::{EventStreamError, Eventsource};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream::BoxStream};
 use pi_rs_core::{
-    CacheRetention, Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
-    ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
+    CacheRetention, Error, Message, Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest,
+    ModelStream, ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
 };
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
+pub const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const MAX_STREAM: usize = 32 * 1024 * 1024;
 const NAMESPACE: &str = "pi";
+
+type ResponseEvents = BoxStream<'static, Result<Value>>;
+
+/// Transport policy for native ChatGPT Codex inference.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CodexTransport {
+    #[default]
+    Auto,
+    Sse,
+    WebSocket,
+    WebSocketCached,
+}
+
+impl CodexTransport {
+    pub fn named(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "sse" => Some(Self::Sse),
+            "websocket" => Some(Self::WebSocket),
+            "websocket-cached" => Some(Self::WebSocketCached),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Sse => "sse",
+            Self::WebSocket => "websocket",
+            Self::WebSocketCached => "websocket-cached",
+        }
+    }
+}
 
 #[derive(Debug)]
 enum RawStreamError {
@@ -69,7 +109,16 @@ pub struct OpenAiResponses {
     endpoint: Url,
     endpoint_source: String,
     token: String,
+    azure_api_version: Option<String>,
+    azure_off_reasoning: Option<String>,
+    deployments: Arc<BTreeMap<String, String>>,
+    codex_account: Option<String>,
+    codex_transport: CodexTransport,
+    idle_timeout: Option<std::time::Duration>,
+    codex_off_effort: Option<String>,
     thinking: Option<String>,
+    configuration_update_models: BTreeSet<String>,
+    configuration_update_thinking: bool,
     provider: String,
     headers: reqwest::header::HeaderMap,
     sampling: BTreeMap<String, Value>,
@@ -80,6 +129,8 @@ pub struct OpenAiResponses {
     session_affinity_format: Option<SessionAffinityFormat>,
     prompt_cache_key_enabled: bool,
     strict_tool_support: bool,
+    send_max_output_tokens: bool,
+    grammar_tool_support: bool,
     use_developer_role: bool,
 }
 
@@ -88,8 +139,14 @@ pub struct PreparedResponsesRequest {
     client: OpenAiResponses,
     request: ModelRequest,
     reservation_request: ModelRequest,
-    wire_tools: Vec<Value>,
+    wire_tools: ResponsesTools,
     effective_tools: Vec<pi_rs_core::EffectiveToolDeclaration>,
+}
+
+#[derive(Default)]
+struct ResponsesTools {
+    declarations: Vec<Value>,
+    grammar_inputs: BTreeMap<String, String>,
 }
 
 impl PreparedResponsesRequest {
@@ -193,10 +250,17 @@ impl OpenAiResponses {
             declarations,
             self.strict_tool_support,
             self.has_implicit_strict_tools(),
+            self.supports_grammar_tools(),
         )?;
         let mut reservation_request = request.clone();
-        for (spec, wire) in reservation_request.tools.iter_mut().zip(&wire_tools) {
-            spec.parameters = wire["parameters"].clone();
+        for (spec, wire) in reservation_request
+            .tools
+            .iter_mut()
+            .zip(&wire_tools.declarations)
+        {
+            if let Some(parameters) = wire.get("parameters").or_else(|| wire.get("format")) {
+                spec.parameters = parameters.clone();
+            }
         }
         Ok(PreparedResponsesRequest {
             client: self.clone(),
@@ -207,8 +271,9 @@ impl OpenAiResponses {
         })
     }
     fn has_implicit_strict_tools(&self) -> bool {
-        // OpenAI Responses may enable strict sampling when the field is omitted.
-        self.provider == "openai-chatgpt" || self.endpoint.host_str() == Some("api.openai.com")
+        // OpenAI and Copilot Responses may enable strict sampling when the field is omitted.
+        matches!(self.provider.as_str(), "openai-chatgpt" | "github-copilot")
+            || self.endpoint.host_str() == Some("api.openai.com")
     }
 
     pub fn with_http_options(
@@ -225,6 +290,7 @@ impl OpenAiResponses {
         for proxy in proxies {
             builder = builder.proxy(proxy.clone());
         }
+        self.idle_timeout = timeout;
         self.identity_safe_transport = proxies.is_empty();
         self.client = builder
             .build()
@@ -248,6 +314,47 @@ impl OpenAiResponses {
         let mut client = Self::create(endpoint, token, false)?;
         client.provider = provider.to_owned();
         Ok(client)
+    }
+
+    /// Connect to an Azure Responses endpoint using its API-key authentication.
+    pub fn new_azure(endpoint: &str, token: String, provider: &str) -> Result<Self> {
+        let mut client = Self::new_api_provider(endpoint, token, provider)?;
+        client.azure_api_version = Some("v1".into());
+        client.session_affinity_format = Some(SessionAffinityFormat::Disabled);
+        Ok(client)
+    }
+
+    pub fn is_azure(&self) -> bool {
+        self.azure_api_version.is_some()
+    }
+
+    pub fn new_codex(endpoint: &str, token: String, provider: &str) -> Result<Self> {
+        let account = codex_account_id(&token).ok_or_else(|| {
+            Error::Config("OpenAI Codex requires a bearer token with an account ID".into())
+        })?;
+        let mut client = Self::new_api_provider(endpoint, token, provider)?;
+        client.codex_account = Some(account);
+        client.codex_off_effort = Some("none".into());
+        client.strict_tool_support = true;
+        Ok(client)
+    }
+
+    pub fn with_codex_transport(mut self, transport: CodexTransport) -> Self {
+        self.codex_transport = transport;
+        self
+    }
+
+    pub fn with_codex_off_effort(mut self, effort: Option<&str>) -> Self {
+        self.codex_off_effort = effort.map(str::to_owned);
+        self
+    }
+
+    fn api(&self) -> pi_rs_core::ModelApi {
+        if self.codex_account.is_some() {
+            pi_rs_core::ModelApi::OpenaiCodexResponses
+        } else {
+            pi_rs_core::ModelApi::OpenaiResponses
+        }
     }
 
     fn create(endpoint: &str, token: String, plan: bool) -> Result<Self> {
@@ -283,7 +390,16 @@ impl OpenAiResponses {
             endpoint,
             endpoint_source,
             token,
+            azure_api_version: None,
+            azure_off_reasoning: None,
+            deployments: Arc::default(),
+            codex_account: None,
+            codex_transport: CodexTransport::default(),
+            idle_timeout: None,
+            codex_off_effort: None,
             thinking: None,
+            configuration_update_models: BTreeSet::new(),
+            configuration_update_thinking: false,
             identity_safe_transport: true,
             provider: if plan { "openai-chatgpt" } else { "openai" }.into(),
             headers: reqwest::header::HeaderMap::new(),
@@ -294,13 +410,70 @@ impl OpenAiResponses {
             session_affinity_format: None,
             prompt_cache_key_enabled: true,
             strict_tool_support: false,
+            send_max_output_tokens: true,
+            grammar_tool_support: false,
             use_developer_role: false,
         })
     }
 
-    pub fn with_thinking(mut self, level: Option<&str>) -> Self {
-        self.thinking = level.map(|level| if level == "off" { "none" } else { level }.to_owned());
+    /// Set the API version and model-to-deployment map for Azure Responses.
+    pub fn with_azure_routes(
+        mut self,
+        version: &str,
+        deployments: &BTreeMap<String, String>,
+        off_reasoning: Option<&str>,
+    ) -> Self {
+        if self.azure_api_version.is_some() {
+            self.azure_api_version = Some(version.to_owned());
+            self.deployments = Arc::new(deployments.clone());
+            self.azure_off_reasoning = off_reasoning.map(str::to_owned);
+        }
         self
+    }
+
+    fn replay_provider(&self, model: &str) -> String {
+        if self.azure_api_version.is_some() {
+            let deployment = self.deployments.get(model).map_or(model, String::as_str);
+            pi_rs_core::endpoint_replay_scope(
+                &self.provider,
+                &format!("{}\n{deployment}", self.endpoint),
+            )
+        } else {
+            self.provider.clone()
+        }
+    }
+
+    pub fn with_thinking(self, level: Option<&str>) -> Self {
+        self.with_mapped_thinking(level, level)
+    }
+
+    /// Keep the selected thinking level distinct from its provider-specific effort.
+    pub fn with_mapped_thinking(mut self, level: Option<&str>, effort: Option<&str>) -> Self {
+        self.thinking =
+            effort.map(|effort| if effort == "off" { "none" } else { effort }.to_owned());
+        self.configuration_update_thinking =
+            level.is_some_and(|level| !matches!(level, "off" | "none"));
+        self
+    }
+
+    /// Let these models carry reasoning effort in Responses configuration updates.
+    pub fn with_configuration_update_models(mut self, models: BTreeSet<String>) -> Self {
+        self.configuration_update_models = models;
+        self
+    }
+
+    fn configuration_update_effort(&self, model: &str) -> Option<&str> {
+        if !self.configuration_update_thinking
+            || !self.configuration_update_models.contains(model)
+            || self.codex_account.is_some()
+            || self.provider == "openai-chatgpt"
+            || (self.provider == "openai"
+                && self.endpoint.as_str() == DEFAULT_ENDPOINT
+                && !self.token.starts_with("sk-"))
+        {
+            return None;
+        }
+        self.thinking.as_deref().filter(|effort| !effort.is_empty())
     }
 
     /// Set endpoint-wide strict JSON Schema tool support for this client.
@@ -310,10 +483,26 @@ impl OpenAiResponses {
         self
     }
 
+    /// Set grammar tool support for the selected Responses model.
+    pub fn with_grammar_tool_support(mut self, supported: bool) -> Self {
+        self.grammar_tool_support = supported;
+        self
+    }
+
+    fn supports_grammar_tools(&self) -> bool {
+        self.grammar_tool_support && self.provider != "openai-chatgpt"
+    }
+
     /// Configure Responses prompt cache retention for the selected model.
     pub fn with_cache_retention(mut self, retention: CacheRetention, explicit_mode: bool) -> Self {
         self.cache_retention = retention;
         self.explicit_cache_mode = explicit_mode;
+        self
+    }
+
+    /// Omit the output limit for Responses-compatible endpoints that reject it.
+    pub fn with_max_output_tokens_field(mut self, enabled: bool) -> Self {
+        self.send_max_output_tokens = enabled;
         self
     }
 
@@ -431,7 +620,7 @@ impl OpenAiResponses {
                 .entry("prompt_cache_key")
                 .or_insert_with(|| json!(key));
         }
-        if self.provider == "openai-chatgpt" {
+        if self.provider == "openai-chatgpt" || self.codex_account.is_some() {
             let object = body.as_object_mut().expect("Responses request object");
             object.remove("prompt_cache_retention");
             object.remove("prompt_cache_options");
@@ -465,15 +654,55 @@ impl OpenAiResponses {
         }
     }
 
+    fn authenticate(
+        &self,
+        request: reqwest::RequestBuilder,
+        mut headers: reqwest::header::HeaderMap,
+        azure_version: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder> {
+        if let Some(version) = azure_version {
+            if !headers.contains_key("api-key") {
+                let mut key = reqwest::header::HeaderValue::from_str(&self.token)
+                    .map_err(|_| Error::Config("invalid Azure OpenAI API key".into()))?;
+                key.set_sensitive(true);
+                headers.insert("api-key", key);
+            }
+            Ok(request.headers(headers).query(&[("api-version", version)]))
+        } else if self.provider == "cloudflare-ai-gateway" {
+            Ok(request
+                .headers(headers)
+                .header("cf-aig-authorization", format!("Bearer {}", self.token)))
+        } else {
+            Ok(request.headers(headers).bearer_auth(&self.token))
+        }
+    }
+
     /// Return the signed-in account's displayable models in server order.
     pub async fn models(&self) -> Result<Vec<String>> {
+        self.models_with_azure_version(None).await
+    }
+
+    /// List models using the configured Azure API version when applicable.
+    pub async fn models_with_azure_version(
+        &self,
+        azure_version: Option<&str>,
+    ) -> Result<Vec<String>> {
         let mut endpoint = self.endpoint.clone();
-        endpoint.set_path("/v1/models");
+        let version = self
+            .azure_api_version
+            .as_deref()
+            .map(|version| azure_version.unwrap_or(version));
+        if version.is_some() {
+            let path = endpoint.path().trim_end_matches('/');
+            let base = path
+                .strip_suffix("/responses")
+                .ok_or_else(|| Error::Config("Azure discovery requires a /responses URL".into()))?;
+            endpoint.set_path(&format!("{base}/models"));
+        } else {
+            endpoint.set_path("/v1/models");
+        }
         let mut response = self
-            .client
-            .get(endpoint)
-            .headers(self.headers.clone())
-            .bearer_auth(&self.token)
+            .authenticate(self.client.get(endpoint), self.headers.clone(), version)?
             .send()
             .await
             .map_err(|_| Error::RetryableModel("OpenAI model listing failed".into()))?;
@@ -517,6 +746,39 @@ impl OpenAiResponses {
                 .map(str::to_owned)
             })
             .collect())
+    }
+}
+
+fn response_usage_metadata(
+    api: ModelApi,
+    model: &str,
+    requested_tier: Option<&str>,
+    response: &Value,
+) -> ModelMetadata {
+    let returned_tier = response["service_tier"].as_str();
+    let codex = api == ModelApi::OpenaiCodexResponses;
+    let tier = if codex
+        && returned_tier == Some("default")
+        && matches!(requested_tier, Some("flex" | "priority"))
+    {
+        requested_tier
+    } else {
+        returned_tier.or(requested_tier)
+    };
+    let multiplier = match tier {
+        Some("flex") => Some(0.5),
+        Some("priority") => Some(if model == "gpt-5.5" { 2.5 } else { 2.0 }),
+        Some("fast") if !codex => Some(if model == "gpt-5.5" { 2.5 } else { 2.0 }),
+        _ => None,
+    };
+    let counts = &response["usage"]["input_tokens_details"];
+    ModelMetadata {
+        cached_input_tokens: counts["cached_tokens"].as_u64(),
+        cache_creation_input_tokens: counts["cache_write_tokens"].as_u64(),
+        reasoning_output_tokens: response["usage"]["output_tokens_details"]["reasoning_tokens"]
+            .as_u64(),
+        catalog_cost_multiplier: multiplier.and_then(serde_json::Number::from_f64),
+        ..Default::default()
     }
 }
 
@@ -575,15 +837,66 @@ pub fn thinking_levels(model: &str) -> Vec<String> {
     levels.iter().map(|level| (*level).into()).collect()
 }
 
+/// Extract the account routing hint from a Codex access token.
+pub fn codex_account_id(token: &str) -> Option<String> {
+    if token.len() > 64 * 1024 {
+        return None;
+    }
+    let mut parts = token.split('.');
+    let (header, payload, signature) = (parts.next()?, parts.next()?, parts.next()?);
+    if header.is_empty() || signature.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let json: Value = serde_json::from_slice(&decoded).ok()?;
+    let account = json["https://api.openai.com/auth"]["chatgpt_account_id"].as_str()?;
+    (!account.is_empty()
+        && account.len() <= 128
+        && account.bytes().all(|byte| byte.is_ascii_graphic()))
+    .then(|| account.to_owned())
+}
+
+fn configuration_update(effort: &str) -> Value {
+    json!({"type":"configuration_update","reasoning":{"effort":effort}})
+}
+
+#[cfg(test)]
 fn payload(
     request: &ModelRequest,
     provider: &str,
     edited_scope: &str,
     instruction_role: &str,
 ) -> Value {
+    responses_payload(
+        request,
+        provider,
+        edited_scope,
+        instruction_role,
+        pi_rs_core::ModelApi::OpenaiResponses,
+        None,
+    )
+}
+
+fn responses_payload(
+    request: &ModelRequest,
+    provider: &str,
+    edited_scope: &str,
+    instruction_role: &str,
+    api: pi_rs_core::ModelApi,
+    active_effort: Option<&str>,
+) -> Value {
+    let codex = api == pi_rs_core::ModelApi::OpenaiCodexResponses;
     let mut input = Vec::new();
-    for message in &request.messages {
+    let mut instructions = "You are a helpful assistant.";
+    for (index, message) in request.messages.iter().enumerate() {
         match message {
+            Message::System { content } if codex && index == 0 => {
+                if !content.is_empty() {
+                    instructions = content;
+                }
+            }
             Message::System { content } => {
                 input.push(json!({"role":instruction_role, "content": content}))
             }
@@ -598,36 +911,38 @@ fn payload(
                 calls,
                 replay,
             } => {
-                if let Some(replay) = replay.as_deref().filter(|r| {
+                let matched_replay = replay.as_deref().filter(|r| {
                     r.identity.provider
-                        == if r.is_context_edit() {
+                        == if codex || r.is_context_edit() {
                             edited_scope
                         } else {
                             provider
                         }
                         && r.identity.model == request.model
-                        && r.supports_api(pi_rs_core::ModelApi::OpenaiResponses)
-                }) {
-                    let edited = replay
-                        .blocks
-                        .iter()
-                        .any(|block| block.get("_pi_context_edit_api").is_some());
-                    input.extend(
-                        replay
-                            .blocks
-                            .iter()
-                            .filter(|block| block.get("_pi_context_edit_api").is_none())
-                            .cloned()
-                            .map(|mut block| {
-                                if edited
-                                    && provider == "openai-chatgpt"
-                                    && block["type"] == "function_call"
-                                {
-                                    block["namespace"] = json!(NAMESPACE);
-                                }
-                                block
-                            }),
-                    );
+                        && r.supports_api(api)
+                });
+                let before = input.len();
+                let wire_blocks = matched_replay
+                    .into_iter()
+                    .flat_map(|r| r.blocks.iter())
+                    .filter(|block| {
+                        block.get("_pi_context_edit_api").is_none()
+                            && block.get("_pi_openai_effort").is_none()
+                    });
+                let metadata_only = matched_replay.is_some_and(|r| {
+                    r.openai_effort().is_some() && wire_blocks.clone().next().is_none()
+                });
+                if let Some(replay) = matched_replay.filter(|_| !metadata_only) {
+                    let edited = replay.is_context_edit();
+                    input.extend(wire_blocks.cloned().map(|mut block| {
+                        if edited
+                            && provider == "openai-chatgpt"
+                            && block["type"] == "function_call"
+                        {
+                            block["namespace"] = json!(NAMESPACE);
+                        }
+                        block
+                    }));
                 } else {
                     if !content.is_empty() {
                         input.push(json!({"role":"assistant", "content":content}));
@@ -637,6 +952,14 @@ fn payload(
                         if provider == "openai-chatgpt" { item["namespace"] = json!(NAMESPACE); }
                         item
                     }));
+                }
+                if active_effort.is_some()
+                    && input.len() > before
+                    && let Some(effort) = matched_replay
+                        .filter(|r| !r.is_context_edit())
+                        .and_then(ProviderReplay::openai_effort)
+                {
+                    input.insert(before, configuration_update(effort));
                 }
             }
             Message::Tool {
@@ -664,7 +987,19 @@ fn payload(
             }
         }
     }
-    let mut body = json!({"model":request.model, "input":input, "store":false, "stream":true, "max_output_tokens":request.max_output_tokens});
+    if let Some(effort) = active_effort {
+        input.push(configuration_update(effort));
+    }
+    let mut body = if codex {
+        json!({"model":request.model, "input":input, "store":false, "stream":true,
+            "instructions":instructions, "text":{"verbosity":"low"}, "include":["reasoning.encrypted_content"],
+            "tool_choice":"auto", "parallel_tool_calls":true})
+    } else {
+        json!({"model":request.model, "input":input, "store":false, "stream":true, "max_output_tokens":request.max_output_tokens})
+    };
+    if codex && request.max_output_tokens != 0 {
+        body["max_output_tokens"] = json!(request.max_output_tokens);
+    }
     if !request.tools.is_empty() {
         let tools: Vec<_> = request.tools.iter().map(|tool| json!({"type":"function", "name":tool.name, "description":tool.description, "parameters":tool.parameters, "strict":false})).collect();
         body["tools"] = if provider == "openai-chatgpt" {
@@ -681,7 +1016,8 @@ fn resolved_constrained_tools(
     declarations: &[pi_rs_core::ToolDeclaration],
     supports_strict: bool,
     implicit_strict_tools: bool,
-) -> Result<(Vec<Value>, Vec<pi_rs_core::EffectiveToolDeclaration>)> {
+    supports_grammar: bool,
+) -> Result<(ResponsesTools, Vec<pi_rs_core::EffectiveToolDeclaration>)> {
     if request.tools.len() != declarations.len()
         || request
             .tools
@@ -693,10 +1029,33 @@ fn resolved_constrained_tools(
             "tool declarations do not match the effective request".into(),
         ));
     }
-    let mut wire = Vec::with_capacity(declarations.len());
+    let mut wire = ResponsesTools {
+        declarations: Vec::with_capacity(declarations.len()),
+        ..Default::default()
+    };
     let mut effective = Vec::with_capacity(declarations.len());
     for declaration in declarations {
         let spec = &declaration.spec;
+        if supports_grammar
+            && let Some((syntax, definition, property)) =
+                pi_rs_core::resolve_openai_tool_grammar(declaration)
+                    .map_err(|error| Error::Config(error.to_string()))?
+        {
+            wire.declarations.push(json!({
+                "type":"custom","name":spec.name,"description":spec.description,
+                "format":{"type":"grammar","syntax":syntax,"definition":definition}
+            }));
+            wire.grammar_inputs
+                .insert(spec.name.clone(), property.to_owned());
+            effective.push(pi_rs_core::EffectiveToolDeclaration {
+                spec: spec.clone(),
+                sampling: pi_rs_core::EffectiveToolSampling::OpenAiGrammar {
+                    syntax,
+                    input_property: property.to_owned(),
+                },
+            });
+            continue;
+        }
         let strict_schema = match &declaration.constrained_sampling {
             Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => {
                 pi_rs_core::resolve_strict_tool_schema(
@@ -708,8 +1067,6 @@ fn resolved_constrained_tools(
                 )
                 .map_err(|error| Error::Config(error.to_string()))?
             }
-            // Grammar is sent as an ordinary function until custom tool streaming
-            // and replay are supported by this path.
             _ => None,
         };
         let mut tool = json!({"type":"function","name":spec.name,"description":spec.description,"parameters":strict_schema.as_ref().unwrap_or(&spec.parameters)});
@@ -724,7 +1081,7 @@ fn resolved_constrained_tools(
         } else {
             pi_rs_core::EffectiveToolSampling::Unconstrained
         };
-        wire.push(tool);
+        wire.declarations.push(tool);
         effective.push(pi_rs_core::EffectiveToolDeclaration {
             spec: spec.clone(),
             sampling,
@@ -741,7 +1098,8 @@ fn constrained_tools(
     declarations: &[pi_rs_core::ToolDeclaration],
     supports_strict: bool,
 ) -> Result<Vec<Value>> {
-    resolved_constrained_tools(request, declarations, supports_strict, false).map(|(wire, _)| wire)
+    resolved_constrained_tools(request, declarations, supports_strict, false, false)
+        .map(|(wire, _)| wire.declarations)
 }
 
 fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
@@ -762,6 +1120,9 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
         Some("subscription_sharing_usage_unavailable") => {
             Error::RetryableModel("ChatGPT plan usage is temporarily unavailable".into())
         }
+        _ if status == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) => {
+            Error::RetryableModel("OpenAI rate limit reached".into())
+        }
         _ if status.is_some_and(|status| status.is_server_error()) => {
             Error::RetryableModel("OpenAI service temporarily unavailable".into())
         }
@@ -774,6 +1135,14 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
+    fn minimum_output_tokens(&self) -> u32 {
+        if self.send_max_output_tokens && (self.codex_account.is_some() || self.is_azure()) {
+            16
+        } else {
+            1
+        }
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,
@@ -824,6 +1193,16 @@ impl Model for OpenAiResponses {
                     self.explicit_cache_mode,
                 ))
             };
+        let base = if let Some(version) = &self.azure_api_version {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                version,
+                self.deployments.as_ref(),
+                &self.azure_off_reasoning,
+            ))
+        } else {
+            base
+        };
         let base = if self.session_affinity_format.is_none()
             && self.provider != "openrouter"
             && self.endpoint_source.contains("openrouter.ai")
@@ -844,6 +1223,28 @@ impl Model for OpenAiResponses {
                 pi_rs_core::protected_model_fingerprint(&(base, format!("{format:?}")))
             }),
         };
+        let base = if self.codex_account.is_some() {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    "codex-sse-v1",
+                    &self.codex_off_effort,
+                    self.codex_transport.as_str(),
+                ))
+            })
+        } else {
+            base
+        };
+        let base = if self.send_max_output_tokens {
+            base
+        } else {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    "responses-without-max-output-tokens",
+                ))
+            })
+        };
         let base = if self.prompt_cache_key_enabled {
             base
         } else {
@@ -858,9 +1259,31 @@ impl Model for OpenAiResponses {
                 pi_rs_core::protected_model_fingerprint(&(base, "system-instruction-role"))
             })
         };
-        if self.strict_tool_support {
+        let base = if self
+            .configuration_update_models
+            .iter()
+            .any(|model| self.configuration_update_effort(model).is_some())
+        {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    "configuration-update-effort-v1",
+                    &self.configuration_update_models,
+                ))
+            })
+        } else {
+            base
+        };
+        let base = if self.strict_tool_support {
             base.and_then(|base| {
                 pi_rs_core::protected_model_fingerprint(&(base, "strict-tools-enabled"))
+            })
+        } else {
+            base
+        };
+        if self.supports_grammar_tools() {
+            base.and_then(|base| {
+                pi_rs_core::protected_model_fingerprint(&(base, "grammar-tools-enabled"))
             })
         } else {
             base
@@ -868,18 +1291,19 @@ impl Model for OpenAiResponses {
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        let replay_provider = self.replay_provider(&request.model);
         match message {
             Message::Assistant {
                 replay: Some(replay),
                 ..
             } if replay.identity.provider
-                == if replay.is_context_edit() {
-                    pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str())
+                == if self.codex_account.is_some() || replay.is_context_edit() {
+                    pi_rs_core::endpoint_replay_scope(&replay_provider, self.endpoint.as_str())
                 } else {
-                    self.provider.clone()
+                    replay_provider
                 }
                 && replay.identity.model == request.model
-                && replay.supports_api(pi_rs_core::ModelApi::OpenaiResponses) =>
+                && replay.supports_api(self.api()) =>
             {
                 pi_rs_core::estimate_replay_tokens(&replay.blocks)
                     .max(pi_rs_core::estimate_message_tokens(message))
@@ -1001,18 +1425,88 @@ impl Model for OpenAiResponses {
     }
 }
 
+fn limit_visible_output(
+    mut stream: pi_rs_core::EnrichedModelStream,
+    allowance: u32,
+) -> pi_rs_core::EnrichedModelStream {
+    use pi_rs_core::EnrichedModelEvent::{
+        Legacy, ReasoningDelta, ReasoningEnd, TextDelta, TextEnd,
+    };
+    Box::pin(async_stream::try_stream! {
+        // The provider's tokenizer is unknown. This is a runaway output guard,
+        // not a token counter. The agent uses reported usage for accounting.
+        let limit = u64::from(allowance).saturating_mul(128);
+        let mut streamed_units = 0_u64;
+        let mut legacy_text_units = 0_u64;
+        let mut text = BTreeMap::new();
+        let mut reasoning = BTreeMap::new();
+        while let Some(event) = stream.next().await {
+            let event = event?;
+            let units = |text: &str| text.encode_utf16().count() as u64;
+            let observe = |parts: &mut BTreeMap<u64, u64>, index, content: &str, final_block| {
+                let previous = parts.entry(index).or_default();
+                let observed = units(content);
+                let next = if final_block { observed } else { previous.saturating_add(observed) };
+                let added = next.saturating_sub(*previous);
+                *previous = next;
+                added
+            };
+            match &event {
+                TextDelta { index, delta } => {
+                    streamed_units = streamed_units.saturating_add(observe(&mut text, *index, delta, false));
+                }
+                TextEnd { index, content } => {
+                    streamed_units = streamed_units.saturating_add(observe(&mut text, *index, content, true));
+                }
+                ReasoningDelta { index, delta } => {
+                    streamed_units = streamed_units.saturating_add(observe(&mut reasoning, *index, delta, false));
+                }
+                ReasoningEnd { index, content } => {
+                    streamed_units = streamed_units.saturating_add(observe(&mut reasoning, *index, content, true));
+                }
+                Legacy(ModelEvent::Text(delta)) => {
+                    legacy_text_units = legacy_text_units.saturating_add(units(delta));
+                    streamed_units = streamed_units.saturating_add(units(delta));
+                }
+                Legacy(ModelEvent::Reasoning(delta)) => {
+                    streamed_units = streamed_units.saturating_add(units(delta));
+                }
+                Legacy(ModelEvent::ToolCallDelta(delta)) => {
+                    streamed_units = streamed_units
+                        .saturating_add(units(&delta.name))
+                        .saturating_add(units(&delta.arguments));
+                }
+                // Some relays omit usage. Before accepting their final output
+                // or any tool call, check the same estimate Pi uses for text.
+                Legacy(ModelEvent::Complete { calls, usage: None }) => {
+                    let text_units = text.values().fold(legacy_text_units, |sum, units| sum.saturating_add(*units));
+                    if pi_rs_core::estimate_assistant_output_tokens(text_units, calls) > u64::from(allowance) {
+                        Err(Error::Budget)?;
+                    }
+                }
+                _ => {}
+            }
+            if streamed_units > limit {
+                Err(Error::Budget)?;
+            }
+            yield event;
+        }
+    })
+}
+
 impl OpenAiResponses {
     fn stream_only_constrained_tools(
         &self,
         request: &ModelRequest,
         declarations: &[pi_rs_core::ToolDeclaration],
         supports_strict: bool,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<ResponsesTools> {
         let (wire, effective) = resolved_constrained_tools(
             request,
             declarations,
             supports_strict,
             self.has_implicit_strict_tools(),
+            self.supports_grammar_tools(),
         )?;
         if effective.iter().any(|tool| {
             matches!(
@@ -1061,74 +1555,61 @@ impl OpenAiResponses {
         self.stream_enriched_with_tools(request, None).await
     }
 
-    async fn stream_enriched_with_tools(
+    async fn open_sse(
         &self,
-        request: ModelRequest,
-        tools: Option<Vec<Value>>,
-    ) -> Result<pi_rs_core::EnrichedModelStream> {
-        let model = request.model.clone();
-        let edited_scope =
-            pi_rs_core::endpoint_replay_scope(&self.provider, self.endpoint.as_str());
-        let mut body = payload(
-            &request,
-            &self.provider,
-            &edited_scope,
-            if self.use_developer_role {
-                "developer"
-            } else {
-                "system"
-            },
-        );
-        if let Some(tools) = tools
-            && !tools.is_empty()
-        {
-            body["tools"] = if self.provider == "openai-chatgpt" {
-                json!([{"type":"namespace","name":NAMESPACE,"description":"Local tools","tools":tools}])
-            } else {
-                json!(tools)
-            };
-        }
-        let provider = self.provider.clone();
-        if let Some(thinking) = &self.thinking {
-            body["reasoning"] = json!({"effort":thinking, "summary":"auto"});
-            body["include"] = json!(["reasoning.encrypted_content"]);
-        }
-        body.as_object_mut()
-            .expect("Responses request object")
-            .extend(
-                self.sampling
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone())),
-            );
-        self.apply_cache(&mut body);
-        let error_secrets = pi_rs_core::provider_error_secrets(
-            Some(self.token.as_str()),
-            self.headers.iter().filter_map(|(name, value)| {
-                value.to_str().ok().map(|value| (name.as_str(), value))
-            }),
-        );
-        let mut headers = self.headers.clone();
-        if provider == "github-copilot" {
-            for (name, value) in pi_rs_core::copilot_request_headers(&request.messages) {
-                headers
-                    .entry(name)
-                    .or_insert_with(|| reqwest::header::HeaderValue::from_static(value));
+        body: &Value,
+        mut headers: reqwest::header::HeaderMap,
+        error_secrets: &[String],
+    ) -> Result<(ResponseEvents, bool)> {
+        let mut request = self.client.post(self.endpoint.clone());
+        if let Some(account) = &self.codex_account {
+            headers.remove("chatgpt-account-id");
+            headers.remove("openai-beta");
+            headers.remove(reqwest::header::AUTHORIZATION);
+            request = request
+                .header("chatgpt-account-id", account)
+                .header("openai-beta", "responses=experimental");
+            if !self.headers.contains_key("originator") {
+                request = request.header("originator", "pi");
             }
         }
-        let mut response = self
-            .client
-            .post(self.endpoint.clone())
-            .headers(headers)
-            .bearer_auth(&self.token)
+        let codex_body = if self.codex_account.is_some() {
+            let serialized = serde_json::to_vec(body)?;
+            let (bytes, compressed) =
+                tokio::task::spawn_blocking(move || match zstd::bulk::compress(&serialized, 3) {
+                    Ok(compressed) => (compressed, true),
+                    Err(_) => (serialized, false),
+                })
+                .await
+                .map_err(|_| Error::Model("Codex request compression task failed".into()))?;
+            headers.entry(reqwest::header::CONTENT_TYPE).or_insert(
+                reqwest::header::HeaderValue::from_static("application/json"),
+            );
+            headers.remove(reqwest::header::CONTENT_ENCODING);
+            if compressed {
+                headers.insert(
+                    reqwest::header::CONTENT_ENCODING,
+                    reqwest::header::HeaderValue::from_static("zstd"),
+                );
+            }
+            Some(bytes)
+        } else {
+            None
+        };
+        let request = self.authenticate(request, headers, self.azure_api_version.as_deref())?;
+        let request = match codex_body {
+            Some(bytes) => request.body(bytes),
+            None => request.json(body),
+        };
+        let mut response = request
             .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(&body)
             .send()
             .await
             .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))?;
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
-            &error_secrets,
+            error_secrets,
             &self.headers,
         )
         .await;
@@ -1139,7 +1620,7 @@ impl OpenAiResponses {
             }
             if status.as_u16() == 429 || status.is_server_error() {
                 let info =
-                    pi_rs_core::provider_limit_info(response.bytes_stream(), &error_secrets).await;
+                    pi_rs_core::provider_limit_info(response.bytes_stream(), error_secrets).await;
                 return Err(if info.permanent {
                     if info.recognized_code == Some("subscription_sharing_usage_limit_exceeded") {
                         response_error(info.recognized_code, Some(status))
@@ -1160,7 +1641,7 @@ impl OpenAiResponses {
                 bytes.extend_from_slice(&chunk);
             }
             let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-            let body = pi_rs_core::sanitized_provider_error(&body, &error_secrets);
+            let body = pi_rs_core::sanitized_provider_error(&body, error_secrets);
             if pi_rs_core::provider_context_overflow(&body, &[]) {
                 return Err(Error::Model("context window exceeded".into()));
             }
@@ -1172,7 +1653,7 @@ impl OpenAiResponses {
         let declared_sse = content_type
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.starts_with("text/event-stream"));
-        if !(declared_sse || (content_type.is_none() && provider == "openai-chatgpt")) {
+        if !(declared_sse || (content_type.is_none() && self.provider == "openai-chatgpt")) {
             return Err(Error::Model("expected OpenAI event stream".into()));
         }
         // Bound wire bytes before the SSE parser sees them. Coalesce incomplete
@@ -1201,21 +1682,187 @@ impl OpenAiResponses {
             }
             if !pending.is_empty() { yield Ok(pending); }
         };
-        let mut source = Box::pin(bytes.eventsource());
-        Ok(Box::pin(async_stream::try_stream! {
+        let source = bytes.eventsource();
+        let events = Box::pin(source.filter_map(|item| async move {
+            let item = match item {
+                Ok(item) => item,
+                Err(error) => {
+                    return Some(Err(match error {
+                        EventStreamError::Transport(RawStreamError::LimitExceeded) => {
+                            Error::Model("OpenAI stream exceeds 32 MiB".into())
+                        }
+                        EventStreamError::Transport(RawStreamError::Transport) => {
+                            Error::RetryableModel("OpenAI stream interrupted".into())
+                        }
+                        _ => Error::Model("invalid OpenAI event stream".into()),
+                    }));
+                }
+            };
+            if item.data == "[DONE]" {
+                return None;
+            }
+            Some(
+                serde_json::from_str(&item.data)
+                    .map_err(|_| Error::Model("invalid OpenAI stream event".into())),
+            )
+        }));
+        Ok((events, declared_sse))
+    }
+
+    async fn stream_enriched_with_tools(
+        &self,
+        request: ModelRequest,
+        tools: Option<ResponsesTools>,
+    ) -> Result<pi_rs_core::EnrichedModelStream> {
+        let max_output_tokens = request.max_output_tokens;
+        let model = request.model.clone();
+        let replay_provider = self.replay_provider(&model);
+        let edited_scope =
+            pi_rs_core::endpoint_replay_scope(&replay_provider, self.endpoint.as_str());
+        let api = self.api();
+        if (1..self.minimum_output_tokens()).contains(&max_output_tokens) {
+            return Err(Error::Budget);
+        }
+        let active_effort = self.configuration_update_effort(&model).map(str::to_owned);
+        let mut body = responses_payload(
+            &request,
+            &replay_provider,
+            &edited_scope,
+            if self.use_developer_role {
+                "developer"
+            } else {
+                "system"
+            },
+            api,
+            active_effort.as_deref(),
+        );
+        if self.azure_api_version.is_some() {
+            if let Some(deployment) = self.deployments.get(&model) {
+                body["model"] = json!(deployment);
+            }
+            if request.max_output_tokens == 0 {
+                body.as_object_mut()
+                    .expect("Responses request object")
+                    .remove("max_output_tokens");
+            }
+        }
+        let tools = tools.unwrap_or_default();
+        grammar::project_input(
+            &request,
+            &mut body["input"],
+            &tools.grammar_inputs,
+            (self.provider == "openai-chatgpt").then_some(NAMESPACE),
+        )?;
+        if !tools.declarations.is_empty() {
+            body["tools"] = if self.provider == "openai-chatgpt" {
+                json!([{"type":"namespace","name":NAMESPACE,"description":"Local tools","tools":tools.declarations}])
+            } else {
+                json!(tools.declarations)
+            };
+        }
+        let provider = self.provider.clone();
+        if let Some(thinking) = &self.thinking {
+            let effort = if active_effort.is_some() {
+                "medium"
+            } else {
+                thinking
+            };
+            body["reasoning"] = json!({"effort":effort,"summary":"auto"});
+            body["include"] = json!(["reasoning.encrypted_content"]);
+        } else if let Some(off) = self
+            .codex_off_effort
+            .as_ref()
+            .or(self.azure_off_reasoning.as_ref())
+        {
+            body["reasoning"] = json!({"effort": off});
+        }
+        if self.codex_account.is_some()
+            && !self.strict_tool_support
+            && let Some(tools) = body["tools"].as_array_mut()
+        {
+            for tool in tools {
+                if let Some(object) = tool.as_object_mut() {
+                    object.remove("strict");
+                }
+            }
+        }
+        body.as_object_mut()
+            .expect("Responses request object")
+            .extend(
+                self.sampling
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        if !self.send_max_output_tokens {
+            body.as_object_mut()
+                .expect("Responses request object")
+                .remove("max_output_tokens");
+        }
+        self.apply_cache(&mut body);
+        let requested_service_tier = body["service_tier"].as_str().map(str::to_owned);
+        let error_secrets = pi_rs_core::provider_error_secrets(
+            Some(self.token.as_str()),
+            self.headers.iter().filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| (name.as_str(), value))
+            }),
+        );
+        let mut headers = self.headers.clone();
+        if provider == "github-copilot" {
+            for (name, value) in pi_rs_core::copilot_request_headers(&request.messages) {
+                headers
+                    .entry(name)
+                    .or_insert_with(|| reqwest::header::HeaderValue::from_static(value));
+            }
+        }
+        let ws = if self.codex_transport != CodexTransport::Sse
+            && let Some(account) = &self.codex_account
+        {
+            let session = self.session_cache_key.as_deref();
+            let affinity_session = session.filter(|_| self.cache_retention != CacheRetention::None);
+            codex_ws::open(
+                codex_ws::Request {
+                    client: &self.client,
+                    endpoint: &self.endpoint,
+                    headers: &self.headers,
+                    token: &self.token,
+                    account,
+                    error_secrets: &error_secrets,
+                    session,
+                    affinity_session,
+                    timeout: self.idle_timeout,
+                    reuse_connection: self.identity_safe_transport && affinity_session.is_some(),
+                    cache_context: matches!(
+                        self.codex_transport,
+                        CodexTransport::Auto | CodexTransport::WebSocketCached
+                    ),
+                },
+                &body,
+            )
+            .await?
+        } else {
+            None
+        };
+        let (mut source, declared_sse) = match ws {
+            Some(source) => (source, true),
+            None => self.open_sse(&body, headers, &error_secrets).await?,
+        };
+        let stream: pi_rs_core::EnrichedModelStream = Box::pin(async_stream::try_stream! {
             let mut started = false;
             let mut calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
+            let mut grammar_inputs: BTreeMap<u64, grammar::Input> = BTreeMap::new();
             let mut reasoning: BTreeMap<u64, String> = BTreeMap::new();
             let mut text_items: BTreeMap<u64, String> = BTreeMap::new();
             while let Some(item) = source.next().await {
-                let item = item.map_err(|error| match error {
-                    EventStreamError::Transport(RawStreamError::LimitExceeded) => Error::Model("OpenAI stream exceeds 32 MiB".into()),
-                    EventStreamError::Transport(RawStreamError::Transport) => Error::RetryableModel("OpenAI stream interrupted".into()),
-                    _ => Error::Model("invalid OpenAI event stream".into()),
-                })?;
-                if item.data == "[DONE]" { continue; }
-                let event: Value = serde_json::from_str(&item.data).map_err(|_| Error::Model("invalid OpenAI stream event".into()))?;
+                let event = item?;
                 let kind = field(&event, "type")?;
+                let kind = if api == pi_rs_core::ModelApi::OpenaiCodexResponses && kind == "response.done" {
+                    match event["response"]["status"].as_str() {
+                        Some("completed") => "response.completed",
+                        Some("incomplete") => "response.incomplete",
+                        Some("failed") => "response.failed",
+                        _ => kind,
+                    }
+                } else { kind };
                 started |= recognized_response_event(kind);
                 match kind {
                     "response.output_item.added" if event["item"]["type"] == "reasoning" => {
@@ -1264,17 +1911,48 @@ impl OpenAiResponses {
                         reasoning.insert(index, content.clone());
                         yield pi_rs_core::EnrichedModelEvent::ReasoningEnd { index, content };
                     }
+                    "response.output_item.added" if event["item"]["type"] == "custom_tool_call" => {
+                        let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
+                        let (input, call) = grammar::Input::start(&event["item"], &tools.grammar_inputs)?;
+                        if calls.insert(index, call.clone()).is_some() { Err(Error::Model("duplicate OpenAI tool index".into()))?; }
+                        grammar_inputs.insert(index, input);
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index, id:call.id, name:call.name, arguments:call.arguments }));
+                    }
+                    "response.custom_tool_call_input.delta" | "response.custom_tool_call_input.done" | "response.output_item.done"
+                        if kind != "response.output_item.done" || event["item"]["type"] == "custom_tool_call" => {
+                        let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
+                        let item = if kind == "response.output_item.done" { &event["item"] } else { &event };
+                        if kind == "response.output_item.done"
+                            && let std::collections::btree_map::Entry::Vacant(slot) = calls.entry(index)
+                        {
+                            let (input, call) = grammar::Input::start(item, &tools.grammar_inputs)?;
+                            slot.insert(call.clone());
+                            grammar_inputs.insert(index, input);
+                            yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index, id:call.id, name:call.name, arguments:call.arguments }));
+                        }
+                        let input = grammar_inputs.get_mut(&index).ok_or_else(|| Error::Model("unknown OpenAI grammar tool call".into()))?;
+                        let call = calls.get_mut(&index).expect("grammar tool call slot");
+                        if item.get("call_id").is_some_and(|id| id != &call.id) || item.get("name").is_some_and(|name| name != &call.name) { Err(Error::Model("OpenAI tool call changed during stream".into()))?; }
+                        let delta = if kind == "response.custom_tool_call_input.delta" {
+                            input.append(call, item["delta"].as_str().ok_or_else(|| Error::Model("invalid OpenAI tool input delta".into()))?)?
+                        } else {
+                            input.finish(call, item["input"].as_str().ok_or_else(|| Error::Model("invalid OpenAI tool input".into()))?)?
+                        };
+                        if !delta.is_empty() { yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index, id:String::new(), name:String::new(), arguments:delta })); }
+                    }
                     "response.output_item.added" if event["item"]["type"] == "function_call" => {
                         let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
                         let item = &event["item"];
                         if provider == "openai-chatgpt" && item["namespace"] != NAMESPACE { Err(Error::Model("unexpected OpenAI tool namespace".into()))?; }
                         let initial = item.get("arguments").map(|value| value.as_str().ok_or_else(|| Error::Model("invalid OpenAI tool arguments".into()))).transpose()?.unwrap_or("");
                         let call = ToolCall { id:field(item,"call_id")?.into(), name:field(item,"name")?.into(), arguments:initial.into() };
+                        if tools.grammar_inputs.contains_key(&call.name) { Err(Error::Model("OpenAI grammar tool returned as a function".into()))?; }
                         if calls.insert(index, call.clone()).is_some() { Err(Error::Model("duplicate OpenAI tool index".into()))?; }
                         yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index, id:call.id, name:call.name, arguments:call.arguments }));
                     }
                     "response.function_call_arguments.delta" => {
                         let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
+                        if grammar_inputs.contains_key(&index) { Err(Error::Model("OpenAI grammar tool returned function arguments".into()))?; }
                         let delta = field(&event,"delta")?;
                         calls.get_mut(&index).ok_or_else(|| Error::Model("unknown OpenAI tool call".into()))?.arguments.push_str(delta);
                         yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index, id:String::new(), name:String::new(), arguments:delta.into() }));
@@ -1282,6 +1960,7 @@ impl OpenAiResponses {
                     "response.function_call_arguments.done" | "response.output_item.done" if event["type"] == "response.function_call_arguments.done" || event["item"]["type"] == "function_call" => {
                         let index = event["output_index"].as_u64().ok_or_else(|| Error::Model("invalid OpenAI tool index".into()))?;
                         let item = if event["type"] == "response.output_item.done" { &event["item"] } else { &event };
+                        if grammar_inputs.contains_key(&index) { Err(Error::Model("OpenAI grammar tool returned function arguments".into()))?; }
                         let call = calls.get_mut(&index).ok_or_else(|| Error::Model("unknown OpenAI tool call".into()))?;
                         if item.get("call_id").is_some_and(|id| id != &call.id) || item.get("name").is_some_and(|name| name != &call.name) { Err(Error::Model("OpenAI tool call changed during stream".into()))?; }
                         if let Some(value) = item.get("arguments") {
@@ -1293,7 +1972,7 @@ impl OpenAiResponses {
                     }
                     "response.completed" | "response.incomplete" => {
                         let response = &event["response"];
-                        let finish_reason = match (event["type"].as_str(), response["status"].as_str(), response["incomplete_details"]["reason"].as_str()) {
+                        let finish_reason = match (Some(kind), response["status"].as_str(), response["incomplete_details"]["reason"].as_str()) {
                             (Some("response.completed"), Some("completed"), _) => "stop",
                             (Some("response.incomplete"), Some("incomplete"), Some("max_output_tokens")) => "length",
                             (Some("response.incomplete"), Some("incomplete"), reason) => {
@@ -1302,28 +1981,53 @@ impl OpenAiResponses {
                             _ => Err(Error::Model("invalid OpenAI completion status".into()))?,
                         };
                         let output = response["output"].as_array().ok_or_else(|| Error::Model("OpenAI completion missing output".into()))?;
-                        let reported_calls: Vec<_> = output.iter().filter(|item| item["type"] == "function_call").collect();
+                        let reported_calls: Vec<_> = output.iter().filter(|item| matches!(item["type"].as_str(), Some("function_call" | "custom_tool_call"))).collect();
                         if reported_calls.len() != calls.len() { Err(Error::Model("incomplete OpenAI tool stream".into()))?; }
                         for ((index, call), item) in calls.iter_mut().zip(reported_calls) {
                             if item["call_id"] != call.id || item["name"] != call.name || (provider == "openai-chatgpt" && item["namespace"] != NAMESPACE) { Err(Error::Model("OpenAI tool call changed during stream".into()))?; }
-                            let final_arguments = field(item, "arguments")?;
-                            let suffix = final_arguments.strip_prefix(&call.arguments).ok_or_else(|| Error::Model("OpenAI tool call changed during stream".into()))?.to_owned();
-                            call.arguments.push_str(&suffix);
+                            let suffix = if let Some(input) = grammar_inputs.get_mut(index) {
+                                if item["type"] != "custom_tool_call" { Err(Error::Model("OpenAI tool call changed during stream".into()))?; }
+                                input.finish(call, item["input"].as_str().ok_or_else(|| Error::Model("invalid OpenAI tool input".into()))?)?
+                            } else {
+                                if item["type"] != "function_call" { Err(Error::Model("OpenAI tool call changed during stream".into()))?; }
+                                let final_arguments = field(item, "arguments")?;
+                                let suffix = final_arguments.strip_prefix(&call.arguments).ok_or_else(|| Error::Model("OpenAI tool call changed during stream".into()))?.to_owned();
+                                call.arguments.push_str(&suffix);
+                                suffix
+                            };
                             if !suffix.is_empty() { yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(ToolCallDelta { index:*index, id:String::new(), name:String::new(), arguments:suffix })); }
                         }
                         let usage = response["usage"]["input_tokens"].as_u64().zip(response["usage"]["output_tokens"].as_u64()).map(|(input_tokens,output_tokens)| Usage { input_tokens, output_tokens });
                         let identity = ResolvedModelIdentity { provider:provider.clone(), model:model.clone() };
                         let reasoning: String = reasoning.into_values().collect();
-                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(pi_rs_core::ModelApi::OpenaiResponses), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), cached_input_tokens:response["usage"]["input_tokens_details"]["cached_tokens"].as_u64(), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay:(finish_reason != "length").then(|| Box::new(ProviderReplay { identity, blocks:output.clone() })), ..Default::default() }));
+                        let replay = (finish_reason != "length" || active_effort.is_some()).then(|| {
+                            let mut replay = ProviderReplay {
+                                identity: if api == pi_rs_core::ModelApi::OpenaiCodexResponses {
+                                    ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }
+                                } else { ResolvedModelIdentity { provider: replay_provider.clone(), model: model.clone() } },
+                                blocks: if finish_reason == "length" { Vec::new() } else { output.clone() },
+                            };
+                            if let Some(effort) = active_effort.as_deref() {
+                                replay.record_openai_effort(effort);
+                            }
+                            Box::new(replay)
+                        });
+                        yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { provider_api:Some(api), replay_identity:Some(ResolvedModelIdentity { provider: edited_scope.clone(), model: model.clone() }), resolved_model:Some(identity.clone()), finish_reason:Some(finish_reason.into()), reasoning:(!reasoning.is_empty()).then_some(reasoning), replay, ..response_usage_metadata(api, &model, requested_service_tier.as_deref(), response) }));
                         yield pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls:calls.into_values().collect(), usage });
                         return;
                     }
                     "response.failed" | "error" => {
-                        let error = event["response"].get("error").filter(|error| !error.is_null()).or_else(|| event.get("error")).unwrap_or(&Value::Null);
+                        let error = event["response"].get("error").filter(|error| !error.is_null())
+                            .or_else(|| event.get("error").filter(|error| !error.is_null()))
+                            .unwrap_or(&event);
+                        let status = event["status"].as_u64()
+                            .and_then(|status| u16::try_from(status).ok())
+                            .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
+                            .filter(|status| status.is_client_error() || status.is_server_error());
                         let safe_error = pi_rs_core::sanitized_provider_error(error, &error_secrets);
                         let code = safe_error["code"].as_str();
                         Err(if matches!(code, Some("subscription_sharing_usage_limit_exceeded" | "subscription_sharing_user_not_eligible" | "subscription_sharing_usage_unavailable")) {
-                            response_error(code, None)
+                            response_error(code, status)
                         } else if pi_rs_core::permanent_provider_error(error, &error_secrets) {
                             Error::Model("OpenAI account quota or billing limit reached".into())
                         } else if pi_rs_core::retryable_provider_error(error, &error_secrets) {
@@ -1331,7 +2035,7 @@ impl OpenAiResponses {
                         } else if pi_rs_core::provider_context_overflow(error, &error_secrets) {
                             Error::Model("context window exceeded".into())
                         } else {
-                            response_error(code, None)
+                            response_error(code, status)
                         })?;
                     },
                     _ => {}
@@ -1342,12 +2046,261 @@ impl OpenAiResponses {
             } else {
                 Err(Error::Model("invalid OpenAI event stream".into()))?;
             }
-        }))
+        });
+        if self.send_max_output_tokens {
+            Ok(stream)
+        } else {
+            Ok(limit_visible_output(stream, max_output_tokens))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn codex_sse_uses_subscription_headers_payload_and_completion_alias() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            socket.read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), "POST /backend-api/codex/responses HTTP/1.1");
+            let mut headers = String::new();
+            let mut length = 0;
+            loop {
+                line.clear();
+                socket.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                let line = line.to_ascii_lowercase();
+                if let Some(value) = line.strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            for header in [
+                "chatgpt-account-id: fixture-account",
+                "openai-beta: responses=experimental",
+                "originator: pi",
+                "authorization: bearer",
+                "content-type: application/json",
+                "content-encoding: zstd",
+            ] {
+                assert!(headers.contains(header), "missing {header}");
+            }
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            let body: Value =
+                serde_json::from_slice(&zstd::bulk::decompress(&body, 65536).unwrap()).unwrap();
+            assert_eq!(body["instructions"], "fixture system");
+            assert_eq!(body["input"][0]["role"], "user");
+            assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+            assert_eq!(body["reasoning"], json!({"effort":"none"}));
+            assert_eq!(body["tool_choice"], "auto");
+            assert_eq!(body["max_output_tokens"], 16);
+            let response = format!(
+                "data: {}\n\n",
+                json!({"type":"response.done", "response":{"status":"completed", "output":[]}})
+            );
+            write!(socket.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            ).unwrap();
+        });
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}"#);
+        let client = OpenAiResponses::new_codex(
+            &format!("http://{address}/backend-api/codex/responses"),
+            format!("e30.{payload}.fixture"),
+            "openai-codex",
+        )
+        .unwrap()
+        .with_codex_transport(CodexTransport::Sse);
+        let request = ModelRequest {
+            model: "gpt-6.1-sol".into(),
+            messages: vec![
+                Message::System {
+                    content: "fixture system".into(),
+                },
+                Message::User {
+                    content: "hello".into(),
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        assert!(matches!(
+            client
+                .stream(ModelRequest {
+                    max_output_tokens: 4,
+                    ..request.clone()
+                })
+                .await,
+            Err(Error::Budget)
+        ));
+        let events = client
+            .stream(request)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Ok(ModelEvent::Metadata(metadata))
+            if metadata.provider_api == Some(pi_rs_core::ModelApi::OpenaiCodexResponses)))
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Ok(ModelEvent::Complete { .. }))
+        ));
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_without_a_wire_limit_bound_runaway_output() {
+        use pi_rs_core::EnrichedModelEvent::{TextDelta, TextEnd};
+        let events = vec![
+            Ok(TextDelta {
+                index: 0,
+                delta: "four".into(),
+            }),
+            Ok(TextEnd {
+                index: 0,
+                content: "four".into(),
+            }),
+            Ok(TextDelta {
+                index: 1,
+                delta: "x".repeat(260),
+            }),
+        ];
+        let mut stream = limit_visible_output(Box::pin(futures_util::stream::iter(events)), 2);
+        assert!(matches!(stream.next().await, Some(Ok(TextDelta { .. }))));
+        assert!(matches!(stream.next().await, Some(Ok(TextEnd { .. }))));
+        assert!(matches!(stream.next().await, Some(Err(Error::Budget))));
+
+        let replaced_text = [
+            Ok(TextDelta {
+                index: 0,
+                delta: "moderately long".into(),
+            }),
+            Ok(TextEnd {
+                index: 0,
+                content: "yes".into(),
+            }),
+            Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )),
+        ];
+        let mut stream =
+            limit_visible_output(Box::pin(futures_util::stream::iter(replaced_text)), 1);
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+
+        let with_thought = [
+            Ok(pi_rs_core::EnrichedModelEvent::ReasoningDelta {
+                index: 0,
+                delta: "reasoning summary".into(),
+            }),
+            Ok(TextDelta {
+                index: 0,
+                delta: "four".into(),
+            }),
+            Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )),
+        ];
+        let mut stream =
+            limit_visible_output(Box::pin(futures_util::stream::iter(with_thought)), 1);
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+
+        let unreported = [
+            Ok(TextDelta {
+                index: 0,
+                delta: "moderately long".into(),
+            }),
+            Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )),
+        ];
+        let mut stream = limit_visible_output(Box::pin(futures_util::stream::iter(unreported)), 2);
+        assert!(matches!(stream.next().await, Some(Ok(TextDelta { .. }))));
+        assert!(matches!(stream.next().await, Some(Err(Error::Budget))));
+
+        let call = ToolCall {
+            id: "fixture".into(),
+            name: "t".into(),
+            arguments: format!("{{{}}}", " ".repeat(40)),
+        };
+        let formatted = [
+            Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::ToolCallDelta(ToolCallDelta {
+                    index: 0,
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                }),
+            )),
+            Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::Complete {
+                    calls: vec![call],
+                    usage: None,
+                },
+            )),
+        ];
+        let mut stream = limit_visible_output(Box::pin(futures_util::stream::iter(formatted)), 1);
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+
+        let completion = pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete {
+            calls: vec![],
+            usage: Some(Usage {
+                input_tokens: 1,
+                output_tokens: 32,
+            }),
+        });
+        let reported = [
+            Ok(TextDelta {
+                index: 0,
+                delta: "moderately long".into(),
+            }),
+            Ok(completion),
+        ];
+        let mut stream = limit_visible_output(Box::pin(futures_util::stream::iter(reported)), 2);
+        assert!(matches!(stream.next().await, Some(Ok(TextDelta { .. }))));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(pi_rs_core::EnrichedModelEvent::Legacy(
+                ModelEvent::Complete {
+                    usage: Some(Usage {
+                        output_tokens: 32,
+                        ..
+                    }),
+                    ..
+                }
+            )))
+        ));
+    }
+
     #[tokio::test]
     async fn interleaved_text_items_have_boundaries_and_legacy_projection() {
         use std::io::{Read, Write};
@@ -2100,8 +3053,7 @@ mod tests {
     }
 
     #[test]
-    fn official_responses_explicitly_disables_implicit_strict_sampling() {
-        let model = OpenAiResponses::new_api(DEFAULT_ENDPOINT, "fixture".into()).unwrap();
+    fn responses_explicitly_disables_implicit_strict_sampling_on_openai_and_copilot() {
         let req = request();
         let declarations = [pi_rs_core::ToolDeclaration {
             spec: req.tools[0].clone(),
@@ -2109,18 +3061,28 @@ mod tests {
                 strict: pi_rs_core::StrictToolPolicy::Prefer,
             }),
         }];
-        let prepared = model
-            .prepare_tool_request(req.clone(), &declarations)
-            .unwrap();
-        assert_eq!(prepared.wire_tools[0]["strict"], false);
-        assert_eq!(
-            prepared.wire_tools[0]["parameters"],
-            req.tools[0].parameters
-        );
-        let stream_tools = model
-            .stream_only_constrained_tools(&req, &declarations, false)
-            .unwrap();
-        assert_eq!(stream_tools, prepared.wire_tools);
+        for model in [
+            OpenAiResponses::new_api(DEFAULT_ENDPOINT, "fixture".into()).unwrap(),
+            OpenAiResponses::new_api_provider(
+                "https://api.individual.githubcopilot.com/responses",
+                "fixture".into(),
+                "github-copilot",
+            )
+            .unwrap(),
+        ] {
+            let prepared = model
+                .prepare_tool_request(req.clone(), &declarations)
+                .unwrap();
+            assert_eq!(prepared.wire_tools.declarations[0]["strict"], false);
+            assert_eq!(
+                prepared.wire_tools.declarations[0]["parameters"],
+                req.tools[0].parameters
+            );
+            let stream_tools = model
+                .stream_only_constrained_tools(&req, &declarations, false)
+                .unwrap();
+            assert_eq!(stream_tools.declarations, prepared.wire_tools.declarations);
+        }
     }
 
     #[tokio::test]
@@ -2643,6 +3605,260 @@ mod tests {
         assert_eq!(body["tools"][0]["parameters"], original);
         assert_eq!(body["input"][0]["role"], "system");
         assert_eq!(body["prompt_cache_key"], "strict-session");
+    }
+
+    fn grammar_request() -> (ModelRequest, pi_rs_core::ToolDeclaration) {
+        let mut req = request();
+        req.tools[0].parameters = json!({
+            "type":"object","required":["path"],"properties":{"path":{"type":"string"}}
+        });
+        let declaration = pi_rs_core::ToolDeclaration {
+            spec: req.tools[0].clone(),
+            constrained_sampling: Some(pi_rs_core::ToolConstraint::Grammar {
+                variants: pi_rs_core::ToolGrammarVariants {
+                    openai_lark: Some("start: /.+/".into()),
+                    openai_regex: Some(".+".into()),
+                },
+            }),
+        };
+        (req, declaration)
+    }
+
+    #[tokio::test]
+    async fn grammar_tools_stream_raw_input_as_json_and_replay_matching_results() {
+        use pi_rs_core::{EffectiveToolSampling, ToolGrammarSyntax};
+
+        let input = "x\"\\y\n界";
+        let item = json!({"type":"custom_tool_call","id":"ctc_fixture","call_id":"c1","name":"read","input":input});
+        let events = [
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","id":"ctc_fixture","call_id":"c1","name":"read","input":"x"}}),
+            json!({"type":"response.custom_tool_call_input.delta","output_index":0,"delta":"\"\\"}),
+            json!({"type":"response.custom_tool_call_input.done","output_index":0,"input":input}),
+            json!({"type":"response.output_item.done","output_index":0,"item":item}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[item]}}),
+        ]
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        let (client, server) = fixture(&events).await;
+        let mut client = client.with_grammar_tool_support(true);
+        client.provider = "openai".into();
+        let (mut req, declaration) = grammar_request();
+        let prepared = client
+            .prepare_tool_request(req.clone(), std::slice::from_ref(&declaration))
+            .unwrap();
+        assert_eq!(
+            prepared.wire_tools.declarations[0],
+            json!({"type":"custom","name":"read","description":"read a file","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}})
+        );
+        assert_eq!(
+            prepared.effective_tools()[0].sampling,
+            EffectiveToolSampling::OpenAiGrammar {
+                syntax: ToolGrammarSyntax::Lark,
+                input_property: "path".into(),
+            }
+        );
+        let mut stream = client
+            .stream_enriched_with_tools(req.clone(), Some(prepared.wire_tools))
+            .await
+            .unwrap();
+        let mut fragments = String::new();
+        let mut calls = Vec::new();
+        let mut replay = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(delta)) => {
+                    fragments.push_str(&delta.arguments);
+                }
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata)) => {
+                    replay = metadata.replay;
+                }
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete {
+                    calls: result,
+                    ..
+                }) => {
+                    calls = result;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(calls[0].arguments, fragments);
+        assert_eq!(
+            serde_json::from_str::<Value>(&fragments).unwrap(),
+            json!({"path":input})
+        );
+        server.await.unwrap();
+        req.messages.extend([
+            Message::Assistant {
+                content: String::new(),
+                calls,
+                replay,
+            },
+            Message::Tool {
+                call_id: "c1".into(),
+                content: "result".into(),
+                is_structured: Some(false),
+                is_error: false,
+            },
+        ]);
+        let mut body = payload(&req, "openai", "openai", "system");
+        grammar::project_input(
+            &req,
+            &mut body["input"],
+            &BTreeMap::from([("read".into(), "path".into())]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(body["input"][2], item);
+        assert_eq!(
+            body["input"][3],
+            json!({"type":"custom_tool_call_output","call_id":"c1","output":"result"})
+        );
+
+        let mut body = payload(&req, "openai", "openai", "system");
+        grammar::project_input(&req, &mut body["input"], &BTreeMap::new(), None).unwrap();
+        assert_eq!(
+            body["input"][2],
+            json!({"type":"function_call","call_id":"c1","name":"read","arguments":fragments})
+        );
+        assert_eq!(body["input"][3]["type"], "function_call_output");
+    }
+
+    #[tokio::test]
+    async fn codex_grammar_completion_matches_the_recorded_tool_decision() {
+        let events = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"c1\",\"name\":\"read\",\"input\":\"\"}}\n\n",
+            "data: {\"type\":\"response.done\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"custom_tool_call\",\"call_id\":\"c1\",\"name\":\"read\",\"input\":\"\"}]}}\n\n"
+        );
+        let (client, server) = fixture(events).await;
+        let mut client = client
+            .with_grammar_tool_support(true)
+            .with_codex_transport(CodexTransport::Sse);
+        client.provider = "openai-codex".into();
+        client.codex_account = Some("account-fixture".into());
+        let (req, declaration) = grammar_request();
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "grammar-fixture".into(),
+            summary: false,
+        };
+        let prepared = client
+            .prepare_bound_tool_dispatch(&req, &[declaration], &context)
+            .unwrap();
+        let snapshot: pi_rs_core::ToolDecisionSnapshot =
+            serde_json::from_value(serde_json::to_value(prepared.decision_snapshot()).unwrap())
+                .unwrap();
+        let validated = snapshot
+            .validate_recorded(
+                &context,
+                snapshot.request_sha256(),
+                snapshot.dispatch_sha256(),
+                snapshot.binding_sha256(),
+            )
+            .unwrap();
+        let events: Vec<_> = prepared
+            .dispatch()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut calls = events
+            .into_iter()
+            .find_map(|event| match event.event {
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls, .. }) => {
+                    Some(calls)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            validated.normalized_arguments(&calls[0]).unwrap(),
+            json!({"path":""})
+        );
+        calls[0].arguments = r#"{"path":false}"#.into();
+        assert!(validated.normalized_arguments(&calls[0]).is_err());
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn grammar_replay_preserves_historical_function_arguments() {
+        let (mut req, _) = grammar_request();
+        for (id, arguments) in [
+            ("convertible", r#"{"path":"example"}"#),
+            ("extra", r#"{"path":"example","line":5}"#),
+            ("older-schema", r#"{"file":"example"}"#),
+        ] {
+            req.messages.extend([
+                Message::Assistant {
+                    content: String::new(),
+                    calls: vec![ToolCall {
+                        id: id.into(),
+                        name: "read".into(),
+                        arguments: arguments.into(),
+                    }],
+                    replay: None,
+                },
+                Message::Tool {
+                    call_id: id.into(),
+                    content: "result".into(),
+                    is_structured: Some(false),
+                    is_error: false,
+                },
+            ]);
+        }
+        let mut body = payload(&req, "openai", "openai", "system");
+        let original = body["input"].clone();
+        grammar::project_input(
+            &req,
+            &mut body["input"],
+            &BTreeMap::from([("read".into(), "path".into())]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            body["input"][2],
+            json!({"type":"custom_tool_call","name":"read","call_id":"convertible","input":"example"})
+        );
+        assert_eq!(body["input"][3]["type"], "custom_tool_call_output");
+        assert_eq!(
+            body["input"].as_array().unwrap()[4..],
+            original.as_array().unwrap()[4..]
+        );
+    }
+
+    #[test]
+    fn responses_grammar_validation_is_conditional_on_model_support() {
+        let (mut req, mut declaration) = grammar_request();
+        let supports_grammar = OpenAiResponses::new_api(DEFAULT_ENDPOINT, "fixture".into())
+            .unwrap()
+            .with_grammar_tool_support(true);
+        declaration.constrained_sampling = Some(pi_rs_core::ToolConstraint::Grammar {
+            variants: pi_rs_core::ToolGrammarVariants {
+                openai_lark: Some(" ".into()),
+                openai_regex: Some(".+".into()),
+            },
+        });
+        let prepared = supports_grammar
+            .prepare_tool_request(req.clone(), std::slice::from_ref(&declaration))
+            .unwrap();
+        assert_eq!(
+            prepared.wire_tools.declarations[0]["format"]["syntax"],
+            "regex"
+        );
+        req.tools[0].parameters["required"] = json!(["path", "other"]);
+        declaration.spec = req.tools[0].clone();
+        assert!(
+            supports_grammar
+                .prepare_tool_request(req.clone(), std::slice::from_ref(&declaration))
+                .is_err()
+        );
+        let fallback = supports_grammar
+            .with_grammar_tool_support(false)
+            .prepare_tool_request(req, &[declaration])
+            .unwrap();
+        assert_eq!(fallback.wire_tools.declarations[0]["type"], "function");
     }
 
     #[tokio::test]
@@ -3336,6 +4552,397 @@ mod tests {
         }
     }
 
+    #[test]
+    fn responses_reencode_anthropic_replies_when_provider_and_model_are_reused() {
+        let mut request = request();
+        let signed = json!({"type":"thinking","thinking":"hidden","signature":"signed"});
+        let effort = json!({"_pi_anthropic_effort":"xhigh"});
+        let bedrock = json!({"type":"reasoning","text":"hidden","signature":"signed"});
+        let pi_messages = json!({"type":"pi-rs:pi-messages-origin"});
+        for private_block in [signed, effort, bedrock, pi_messages] {
+            request.messages = vec![
+                Message::User {
+                    content: "question".into(),
+                },
+                Message::Assistant {
+                    content: "portable reply".into(),
+                    calls: vec![],
+                    replay: Some(Box::new(ProviderReplay {
+                        identity: ResolvedModelIdentity {
+                            provider: "fixture".into(),
+                            model: request.model.clone(),
+                        },
+                        blocks: vec![private_block],
+                    })),
+                },
+            ];
+            let body = responses_payload(
+                &request,
+                "fixture",
+                "fixture",
+                "system",
+                pi_rs_core::ModelApi::OpenaiResponses,
+                Some("low"),
+            );
+            assert_eq!(
+                body["input"],
+                json!([
+                    {"role":"user","content":"question"},
+                    {"role":"assistant","content":"portable reply"},
+                    configuration_update("low"),
+                ])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_configuration_updates_preserve_effort_across_replies() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (level, previous, incomplete) in [
+                ("low", None, false),
+                ("xhigh", Some("low"), true),
+                ("none", None, false),
+                ("high", Some("low"), false),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let offset = loop {
+                    let mut chunk = [0; 4096];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..pos]).to_ascii_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length: ")?.parse::<usize>().ok()
+                            })
+                            .unwrap();
+                        if bytes.len() >= pos + 4 + length {
+                            break pos + 4;
+                        }
+                    }
+                };
+                let body: Value = serde_json::from_slice(&bytes[offset..]).unwrap();
+                let input = body["input"].as_array().unwrap();
+                assert_eq!(input[0]["role"], "user");
+                assert!(!body.to_string().contains("_pi_openai_effort"));
+                if level == "none" {
+                    assert_eq!(body["reasoning"]["effort"], "none");
+                    assert!(
+                        !input
+                            .iter()
+                            .any(|item| item["type"] == "configuration_update")
+                    );
+                } else {
+                    assert_eq!(body["reasoning"]["effort"], "medium");
+                    assert_eq!(input.last().unwrap(), &configuration_update(level));
+                }
+                if let Some(previous) = previous {
+                    assert_eq!(input[1], configuration_update(previous));
+                    assert_eq!(input[2]["content"][0]["text"], "reply");
+                    assert_eq!(input[3]["type"], "function_call");
+                    assert_eq!(input[4]["type"], "function_call_output");
+                }
+                if level == "high" {
+                    let updates: Vec<_> = input
+                        .iter()
+                        .filter(|item| item["type"] == "configuration_update")
+                        .collect();
+                    assert_eq!(
+                        updates,
+                        [&configuration_update("low"), &configuration_update("high")]
+                    );
+                    assert_eq!(input[5]["content"][0]["text"], "reply with thinking off");
+                }
+                let state = if incomplete {
+                    "incomplete"
+                } else {
+                    "completed"
+                };
+                let text = if level == "none" {
+                    "reply with thinking off"
+                } else {
+                    "reply"
+                };
+                let mut response = json!({
+                    "status":state,"output":[{"type":"message","role":"assistant","content":[
+                        {"type":"output_text","text":text}
+                    ]}],"usage":{"input_tokens":3,"output_tokens":1}
+                });
+                if incomplete {
+                    response["incomplete_details"] = json!({"reason":"max_output_tokens"});
+                }
+                let mut reply = String::new();
+                if level == "low" {
+                    let item = json!({"type":"function_call","call_id":"call","name":"read","arguments":"{}"});
+                    response["output"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(item.clone());
+                    let event =
+                        json!({"type":"response.output_item.added","output_index":1,"item":item});
+                    reply.push_str(&format!("data: {event}\n\n"));
+                }
+                let event = json!({"type":format!("response.{state}"),"response":response});
+                reply.push_str(&format!("data: {event}\n\n"));
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.len()
+                );
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let client = OpenAiResponses::new_api(&endpoint, "sk-fixture".into())
+            .unwrap()
+            .with_configuration_update_models(BTreeSet::from(["gpt-6-luna".into()]));
+        let mut request = ModelRequest {
+            model: "gpt-6-luna".into(),
+            messages: vec![Message::User {
+                content: "prompt".into(),
+            }],
+            tools: vec![pi_rs_core::ToolSpec {
+                name: "read".into(),
+                description: "Read a fixture".into(),
+                parameters: json!({"type":"object"}),
+            }],
+            max_output_tokens: 64,
+        };
+        for level in ["low", "xhigh", "off", "high"] {
+            let mut stream = client
+                .clone()
+                .with_thinking(Some(level))
+                .stream(request.clone())
+                .await
+                .unwrap();
+            let mut replay = None;
+            let mut calls = Vec::new();
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    ModelEvent::Metadata(metadata) => replay = metadata.replay.or(replay),
+                    ModelEvent::Complete {
+                        calls: completed, ..
+                    } => calls = completed,
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                replay.as_deref().and_then(ProviderReplay::openai_effort),
+                (level != "off").then_some(level),
+            );
+            if level == "low" {
+                request.messages.extend([
+                    Message::Assistant {
+                        content: "reply".into(),
+                        calls,
+                        replay,
+                    },
+                    Message::Tool {
+                        call_id: "call".into(),
+                        content: "result".into(),
+                        is_error: false,
+                        is_structured: None,
+                    },
+                ]);
+            } else if level == "xhigh" {
+                assert_eq!(replay.unwrap().blocks.len(), 1);
+            } else if level == "off" {
+                request.messages.extend([
+                    Message::Assistant {
+                        content: "reply with thinking off".into(),
+                        calls,
+                        replay,
+                    },
+                    Message::User {
+                        content: "resume thinking".into(),
+                    },
+                ]);
+            }
+        }
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn responses_effort_never_uses_configuration_items_with_subscription_credentials() {
+        let enable = |client: OpenAiResponses| {
+            client
+                .with_thinking(Some("high"))
+                .with_configuration_update_models(BTreeSet::from(["gpt-6-luna".into()]))
+        };
+        let api_key =
+            enable(OpenAiResponses::new_api(DEFAULT_ENDPOINT, "sk-fixture".into()).unwrap());
+        assert_eq!(
+            api_key.configuration_update_effort("gpt-6-luna"),
+            Some("high")
+        );
+        assert_eq!(api_key.configuration_update_effort("unlisted"), None);
+        assert_eq!(
+            api_key
+                .clone()
+                .with_mapped_thinking(Some("low"), Some("none"))
+                .configuration_update_effort("gpt-6-luna"),
+            Some("none")
+        );
+        assert_eq!(
+            api_key
+                .clone()
+                .with_mapped_thinking(Some("off"), Some("none"))
+                .configuration_update_effort("gpt-6-luna"),
+            None
+        );
+        assert_eq!(
+            api_key
+                .clone()
+                .with_thinking(Some("strong"))
+                .configuration_update_effort("gpt-6-luna"),
+            Some("strong")
+        );
+        assert_eq!(
+            enable(OpenAiResponses::new_api(DEFAULT_ENDPOINT, "access-token".into()).unwrap())
+                .configuration_update_effort("gpt-6-luna"),
+            None
+        );
+        assert_eq!(
+            enable(OpenAiResponses::new(DEFAULT_ENDPOINT, "sk-fixture".into()).unwrap())
+                .configuration_update_effort("gpt-6-luna"),
+            None
+        );
+    }
+
+    #[test]
+    fn imported_responses_effort_keeps_portable_assistant_content() {
+        let mut replay = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "openai".into(),
+                model: "m".into(),
+            },
+            blocks: vec![],
+        };
+        replay.record_openai_effort("low");
+        let request = ModelRequest {
+            model: "m".into(),
+            tools: vec![],
+            max_output_tokens: 32,
+            messages: vec![Message::Assistant {
+                content: "reply".into(),
+                calls: vec![],
+                replay: Some(Box::new(replay)),
+            }],
+        };
+        let body = responses_payload(
+            &request,
+            "openai",
+            "route",
+            "developer",
+            pi_rs_core::ModelApi::OpenaiResponses,
+            Some("high"),
+        );
+        assert_eq!(
+            body["input"],
+            json!([
+                configuration_update("low"),
+                {"role":"assistant","content":"reply"},
+                configuration_update("high")
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_applies_service_tier_and_records_cache_writes() {
+        for (codex, model, requested, returned, expected) in [
+            (false, "gpt-5.5", "priority", Some("default"), None),
+            (false, "gpt-5.5", "priority", None, Some(2.5)),
+            (false, "gpt-6-luna", "priority", Some("fast"), Some(2.0)),
+            (false, "gpt-5.5", "priority", Some("flex"), Some(0.5)),
+            (true, "gpt-5.5", "priority", Some("default"), Some(2.5)),
+            (true, "gpt-5.5", "flex", Some("default"), Some(0.5)),
+            (true, "gpt-5.5", "priority", Some("fast"), None),
+            (true, "gpt-5.5", "flex", None, Some(0.5)),
+        ] {
+            let payload = json!({"type":"response.completed", "response":{
+                "status":"completed", "output":[], "service_tier": returned,
+                "usage":{"input_tokens":100, "output_tokens":10,
+                    "input_tokens_details":{"cached_tokens":20, "cache_write_tokens":30}}
+            }});
+            let (mut client, server) = fixture(&format!("data: {payload}\n\n")).await;
+            if codex {
+                client.provider = "openai-codex".into();
+                client.codex_account = Some("fixture-account".into());
+            } else {
+                client.provider = "openai".into();
+            }
+            let client = client
+                .with_sampling(BTreeMap::from([("service_tier".into(), json!(requested))]))
+                .unwrap();
+            let mut request = request();
+            request.model = model.into();
+            let mut stream = client.stream(request).await.unwrap();
+            let mut saw_metadata = false;
+            let mut saw_usage = false;
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    ModelEvent::Metadata(metadata) => {
+                        assert_eq!(metadata.cached_input_tokens, Some(20));
+                        assert_eq!(metadata.cache_creation_input_tokens, Some(30));
+                        assert_eq!(
+                            metadata
+                                .catalog_cost_multiplier
+                                .as_ref()
+                                .and_then(serde_json::Number::as_f64),
+                            expected
+                        );
+                        saw_metadata = true;
+                    }
+                    ModelEvent::Complete { usage, .. } => {
+                        assert_eq!(
+                            usage,
+                            Some(Usage {
+                                input_tokens: 100,
+                                output_tokens: 10
+                            })
+                        );
+                        saw_usage = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_metadata && saw_usage);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_reasoning_usage_is_included_in_output_total() {
+        let response = json!({"type":"response.completed","response":{
+            "status":"completed","output":[],"usage":{"input_tokens":12,"output_tokens":9,
+                "output_tokens_details":{"reasoning_tokens":4}}
+        }});
+        let (client, server) = fixture(&format!("data: {response}\n\n")).await;
+        let events = client
+            .stream(request())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().any(|event| matches!(event,
+            Ok(ModelEvent::Metadata(metadata)) if metadata.reasoning_output_tokens == Some(4))));
+        assert!(matches!(
+            events.last(),
+            Some(Ok(ModelEvent::Complete {
+                usage: Some(Usage {
+                    input_tokens: 12,
+                    output_tokens: 9
+                }),
+                ..
+            }))
+        ));
+        server.await.unwrap();
+    }
+
     async fn fixture(events: &str) -> (OpenAiResponses, tokio::task::JoinHandle<()>) {
         fixture_with_content_type(events, Some("text/event-stream")).await
     }
@@ -3353,19 +4960,28 @@ mod tests {
         let body = events.to_owned();
         let content_type = content_type.map(str::to_owned);
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            loop {
-                let mut chunk = [0; 4096];
-                let n = socket.read(&mut chunk).await.unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&chunk[..n]);
-                if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+            let mut socket = loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
                 }
-            }
-            let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-            assert!(headers.contains("authorization: bearer fixture"));
+                let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                assert!(headers.contains("authorization: bearer fixture"));
+                // A Codex client with auto transport can try an upgrade before SSE.
+                if headers.starts_with("get ") && headers.contains("upgrade: websocket") {
+                    socket.write_all(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
+                assert!(headers.starts_with("post "));
+                break socket;
+            };
             let header =
                 content_type.map_or_else(String::new, |value| format!("Content-Type: {value}\r\n"));
             let response = format!(
