@@ -291,6 +291,13 @@ impl Settings {
     pub fn string(&self, key: &str) -> Option<&str> {
         self.value.get(key)?.as_str()
     }
+    pub fn cache_warming_mode(&self) -> &'static str {
+        match self.string("cacheWarming") {
+            Some("off") => "off",
+            Some("streaming") => "streaming",
+            _ => "idle",
+        }
+    }
     pub fn thinking_for_model(&self, provider: &str, model: &str) -> Option<&str> {
         self.value
             .get("modelThinkingLevels")
@@ -620,11 +627,16 @@ fn read_settings_layer(
         .and_then(|parent| parent.canonicalize().ok())
         .and_then(|parent| absolute.file_name().map(|name| parent.join(name)))
         .unwrap_or(absolute);
-    match read_object(&absolute) {
+    match read_json_object(&absolute, true, true) {
         Ok(value) => value,
         Err(error) => {
+            let reason = match error {
+                JsonObjectError::Read(error) => error.to_string(),
+                JsonObjectError::Parse(reason) => reason,
+                JsonObjectError::NotAnObject => "Settings must contain a JSON object".into(),
+            };
             diagnostics.push(format!(
-                "Warning: Invalid settings file {}: {error}",
+                "Warning: Invalid settings file {}: {reason}",
                 absolute.display()
             ));
             previous
@@ -865,16 +877,30 @@ pub(super) fn update_object_locked(
     shared: Option<&super::auth_lock::Guard>,
     update: impl FnOnce(&mut Map<String, Value>) -> Result<()>,
 ) -> Result<()> {
+    let path = match shared {
+        Some(guard) => guard.auth_path_for(path)?,
+        None => path,
+    };
     let parent = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
+    let lock_path = if shared.is_some() && path.file_name().is_none_or(|name| name != "auth.json") {
+        let mut path = path.as_os_str().to_os_string();
+        path.push(".pi-rs-write.lock");
+        std::path::PathBuf::from(path)
+    } else {
+        path.with_extension("lock")
+    };
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(path.with_extension("lock"))?;
+        .open(lock_path)?;
     lock.lock()?;
-    let mut value = read_object_unlocked(path)?;
+    let mut value = match shared {
+        Some(guard) => read_auth_object_locked(guard)?,
+        None => read_object_unlocked(path)?,
+    };
     update(value.as_object_mut().expect("object"))?;
     if let Some(guard) = shared {
         guard.check()?;
@@ -895,24 +921,22 @@ pub fn read_object(path: &Path) -> Result<Value> {
         return read_object_unlocked(path);
     }
     match super::auth_lock::acquire(path) {
-        Ok(guard) => {
-            let value = read_object_unlocked(path)?;
-            guard.check()?;
-            Ok(value)
-        }
+        Ok(guard) => read_auth_object_locked(&guard),
         Err(error) => read_readonly_auth(path, error),
     }
 }
 
 pub(super) async fn read_auth_object(path: &Path) -> Result<Value> {
     match super::auth_lock::acquire_async(path).await {
-        Ok(guard) => {
-            let value = read_object_unlocked(path)?;
-            guard.check()?;
-            Ok(value)
-        }
+        Ok(guard) => read_auth_object_locked(&guard),
         Err(error) => read_readonly_auth(path, error),
     }
+}
+
+pub(super) fn read_auth_object_locked(guard: &super::auth_lock::Guard) -> Result<Value> {
+    let value = read_object_with_format(guard.auth_path()?, false, false)?;
+    guard.check()?;
+    Ok(value)
 }
 
 fn same_auth_metadata(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
@@ -940,9 +964,9 @@ pub(super) fn read_readonly_auth(path: &Path, error: Error) -> Result<Value> {
     if !denied {
         return Err(error);
     }
-    let mut lock = path.as_os_str().to_os_string();
-    lock.push(".lock");
-    let lock = std::path::PathBuf::from(lock);
+    let requested = path;
+    let path = super::auth_lock::resolved_auth_path(requested)?;
+    let lock = super::auth_lock::lock_path(&path);
     let unlocked = || match std::fs::symlink_metadata(&lock) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Ok(_) => Err(Error::Config(
@@ -951,7 +975,7 @@ pub(super) fn read_readonly_auth(path: &Path, error: Error) -> Result<Value> {
         Err(e) => Err(Error::Io(e)),
     };
     let snapshot = || -> Result<Option<(Vec<u8>, std::fs::Metadata)>> {
-        match std::fs::File::open(path) {
+        match std::fs::File::open(&path) {
             Ok(mut file) => {
                 use std::io::Read;
                 let before = file.metadata()?;
@@ -982,16 +1006,18 @@ pub(super) fn read_readonly_auth(path: &Path, error: Error) -> Result<Value> {
     }
     // A writer could finish and remove its lock after the second read; compare
     // the path again after the final lock check before accepting the snapshot.
-    let current = match std::fs::metadata(path) {
+    let current = match std::fs::metadata(&path) {
         Ok(value) => Some(value),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
-    if !match (&second, current.as_ref()) {
-        (None, None) => true,
-        (Some((_, before)), Some(after)) => same_auth_metadata(before, after),
-        _ => false,
-    } {
+    if super::auth_lock::resolved_auth_path(requested)? != path
+        || !match (&second, current.as_ref()) {
+            (None, None) => true,
+            (Some((_, before)), Some(after)) => same_auth_metadata(before, after),
+            _ => false,
+        }
+    {
         return Err(Error::Config("auth.json changed while reading".into()));
     }
     match second {
@@ -1010,34 +1036,66 @@ pub(super) fn read_readonly_auth(path: &Path, error: Error) -> Result<Value> {
     }
 }
 
+enum JsonObjectError {
+    Read(std::io::Error),
+    Parse(String),
+    NotAnObject,
+}
+
 pub(super) fn read_object_unlocked(path: &Path) -> Result<Value> {
+    let name = path.file_name();
+    let settings = name.is_some_and(|name| name == "settings.json");
+    read_object_with_format(
+        path,
+        settings,
+        settings || name.is_some_and(|name| name == "mcp.json"),
+    )
+}
+
+fn read_object_with_format(path: &Path, empty_is_object: bool, allow_bom: bool) -> Result<Value> {
+    read_json_object(path, empty_is_object, allow_bom).map_err(|error| match error {
+        JsonObjectError::Read(error) => error.into(),
+        JsonObjectError::Parse(reason) => Error::Config(format!("{}: {reason}", path.display())),
+        JsonObjectError::NotAnObject => {
+            Error::Config(format!("{} must contain an object", path.display()))
+        }
+    })
+}
+
+fn read_json_object(
+    path: &Path,
+    empty_is_object: bool,
+    allow_bom: bool,
+) -> std::result::Result<Value, JsonObjectError> {
     match std::fs::read(path) {
         Ok(bytes) => {
             // Pi treats an empty settings file as an empty settings scope.
-            if bytes.is_empty() && path.file_name().is_some_and(|name| name == "settings.json") {
+            if bytes.is_empty() && empty_is_object {
                 return Ok(Value::Object(Map::new()));
             }
             // Pi accepts a UTF-8 BOM in settings and MCP configuration when loading and editing them.
-            let input = if path
-                .file_name()
-                .is_some_and(|name| name == "mcp.json" || name == "settings.json")
-            {
+            let input = if allow_bom {
                 bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes)
             } else {
                 &bytes
             };
-            let value: Value = serde_json::from_slice(input)
-                .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+            let value: Value = serde_json::from_slice(input).map_err(|error| {
+                let reason = if path.file_name().is_some_and(|name| name == "settings.json")
+                    && let Ok(text) = std::str::from_utf8(input)
+                {
+                    super::rpc::json_syntax_diagnostic(text, &error)
+                } else {
+                    error.to_string()
+                };
+                JsonObjectError::Parse(reason)
+            })?;
             if !value.is_object() {
-                return Err(Error::Config(format!(
-                    "{} must contain an object",
-                    path.display()
-                )));
+                return Err(JsonObjectError::NotAnObject);
             }
             Ok(value)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Object(Map::new())),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(JsonObjectError::Read(error)),
     }
 }
 
@@ -1047,10 +1105,11 @@ static JSON_WRITE_FAULT: std::sync::Mutex<Vec<(std::path::PathBuf, bool, &'stati
 
 #[cfg(test)]
 pub(super) fn fail_json_write_for_test(path: &Path, pending: bool, stage: &'static str) {
-    JSON_WRITE_FAULT
-        .lock()
-        .unwrap()
-        .push((path.to_owned(), pending, stage));
+    JSON_WRITE_FAULT.lock().unwrap().push((
+        super::auth_lock::resolved_auth_path(path).unwrap(),
+        pending,
+        stage,
+    ));
 }
 
 #[cfg(test)]
@@ -1133,6 +1192,27 @@ fn merge(base: &mut Value, overlay: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cache_warming_uses_pi_default_and_user_setting() {
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("user.json");
+        let project = root.path().join(".pi");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("settings.json"), r#"{"cacheWarming":"off"}"#).unwrap();
+        for (settings, expected) in [
+            ("{}", "idle"),
+            (r#"{"cacheWarming":"streaming"}"#, "streaming"),
+            (r#"{"cacheWarming":"idle"}"#, "idle"),
+            (r#"{"cacheWarming":"off"}"#, "off"),
+        ] {
+            std::fs::write(&user, settings).unwrap();
+            let settings = super::Settings::load_from_paths(root.path(), true, &user).unwrap();
+            assert_eq!(settings.cache_warming_mode(), expected);
+        }
+        std::fs::write(&user, r#"{"cacheWarming":"unknown"}"#).unwrap();
+        assert!(super::Settings::load_from_paths(root.path(), true, &user).is_err());
+    }
+
     #[test]
     fn legacy_settings_migrate_per_layer_without_rewriting_files() {
         use clap::Parser;
@@ -1584,6 +1664,53 @@ mod tests {
         assert!(!reader.is_finished());
         drop(guard);
         assert_eq!(reader.await.unwrap().unwrap()["provider"]["key"], "fixture");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auth_alias_uses_the_target_lock_and_preserves_the_link() {
+        use std::os::unix::fs::symlink;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials");
+        let alias = directory.path().join("auth.json");
+        let pi_lock = directory.path().join("credentials.lock");
+        symlink("credentials", &alias).unwrap();
+        assert_eq!(
+            super::read_auth_object(&alias).await.unwrap(),
+            serde_json::json!({})
+        );
+
+        super::update_auth_object(&alias, |data| {
+            data.insert("existing".into(), serde_json::json!(true));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        std::fs::create_dir(&pi_lock).unwrap();
+        let denied = pi_rs::Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(super::read_readonly_auth(&alias, denied).is_err());
+        let update = |data: &mut serde_json::Map<String, serde_json::Value>| {
+            data.insert("new".into(), serde_json::json!(true));
+            Ok(())
+        };
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                super::update_auth_object(&alias, update)
+            )
+            .await
+            .is_err()
+        );
+        assert!(!directory.path().join("auth.json.lock").exists());
+        std::fs::remove_dir(&pi_lock).unwrap();
+
+        super::update_auth_object(&alias, update).await.unwrap();
+        assert!(std::fs::symlink_metadata(&alias).unwrap().is_symlink());
+        let value = serde_json::json!({"existing":true,"new":true});
+        assert_eq!(super::read_auth_object(&path).await.unwrap(), value);
+        assert_eq!(super::read_object(&alias).unwrap(), value);
     }
 
     #[cfg(unix)]
