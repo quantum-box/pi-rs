@@ -1497,6 +1497,7 @@ async fn run_worker(
                     ..
                 } => {
                     let tokens_before = session.estimated_context_tokens();
+                    let previous_records = session.records().len();
                     if use_token_settings {
                         agent
                             .summarize_configured(
@@ -1519,7 +1520,9 @@ async fn run_worker(
                             )
                             .await?;
                     }
-                    if let Some(record) = session.records().last()
+                    if let Some(record) = session.records()[previous_records..]
+                        .iter()
+                        .rfind(|record| matches!(record.event, pi_rs::Event::Compacted { .. }))
                         && let pi_rs::Event::Compacted {
                             summary,
                             retain_from,
@@ -1531,7 +1534,19 @@ async fn run_worker(
                             "summary": summary,
                             "firstKeptEntryId": retain_from.unwrap_or(record.id).to_string(),
                             "tokensBefore": recorded_tokens.unwrap_or(tokens_before),
+                            "estimatedTokensAfter": session.estimated_context_tokens(),
                         });
+                        super::rpc_entries::add_summary_usage(
+                            &mut compact_result,
+                            session.records(),
+                            record,
+                        );
+                        if let Some(details) = session
+                            .record_metadata(record.id)
+                            .and_then(|metadata| metadata.get("details"))
+                        {
+                            compact_result["details"] = details.clone();
+                        }
                     }
                 }
                 Request::BranchSummary {
@@ -1690,21 +1705,16 @@ async fn run_worker(
                     .map(|_| json!({"disposition":"handled"}))
                     .map_err(|error| Error::Config(error.to_string())),
             );
-        } else if let Err(error) = &result {
+        } else if compact_response.is_none()
+            && let Err(error) = &result
+        {
             output(json!({"type":"error","message":error.to_string()}));
         }
         output(
             json!({"type":"agent_settled","success":result.is_ok(),"aborted":matches!(result, Err(Error::Cancelled)),"started":started}),
         );
         if let Some(id) = compact_response {
-            control_response(
-                "compact",
-                id,
-                result
-                    .as_ref()
-                    .map(|_| compact_result)
-                    .map_err(|error| Error::Config(error.to_string())),
-            );
+            control_response("compact", id, result.map(|_| compact_result));
         }
     }
     while let Ok(request) = requests.try_recv() {
@@ -2220,6 +2230,12 @@ fn control_response(
     match result {
         Ok(data) if !data.is_null() => response["data"] = data,
         Ok(_) => {}
+        Err(Error::Cancelled) if command == "compact" => {
+            response["error"] = json!("Compaction cancelled");
+        }
+        Err(Error::Config(message)) if command == "compact" => {
+            response["error"] = json!(message);
+        }
         Err(error) => response["error"] = json!(error.to_string()),
     }
     output(response);
