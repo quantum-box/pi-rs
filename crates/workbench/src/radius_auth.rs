@@ -269,10 +269,9 @@ impl Gateway {
         let _guard = auth_lock_at(path.parent().expect("auth parent")).await?;
         let mut removed = false;
         super::config::update_auth_object(path, |data| {
-            if self.pending_for_gateway(&data.get("radius").cloned().unwrap_or(Value::Null))?
-                || self
-                    .credential_from_value(&Value::Object(data.clone()))?
-                    .is_some()
+            let entry = data.get("radius").unwrap_or(&Value::Null);
+            if self.pending_for_gateway(entry)?
+                || (entry["type"] == "oauth" && entry["gateway"] == self.origin.as_str())
             {
                 data.remove("radius");
                 removed = true;
@@ -908,7 +907,7 @@ mod tests {
             }
             child.0.kill().unwrap();
             child.0.wait().unwrap();
-            std::fs::remove_dir(dir.path().join("auth.json.lock")).unwrap();
+            std::fs::remove_dir_all(dir.path().join("auth.json.lock")).unwrap();
             let stored = super::super::config::read_auth_object(&path).await.unwrap();
             let gateway = Gateway::build(origin, &[], None).unwrap();
             if stage == "after-persist" {
@@ -1025,7 +1024,7 @@ mod tests {
         );
         // The killed fixture alone owned this lock. Real stores require all Pi
         // processes to stop before recovering a stale lock.
-        std::fs::remove_dir(dir.path().join("auth.json.lock")).unwrap();
+        std::fs::remove_dir_all(dir.path().join("auth.json.lock")).unwrap();
         let stored = super::super::config::read_auth_object(&path).await.unwrap();
         assert_eq!(stored["radius"]["type"], "api_key");
         assert!(stored["radius"][REFRESH_PENDING].is_object());
@@ -1528,7 +1527,7 @@ mod tests {
         assert!(result.is_err());
         let lock = dir.path().join("auth.json.lock");
         if lock.exists() {
-            std::fs::remove_dir(lock).unwrap();
+            std::fs::remove_dir_all(lock).unwrap();
         }
         let stored = super::super::config::read_auth_object(&path).await.unwrap();
         assert_eq!(stored["radius"]["type"], "api_key");
