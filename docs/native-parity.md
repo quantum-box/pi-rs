@@ -461,7 +461,10 @@ respectively, using `OPENCODE_API_KEY`. The model selects the Messages, Gemini, 
 Completions or Responses route. Session requests include `x-opencode-session`
 unless configuration supplies the header explicitly. Endpointless saved keys
 apply to the official routes for the corresponding provider. Gemini prepared
-requests also accept an empty tool list. Zen and Go use per-reply effort on
+requests also accept an empty tool list. Zen's Gemini 4 Hydrogen and Neon
+send the documented `XHIGH` level when selected. Pi v1.6.0 publishes that
+catalog mapping but its Google client rejects it before sending a request.
+Zen and Go use per-reply effort on
 the Anthropic models marked `supportsMidConvoEffort` in that catalog. Native
 requests include Anthropic's thinking block binding with
 `prefix_mismatch_behavior: drop_block`. Live inference with a Zen or Go

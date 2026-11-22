@@ -1308,7 +1308,11 @@ impl Client {
                         .flatten()
                         .unwrap_or(level)
                         .to_ascii_lowercase();
-                    if !matches!(mapped.as_str(), "minimal" | "low" | "medium" | "high") {
+                    let xhigh = mapped == "xhigh"
+                        && pi_rs::google::model_thinking_levels(&args.model)
+                            .iter()
+                            .any(|level| level == "xhigh");
+                    if !xhigh && !matches!(mapped.as_str(), "minimal" | "low" | "medium" | "high") {
                         return Err(Error::Config(format!(
                             "unsupported Google thinking level mapping {mapped:?}"
                         )));
@@ -3912,6 +3916,24 @@ mod estimation_tests {
                 expected,
                 "{provider}/{model_id}"
             );
+        }
+    }
+
+    #[test]
+    fn opencode_zen_preserves_xhigh_for_gemini_4_models() {
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.provider = args.model_profiles.provider("opencode").unwrap();
+        let zen = Client::Google(
+            pi_rs::google::Google::new("https://opencode.ai/inference/v1", "fixture").unwrap(),
+        );
+        for model in ["gemini-4-hydrogen", "gemini-4-neon"] {
+            args.model = model.into();
+            args.thinking = Some("high".into());
+            let high = zen.clone().with_model_options(&args, false).unwrap();
+            args.thinking = Some("xhigh".into());
+            let highest = zen.clone().with_model_options(&args, false).unwrap();
+            assert!(highest.context_identity().is_some());
+            assert_ne!(highest.context_identity(), high.context_identity());
         }
     }
 
