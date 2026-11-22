@@ -726,16 +726,27 @@ impl Client {
         };
         let proxies = super::http_proxy::configured(settings)?;
         let timeout = settings.http_idle_timeout();
+        let retry = settings.provider_retry();
         Ok(match this {
-            Self::Ollama(client) => Self::Ollama(client.with_http_options(timeout, &proxies)?),
-            Self::Anthropic(client) => {
-                Self::Anthropic(client.with_http_options(timeout, &proxies)?)
-            }
+            Self::Ollama(client) => Self::Ollama(
+                client
+                    .with_http_options(timeout, &proxies)?
+                    .with_provider_retry(retry),
+            ),
+            Self::Anthropic(client) => Self::Anthropic(
+                client
+                    .with_http_options(timeout, &proxies)?
+                    .with_provider_retry(retry),
+            ),
             Self::Google(client) => Self::Google(client.with_http_options(timeout, &proxies)?),
             Self::PiMessages(client) => {
                 Self::PiMessages(client.with_http_options(timeout, &proxies)?)
             }
-            Self::OpenAi(client) => Self::OpenAi(client.with_http_options(timeout, &proxies)?),
+            Self::OpenAi(client) => Self::OpenAi(
+                client
+                    .with_http_options(timeout, &proxies)?
+                    .with_provider_retry(retry),
+            ),
             Self::Bedrock(_) => unreachable!("Bedrock handled above"),
             Self::Deferred(mut client) => {
                 client.http_settings = Some(settings.clone());

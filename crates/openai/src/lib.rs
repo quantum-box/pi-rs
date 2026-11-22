@@ -106,6 +106,7 @@ pub enum SessionAffinityFormat {
 #[derive(Clone)]
 pub struct OpenAiResponses {
     client: Client,
+    provider_retry: pi_rs_core::ProviderRetry,
     endpoint: Url,
     endpoint_source: String,
     token: String,
@@ -276,6 +277,12 @@ impl OpenAiResponses {
             || self.endpoint.host_str() == Some("api.openai.com")
     }
 
+    /// Configure provider-level retries before a response stream starts.
+    pub fn with_provider_retry(mut self, policy: pi_rs_core::ProviderRetry) -> Self {
+        self.provider_retry = policy;
+        self
+    }
+
     pub fn with_http_options(
         mut self,
         timeout: Option<std::time::Duration>,
@@ -401,6 +408,7 @@ impl OpenAiResponses {
             configuration_update_models: BTreeSet::new(),
             configuration_update_thinking: false,
             identity_safe_transport: true,
+            provider_retry: pi_rs_core::ProviderRetry::default(),
             provider: if plan { "openai-chatgpt" } else { "openai" }.into(),
             headers: reqwest::header::HeaderMap::new(),
             sampling: BTreeMap::new(),
@@ -1601,11 +1609,28 @@ impl OpenAiResponses {
             Some(bytes) => request.body(bytes),
             None => request.json(body),
         };
-        let mut response = request
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .send()
-            .await
-            .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))?;
+        let request = request.header(reqwest::header::ACCEPT, "text/event-stream");
+        let retry = if self.codex_account.is_some() || self.provider == "openai-chatgpt" {
+            pi_rs_core::ProviderRetry::default()
+        } else {
+            self.provider_retry
+        };
+        let mut response = retry
+            .send(
+                || {
+                    let request = request
+                        .try_clone()
+                        .ok_or_else(|| Error::Config("OpenAI request cannot be replayed".into()));
+                    async {
+                        request?
+                            .send()
+                            .await
+                            .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))
+                    }
+                },
+                |response| (response.status().as_u16(), response.headers()),
+            )
+            .await?;
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),

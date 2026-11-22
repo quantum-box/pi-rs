@@ -382,6 +382,22 @@ impl Settings {
             max_agent_delay_ms: number("maxAgentDelayMs", defaults.max_agent_delay_ms),
         }
     }
+    pub fn provider_retry(&self) -> pi_rs::ProviderRetry {
+        let value = &self.value["retry"]["provider"];
+        let defaults = pi_rs::ProviderRetry::default();
+        let number = |key: &str| {
+            value[key]
+                .as_u64()
+                .or_else(|| value[key].as_f64().map(|value| value as u64))
+        };
+        pi_rs::ProviderRetry {
+            max_retries: number("maxRetries")
+                .unwrap_or_default()
+                .min(u64::from(u32::MAX)) as u32,
+            max_retry_delay_ms: number("maxRetryDelayMs").unwrap_or(defaults.max_retry_delay_ms),
+            timeout: number("timeoutMs").map(std::time::Duration::from_millis),
+        }
+    }
     pub fn set_auto_retry_enabled(&mut self, enabled: bool) -> Result<()> {
         self.set_user_member("retry", "enabled", Value::Bool(enabled))?;
         self.live_auto_retry = Some(enabled);
@@ -747,6 +763,19 @@ fn migrate_legacy_settings(value: &mut Value) {
         && let Some(mode) = settings.remove("queueMode")
     {
         settings.insert("steeringMode".into(), mode);
+    }
+    if let Some(retry) = settings.get_mut("retry").and_then(Value::as_object_mut)
+        && let Some(delay) = retry.remove("maxDelayMs").filter(Value::is_number)
+    {
+        let provider = retry.entry("provider").or_insert(Value::Null);
+        if provider.is_null() {
+            *provider = Value::Object(Map::new());
+        }
+        if let Some(provider) = provider.as_object_mut()
+            && provider.get("maxRetryDelayMs").is_none_or(Value::is_null)
+        {
+            provider.insert("maxRetryDelayMs".into(), delay);
+        }
     }
     if let Some(legacy) = settings.get("skills").and_then(Value::as_object).cloned() {
         if !settings.contains_key("enableSkillCommands")
@@ -2448,6 +2477,38 @@ mod tests {
         assert_eq!(retry.max_retries, 0);
         assert_eq!(retry.base_delay_ms, 0);
         assert_eq!(retry.max_agent_delay_ms, 42);
+    }
+
+    #[test]
+    fn provider_retry_settings_migrate_legacy_delay_and_prefer_nested_value() {
+        assert_eq!(
+            Settings::default().provider_retry(),
+            pi_rs::ProviderRetry::default()
+        );
+        for (provider, expected_delay) in [
+            (json!({"maxRetries":2.0,"timeoutMs":500}), 3000),
+            (
+                json!({"maxRetries":2.0,"timeoutMs":500,"maxRetryDelayMs":0}),
+                0,
+            ),
+        ] {
+            let mut value = json!({"retry":{"maxDelayMs":3000,"provider":provider}});
+            migrate_legacy_settings(&mut value);
+            assert!(value["retry"].get("maxDelayMs").is_none());
+            validate_settings(&value, Path::new("settings.json")).unwrap();
+            let settings = Settings {
+                value,
+                ..Settings::default()
+            };
+            assert_eq!(
+                settings.provider_retry(),
+                pi_rs::ProviderRetry {
+                    max_retries: 2,
+                    max_retry_delay_ms: expected_delay,
+                    timeout: Some(std::time::Duration::from_millis(500)),
+                }
+            );
+        }
     }
 
     #[test]

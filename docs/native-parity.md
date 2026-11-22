@@ -3492,8 +3492,13 @@ their control state is cleared when the waiting future is dropped.
 
 RPC supports `set_auto_retry` and `abort_retry`, with `auto_retry_start` and
 `auto_retry_end` events. The terminal displays the retry wait, attempt count and
-error. Provider-internal retries and Retry-After handling, summary-specific retry
-policy remain open.
+error. The initial OpenAI Responses (including Azure), OpenAI-compatible Chat
+Completions, and Anthropic Messages HTTP requests honor `retry.provider.maxRetries`
+(default 0), `maxRetryDelayMs` (default 60000, 0 disables the ceiling), and
+`timeoutMs` (to receive response headers on each attempt). They honor `x-should-retry`, `Retry-After-Ms`, and
+`Retry-After` before accepting a response stream. This policy also loads legacy
+`retry.maxDelayMs` when the replacement is unset. Google Gemini and Codex-specific
+provider retries and summary-specific retry policy remain open.
 
 Tests cover recovery, request and retry caps, queued input, wait cancellation,
 dropped-wait cleanup and usage-settlement failures. Loopback RPC checks verify

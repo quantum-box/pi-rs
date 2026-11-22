@@ -106,6 +106,7 @@ impl AnthropicFallbackModel {
 #[derive(Clone)]
 pub struct Anthropic {
     client: Client,
+    provider_retry: pi_rs_core::ProviderRetry,
     http_proxies: Vec<reqwest::Proxy>,
     endpoint: Url,
     auth: (HeaderName, HeaderValue),
@@ -219,6 +220,7 @@ impl Anthropic {
         Ok(Self {
             client,
             http_proxies: Vec::new(),
+            provider_retry: pi_rs_core::ProviderRetry::default(),
             endpoint,
             auth: (name, value),
             oauth: false,
@@ -329,6 +331,12 @@ impl Anthropic {
     }
 
     /// Configure the per-read deadline and explicit HTTP proxies.
+    /// Configure provider-level retries before a response stream starts.
+    pub fn with_provider_retry(mut self, policy: pi_rs_core::ProviderRetry) -> Self {
+        self.provider_retry = policy;
+        self
+    }
+
     pub fn with_http_options(
         mut self,
         timeout: Option<Duration>,
@@ -2201,14 +2209,25 @@ impl Anthropic {
                 }
             }
         }
-        let response = send_http(self.authenticate(
+        let request = self.authenticate(
             request.json(&body),
             interleaved,
             legacy_tool_streaming,
             supports_managed_effort,
             !fallbacks.is_empty(),
-        ))
-        .await?;
+        );
+        let response = self
+            .provider_retry
+            .send(
+                || {
+                    let request = request.try_clone().ok_or_else(|| {
+                        Error::Config("Anthropic request cannot be replayed".into())
+                    });
+                    async { send_http(request?).await }
+                },
+                |response| (response.status().as_u16(), response.headers()),
+            )
+            .await?;
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
