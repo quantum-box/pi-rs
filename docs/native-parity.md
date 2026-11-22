@@ -6563,7 +6563,12 @@ The workbench applies `httpProxy`, proxy environment variables, and
 `NO_PROXY` exclusions to Bedrock Runtime and supported AWS credential
 requests. Instance and container metadata endpoints use direct connections.
 Loopback CLI tests cover proxy selection, role assumption, metadata bypass,
-and CONNECT authentication. The AWS SDK retains its own HTTP timeouts.
+and CONNECT authentication. As in Pi after upstream #12365, the SSO portal
+and SSO OIDC token refresh use the configured HTTPS proxy. Loopback tests
+observe CONNECT requests for role credentials from both environment and
+Workbench-selected profiles, and for refresh with an expired cached SSO
+token. A live SSO sign-in and successful refresh against AWS were not
+verified. The AWS SDK retains its own HTTP timeouts.
 
 Additional Bedrock features remain outside this workbench integration,
 including non-image inputs, workbench-specific thinking display controls,
