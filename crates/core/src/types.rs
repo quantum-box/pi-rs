@@ -101,6 +101,12 @@ pub enum AgentInput {
         name: String,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
+    /// Persist a bookmark through the session owner during an active run.
+    SetSessionLabel {
+        target: u64,
+        label: Option<String>,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
 }
 impl<T: Into<QueuedMessage>> From<T> for AgentInput {
     fn from(message: T) -> Self {
@@ -299,6 +305,37 @@ pub enum Message {
     },
 }
 
+/// Headers required by Copilot for the initiator and capabilities of a turn.
+pub fn copilot_request_headers(
+    messages: &[Message],
+) -> impl Iterator<Item = (&'static str, &'static str)> {
+    let initiator = match messages.last() {
+        None | Some(Message::User { .. } | Message::UserWithImages { .. }) => "user",
+        Some(_) => "agent",
+    };
+    let images = messages.iter().any(|message| match message {
+        Message::UserWithImages { images, .. } => !images.is_empty(),
+        Message::Tool {
+            content,
+            is_structured,
+            ..
+        } if *is_structured != Some(false) => serde_json::from_str::<Value>(content)
+            .ok()
+            .is_some_and(|body| {
+                body.pointer("/data/content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| parts.iter().any(|part| part["type"] == "image"))
+            }),
+        _ => false,
+    });
+    [
+        ("x-initiator", initiator),
+        ("openai-intent", "conversation-edits"),
+    ]
+    .into_iter()
+    .chain(images.then_some(("copilot-vision-request", "true")))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolSpec {
     pub name: String,
@@ -439,7 +476,9 @@ impl CacheRetention {
 #[serde(rename_all = "kebab-case")]
 pub enum ModelApi {
     OpenaiCompletions,
+    MistralConversations,
     OpenaiResponses,
+    OpenaiCodexResponses,
     AnthropicMessages,
     GoogleGenerativeAi,
     BedrockConverseStream,
@@ -450,7 +489,9 @@ impl ModelApi {
     pub fn named(name: &str) -> Option<Self> {
         match name {
             "openai-completions" => Some(Self::OpenaiCompletions),
+            "mistral-conversations" => Some(Self::MistralConversations),
             "openai-responses" => Some(Self::OpenaiResponses),
+            "openai-codex-responses" => Some(Self::OpenaiCodexResponses),
             "anthropic-messages" => Some(Self::AnthropicMessages),
             "google-generative-ai" => Some(Self::GoogleGenerativeAi),
             "bedrock-converse-stream" => Some(Self::BedrockConverseStream),
@@ -462,7 +503,9 @@ impl ModelApi {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenaiCompletions => "openai-completions",
+            Self::MistralConversations => "mistral-conversations",
             Self::OpenaiResponses => "openai-responses",
+            Self::OpenaiCodexResponses => "openai-codex-responses",
             Self::AnthropicMessages => "anthropic-messages",
             Self::GoogleGenerativeAi => "google-generative-ai",
             Self::BedrockConverseStream => "bedrock-converse-stream",
@@ -480,6 +523,9 @@ pub struct ModelMetadata {
     pub cost_breakdown: Option<UsageCostBreakdown>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_from_provider: Option<bool>,
+    /// Service tier multiplier applied to catalog estimates for this reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_cost_multiplier: Option<serde_json::Number>,
     pub provider_request_id: Option<String>,
     pub cached_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -603,6 +649,33 @@ pub struct ProviderReplay {
 }
 
 impl ProviderReplay {
+    /// Preserve the recorded Anthropic effort without placing private data on the wire.
+    pub fn record_anthropic_effort(&mut self, effort: &str) {
+        if let Some(effort) = Self::valid_anthropic_effort(effort) {
+            self.blocks
+                .retain(|block| block.get("_pi_anthropic_effort").is_none());
+            self.blocks
+                .push(serde_json::json!({"_pi_anthropic_effort":effort}));
+        }
+    }
+
+    pub fn anthropic_effort(&self) -> Option<&'static str> {
+        self.blocks.iter().find_map(|block| {
+            Self::valid_anthropic_effort(block.get("_pi_anthropic_effort")?.as_str()?)
+        })
+    }
+
+    pub fn valid_anthropic_effort(effort: &str) -> Option<&'static str> {
+        match effort {
+            "low" => Some("low"),
+            "medium" => Some("medium"),
+            "high" => Some("high"),
+            "xhigh" => Some("xhigh"),
+            "max" => Some("max"),
+            _ => None,
+        }
+    }
+
     pub fn is_context_edit(&self) -> bool {
         self.blocks
             .iter()
@@ -791,6 +864,12 @@ pub trait Model: Send + Sync {
     async fn context_window(&self, _model: &str) -> Option<u32> {
         None
     }
+
+    /// Smallest positive output budget accepted by this adapter.
+    fn minimum_output_tokens(&self) -> u32 {
+        1
+    }
+
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream>;
 
     /// Host adapters can reserve budget using this ID before calling a provider.

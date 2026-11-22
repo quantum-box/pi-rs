@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -36,15 +39,19 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
     let address = listener.local_addr().unwrap();
     let calls = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
     let server_calls = calls.clone();
+    let initialize_attempts = Arc::new(AtomicUsize::new(0));
+    let server_initialize_attempts = initialize_attempts.clone();
     let server = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             let calls = server_calls.clone();
+            let attempts = server_initialize_attempts.clone();
             tokio::spawn(async move {
                 let mut socket = BufReader::new(socket);
                 let mut line = String::new();
                 if socket.read_line(&mut line).await.is_err() {
                     return;
                 }
+                let templates_unimplemented = line.starts_with("POST /without-templates ");
                 let mut length = 0;
                 loop {
                     line.clear();
@@ -63,18 +70,58 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
                     return;
                 }
                 let request: Value = serde_json::from_slice(&bytes).unwrap_or_default();
-                if let Some(method) = request["method"]
-                    .as_str()
-                    .filter(|method| method.starts_with("resources/"))
-                {
-                    calls.lock().unwrap().push((
-                        method.to_owned(),
-                        request["params"]["cursor"].as_str().map(str::to_owned),
-                    ));
+                let method = request["method"].as_str().unwrap_or_default();
+                let cursor = request["params"]["cursor"].as_str();
+                let mut status = None;
+                if method.starts_with("resources/") || method == "tools/call" {
+                    let mut calls = calls.lock().unwrap();
+                    let first = !calls
+                        .iter()
+                        .any(|(name, value)| name == method && value.as_deref() == cursor);
+                    calls.push((method.to_owned(), cursor.map(str::to_owned)));
+                    status = match (method, cursor, first) {
+                        ("resources/list", Some("retry-408"), true) => Some("408 Request Timeout"),
+                        ("resources/list", Some("retry-429"), true) => {
+                            Some("429 Too Many Requests")
+                        }
+                        ("resources/templates/list", Some("retry-503"), true) => {
+                            Some("503 Unavailable")
+                        }
+                        ("resources/list", Some("never-retry-501"), _) => {
+                            Some("501 Not Implemented")
+                        }
+                        ("resources/list", Some("always-503"), _) => Some("503 Unavailable"),
+                        ("tools/call", _, _) => Some("503 Unavailable"),
+                        _ => None,
+                    };
+                }
+                if method == "initialize" {
+                    status = match attempts.fetch_add(1, Ordering::Relaxed) {
+                        0 => Some("503 Unavailable"),
+                        1 => Some("429 Too Many Requests"),
+                        _ => None,
+                    };
+                }
+                if let Some(status) = status {
+                    socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                    return;
+                }
+                if templates_unimplemented && request["method"] == "resources/templates/list" {
+                    let (code, message) = if request["params"]["cursor"] == "fault" {
+                        (-32603, "fixture internal error")
+                    } else {
+                        (-32601, "resource templates are unavailable")
+                    };
+                    let body = json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":code,"message":message}}).to_string();
+                    let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                    return;
                 }
                 let result = match request["method"].as_str() {
                     Some("initialize") => Some(
-                        json!({"protocolVersion":request["params"]["protocolVersion"],"capabilities":{"resources":{}},"serverInfo":{"name":"fixture","version":"1"}}),
+                        json!({"protocolVersion":request["params"]["protocolVersion"],"capabilities":{"resources":{},"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}),
+                    ),
+                    Some("tools/list") => Some(
+                        json!({"tools":[{"name":"write_fixture","inputSchema":{"type":"object"}}]}),
                     ),
                     Some("resources/list")
                         if matches!(
@@ -141,6 +188,7 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
             .await
             .unwrap(),
     );
+    assert_eq!(initialize_attempts.load(Ordering::Relaxed), 3);
     let tools = extension.tools();
     for (suffix, key, names) in [
         (
@@ -275,6 +323,48 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
         );
         assert_eq!(calls.lock().unwrap().len(), before_invalid);
     }
+    for (tool, cursor, attempts, succeeds) in [
+        ("list_resources_page", "retry-408", 2, true),
+        ("list_resources_page", "retry-429", 2, true),
+        ("list_resource_templates_page", "retry-503", 2, true),
+        ("list_resources_page", "never-retry-501", 1, false),
+        ("list_resources_page", "always-503", 2, false),
+        ("write_fixture", "", 1, false),
+    ] {
+        let tool = tools
+            .iter()
+            .find(|configured| configured.spec().name == format!("mcp__fixture__{tool}"))
+            .unwrap();
+        let arguments = if cursor.is_empty() {
+            json!({})
+        } else {
+            json!({"cursor":cursor})
+        };
+        let before = calls.lock().unwrap().len();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            tool.invoke(
+                arguments,
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: CancellationToken::new(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            matches!(outcome, Outcome::Structured { .. }),
+            succeeds,
+            "{cursor}: {outcome:?}"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len() - before,
+            attempts,
+            "{cursor}: {outcome:?}"
+        );
+    }
+
     let hidden_config: ServerConfig = serde_json::from_value(json!({"url":format!("http://{address}/mcp"),"oauth":false,"exposure":"direct","toolExposure":{"list_resources":"hidden"}})).unwrap();
     let hidden = McpExtension::connect("hidden", &hidden_config, directory.path())
         .await
@@ -360,6 +450,49 @@ async fn resource_listings_filter_mcp_apps_and_presentation_metadata_across_page
     let page: Value = serde_json::from_str(&page).unwrap();
     assert_eq!(page["nextCursor"], "after-large");
     assert_eq!(page["resources"][0]["description"], "猫\n".repeat(300_000));
+    let legacy_config: ServerConfig = serde_json::from_value(json!({
+        "url":format!("http://{address}/without-templates"),
+        "oauth":false
+    }))
+    .unwrap();
+    let legacy = McpExtension::connect("legacy", &legacy_config, directory.path())
+        .await
+        .unwrap();
+    for (name, arguments, expected) in [
+        (
+            "mcp__legacy__list_resource_templates",
+            json!({}),
+            json!({"resourceTemplates":[]}),
+        ),
+        (
+            "mcp__legacy__list_resource_templates_page",
+            json!({"cursor":"stale"}),
+            json!({"server":"legacy","resourceTemplates":[]}),
+        ),
+    ] {
+        let tool = legacy
+            .tools()
+            .into_iter()
+            .find(|tool| tool.spec().name == name)
+            .unwrap();
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::new_v4(),
+            cancellation: CancellationToken::new(),
+        };
+        let result = tool.invoke(arguments, context()).await;
+        let Outcome::Structured { data, .. } = result else {
+            panic!("an unimplemented template method should return an empty result: {result:?}");
+        };
+        assert_eq!(data, expected);
+        if name.ends_with("_page") {
+            let error = tool.invoke(json!({"cursor":"fault"}), context()).await;
+            assert!(
+                matches!(&error, Outcome::Unknown(message) if message.contains("fixture internal error")),
+                "expected the existing MCP error outcome, got {error:?}"
+            );
+        }
+    }
+    legacy.close().await;
     extension.close().await;
     server.abort();
 }
