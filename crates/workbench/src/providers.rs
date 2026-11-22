@@ -134,6 +134,56 @@ impl Provider {
         }
     }
 
+    pub fn display_name(&self) -> &str {
+        match self.id() {
+            "amazon-bedrock" => "Amazon Bedrock",
+            "ant-ling" => "Ant Ling",
+            "anthropic" => "Anthropic",
+            "azure" => "Azure",
+            "baseten" => "Baseten",
+            "cerebras" => "Cerebras",
+            "cloudflare-ai-gateway" => "Cloudflare AI Gateway",
+            "cloudflare-workers-ai" => "Cloudflare Workers AI",
+            "deepseek" => "DeepSeek",
+            "fireworks" => "Fireworks",
+            "github-copilot" => "GitHub Copilot",
+            "google" => "Google",
+            "google-vertex" => "Google Vertex AI",
+            "groq" => "Groq",
+            "huggingface" => "Hugging Face",
+            "kimi-coding" => "Kimi For Coding",
+            "meta" => "Meta",
+            "minimax" => "MiniMax",
+            "minimax-cn" => "MiniMax CN",
+            "mistral" => "Mistral",
+            "moonshotai" => "Moonshot AI",
+            "moonshotai-cn" => "Moonshot AI CN",
+            "nvidia" => "NVIDIA",
+            "ollama" => "Ollama",
+            "openai" => "OpenAI",
+            "openai-chatgpt" => "ChatGPT",
+            "openai-codex" => "OpenAI Codex",
+            "opencode" => "OpenCode Zen",
+            "opencode-go" => "OpenCode Go",
+            "openrouter" => "OpenRouter",
+            "qwen-token-plan" => "Qwen Token Plan Team",
+            "qwen-token-plan-cn" => "Qwen Token Plan Team CN",
+            "qwen-token-plan-individual" => "Qwen Token Plan Individual",
+            "qwen-token-plan-individual-cn" => "Qwen Token Plan Individual CN",
+            "radius" => "Radius",
+            "together" => "Together",
+            "vercel-ai-gateway" => "Vercel AI Gateway",
+            "xai" => "xAI",
+            "xiaomi" => "Xiaomi",
+            "xiaomi-token-plan-ams" => "Xiaomi Token Plan AMS",
+            "xiaomi-token-plan-cn" => "Xiaomi Token Plan CN",
+            "xiaomi-token-plan-sgp" => "Xiaomi Token Plan SGP",
+            "zai" => "Z.AI",
+            "zai-coding-cn" => "Z.AI Coding CN",
+            id => id,
+        }
+    }
+
     pub fn named(name: &str) -> Option<Self> {
         if name.eq_ignore_ascii_case("openai-chatgpt") {
             return Some(Self::Custom {
@@ -372,6 +422,7 @@ pub(super) struct Deferred {
     http_settings: Option<super::config::Settings>,
     options: Option<(Box<Cli>, bool)>,
     probe_context: bool,
+    disable_message_thread_continuation: bool,
     observed: bool,
     estimator: Arc<OnceLock<Option<Box<Client>>>>,
 }
@@ -567,6 +618,9 @@ impl Deferred {
         if let Some((args, reported)) = &self.options {
             client = client.with_model_options(args, *reported)?;
         }
+        if self.disable_message_thread_continuation {
+            client = client.without_message_thread_continuation();
+        }
         Ok((
             if self.observed {
                 client.observe()
@@ -699,9 +753,23 @@ impl Client {
             http_settings: None,
             options: None,
             probe_context: true,
+            disable_message_thread_continuation: false,
             observed: false,
             estimator: Arc::new(OnceLock::new()),
         }))
+    }
+
+    pub(super) fn without_message_thread_continuation(self) -> Self {
+        match self {
+            Self::Anthropic(client) => {
+                Self::Anthropic(client.without_message_thread_continuation())
+            }
+            Self::Deferred(mut client) if client.adapter == Adapter::Anthropic => {
+                client.disable_message_thread_continuation = true;
+                Self::Deferred(client)
+            }
+            other => other,
+        }
     }
 
     pub fn with_http_settings(self, settings: &super::config::Settings) -> Result<Self> {
@@ -1338,6 +1406,11 @@ impl Client {
                         &args.model,
                         args.explicit_endpoint_for(&args.provider),
                     );
+                let (thread_default, thread_models) = args.model_profiles.anthropic_thread_support(
+                    &args.provider,
+                    &args.model,
+                    args.explicit_endpoint_for(&args.provider),
+                );
                 let mut client = client
                     .with_eager_tool_input_streaming(eager_default, eager_models)
                     .with_strict_tool_support(strict)
@@ -1367,6 +1440,7 @@ impl Client {
                             args.explicit_endpoint_for(&args.provider),
                         ),
                     )
+                    .with_message_thread_support(thread_default, thread_models)
                     .with_fallback_models(args.model_profiles.anthropic_fallback_models(
                         &args.provider,
                         &args.model,
@@ -2521,11 +2595,12 @@ mod contention_tests {
     async fn prepared_anthropic_dispatch_preserves_config_wire_and_routing() {
         use clap::Parser;
         use std::io::{Read, Write};
-        for (deferred, summary, direct) in [
-            (false, false, false),
-            (true, false, false),
-            (true, true, false),
-            (true, false, true),
+        for (deferred, summary, direct, warming) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, true),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -2584,7 +2659,7 @@ mod contention_tests {
             let endpoint = format!("http://{address}/v1/messages");
             let mut args = super::super::Cli::parse_from(["pi"]);
             args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"test":{
-                "api":"anthropic-messages","baseUrl":endpoint,"models":[{"id":"m-base","compat":{"supportsStrictTools":false}},{"id":"m","compat":{"supportsStrictTools":true}}]
+                "api":"anthropic-messages","baseUrl":endpoint,"compat":{"supportsMessageThreads":true},"models":[{"id":"m-base","compat":{"supportsStrictTools":false}},{"id":"m","compat":{"supportsStrictTools":true}}]
             }}})).unwrap();
             args.provider = args.model_profiles.provider("test").unwrap();
             args.model = "m-base".into();
@@ -2606,6 +2681,11 @@ mod contention_tests {
             .with_context_probes(false)
             .with_model_options(&args, false)
             .unwrap();
+            let client = if warming {
+                client.without_message_thread_continuation()
+            } else {
+                client
+            };
             let model = super::super::image_policy::WorkbenchModel {
                 strict_policy: None,
                 client: client.clone(),
@@ -2672,6 +2752,8 @@ mod contention_tests {
                 !summary && !direct
             );
             assert_eq!(body["tools"][0].get("cache_control").is_some(), !summary);
+            assert_eq!(headers.contains("message-threads-2026-08-12"), !summary);
+            assert_eq!(body.get("thread").is_some(), !summary && !warming);
         }
     }
 
