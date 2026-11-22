@@ -5364,6 +5364,11 @@ An explicit connection-limit rejection before output opens a new connection
 once. Stream error statuses distinguish retryable service failures from
 terminal account limits. Native HTTP SSE uses a zstd-compressed JSON body
 when compression succeeds. The WebSocket request stays a JSON text frame.
+Responses can carry JSON as text or binary WebSocket messages. Ping, pong and
+empty messages do not reset the configured HTTP idle deadline for a response.
+The native client retains its per-attempt interruption policy. Loopback
+fixtures cover both frame handling and the deadline. Authenticated acceptance
+of these transport cases was unverified.
 
 OpenAI Responses and Codex models with `compat.supportsOpenAIGrammarTools` advertise grammar
 tools as custom tools. They choose a nonempty Lark definition before a regex

@@ -324,16 +324,28 @@ async fn send(socket: &mut Socket, mut body: Value, timeout: Option<Duration>) -
     .map_err(|_| disconnected())
 }
 
-async fn next(socket: &mut Socket, timeout: Option<Duration>) -> Result<Message> {
-    let next = socket.next();
+async fn next_response_frame(socket: &mut Socket, timeout: Option<Duration>) -> Result<Message> {
+    let next = async {
+        while let Some(frame) = socket.next().await {
+            let frame = frame.map_err(|_| disconnected())?;
+            match &frame {
+                Message::Ping(_) | Message::Pong(_) => {}
+                Message::Text(payload) if payload.is_empty() => {}
+                Message::Binary(payload) if payload.is_empty() => {}
+                _ => return Ok(frame),
+            }
+        }
+        Err(disconnected())
+    };
     match timeout {
-        Some(timeout) => tokio::time::timeout(timeout, next)
-            .await
-            .map_err(|_| disconnected())?,
+        Some(timeout) => tokio::time::timeout(timeout, next).await.map_err(|_| {
+            Error::RetryableModel(format!(
+                "WebSocket idle timeout after {}ms",
+                timeout.as_millis()
+            ))
+        })?,
         None => next.await,
     }
-    .ok_or_else(disconnected)?
-    .map_err(|_| disconnected())
 }
 
 async fn probe_idle_socket(socket: &mut Socket, timeout: Option<Duration>) -> bool {
@@ -452,20 +464,20 @@ pub(super) async fn open(
         let mut has_output = false;
         let mut retried_connection_limit = false;
         loop {
-            let event = match next(&mut socket, timeout)
+            let frame = next_response_frame(&mut socket, timeout)
                 .await
-                .map_err(|error| interrupted_transport(transport_key.as_deref(), error))?
-            {
-                Message::Text(text) => text,
-                Message::Ping(_) | Message::Pong(_) => continue,
+                .map_err(|error| interrupted_transport(transport_key.as_deref(), error))?;
+            let payload = match &frame {
+                Message::Text(text) => text.as_str().as_bytes(),
+                Message::Binary(bytes) => bytes.as_ref(),
                 Message::Close(_) => Err(interrupted_transport(transport_key.as_deref(), disconnected()))?,
                 _ => Err(Error::Model("unexpected Codex WebSocket message".into()))?,
             };
-            seen = seen.saturating_add(event.len());
+            seen = seen.saturating_add(payload.len());
             if seen > super::MAX_STREAM {
                 Err(Error::Model("OpenAI stream exceeds 32 MiB".into()))?;
             }
-            let event: Value = serde_json::from_str(event.as_str())
+            let event: Value = serde_json::from_str(&String::from_utf8_lossy(payload))
                 .map_err(|_| Error::Model("invalid Codex WebSocket event".into()))?;
             let kind = event["type"].as_str().unwrap_or_default();
             let failure_code = event["error"]["code"].as_str().or_else(|| event["code"].as_str())
@@ -510,6 +522,7 @@ pub(super) async fn open(
 mod tests {
     use super::*;
     use crate::{CodexTransport, OpenAiResponses};
+    use futures_util::TryStreamExt;
     use pi_rs_core::{Message as CoreMessage, Model, ModelEvent, ModelRequest};
 
     fn client(endpoint: String, transport: CodexTransport) -> OpenAiResponses {
@@ -1291,6 +1304,89 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), exchange)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_accepts_binary_json_and_ignores_empty_response_frames() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            assert_eq!(read_request(&mut socket).await["type"], "response.create");
+            socket.send(Message::Text("".into())).await.unwrap();
+            socket
+                .send(Message::Binary(Vec::new().into()))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Binary(
+                    serde_json::to_vec(&json!({
+                        "type":"response.completed",
+                        "response":{"status":"completed","output":[]}
+                    }))
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let model = client(
+            format!("http://{address}/backend-api/codex/responses"),
+            CodexTransport::WebSocket,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            model
+                .stream(request(vec![prompt("test")]))
+                .await?
+                .try_collect::<Vec<_>>()
+                .await
+        })
+        .await
+        .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_control_and_empty_frames_do_not_extend_response_idle_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            assert_eq!(read_request(&mut socket).await["type"], "response.create");
+            loop {
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err()
+                    || socket.send(Message::Text("".into())).await.is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let model = client(
+            format!("http://{address}/backend-api/codex/responses"),
+            CodexTransport::WebSocket,
+        )
+        .with_http_options(Some(Duration::from_millis(150)), &[])
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            model
+                .stream(request(vec![prompt("test")]))
+                .await?
+                .try_collect::<Vec<_>>()
+                .await
+        })
+        .await;
+        server.abort();
+        let error = result
+            .expect("control frames sustained the idle stream")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::RetryableModel(message) if message == "WebSocket idle timeout after 150ms"
+        ));
     }
 
     #[tokio::test]
