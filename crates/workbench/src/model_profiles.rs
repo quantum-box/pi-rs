@@ -2,8 +2,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 
-use pi_rs::ollama::ChatCompatibility;
+pub(super) use pi_rs::ChatPrice;
 use pi_rs::{Error, Result};
+use pi_rs::{anthropic::AnthropicFallbackModel, ollama::ChatCompatibility};
 use pi_rs_workbench::image_profile::ImageResizeProfile;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,10 @@ pub(super) struct Profiles {
     entries: BTreeMap<String, Profile>,
     revision: String,
     cloudflare_saved_account: Option<String>,
+    cloudflare_gateway_route: Option<super::cloudflare_gateway::Route>,
     radius_endpoint: Option<String>,
+    azure_api_version: Option<String>,
+    azure_deployments: BTreeMap<String, String>,
     operations: super::operation_models::Catalogue,
 }
 
@@ -26,6 +30,7 @@ struct Profile {
     provider: Provider,
     endpoint: String,
     base_url: Option<String>,
+    configured_cloudflare_base: Option<String>,
     provider_endpoints: BTreeSet<String>,
     api_key: Option<String>,
     headers: BTreeMap<String, String>,
@@ -203,6 +208,9 @@ struct ModelCompatibility {
     chat: ChatCompatibility,
     allow_empty_signature: Option<bool>,
     supports_strict_tools: Option<bool>,
+    supports_max_output_tokens: Option<bool>,
+    supports_mid_convo_effort: Option<bool>,
+    allowed_fallback_models: Option<Vec<AnthropicFallbackModel>>,
     force_adaptive_thinking: Option<bool>,
     send_session_affinity_headers: Option<bool>,
     session_affinity_format: Option<AffinityFormat>,
@@ -210,15 +218,31 @@ struct ModelCompatibility {
     supports_long_cache_retention: Option<bool>,
     supports_explicit_prompt_cache_mode: Option<bool>,
     supports_cache_control_on_tools: Option<bool>,
+    supports_eager_tool_input_streaming: Option<bool>,
     cache_control_format: Option<CacheControlFormat>,
 }
 
 impl ModelCompatibility {
+    fn valid(&self) -> bool {
+        self.allowed_fallback_models
+            .as_deref()
+            .is_none_or(AnthropicFallbackModel::valid_list)
+    }
+
     fn overlay(self, newer: Self) -> Self {
         Self {
             chat: self.chat.overlay(newer.chat),
             allow_empty_signature: newer.allow_empty_signature.or(self.allow_empty_signature),
             supports_strict_tools: newer.supports_strict_tools.or(self.supports_strict_tools),
+            supports_max_output_tokens: newer
+                .supports_max_output_tokens
+                .or(self.supports_max_output_tokens),
+            supports_mid_convo_effort: newer
+                .supports_mid_convo_effort
+                .or(self.supports_mid_convo_effort),
+            allowed_fallback_models: newer
+                .allowed_fallback_models
+                .or(self.allowed_fallback_models),
             force_adaptive_thinking: newer
                 .force_adaptive_thinking
                 .or(self.force_adaptive_thinking),
@@ -238,134 +262,11 @@ impl ModelCompatibility {
             supports_cache_control_on_tools: newer
                 .supports_cache_control_on_tools
                 .or(self.supports_cache_control_on_tools),
+            supports_eager_tool_input_streaming: newer
+                .supports_eager_tool_input_streaming
+                .or(self.supports_eager_tool_input_streaming),
             cache_control_format: newer.cache_control_format.or(self.cache_control_format),
         }
-    }
-}
-
-/// Model prices in dollars per million tokens.
-#[derive(Clone, Default, Deserialize)]
-struct ChatRates {
-    input: Option<f64>,
-    output: Option<f64>,
-    #[serde(rename = "cacheRead")]
-    cache_read: Option<f64>,
-    #[serde(rename = "cacheWrite")]
-    cache_write: Option<f64>,
-}
-
-impl ChatRates {
-    fn overlay(self, newer: Self) -> Self {
-        Self {
-            input: newer.input.or(self.input),
-            output: newer.output.or(self.output),
-            cache_read: newer.cache_read.or(self.cache_read),
-            cache_write: newer.cache_write.or(self.cache_write),
-        }
-    }
-
-    fn valid(&self) -> bool {
-        [self.input, self.output, self.cache_read, self.cache_write]
-            .into_iter()
-            .flatten()
-            .all(|amount| amount.is_finite() && amount >= 0.0)
-    }
-
-    fn value(&self) -> Value {
-        serde_json::json!({
-            "input": self.input.unwrap_or_default(),
-            "output": self.output.unwrap_or_default(),
-            "cacheRead": self.cache_read.unwrap_or_default(),
-            "cacheWrite": self.cache_write.unwrap_or_default(),
-        })
-    }
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PriceTier {
-    input_tokens_above: u64,
-    #[serde(flatten)]
-    rates: ChatRates,
-}
-
-#[derive(Clone, Default, Deserialize)]
-pub(super) struct ChatPrice {
-    #[serde(flatten)]
-    rates: ChatRates,
-    tiers: Option<Vec<PriceTier>>,
-}
-
-impl ChatPrice {
-    fn overlay(self, newer: Self) -> Self {
-        Self {
-            rates: self.rates.overlay(newer.rates),
-            tiers: newer.tiers.or(self.tiers),
-        }
-    }
-
-    fn valid(&self) -> bool {
-        self.rates.valid()
-            && self
-                .tiers
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .all(|tier| tier.rates.valid())
-    }
-
-    pub fn value(&self) -> Value {
-        let mut value = self.rates.value();
-        if let Some(tiers) = &self.tiers {
-            value["tiers"] = Value::Array(
-                tiers
-                    .iter()
-                    .map(|tier| {
-                        let mut value = tier.rates.value();
-                        value["inputTokensAbove"] = serde_json::json!(tier.input_tokens_above);
-                        value
-                    })
-                    .collect(),
-            );
-        }
-        value
-    }
-
-    pub fn estimate(
-        &self,
-        usage: pi_rs::Usage,
-        metadata: &pi_rs::ModelMetadata,
-    ) -> Option<pi_rs::UsageCostBreakdown> {
-        let tier = self
-            .tiers
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .rev()
-            .filter(|tier| usage.input_tokens > tier.input_tokens_above)
-            .max_by_key(|tier| tier.input_tokens_above);
-        let rates = tier.map_or(&self.rates, |tier| &tier.rates);
-        let reads = metadata
-            .cached_input_tokens
-            .unwrap_or_default()
-            .min(usage.input_tokens);
-        let other_input = usage.input_tokens - reads;
-        let writes = metadata
-            .cache_creation_input_tokens
-            .unwrap_or_default()
-            .min(other_input);
-        let long = metadata
-            .cache_write_1h_tokens
-            .unwrap_or_default()
-            .min(writes);
-        let input_rate = rates.input.unwrap_or_default();
-        pi_rs::UsageCostBreakdown::new(
-            (input_rate / 1_000_000.0) * (other_input - writes) as f64,
-            (rates.output.unwrap_or_default() / 1_000_000.0) * usage.output_tokens as f64,
-            (rates.cache_read.unwrap_or_default() / 1_000_000.0) * reads as f64,
-            (rates.cache_write.unwrap_or_default() / 1_000_000.0) * (writes - long) as f64
-                + (input_rate / 500_000.0) * long as f64,
-        )
     }
 }
 
@@ -530,6 +431,7 @@ impl ModelMetadata {
                 .is_some_and(|name| name.trim().is_empty())
             || self.context_window == Some(0)
             || self.max_tokens == Some(0)
+            || !self.compat.valid()
             || self.cost.as_ref().is_some_and(|cost| !cost.valid())
             || self.input_limits.is_some_and(|limits| !limits.valid())
             || self.prompt_cache.is_some_and(|cache| !cache.valid())
@@ -568,7 +470,7 @@ impl ModelMetadata {
         }
         // Pi exposes the default five levels for a reasoning model even when
         // its configuration does not specify a thinkingLevelMap.
-        if adapter == Adapter::Anthropic
+        if matches!(adapter, Adapter::Anthropic | Adapter::AzureResponses)
             && self.reasoning == Some(true)
             && self.thinking_level_map.is_empty()
         {
@@ -581,9 +483,13 @@ impl ModelMetadata {
         if !matches!(
             adapter,
             Adapter::ChatCompletions
+                | Adapter::MistralConversations
                 | Adapter::Anthropic
                 | Adapter::OpenAiResponses
+                | Adapter::AzureResponses
+                | Adapter::CodexResponses
                 | Adapter::Google
+                | Adapter::GoogleVertex
                 | Adapter::Bedrock
         ) || self.thinking_level_map.is_empty()
         {
@@ -661,6 +567,10 @@ impl ModelMetadata {
         !self.thinking_level_map.is_empty()
     }
 
+    pub fn has_thinking_map(&self) -> bool {
+        !self.thinking_level_map.is_empty()
+    }
+
     pub fn mapped_effort(&self, level: &str) -> Option<Option<&str>> {
         self.thinking_level_map.get(level).map(Option::as_deref)
     }
@@ -713,6 +623,62 @@ static BUILTIN_MODELS: LazyLock<BTreeMap<String, Vec<ConfiguredModel>>> = LazyLo
     );
     models
 });
+
+fn configure_azure(data: &mut Value, env: impl Fn(&str) -> Option<String>) -> Result<()> {
+    let configured_base = data
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| {
+            providers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("azure"))
+        })
+        .is_some_and(|(_, provider)| provider.get("baseUrl").is_some());
+    if configured_base {
+        return Ok(());
+    }
+
+    let explicit = env("AZURE_OPENAI_BASE_URL").filter(|base| !base.trim().is_empty());
+    let base = if let Some(base) = explicit {
+        base.trim().to_owned()
+    } else if let Some(resource) = env("AZURE_OPENAI_RESOURCE_NAME").filter(|name| !name.is_empty())
+    {
+        if !resource
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || resource.starts_with('-')
+            || resource.ends_with('-')
+            || resource.len() > 63
+        {
+            return Err(Error::Config("invalid AZURE_OPENAI_RESOURCE_NAME".into()));
+        }
+        format!("https://{resource}.openai.azure.com")
+    } else {
+        return Ok(());
+    };
+    let providers = data
+        .as_object_mut()
+        .and_then(|data| {
+            data.entry("providers")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+        })
+        .ok_or_else(|| Error::Config("models.json providers must be an object".into()))?;
+    let name = providers
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case("azure"))
+        .cloned();
+    let azure = providers
+        .entry(name.unwrap_or_else(|| "azure".into()))
+        .or_insert_with(|| serde_json::json!({}));
+    let azure = azure
+        .as_object_mut()
+        .ok_or_else(|| Error::Config("invalid models.json profile for azure".into()))?;
+    azure
+        .entry("baseUrl")
+        .or_insert_with(|| serde_json::json!(base));
+    Ok(())
+}
 
 fn configure_cloudflare_workers(
     providers: &mut serde_json::Map<String, Value>,
@@ -780,6 +746,10 @@ fn configure_cloudflare_workers(
     Ok(())
 }
 
+fn fixed_cloudflare_base(base: &str) -> bool {
+    !base.contains("{CLOUDFLARE_ACCOUNT_ID}") && !base.contains("{CLOUDFLARE_GATEWAY_ID}")
+}
+
 pub(super) fn cloudflare_workers_chat_account(endpoint: &str) -> Option<&str> {
     let path = endpoint.strip_prefix("https://api.cloudflare.com/client/v4/accounts/")?;
     let account = path.strip_suffix("/ai/v1/chat/completions")?;
@@ -789,11 +759,13 @@ pub(super) fn cloudflare_workers_chat_account(endpoint: &str) -> Option<&str> {
 impl Profiles {
     pub fn load(keys: &super::model_auth::Keys) -> Result<Self> {
         let path = config::agent_dir().join("models.json");
-        let data = config::read_object(&path)?;
+        let mut data = config::read_object(&path)?;
         let account = std::env::var("CLOUDFLARE_ACCOUNT_ID").ok();
-        let mut profiles = Self::parse_with_cloudflare_account(
-            &data,
+        let mut profiles = Self::parse_with_provider_environment(
+            &mut data,
             keys.cloudflare_chat_account().or(account.as_deref()),
+            keys.cloudflare_gateway_route(),
+            |name| std::env::var(name).ok(),
         )?;
         profiles.cloudflare_saved_account = keys.cloudflare_chat_account().map(str::to_owned);
         if std::env::var_os("PI_RADIUS_GATEWAY").is_some() {
@@ -817,16 +789,74 @@ impl Profiles {
         Ok(profiles)
     }
 
+    #[cfg(test)]
+    pub(super) fn parse_with_azure_env(
+        data: &mut Value,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        Self::parse_with_provider_environment(data, None, None, env)
+    }
+
+    fn parse_with_provider_environment(
+        data: &mut Value,
+        account: Option<&str>,
+        gateway: Option<super::cloudflare_gateway::Route>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        configure_azure(data, &env)?;
+        let mut profiles = Self::parse_with_cloudflare_routes(data, account, gateway)?;
+        profiles.azure_api_version =
+            env("AZURE_OPENAI_API_VERSION").filter(|value| !value.is_empty());
+        if let Some(mapping) = env("AZURE_OPENAI_DEPLOYMENT_NAME_MAP") {
+            profiles.azure_deployments = parse_azure_deployments(&mapping);
+        }
+        Ok(profiles)
+    }
+
     pub(super) fn cloudflare_saved_account(&self) -> Option<&str> {
         self.cloudflare_saved_account.as_deref()
     }
 
     #[cfg(test)]
     pub(super) fn parse(data: &Value) -> Result<Self> {
-        Self::parse_with_cloudflare_account(data, None)
+        Self::parse_with_cloudflare_routes(data, None, None)
     }
 
+    #[cfg(test)]
     fn parse_with_cloudflare_account(data: &Value, account: Option<&str>) -> Result<Self> {
+        Self::parse_with_cloudflare_routes(data, account, None)
+    }
+
+    pub(super) fn cloudflare_configured_base(
+        &self,
+        provider: &Provider,
+        model: Option<&str>,
+    ) -> Option<&str> {
+        let profile = self.entries.get(provider.id())?;
+        model
+            .and_then(|id| profile.models.iter().find(|model| model.id == id))
+            .and_then(|model| model.base_url.as_deref())
+            .or(profile.configured_cloudflare_base.as_deref())
+    }
+
+    pub(super) fn has_fixed_cloudflare_endpoint(
+        &self,
+        provider: &Provider,
+        model: Option<&str>,
+    ) -> bool {
+        self.cloudflare_configured_base(provider, model)
+            .is_some_and(fixed_cloudflare_base)
+    }
+
+    pub(super) fn cloudflare_gateway_route(&self) -> Option<&super::cloudflare_gateway::Route> {
+        self.cloudflare_gateway_route.as_ref()
+    }
+
+    pub(super) fn parse_with_cloudflare_routes(
+        data: &Value,
+        account: Option<&str>,
+        cloudflare_gateway_route: Option<super::cloudflare_gateway::Route>,
+    ) -> Result<Self> {
         let empty = serde_json::Map::new();
         let providers = match data.get("providers") {
             Some(providers) => providers
@@ -838,6 +868,33 @@ impl Profiles {
         let operations = super::operation_models::Catalogue::parse(configured_providers)?;
         let mut providers = configured_providers.clone();
         configure_cloudflare_workers(&mut providers, account)?;
+        if let Some(route) = &cloudflare_gateway_route {
+            let name = providers
+                .keys()
+                .find(|name| name.eq_ignore_ascii_case("cloudflare-ai-gateway"))
+                .cloned();
+            let entry = providers
+                .entry(name.unwrap_or_else(|| "cloudflare-ai-gateway".into()))
+                .or_insert_with(|| serde_json::json!({}));
+            let entry = entry
+                .as_object_mut()
+                .ok_or_else(|| Error::Config("invalid Cloudflare AI Gateway profile".into()))?;
+            let base = entry.get("baseUrl").and_then(Value::as_str);
+            let routed = match base {
+                None => Some(route.clone()),
+                Some(base) => super::cloudflare_gateway::Route::from_configured(base, Some(route)),
+            };
+            if let Some(route) = routed {
+                entry.insert(
+                    "baseUrl".into(),
+                    Value::String(
+                        route
+                            .endpoint(Adapter::ChatCompletions)
+                            .expect("supported gateway API"),
+                    ),
+                );
+            }
+        }
 
         let mut entries = BTreeMap::new();
         for (name, entry) in &providers {
@@ -878,12 +935,18 @@ impl Profiles {
             if profile
                 .api
                 .as_deref()
-                .is_some_and(|api| api != provider.api())
+                .is_some_and(|api| Adapter::named(api) != Some(provider.adapter()))
             {
                 return Err(Error::Config(format!(
                     "models.json profile {} requires the {} API",
                     provider.id(),
                     provider.api()
+                )));
+            }
+            if !profile.compat.valid() {
+                return Err(Error::Config(format!(
+                    "invalid Anthropic fallback policy for {}",
+                    provider.id()
                 )));
             }
             let endpoint = profile.base_url.as_deref().map_or_else(
@@ -971,13 +1034,16 @@ impl Profiles {
                     let Some(adapter) = model.api.as_deref().and_then(Adapter::named) else {
                         continue;
                     };
-                    let Some(official) = builtin.endpoint_for(adapter) else {
-                        continue;
-                    };
-                    let endpoint = profile.base_url.as_deref().map_or_else(
-                        || Ok(official.to_owned()),
-                        |base| endpoint_from_base(&provider, adapter, base),
-                    )?;
+                    let endpoint =
+                        match (profile.base_url.as_deref(), builtin.endpoint_for(adapter)) {
+                            (Some(base), official)
+                                if official.is_some() || provider.id() == "azure" =>
+                            {
+                                endpoint_from_base(&provider, adapter, base)?
+                            }
+                            (_, Some(official)) => official.to_owned(),
+                            _ => continue,
+                        };
                     provider_endpoints.insert(endpoint.clone());
                     model_endpoints.insert(model.id.clone(), endpoint);
                 }
@@ -993,6 +1059,16 @@ impl Profiles {
                 metadata.validate(&provider, adapter, id)?;
                 metadata.headers = validate_headers(std::mem::take(&mut metadata.headers))?;
             }
+            let configured_cloudflare_base = configured_providers
+                .get(name)
+                .filter(|configured| {
+                    matches!(
+                        provider.id(),
+                        "cloudflare-workers-ai" | "cloudflare-ai-gateway"
+                    ) && configured["api"] != "cloudflare-workers-ai-system-one"
+                })
+                .and_then(|configured| configured["baseUrl"].as_str())
+                .map(str::to_owned);
             let id = provider.id().to_owned();
             if entries
                 .insert(
@@ -1001,6 +1077,7 @@ impl Profiles {
                         provider,
                         endpoint,
                         base_url: profile.base_url,
+                        configured_cloudflare_base,
                         provider_endpoints,
                         api_key: profile.api_key,
                         headers: validate_headers(profile.headers)?,
@@ -1026,13 +1103,28 @@ impl Profiles {
             entries,
             revision,
             cloudflare_saved_account: None,
+            cloudflare_gateway_route,
             radius_endpoint: None,
+            azure_api_version: None,
+            azure_deployments: BTreeMap::new(),
             operations,
         })
     }
 
+    pub fn azure_api_version(&self) -> &str {
+        self.azure_api_version.as_deref().unwrap_or("v1")
+    }
+
+    pub fn azure_deployments(&self) -> &BTreeMap<String, String> {
+        &self.azure_deployments
+    }
+
     pub fn operations(&self) -> &super::operation_models::Catalogue {
         &self.operations
+    }
+
+    pub fn operations_mut(&mut self) -> &mut super::operation_models::Catalogue {
+        &mut self.operations
     }
 
     pub fn revision(&self) -> &str {
@@ -1203,11 +1295,15 @@ impl Profiles {
     pub(super) fn responses_strict_tool_support(
         &self,
         provider: &Provider,
+        adapter: Adapter,
         model: Option<&ModelMetadata>,
     ) -> bool {
         self.chat_compatibility(provider, model)
             .supports_strict_mode()
-            .unwrap_or_else(|| provider.id() == "openai-chatgpt")
+            .unwrap_or_else(|| {
+                matches!(provider.id(), "openai-chatgpt" | "openai-codex")
+                    || adapter == Adapter::AzureResponses
+            })
     }
 
     fn cache_compatibility(
@@ -1235,6 +1331,41 @@ impl Profiles {
             .supports_long_cache_retention
     }
 
+    pub fn responses_effort_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> BTreeSet<String> {
+        let endpoint = |id: &str| {
+            explicit_endpoint
+                .or_else(|| self.model_endpoint(provider, id))
+                .unwrap_or_else(|| self.endpoint(provider))
+        };
+        let selected_endpoint = endpoint(selected);
+        let mut ids = self.model_ids(provider);
+        if !ids.iter().any(|id| id == selected) {
+            ids.push(selected.into());
+        }
+        ids.into_iter()
+            .filter(|id| {
+                if self.model_adapter(provider, id) != Adapter::OpenAiResponses
+                    || endpoint(id) != selected_endpoint
+                {
+                    return false;
+                }
+                let metadata = self.model(provider, id);
+                metadata
+                    .as_ref()
+                    .is_none_or(|model| model.reasoning != Some(false))
+                    && self
+                        .cache_compatibility(provider, metadata.as_ref())
+                        .supports_mid_convo_effort
+                        .unwrap_or(false)
+            })
+            .collect()
+    }
+
     pub fn anthropic_strict_tool_support(
         &self,
         provider: &Provider,
@@ -1252,12 +1383,77 @@ impl Profiles {
         selected: &str,
         explicit_endpoint: Option<&str>,
     ) -> BTreeMap<String, bool> {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+            self.anthropic_strict_tool_support(provider, metadata)
+        })
+    }
+
+    pub fn anthropic_mid_conversation_system_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> BTreeSet<String> {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+            self.chat_compatibility(provider, metadata)
+                .supports_mid_conversation_system_messages()
+        })
+        .into_iter()
+        .filter_map(|(id, supported)| supported.then_some(id))
+        .collect()
+    }
+
+    pub fn anthropic_fallback_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> BTreeMap<String, Vec<AnthropicFallbackModel>> {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+            self.cache_compatibility(provider, metadata)
+                .allowed_fallback_models
+                .unwrap_or_default()
+        })
+        .into_iter()
+        .filter(|(_, targets)| !targets.is_empty())
+        .collect()
+    }
+
+    pub fn anthropic_managed_effort_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> BTreeMap<String, bool> {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+            self.cache_compatibility(provider, metadata)
+                .supports_mid_convo_effort
+                .unwrap_or(false)
+        })
+        .into_iter()
+        .filter(|(_, supported)| *supported)
+        .map(|(id, _)| {
+            let can_disable = self
+                .model(provider, &id)
+                .is_none_or(|metadata| metadata.mapped_effort("off") != Some(None));
+            (id, can_disable)
+        })
+        .collect()
+    }
+
+    fn anthropic_route_models<T>(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+        capability: impl Fn(Option<&ModelMetadata>) -> T,
+    ) -> BTreeMap<String, T> {
         let endpoint = explicit_endpoint
             .or_else(|| self.model_endpoint(provider, selected))
             .unwrap_or_else(|| self.endpoint(provider));
         // A partial model override does not establish a routable model.
         let ids = self.model_ids(provider);
-        let mut models: BTreeMap<String, bool> = ids
+        let mut models: BTreeMap<String, T> = ids
             .into_iter()
             .filter_map(|id| {
                 if self.model_adapter(provider, &id) != Adapter::Anthropic
@@ -1269,7 +1465,7 @@ impl Profiles {
                     return None;
                 }
                 let metadata = self.model(provider, &id)?;
-                let supported = self.anthropic_strict_tool_support(provider, Some(&metadata));
+                let supported = capability(Some(&metadata));
                 Some((id, supported))
             })
             .collect();
@@ -1277,9 +1473,27 @@ impl Profiles {
         // capability (or the default false) still applies to that selection.
         models.entry(selected.to_owned()).or_insert_with(|| {
             let metadata = self.model(provider, selected);
-            self.anthropic_strict_tool_support(provider, metadata.as_ref())
+            capability(metadata.as_ref())
         });
         models
+    }
+
+    pub fn anthropic_eager_tool_input_policy(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> (bool, BTreeMap<String, bool>) {
+        let capability = |model: Option<&ModelMetadata>| {
+            self.cache_compatibility(provider, model)
+                .supports_eager_tool_input_streaming
+                .unwrap_or(true)
+        };
+        let default = capability(None);
+        let mut models =
+            self.anthropic_route_models(provider, selected, explicit_endpoint, capability);
+        models.retain(|_, supported| *supported != default);
+        (default, models)
     }
 
     pub fn messages_cache_support(
@@ -1292,6 +1506,16 @@ impl Profiles {
             compat.supports_long_cache_retention.unwrap_or(true),
             compat.supports_cache_control_on_tools.unwrap_or(true),
         )
+    }
+
+    pub fn responses_max_output_tokens(
+        &self,
+        provider: &Provider,
+        model: Option<&ModelMetadata>,
+    ) -> bool {
+        self.cache_compatibility(provider, model)
+            .supports_max_output_tokens
+            .unwrap_or(true)
     }
 
     pub fn responses_cache_support(
@@ -1409,6 +1633,9 @@ impl Profiles {
         endpoint: &str,
     ) -> &'static [&'static str] {
         let adapter = self.model_adapter(provider, model);
+        if adapter == Adapter::MistralConversations {
+            return &["x-affinity"];
+        }
         let opencode = matches!(provider.id(), "opencode" | "opencode-go");
         let routing: &'static [&'static str] = if opencode {
             &["x-opencode-session"]
@@ -1417,8 +1644,11 @@ impl Profiles {
         };
         if !matches!(
             adapter,
-            Adapter::Anthropic | Adapter::ChatCompletions | Adapter::OpenAiResponses
-        ) || provider.id() == "openai-chatgpt"
+            Adapter::Anthropic
+                | Adapter::ChatCompletions
+                | Adapter::OpenAiResponses
+                | Adapter::CodexResponses
+        ) || matches!(provider.id(), "openai-chatgpt" | "azure")
         {
             return routing;
         }
@@ -1454,7 +1684,9 @@ impl Profiles {
         let send = model_compat
             .and_then(|compat| compat.send_session_affinity_headers)
             .or_else(|| profile.and_then(|compat| compat.send_session_affinity_headers))
-            .unwrap_or(openrouter || adapter == Adapter::OpenAiResponses);
+            .unwrap_or(
+                openrouter || matches!(adapter, Adapter::OpenAiResponses | Adapter::CodexResponses),
+            );
         if !send {
             return routing;
         }
@@ -1487,10 +1719,13 @@ impl Profiles {
                 "x-session-affinity",
             ],
             (_, AffinityFormat::Openrouter) => &["x-session-id"],
-            (Adapter::OpenAiResponses, AffinityFormat::Openai) => {
+            (Adapter::OpenAiResponses | Adapter::CodexResponses, AffinityFormat::Openai) => {
                 &["session-id", "x-client-request-id"]
             }
-            (Adapter::OpenAiResponses, AffinityFormat::OpenaiNosession) => &["x-client-request-id"],
+            (
+                Adapter::OpenAiResponses | Adapter::CodexResponses,
+                AffinityFormat::OpenaiNosession,
+            ) => &["x-client-request-id"],
             (Adapter::Anthropic, _) => &["x-session-affinity"],
             (_, AffinityFormat::Openai) => {
                 &["session_id", "x-client-request-id", "x-session-affinity"]
@@ -1558,15 +1793,47 @@ impl Profiles {
         {
             model.compat = model.compat.clone().overlay(profile.compat.clone());
         }
-        match profile.and_then(|profile| profile.overrides.get(id)) {
-            Some(overrides) => Some(model.unwrap_or_default().overlay(overrides)),
-            None => model,
+        let mut model = match profile.and_then(|profile| profile.overrides.get(id)) {
+            Some(overrides) => model.unwrap_or_default().overlay(overrides),
+            None => model?,
+        };
+        // A named Azure relay may declare only reasoning capability. Keep a
+        // model-specific map when the same ID has one in the Azure catalog.
+        if self.model_adapter(provider, id) == Adapter::AzureResponses
+            && model.thinking_level_map.is_empty()
+            && let Some(configured) = BUILTIN_MODELS
+                .get("azure")
+                .and_then(|models| models.iter().find(|model| model.id == id))
+        {
+            model
+                .thinking_level_map
+                .clone_from(&configured.metadata.thinking_level_map);
         }
+        Some(model)
     }
+}
+
+fn parse_azure_deployments(mapping: &str) -> BTreeMap<String, String> {
+    mapping
+        .split(',')
+        .filter_map(|entry| {
+            let mut pair = entry.split('=').map(str::trim);
+            let model = pair.next()?;
+            let deployment = pair.next()?;
+            (!model.is_empty() && !deployment.is_empty()).then(|| (model.into(), deployment.into()))
+        })
+        .collect()
 }
 
 fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Result<String> {
     let invalid = || Error::Config(format!("invalid models.json baseUrl for {}", provider.id()));
+    if provider.id() == "cloudflare-ai-gateway"
+        && let Some(endpoint) = super::cloudflare_gateway::Route::from_endpoint(base)
+            .and_then(|route| route.endpoint(adapter))
+    {
+        return Ok(endpoint);
+    }
+
     let mut url = reqwest::Url::parse(base).map_err(|_| invalid())?;
     let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     if !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
@@ -1580,10 +1847,45 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
     }
 
     let suffix = match adapter {
-        Adapter::ChatCompletions => "/chat/completions",
-        Adapter::OpenAiResponses => "/responses",
+        Adapter::CodexResponses => {
+            let path = url.path().trim_end_matches('/');
+            let normalized = if path.ends_with("/codex/responses") || path.ends_with("/responses") {
+                path.to_owned()
+            } else if path.ends_with("/codex") {
+                format!("{path}/responses")
+            } else {
+                format!("{path}/codex/responses")
+            };
+            url.set_path(&normalized);
+            return Ok(url.to_string());
+        }
+        Adapter::ChatCompletions | Adapter::MistralConversations => "/chat/completions",
+        Adapter::OpenAiResponses | Adapter::AzureResponses => "/responses",
         Adapter::Anthropic | Adapter::PiMessages => "/messages",
         Adapter::Bedrock => return Ok(url.to_string()),
+        Adapter::GoogleVertex => {
+            let mut segments = base.trim_end_matches('/').rsplit('/');
+            let has_version = segments.any(|part| {
+                part.strip_prefix('v').is_some_and(|rest| {
+                    !rest.is_empty()
+                        && rest.split_once("beta").map_or(
+                            rest.bytes().all(|byte| byte.is_ascii_digit()),
+                            |(version, beta)| {
+                                !version.is_empty()
+                                    && version.bytes().all(|byte| byte.is_ascii_digit())
+                                    && beta.bytes().all(|byte| byte.is_ascii_digit())
+                            },
+                        )
+                })
+            });
+            if !has_version {
+                url.path_segments_mut()
+                    .map_err(|_| invalid())?
+                    .pop_if_empty()
+                    .push("v1");
+            }
+            return Ok(url.to_string());
+        }
         Adapter::Google => {
             if url.path() == "/" {
                 url.set_path("/v1beta");
@@ -1592,7 +1894,19 @@ fn endpoint_from_base(provider: &Provider, adapter: Adapter, base: &str) -> Resu
         }
     };
     let path = url.path().trim_end_matches('/');
-    let path = if path.ends_with(suffix) {
+    let azure_host = (provider.id() == "azure" || adapter == Adapter::AzureResponses)
+        && url.host_str().is_some_and(|host| {
+            [
+                ".openai.azure.com",
+                ".cognitiveservices.azure.com",
+                ".ai.azure.com",
+            ]
+            .into_iter()
+            .any(|domain| host.ends_with(domain))
+        });
+    let path = if azure_host && matches!(path, "" | "/openai" | "/openai/v1/responses") {
+        format!("/openai/v1{suffix}")
+    } else if path.ends_with(suffix) {
         path.to_owned()
     } else if adapter == Adapter::Anthropic
         && url.host_str() == Some("opencode.ai")
@@ -1673,6 +1987,94 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn google_catalogs_and_vertex_model_endpoints_match_upstream() {
+        let profiles = Profiles::parse(&json!({"providers":{"google-vertex":{
+            "baseUrl":"https://relay.example/forward",
+            "models":[{"id":"custom","baseUrl":"https://relay.example/v1beta1"}]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("google-vertex").unwrap();
+        assert_eq!(provider.adapter(), Adapter::GoogleVertex);
+        assert_eq!(
+            profiles.endpoint(&provider),
+            "https://relay.example/forward/v1"
+        );
+        assert_eq!(
+            profiles.model_endpoint(&provider, "custom"),
+            Some("https://relay.example/v1beta1")
+        );
+        assert_eq!(profiles.model_ids(&provider).len(), 18);
+        assert_eq!(
+            Profiles::default().model_ids(&provider)[0],
+            "gemini-3.1-pro-preview"
+        );
+        let default = Profiles::default();
+        assert_eq!(default.model_ids(&Provider::Google).len(), 26);
+        assert_eq!(default.model_ids(&provider).len(), 17);
+        for (provider, adapter) in [
+            (&Provider::Google, Adapter::Google),
+            (&provider, Adapter::GoogleVertex),
+        ] {
+            let small_output = if adapter == Adapter::Google {
+                32_768
+            } else {
+                65_536
+            };
+            for (id, cap) in [
+                ("gemini-4-argon", small_output),
+                ("gemini-4-carbon", small_output),
+                ("gemini-4-hydrogen", 65_536),
+                ("gemini-4-neon", 65_536),
+            ] {
+                assert_eq!(default.model_adapter(provider, id), adapter);
+                let model = default.model(provider, id).unwrap();
+                assert_eq!(model.context_window, Some(1_048_576));
+                assert_eq!(model.max_tokens, Some(cap));
+                assert_eq!(model.supports_images(), Some(true));
+                assert!(model.levels(adapter).unwrap().contains(&"medium".into()));
+            }
+        }
+        for provider in [&Provider::Google, &provider] {
+            let id = "gemini-robotics-er-2-preview";
+            assert!(default.model_ids(provider).iter().any(|model| model == id));
+            let model = default.model(provider, id).unwrap();
+            assert_eq!(model.context_window, Some(131_072));
+            assert_eq!(model.max_tokens, Some(65_536));
+            assert_eq!(model.reasoning, Some(true));
+            assert_eq!(model.supports_images(), Some(true));
+        }
+    }
+
+    #[test]
+    fn service_tier_scales_all_catalog_cost_components() {
+        let price: ChatPrice = serde_json::from_value(json!({
+            "input":10, "output":20, "cacheRead":2, "cacheWrite":4
+        }))
+        .unwrap();
+        let usage = pi_rs::Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+        };
+        for (tier, multiplier) in [(None, 1.0), (Some(0.5), 0.5), (Some(2.5), 2.5)] {
+            let metadata = pi_rs::ModelMetadata {
+                cached_input_tokens: Some(200_000),
+                cache_creation_input_tokens: Some(300_000),
+                catalog_cost_multiplier: tier.and_then(serde_json::Number::from_f64),
+                ..Default::default()
+            };
+            let cost = price.estimate(usage, &metadata).unwrap();
+            for (actual, base) in [
+                (cost.input, 5.0),
+                (cost.output, 2.0),
+                (cost.cache_read, 0.4),
+                (cost.cache_write, 1.2),
+            ] {
+                assert!((actual.as_f64().unwrap() - base * multiplier).abs() < 1e-10);
+            }
+        }
+    }
+
+    #[test]
     fn cloudflare_worker_chats_and_classifiers_keep_saved_account_scope() {
         let keys = super::super::model_auth::Keys::parse(&json!({
             "cloudflare-workers-ai":{
@@ -1688,8 +2090,23 @@ mod tests {
             endpoint,
             "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
         );
-        assert_eq!(profiles.model_ids(&provider).len(), 19);
+        assert_eq!(profiles.model_ids(&provider).len(), 20);
         assert_eq!(profiles.model_ids(&provider)[0], "@cf/moonshotai/kimi-k2.6");
+        let inkling = "@cf/thinkingmachines/inkling-2-small";
+        assert!(
+            profiles
+                .model_ids(&provider)
+                .iter()
+                .any(|model| model == inkling)
+        );
+        assert_eq!(
+            profiles.model_adapter(&provider, inkling),
+            Adapter::ChatCompletions
+        );
+        let model = profiles.model(&provider, inkling).unwrap();
+        assert_eq!(model.context_window, Some(1_048_576));
+        assert_eq!(model.max_tokens, Some(1_048_576));
+        assert_eq!(model.supports_images(), Some(true));
         assert_eq!(
             keys.custom_credential(&provider, endpoint, &profiles)
                 .and_then(|key| key.literal()),
@@ -1741,7 +2158,7 @@ mod tests {
             "https://api.cloudflare.com/client/v4/accounts/mine/ai/v1/chat/completions"
         );
         assert!(profiles.credential(&provider, endpoint).is_none());
-        assert_eq!(profiles.model_ids(&provider).len(), 19);
+        assert_eq!(profiles.model_ids(&provider).len(), 20);
     }
 
     #[test]
@@ -1908,6 +2325,162 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_fallback_targets_match_pi_and_respect_model_overrides() {
+        let profiles = Profiles::default();
+        let provider = Provider::Anthropic;
+        let id = "claude-fable-5-2";
+        let targets = profiles.anthropic_fallback_models(&provider, id, None);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[id][0].provider, "anthropic");
+        assert_eq!(targets[id][0].model, "claude-opus-5");
+        assert_eq!(targets["claude-fable-5"][0].model, "claude-opus-4-8");
+        assert_eq!(targets["claude-fable-5"][1].model, "claude-opus-5");
+
+        let profiles = Profiles::parse(&json!({"providers":{"anthropic":{
+            "modelOverrides":{(id):{"compat":{"allowedFallbackModels":[]}}}
+        }}}))
+        .unwrap();
+        assert!(
+            !profiles
+                .anthropic_fallback_models(&provider, id, None)
+                .contains_key(id)
+        );
+
+        let invalid = Profiles::parse(&json!({"providers":{"anthropic":{
+            "modelOverrides":{(id):{"compat":{"allowedFallbackModels":[
+                {"provider":"anthropic","model":"other","cost":{"input":-1}}
+            ]}}}
+        }}}));
+        assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn openrouter_chat_catalog_uses_pi_model_routes_and_instruction_defaults() {
+        let profiles = Profiles::default();
+        let provider = Provider::named("openrouter").unwrap();
+        let models = profiles.model_ids(&provider);
+        assert_eq!(models.len(), 417);
+        assert_eq!(
+            models
+                .iter()
+                .filter(|id| profiles.model_adapter(&provider, id) == Adapter::Anthropic)
+                .count(),
+            20
+        );
+        assert!(models.iter().any(|id| id == "openai/gpt-6.2-sol"));
+        assert!(!models.iter().any(|id| id == "inception/mercury-2"));
+        let messages = "anthropic/claude-fable-5.2";
+        assert_eq!(
+            profiles.model_endpoint(&provider, messages),
+            Some("https://openrouter.ai/api/v1/messages")
+        );
+        assert_eq!(
+            profiles.model_adapter(&provider, messages),
+            Adapter::Anthropic
+        );
+        let chat = "openai/gpt-5.6-sol";
+        let metadata = profiles.model(&provider, chat).unwrap();
+        assert_eq!(
+            profiles
+                .chat_compatibility(&provider, Some(&metadata))
+                .supports_developer_role(),
+            None
+        );
+        assert_eq!(
+            profiles.session_affinity(&provider, chat, profiles.endpoint(&provider)),
+            ["x-session-id"]
+        );
+        let overridden = Profiles::parse(&json!({"providers":{"openrouter":{
+            "compat":{"supportsDeveloperRole":true,"sendSessionAffinityHeaders":false}
+        }}}))
+        .unwrap();
+        let metadata = overridden.model(&provider, chat).unwrap();
+        assert_eq!(
+            overridden
+                .chat_compatibility(&provider, Some(&metadata))
+                .supports_developer_role(),
+            Some(true)
+        );
+        assert!(
+            overridden
+                .session_affinity(&provider, chat, overridden.endpoint(&provider))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn anthropic_fable_5_2_catalog_exposes_pi_limits_and_capabilities() {
+        let profiles = Profiles::default();
+        let provider = Provider::Anthropic;
+        let id = "claude-fable-5-2";
+        assert_eq!(profiles.model_ids(&provider).len(), 18);
+        assert_eq!(profiles.model_adapter(&provider, id), Adapter::Anthropic);
+        let model = profiles.model(&provider, id).unwrap();
+        assert_eq!(model.context_window, Some(1_000_000));
+        assert_eq!(model.max_tokens, Some(128_000));
+        assert_eq!(model.supports_images(), Some(true));
+        assert_eq!(model.adaptive_thinking(), Some(true));
+        assert_eq!(
+            model.levels(Adapter::Anthropic).unwrap(),
+            ["minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(profiles.anthropic_strict_tool_support(&provider, Some(&model)));
+        assert_eq!(
+            model.prompt_cache_seconds(pi_rs::CacheRetention::Long),
+            Some(3600.0)
+        );
+        let image_limits = model
+            .input_limits
+            .as_ref()
+            .unwrap()
+            .images
+            .as_ref()
+            .unwrap();
+        assert_eq!(image_limits.max_per_request, Some(600));
+        assert_eq!(
+            model.cost.as_ref().unwrap().value(),
+            json!({"input": 8.0, "output": 40.0, "cacheRead": 0.2, "cacheWrite": 10.0})
+        );
+    }
+
+    #[test]
+    fn anthropic_managed_effort_uses_catalog_and_effective_model_route() {
+        let profiles = Profiles::default();
+        let native =
+            profiles.anthropic_managed_effort_models(&Provider::Anthropic, "claude-opus-5", None);
+        assert_eq!(native.len(), 6);
+        assert_eq!(native.get("claude-opus-5"), Some(&true));
+        assert_eq!(native.get("claude-opus-5-5"), Some(&false));
+        assert_eq!(native.get("claude-fable-5-2"), Some(&false));
+        assert!(!native.contains_key("claude-opus-4-8"));
+        let openrouter = Provider::named("openrouter").unwrap();
+        let gateway = profiles.anthropic_managed_effort_models(
+            &openrouter,
+            "anthropic/claude-opus-5.5",
+            None,
+        );
+        assert_eq!(gateway.len(), 5);
+        assert_eq!(gateway.get("anthropic/claude-fable-5.2"), Some(&false));
+        assert_eq!(gateway.get("anthropic/claude-haiku-5.5"), Some(&true));
+        assert!(!gateway.contains_key("anthropic/claude-opus-5"));
+        let profiles = Profiles::parse(&json!({"providers":{"custom":{
+            "api":"anthropic-messages","baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMidConvoEffort":true},
+            "models":[
+                {"id":"selected","compat":{"supportsMidConvoEffort":false}},
+                {"id":"rewritten"},
+                {"id":"other-route","baseUrl":"http://localhost:2/v1"}
+            ]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("custom").unwrap();
+        assert_eq!(
+            profiles.anthropic_managed_effort_models(&provider, "selected", None),
+            BTreeMap::from([("rewritten".into(), true)])
+        );
+    }
+
+    #[test]
     fn anthropic_explicit_endpoint_overrides_model_endpoints() {
         let profiles = Profiles::parse(&json!({"providers":{"proxy":{
             "api":"anthropic-messages", "baseUrl":"http://localhost:1/v1",
@@ -1929,6 +2502,52 @@ mod tests {
             assert_eq!(explicit.get(rewritten), Some(&expected));
             assert!(!explicit.contains_key("other-api"));
         }
+    }
+
+    #[test]
+    fn anthropic_system_update_policy_follows_the_final_model_on_the_selected_route() {
+        let profiles = Profiles::parse(&json!({"providers":{"proxy":{
+            "api":"anthropic-messages", "baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMidConvoSystemMessages":true},
+            "models":[
+                {"id":"enabled"},
+                {"id":"disabled","compat":{"supportsMidConvoSystemMessages":false}},
+                {"id":"other-endpoint","baseUrl":"http://localhost:2/v1"},
+                {"id":"other-api","api":"openai-completions"}
+            ]
+        }}}))
+        .unwrap();
+        let proxy = profiles.provider("proxy").unwrap();
+        assert_eq!(
+            profiles.anthropic_mid_conversation_system_models(&proxy, "selected", None),
+            BTreeSet::from(["enabled".into(), "selected".into()])
+        );
+        assert_eq!(
+            profiles.anthropic_mid_conversation_system_models(
+                &proxy,
+                "selected",
+                Some("http://localhost:3/v1/messages"),
+            ),
+            BTreeSet::from(["enabled".into(), "other-endpoint".into(), "selected".into()])
+        );
+
+        let provider = Provider::Anthropic;
+        let default = Profiles::default();
+        let native =
+            default.anthropic_mid_conversation_system_models(&provider, "claude-opus-4-8", None);
+        assert_eq!(
+            native,
+            BTreeSet::from([
+                "claude-fable-5".into(),
+                "claude-fable-5-1".into(),
+                "claude-fable-5-2".into(),
+                "claude-haiku-5-5".into(),
+                "claude-opus-4-8".into(),
+                "claude-opus-5".into(),
+                "claude-opus-5-5".into(),
+                "claude-sonnet-5-5".into(),
+            ])
+        );
     }
 
     #[test]
@@ -2037,6 +2656,70 @@ mod tests {
         let model = profiles.model(&provider, "amazon.nova-lite-v1:0").unwrap();
         assert_eq!(model.context_window, Some(300_000));
         assert_eq!(model.max_tokens, Some(10_000));
+        let nova_cost = model.cost.unwrap().value();
+        assert_eq!(nova_cost["cacheWrite"], 0.06);
+        assert_eq!(profiles.model_ids(&provider).len(), 208);
+        let sol = profiles
+            .model(&provider, "global.openai.gpt-6.2-sol")
+            .unwrap();
+        assert_eq!(sol.context_window, Some(1_050_000));
+        assert_eq!(sol.max_tokens, Some(128_000));
+        let cost = sol.cost.unwrap().value();
+        assert_eq!(cost["tiers"][0]["inputTokensAbove"], 272_000);
+        assert_eq!(cost["tiers"][0]["output"], 15.0);
+    }
+
+    #[test]
+    fn anthropic_tool_input_streaming_uses_the_selected_model_configuration() {
+        let profiles = Profiles::parse(&json!({"providers":{"fireworks":{"modelOverrides":{
+            "accounts/fireworks/models/deepseek-v4p1-flash":{"compat":{"supportsEagerToolInputStreaming":true}}
+        }}}})).unwrap();
+        let provider = profiles.provider("fireworks").unwrap();
+        let forced_eager = "accounts/fireworks/models/deepseek-v4p1-flash";
+        let (default, models) =
+            profiles.anthropic_eager_tool_input_policy(&provider, forced_eager, None);
+        assert!(default);
+        assert_eq!(models.get(forced_eager), None);
+        assert_eq!(
+            models.get("accounts/fireworks/models/deepseek-v4p1-flash-1017"),
+            Some(&false)
+        );
+    }
+
+    #[test]
+    fn fireworks_catalog_distinguishes_messages_and_chat_model_routes() {
+        let profiles = Profiles::default();
+        let provider = profiles.provider("fireworks").unwrap();
+        let deepseek = "accounts/fireworks/routers/deepseek-v4p1-flash-1017-ultrafast";
+        let kimi = "accounts/fireworks/models/kimi-k3p1-pro";
+        assert_eq!(profiles.model_ids(&provider).len(), 27);
+        assert!(
+            profiles
+                .model(&provider, "accounts/fireworks/models/gpt-oss-120b")
+                .is_none()
+        );
+        assert_eq!(
+            profiles.model_adapter(&provider, deepseek),
+            Adapter::Anthropic
+        );
+        let model = profiles.model(&provider, deepseek).unwrap();
+        assert_eq!(model.adaptive_thinking(), Some(true));
+        assert_eq!(model.supports_images(), Some(true));
+        assert_eq!(model.mapped_effort("off"), Some(Some("none")));
+        assert_eq!(
+            profiles.model_adapter(&provider, kimi),
+            Adapter::ChatCompletions
+        );
+        let model = profiles.model(&provider, kimi).unwrap();
+        assert_eq!(model.max_tokens, Some(1_048_576));
+        assert_eq!(model.supports_images(), Some(true));
+        assert_eq!(model.mapped_effort("medium"), Some(None));
+        assert_eq!(
+            profiles
+                .chat_compatibility(&provider, Some(&model))
+                .supports_developer_role(),
+            None
+        );
     }
 
     #[test]
@@ -2103,7 +2786,23 @@ mod tests {
         assert_eq!(provider.adapter(), Adapter::OpenAiResponses);
         let endpoint = args.model_profiles.endpoint(&provider);
         assert_eq!(endpoint, "https://api.meta.ai/v1/responses");
-        assert_eq!(args.model_profiles.model_ids(&provider).len(), 6);
+        assert_eq!(args.model_profiles.model_ids(&provider).len(), 7);
+        let ember = args
+            .model_profiles
+            .model(&provider, "muse-ember-1.0")
+            .unwrap();
+        assert_eq!(ember.context_window, Some(1_048_576));
+        assert_eq!(ember.max_tokens, Some(524_288));
+        assert_eq!(ember.supports_images(), Some(true));
+        assert_eq!(ember.mapped_effort("max"), Some(Some("max")));
+        let mut metadata = json!({});
+        ember.apply_catalog_metadata(&mut metadata);
+        assert_eq!(metadata["cost"]["input"], 0.1);
+        assert_eq!(
+            metadata["cost"]["tiers"][0],
+            json!({"inputTokensAbove":200_000,"input":0.3,"output":1.5,
+                "cacheRead":0.012,"cacheWrite":0.0})
+        );
         let model = args
             .model_profiles
             .model(&provider, "muse-spark-1.3")
@@ -2264,6 +2963,17 @@ mod tests {
         );
         assert_eq!(profiles.model_ids(&provider).len(), 6);
         let model = profiles.model(&provider, "k3.1-pro").unwrap();
+        for (id, output) in [
+            ("k3", 1_048_576),
+            ("k3-256k", 262_144),
+            ("k3.1-pro", 1_048_576),
+            ("k3.1-pro-highspeed", 1_048_576),
+        ] {
+            assert_eq!(
+                profiles.model(&provider, id).unwrap().max_tokens,
+                Some(output)
+            );
+        }
         assert_eq!(
             model.levels(Adapter::ChatCompletions).unwrap(),
             ["low", "high", "max"]
@@ -2390,6 +3100,34 @@ mod tests {
     }
 
     #[test]
+    fn responses_effort_capabilities_follow_the_api_and_route() {
+        let profiles = Profiles::default();
+        let openai = Provider::named("openai").unwrap();
+        let native = profiles.responses_effort_models(&openai, "gpt-6-luna", None);
+        assert_eq!(native.len(), 5);
+        assert!(native.contains("gpt-6-luna"));
+        assert!(!native.contains("gpt-5.4"));
+
+        let profiles = Profiles::parse(&json!({"providers":{"fixture":{
+            "api":"openai-responses","baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMidConvoEffort":true},
+            "models":[
+                {"id":"selected","reasoning":true,"compat":{"supportsMidConvoEffort":false}},
+                {"id":"enabled","reasoning":true},
+                {"id":"unsupported","reasoning":false},
+                {"id":"other-api","reasoning":true,"api":"openai-completions"},
+                {"id":"other-endpoint","reasoning":true,"baseUrl":"http://localhost:2/v1"}
+            ]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("fixture").unwrap();
+        assert_eq!(
+            profiles.responses_effort_models(&provider, "selected", None),
+            BTreeSet::from(["enabled".into()])
+        );
+    }
+
+    #[test]
     fn responses_prompt_cache_key_mode_inherits_and_overrides() {
         let profiles = Profiles::parse(&json!({"providers":{"example":{
             "baseUrl":"https://example.com/v1", "api":"openai-responses",
@@ -2470,27 +3208,37 @@ mod tests {
         for (name, endpoint, key, count) in [
             (
                 "qwen-token-plan",
-                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
-                "QWEN_TOKEN_PLAN_API_KEY",
-                21,
+                "token-plan.maas.qwencloudapi.com",
+                "QWEN_TOKEN_PLAN_TEAM_API_KEY",
+                20,
             ),
             (
                 "qwen-token-plan-cn",
-                "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
-                "QWEN_TOKEN_PLAN_CN_API_KEY",
-                21,
+                "token-plan.maas.qianwenaiapi.com",
+                "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY",
+                20,
             ),
             (
                 "qwen-token-plan-individual",
-                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
-                "QWEN_TOKEN_PLAN_API_KEY",
-                9,
+                "token-plan.maas.qwencloudapi.com",
+                "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+                13,
+            ),
+            (
+                "qwen-token-plan-individual-cn",
+                "token-plan.maas.qianwenaiapi.com",
+                "QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY",
+                13,
             ),
         ] {
             let provider = profiles.provider(name).unwrap();
             assert_eq!(provider.adapter(), Adapter::ChatCompletions);
-            assert_eq!(profiles.endpoint(&provider), endpoint);
-            assert_eq!(builtin_chat::find(name).unwrap().env(), key);
+            assert_eq!(
+                profiles.endpoint(&provider),
+                format!("https://{endpoint}/compatible-mode/v1/chat/completions")
+            );
+            let builtin = builtin_chat::find(name).unwrap();
+            assert_eq!(builtin.env(), key);
             assert_eq!(profiles.model_ids(&provider).len(), count);
             let model = profiles.model(&provider, "qwen3.8-max").unwrap();
             assert_eq!(model.supports_images(), Some(true));
@@ -2498,16 +3246,117 @@ mod tests {
                 model.levels(Adapter::ChatCompletions).unwrap(),
                 ["low", "medium", "xhigh"]
             );
+            assert!(profiles.model(&provider, "qwen4-max-preview").is_some());
             assert!(profiles.model(&provider, "qwen3.8-max-preview").is_none());
+            assert!(profiles.model(&provider, "deepseek-v3.2").is_none());
+            assert!(profiles.model(&provider, "deepseek-v4-flash").is_none());
         }
-        assert!(
-            profiles
-                .model(
-                    &profiles.provider("qwen-token-plan-individual").unwrap(),
-                    "deepseek-v3.2"
-                )
-                .is_none()
-        );
+    }
+
+    #[test]
+    fn qwen_token_plan_environment_keys_are_ordered_and_scoped() {
+        const CHILD: &str = "PI_RS_TEST_QWEN_TOKEN_PLAN_KEYS";
+        let entries = [
+            (
+                "qwen-token-plan",
+                "QWEN_TOKEN_PLAN_TEAM_API_KEY",
+                "QWEN_TOKEN_PLAN_API_KEY",
+                "international-legacy",
+            ),
+            (
+                "qwen-token-plan-cn",
+                "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY",
+                "QWEN_TOKEN_PLAN_CN_API_KEY",
+                "china-legacy",
+            ),
+            (
+                "qwen-token-plan-individual",
+                "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+                "QWEN_TOKEN_PLAN_API_KEY",
+                "international-legacy",
+            ),
+            (
+                "qwen-token-plan-individual-cn",
+                "QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY",
+                "QWEN_TOKEN_PLAN_CN_API_KEY",
+                "china-legacy",
+            ),
+        ];
+        let Ok(scenario) = std::env::var(CHILD) else {
+            for scenario in ["preferred", "fallback", "blank"] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", "model_profiles::tests::qwen_token_plan_environment_keys_are_ordered_and_scoped"])
+                    .env(CHILD, scenario);
+                for (provider, primary, fallback, legacy) in entries {
+                    command.env(fallback, legacy).env_remove(primary);
+                    match scenario {
+                        "preferred" => {
+                            command.env(primary, provider);
+                        }
+                        "blank" => {
+                            command.env(primary, " ");
+                        }
+                        _ => {}
+                    }
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{scenario}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        };
+        let mut args = super::super::Cli::parse_from(["pi"]);
+        args.model_profiles = Profiles::parse(&json!({})).unwrap();
+        args.model_keys = super::super::model_auth::Keys::parse(&json!({}));
+        let international_old = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions";
+        let china_old =
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions";
+        for (name, _, _, fallback) in entries {
+            let provider = args.model_profiles.provider(name).unwrap();
+            let official = args.model_profiles.endpoint(&provider);
+            let (legacy, foreign) = if name.ends_with("-cn") {
+                (china_old, international_old)
+            } else {
+                (international_old, china_old)
+            };
+            let expected = if scenario == "preferred" {
+                name
+            } else {
+                fallback
+            };
+            for endpoint in [official, legacy] {
+                assert_eq!(
+                    args.configured_model_credential(&provider, endpoint)
+                        .unwrap()
+                        .literal(),
+                    Some(expected)
+                );
+            }
+            for endpoint in [
+                foreign,
+                "https://token-plan.maas.qwencloudapi.com:444/compatible-mode/v1/chat/completions",
+                "https://relay.example/compatible-mode/v1/chat/completions",
+            ] {
+                assert!(
+                    args.configured_model_credential(&provider, endpoint)
+                        .is_none()
+                );
+            }
+            let saved = super::super::model_auth::Keys::parse(
+                &json!({(name):{"type":"api_key", "key":"old-route-key", "endpoint":legacy}}),
+            );
+            assert!(saved.credential(&provider, official).is_none());
+            assert_eq!(
+                saved.credential(&provider, legacy).unwrap().literal(),
+                Some("old-route-key")
+            );
+        }
     }
 
     #[test]
@@ -2593,21 +3442,113 @@ mod tests {
     }
 
     #[test]
+    fn azure_profiles_scope_credentials_to_configured_resource_routes() {
+        let mut data = json!({});
+        let profiles = Profiles::parse_with_azure_env(&mut data, |key| match key {
+            "AZURE_OPENAI_RESOURCE_NAME" => Some("configured-account".into()),
+            "AZURE_OPENAI_API_VERSION" => Some("preview".into()),
+            "AZURE_OPENAI_DEPLOYMENT_NAME_MAP" => Some("o4-mini = deployment,invalid".into()),
+            _ => None,
+        })
+        .unwrap();
+        let azure = profiles.provider("azure").unwrap();
+        assert_eq!(profiles.model_ids(&azure).len(), 48);
+        assert_eq!(profiles.model_ids(&azure)[0], "chat-latest");
+        assert_eq!(profiles.azure_api_version(), "preview");
+        let model = profiles.model(&azure, "gpt-6.2-sol").unwrap();
+        assert_eq!(model.context_window, Some(1_050_000));
+        let price = model.cost.unwrap();
+        for (tokens, rate) in [(272_000, 2.0), (272_001, 4.0)] {
+            let usage = pi_rs::Usage {
+                input_tokens: tokens,
+                output_tokens: 0,
+            };
+            let cost = price
+                .estimate(usage, &pi_rs::ModelMetadata::default())
+                .unwrap();
+            let expected = rate * tokens as f64 / 1_000_000.0;
+            assert!((cost.input.as_f64().unwrap() - expected).abs() < 1e-12);
+        }
+        assert_eq!(
+            profiles
+                .azure_deployments()
+                .get("o4-mini")
+                .map(String::as_str),
+            Some("deployment")
+        );
+
+        let keys = super::super::model_auth::Keys::parse(
+            &json!({"azure":{"type":"api_key","key":"fixture"}}),
+        );
+        for (model, adapter, endpoint) in [
+            (
+                "o4-mini",
+                Adapter::AzureResponses,
+                "https://configured-account.openai.azure.com/openai/v1/responses",
+            ),
+            (
+                "gpt-6.2-sol",
+                Adapter::AzureResponses,
+                "https://configured-account.openai.azure.com/openai/v1/responses",
+            ),
+            (
+                "deepseek-v4-pro",
+                Adapter::ChatCompletions,
+                "https://configured-account.openai.azure.com/openai/v1/chat/completions",
+            ),
+        ] {
+            assert_eq!(profiles.model_adapter(&azure, model), adapter);
+            assert_eq!(profiles.model_endpoint(&azure, model), Some(endpoint));
+            assert!(profiles.has_provider_endpoint(&azure, endpoint));
+            assert_eq!(
+                keys.custom_credential(&azure, endpoint, &profiles)
+                    .and_then(|key| key.literal()),
+                Some("fixture")
+            );
+        }
+        assert!(
+            keys.custom_credential(
+                &azure,
+                "https://other.openai.azure.com/openai/v1/responses",
+                &profiles
+            )
+            .is_none()
+        );
+        assert!(
+            Profiles::parse_with_azure_env(&mut json!({}), |key| {
+                (key == "AZURE_OPENAI_RESOURCE_NAME").then(|| "other.example/path".into())
+            })
+            .is_err()
+        );
+        let mut configured = json!({
+            "providers":{"Azure":{"baseUrl":"https://configured.openai.azure.com"}}
+        });
+        let profiles = Profiles::parse_with_azure_env(&mut configured, |key| {
+            (key == "AZURE_OPENAI_RESOURCE_NAME").then(|| "other.example/path".into())
+        })
+        .unwrap();
+        assert_eq!(
+            profiles.endpoint(&profiles.provider("azure").unwrap()),
+            "https://configured.openai.azure.com/openai/v1/responses"
+        );
+    }
+
+    #[test]
     fn opencode_catalogs_bind_each_api_to_its_own_official_route() {
         let profiles = Profiles::default();
         for (id, prefix, count, default, messages, responses) in [
             (
                 "opencode",
                 "/inference",
-                79,
+                84,
                 "kimi-k2.6",
-                "claude-fable-5",
-                "gpt-6-sol",
+                "claude-fable-5-2",
+                "gpt-6.2-sol",
             ),
             (
                 "opencode-go",
                 "/inference/go",
-                30,
+                33,
                 "kimi-k3",
                 "claude-haiku-5-5",
                 "gpt-6-luna",
@@ -2619,6 +3560,19 @@ mod tests {
             assert_eq!(available.len(), count);
             assert_eq!(available[0], default);
             assert_eq!(builtin.env(), "OPENCODE_API_KEY");
+            assert!(!available.iter().any(|model| model == "glm-5.2"));
+            let efforts = profiles.anthropic_managed_effort_models(&provider, messages, None);
+            if id == "opencode" {
+                assert_eq!(efforts.len(), 6);
+                assert_eq!(efforts.get("claude-fable-5-2"), Some(&false));
+                assert_eq!(efforts.get("claude-opus-5"), Some(&true));
+            } else {
+                assert_eq!(efforts, BTreeMap::from([("claude-haiku-5-5".into(), true)]));
+                assert_eq!(
+                    profiles.model_adapter(&provider, "qwen4-max"),
+                    Adapter::Anthropic
+                );
+            }
 
             let keys = super::super::model_auth::Keys::parse(
                 &json!({id:{"type":"api_key","key":"fixture"}}),
@@ -2686,8 +3640,14 @@ mod tests {
         let profiles = Profiles::parse(&json!({})).unwrap();
         let baseten = profiles.provider("baseten").unwrap();
         let nvidia = profiles.provider("nvidia").unwrap();
-        assert_eq!(profiles.model_ids(&baseten).len(), 14);
-        assert_eq!(profiles.model_ids(&nvidia).len(), 21);
+        assert_eq!(profiles.model_ids(&baseten).len(), 15);
+        assert_eq!(profiles.model_ids(&nvidia).len(), 12);
+        assert!(
+            !profiles
+                .model_ids(&nvidia)
+                .iter()
+                .any(|id| id == "deepseek-ai/deepseek-v4.1-flash")
+        );
         let model = profiles.model(&baseten, "zai-org/GLM-5.2").unwrap();
         assert_eq!(model.reasoning, Some(true));
         assert_eq!(
@@ -2699,7 +3659,7 @@ mod tests {
             .request_headers(
                 &nvidia,
                 endpoint,
-                Some("deepseek-ai/deepseek-v4.1-flash"),
+                Some("nvidia/nemotron-3.5-super-vl-120b-a12b"),
                 Some("fixture"),
             )
             .unwrap();
@@ -2708,20 +3668,20 @@ mod tests {
             .request_headers(
                 &nvidia,
                 "https://relay.example/v1/chat/completions",
-                Some("deepseek-ai/deepseek-v4.1-flash"),
+                Some("nvidia/nemotron-3.5-super-vl-120b-a12b"),
                 None,
             )
             .unwrap();
         assert!(untrusted.get("nvcf-poll-seconds").is_none());
         let configured = Profiles::parse(&json!({"providers":{"nvidia":{
             "baseUrl":"https://relay.example/v1",
-            "modelOverrides":{"deepseek-ai/deepseek-v4.1-flash":{"headers":{"X-Relay-Secret":"private"}}}
+            "modelOverrides":{"nvidia/nemotron-3.5-super-vl-120b-a12b":{"headers":{"X-Relay-Secret":"private"}}}
         }}})).unwrap();
         let official = configured
             .request_headers(
                 &nvidia,
                 endpoint,
-                Some("deepseek-ai/deepseek-v4.1-flash"),
+                Some("nvidia/nemotron-3.5-super-vl-120b-a12b"),
                 None,
             )
             .unwrap();
@@ -2731,11 +3691,65 @@ mod tests {
             .request_headers(
                 &nvidia,
                 "https://relay.example/v1/chat/completions",
-                Some("deepseek-ai/deepseek-v4.1-flash"),
+                Some("nvidia/nemotron-3.5-super-vl-120b-a12b"),
                 None,
             )
             .unwrap();
         assert_eq!(relay["x-relay-secret"], "private");
+    }
+
+    #[test]
+    fn kimi_k31_pro_catalog_keeps_host_specific_limits_and_compatibility() {
+        let profiles = Profiles::default();
+        let model_id = "moonshotai/Kimi-K3.1-Pro";
+        for (provider_id, total, max_output) in
+            [("baseten", 15, 262_144), ("together", 16, 1_048_576)]
+        {
+            let provider = profiles.provider(provider_id).unwrap();
+            assert_eq!(profiles.model_ids(&provider).len(), total);
+            assert_eq!(
+                profiles.model_adapter(&provider, model_id),
+                Adapter::ChatCompletions
+            );
+            let model = profiles.model(&provider, model_id).unwrap();
+            assert_eq!(model.context_window, Some(1_048_576));
+            assert_eq!(model.max_tokens, Some(max_output));
+            assert_eq!(model.supports_images(), Some(true));
+            assert_eq!(model.image_resize().unwrap().max_width, Some(2000));
+            assert_ne!(
+                profiles
+                    .chat_compatibility(&provider, Some(&model))
+                    .supports_developer_role(),
+                Some(true)
+            );
+        }
+        let together = profiles.provider("together").unwrap();
+        let previous = profiles.model(&together, "moonshotai/Kimi-K3").unwrap();
+        assert_eq!(previous.max_tokens, Some(1_048_576));
+        let latest = profiles.model(&together, model_id).unwrap();
+        assert_eq!(latest.mapped_effort("medium"), Some(None));
+    }
+
+    #[test]
+    fn huggingface_catalog_uses_text_and_vision_metadata_from_the_router() {
+        let profiles = Profiles::default();
+        let provider = profiles.provider("huggingface").unwrap();
+        assert_eq!(profiles.model_ids(&provider).len(), 87);
+        let model = profiles
+            .model(&provider, "moonshotai/Kimi-K3.1-Pro")
+            .unwrap();
+        assert_eq!(model.supports_images(), Some(true));
+        assert_eq!(
+            profiles
+                .chat_compatibility(&provider, Some(&model))
+                .supports_developer_role(),
+            None
+        );
+        assert_eq!(model.image_resize().unwrap().max_width, Some(2000));
+        let llama = profiles
+            .model(&provider, "meta-llama/Llama-3.2-1B-Instruct")
+            .unwrap();
+        assert_eq!(llama.supports_images(), Some(false));
     }
 
     #[test]
@@ -3118,6 +4132,51 @@ mod tests {
         assert_eq!(existing.supports_images(), None);
         assert_eq!(existing.context_window, Some(32000));
         assert_eq!(existing.max_tokens, None);
+    }
+
+    #[test]
+    fn mistral_catalog_uses_the_conversations_transport() {
+        let profiles = Profiles::default();
+        let provider = profiles.provider("mistral").unwrap();
+        assert_eq!(provider.adapter(), Adapter::MistralConversations);
+        assert_eq!(profiles.model_ids(&provider).len(), 34);
+        assert_eq!(profiles.model_ids(&provider)[0], "devstral-medium-latest");
+        assert_eq!(
+            profiles.endpoint(&provider),
+            "https://api.mistral.ai/v1/chat/completions"
+        );
+        assert_eq!(
+            profiles.session_affinity(
+                &provider,
+                "deepseek-v4-1-flash-1017",
+                profiles.endpoint(&provider)
+            ),
+            ["x-affinity"]
+        );
+        let model = profiles
+            .model(&provider, "deepseek-v4-1-flash-1017")
+            .unwrap();
+        assert_eq!(model.mapped_effort("high"), Some(Some("high")));
+        assert_eq!(model.mapped_effort("off"), Some(Some("none")));
+        assert_eq!(model.supports_images(), Some(true));
+        assert_eq!(
+            model.image_resize(),
+            Some(ImageResizeProfile {
+                max_width: Some(2000),
+                max_height: Some(2000),
+                max_bytes: Some(4_718_592),
+                jpeg_quality: Some(80),
+            })
+        );
+
+        let ministral = profiles.model(&provider, "ministral-3b-2512").unwrap();
+        assert_eq!(ministral.max_tokens, Some(131_072));
+
+        let large = profiles.model(&provider, "mistral-large-latest").unwrap();
+        assert_eq!(large.context_window, Some(1_048_576));
+        assert_eq!(large.reasoning, Some(true));
+        assert_eq!(large.mapped_effort("medium"), Some(Some("medium")));
+        assert_eq!(large.mapped_effort("off"), Some(None));
     }
 
     #[test]

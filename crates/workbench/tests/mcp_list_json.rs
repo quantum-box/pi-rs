@@ -61,14 +61,26 @@ async fn list_json_reports_servers_tools_sources_and_failures() {
                     ),
                     _ => None,
                 };
-                let (status, body) = match result {
-                    Some(result) => (
-                        "200 OK",
-                        json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string(),
-                    ),
-                    None => ("202 Accepted", String::new()),
+                let (status, content_type, body) = match result {
+                    Some(result) => {
+                        let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                        if request["method"] == "tools/list" {
+                            let notification = json!({
+                                "jsonrpc":"2.0","method":"notifications/message",
+                                "params":{"level":"warning","logger":"test","data":"fixture log\nsecond line"}
+                            });
+                            (
+                                "200 OK",
+                                "text/event-stream",
+                                format!("data: {notification}\n\ndata: {reply}\n\n"),
+                            )
+                        } else {
+                            ("200 OK", "application/json", reply.to_string())
+                        }
+                    }
+                    None => ("202 Accepted", "application/json", String::new()),
                 };
-                let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
             });
         }
     });
@@ -126,6 +138,10 @@ async fn list_json_reports_servers_tools_sources_and_failures() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("private-argument"));
     assert!(!stdout.contains("private-query"));
+    assert!(!stdout.contains("fixture log"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture log"));
+    let log = std::fs::read_to_string(home.join("mcp.log")).unwrap();
+    assert!(log.contains("[fixture] warning test: fixture log\n    second line\n"));
     let find = |name: &str| {
         reports
             .iter()
