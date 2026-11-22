@@ -5139,7 +5139,9 @@ validated after JSON serialization, so sparse array slots are rejected as null.
 Classifier and image usage is included in the script result, terminal token
 total, and RPC session statistics. The TypeSafe and OpenRouter non-chat
 catalogues are projected from the published
-[Pi AI v1.5.0 package](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.5.0).
+[Pi AI v1.6.0 package](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.6.0).
+The GitHub Copilot classifier in that release still requires support for
+Copilot's authenticated System One route.
 
 ### Cloudflare Workers AI chat checkpoint
 
