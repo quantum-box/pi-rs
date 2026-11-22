@@ -132,6 +132,34 @@ fn model_listing_reports_unknown_options_before_showing_results() {
 }
 
 #[test]
+fn deferred_builtin_errors_precede_model_selection() {
+    let output = run(&[
+        "--offline",
+        "--no-approve",
+        "--provider",
+        "unknown-provider-fixture",
+        "--model",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(output.stderr, b"Error: Unknown option: --model\n");
+}
+
+#[test]
+fn model_listing_surfaces_resource_discovery_errors_during_option_validation() {
+    let output = run(&[
+        "--offline",
+        "--no-approve",
+        "--list-models",
+        "--skill",
+        "missing-fixture-*.md",
+        "--extra-fixture",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing-fixture-*.md"));
+}
+
+#[test]
 fn rpc_rejects_file_arguments_before_startup() {
     for args in [
         &["--mode", "rpc", "@missing.txt"][..],

@@ -505,7 +505,7 @@ pub(super) fn extension_help_from_args(argv: &[OsString]) -> Option<String> {
         .unwrap_or(false);
     args.settings = super::config::Settings::load(&args.workspace, args.trusted).ok()?;
     let mut flags = BTreeMap::new();
-    for flag in discovered_extension_flags(&args)? {
+    for flag in discovered_extension_flags(&args).ok()? {
         let usage = match flag.default {
             ExtensionFlagValue::Boolean(_) => format!("--{}", flag.name),
             ExtensionFlagValue::String(_) => format!("--{} <value>", flag.name),
@@ -535,10 +535,12 @@ pub(super) fn extension_help_from_args(argv: &[OsString]) -> Option<String> {
     Some(help)
 }
 
-pub(super) fn discovered_extension_flags(args: &super::Cli) -> Option<Vec<pi_rs::ExtensionFlag>> {
+pub(super) fn discovered_extension_flags(
+    args: &super::Cli,
+) -> pi_rs::Result<Vec<pi_rs::ExtensionFlag>> {
     use pi_rs::Extension;
 
-    let resources = super::resources::Resources::load(args).ok()?;
+    let resources = super::resources::Resources::load(args)?;
     let reserved = reserved_flag_names();
     let mut flags = Vec::new();
     for path in resources.extensions {
@@ -556,7 +558,7 @@ pub(super) fn discovered_extension_flags(args: &super::Cli) -> Option<Vec<pi_rs:
             }
         }
     }
-    Some(flags)
+    Ok(flags)
 }
 
 /// Export paths are resolved independently of Clap's multi-value `--export`.

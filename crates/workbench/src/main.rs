@@ -1574,6 +1574,38 @@ async fn run_cli() -> i32 {
                 eprintln!("{warning}");
             }
         }
+        if args.command.is_none() && !args.extension_flags.is_empty() {
+            let reserved = cli_compat::reserved_flag_names();
+            let deferred_builtin = args
+                .extension_flags
+                .keys()
+                .any(|name| reserved.contains(name));
+            if args.list_models.is_some() || deferred_builtin {
+                let registered = cli_compat::discovered_extension_flags(&args);
+                let unknown: Vec<_> = args
+                    .ordered_extension_flags()
+                    .filter(|(name, _)| {
+                        registered.as_ref().map_or_else(
+                            |_| reserved.contains(*name),
+                            |flags| !flags.iter().any(|flag| flag.name == **name),
+                        )
+                    })
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                if !unknown.is_empty() {
+                    let message = cli_compat::unknown_extension_options(&unknown);
+                    if args.list_models.is_none() {
+                        return Err(Error::Config(message));
+                    }
+                    eprintln!("Error: {message}");
+                }
+                // Preserve the discovery error even when a malformed built-in flag
+                // could be diagnosed without the registration list.
+                if args.list_models.is_some() {
+                    registered?;
+                }
+            }
+        }
         args.model_keys = tokio::select! {
             result = model_auth::Keys::load_async() => result?,
             _ = &mut signal_rx => return Err(Error::Cancelled),
@@ -1832,19 +1864,6 @@ async fn execute(
         Vec::new()
     };
     if let Some(search) = &args.list_models {
-        if pi_style_invocation
-            && !args.extension_flags.is_empty()
-            && let Some(registered) = cli_compat::discovered_extension_flags(&args)
-        {
-            let unknown: Vec<_> = args
-                .ordered_extension_flags()
-                .filter(|(name, _)| !registered.iter().any(|flag| flag.name == **name))
-                .map(|(name, _)| name.as_str())
-                .collect();
-            if !unknown.is_empty() {
-                eprintln!("Error: {}", cli_compat::unknown_extension_options(&unknown));
-            }
-        }
         return model_listing::list(&args, search).await;
     }
     let needs_default_model = args.model.is_empty()
