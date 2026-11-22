@@ -6245,11 +6245,17 @@ metadata is forwarded to AWS for service-side validation. The effective options
 are part of the protected prepared-request identity. Published Pi and signed
 loopback requests verified the payload; live AWS verification was unavailable.
 
-Not yet supported: non-image multimodal inputs, workbench-specific thinking
-display controls, guardrails, prompt management ARNs, live account-specific
-model discovery, and workbench proxy/idle-timeout settings. Custom model endpoints in workbench configuration are rejected;
-callers embedding the adapter can pass a configured AWS SDK client, including a
-test endpoint, through `Bedrock::new`.
+The workbench applies `httpProxy`, proxy environment variables, and
+`NO_PROXY` exclusions to Bedrock Runtime and supported AWS credential
+requests. Instance and container metadata endpoints use direct connections.
+Loopback CLI tests cover proxy selection, role assumption, metadata bypass,
+and CONNECT authentication. The AWS SDK retains its own HTTP timeouts.
+
+Additional Bedrock features remain outside this workbench integration,
+including non-image inputs, workbench-specific thinking display controls,
+guardrails, prompt management ARNs, and live account-specific model discovery.
+Workbench model profiles reject custom Bedrock endpoints. Embedders can
+provide a configured AWS SDK client through `Bedrock::new`.
 
 ### External editor result
 
