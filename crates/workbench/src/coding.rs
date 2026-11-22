@@ -41,6 +41,13 @@ impl ReadImageModel {
     }
 }
 
+/// The prompt-visible name and contents of an explicit CLI file attachment.
+pub struct CliAttachment {
+    pub name: PathBuf,
+    pub text: String,
+    pub images: Vec<pi_rs::ImageContent>,
+}
+
 pub struct CodingTools {
     root: PathBuf,
     unrestricted: bool,
@@ -434,17 +441,7 @@ impl CodingTools {
 
     /// Resolve a reader path, including Pi's filename fallbacks and this profile's scope.
     pub fn resolve_read_path(&self, path: &Path) -> Result<PathBuf> {
-        CodingTool {
-            root: self.root.clone(),
-            unrestricted: self.unrestricted,
-            shell: self.shell.clone(),
-            kind: Kind::Read {
-                auto_resize: self.auto_resize_images,
-                profile: self.image_profile,
-                unsupported_image_model: None,
-            },
-        }
-        .path(
+        self.attachment_reader().path(
             path.to_str()
                 .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?,
         )
@@ -460,12 +457,39 @@ impl CodingTools {
         self.read_attachment_inner(path, true)
     }
 
+    /// Read an explicit CLI attachment and retain its lexical filename for the prompt.
+    /// Relative names are resolved from the CLI workspace before following links.
+    pub fn read_cli_attachment(
+        &self,
+        workspace: &Path,
+        value: &str,
+    ) -> Result<Option<CliAttachment>> {
+        let tool = self.attachment_reader();
+        let name = tool.input_path(&std::path::absolute(workspace)?, value)?;
+        let path = tool.canonical_path(&name)?;
+        let metadata = path.metadata()?;
+        if metadata.is_file() && metadata.len() == 0 {
+            return Ok(None);
+        }
+        let (text, images) = tool.read_attachment_at(&path, true)?;
+        Ok(Some(CliAttachment { name, text, images }))
+    }
+
     fn read_attachment_inner(
         &self,
         path: &Path,
         lossy: bool,
     ) -> Result<(String, Vec<pi_rs::ImageContent>)> {
-        let tool = CodingTool {
+        let tool = self.attachment_reader();
+        let name = path
+            .to_str()
+            .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?;
+        let path = tool.path(name)?;
+        tool.read_attachment_at(&path, lossy)
+    }
+
+    fn attachment_reader(&self) -> CodingTool {
+        CodingTool {
             root: self.root.clone(),
             unrestricted: self.unrestricted,
             shell: self.shell.clone(),
@@ -474,31 +498,36 @@ impl CodingTools {
                 profile: self.image_profile,
                 unsupported_image_model: None,
             },
-        };
-        let name = path
-            .to_str()
-            .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?;
-        let path = tool.path(name)?;
-        let image = if lossy && !crate::cli_attachment_sniff::is_image_file(&path)? {
+        }
+    }
+}
+
+impl CodingTool {
+    fn read_attachment_at(
+        &self,
+        path: &Path,
+        lossy: bool,
+    ) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+        let image = if lossy && !crate::cli_attachment_sniff::is_image_file(path)? {
             Ok(None)
         } else if lossy {
-            tool.read_image_inner(&path, false)
+            self.read_image_inner(path, false)
         } else {
-            tool.read_image(&path)
+            self.read_image(path)
         };
         finish_attachment(image, || {
             if !lossy {
-                return tool.text(&path);
+                return self.text(path);
             }
             use std::io::Read as _;
             let metadata = path.metadata()?;
-            if !metadata.is_file() || (!tool.unrestricted && metadata.len() > MAX_FILE_BYTES) {
+            if !metadata.is_file() || (!self.unrestricted && metadata.len() > MAX_FILE_BYTES) {
                 return Err(Error::Config(
                     "expected a regular text file up to 4 MiB".into(),
                 ));
             }
             let mut bytes = Vec::new();
-            std::fs::File::open(&path)?
+            std::fs::File::open(path)?
                 .take(8 * 1024 * 1024 + 1)
                 .read_to_end(&mut bytes)?;
             if bytes.len() > 8 * 1024 * 1024 {
@@ -2713,6 +2742,10 @@ fn grep_glob_overrides(
 
 impl CodingTool {
     fn path(&self, value: &str) -> Result<PathBuf> {
+        self.canonical_path(&self.input_path(&self.root, value)?)
+    }
+
+    fn input_path(&self, root: &Path, value: &str) -> Result<PathBuf> {
         let input = crate::coding_paths::normalize(value)?;
         if !self.unrestricted
             && input
@@ -2721,12 +2754,15 @@ impl CodingTool {
         {
             return Err(Error::Config("parent traversal is not supported".into()));
         }
-        let path = crate::coding_paths::resolve(&self.root, &input);
-        let path = if matches!(self.kind, Kind::Read { .. }) {
+        let path = crate::coding_paths::resolve(root, &input);
+        Ok(if matches!(self.kind, Kind::Read { .. }) {
             crate::coding_paths::read_variant(path)
         } else {
             path
-        };
+        })
+    }
+
+    fn canonical_path(&self, path: &Path) -> Result<PathBuf> {
         let resolved = path.canonicalize().map_err(|error| {
             if self.unrestricted
                 && error.kind() == std::io::ErrorKind::NotFound
