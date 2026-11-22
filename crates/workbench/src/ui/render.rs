@@ -5238,6 +5238,7 @@ mod tests {
             finished: true,
             numbered_diff: true,
             render_records: None,
+            render_call_id: None,
             rendered: None,
             parts: Vec::new(),
         };
