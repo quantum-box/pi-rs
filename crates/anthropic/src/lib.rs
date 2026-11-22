@@ -22,6 +22,7 @@ mod thread;
 
 pub const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
+pub const OAUTH_API_BETA: &str = "oauth-2025-04-20";
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
@@ -114,6 +115,7 @@ pub struct Anthropic {
     endpoint: Url,
     auth: (HeaderName, HeaderValue),
     oauth: bool,
+    federation_rejected: Option<Arc<dyn Fn() + Send + Sync>>,
     provider: Arc<str>,
     replay_scope: Arc<str>,
     headers: HeaderMap,
@@ -156,6 +158,34 @@ impl Anthropic {
             ));
         }
         Self::connect(endpoint, AUTHORIZATION, &format!("Bearer {token}"))
+    }
+
+    /// Authenticate using a short-lived Anthropic workload identity access token.
+    pub fn with_federated_token(
+        endpoint: &str,
+        token: &str,
+        on_rejection: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self> {
+        let mut client = Self::with_bearer_token(endpoint, token)?;
+        if client.endpoint.as_str() != DEFAULT_ENDPOINT {
+            return Err(Error::Config(
+                "Anthropic workload identity requires the official endpoint".into(),
+            ));
+        }
+        client.federation_rejected = Some(Arc::new(on_rejection));
+        Ok(client)
+    }
+
+    /// Use an explicitly configured authentication header as the request credential.
+    pub fn with_authentication_header(
+        endpoint: &str,
+        name: HeaderName,
+        value: &HeaderValue,
+    ) -> Result<Self> {
+        let credential = value
+            .to_str()
+            .map_err(|_| Error::Config("invalid Anthropic authentication header".into()))?;
+        Self::connect(endpoint, name, credential)
     }
 
     /// Authenticate to Cloudflare AI Gateway without an origin API key.
@@ -231,6 +261,7 @@ impl Anthropic {
             endpoint,
             auth: (name, value),
             oauth: false,
+            federation_rejected: None,
             provider: Arc::from("anthropic"),
             replay_scope,
             headers: HeaderMap::new(),
@@ -562,12 +593,7 @@ impl Anthropic {
         let mut url = self.models_url();
         url.path_segments_mut().ok()?.push(model);
         let details = tokio::time::timeout(Duration::from_secs(2), async {
-            let response = send(
-                self.authenticate(self.client.get(url), false, false, false, false, false),
-                &self.error_secrets(),
-            )
-            .await
-            .ok()?;
+            let response = self.send_catalog_request(url).await.ok()?;
             decode_model(&read_json(response).await.ok()?)
         })
         .await
@@ -659,12 +685,17 @@ impl Anthropic {
                 );
             }
         }
-        if has_fallbacks || supports_managed_effort || session_threads {
+        if has_fallbacks
+            || supports_managed_effort
+            || session_threads
+            || self.federation_rejected.is_some()
+        {
             let mut value = headers
                 .get(&beta)
                 .map_or_else(Vec::new, |value| value.as_bytes().to_vec());
             for feature in [
                 has_fallbacks.then_some(FALLBACK_BETA),
+                self.federation_rejected.is_some().then_some(OAUTH_API_BETA),
                 supports_managed_effort.then_some(EFFORT_BETA),
                 supports_managed_effort.then_some(THINKING_BINDING_BETA),
                 session_threads.then_some(MESSAGE_THREADS_BETA),
@@ -752,11 +783,7 @@ impl Anthropic {
             if let Some(cursor) = &cursor {
                 url.query_pairs_mut().append_pair("after_id", cursor);
             }
-            let response = send(
-                self.authenticate(self.client.get(url), false, false, false, false, false),
-                &self.error_secrets(),
-            )
-            .await?;
+            let response = self.send_catalog_request(url).await?;
             let page = read_json(response).await?;
             let models = page["data"]
                 .as_array()
@@ -787,6 +814,21 @@ impl Anthropic {
         Err(Error::Model(
             "Anthropic model listing exceeds page limit".into(),
         ))
+    }
+
+    async fn send_catalog_request(&self, url: Url) -> Result<Response> {
+        let request = self.authenticate(self.client.get(url), false, false, false, false, false);
+        let response = send_http(request).await?;
+        self.invalidate_rejected_federation_token(response.status());
+        check_status(response, &self.error_secrets()).await
+    }
+
+    fn invalidate_rejected_federation_token(&self, status: reqwest::StatusCode) {
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(rejected) = &self.federation_rejected
+        {
+            rejected();
+        }
     }
 }
 
@@ -1047,6 +1089,7 @@ async fn is_permanent_quota(mut response: Response, secrets: &[String]) -> bool 
     .unwrap_or(false)
 }
 
+#[cfg(test)]
 async fn send(request: reqwest::RequestBuilder, secrets: &[String]) -> Result<Response> {
     check_status(send_http(request).await?, secrets).await
 }
@@ -2204,6 +2247,7 @@ impl Anthropic {
                 |response| (response.status().as_u16(), response.headers()),
             )
             .await?;
+        self.invalidate_rejected_federation_token(response.status());
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
@@ -3836,6 +3880,118 @@ mod tests {
         ] if matches!(diagnostics.as_slice(), [
             AssistantDiagnostic::AnthropicThreadFallback { details, .. },
         ] if details.reason == "thread_beta_unsupported")));
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_federation_token_is_invalidated_by_catalog_requests() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let exchanges = [
+            ("/v1/models?limit=100", "401 Unauthorized"),
+            ("/v1/models/claude", "401 Unauthorized"),
+            ("/v1/models?limit=100", "403 Forbidden"),
+        ];
+        let worker = std::thread::spawn(move || {
+            for (path, status) in exchanges {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                assert_eq!(first.trim_end(), format!("GET {path} HTTP/1.1"));
+                let headers: Vec<_> = reader
+                    .lines()
+                    .map(|line| line.unwrap())
+                    .take_while(|line| !line.is_empty())
+                    .collect();
+                assert!(headers.iter().any(|line| {
+                    line.eq_ignore_ascii_case("authorization: Bearer fixture-token")
+                }));
+                let status_line = format!("HTTP/1.1 {status}\r\n");
+                socket.write_all(status_line.as_bytes()).unwrap();
+                socket
+                    .write_all(b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            }
+        });
+        let rejected = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&rejected);
+        let mut client =
+            Anthropic::with_bearer_token(&format!("http://{address}/v1/messages"), "fixture-token")
+                .unwrap();
+        client.federation_rejected = Some(Arc::new(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        }));
+        assert!(client.models().await.is_err());
+        assert_eq!(rejected.load(Ordering::Relaxed), 1);
+        assert!(client.model("claude").await.is_none());
+        assert_eq!(rejected.load(Ordering::Relaxed), 2);
+        assert!(client.models().await.is_err());
+        assert_eq!(rejected.load(Ordering::Relaxed), 2);
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_federation_token_is_invalidated_after_thread_fallback() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for (status, error) in [
+                (
+                    "404 Not Found",
+                    json!({"error":{"details":{"error_code":"thread_not_found"},"message":"fixture"}}),
+                ),
+                (
+                    "401 Unauthorized",
+                    json!({"error":{"type":"authentication_error","message":"expired"}}),
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (headers, body) = read_fixture_request(&mut socket);
+                assert!(headers.contains(MESSAGE_THREADS_BETA));
+                assert!(headers.contains(OAUTH_API_BETA));
+                assert_eq!(body["thread"], json!({"type":"create"}));
+                let error = error.to_string();
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}", error.len()).unwrap();
+            }
+        });
+        let rejections = Arc::new(AtomicUsize::new(0));
+        let rejected = Arc::clone(&rejections);
+        let mut client =
+            Anthropic::with_bearer_token(&format!("http://{address}/v1/messages"), "fixture-token")
+                .unwrap()
+                .with_message_thread_support(Some(true), BTreeMap::new())
+                .with_cache_retention(CacheRetention::Short, true);
+        client.federation_rejected = Some(Arc::new(move || {
+            rejected.fetch_add(1, Ordering::Relaxed);
+        }));
+        let request = ModelRequest {
+            model: "claude".into(),
+            messages: vec![Message::User {
+                content: "test".into(),
+            }],
+            tools: Vec::new(),
+            max_output_tokens: 8,
+        };
+        let mut stream = client
+            .stream_detailed_with_tools(request, None, Some((uuid::Uuid::new_v4(), "fixture")))
+            .await
+            .unwrap();
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert!(matches!(stream.next().await, Some(Err(_))));
+        assert_eq!(rejections.load(Ordering::Relaxed), 1);
         worker.join().unwrap();
     }
 

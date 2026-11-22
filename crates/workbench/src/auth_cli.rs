@@ -39,6 +39,7 @@ struct Candidate {
 enum AuthType {
     ApiKey,
     OAuth,
+    UnresolvedAuthorization,
 }
 
 struct Resolved {
@@ -141,6 +142,75 @@ async fn resolve(
         .and_then(|id| args.model_profiles.model_endpoint(provider, id))
         .unwrap_or_else(|| args.model_profiles.endpoint(provider));
     if let Some(credential) = args.configured_model_credential(provider, endpoint) {
+        if let super::model_auth::Credential::AnthropicFederation(federation) = &credential {
+            if model.is_some_and(|id| {
+                args.model_profiles.model_adapter(provider, id)
+                    != super::providers::Adapter::Anthropic
+            }) {
+                return Ok(None);
+            }
+            let headers = args
+                .model_profiles
+                .header_settings(provider, endpoint, model)
+                .with_environment(args.model_keys.environment(
+                    provider,
+                    endpoint,
+                    &args.model_profiles,
+                ));
+            let selected = if no_refresh {
+                headers.anthropic_auth_without_refresh().await?
+            } else {
+                let (headers, selected) = headers.resolve_anthropic_auth().await?;
+                selected.map(|name| {
+                    let value = headers[&name].clone();
+                    (name, Some(value))
+                })
+            };
+            if let Some((name, value)) = selected {
+                let value = value
+                    .as_ref()
+                    .map(|value| value.to_str().expect("validated Anthropic header"));
+                let (kind, value) = match (name.as_str(), value) {
+                    ("x-api-key", value) => (AuthType::ApiKey, value.map(str::trim)),
+                    ("authorization", None) => (AuthType::UnresolvedAuthorization, None),
+                    ("authorization", Some(value)) => {
+                        let mut parts = value.split_ascii_whitespace();
+                        match (parts.next(), parts.next(), parts.next()) {
+                            (Some(scheme), Some(token), None)
+                                if scheme.eq_ignore_ascii_case("bearer") =>
+                            {
+                                (AuthType::OAuth, Some(token))
+                            }
+                            _ => (AuthType::ApiKey, None),
+                        }
+                    }
+                    _ => (AuthType::ApiKey, None),
+                };
+                return Ok(wanted
+                    .is_none_or(|wanted| wanted == kind)
+                    .then(|| Resolved {
+                        kind,
+                        value: value.map(str::to_owned),
+                    }));
+            }
+            if wanted == Some(AuthType::ApiKey) {
+                return Ok(None);
+            }
+            let value = if no_refresh {
+                federation.check_identity_file().await?;
+                None
+            } else {
+                Some(
+                    federation
+                        .access_with_minimum(&args.settings, minimum)
+                        .await?,
+                )
+            };
+            return Ok(Some(Resolved {
+                kind: AuthType::OAuth,
+                value,
+            }));
+        }
         if matches!(credential, super::model_auth::Credential::BedrockChain) {
             return Ok(
                 (wanted.is_none() && bedrock_ambient_configured(false)).then_some(Resolved {
@@ -373,6 +443,9 @@ async fn logout(settings: &super::config::Settings, reference: &str) -> Result<i
         Some(AuthType::ApiKey) => emit(&format!(
             "Removed stored API key for {name}. Environment variables and models.json config are unchanged."
         ))?,
+        Some(AuthType::UnresolvedAuthorization) => {
+            emit(&format!("Removed stored credentials for {name}."))?;
+        }
         None => emit(&format!(
             "No stored credentials for {name}. Environment variables and models.json config are unchanged."
         ))?,
@@ -457,11 +530,11 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
                     } else {
                         status = "ready";
                         reason = None;
-                        auth_type = Some(if value.kind == AuthType::OAuth {
-                            "oauth"
-                        } else {
-                            "api_key"
-                        });
+                        auth_type = match value.kind {
+                            AuthType::ApiKey => Some("api_key"),
+                            AuthType::OAuth => Some("oauth"),
+                            AuthType::UnresolvedAuthorization => None,
+                        };
                         if credentials {
                             output_credential = value.value;
                         }

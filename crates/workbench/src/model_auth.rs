@@ -54,6 +54,7 @@ pub(super) enum Credential {
     Codex,
     Copilot,
     AnthropicOAuth,
+    AnthropicFederation(Arc<super::anthropic_federation::Federation>),
     Kimi,
     Meta,
     Xai,
@@ -106,6 +107,7 @@ impl Credential {
             | Self::Codex
             | Self::Copilot
             | Self::AnthropicOAuth
+            | Self::AnthropicFederation(_)
             | Self::Kimi
             | Self::Meta
             | Self::Xai
@@ -139,6 +141,7 @@ impl Credential {
                     | Self::Codex
                     | Self::Copilot
                     | Self::AnthropicOAuth
+                    | Self::AnthropicFederation(_)
                     | Self::Kimi
                     | Self::Meta
                     | Self::Xai
@@ -187,6 +190,11 @@ impl Credential {
             Self::AnthropicOAuth => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;
                 return super::anthropic_auth::access(&settings, None, false).await;
+            }
+            Self::AnthropicFederation(_) => {
+                return Err(Error::Config(
+                    "Anthropic workload identity requires the official Messages endpoint".into(),
+                ));
             }
             Self::Kimi => {
                 let settings = super::config::Settings::load(&std::env::current_dir()?, false)?;

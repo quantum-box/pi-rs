@@ -9610,6 +9610,121 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
 }
 
 #[test]
+fn anthropic_federation_auth_check_without_refresh_uses_only_the_identity_file() {
+    let root = tempfile::tempdir().unwrap();
+    let identity = root.path().join("jwt");
+    let assertion = "local-test-identity";
+    std::fs::write(&identity, assertion).unwrap();
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("ANTHROPIC_OAUTH_TOKEN")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env("ANTHROPIC_FEDERATION_RULE_ID", "federation-rule")
+            .env("ANTHROPIC_ORGANIZATION_ID", "organization")
+            .env("ANTHROPIC_IDENTITY_TOKEN_FILE", &identity)
+            .args(["--provider", "anthropic", "auth"]);
+        command
+    };
+    let check = || {
+        command()
+            .args(["check", "--json", "--no-refresh"])
+            .output()
+            .unwrap()
+    };
+    let output = check();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["status"], "ready");
+    assert_eq!(status["authType"], "oauth");
+    assert!(status.get("credentials").is_none());
+    assert_eq!(std::fs::read_to_string(&identity).unwrap(), assertion);
+
+    std::fs::write(&identity, "").unwrap();
+    let output = check();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["reason"], "invalid_state");
+
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"anthropic":{
+            "headers":{"Authorization":"Bearer fixture-header"}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let output = check();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["status"], "ready");
+    assert_eq!(status["authType"], "oauth");
+    assert!(status.get("credentials").is_none());
+
+    let output = command()
+        .args(["check", "--json", "--credentials", "--no-refresh"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["authType"], "oauth");
+    assert_eq!(status["credentials"], "fixture-header");
+
+    let export = command().arg("print-bearer-token").output().unwrap();
+    assert!(export.status.success(), "{export:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&export.stdout).trim(),
+        "fixture-header"
+    );
+    let export = command().arg("print-api-key").output().unwrap();
+    assert!(!export.status.success());
+
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"anthropic":{"headers":{"x-api-key":"fixture-key"}}}}).to_string(),
+    )
+    .unwrap();
+    let export = command().arg("print-api-key").output().unwrap();
+    assert!(export.status.success(), "{export:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&export.stdout).trim(),
+        "fixture-key"
+    );
+    let export = command().arg("print-bearer-token").output().unwrap();
+    assert!(!export.status.success());
+    assert!(String::from_utf8_lossy(&export.stderr).contains("No usable OAuth bearer token"));
+
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"anthropic":{
+            "headers":{"Authorization":"!pi-rs-missing-auth-fixture-command"}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let output = check();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(status.get("authType").is_none());
+
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"anthropic":{
+            "headers":{"Authorization":"Bearer fixture-header", "x-other":"invalid\nvalue"}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let output = command().args(["check", "--json"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["reason"], "invalid_state");
+}
+
+#[test]
 fn auth_logout_resolves_provider_names_and_preserves_other_credential_sources() {
     let root = tempfile::tempdir().unwrap();
     let config = root.path().join("models.json");
