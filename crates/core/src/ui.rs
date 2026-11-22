@@ -40,7 +40,7 @@ pub struct CustomMessageRenderOptions {
 /// and wraps the rows to fit.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RenderedExtensionContent {
+pub struct RenderedCustomMessage {
     pub lines: Vec<Vec<UiComponentSpan>>,
     #[serde(default)]
     pub padding: usize,
@@ -48,11 +48,14 @@ pub struct RenderedExtensionContent {
     pub background: Option<String>,
 }
 
-/// Rendered rows returned by a custom-message renderer.
-pub type RenderedCustomMessage = RenderedExtensionContent;
+/// Styled rows returned by a custom-entry renderer.
+pub type RenderedExtensionContent = RenderedCustomMessage;
 
-impl RenderedExtensionContent {
-    fn within_limits(&self) -> bool {
+/// Styled rows shared by the native extension renderers.
+pub type RenderedExtensionRows = RenderedCustomMessage;
+
+impl RenderedCustomMessage {
+    pub(crate) fn within_limits(&self) -> bool {
         component_lines_within_limits(&self.lines)
             && self
                 .background
