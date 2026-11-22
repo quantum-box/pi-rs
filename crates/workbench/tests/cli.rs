@@ -8727,8 +8727,21 @@ fn auth_check_with_model_uses_catalog_resolution_without_crossing_endpoints() {
     }});
     std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
     for (model, code, provider, status, reason) in [
-        ("Widget Alpha", 0, "relay-one", "ready", None),
-        ("Widget:high", 0, "relay-one", "ready", None),
+        ("relay-one/Widget Alpha", 0, "relay-one", "ready", None),
+        (
+            "Widget Alpha",
+            2,
+            "Widget Alpha",
+            "invalid",
+            Some("invalid_state"),
+        ),
+        (
+            "Widget:high",
+            1,
+            "relay-two",
+            "not_ready",
+            Some("credentials_not_configured"),
+        ),
         (
             "Widget Pro",
             1,

@@ -111,7 +111,9 @@ fn check_candidate(args: &Cli) -> Result<Option<Candidate>> {
         return candidates(args).map(|mut candidates| candidates.pop());
     }
     let model = args.model.trim();
-    if let Some(choice) = model_selection::cli_catalog_model(args, model, false)? {
+    // Pi builds the auth-check catalog without refreshing availability, so
+    // credential presence does not disambiguate the queried model.
+    if let Some(choice) = model_selection::cli_catalog_model(args, model, true)? {
         return Ok(Some(Candidate {
             provider: choice.provider,
             model: Some(choice.model),

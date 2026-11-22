@@ -5504,8 +5504,8 @@ split it into separate output lines. Scoped `find` preserves its filename spelli
 
 `pi auth check` reports configured credential readiness for a provider
 or model. It supports JSON output and a read-only `--no-refresh` check.
-A bare model reference uses the CLI catalog resolver, including provider
-precedence and ambiguity handling. Native qualified uncatalogued model IDs
+A bare model reference uses the CLI catalog resolver without using stored
+credentials to break ties, as Pi does for auth checks. Native qualified uncatalogued model IDs
 remain usable for checking their provider route.
 `print-api-key` and `print-bearer-token` explicitly resolve their own
 credential type. Model-specific endpoints are respected. Radius bearer
