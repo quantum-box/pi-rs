@@ -406,6 +406,18 @@ impl Settings {
             timeout: number("timeoutMs").map(std::time::Duration::from_millis),
         }
     }
+    /// Suppress retries for a request-only settings copy.
+    pub fn disable_provider_retries(&mut self) {
+        if let Some(provider) = self
+            .value
+            .get_mut("retry")
+            .and_then(|retry| retry.get_mut("provider"))
+            .and_then(Value::as_object_mut)
+        {
+            provider.insert("maxRetries".into(), Value::from(0));
+        }
+    }
+
     pub fn set_auto_retry_enabled(&mut self, enabled: bool) -> Result<()> {
         self.set_user_member("retry", "enabled", Value::Bool(enabled))?;
         self.live_auto_retry = Some(enabled);
@@ -2562,6 +2574,23 @@ mod tests {
         assert_eq!(retry.max_retries, 0);
         assert_eq!(retry.base_delay_ms, 0);
         assert_eq!(retry.max_agent_delay_ms, 42);
+    }
+
+    #[test]
+    fn disabling_provider_retries_preserves_unrecognized_settings() {
+        for value in [
+            json!({}),
+            json!({"retry":false}),
+            json!({"retry":{"provider":"invalid"}}),
+        ] {
+            let mut settings = Settings {
+                value: value.clone(),
+                ..Settings::default()
+            };
+            settings.disable_provider_retries();
+            assert_eq!(settings.value(), &value);
+            assert_eq!(settings.provider_retry(), pi_rs::ProviderRetry::default());
+        }
     }
 
     #[test]
