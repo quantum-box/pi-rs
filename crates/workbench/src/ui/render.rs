@@ -2168,6 +2168,10 @@ fn markdown_plain_at_depth(
                 {
                     lines.push(Line::default());
                 }
+                let start = super::markdown_spaces::include_line_indent(text, range.start);
+                if start != range.start {
+                    spans.push(Span::themed(&text[start..range.start], theme, "text"));
+                }
             }
             Event::Start(Tag::Table(alignments)) => {
                 flush(&mut spans, &mut lines, width, item_prefixes.last());
@@ -2757,19 +2761,26 @@ fn markdown_plain_at_depth(
                 if soft && matches!(events.peek(), Some((Event::DisplayMath(_), _))) {
                     continue;
                 }
-                let mut spaces = 0;
-                if !item_source_indents.is_empty()
-                    && !matches!(events.peek(), Some((Event::Text(value), _)) if value.starts_with(' '))
-                {
-                    spaces = list_continuation_spaces(&text[range.end..], &item_source_indents);
-                }
                 let mut continuation = String::new();
                 if soft {
                     continuation.push('\n');
                 } else {
                     flush(&mut spans, &mut lines, width, item_prefixes.last());
                 }
-                continuation.push_str(&" ".repeat(spaces));
+                if lists.is_empty() {
+                    if let Some((next, next_range)) = events.peek()
+                        && !matches!(next, Event::End(_))
+                        && let Some(indent) = text.get(range.end..next_range.start)
+                        && indent.bytes().all(|byte| byte == b' ')
+                    {
+                        continuation.push_str(indent);
+                    }
+                } else if !item_source_indents.is_empty()
+                    && !matches!(events.peek(), Some((Event::Text(value), _)) if value.starts_with(' '))
+                {
+                    let spaces = list_continuation_spaces(&text[range.end..], &item_source_indents);
+                    continuation.push_str(&" ".repeat(spaces));
+                }
                 if !continuation.is_empty() {
                     if soft && let Some((_, label, _)) = links.last_mut() {
                         label.push_str(&continuation);
@@ -3184,6 +3195,32 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(lines, expected, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn paragraph_indentation_matches_pinned_pi() {
+        let theme = Theme::system();
+        for (source, expected) in [
+            ("   *emphasis*", vec!["   emphasis"]),
+            ("\ttext", vec!["   text"]),
+            ("\n\ttext", vec!["", "   text"]),
+            ("text\n\tmore", vec!["text", "   more"]),
+            ("text  \n\t**more**", vec!["text", "   more"]),
+            ("text\n    more", vec!["text", "    more"]),
+            ("> text\n>\tmore", vec!["│ text", "│   more"]),
+            ("[r]: /a\n   text", vec!["   text"]),
+        ] {
+            let actual = markdown(source, &theme, 80)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{source:?}");
         }
     }
 
