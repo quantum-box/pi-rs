@@ -1581,11 +1581,12 @@ keeps stale responses out of a later query but means a terminal that never sends
 DA1 cannot refresh colors during that session. After an external editor or
 suspend hands terminal ownership away, further color queries are disabled for
 the session: another owner may consume the old DA1 or leave an unrelated one.
-If a later appearance report changes, or automatic mode is enabled after
-running with a fixed theme, the next applicable report clears stale colors and
-uses the reported light/dark mode with the ANSI fallback. A repeated report in
-continuous automatic mode retains the colors: a terminal's colors can
-intentionally differ from the OS appearance.
+When a terminal handoff has disabled queries, a changed appearance report
+clears the old colors and uses the reported light/dark mode with the ANSI
+fallback. The first report after switching back to automatic mode does the
+same in that state. Repeated reports in continuous automatic mode retain the
+colors because a terminal's colors can intentionally differ from the OS
+appearance.
 The first appearance report received during the initial color query is treated as
 the startup status report, not a color change; the protocol
 does not distinguish this report from a simultaneous notification.
@@ -2637,8 +2638,10 @@ characters and oversized lists are rejected before insertion. Windows uses
 PowerShell quoting, and Unix uses POSIX shell quoting.
 
 Tests cover file-list insertion, surrounding text, shell quoting, validation and
-existing image/text draft behavior. A populated system file-list clipboard has
-not been exercised in this environment.
+existing image/text draft behavior. In both regular and fullscreen modes, a
+macOS pasteboard containing two file URLs, PNG data and plain text inserted the
+two paths in order, with spaces around adjacent draft text. Pi v1.5.0 chose the
+same paths from the same fixture. Each run restored the original pasteboard.
 
 ### Durable queue controls checkpoint
 
@@ -2960,6 +2963,12 @@ modes, scrolling, resize and terminal restoration. Existing Kitty crop, active
 image and inline-image fixtures also passed, along with workspace tests and
 all-target Clippy on Rust 1.89. Further cell-metric and aspect-ratio fidelity
 work remains in the terminal surface.
+
+Konsole 25.04.2 also displayed the iTerm2 OSC 1337 protocol in both modes.
+Screenshots of the macOS pi-rs process relayed to Konsole in an isolated Linux
+display matched the visible bands of the 320×480 pasteboard PNG. Fullscreen
+sent a 320×208 crop and regular mode sent the full image for viewport
+clipping. Visual acceptance in the iTerm2 application remains open.
 
 ### Image cell-sizing checkpoint
 
