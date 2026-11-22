@@ -21,13 +21,15 @@ pub fn expand(
             messages.push(argument.as_str());
             continue;
         };
-        let path = tools.resolve_read_path(Path::new(path))?;
-        let metadata = path.metadata()?;
-        if metadata.is_file() && metadata.len() == 0 {
+        let Some(attachment) = tools.read_cli_attachment(workspace, path)? else {
             continue;
-        }
-        let (content, attached) = tools.read_attachment_lossy(&path)?;
-        let name = path.to_string_lossy();
+        };
+        let pi_rs_workbench::coding::CliAttachment {
+            name,
+            text: content,
+            images: attached,
+        } = attachment;
+        let name = name.to_string_lossy();
         if attached.is_empty() {
             let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
             files.push_str(&format!("<file name=\"{name}\">\n{content}\n</file>\n"));
@@ -86,6 +88,60 @@ mod tests {
         std::fs::write(directory.path().join("a\"<b>.txt"), "text").unwrap();
         let (text, _) = expand(&["@a\"<b>.txt".into()], directory.path(), false, None).unwrap();
         assert!(text.contains("a\"<b>.txt\">\ntext\n</file>\n"), "{text}");
+    }
+
+    #[test]
+    fn attachment_tags_use_the_absolute_workspace_path() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "text").unwrap();
+        let (text, _) = expand(
+            &["@missing/../note.txt".into()],
+            directory.path(),
+            false,
+            None,
+        )
+        .unwrap();
+        let name = directory.path().join("note.txt");
+        assert_eq!(
+            text,
+            format!("<file name=\"{}\">\ntext\n</file>\n", name.display())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_tags_keep_symlink_names_for_text_and_images() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("note.txt"), "linked text").unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(source.join("target.png"))
+            .unwrap();
+        symlink("source", directory.path().join("linked")).unwrap();
+        symlink("linked/target.png", directory.path().join("image.png")).unwrap();
+
+        let (text, images) = expand(
+            &["@linked/note.txt".into(), "@image.png".into()],
+            directory.path(),
+            false,
+            None,
+        )
+        .unwrap();
+        let note = directory.path().join("linked/note.txt");
+        let image = directory.path().join("image.png");
+        assert_eq!(
+            text,
+            format!(
+                "<file name=\"{}\">\nlinked text\n</file>\n<file name=\"{}\"></file>\n",
+                note.display(),
+                image.display()
+            )
+        );
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
     }
 
     #[test]
