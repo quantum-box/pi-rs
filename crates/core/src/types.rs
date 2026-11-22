@@ -101,6 +101,12 @@ pub enum AgentInput {
         name: String,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
+    /// Persist a bookmark through the session owner during an active run.
+    SetSessionLabel {
+        target: u64,
+        label: Option<String>,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
 }
 impl<T: Into<QueuedMessage>> From<T> for AgentInput {
     fn from(message: T) -> Self {
@@ -470,9 +476,12 @@ impl CacheRetention {
 #[serde(rename_all = "kebab-case")]
 pub enum ModelApi {
     OpenaiCompletions,
+    MistralConversations,
     OpenaiResponses,
+    OpenaiCodexResponses,
     AnthropicMessages,
     GoogleGenerativeAi,
+    GoogleVertex,
     BedrockConverseStream,
     PiMessages,
 }
@@ -481,9 +490,12 @@ impl ModelApi {
     pub fn named(name: &str) -> Option<Self> {
         match name {
             "openai-completions" => Some(Self::OpenaiCompletions),
+            "mistral-conversations" => Some(Self::MistralConversations),
             "openai-responses" => Some(Self::OpenaiResponses),
+            "openai-codex-responses" => Some(Self::OpenaiCodexResponses),
             "anthropic-messages" => Some(Self::AnthropicMessages),
             "google-generative-ai" => Some(Self::GoogleGenerativeAi),
+            "google-vertex" => Some(Self::GoogleVertex),
             "bedrock-converse-stream" => Some(Self::BedrockConverseStream),
             "pi-messages" => Some(Self::PiMessages),
             _ => None,
@@ -493,9 +505,12 @@ impl ModelApi {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenaiCompletions => "openai-completions",
+            Self::MistralConversations => "mistral-conversations",
             Self::OpenaiResponses => "openai-responses",
+            Self::OpenaiCodexResponses => "openai-codex-responses",
             Self::AnthropicMessages => "anthropic-messages",
             Self::GoogleGenerativeAi => "google-generative-ai",
+            Self::GoogleVertex => "google-vertex",
             Self::BedrockConverseStream => "bedrock-converse-stream",
             Self::PiMessages => "pi-messages",
         }
@@ -511,6 +526,9 @@ pub struct ModelMetadata {
     pub cost_breakdown: Option<UsageCostBreakdown>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_from_provider: Option<bool>,
+    /// Service tier multiplier applied to catalog estimates for this reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_cost_multiplier: Option<serde_json::Number>,
     pub provider_request_id: Option<String>,
     pub cached_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -533,6 +551,9 @@ pub struct ModelMetadata {
     /// Provider-supplied visible reasoning, retained for session presentation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Provider-reported reasoning tokens already included in total output tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<AssistantDiagnostic>,
     /// Complete ordered assistant content required for provider-specific continuations.
@@ -634,18 +655,139 @@ pub struct ProviderReplay {
 }
 
 impl ProviderReplay {
+    /// Keep the request effort as private metadata beside the response blocks.
+    pub fn record_openai_effort(&mut self, effort: &str) {
+        if !effort.is_empty() {
+            self.blocks
+                .retain(|block| block.get("_pi_openai_effort").is_none());
+            self.blocks
+                .push(serde_json::json!({"_pi_openai_effort":effort}));
+        }
+    }
+
+    pub fn openai_effort(&self) -> Option<&str> {
+        self.blocks.iter().find_map(|block| {
+            block
+                .get("_pi_openai_effort")?
+                .as_str()
+                .filter(|effort| !effort.is_empty())
+        })
+    }
+
+    /// Preserve the recorded Anthropic effort without placing private data on the wire.
+    pub fn record_anthropic_effort(&mut self, effort: &str) {
+        if let Some(effort) = Self::valid_anthropic_effort(effort) {
+            self.blocks
+                .retain(|block| block.get("_pi_anthropic_effort").is_none());
+            self.blocks
+                .push(serde_json::json!({"_pi_anthropic_effort":effort}));
+        }
+    }
+
+    pub fn anthropic_effort(&self) -> Option<&'static str> {
+        self.blocks.iter().find_map(|block| {
+            Self::valid_anthropic_effort(block.get("_pi_anthropic_effort")?.as_str()?)
+        })
+    }
+
+    pub fn valid_anthropic_effort(effort: &str) -> Option<&'static str> {
+        match effort {
+            "low" => Some("low"),
+            "medium" => Some("medium"),
+            "high" => Some("high"),
+            "xhigh" => Some("xhigh"),
+            "max" => Some("max"),
+            _ => None,
+        }
+    }
+
     pub fn is_context_edit(&self) -> bool {
         self.blocks
             .iter()
             .any(|b| b.get("_pi_context_edit_api").is_some())
     }
 
-    /// Edited replay is scoped to the originating transport as well as the model.
+    /// Replay with a known wire format must use the originating API family.
     pub fn supports_api(&self, api: ModelApi) -> bool {
-        self.blocks
+        if let Some(name) = self
+            .blocks
             .iter()
-            .find_map(|b| b.get("_pi_context_edit_api").and_then(Value::as_str))
-            .is_none_or(|name| name == api.as_str())
+            .find_map(|block| block.get("_pi_context_edit_api").and_then(Value::as_str))
+        {
+            return name == api.as_str();
+        }
+        // Pi Messages uses Anthropic-shaped content with its own marker.
+        if self
+            .blocks
+            .first()
+            .is_some_and(|block| block["type"] == "pi-rs:pi-messages-origin")
+        {
+            return api == ModelApi::PiMessages;
+        }
+        // Mistral may record a compatibility reasoning block alongside its
+        // native content envelope. The envelope defines the route for both.
+        if self
+            .blocks
+            .iter()
+            .any(|block| block.get("mistral_content").is_some())
+        {
+            return api == ModelApi::MistralConversations;
+        }
+        self.blocks.iter().all(|block| {
+            if block.get("_pi_anthropic_effort").is_some() {
+                return api == ModelApi::AnthropicMessages;
+            }
+            if block.get("_pi_openai_effort").is_some() {
+                return matches!(
+                    api,
+                    ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses
+                );
+            }
+            match block["type"].as_str() {
+                Some("thinking" | "redacted_thinking") => api == ModelApi::AnthropicMessages,
+                // Older Bedrock and Anthropic journals share these block types.
+                Some("text" | "tool_use") => {
+                    matches!(
+                        api,
+                        ModelApi::AnthropicMessages | ModelApi::BedrockConverseStream
+                    )
+                }
+                Some("reasoning")
+                    if block.get("text").is_some()
+                        || block.get("redacted").is_some()
+                        || block.get("signature").is_some() =>
+                {
+                    api == ModelApi::BedrockConverseStream
+                }
+                Some("message" | "reasoning" | "function_call" | "custom_tool_call") => {
+                    matches!(
+                        api,
+                        ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses
+                    )
+                }
+                Some(kind) if kind == "reasoning_content" || kind.starts_with("reasoning.") => {
+                    api == ModelApi::OpenaiCompletions
+                }
+                None if [
+                    "text",
+                    "thought",
+                    "thoughtSignature",
+                    "functionCall",
+                    "functionResponse",
+                    "inlineData",
+                    "fileData",
+                    "executableCode",
+                    "codeExecutionResult",
+                ]
+                .iter()
+                .any(|key| block.get(key).is_some()) =>
+                {
+                    matches!(api, ModelApi::GoogleGenerativeAi | ModelApi::GoogleVertex)
+                }
+                // An older or host-defined block may have no recognizable API marker.
+                _ => true,
+            }
+        })
     }
 }
 
@@ -822,6 +964,12 @@ pub trait Model: Send + Sync {
     async fn context_window(&self, _model: &str) -> Option<u32> {
         None
     }
+
+    /// Smallest positive output budget accepted by this adapter.
+    fn minimum_output_tokens(&self) -> u32 {
+        1
+    }
+
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream>;
 
     /// Host adapters can reserve budget using this ID before calling a provider.

@@ -229,6 +229,9 @@ pub enum LifecycleEvent {
         turn_index: u32,
         messages: Vec<LifecycleMessage>,
     },
+    McpServersChange {
+        servers: Vec<crate::RegisteredMcpServer>,
+    },
     ToolExecutionStart {
         #[serde(rename = "toolCallId")]
         tool_call_id: String,
@@ -299,6 +302,7 @@ impl LifecycleEvent {
             Self::UiPromptEnd { .. } => "ui_prompt_end",
             Self::TurnStart { .. } => "turn_start",
             Self::TurnEnd { .. } => "turn_end",
+            Self::McpServersChange { .. } => "mcp_servers_change",
             Self::ToolExecutionStart { .. } => "tool_execution_start",
             Self::ToolExecutionUpdate { .. } => "tool_execution_update",
             Self::ToolExecutionEnd { .. } => "tool_execution_end",
@@ -691,33 +695,29 @@ async fn notify_inner(
     compaction: Option<(crate::CompactionTrigger, Option<serde_json::Value>)>,
 ) {
     let deadline = platform_time::Instant::now() + timeout.min(Duration::from_secs(10));
-    for extension in registry.extensions.iter().filter(|extension| {
-        extension.handles_lifecycle()
-            && match event {
-                LifecycleEvent::ModelSelect { .. } | LifecycleEvent::ThinkingLevelSelect { .. } => {
-                    extension.handles_model_selection()
-                }
-                LifecycleEvent::SessionStart { .. }
-                | LifecycleEvent::SessionShutdown { .. }
-                | LifecycleEvent::SessionInfoChanged { .. }
-                | LifecycleEvent::SessionCompact { .. }
-                | LifecycleEvent::SessionCompactFailed { .. } => {
-                    extension.handles_session_lifecycle()
-                }
-                LifecycleEvent::SessionTree { .. } => extension.handles_tree_navigation(),
-                LifecycleEvent::UiPromptStart { .. } | LifecycleEvent::UiPromptEnd { .. } => {
-                    extension.handles_ui_prompt_lifecycle()
-                }
-                LifecycleEvent::ToolExecutionStart { .. }
-                | LifecycleEvent::ToolExecutionEnd { .. } => {
-                    extension.handles_tool_execution_lifecycle()
-                }
-                LifecycleEvent::ToolExecutionUpdate { .. } => {
-                    extension.handles_tool_execution_lifecycle()
-                        && extension.handles_tool_execution_updates()
-                }
-                _ => true,
-            }
+    for extension in registry.extensions.iter().filter(|extension| match event {
+        LifecycleEvent::McpServersChange { .. } => extension.handles_mcp_servers_change(),
+        _ if !extension.handles_lifecycle() => false,
+        LifecycleEvent::ModelSelect { .. } | LifecycleEvent::ThinkingLevelSelect { .. } => {
+            extension.handles_model_selection()
+        }
+        LifecycleEvent::SessionStart { .. }
+        | LifecycleEvent::SessionShutdown { .. }
+        | LifecycleEvent::SessionInfoChanged { .. }
+        | LifecycleEvent::SessionCompact { .. }
+        | LifecycleEvent::SessionCompactFailed { .. } => extension.handles_session_lifecycle(),
+        LifecycleEvent::SessionTree { .. } => extension.handles_tree_navigation(),
+        LifecycleEvent::UiPromptStart { .. } | LifecycleEvent::UiPromptEnd { .. } => {
+            extension.handles_ui_prompt_lifecycle()
+        }
+        LifecycleEvent::ToolExecutionStart { .. } | LifecycleEvent::ToolExecutionEnd { .. } => {
+            extension.handles_tool_execution_lifecycle()
+        }
+        LifecycleEvent::ToolExecutionUpdate { .. } => {
+            extension.handles_tool_execution_lifecycle()
+                && extension.handles_tool_execution_updates()
+        }
+        _ => true,
     }) {
         let error = match platform_time::timeout_at(
             deadline,
