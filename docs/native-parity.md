@@ -3291,10 +3291,11 @@ prefix-specific character estimates rather than borrowing usage for the whole
 conversation. The compaction record and RPC response report Pi-compatible
 `tokensBefore`, independently of the native retention budget.
 
-Native request budgeting uses adapter-specific message estimates. Anthropic tool
-results count their original text envelope; Bedrock and other adapters that
-extract tool images use a fixed image allowance instead of counting encoded
-image bytes. Bedrock also accepts user images. Matching provider replay blocks,
+Native request budgeting uses adapter-specific message estimates. Anthropic,
+Bedrock, and other adapters that extract tool images use a fixed image
+allowance. Anthropic counts the remaining text envelope and any error-image
+caption. Its request fingerprint changed so old measurements use a fresh
+estimate. Matching provider replay blocks,
 including reasoning and signatures, are included only when the adapter actually
 replays them. Bedrock freezes inspectable SDK credentials or bearer tokens,
 region and endpoint before reusing a measured baseline; opaque SDK clients or
@@ -4145,6 +4146,15 @@ and cache-aware token usage. It translates request and stream errors into
 the existing agent error categories. The journal records the selected
 provider separately from the model ID and accepts older records.
 
+Structured Anthropic tool results send images as Messages API image blocks.
+For errors, the result remains text and the captioned images follow all tool
+results in that user turn. The native tool-result text envelope is retained,
+with attached image data represented by a placeholder. Plain-text results
+and results with invalid supported image data keep their original bytes.
+Request fixtures covered successful and
+failed results, system-update ordering, and image budgets. Live authenticated
+tool-image requests were unverified.
+
 A loopback fixture verified pagination, authentication, image input, a real
 native read tool round trip, usage and RPC. Live account sign-in and provider switching within a running session remain open.
 
@@ -4398,7 +4408,8 @@ another route fails closed. A partial model override alone does not establish a
 routable model for a rewrite. Direct Anthropic declaration-aware streams reject
 strict decisions that only prepared dispatch can retain; preferred fallback
 streams use their resolved unconstrained wire schema. A model capability
-map with no strict-capable entries keeps the legacy Anthropic model fingerprint.
+map with no strict-capable entries keeps the same Anthropic model fingerprint
+as a client without a capability map.
 Existing usage anchors for constrained Anthropic requests can still be invalidated:
 the native agent records a separate prepared-tool configuration hash, and the
 new fallback projection can change the wire schema even with strict disabled
