@@ -745,7 +745,8 @@ impl Client {
             Self::OpenAi(client) => Self::OpenAi(
                 client
                     .with_http_options(timeout, &proxies)?
-                    .with_provider_retry(retry),
+                    .with_provider_retry(retry)
+                    .with_websocket_connect_timeout(settings.websocket_connect_timeout()),
             ),
             Self::Bedrock(_) => unreachable!("Bedrock handled above"),
             Self::Deferred(mut client) => {

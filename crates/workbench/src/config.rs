@@ -318,12 +318,20 @@ impl Settings {
     pub fn http_idle_timeout_ms(&self) -> u64 {
         self.value
             .get("httpIdleTimeoutMs")
-            .and_then(parse_http_idle_timeout)
+            .and_then(parse_timeout_setting)
             .unwrap_or(300_000)
     }
     pub fn http_idle_timeout(&self) -> Option<std::time::Duration> {
         let value = self.http_idle_timeout_ms();
         (value > 0).then(|| std::time::Duration::from_millis(value))
+    }
+    pub fn websocket_connect_timeout(&self) -> Option<std::time::Duration> {
+        let millis = self
+            .value
+            .get("websocketConnectTimeoutMs")
+            .and_then(parse_timeout_setting)
+            .unwrap_or(15_000);
+        (millis > 0).then(|| std::time::Duration::from_millis(millis))
     }
     pub fn strings(&self, key: &str) -> Vec<String> {
         self.value
@@ -658,7 +666,7 @@ fn read_settings_layer(
     }
 }
 
-fn parse_http_idle_timeout(value: &Value) -> Option<u64> {
+fn parse_timeout_setting(value: &Value) -> Option<u64> {
     let number = match value {
         Value::Number(number) => number.as_f64()?,
         Value::String(value) => {
@@ -723,16 +731,24 @@ pub fn validate_settings(value: &Value, path: &Path) -> Result<()> {
             (field, error.masked().to_string())
         })
         .collect();
-    if let Some(timeout) = normalized.get("httpIdleTimeoutMs")
-        && parse_http_idle_timeout(timeout).is_none()
-        && !errors
-            .iter()
-            .any(|(field, _)| field == "/httpIdleTimeoutMs")
-    {
-        errors.push((
-            "/httpIdleTimeoutMs".into(),
-            "invalid HTTP idle timeout".into(),
-        ));
+    for (key, field, message) in [
+        (
+            "httpIdleTimeoutMs",
+            "/httpIdleTimeoutMs",
+            "invalid HTTP idle timeout",
+        ),
+        (
+            "websocketConnectTimeoutMs",
+            "/websocketConnectTimeoutMs",
+            "invalid WebSocket connect timeout",
+        ),
+    ] {
+        if let Some(timeout) = normalized.get(key)
+            && parse_timeout_setting(timeout).is_none()
+            && !errors.iter().any(|(existing, _)| existing == field)
+        {
+            errors.push((field.into(), message.into()));
+        }
     }
     if !errors.is_empty() {
         errors.sort();
@@ -1934,6 +1950,34 @@ mod tests {
             error.contains(r"settings\n.json/modelThinkingLevels/モデル\n\u{1b}~1~0:"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn websocket_connect_timeout_has_its_own_default_and_supports_disabling() {
+        use std::time::Duration;
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.websocket_connect_timeout(),
+            Some(Duration::from_secs(15))
+        );
+        settings.value = json!({"websocketConnectTimeoutMs":"25.9","httpIdleTimeoutMs":"disabled"});
+        validate_settings(settings.value(), Path::new("settings.json")).unwrap();
+        assert_eq!(
+            settings.websocket_connect_timeout(),
+            Some(Duration::from_millis(25))
+        );
+        assert!(settings.http_idle_timeout().is_none());
+        for timeout in [json!(0), json!("disabled")] {
+            settings.value = json!({"websocketConnectTimeoutMs":timeout});
+            validate_settings(settings.value(), Path::new("settings.json")).unwrap();
+            assert!(settings.websocket_connect_timeout().is_none());
+        }
+        let error = validate_settings(
+            &json!({"websocketConnectTimeoutMs":"later"}),
+            Path::new("settings.json"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("/websocketConnectTimeoutMs"));
     }
 
     #[test]

@@ -5343,8 +5343,10 @@ matches the previous conversation. `websocket` sends the full history on
 the connection, and `sse` uses HTTP directly. WebSocket requests omit the
 HTTP-only `stream` flag as specified by the [Responses WebSocket protocol](https://developers.openai.com/api/reference/resources/responses/websocket-events).
 An unavailable WebSocket
-upgrade falls back to HTTP SSE before any inference request is sent. Native
-provider-response hooks receive the sanitized HTTP handshake status and
+upgrade falls back to HTTP SSE before any inference request is sent.
+`websocketConnectTimeoutMs` controls the opening deadline independently of
+`httpIdleTimeoutMs`. It defaults to 15000 and accepts 0 or `"disabled"` to
+remove the opening deadline. Native provider-response hooks receive the sanitized HTTP handshake status and
 headers when a connection is opened. An upgrade failure or interrupted
 WebSocket response makes later attempts use SSE for up to a minute, including
 with prompt-cache retention disabled. With no session key, the cooldown

@@ -17,7 +17,7 @@ use tokio_tungstenite::{
     },
 };
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 // Leave room for a long response before the server's one-hour limit.
@@ -40,6 +40,7 @@ pub(super) struct Request<'a> {
     pub error_secrets: &'a [String],
     pub session: Option<&'a str>,
     pub affinity_session: Option<&'a str>,
+    pub connect_timeout: Option<Duration>,
     pub timeout: Option<Duration>,
     pub cache_context: bool,
     pub reuse_connection: bool,
@@ -208,6 +209,7 @@ struct Handshake {
     token: String,
     session: String,
     error_secrets: Vec<String>,
+    connect_timeout: Option<Duration>,
 }
 
 impl Handshake {
@@ -240,7 +242,7 @@ impl Handshake {
                 headers.insert(name, session);
             }
         }
-        let response = self
+        let mut request = self
             .client
             .get(self.endpoint.clone())
             .version(Version::HTTP_11)
@@ -251,11 +253,11 @@ impl Handshake {
             .header(header::CONNECTION, "Upgrade")
             .header(header::UPGRADE, "websocket")
             .header("sec-websocket-version", "13")
-            .header("sec-websocket-key", &nonce)
-            .timeout(CONNECT_TIMEOUT)
-            .send()
-            .await
-            .map_err(|_| unavailable())?;
+            .header("sec-websocket-key", &nonce);
+        if let Some(timeout) = self.connect_timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request.send().await.map_err(|_| unavailable())?;
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
@@ -383,6 +385,7 @@ pub(super) async fn open(
     };
     let handshake = Handshake {
         client: options.client.clone(),
+        connect_timeout: options.connect_timeout,
         endpoint: options.endpoint.clone(),
         headers: options.headers.clone(),
         account: options.account.into(),
@@ -1288,6 +1291,77 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), exchange)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_connect_timeout_is_independent_of_http_idle_timeout() {
+        use tokio::io::AsyncReadExt;
+
+        for (connect_timeout, upgraded) in [(Some(Duration::from_millis(100)), false), (None, true)]
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut tcp, _) = listener.accept().await.unwrap();
+                if upgraded {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                    assert_eq!(read_request(&mut socket).await["type"], "response.create");
+                    let event = json!({"type":"response.completed","response":{"status":"completed","output":[]}});
+                    socket
+                        .send(Message::Text(event.to_string().into()))
+                        .await
+                        .unwrap();
+                } else {
+                    let mut request = Vec::new();
+                    tcp.read_to_end(&mut request).await.unwrap();
+                    assert!(request.starts_with(b"GET "));
+                }
+            });
+            let model = client(
+                format!("http://{address}/backend-api/codex/responses"),
+                CodexTransport::WebSocket,
+            )
+            .with_http_options(Some(Duration::from_millis(200)), &[])
+            .unwrap()
+            .with_websocket_connect_timeout(connect_timeout);
+            let opened = tokio::time::timeout(
+                Duration::from_secs(3),
+                open(
+                    Request {
+                        client: model.websocket_client.as_ref().unwrap(),
+                        endpoint: &model.endpoint,
+                        headers: &model.headers,
+                        token: &model.token,
+                        account: model.codex_account.as_deref().unwrap(),
+                        error_secrets: &[],
+                        session: None,
+                        affinity_session: None,
+                        connect_timeout: model.websocket_connect_timeout,
+                        timeout: model.idle_timeout,
+                        cache_context: false,
+                        reuse_connection: false,
+                    },
+                    &json!({"model":"fixture","input":[]}),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if let Some(mut events) = opened {
+                assert!(upgraded);
+                assert_eq!(
+                    events.next().await.unwrap().unwrap()["type"],
+                    "response.completed"
+                );
+            } else {
+                assert!(!upgraded);
+            }
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]

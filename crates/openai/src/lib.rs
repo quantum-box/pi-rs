@@ -25,6 +25,24 @@ pub const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const MAX_STREAM: usize = 32 * 1024 * 1024;
 const NAMESPACE: &str = "pi";
 
+fn openai_http_client(
+    timeout: Option<std::time::Duration>,
+    proxies: &[reqwest::Proxy],
+) -> Result<Client> {
+    let mut builder = Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(timeout) = timeout {
+        builder = builder.read_timeout(timeout);
+    }
+    for proxy in proxies {
+        builder = builder.proxy(proxy.clone());
+    }
+    builder
+        .build()
+        .map_err(|_| Error::Config("could not initialize OpenAI client".into()))
+}
+
 type ResponseEvents = BoxStream<'static, Result<Value>>;
 
 /// Transport policy for native ChatGPT Codex inference.
@@ -116,6 +134,8 @@ pub struct OpenAiResponses {
     deployments: Arc<BTreeMap<String, String>>,
     codex_account: Option<String>,
     codex_transport: CodexTransport,
+    websocket_client: Option<Client>,
+    websocket_connect_timeout: Option<std::time::Duration>,
     idle_timeout: Option<std::time::Duration>,
     codex_off_effort: Option<String>,
     thinking: Option<String>,
@@ -291,22 +311,24 @@ impl OpenAiResponses {
         timeout: Option<std::time::Duration>,
         proxies: &[reqwest::Proxy],
     ) -> Result<Self> {
-        let mut builder = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none());
-        if let Some(timeout) = timeout {
-            builder = builder.read_timeout(timeout);
-        }
-        for proxy in proxies {
-            builder = builder.proxy(proxy.clone());
-        }
+        // Keep the WebSocket opening deadline separate from the HTTP
+        // header timeout and the idle timeout after the upgrade.
+        self.websocket_client = if self.codex_account.is_some() && timeout.is_some() {
+            Some(openai_http_client(None, proxies)?)
+        } else {
+            None
+        };
         self.idle_timeout = timeout;
         self.identity_safe_transport = proxies.is_empty();
-        self.client = builder
-            .build()
-            .map_err(|_| Error::Config("could not initialize OpenAI client".into()))?;
+        self.client = openai_http_client(timeout, proxies)?;
         Ok(self)
     }
+    /// Configure the Codex WebSocket opening deadline. `None` disables it.
+    pub fn with_websocket_connect_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.websocket_connect_timeout = timeout.filter(|timeout| !timeout.is_zero());
+        self
+    }
+
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
         Self::create(endpoint, token, true)
     }
@@ -390,11 +412,7 @@ impl OpenAiResponses {
         if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
             return Err(Error::Config("invalid OpenAI bearer token".into()));
         }
-        let client = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| Error::Config("could not initialize OpenAI client".into()))?;
+        let client = openai_http_client(None, &[])?;
         Ok(Self {
             client,
             endpoint,
@@ -405,6 +423,8 @@ impl OpenAiResponses {
             deployments: Arc::default(),
             codex_account: None,
             codex_transport: CodexTransport::default(),
+            websocket_client: None,
+            websocket_connect_timeout: Some(codex_ws::DEFAULT_CONNECT_TIMEOUT),
             idle_timeout: None,
             codex_off_effort: None,
             thinking: None,
@@ -1930,7 +1950,7 @@ impl OpenAiResponses {
             let affinity_session = session.filter(|_| self.cache_retention != CacheRetention::None);
             codex_ws::open(
                 codex_ws::Request {
-                    client: &self.client,
+                    client: self.websocket_client.as_ref().unwrap_or(&self.client),
                     endpoint: &self.endpoint,
                     headers: &self.headers,
                     token: &self.token,
@@ -1938,6 +1958,7 @@ impl OpenAiResponses {
                     error_secrets: &error_secrets,
                     session,
                     affinity_session,
+                    connect_timeout: self.websocket_connect_timeout,
                     timeout: self.idle_timeout,
                     reuse_connection: self.identity_safe_transport && affinity_session.is_some(),
                     cache_context: matches!(
