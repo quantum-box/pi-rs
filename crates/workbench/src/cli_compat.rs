@@ -690,6 +690,7 @@ pub(super) fn export_plan(args: &[OsString]) -> Option<ExportPlan> {
 pub(super) struct Metadata {
     pub(super) version: bool,
     pub(super) short_help: bool,
+    pub(super) rpc_has_attachments: bool,
     pub(super) export: bool,
     pub(super) literal_export: Option<Vec<std::path::PathBuf>>,
     pub(super) args_without_help: Vec<OsString>,
@@ -706,6 +707,7 @@ pub(super) fn metadata(args: &[OsString]) -> Option<Metadata> {
     let mut result = Metadata {
         version: false,
         short_help: false,
+        rpc_has_attachments: false,
         export: false,
         literal_export: literal_export_output.and_then(|index| {
             let input = args.get(index.checked_sub(1)?)?;
@@ -728,10 +730,14 @@ pub(super) fn metadata(args: &[OsString]) -> Option<Metadata> {
         diagnostics: Vec::new(),
     };
     let mut help = false;
+    let mut rpc_mode = false;
     let mut help_edits = BTreeMap::new();
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg_os) = iter.next() {
         if arg_os == "--" {
+            // Normalization puts root positional arguments after this delimiter.
+            result.rpc_has_attachments =
+                rpc_mode && iter.any(|argument| argument.as_encoded_bytes().starts_with(b"@"));
             break;
         }
         let index = args
@@ -774,6 +780,10 @@ pub(super) fn metadata(args: &[OsString]) -> Option<Metadata> {
                     ("--mode", Some(value)) if !["text", "json", "rpc"].contains(&value) => Some(
                         format!("Invalid mode \"{value}\". Valid values: text, json, rpc"),
                     ),
+                    ("--mode", Some(value)) => {
+                        rpc_mode = value == "rpc";
+                        None
+                    }
                     ("--tui-mode", None) => {
                         Some("--tui-mode requires regular or fullscreen".into())
                     }

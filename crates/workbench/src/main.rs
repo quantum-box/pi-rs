@@ -24,6 +24,8 @@ mod cache_warming;
 mod chatgpt_auth;
 mod cli_compat;
 mod clipboard;
+mod cloudflare_gateway;
+mod codex_auth;
 mod config;
 mod copilot_auth;
 mod extension_ui;
@@ -43,6 +45,7 @@ mod packages;
 mod pi_messages;
 mod process;
 mod providers;
+mod vertex_auth;
 mod xai_auth;
 use providers::Provider;
 mod radius_auth;
@@ -339,6 +342,12 @@ struct InitialSelection {
 }
 
 impl Cli {
+    fn theme_setting(&self) -> Option<&str> {
+        self.use_theme
+            .as_deref()
+            .or_else(|| self.settings.string("theme"))
+    }
+
     fn effective_context_window(&self) -> Option<u32> {
         self.context_window.or_else(|| {
             self.model_profiles
@@ -469,26 +478,64 @@ impl Cli {
                     }
                     return None;
                 }
-                if let Some(builtin) = builtin_chat::find(provider.id()) {
-                    return builtin
-                        .is_official_endpoint(endpoint)
-                        .then(|| std::env::var(builtin.env()).ok())
+                if provider.id() == "google-vertex" && endpoint == provider.default_endpoint() {
+                    return std::env::var("GOOGLE_CLOUD_API_KEY")
+                        .ok()
+                        .filter(|key| !key.trim().is_empty())
+                        .map(model_auth::Credential::Literal)
+                        .or_else(|| {
+                            vertex_auth::Adc::configured(self.model_keys.environment(
+                                provider,
+                                endpoint,
+                                &self.model_profiles,
+                            ))
+                            .map(model_auth::Credential::VertexAdc)
+                        });
+                }
+                if provider.id() == "cloudflare-ai-gateway" {
+                    return cloudflare_gateway::Route::is_endpoint(endpoint)
+                        .then(|| std::env::var("CLOUDFLARE_API_KEY").ok())
                         .flatten()
                         .filter(|key| !key.trim().is_empty())
+                        .map(model_auth::Credential::Literal);
+                }
+                if provider.id() == "openai-codex" {
+                    return None;
+                }
+                if let Some(builtin) = builtin_chat::find(provider.id()) {
+                    let eligible = match provider.id() {
+                        "azure" => {
+                            !endpoint.is_empty()
+                                && self
+                                    .model_profiles
+                                    .has_provider_endpoint(provider, endpoint)
+                        }
+                        "cloudflare-workers-ai" => {
+                            model_profiles::cloudflare_workers_chat_account(endpoint).is_some()
+                                && self
+                                    .model_profiles
+                                    .has_provider_endpoint(provider, endpoint)
+                        }
+                        _ => builtin.is_official_endpoint(endpoint),
+                    };
+                    return eligible
+                        .then(|| {
+                            builtin.env_names().find_map(|name| {
+                                std::env::var(name)
+                                    .ok()
+                                    .filter(|key| !key.trim().is_empty())
+                            })
+                        })
+                        .flatten()
                         .map(model_auth::Credential::Literal);
                 }
                 if endpoint != provider.default_endpoint() {
                     return None;
                 }
-                if provider == &Provider::Anthropic
-                    && let Some(token) = std::env::var("ANTHROPIC_AUTH_TOKEN")
-                        .ok()
-                        .filter(|token| !token.trim().is_empty())
-                {
-                    return Some(model_auth::Credential::Bearer(token));
+                if provider == &Provider::Anthropic {
+                    return model_auth::anthropic_env_credential(|name| std::env::var(name).ok());
                 }
                 let variable = match provider {
-                    Provider::Anthropic => "ANTHROPIC_API_KEY",
                     Provider::Google => "GEMINI_API_KEY",
                     _ => return None,
                 };
@@ -542,11 +589,8 @@ impl Cli {
             .and_then(model_auth::Credential::literal)
             .map(str::to_owned);
         let headers = settings.static_headers(provider, token.as_deref())?;
-        let bearer = credential
-            .as_ref()
-            .is_some_and(model_auth::Credential::is_bearer);
         provider
-            .connect(adapter, endpoint, token, bearer)?
+            .connect_for_credential(adapter, endpoint, token, credential.as_ref())?
             .with_headers(headers)
             .with_http_settings_and_env(&self.settings, settings.environment())
     }
@@ -588,8 +632,24 @@ impl Cli {
             .unwrap_or_else(|| self.model_profiles.endpoint(provider))
     }
 
+    fn replace_model_keys(&mut self, keys: model_auth::Keys) -> Result<()> {
+        self.model_keys = keys;
+        if self.model_profiles.cloudflare_gateway_route()
+            != self.model_keys.cloudflare_gateway_route().as_ref()
+        {
+            self.reload_model_profiles()?;
+            return Ok(());
+        }
+        if self.model_profiles.cloudflare_saved_account()
+            != self.model_keys.cloudflare_chat_account()
+        {
+            self.reload_model_profiles()?;
+        }
+        Ok(())
+    }
+
     fn reload_model_profiles(&mut self) -> Result<()> {
-        let profiles = model_profiles::Profiles::load()?;
+        let profiles = model_profiles::Profiles::load(&self.model_keys)?;
         let provider = profiles.provider(self.provider.id()).ok_or_else(|| {
             Error::Config(format!(
                 "model provider {} is no longer configured",
@@ -1154,7 +1214,7 @@ enum Command {
     },
     /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "github-copilot", "kimi-coding", "xai", "anthropic"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "openai-codex", "github-copilot", "kimi-coding", "xai", "anthropic"])]
         provider: String,
         #[arg(long)]
         device_code: bool,
@@ -1173,7 +1233,7 @@ enum Command {
     },
     /// Remove a saved provider credential.
     Logout {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "github-copilot", "kimi-coding", "xai", "anthropic"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "openai-codex", "github-copilot", "kimi-coding", "xai", "anthropic"])]
         provider: String,
     },
     Run {
@@ -1314,6 +1374,8 @@ fn main() {
     std::process::exit(code);
 }
 
+const RPC_FILE_ARGUMENT_ERROR: &str = "Error: @file arguments are not supported in RPC mode";
+
 #[tokio::main(flavor = "current_thread")]
 async fn run_cli() -> i32 {
     // Terminal-owned workers receive the same foreground-group SIGINT as the
@@ -1356,6 +1418,10 @@ async fn run_cli() -> i32 {
             literal_export = metadata.literal_export;
             argv = metadata.args_without_help;
         } else {
+            if !metadata.version && metadata.rpc_has_attachments {
+                eprintln!("{RPC_FILE_ARGUMENT_ERROR}");
+                return 1;
+            }
             let flag = if metadata.version {
                 "--version"
             } else if metadata.short_help {
@@ -1445,7 +1511,7 @@ async fn run_cli() -> i32 {
             && args.mode == Some(OutputMode::Rpc)
             && args.prompt.iter().any(|argument| argument.starts_with('@'))
         {
-            eprintln!("Error: @file arguments are not supported in RPC mode");
+            eprintln!("{RPC_FILE_ARGUMENT_ERROR}");
             cli_exit_code = 1;
             return Ok(());
         }
@@ -1488,11 +1554,11 @@ async fn run_cli() -> i32 {
                 eprintln!("{warning}");
             }
         }
-        args.model_profiles = model_profiles::Profiles::load()?;
         args.model_keys = tokio::select! {
             result = model_auth::Keys::load_async() => result?,
             _ = &mut signal_rx => return Err(Error::Cancelled),
         };
+        args.model_profiles = model_profiles::Profiles::load(&args.model_keys)?;
         let configured_model = args.settings.string("defaultModel");
         let provider_prefix = |model: &str| {
             model
@@ -1564,9 +1630,6 @@ async fn run_cli() -> i32 {
                 .settings
                 .string("defaultThinkingLevel")
                 .map(str::to_owned);
-        }
-        if args.use_theme.is_none() {
-            args.use_theme = args.settings.string("theme").map(str::to_owned);
         }
         if args.session_dir.is_none() {
             args.session_dir = std::env::var_os("PI_CODING_AGENT_SESSION_DIR")
@@ -1926,6 +1989,28 @@ async fn execute(
                         eprintln!("Continue with ChatGPT in your browser: {url}")
                     })
                     .await
+                } else if provider == "openai-codex" {
+                    let method = if *device_code {
+                        codex_auth::Method::Device
+                    } else {
+                        codex_auth::Method::Browser
+                    };
+                    codex_auth::login(
+                        &args.settings, meta_auth::LoginControl::default(), method,
+                        |notice| match notice {
+                            codex_auth::Notice::Device {url, code} => eprintln!("Enter code {code} at {url}"),
+                            codex_auth::Notice::Browser(url, sender) => {
+                                eprintln!("Continue in your browser: {url}");
+                                eprintln!("Paste the authorization code or redirect URL if the callback does not complete:");
+                                std::thread::spawn(move || {
+                                    let mut line = String::new();
+                                    if std::io::stdin().read_line(&mut line).is_ok_and(|count| count > 0) {
+                                        let _ = sender.send(line);
+                                    }
+                                });
+                            }
+                        },
+                    ).await
                 } else if provider == "github-copilot" {
                     copilot_auth::login(
                         &args.settings,
@@ -1986,7 +2071,7 @@ async fn execute(
                 kimi_auth::logout().await?
             } else if matches!(
                 provider.as_str(),
-                "openrouter" | "anthropic" | "github-copilot"
+                "openrouter" | "anthropic" | "github-copilot" | "openai-codex"
             ) {
                 model_auth::remove(&Provider::named(provider).expect("built-in login provider"))?
             } else {
@@ -2135,6 +2220,12 @@ async fn execute(
     if session.host_binding().is_some() {
         return Err(Error::Session(
             "a managed session must be opened by its host".into(),
+        ));
+    }
+    if matches!(&command, Command::Run { .. }) && session.pending_extension_boundary_run().is_some()
+    {
+        return Err(Error::Session(
+            "resume the pending extension boundary before submitting a prompt".into(),
         ));
     }
     let requested_workspace = args.workspace.clone();
@@ -2490,13 +2581,15 @@ async fn execute(
                     observe_with_stream(event, args.trace, stream.is_some());
                 }
                 event => {
-                    let event = reasoning_event_json(event);
+                    let event = agent_stream_event_json(event);
                     if let Some(stream) = &mut stream {
                         let mut rpc_event = event.clone();
                         attach_redacted_reasoning(&mut rpc_event);
                         for output_event in stream.observe(&rpc_event, &args) { output(output_event); }
                     }
-                    if args.trace { output(trace_agent_event_json(event)); }
+                    if args.trace || (stream.is_some() && matches!(event["type"].as_str(), Some("compaction_start" | "compaction_end"))) {
+                        output(trace_agent_event_json(event));
+                    }
                 }
             }
         };
@@ -2537,7 +2630,11 @@ async fn execute(
             }
             }
         }
-        let run_id = if index == 0 { args.run_id } else { None }.unwrap_or_else(Uuid::new_v4);
+        let run_id = if index == 0 {
+            args.run_id.or_else(|| input.is_none().then(|| session.pending_extension_boundary_run()).flatten())
+        } else {
+            None
+        }.unwrap_or_else(Uuid::new_v4);
         let image_record = if images.is_empty() {
             None
         } else {
@@ -2558,10 +2655,9 @@ async fn execute(
         ).await;
         if let Some(stream) = &mut stream {
             let aborted = matches!(&answer, Err(Error::Cancelled));
-            for event in stream.settle(aborted) {
+            for event in stream.settle(aborted, answer.is_ok()) {
                 output(event);
             }
-            output(json!({"type":"agent_end","success":answer.is_ok(),"messages":stream.messages,"willRetry":false}));
             output(json!({"type":"agent_settled","aborted":stream.aborted()}));
         }
         let answer = answer?;
@@ -2623,15 +2719,24 @@ fn trace_tool_progress(
     trace: bool,
     json_stream: bool,
 ) -> Option<Value> {
-    (trace && !json_stream).then(|| serde_json::to_value(event).expect("tool progress"))
+    if json_stream {
+        return None;
+    }
+    if let Some(id) = pi_rs::tool_attempt_operation_id() {
+        return Some(json!({"type":"internal_tool_attempt","operationId":id}));
+    }
+    trace.then(|| serde_json::to_value(event).expect("tool progress"))
 }
 
 fn observe(event: Notification<'_>, trace: bool) {
     observe_with_stream(event, trace, false);
 }
 
-fn reasoning_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
+fn agent_stream_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
     match event {
+        pi_rs::AgentEvent::AutoCompaction { reason, update } => {
+            rpc_events::auto_compaction_value(reason, update)
+        }
         pi_rs::AgentEvent::TextStart { index } => json!({"type":"text_item_start","index":index}),
         pi_rs::AgentEvent::TextDelta { index, delta } => {
             json!({"type":"text_item_delta","index":index,"delta":delta})
@@ -2648,7 +2753,7 @@ fn reasoning_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
         pi_rs::AgentEvent::ReasoningEnd { index, content } => {
             json!({"type":"reasoning_item_end","index":index,"content":content})
         }
-        pi_rs::AgentEvent::Notification(_) => unreachable!("expected a reasoning item event"),
+        pi_rs::AgentEvent::Notification(_) => unreachable!("expected an enriched agent event"),
     }
 }
 
@@ -2679,7 +2784,9 @@ fn trace_agent_event_json(mut event: serde_json::Value) -> serde_json::Value {
 
 fn observe_with_stream(event: Notification<'_>, trace: bool, json_stream: bool) {
     match event {
-        Notification::Retry(event) => output(serde_json::to_value(event).expect("retry event")),
+        Notification::Retry(event) if !json_stream => {
+            output(serde_json::to_value(event).expect("retry event"))
+        }
         Notification::SummaryRequest if trace => output(json!({"type":"summary_request_start"})),
         Notification::QueueUpdated {
             steering,
@@ -2737,6 +2844,9 @@ async fn run_pending_custom_trigger(
     runtime: &runtime::Runtime,
     session: &mut Session,
 ) -> Result<()> {
+    if session.pending_extension_boundary_run().is_some() {
+        return Ok(());
+    }
     let Some(run_id) = session.pending_custom_trigger() else {
         return Ok(());
     };

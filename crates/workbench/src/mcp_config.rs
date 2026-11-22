@@ -1,7 +1,10 @@
 //! MCP configuration overlay and command-line management.
 use super::{Cli, config, output};
 use clap::Subcommand;
-use pi_rs::{Error, Result};
+use pi_rs::{
+    CancellationToken, Error, ExtensionUi, Result, UiComponentAction, UiComponentSpan, UiRequest,
+    UiResponse,
+};
 use pi_rs_workbench::mcp::{McpExtension, ServerConfig};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -154,12 +157,16 @@ fn validate_mcp_file_fields(
     }
 }
 
+pub(super) fn mcp_enabled(args: &Cli) -> Result<bool> {
+    Ok(!args.no_mcp && super::resource_paths::builtin_enabled(args, "builtin:mcp")?)
+}
+
 fn configurations_with_project_scope(
     args: &Cli,
     mode: ConfigurationRead,
 ) -> Result<ScopedConfigurations> {
     let validate_shape = mode.validates_file_shape();
-    if args.no_mcp || !super::resource_paths::builtin_enabled(args, "builtin:mcp")? {
+    if !mcp_enabled(args)? {
         return Ok((
             BTreeMap::new(),
             BTreeSet::new(),
@@ -493,6 +500,8 @@ pub(super) struct Discovery {
     pub connected: Vec<Arc<McpExtension>>,
     pub sign_in: Vec<PendingSignIn>,
     pub skipped_disabled: BTreeSet<String>,
+    pub inspection: Vec<Inspection>,
+    pub configured_namespaces: BTreeSet<String>,
     failed: bool,
 }
 
@@ -503,12 +512,38 @@ pub(super) struct PendingSignIn {
     pub challenge: Option<String>,
 }
 
+fn add_registered_servers(
+    servers: &mut BTreeMap<String, Value>,
+    registered: &[pi_rs::RegisteredMcpServer],
+) {
+    let mut namespaces: BTreeSet<_> = servers.keys().map(|name| name.replace('-', "_")).collect();
+    for entry in registered {
+        if namespaces.insert(entry.server.name.replace('-', "_")) {
+            servers.insert(entry.server.name.clone(), entry.server.config.clone());
+        }
+    }
+}
+
+pub(super) fn registered_configurations(
+    args: &Cli,
+    registered: &[pi_rs::RegisteredMcpServer],
+) -> Result<BTreeMap<String, Value>> {
+    let mut servers = configurations(args)?;
+    if mcp_enabled(args)? {
+        add_registered_servers(&mut servers, registered);
+    }
+    Ok(servers)
+}
+
 pub(super) async fn discover(
     args: &Cli,
     report: bool,
     interactive: bool,
     share_services: Option<&super::runtime::ShareServices<'_>>,
 ) -> Result<Discovery> {
+    if !mcp_enabled(args)? {
+        return Ok(Discovery::default());
+    }
     let require_complete = share_services.is_some();
     let mode = if require_complete {
         ConfigurationRead::Share
@@ -517,7 +552,92 @@ pub(super) async fn discover(
     } else {
         ConfigurationRead::Runtime
     };
-    let (servers, _, _, _, configuration_errors) = configurations_with_project_scope(args, mode)?;
+    let (servers, project, overrides, _, configuration_errors) =
+        configurations_with_project_scope(args, mode)?;
+    let inspection = inspection_entries(&servers, &project, &overrides);
+    let configured_namespaces: BTreeSet<_> =
+        servers.keys().map(|name| name.replace('-', "_")).collect();
+    let mut discovery = discover_servers(
+        args,
+        servers,
+        report,
+        interactive,
+        share_services,
+        configuration_errors,
+        false,
+    )
+    .await?;
+    discovery.configured_namespaces = configured_namespaces;
+    discovery.inspection = inspection;
+    Ok(discovery)
+}
+
+pub(super) async fn discover_registered(
+    args: &Cli,
+    registered: &[pi_rs::RegisteredMcpServer],
+    configured_namespaces: &BTreeSet<String>,
+    interactive: bool,
+    share_services: Option<&super::runtime::ShareServices<'_>>,
+) -> Result<Discovery> {
+    if !mcp_enabled(args)? {
+        return Ok(Discovery::default());
+    }
+    let servers: BTreeMap<_, _> = registered
+        .iter()
+        .filter(|entry| !configured_namespaces.contains(&entry.server.name.replace('-', "_")))
+        .map(|entry| (entry.server.name.clone(), entry.server.config.clone()))
+        .collect();
+    let mut inspection = inspection_entries(&servers, &BTreeSet::new(), &BTreeSet::new());
+    for entry in &mut inspection {
+        entry.scope = "extension";
+        if entry.status == "disconnected"
+            && (args
+                .disable_extension
+                .contains(&format!("mcp-{}", entry.name.replace('-', "_")))
+                || uses_host_mcp_credentials(&servers[&entry.name]))
+        {
+            entry.status = "disabled";
+        }
+    }
+    let mut discovery = discover_servers(
+        args,
+        servers,
+        false,
+        interactive,
+        share_services,
+        Vec::new(),
+        true,
+    )
+    .await?;
+    discovery.inspection = inspection;
+    Ok(discovery)
+}
+
+fn uses_host_mcp_credentials(config: &Value) -> bool {
+    let reference = |value: &Value| {
+        value
+            .as_str()
+            .is_some_and(|value| value.starts_with('!') || value.contains("${"))
+    };
+    config.get("auth").is_some()
+        || ["headers", "env"].iter().any(|field| {
+            config[*field]
+                .as_object()
+                .is_some_and(|values| values.values().any(reference))
+        })
+        || reference(&config["oauth"]["clientSecret"])
+}
+
+async fn discover_servers(
+    args: &Cli,
+    servers: BTreeMap<String, Value>,
+    report: bool,
+    interactive: bool,
+    share_services: Option<&super::runtime::ShareServices<'_>>,
+    configuration_errors: Vec<String>,
+    declared: bool,
+) -> Result<Discovery> {
+    let require_complete = share_services.is_some();
     if !configuration_errors.is_empty() && require_complete {
         return Err(Error::Config(format!(
             "Invalid MCP configuration for Radius share: {}",
@@ -535,7 +655,7 @@ pub(super) async fn discover(
     let mut pending = Vec::new();
     for (name, value) in servers {
         let normalized_name = name.replace('-', "_");
-        if require_complete {
+        if require_complete || declared {
             let id = format!("mcp-{normalized_name}");
             if args.disable_extension.contains(&id) {
                 discovery.skipped_disabled.insert(id);
@@ -549,6 +669,13 @@ pub(super) async fn discover(
                 eprintln!("MCP {name}: invalid configuration");
                 continue;
             }
+        }
+        if declared && uses_host_mcp_credentials(&value) {
+            failed = true;
+            eprintln!(
+                "MCP {name}: host credential references require an explicit MCP configuration"
+            );
+            continue;
         }
         if !normalized.insert(normalized_name) {
             failed = true;
@@ -649,8 +776,8 @@ async fn connect_for_discovery(
             let share_refresh = share_refresh.clone();
             let cleanup = cleanup.clone();
             Box::pin(async move {
-                args.model_profiles = super::model_profiles::Profiles::load()?;
                 args.model_keys = super::model_auth::Keys::load_async().await?;
+                args.model_profiles = super::model_profiles::Profiles::load(&args.model_keys)?;
                 let provider = args.model_profiles.provider(&provider).ok_or_else(|| {
                     Error::Config("MCP auth.provider does not name an installed provider".into())
                 })?;
@@ -895,6 +1022,229 @@ async fn list_json(args: &Cli) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[derive(Clone)]
+pub(super) struct Inspection {
+    name: String,
+    status: &'static str,
+    exposure: String,
+    scope: &'static str,
+    description: String,
+    tools: Vec<String>,
+}
+
+fn inspection_entries(
+    servers: &BTreeMap<String, Value>,
+    project: &BTreeSet<String>,
+    overrides: &BTreeSet<String>,
+) -> Vec<Inspection> {
+    servers
+        .iter()
+        .map(|(name, config)| {
+            let status = if report_server_config(config).is_none() {
+                "invalid"
+            } else if config["enabled"] == false {
+                "disabled"
+            } else {
+                "disconnected"
+            };
+            let scope = if project.contains(name) {
+                "project"
+            } else if overrides.contains(name) {
+                "global · project override"
+            } else {
+                "global"
+            };
+            Inspection {
+                name: name.clone(),
+                status,
+                exposure: report_exposure(config["exposure"].as_str().unwrap_or("codemode")).into(),
+                scope,
+                description: inspection_description(
+                    config["description"].as_str().unwrap_or_default(),
+                ),
+                tools: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+fn inspection_description(description: &str) -> String {
+    description
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(512)
+        .collect()
+}
+
+pub(super) async fn inspect_servers(
+    configured: &[Inspection],
+    connected: &[Arc<McpExtension>],
+    ui: &dyn ExtensionUi,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let mut entries = configured.to_vec();
+    for entry in &mut entries {
+        if let Some(server) = connected
+            .iter()
+            .find(|server| server.server_name == entry.name)
+        {
+            entry.status = "connected";
+            entry.description = inspection_description(&server.description);
+            entry.tools = server
+                .remote_tool_names()
+                .iter()
+                .map(|tool| {
+                    format!(
+                        "{tool} · {}",
+                        report_exposure(server.remote_tool_exposure(tool))
+                    )
+                })
+                .collect();
+        }
+    }
+    // Put disconnected and invalid entries first, as the Pi manager does.
+    entries.sort_by_key(|entry| !matches!(entry.status, "disconnected" | "invalid"));
+    let options = entries
+        .iter()
+        .map(|entry| {
+            let count = entry.tools.len();
+            let tool_label = if count == 1 { "tool" } else { "tools" };
+            format!(
+                "{} · {} · {count} {tool_label} · {} · {}",
+                entry.name, entry.status, entry.exposure, entry.scope,
+            )
+        })
+        .collect::<Vec<_>>();
+    if options.is_empty() {
+        let _ = show_inspection(
+            "MCP servers".into(),
+            vec!["No MCP servers configured.".into()],
+            false,
+            ui,
+            cancel,
+        )
+        .await?;
+        return Ok(());
+    }
+    let mut page = 0;
+    while let Some(index) =
+        select_inspection("MCP servers", &options, &mut page, ui, cancel).await?
+    {
+        let entry = &entries[index];
+        let mut lines = vec![
+            format!("Status · {}", entry.status),
+            format!("Scope · {}", entry.scope),
+            format!("Exposure · {}", entry.exposure),
+            format!("Tools · {}", entry.tools.len()),
+        ];
+        if !entry.description.is_empty() {
+            lines.push(entry.description.clone());
+        }
+        while show_inspection(
+            format!("MCP server · {}", entry.name),
+            lines.clone(),
+            !entry.tools.is_empty(),
+            ui,
+            cancel,
+        )
+        .await?
+        {
+            let title = format!("MCP tools · {}", entry.name);
+            let mut tool_page = 0;
+            let _ = select_inspection(&title, &entry.tools, &mut tool_page, ui, cancel).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn show_inspection(
+    title: String,
+    lines: Vec<String>,
+    tools: bool,
+    ui: &dyn ExtensionUi,
+    cancel: &CancellationToken,
+) -> Result<bool> {
+    let mut actions = vec![UiComponentAction {
+        key: "enter".into(),
+        value: "back".into(),
+        label: Some("Back".into()),
+    }];
+    if tools {
+        actions.push(UiComponentAction {
+            key: "t".into(),
+            value: "tools".into(),
+            label: Some("Tools".into()),
+        });
+    }
+    let request = UiRequest::Custom {
+        title,
+        lines: lines
+            .into_iter()
+            .map(|text| {
+                vec![UiComponentSpan {
+                    text,
+                    ..Default::default()
+                }]
+            })
+            .collect(),
+        actions,
+        timeout: None,
+    };
+    let response = ui
+        .request(request, cancel.clone())
+        .await
+        .map_err(|error| Error::Config(format!("MCP inspector UI failed: {error}")))?;
+    Ok(matches!(response, UiResponse::Text(action) if action == "tools"))
+}
+
+async fn select_inspection(
+    title: &str,
+    items: &[String],
+    page: &mut usize,
+    ui: &dyn ExtensionUi,
+    cancel: &CancellationToken,
+) -> Result<Option<usize>> {
+    // Leave room for both pagination actions in the native dialog.
+    const PAGE_SIZE: usize = 126;
+    const PREVIOUS: &str = "← Previous page";
+    const NEXT: &str = "Next page →";
+    loop {
+        let start = *page * PAGE_SIZE;
+        let end = (start + PAGE_SIZE).min(items.len());
+        let mut options = items[start..end].to_vec();
+        if *page > 0 {
+            options.push(PREVIOUS.into());
+        }
+        if end < items.len() {
+            options.push(NEXT.into());
+        }
+        let response = ui
+            .request(
+                UiRequest::Select {
+                    title: title.into(),
+                    options,
+                    timeout: None,
+                },
+                cancel.clone(),
+            )
+            .await
+            .map_err(|error| Error::Config(format!("MCP inspector UI failed: {error}")))?;
+        match response {
+            UiResponse::Text(value) if value == PREVIOUS && *page > 0 => *page -= 1,
+            UiResponse::Text(value) if value == NEXT && end < items.len() => *page += 1,
+            UiResponse::Text(value) => {
+                return Ok(items[start..end]
+                    .iter()
+                    .position(|item| item == &value)
+                    .map(|index| start + index));
+            }
+            _ => return Ok(None),
+        }
+    }
 }
 
 pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
@@ -1235,9 +1585,7 @@ pub async fn command(args: &Cli, command: McpCommand) -> Result<()> {
             if value
                 .get("description")
                 .is_some_and(|field| !(field.is_string() || inherited_global && field.is_null()))
-                || value.get("timeout").is_some_and(|field| {
-                    !(inherited_global && field.is_null()) && field.as_u64().is_none()
-                })
+                || !inherited_global && value.get("timeout").is_some_and(Value::is_null)
             {
                 return Err(Error::Config("invalid MCP server configuration".into()));
             }
@@ -1305,6 +1653,47 @@ fn path(args: &Cli, local: bool) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_mcp_host_credentials_require_configured_server() {
+        for config in [
+            json!({"url":"https://example.invalid","auth":{"provider":"fixture"}}),
+            json!({"url":"https://example.invalid","headers":{"Authorization":"Bearer ${TOKEN}"}}),
+            json!({"url":"https://example.invalid","oauth":{"clientSecret":"!lookup"}}),
+            json!({"command":"fixture","env":{"KEY":"${TOKEN}"}}),
+        ] {
+            assert!(uses_host_mcp_credentials(&config));
+        }
+        assert!(!uses_host_mcp_credentials(
+            &json!({"url":"https://example.invalid","headers":{"User-Agent":"fixture"}})
+        ));
+    }
+
+    #[test]
+    fn registered_mcp_servers_yield_to_configured_namespaces() {
+        let entry = |name: &str, path: &str| pi_rs::RegisteredMcpServer {
+            server: pi_rs::McpServerDeclaration {
+                name: name.into(),
+                config: serde_json::json!({"command":path}),
+            },
+            extension_id: "fixture".into(),
+            extension_path: None,
+        };
+        let mut configured = BTreeMap::from([(
+            "my_server".into(),
+            serde_json::json!({"command":"configured", "enabled":false}),
+        )]);
+        add_registered_servers(
+            &mut configured,
+            &[
+                entry("my-server", "from-extension"),
+                entry("other", "other-executable"),
+            ],
+        );
+        assert_eq!(configured.len(), 2);
+        assert_eq!(configured["my_server"]["command"], "configured");
+        assert_eq!(configured["other"]["command"], "other-executable");
+    }
 
     #[test]
     fn project_override_rejects_unknown_fields_before_changing_global_server() {
