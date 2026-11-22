@@ -35,6 +35,8 @@ pub enum Selection {
     LoginKimi,
     LoginMeta,
     LoginXai,
+    LoginCodex,
+    LoginCodexDevice,
     LoginCopilot,
     LoginChatGpt,
     LoginChatGptNew,
@@ -617,6 +619,31 @@ impl Picker {
             tree.label_timestamps = timestamps;
         }
     }
+
+    pub fn track_tree_label(&mut self, request: uuid::Uuid, record: u64) {
+        if let Some(tree) = &mut self.tree {
+            tree.pending_label = Some((request, record));
+        }
+    }
+
+    pub fn take_tree_label(&mut self, request: uuid::Uuid) -> Option<u64> {
+        self.tree
+            .as_mut()?
+            .pending_label
+            .take_if(|(id, _)| *id == request)
+            .map(|(_, record)| record)
+    }
+
+    pub fn cancel_pending_tree_label(&mut self) {
+        if let Some(tree) = &mut self.tree
+            && tree.pending_label.take().is_some()
+        {
+            self.show_feedback(Err(
+                "The active worker stopped before confirming the label".into()
+            ));
+        }
+    }
+
     pub fn refresh_tree(&mut self, mut replacement: Self, record: u64) {
         let (Some(previous), Some(next)) = (&mut self.tree, &mut replacement.tree) else {
             return;
@@ -626,6 +653,7 @@ impl Picker {
         next.show_label_timestamps = previous.show_label_timestamps;
         next.rebuild_visible();
         replacement.query = std::mem::take(&mut self.query);
+        replacement.session_action = self.session_action.take();
         replacement.focus_record(record);
         *self = replacement;
     }
@@ -1132,6 +1160,17 @@ impl Picker {
     }
 
     pub fn render(&self, theme: &Theme, width: usize, height: usize, keys: &Keys) -> Vec<Line> {
+        self.render_in_terminal(theme, width, height, height, keys)
+    }
+
+    pub fn render_in_terminal(
+        &self,
+        theme: &Theme,
+        width: usize,
+        height: usize,
+        terminal_height: usize,
+        keys: &Keys,
+    ) -> Vec<Line> {
         let hint = |action| keys.hint(action);
         if let Some(action) = &self.session_action {
             let confirm = hint("tui.select.confirm");
@@ -1233,6 +1272,9 @@ impl Picker {
         if let Some(limit) = self.completion_limit {
             available = available.min(limit);
         }
+        if self.tree.is_some() {
+            available = available.min((terminal_height / 2).max(5));
+        }
         const SETTINGS_MAX_ROWS: usize = 10;
         let scrolling = (settings && items.len() > available.min(SETTINGS_MAX_ROWS))
             || (self.active_session.is_some() && items.len() > available);
@@ -1243,7 +1285,7 @@ impl Picker {
             available = available.min(SETTINGS_MAX_ROWS);
         }
         self.page_size.set(available);
-        let start = if settings || self.active_session.is_some() {
+        let start = if settings || self.tree.is_some() || self.active_session.is_some() {
             self.selected
                 .saturating_sub(available / 2)
                 .min(items.len().saturating_sub(available))
@@ -1429,23 +1471,26 @@ impl Picker {
             }
             lines.push(line);
         }
-        if scrolling {
-            lines.push(Line::themed(
-                &format!("  ({}/{})", self.selected + 1, items.len()),
-                theme,
-                "dim",
-            ));
-        }
         if items.is_empty() {
             let message =
                 if self.active_session.is_some() && self.query.is_empty() && !self.all_workspaces {
                     "No sessions in current folder. Press Tab to view all."
                 } else if settings {
                     "No matching settings"
+                } else if self.tree.is_some() {
+                    "  No entries found"
                 } else {
                     "No matches"
                 };
             lines.push(Line::themed(message, theme, "dim"));
+        }
+        if scrolling || self.tree.is_some() {
+            let position = (self.selected + 1).min(items.len());
+            lines.push(Line::themed(
+                &format!("  ({position}/{})", items.len()),
+                theme,
+                "dim",
+            ));
         }
         lines.extend(description_lines);
         if let Some(feedback) = &self.feedback {
@@ -1732,6 +1777,7 @@ struct TreeState {
     descriptions: std::collections::BTreeMap<u64, TreeDescription>,
     label_timestamps: std::collections::BTreeMap<u64, String>,
     show_label_timestamps: bool,
+    pending_label: Option<(uuid::Uuid, u64)>,
     last_filter_focus: u64,
     roots: Vec<u64>,
     order: Vec<u64>,
@@ -1888,6 +1934,7 @@ impl TreeState {
             descriptions: Default::default(),
             label_timestamps: Default::default(),
             show_label_timestamps: false,
+            pending_label: None,
             last_filter_focus: head,
             roots,
             order: vec![],
@@ -2754,6 +2801,53 @@ mod tests {
     }
 
     #[test]
+    fn tree_viewport_centers_selection_and_pages_by_terminal_height() {
+        let entries = (1..=40)
+            .map(|id| (id, ((id > 1).then_some(id - 1), TreeEntryKind::User)))
+            .collect();
+        let items = (1..=40)
+            .map(|id| Item {
+                label: format!("viewport-entry-{id:02}"),
+                selection: Selection::Checkout(id),
+            })
+            .collect();
+        let mut picker = Picker::tree(items, entries, Default::default(), 40, TreeFilter::Default);
+        let theme = Theme::system();
+        let keys = Keys::default();
+
+        for (key, expected, first) in [
+            (None, 40, 27),
+            (Some(KeyCode::PageUp), 26, 19),
+            (Some(KeyCode::PageDown), 40, 27),
+        ] {
+            if let Some(key) = key {
+                picker.input(KeyEvent::new(key, KeyModifiers::NONE), &keys);
+            }
+            let rows = picker.render_in_terminal(&theme, 80, 22, 28, &keys);
+            assert_eq!(picker.mouse_layout.get(), (first - 1, 14, 22));
+            assert_eq!(picker.selected + 1, expected);
+            assert_eq!(rows[15].spans[0].text, format!("  ({expected}/40)"));
+            let selected = rows
+                .iter()
+                .find(|line| line.spans.first().is_some_and(|span| span.text == "› "))
+                .unwrap();
+            assert!(
+                selected
+                    .spans
+                    .iter()
+                    .any(|span| span.text.contains(&format!("viewport-entry-{expected:02}")))
+            );
+        }
+
+        picker.render_in_terminal(&theme, 80, 10, 12, &keys);
+        assert_eq!(picker.page_size.get(), 6);
+        picker.render_in_terminal(&theme, 80, 8, 9, &keys);
+        assert_eq!(picker.page_size.get(), 5);
+        picker.render_in_terminal(&theme, 80, 7, 9, &keys);
+        assert_eq!(picker.page_size.get(), 4);
+    }
+
+    #[test]
     fn tree_viewport_tracks_deep_selection_and_branch_navigation() {
         let mut entries = std::collections::BTreeMap::new();
         entries.insert(1, (None, TreeEntryKind::Message));
@@ -2793,13 +2887,18 @@ mod tests {
         assert!(text.contains("node-32"), "{text:?}");
         assert!(text.contains('├') || text.contains('└'), "{text:?}");
         assert_eq!(selected.background, Some(theme.color("selectedBg")));
-        assert!(rows.iter().skip(1).take(33).all(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.text.width())
-                .sum::<usize>()
-                <= 24
-        }));
+        assert!(
+            rows.iter()
+                .skip(1)
+                .take(picker.page_size.get())
+                .all(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.width())
+                        .sum::<usize>()
+                        <= 24
+                })
+        );
         let tree = picker.tree.as_ref().unwrap();
         assert!(tree.layout(&tree.order).rows[&parent].width() > 36);
 
