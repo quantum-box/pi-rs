@@ -1601,6 +1601,9 @@ fn new_rpc_session_uses_latest_worker_queue_fallback() {
                 "--no-session",
                 "--mode",
                 "rpc",
+                // Switch providers below to start a new worker with the updated queue settings.
+                "--provider",
+                "ollama",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -7980,6 +7983,133 @@ fn default_model_and_provider_are_read_as_separate_fields() {
         let after = events.iter().find(|event| event["id"] == "after").unwrap();
         assert_eq!(after["data"]["model"]["provider"], provider);
         assert_eq!(after["data"]["model"]["id"], model);
+    }
+}
+
+#[test]
+fn automatic_startup_uses_radius_catalogs_without_making_a_request() {
+    let root = tempfile::tempdir().unwrap();
+    let server = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    server.set_nonblocking(true).unwrap();
+    let address = server.local_addr().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command.env_clear();
+    for name in ["PATH", "SystemRoot", "HOME", "USERPROFILE", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let mut child = command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .env("PI_RADIUS_GATEWAY", format!("http://{address}"))
+        .env("RADIUS_API_KEY", "radius-fixture")
+        .env("GEMINI_API_KEY", "google-fixture")
+        .args(["--mode", "rpc", "--no-session", "--no-mcp", "--offline"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["id"] == "state")
+        .unwrap();
+    assert_eq!(state["data"]["model"]["provider"], "google");
+    assert_eq!(
+        server.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn startup_chooses_authenticated_models_in_pi_provider_order() {
+    let root = tempfile::tempdir().unwrap();
+    let route = "https://example.invalid/v1";
+    let models = json!({"providers":{"relay":{
+        "api":"openai-completions", "baseUrl":route, "apiKey":"relay-fixture", "models":[{"id":"local-model"}]
+    }}});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    for (anthropic, google, extra, expected_provider, expected_model) in [
+        (true, true, vec![], "anthropic", "claude-opus-5-5"),
+        (false, true, vec![], "google", "gemini-4-argon"),
+        (false, false, vec![], "relay", "local-model"),
+        (
+            true,
+            true,
+            vec!["--provider", "ollama"],
+            "ollama",
+            "qwen2.5:7b",
+        ),
+        (
+            true,
+            true,
+            vec!["--api-key", "inline-fixture"],
+            "ollama",
+            "qwen2.5:7b",
+        ),
+        (
+            true,
+            true,
+            vec!["--models", "google/gemini-4-argon"],
+            "google",
+            "gemini-4-argon",
+        ),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command.env_clear();
+        for name in ["PATH", "SystemRoot", "HOME", "USERPROFILE", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        if anthropic {
+            command.env("ANTHROPIC_API_KEY", "anthropic-fixture");
+        }
+        if google {
+            command.env("GEMINI_API_KEY", "google-fixture");
+        }
+        let mut process = command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["--mode", "rpc", "--no-session", "--no-mcp", "--offline"])
+            .args(extra)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
+        let output = process.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for id in ["state", "after"] {
+            let event = events.iter().find(|event| event["id"] == id).unwrap();
+            assert_eq!(event["data"]["model"]["provider"], expected_provider);
+            assert_eq!(event["data"]["model"]["id"], expected_model);
+        }
     }
 }
 
