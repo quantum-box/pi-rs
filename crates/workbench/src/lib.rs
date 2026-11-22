@@ -30,6 +30,7 @@ mod file_search;
 pub mod image_profile;
 pub mod mcp;
 pub mod mcp_auth;
+mod mcp_log;
 mod mcp_login_config_lock;
 #[doc(hidden)]
 pub mod mcp_oauth_client;
