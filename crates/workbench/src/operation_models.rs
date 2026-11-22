@@ -463,32 +463,33 @@ impl Catalogue {
         for (name, provider) in &combined {
             let name = name.to_ascii_lowercase();
             // Bind configured credentials only to an unambiguous user-declared base.
-            let configured_binding =
-                if matches!(name.as_str(), "vercel-ai-gateway" | "cloudflare-workers-ai")
-                    && provider["baseUrl"].as_str().is_none()
-                {
-                    providers
-                        .iter()
-                        .find(|(key, _)| key.eq_ignore_ascii_case(&name))
-                        .and_then(|(_, configured)| {
-                            if name == "cloudflare-workers-ai" {
-                                configured["models"]
-                                    .as_array()
-                                    .and_then(|models| cloudflare_model_binding(models))
-                            } else {
-                                configured["models"]
-                                    .as_array()
-                                    .filter(|models| {
-                                        models
-                                            .iter()
-                                            .any(|model| model["baseUrl"].as_str().is_some())
-                                    })
-                                    .map(|_| unambiguous_model_base(configured))
-                            }
-                        })
-                } else {
-                    None
-                };
+            let configured_binding = if matches!(
+                name.as_str(),
+                "vercel-ai-gateway" | "cloudflare-workers-ai" | "github-copilot"
+            ) && provider["baseUrl"].as_str().is_none()
+            {
+                providers
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+                    .and_then(|(_, configured)| {
+                        if name == "cloudflare-workers-ai" {
+                            configured["models"]
+                                .as_array()
+                                .and_then(|models| cloudflare_model_binding(models))
+                        } else {
+                            configured["models"]
+                                .as_array()
+                                .filter(|models| {
+                                    models
+                                        .iter()
+                                        .any(|model| model["baseUrl"].as_str().is_some())
+                                })
+                                .map(|_| unambiguous_model_base(configured))
+                        }
+                    })
+            } else {
+                None
+            };
             let inferred_base =
                 if provider["baseUrl"].as_str().is_none() && official_base(&name).is_none() {
                     unambiguous_model_base(provider)
@@ -1878,41 +1879,44 @@ mod tests {
     }
 
     #[test]
-    fn vercel_model_only_endpoint_keeps_custom_binding_without_leaking_to_builtins() {
-        let config = json!({"vercel-ai-gateway":{"apiKey":"custom-key", "headers":{"x-secret":"value"}, "models":[
-            {"type":"classifier","id":"custom","api":"typesafe-system-one","baseUrl":"http://127.0.0.1:1234/v1"}
-        ]}});
-        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
-        let custom = catalogue
-            .0
-            .iter()
-            .find(|entry| entry.provider == "vercel-ai-gateway" && entry.model.id == "custom")
-            .unwrap();
-        let builtin = catalogue
-            .0
-            .iter()
-            .find(|entry| {
-                entry.provider == "vercel-ai-gateway" && entry.model.id == "typesafe-ai/jev"
-            })
-            .unwrap();
-        assert_eq!(custom.api_key.as_deref(), Some("custom-key"));
-        assert_eq!(
-            custom.model.headers.get("x-secret").map(String::as_str),
-            Some("value")
-        );
-        assert!(builtin.api_key.is_none());
-        assert!(!builtin.model.headers.contains_key("x-secret"));
-        let mut ambiguous = config;
-        ambiguous["vercel-ai-gateway"]["models"].as_array_mut().unwrap().push(json!({"type":"classifier","id":"other","api":"typesafe-system-one","baseUrl":"http://127.0.0.1:1235/v1"}));
-        let catalogue = Catalogue::parse(ambiguous.as_object().unwrap()).unwrap();
-        assert!(
-            catalogue
+    fn model_only_endpoint_keeps_custom_binding_without_leaking_to_builtins() {
+        for (provider, builtin_id) in [
+            ("vercel-ai-gateway", "typesafe-ai/jev"),
+            ("github-copilot", "microsoft-decision-1"),
+        ] {
+            let config = json!({provider:{"apiKey":"custom-key", "headers":{"x-secret":"value"}, "models":[
+                {"type":"classifier","id":"custom","api":"typesafe-system-one","baseUrl":"http://127.0.0.1:1234/v1"}
+            ]}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let custom = catalogue
                 .0
                 .iter()
-                .filter(|entry| entry.provider == "vercel-ai-gateway")
-                .all(|entry| entry.api_key.is_none()
-                    && !entry.model.headers.contains_key("x-secret"))
-        );
+                .find(|entry| entry.provider == provider && entry.model.id == "custom")
+                .unwrap();
+            let builtin = catalogue
+                .0
+                .iter()
+                .find(|entry| entry.provider == provider && entry.model.id == builtin_id)
+                .unwrap();
+            assert_eq!(custom.api_key.as_deref(), Some("custom-key"));
+            assert_eq!(
+                custom.model.headers.get("x-secret").map(String::as_str),
+                Some("value")
+            );
+            assert!(builtin.api_key.is_none());
+            assert!(!builtin.model.headers.contains_key("x-secret"));
+            let mut ambiguous = config;
+            ambiguous[provider]["models"].as_array_mut().unwrap().push(json!({"type":"classifier","id":"other","api":"typesafe-system-one","baseUrl":"http://127.0.0.1:1235/v1"}));
+            let catalogue = Catalogue::parse(ambiguous.as_object().unwrap()).unwrap();
+            assert!(
+                catalogue
+                    .0
+                    .iter()
+                    .filter(|entry| entry.provider == provider)
+                    .all(|entry| entry.api_key.is_none()
+                        && !entry.model.headers.contains_key("x-secret"))
+            );
+        }
     }
 
     #[tokio::test]
