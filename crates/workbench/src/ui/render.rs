@@ -2069,6 +2069,7 @@ fn markdown_plain_at_depth(
     let mut quote_skip = 0usize;
     let mut code: Option<String> = None;
     let mut code_text = String::new();
+    let mut tilde_indent = None;
     let mut lists: Vec<(Option<u64>, bool, bool)> = Vec::new();
     let options = Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let loose_lists = loose_list_offsets(parsed, options);
@@ -2281,6 +2282,14 @@ fn markdown_plain_at_depth(
                 {
                     lines.push(Line::default());
                 }
+                tilde_indent = (matches!(&kind, CodeBlockKind::Fenced(_))
+                    && text[range.clone()].starts_with("~~~"))
+                .then(|| {
+                    let container = item_source_indents.last().map_or(0, |&(_, column)| column);
+                    let opening = text[..range.start].rsplit('\n').next().unwrap_or("");
+                    (container, opening.len().saturating_sub(container))
+                })
+                .filter(|&(_, indent)| indent != 0);
                 code = Some(match kind {
                     CodeBlockKind::Fenced(language) => {
                         language.split_whitespace().next().unwrap_or("").to_owned()
@@ -2556,6 +2565,17 @@ fn markdown_plain_at_depth(
             }
             Event::Text(content) | Event::Html(content) | Event::InlineHtml(content) => {
                 if code.is_some() {
+                    if let Some((container, indent)) = tilde_indent {
+                        // Marked retains the indentation that Pulldown strips
+                        // from tilde fences, beyond the enclosing list margin.
+                        let skipped = text[..range.start]
+                            .bytes()
+                            .rev()
+                            .take_while(|&byte| byte == b' ')
+                            .count();
+                        let spaces = skipped.saturating_sub(container).min(indent);
+                        code_text.extend(std::iter::repeat_n(' ', spaces));
+                    }
                     code_text.push_str(&content);
                 } else {
                     let mut merged = content.into_string();
@@ -4199,6 +4219,64 @@ mod tests {
                     "more text"
                 ]
             );
+        }
+    }
+
+    #[test]
+    fn tilde_fences_preserve_source_indentation() {
+        for (source, expected) in [
+            (
+                "before\n  ~~~\n  body\n body\nnone\n    four\n  ~~~",
+                vec![
+                    "before",
+                    "",
+                    "```",
+                    "    body",
+                    "   body",
+                    "  none",
+                    "      four",
+                    "```",
+                ],
+            ),
+            (
+                "- one\n    ~~~\n    body\n   body\n  none\n    ~~~",
+                vec![
+                    "- one",
+                    "  ```",
+                    "      body",
+                    "     body",
+                    "    none",
+                    "  ```",
+                ],
+            ),
+            (
+                "> one\n>   ~~~\n>   body\n>  body\n> none\n>   ~~~",
+                vec![
+                    "│ one",
+                    "│",
+                    "│ ```",
+                    "│     body",
+                    "│    body",
+                    "│   none",
+                    "│ ```",
+                ],
+            ),
+            ("- ~~~\n  body\n  ~~~", vec!["- ```", "    body", "  ```"]),
+            ("  ```\n  body\n  ```", vec!["```", "  body", "```"]),
+            ("  ~~~\n  partial", vec!["```", "    partial", "```"]),
+        ] {
+            let lines: Vec<_> = markdown(source, &Theme::system(), 36)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect();
+            assert_eq!(lines, expected, "{source:?}");
         }
     }
 
