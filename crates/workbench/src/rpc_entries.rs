@@ -987,7 +987,7 @@ fn selection<'a>(
     )
 }
 
-fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
+pub(super) fn add_summary_usage(entry: &mut Value, records: &[Record], record: &Record) {
     if let Some((usage, metadata)) = record.summary_usage(records) {
         let metadata = metadata.map(|details| details.metadata).unwrap_or_default();
         entry["usage"] = super::rpc_events::usage_value(usage, &metadata);

@@ -122,10 +122,8 @@ pub fn expand_config_value(
     if value.starts_with('!') {
         return Ok(None);
     }
-    static ENVIRONMENT: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\$\$|\$!|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
-            .expect("environment interpolation")
-    });
+    static NAME: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*").expect("environment name"));
     let mut expanded = String::new();
     let mut append = |chunk: &str| -> Result<()> {
         if chunk.len() > max_len - expanded.len() {
@@ -136,20 +134,46 @@ pub fn expand_config_value(
         expanded.push_str(chunk);
         Ok(())
     };
-    let mut end = 0;
-    for capture in ENVIRONMENT.captures_iter(value) {
-        let token = capture.get(0).expect("matched environment token");
-        append(&value[end..token.start()])?;
-        if let Some(name) = capture.get(1).or_else(|| capture.get(2)) {
-            let Some(replacement) = lookup(name.as_str()).filter(|value| !value.is_empty()) else {
-                return Ok(None);
-            };
-            append(&replacement)?;
-        } else {
-            append(&token.as_str()[1..])?;
-        }
-        end = token.end();
+    let last_brace = value.rfind('}').unwrap_or_default();
+    let mut cursor = 0;
+    while let Some(offset) = value[cursor..].find('$') {
+        let dollar = cursor + offset;
+        append(&value[cursor..dollar])?;
+        cursor = dollar + 1;
+        let tail = &value[cursor..];
+        let name = match tail.as_bytes().first() {
+            Some(b'$' | b'!') => {
+                append(&tail[..1])?;
+                cursor += 1;
+                continue;
+            }
+            Some(b'{') if cursor < last_brace => {
+                let close = tail.find('}').expect("closing brace remains");
+                cursor += close + 1;
+                let name = &tail[1..close];
+                if NAME
+                    .find(name)
+                    .is_none_or(|found| found.end() != name.len())
+                {
+                    append(&value[dollar..cursor])?;
+                    continue;
+                }
+                name
+            }
+            _ => {
+                let Some(name) = NAME.find(tail) else {
+                    append("$")?;
+                    continue;
+                };
+                cursor += name.end();
+                name.as_str()
+            }
+        };
+        let Some(replacement) = lookup(name).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        append(&replacement)?;
     }
-    append(&value[end..])?;
+    append(&value[cursor..])?;
     Ok(Some(expanded))
 }
