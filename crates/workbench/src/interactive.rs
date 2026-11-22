@@ -623,10 +623,25 @@ enum LocalEditor {
     Setting(String),
     BranchSummary(u64),
     ProviderKey(super::Provider),
+    CloudflareLogin(CloudflareLoginField),
     BedrockProfile,
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
     AnthropicCode(Option<tokio::sync::oneshot::Sender<String>>),
+    CodexCode(Option<tokio::sync::oneshot::Sender<String>>),
+}
+
+enum CloudflareLoginField {
+    Key(super::Provider),
+    Account {
+        provider: super::Provider,
+        key: String,
+    },
+    Gateway {
+        provider: super::Provider,
+        key: String,
+        account: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -684,6 +699,7 @@ enum RemoteEvent {
     DeviceCode { url: String, code: String },
     OpenRouterCode(tokio::sync::oneshot::Sender<String>),
     AnthropicCode(tokio::sync::oneshot::Sender<String>),
+    CodexCode(tokio::sync::oneshot::Sender<String>),
     ForgetModelKey(&'static str),
     RefreshModelKeys,
     Finished(Result<Vec<String>>),
@@ -1037,6 +1053,13 @@ struct StreamingTool {
 
 type LinkRow = (u16, Vec<(std::ops::Range<usize>, String)>);
 
+struct TreeNavigationHandoff {
+    id: u64,
+    summarize: bool,
+    instructions: Option<String>,
+    clear_id: Option<uuid::Uuid>,
+}
+
 struct CustomMessageRenderPending {
     request: uuid::Uuid,
     record: u64,
@@ -1054,6 +1077,7 @@ struct View {
     local_editor: Option<(LocalEditor, crate::ui::dialog::Dialog)>,
     tree_confirmation: Option<u64>,
     tree_navigation: Option<(u64, bool)>,
+    tree_handoff: Option<TreeNavigationHandoff>,
     branch_error: Option<String>,
     ui_status: std::collections::BTreeMap<String, String>,
     widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
@@ -1429,6 +1453,16 @@ impl View {
             .collect();
         self.append_entry(Entry::Notice(text));
     }
+    fn show_status(&mut self, mode: Option<TuiMode>, status: String) {
+        if (mode != Some(TuiMode::Regular) || self.regular.committed < self.lines.len())
+            && let Some(Entry::Status(previous)) = self.lines.last_mut()
+        {
+            *previous = status;
+        } else {
+            self.append_entry(Entry::Status(status));
+        }
+    }
+
     fn append_entry(&mut self, entry: Entry) {
         self.lines.push(entry);
         if self.lines.len() > 4000 {
@@ -1727,6 +1761,32 @@ impl View {
     }
 
     fn receive_worker(&mut self, mut value: Value, args: &mut Cli) {
+        if value["type"] == "response" && value["command"] == "set_session_label" {
+            if let Ok(request) = serde_json::from_value(value["id"].take())
+                && let Some(picker) = &mut self.picker
+                && let Some(target) = picker.take_tree_label(request)
+            {
+                if value["success"] == true {
+                    let focus = match picker.selected() {
+                        Some(Selection::Checkout(record)) => record,
+                        _ => target,
+                    };
+                    match Session::snapshot(&args.session) {
+                        Ok(session) => picker.refresh_tree(
+                            session_tree::picker(&session, TreeFilter::Default),
+                            focus,
+                        ),
+                        Err(error) => picker.show_feedback(Err(error.to_string())),
+                    }
+                } else {
+                    let message = value["error"]
+                        .as_str()
+                        .unwrap_or("Could not save the label");
+                    picker.show_feedback(Err(message.into()));
+                }
+            }
+            return;
+        }
         if value["type"] == "resources_discovered" {
             match serde_json::from_value::<pi_rs::DiscoveredResources>(value["resources"].take())
                 .map_err(Error::from)
@@ -2108,20 +2168,45 @@ impl View {
             *finished = true;
         }
     }
+    fn restore_queue(&mut self, response: &Value) -> Result<()> {
+        if response["success"] != true {
+            return Err(Error::Config(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("Queue restore failed")
+                    .into(),
+            ));
+        }
+        let messages: Vec<pi_rs::QueuedMessage> =
+            serde_json::from_value(response["data"]["messages"].clone())?;
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut text: Vec<_> = messages
+            .iter()
+            .map(|message| message.input.content.as_str())
+            .filter(|text| !text.is_empty())
+            .collect();
+        if !self.editor.text.is_empty() {
+            text.push(&self.editor.text);
+        }
+        self.editor.replace(text.join("\n\n"));
+        let mut images: Vec<_> = messages
+            .into_iter()
+            .flat_map(|message| message.images)
+            .collect();
+        images.append(&mut self.draft_images);
+        self.draft_images = images;
+        Ok(())
+    }
+
     fn receive(&mut self, value: &Value) {
         match value["type"].as_str() {
             Some("response") if value["command"] == "clear_queue" && self.restoring_queue => {
                 self.restoring_queue = false;
-                if value["success"] == true {
-                    if let Ok(messages) = serde_json::from_value::<Vec<pi_rs::QueuedMessage>>(value["data"]["messages"].clone()) {
-                        let mut text: Vec<_> = messages.iter().map(|message| message.input.content.clone()).filter(|text| !text.is_empty()).collect();
-                        if !self.editor.text.is_empty() { text.push(self.editor.text.clone()); }
-                        self.editor.replace(text.join("\n\n"));
-                        let mut images: Vec<_> = messages.into_iter().flat_map(|message| message.images).collect();
-                        images.append(&mut self.draft_images);
-                        self.draft_images = images;
-                    }
-                } else { self.append(value["error"].as_str().unwrap_or("Queue restore failed")); }
+                if let Err(error) = self.restore_queue(value) {
+                    self.append(&error.to_string());
+                }
             }
             Some("bash_execution_start") => {
                 self.shell_running = true;
@@ -2660,7 +2745,7 @@ impl View {
             ));
         }
         if let Some(picker) = &self.picker {
-            lines = picker.render(theme, width, body_height, keys);
+            lines = picker.render_in_terminal(theme, width, body_height, height, keys);
         }
         let dialog_cursor = self
             .dialog()
@@ -3079,8 +3164,8 @@ impl View {
         };
         let modal = self.picker.is_some() || self.dialog().is_some();
         let committing = !busy && !modal;
-        // A trailing cycle notice can still be replaced by another cycle.
-        let trailing_status = matches!(self.lines.last(), Some(Entry::ModelCycleStatus(_)));
+        // A trailing status can still be replaced by another status.
+        let trailing_status = matches!(self.lines.last(), Some(Entry::Status(_)));
         let commit_end = if committing {
             (self.lines.len() - usize::from(trailing_status)).max(self.regular.committed)
         } else {
@@ -3120,8 +3205,13 @@ impl View {
                 active.extend(render_entry(&entry));
             }
             if let Some(picker) = &self.picker {
-                active =
-                    picker.render(theme, width, height - prompt_height - 4 - below.len(), keys);
+                active = picker.render_in_terminal(
+                    theme,
+                    width,
+                    height - prompt_height - 4 - below.len(),
+                    height,
+                    keys,
+                );
             }
         }
         let dialog_height = height - prompt_height - 4 - below.len();
@@ -3617,6 +3707,15 @@ fn slash(
             super::Provider::named("openrouter").expect("built-in OpenRouter provider"),
             view,
         ),
+        "/login"
+            if rest.eq_ignore_ascii_case("openai-codex")
+                || rest.eq_ignore_ascii_case("openai-codex browser") =>
+        {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Browser)
+        }
+        "/login" if rest.eq_ignore_ascii_case("openai-codex device") => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
+        }
         "/login" if rest.eq_ignore_ascii_case("github-copilot") => {
             start_copilot_login(view, &args.settings)
         }
@@ -3656,6 +3755,20 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-codex · Browser authorization".into(),
+                            selection: Selection::LoginCodex,
+                        },
+                    );
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-codex · Device authorization".into(),
+                            selection: Selection::LoginCodexDevice,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -3751,6 +3864,8 @@ fn slash(
                 if login {
                     if provider.id() == "amazon-bedrock" {
                         show_bedrock_methods(view);
+                    } else if uses_cloudflare_login(&provider, args) {
+                        edit_cloudflare_login(view, CloudflareLoginField::Key(provider));
                     } else {
                         edit_provider_key(provider, view);
                     }
@@ -4018,7 +4133,7 @@ fn slash(
             );
         }
         "/tree" => {
-            let session = Session::open(&args.session)?;
+            let session = Session::snapshot(&args.session)?;
             let filter =
                 TreeFilter::parse(args.settings.string("treeFilterMode").unwrap_or("default"));
             view.picker = Some(session_tree::picker(&session, filter));
@@ -4749,6 +4864,32 @@ pub(super) async fn run(
                 {
                     view.append(&error);
                 }
+                if value["type"] == "response"
+                    && value["command"] == "clear_queue"
+                    && let Some(handoff) = &view.tree_handoff
+                    && handoff.clear_id.is_some_and(|id| value["id"] == json!(id))
+                {
+                    let result = view.restore_queue(&value).and_then(|()| {
+                        if active.busy && (active.compacting || view.summarizing) {
+                            return Err(tree_compaction_in_progress());
+                        }
+                        if active.busy {
+                            active.send(json!({"type":"cancel"}))?;
+                        }
+                        Ok(())
+                    });
+                    match result {
+                        Ok(()) => {
+                            view.tree_handoff.as_mut().expect("active handoff").clear_id = None
+                        }
+                        Err(error) => {
+                            view.tree_handoff = None;
+                            view.append(&error.to_string());
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
                 let settled = value["type"] == "agent_settled";
                 let success = value["success"] == true;
                 if view.tree_navigation.is_some() {
@@ -4846,6 +4987,12 @@ pub(super) async fn run(
                 view.cache_warming_status = None;
                 cancel_running_extension_editor(&mut external_editor, None);
                 view.dialogs.clear();
+                if view.tree_handoff.take().is_some() {
+                    view.append("Branch navigation stopped when the active worker exited");
+                }
+                if let Some(picker) = &mut view.picker {
+                    picker.cancel_pending_tree_label();
+                }
                 if let Some((id, _)) = view.tree_navigation.take()
                     && let Err(error) = reopen_tree(&mut args, &mut view, id)
                 {
@@ -4861,6 +5008,25 @@ pub(super) async fn run(
                 view.shell_running = false;
                 dirty = true;
             }
+        }
+        if !is_busy(&worker)
+            && view
+                .tree_handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.clear_id.is_none())
+        {
+            let handoff = view.tree_handoff.take().expect("acknowledged tree handoff");
+            if let Err(error) = start_tree_navigation(
+                &args,
+                &mut view,
+                &mut worker,
+                handoff.id,
+                handoff.summarize,
+                handoff.instructions,
+            ) {
+                view.append(&error.to_string());
+            }
+            dirty = true;
         }
         if view
             .custom_render_redraw_at
@@ -4899,6 +5065,15 @@ pub(super) async fn run(
                     view.local_editor = Some((
                         LocalEditor::OpenRouterCode(Some(sender)),
                         crate::ui::dialog::Dialog::secret("OpenRouter code or redirect URL".into()),
+                    ));
+                    dirty = true;
+                }
+                Ok(RemoteEvent::CodexCode(sender)) => {
+                    view.local_editor = Some((
+                        LocalEditor::CodexCode(Some(sender)),
+                        crate::ui::dialog::Dialog::secret(
+                            "OpenAI Codex code or redirect URL".into(),
+                        ),
                     ));
                     dirty = true;
                 }
@@ -5453,7 +5628,7 @@ pub(super) async fn run(
                                         Err(Error::Config("Enter an OpenRouter authorization code or redirect URL".into()))
                                     }
                                 }
-                                LocalEditor::AnthropicCode(sender) => {
+                                LocalEditor::AnthropicCode(sender) | LocalEditor::CodexCode(sender) => {
                                     if let Some(sender) = sender.take() { let _ = sender.send(text); }
                                     Ok(())
                                 }
@@ -5468,6 +5643,9 @@ pub(super) async fn run(
                                             view.invalidate_model_catalog();
                                             view.append("AWS profile saved for amazon-bedrock");
                                         })
+                                }
+                                LocalEditor::CloudflareLogin(field) => {
+                                    advance_cloudflare_login(field, text.trim(), &mut args, &mut view)
                                 }
                                 LocalEditor::ProviderKey(provider) => super::model_auth::save(
                                     provider,
@@ -5498,7 +5676,10 @@ pub(super) async fn run(
                         Some(_) => {
                             if let LocalEditor::BranchSummary(id) = editor {
                                 confirm_tree(&mut view, id);
-                            } else if matches!(editor, LocalEditor::AnthropicCode(_)) {
+                            } else if matches!(
+                                editor,
+                                LocalEditor::AnthropicCode(_) | LocalEditor::CodexCode(_)
+                            ) {
                                 interrupt_remote_task(&mut view);
                             }
                         }
@@ -5593,7 +5774,7 @@ pub(super) async fn run(
                         }
                         Input::CopyTreeRecord(id) => {
                             picker.show_feedback(
-                                Session::open(&args.session)
+                                Session::snapshot(&args.session)
                                     .and_then(|session| sessions::tree_record_text(&session, id))
                                     .and_then(|text| sessions::copy_text(&text))
                                     .map(|()| "Copied entry".into())
@@ -5602,14 +5783,24 @@ pub(super) async fn run(
                             view.picker = Some(picker);
                         }
                         Input::SetTreeLabel(id, label) => {
-                            let result = Session::open(&args.session).and_then(|mut session| {
-                                session.set_label(id, (!label.is_empty()).then_some(label))?;
-                                picker.refresh_tree(
-                                    session_tree::picker(&session, TreeFilter::Default),
-                                    id,
-                                );
-                                Ok(())
-                            });
+                            let label = (!label.is_empty()).then_some(label);
+                            let result = if let Some(active) =
+                                worker.as_mut().filter(|worker| worker.busy)
+                            {
+                                let request = uuid::Uuid::new_v4();
+                                active.send(json!({
+                                    "type":"set_session_label","target":id,"label":label,"id":request,
+                                })).map(|()| picker.track_tree_label(request, id))
+                            } else {
+                                Session::open(&args.session).and_then(|mut session| {
+                                    session.set_label(id, label)?;
+                                    picker.refresh_tree(
+                                        session_tree::picker(&session, TreeFilter::Default),
+                                        id,
+                                    );
+                                    Ok(())
+                                })
+                            };
                             if let Err(error) = result {
                                 picker.show_feedback(Err(error.to_string()));
                             }
@@ -5983,6 +6174,7 @@ pub(super) async fn run(
                         #[cfg(not(unix))]
                         view.append("Suspending the terminal is unavailable on this platform");
                     }
+                    "app.message.dequeue" | "app.interrupt" if view.tree_handoff.is_some() => {}
                     "app.message.dequeue" => {
                         match Worker::control(&mut worker, &args, json!({"type":"clear_queue"})) {
                             Ok(()) => view.restoring_queue = true,
@@ -6035,13 +6227,19 @@ pub(super) async fn run(
                             }
                         }
                     }
-                    "app.session.new" | "app.session.tree" | "app.session.fork"
-                    | "app.session.resume"
-                        if !is_busy(&worker) =>
+                    "app.session.tree"
+                        if view.tree_handoff.is_none() && view.tree_navigation.is_none() =>
+                    {
+                        if let Err(error) = slash("/tree", &mut args, &mut view, Some(&mut worker))
+                        {
+                            view.append(&error.to_string());
+                        }
+                    }
+                    "app.session.new" | "app.session.fork" | "app.session.resume"
+                        if !is_busy(&worker) && view.tree_handoff.is_none() =>
                     {
                         let command = match action {
                             "app.session.new" => "/new",
-                            "app.session.tree" => "/tree",
                             "app.session.fork" => "/fork",
                             _ => "/resume",
                         };
@@ -6067,19 +6265,37 @@ pub(super) async fn run(
                     }
                     "app.thinking.cycle" if !is_busy(&worker) => {
                         match super::thinking::cycle(&mut args) {
-                            Ok(Some(level)) => view.append(&format!("Thinking level: {level}")),
-                            Ok(None) => view.append("Current model does not support thinking"),
+                            Ok(Some(level)) => {
+                                view.show_status(args.tui_mode, format!("Thinking level: {level}"));
+                            }
+                            Ok(None) => view.show_status(
+                                args.tui_mode,
+                                "Current model does not support thinking".into(),
+                            ),
                             Err(error) => view.append(&error.to_string()),
                         }
                     }
-                    "app.tools.expand" => view.set_expand_tools(!view.expand_tools),
+                    "app.tools.expand" => {
+                        view.set_expand_tools(!view.expand_tools);
+                        let state = if view.expand_tools {
+                            "expanded"
+                        } else {
+                            "collapsed"
+                        };
+                        view.show_status(args.tui_mode, format!("Tool output: {state}"));
+                    }
                     "app.thinking.toggle" => {
                         let hidden = !view.hide_thinking;
                         view.set_hide_thinking(hidden);
-                        if let Err(error) =
-                            args.settings.set_user("hideThinkingBlock", json!(hidden))
-                        {
-                            view.append(&error.to_string());
+                        match args.settings.set_user("hideThinkingBlock", json!(hidden)) {
+                            Ok(()) => {
+                                let state = if hidden { "hidden" } else { "visible" };
+                                view.show_status(
+                                    args.tui_mode,
+                                    format!("Thinking blocks: {state}"),
+                                );
+                            }
+                            Err(error) => view.append(&error.to_string()),
                         }
                     }
                     "app.clipboard.pasteImage" => view.paste_clipboard(&args),
@@ -6105,7 +6321,7 @@ pub(super) async fn run(
                     }
                     "tui.input.submit" if view.editor.continued_line() => {}
                     "tui.input.submit" | "app.message.followUp" => {
-                        if view.tree_navigation.is_some() {
+                        if view.tree_navigation.is_some() || view.tree_handoff.is_some() {
                             continue;
                         }
                         if view.clipboard.is_some() {
@@ -6192,7 +6408,7 @@ pub(super) async fn run(
                                 view.append(&error.to_string());
                                 view.editor.replace(input);
                             }
-                        } else if matches!(input.trim(), "/session" | "/share")
+                        } else if matches!(input.trim(), "/session" | "/share" | "/tree")
                             && view.draft_images.is_empty()
                         {
                             if let Err(error) =
@@ -6251,6 +6467,12 @@ pub(super) async fn run(
                             ) {
                                 Ok(next) => theme = next,
                                 Err(error) => view.append(&error.to_string()),
+                            }
+                            #[cfg(any(unix, windows))]
+                            if let Some(terminal) = &mut _terminal {
+                                terminal
+                                    .colors
+                                    .query_terminal_colors(&mut std::io::stdout())?;
                             }
                             view.append("Reloaded settings, context, skills, prompts, native extensions, MCP, keybindings and theme");
                             args.session_transition = Some(pi_rs::SessionStartReason::Reload);
@@ -6454,6 +6676,105 @@ fn edit_provider_key(provider: super::Provider, view: &mut View) {
     view.local_editor = Some((LocalEditor::ProviderKey(provider), dialog));
 }
 
+fn uses_cloudflare_login(provider: &super::Provider, args: &Cli) -> bool {
+    matches!(
+        provider.id(),
+        "cloudflare-workers-ai" | "cloudflare-ai-gateway"
+    ) && args.explicit_endpoint_for(provider).is_none()
+        && !args.model_profiles.has_fixed_cloudflare_endpoint(
+            provider,
+            (provider == &args.provider).then_some(args.model.as_str()),
+        )
+}
+
+fn edit_cloudflare_login(view: &mut View, field: CloudflareLoginField) {
+    use crate::ui::dialog::Dialog;
+    let dialog = match field {
+        CloudflareLoginField::Key(_) => Dialog::secret("Enter Cloudflare API key".into()),
+        _ => Dialog::new(
+            uuid::Uuid::new_v4(),
+            pi_rs::UiRequest::Input {
+                title: match field {
+                    CloudflareLoginField::Account { .. } => "Enter Cloudflare account ID",
+                    _ => "Enter Cloudflare AI Gateway ID",
+                }
+                .into(),
+                placeholder: None,
+                initial_value: None,
+                timeout: None,
+            },
+        ),
+    };
+    view.local_editor = Some((LocalEditor::CloudflareLogin(field), dialog));
+}
+
+fn cloudflare_login_matches_gateway_base(base: &str, account: &str, gateway: &str) -> bool {
+    super::cloudflare_gateway::Route::new(account, gateway).is_some_and(|route| {
+        super::cloudflare_gateway::Route::from_configured(base, Some(&route)) == Some(route)
+    })
+}
+
+fn advance_cloudflare_login(
+    field: &CloudflareLoginField,
+    text: &str,
+    args: &mut Cli,
+    view: &mut View,
+) -> Result<()> {
+    let (provider, key, account, gateway) = match field {
+        CloudflareLoginField::Key(provider) => {
+            if !super::model_auth::valid_key(text) {
+                return Err(Error::Config("Enter a valid Cloudflare API key".into()));
+            }
+            edit_cloudflare_login(
+                view,
+                CloudflareLoginField::Account {
+                    provider: provider.clone(),
+                    key: text.into(),
+                },
+            );
+            return Ok(());
+        }
+        CloudflareLoginField::Account { provider, key } => {
+            if !super::operation_models::valid_cloudflare_account(text) {
+                return Err(Error::Config("Enter a valid Cloudflare account ID".into()));
+            }
+            if provider.id() == "cloudflare-ai-gateway" {
+                edit_cloudflare_login(
+                    view,
+                    CloudflareLoginField::Gateway {
+                        provider: provider.clone(),
+                        key: key.clone(),
+                        account: text.into(),
+                    },
+                );
+                return Ok(());
+            }
+            (provider, key.as_str(), text, None)
+        }
+        CloudflareLoginField::Gateway {
+            provider,
+            key,
+            account,
+        } => (provider, key.as_str(), account.as_str(), Some(text)),
+    };
+    if let Some(gateway) = gateway
+        && let Some(base) = args.model_profiles.cloudflare_configured_base(
+            provider,
+            (provider == &args.provider).then_some(args.model.as_str()),
+        )
+        && !cloudflare_login_matches_gateway_base(base, account, gateway)
+    {
+        return Err(Error::Config(
+            "Enter identifiers that match the configured Cloudflare route".into(),
+        ));
+    }
+    super::model_auth::save_cloudflare_login(provider, key, account, gateway)?;
+    args.replace_model_keys(super::model_auth::Keys::load()?)?;
+    view.invalidate_model_catalog();
+    view.append(&format!("Cloudflare API key saved for {}", provider.id()));
+    Ok(())
+}
+
 fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut View) -> Result<()> {
     let removed = super::model_auth::remove(&provider)?;
     let mut keys = args.model_keys.clone();
@@ -6576,14 +6897,7 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     } else {
         "Only one model in scope".into()
     };
-    // A normal terminal has already printed committed rows to its scrollback.
-    if (args.tui_mode != Some(TuiMode::Regular) || view.regular.committed < view.lines.len())
-        && let Some(Entry::ModelCycleStatus(previous)) = view.lines.last_mut()
-    {
-        *previous = status;
-    } else {
-        view.append_entry(Entry::ModelCycleStatus(status));
-    }
+    view.show_status(args.tui_mode, status);
     Ok(())
 }
 
@@ -6695,6 +7009,41 @@ fn take_device_code_action(
         return None;
     }
     view.remote_task.as_mut()?.device_code.take()
+}
+
+fn start_codex_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    method: super::codex_auth::Method,
+) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to OpenAI Codex",
+        "OpenAI Codex login cancelled",
+        move |sender| async move {
+            super::codex_auth::login(&settings, task_control, method, |notice| match notice {
+                super::codex_auth::Notice::Device { url, code } => {
+                    let _ = sender.send(RemoteEvent::DeviceCode {
+                        url: url.to_owned(),
+                        code,
+                    });
+                }
+                super::codex_auth::Notice::Browser(url, input) => {
+                    let _ = sender.send(RemoteEvent::Notice(format!(
+                        "Continue in your browser: {url}"
+                    )));
+                    let _ = sender.send(RemoteEvent::CodexCode(input));
+                }
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to OpenAI Codex".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
 }
 
 fn start_copilot_login(view: &mut View, settings: &crate::config::Settings) {
@@ -6870,6 +7219,8 @@ fn interrupt_remote_task(view: &mut View) {
     } else if task.meta_login_control.is_some() {
         view.append(if task.status == "Signing in to xAI" {
             "xAI sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to OpenAI Codex" {
+            "OpenAI Codex sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to GitHub Copilot" {
             "GitHub Copilot sign-in is completing; waiting for the result"
         } else if task.status == "Signing in to Anthropic" {
@@ -6886,7 +7237,9 @@ fn clear_openrouter_editor(view: &mut View) {
     if matches!(
         view.local_editor,
         Some((
-            LocalEditor::OpenRouterCode(_) | LocalEditor::AnthropicCode(_),
+            LocalEditor::OpenRouterCode(_)
+                | LocalEditor::AnthropicCode(_)
+                | LocalEditor::CodexCode(_),
             _
         ))
     ) {
@@ -7073,6 +7426,10 @@ fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()>
     Ok(())
 }
 
+fn tree_compaction_in_progress() -> Error {
+    Error::Config("Wait for the current compaction or tree navigation to finish before navigating the session tree".into())
+}
+
 fn start_tree_navigation(
     args: &Cli,
     view: &mut View,
@@ -7081,6 +7438,28 @@ fn start_tree_navigation(
     summarize: bool,
     instructions: Option<String>,
 ) -> Result<()> {
+    if view.tree_handoff.is_some() || view.tree_navigation.is_some() {
+        return Err(tree_compaction_in_progress());
+    }
+    if let Some(active) = worker.as_mut() {
+        if active.bashing {
+            return Err(Error::Config("Wait for the shell command to finish".into()));
+        }
+        if active.busy {
+            if active.compacting || view.summarizing {
+                return Err(tree_compaction_in_progress());
+            }
+            let clear_id = uuid::Uuid::new_v4();
+            active.send(json!({"type":"clear_queue", "id": clear_id}))?;
+            view.tree_handoff = Some(TreeNavigationHandoff {
+                id,
+                summarize,
+                instructions,
+                clear_id: Some(clear_id),
+            });
+            return Ok(());
+        }
+    }
     let configured_reserve = &args.settings.value()["branchSummary"]["reserveTokens"];
     let reserve_tokens = configured_reserve
         .as_u64()
@@ -7746,7 +8125,7 @@ fn select(
             )?;
         }
         Selection::Checkout(id) => {
-            if id == Session::open(&args.session)?.head() {
+            if id == Session::snapshot(&args.session)?.head() {
                 view.append("Already at this point");
             } else if args.settings.value()["branchSummary"]["skipPrompt"] == true {
                 start_tree_navigation(args, view, worker, id, false, None)?;
@@ -7781,6 +8160,9 @@ fn select(
         Selection::LoginProvider(provider) if provider.id() == "amazon-bedrock" => {
             show_bedrock_methods(view)
         }
+        Selection::LoginProvider(provider) if uses_cloudflare_login(&provider, args) => {
+            edit_cloudflare_login(view, CloudflareLoginField::Key(provider));
+        }
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
         Selection::BedrockBearer => edit_provider_key(super::Provider::Bedrock, view),
         Selection::BedrockProfile => {
@@ -7806,6 +8188,12 @@ fn select(
                 },
             );
             view.local_editor = Some((LocalEditor::BedrockChain, dialog));
+        }
+        Selection::LoginCodex => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Browser)
+        }
+        Selection::LoginCodexDevice => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
         }
         Selection::LoginCopilot => start_copilot_login(view, &args.settings),
         Selection::LoginXai => start_xai_login(view, &args.settings),
@@ -8870,6 +9258,62 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cloudflare_login_validates_fixed_identifiers_in_gateway_templates() {
+        let base = "https://gateway.ai.cloudflare.com/v1/fixed/{CLOUDFLARE_GATEWAY_ID}/compat";
+        assert!(cloudflare_login_matches_gateway_base(
+            base,
+            "fixed",
+            "other-gateway"
+        ));
+        assert!(!cloudflare_login_matches_gateway_base(
+            base,
+            "wrong",
+            "other-gateway"
+        ));
+    }
+
+    #[test]
+    fn cloudflare_login_preserves_key_entry_for_fixed_routes() {
+        use clap::Parser;
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(uses_cloudflare_login(&provider, &args));
+        }
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{
+                "cloudflare-workers-ai":{"baseUrl":"http://127.0.0.1:31415/v1"},
+                "cloudflare-ai-gateway":{"baseUrl":"http://127.0.0.1:31416/v1"},
+            }}))
+            .unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(!uses_cloudflare_login(&provider, &args));
+        }
+        args.model_profiles = super::super::model_profiles::Profiles::parse(
+            &serde_json::json!({"providers":{
+                "cloudflare-workers-ai":{"baseUrl":"https://api.cloudflare.com/client/v4/accounts/fixture/ai/v1"},
+                "cloudflare-ai-gateway":{"baseUrl":"https://gateway.ai.cloudflare.com/v1/fixture/gateway/compat"},
+            }}),
+        ).unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(!uses_cloudflare_login(&provider, &args));
+        }
+        args.model_profiles = super::super::model_profiles::Profiles::parse_with_cloudflare_routes(
+            &serde_json::json!({}),
+            Some("storedworker"),
+            super::super::cloudflare_gateway::Route::new("storedaccount", "storedgateway"),
+        )
+        .unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(!args.model_profiles.endpoint(&provider).is_empty());
+            assert!(uses_cloudflare_login(&provider, &args));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn signal_listener_survives_interrupt_during_editor() {

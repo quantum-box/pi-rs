@@ -24,6 +24,8 @@ mod cache_warming;
 mod chatgpt_auth;
 mod cli_compat;
 mod clipboard;
+mod cloudflare_gateway;
+mod codex_auth;
 mod config;
 mod copilot_auth;
 mod extension_ui;
@@ -469,6 +471,16 @@ impl Cli {
                     }
                     return None;
                 }
+                if provider.id() == "cloudflare-ai-gateway" {
+                    return cloudflare_gateway::Route::is_endpoint(endpoint)
+                        .then(|| std::env::var("CLOUDFLARE_API_KEY").ok())
+                        .flatten()
+                        .filter(|key| !key.trim().is_empty())
+                        .map(model_auth::Credential::Literal);
+                }
+                if provider.id() == "openai-codex" {
+                    return None;
+                }
                 if let Some(builtin) = builtin_chat::find(provider.id()) {
                     let official = if provider.id() == "cloudflare-workers-ai" {
                         model_profiles::cloudflare_workers_chat_account(endpoint).is_some()
@@ -479,9 +491,14 @@ impl Cli {
                         builtin.is_official_endpoint(endpoint)
                     };
                     return official
-                        .then(|| std::env::var(builtin.env()).ok())
+                        .then(|| {
+                            builtin.env_names().find_map(|name| {
+                                std::env::var(name)
+                                    .ok()
+                                    .filter(|key| !key.trim().is_empty())
+                            })
+                        })
                         .flatten()
-                        .filter(|key| !key.trim().is_empty())
                         .map(model_auth::Credential::Literal);
                 }
                 if endpoint != provider.default_endpoint() {
@@ -597,6 +614,12 @@ impl Cli {
 
     fn replace_model_keys(&mut self, keys: model_auth::Keys) -> Result<()> {
         self.model_keys = keys;
+        if self.model_profiles.cloudflare_gateway_route()
+            != self.model_keys.cloudflare_gateway_route().as_ref()
+        {
+            self.reload_model_profiles()?;
+            return Ok(());
+        }
         if self.model_profiles.cloudflare_saved_account()
             != self.model_keys.cloudflare_chat_account()
         {
@@ -1171,7 +1194,7 @@ enum Command {
     },
     /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "github-copilot", "kimi-coding", "xai", "anthropic"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "openai-codex", "github-copilot", "kimi-coding", "xai", "anthropic"])]
         provider: String,
         #[arg(long)]
         device_code: bool,
@@ -1190,7 +1213,7 @@ enum Command {
     },
     /// Remove a saved provider credential.
     Logout {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "github-copilot", "kimi-coding", "xai", "anthropic"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "openai-codex", "github-copilot", "kimi-coding", "xai", "anthropic"])]
         provider: String,
     },
     Run {
@@ -1949,6 +1972,28 @@ async fn execute(
                         eprintln!("Continue with ChatGPT in your browser: {url}")
                     })
                     .await
+                } else if provider == "openai-codex" {
+                    let method = if *device_code {
+                        codex_auth::Method::Device
+                    } else {
+                        codex_auth::Method::Browser
+                    };
+                    codex_auth::login(
+                        &args.settings, meta_auth::LoginControl::default(), method,
+                        |notice| match notice {
+                            codex_auth::Notice::Device {url, code} => eprintln!("Enter code {code} at {url}"),
+                            codex_auth::Notice::Browser(url, sender) => {
+                                eprintln!("Continue in your browser: {url}");
+                                eprintln!("Paste the authorization code or redirect URL if the callback does not complete:");
+                                std::thread::spawn(move || {
+                                    let mut line = String::new();
+                                    if std::io::stdin().read_line(&mut line).is_ok_and(|count| count > 0) {
+                                        let _ = sender.send(line);
+                                    }
+                                });
+                            }
+                        },
+                    ).await
                 } else if provider == "github-copilot" {
                     copilot_auth::login(
                         &args.settings,
@@ -2009,7 +2054,7 @@ async fn execute(
                 kimi_auth::logout().await?
             } else if matches!(
                 provider.as_str(),
-                "openrouter" | "anthropic" | "github-copilot"
+                "openrouter" | "anthropic" | "github-copilot" | "openai-codex"
             ) {
                 model_auth::remove(&Provider::named(provider).expect("built-in login provider"))?
             } else {
@@ -2519,13 +2564,15 @@ async fn execute(
                     observe_with_stream(event, args.trace, stream.is_some());
                 }
                 event => {
-                    let event = reasoning_event_json(event);
+                    let event = agent_stream_event_json(event);
                     if let Some(stream) = &mut stream {
                         let mut rpc_event = event.clone();
                         attach_redacted_reasoning(&mut rpc_event);
                         for output_event in stream.observe(&rpc_event, &args) { output(output_event); }
                     }
-                    if args.trace { output(trace_agent_event_json(event)); }
+                    if args.trace || (stream.is_some() && matches!(event["type"].as_str(), Some("compaction_start" | "compaction_end"))) {
+                        output(trace_agent_event_json(event));
+                    }
                 }
             }
         };
@@ -2591,10 +2638,9 @@ async fn execute(
         ).await;
         if let Some(stream) = &mut stream {
             let aborted = matches!(&answer, Err(Error::Cancelled));
-            for event in stream.settle(aborted) {
+            for event in stream.settle(aborted, answer.is_ok()) {
                 output(event);
             }
-            output(json!({"type":"agent_end","success":answer.is_ok(),"messages":stream.messages,"willRetry":false}));
             output(json!({"type":"agent_settled","aborted":stream.aborted()}));
         }
         let answer = answer?;
@@ -2656,15 +2702,24 @@ fn trace_tool_progress(
     trace: bool,
     json_stream: bool,
 ) -> Option<Value> {
-    (trace && !json_stream).then(|| serde_json::to_value(event).expect("tool progress"))
+    if json_stream {
+        return None;
+    }
+    if let Some(id) = pi_rs::tool_attempt_operation_id() {
+        return Some(json!({"type":"internal_tool_attempt","operationId":id}));
+    }
+    trace.then(|| serde_json::to_value(event).expect("tool progress"))
 }
 
 fn observe(event: Notification<'_>, trace: bool) {
     observe_with_stream(event, trace, false);
 }
 
-fn reasoning_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
+fn agent_stream_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
     match event {
+        pi_rs::AgentEvent::AutoCompaction { reason, update } => {
+            rpc_events::auto_compaction_value(reason, update)
+        }
         pi_rs::AgentEvent::TextStart { index } => json!({"type":"text_item_start","index":index}),
         pi_rs::AgentEvent::TextDelta { index, delta } => {
             json!({"type":"text_item_delta","index":index,"delta":delta})
@@ -2681,7 +2736,7 @@ fn reasoning_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
         pi_rs::AgentEvent::ReasoningEnd { index, content } => {
             json!({"type":"reasoning_item_end","index":index,"content":content})
         }
-        pi_rs::AgentEvent::Notification(_) => unreachable!("expected a reasoning item event"),
+        pi_rs::AgentEvent::Notification(_) => unreachable!("expected an enriched agent event"),
     }
 }
 
@@ -2712,7 +2767,9 @@ fn trace_agent_event_json(mut event: serde_json::Value) -> serde_json::Value {
 
 fn observe_with_stream(event: Notification<'_>, trace: bool, json_stream: bool) {
     match event {
-        Notification::Retry(event) => output(serde_json::to_value(event).expect("retry event")),
+        Notification::Retry(event) if !json_stream => {
+            output(serde_json::to_value(event).expect("retry event"))
+        }
         Notification::SummaryRequest if trace => output(json!({"type":"summary_request_start"})),
         Notification::QueueUpdated {
             steering,

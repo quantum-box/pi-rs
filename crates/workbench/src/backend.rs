@@ -131,6 +131,11 @@ enum Request {
         name: String,
         id: Option<serde_json::Value>,
     },
+    SetSessionLabel {
+        target: u64,
+        label: Option<String>,
+        id: Option<serde_json::Value>,
+    },
     SetQueueMode {
         kind: InputKind,
         mode: QueueMode,
@@ -1273,7 +1278,7 @@ async fn run_worker(
                         &mut |event| match event {
                             pi_rs::AgentEvent::Notification(event) => observer(event),
                             event if args.trace => {
-                                let mut event = super::reasoning_event_json(event);
+                                let mut event = super::agent_stream_event_json(event);
                                 if args.mode == Some(super::OutputMode::Rpc) {
                                     super::attach_redacted_reasoning(&mut event);
                                 }
@@ -1409,7 +1414,7 @@ async fn run_worker(
                         &mut |event| match event {
                             pi_rs::AgentEvent::Notification(event) => observer(event),
                             event if args.trace => {
-                                let mut event = super::reasoning_event_json(event);
+                                let mut event = super::agent_stream_event_json(event);
                                 if args.mode == Some(super::OutputMode::Rpc) {
                                     super::attach_redacted_reasoning(&mut event);
                                 }
@@ -1451,7 +1456,7 @@ async fn run_worker(
                             &mut |event| match event {
                                 pi_rs::AgentEvent::Notification(event) => observer(event),
                                 event if args.trace => {
-                                    let mut event = super::reasoning_event_json(event);
+                                    let mut event = super::agent_stream_event_json(event);
                                     if args.mode == Some(super::OutputMode::Rpc) {
                                         super::attach_redacted_reasoning(&mut event);
                                     }
@@ -2128,6 +2133,7 @@ fn read_requests(
                 | Request::QueueInput { .. }
                 | Request::ClearQueue { .. }
                 | Request::SetSessionName { .. }
+                | Request::SetSessionLabel { .. }
                 | Request::SetQueueMode { .. }) => {
                     if prepare_in_background {
                         if let Err(error) = queue_requests.try_send(request) {
