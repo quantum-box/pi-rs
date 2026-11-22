@@ -4598,7 +4598,37 @@ pub(crate) fn system_transcript(
     let compacted = path
         .iter()
         .rposition(|record| matches!(record.event, Event::Compacted { .. }));
-    let retained = &path[compacted.map_or(0, |index| index + 1)..];
+    let start = compacted.map_or(0, |index| {
+        // Imported compactions already carry the resolved prompt snapshot.
+        // Native compaction can retain original messages without such a snapshot.
+        if path[index].run_id.is_some()
+            && let Event::Compacted {
+                system_prompt: None,
+                retain_from: Some(first),
+                ..
+            } = path[index].event
+        {
+            let retained = path[..index].partition_point(|record| record.id < first);
+            if retained < index {
+                // An earlier imported snapshot is still the prompt authority.
+                let snapshot_floor = path[..index]
+                    .iter()
+                    .rposition(|record| {
+                        matches!(
+                            record.event,
+                            Event::Compacted {
+                                system_prompt: Some(_),
+                                ..
+                            }
+                        )
+                    })
+                    .map_or(0, |snapshot| snapshot + 1);
+                return retained.max(snapshot_floor);
+            }
+        }
+        index + 1
+    });
+    let retained = &path[start..];
     let mut checkpoints = retained
         .iter()
         .filter_map(|record| match &record.event {
@@ -4614,8 +4644,8 @@ pub(crate) fn system_transcript(
         .enumerate()
         .filter(|(_, (_, message))| !matches!(message, Message::Tool { .. }))
         .peekable();
-    let leading = if let Some(index) = compacted {
-        system_context(&path[..=index], fallback, Vec::new()).0
+    let leading = if compacted.is_some() {
+        system_context(&path[..start], fallback, Vec::new()).0
     } else if conversation_start == 1
         && boundaries
             .peek()
@@ -6354,6 +6384,83 @@ mod system_checkpoint_tests {
         assert_eq!(
             system_context(&session.branch(), "fallback", vec![read, old.clone()]),
             ("old base\n\nold section".into(), vec![old])
+        );
+    }
+
+    #[test]
+    fn native_compaction_replays_updates_between_retained_messages() {
+        let checkpoint = |content: &str| Event::SystemCheckpoint {
+            content: content.into(),
+            sections: vec![],
+            tools_added: vec![],
+            tools_removed: vec![],
+        };
+        let user = |text: &str| Event::User {
+            content: text.into(),
+            input_id: None,
+        };
+        let records: Vec<_> = [
+            checkpoint("base"),
+            user("first"),
+            checkpoint("update"),
+            user("second"),
+            Event::Compacted {
+                summary: "older conversation".into(),
+                retain_from: Some(2),
+                system_prompt: None,
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| Record {
+            version: FORMAT_VERSION,
+            id: index as u64 + 1,
+            parent: (index > 0).then_some(index as u64),
+            timestamp: None,
+            run_id: Some(Uuid::nil()),
+            event,
+        })
+        .collect();
+        let path: Vec<_> = records.iter().collect();
+        let conversation = conversation_entries(&path, vec![]);
+        let mut messages = vec![
+            Message::System {
+                content: "base\n\nupdate".into(),
+            },
+            Message::User {
+                content: "older conversation".into(),
+            },
+        ];
+        messages.extend(conversation.iter().map(|(_, message)| message.clone()));
+        assert!(
+            system_transcript(&path, &conversation, 2, "fallback")
+                .unwrap()
+                .apply(&mut messages)
+                .is_some()
+        );
+        assert_eq!(
+            messages,
+            [
+                Message::System {
+                    content: "base".into()
+                },
+                Message::User {
+                    content: "older conversation".into()
+                },
+                Message::User {
+                    content: "first".into()
+                },
+                Message::System {
+                    content: "update".into()
+                },
+                Message::User {
+                    content: "second".into()
+                },
+            ]
         );
     }
 

@@ -2911,9 +2911,10 @@ On ordinary turns, models that support mid-conversation instructions receive
 the original system prompt followed by checkpoint updates at their conversation
 positions, with named sections rendered as replacements or removals. Anthropic
 Messages queues those updates until the next assistant message or the end of
-the request, as Pi does. Compaction uses the saved prompt as the leading
-checkpoint. A checkpoint inside a tool
-batch follows its results to preserve provider tool-call pairing. Models
+the request, as Pi does. An imported compaction snapshot supplies the leading
+prompt. Native compaction preserves checkpoint positions among retained
+messages when it has no prompt snapshot. A checkpoint inside a tool batch
+follows its results to preserve provider tool-call pairing. Models
 without that capability receive the fully resolved leading prompt. Extension
 message hooks see the ordered checkpoints. Edits to other messages preserve
 checkpoint placement. If a hook edits system messages on a route that needs
