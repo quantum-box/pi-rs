@@ -8723,11 +8723,12 @@ fn auth_check_with_model_uses_catalog_resolution_without_crossing_endpoints() {
         "relay-one":{"api":"openai-completions","baseUrl":"https://one.example/v1","apiKey":"fixture-one",
             "models":[{"id":"widget-a","name":"Widget Alpha"},{"id":"widget-b","baseUrl":"https://other.example/v1"}]},
         "relay-two":{"api":"openai-completions","baseUrl":"https://two.example/v1",
-            "models":[{"id":"widget-z","name":"Widget Pro"},{"id":"widget-a","name":"Widget Alpha"}]}
+            "models":[{"id":"widget-z","name":"Widget Pro"},{"id":"widget-a","name":"Widget Alpha"},{"id":"relay-one/local-only"}]}
     }});
     std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
     for (model, code, provider, status, reason) in [
         ("relay-one/Widget Alpha", 0, "relay-one", "ready", None),
+        ("relay-one/local-only", 0, "relay-one", "ready", None),
         (
             "Widget Alpha",
             2,

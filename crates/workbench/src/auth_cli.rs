@@ -107,24 +107,23 @@ fn candidates(args: &Cli) -> Result<Vec<Candidate>> {
 }
 
 fn check_candidate(args: &Cli) -> Result<Option<Candidate>> {
-    if !args.model_explicit || args.provider_argument.is_some() {
-        return candidates(args).map(|mut candidates| candidates.pop());
-    }
     let model = args.model.trim();
-    // Pi builds the auth-check catalog without refreshing availability, so
-    // credential presence does not disambiguate the queried model.
-    if let Some(choice) = model_selection::cli_catalog_model(args, model, true)? {
-        return Ok(Some(Candidate {
-            provider: choice.provider,
-            model: Some(choice.model),
-        }));
-    }
-    // An explicit native provider/model still identifies a route when its
-    // server uses model IDs that are absent from the local catalog.
-    if model_selection::qualified_model(model, &args.model_profiles).is_some() {
+    if !args.model_explicit
+        || args.provider_argument.is_some()
+        || model_selection::qualified_model(model, &args.model_profiles).is_some()
+    {
+        // Keep the existing provider-constrained lookup, including native
+        // qualified IDs for models not present in the local catalog.
         return candidates(args).map(|mut candidates| candidates.pop());
     }
-    Err(Error::Config(format!("Model \"{model}\" not found")))
+    // Pi's auth-check catalog does not refresh availability, so credential
+    // presence does not disambiguate the model.
+    let choice = model_selection::cli_catalog_model(args, model, true)?
+        .ok_or_else(|| Error::Config(format!("Model \"{model}\" not found")))?;
+    Ok(Some(Candidate {
+        provider: choice.provider,
+        model: Some(choice.model),
+    }))
 }
 
 async fn resolve(
