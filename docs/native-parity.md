@@ -6747,22 +6747,23 @@ interpreted as patterns; this preserves native glob precedence for ambiguous pat
 ### Google Generative AI constrained tools
 
 The native Google adapter resolves JSON Schema tool constraints before dispatch.
-Gemini 3 and later default to strict support; other model IDs default to no
-strict support. An explicit `compat.supportsStrictMode` provider or model
-setting overrides that inference in pi-rs (upstream Pi derives this capability
-from the model ID). A required constraint fails before dispatch when strict
-sampling or schema conversion is unavailable; a preferred constraint falls
-back to ordinary tool calling. When any tool is strict, the bound request uses
+Gemini 3 and later default to strict support, including IDs with a host prefix
+such as `gateway-gemini-4-argon`. Other model IDs default to ordinary tool
+calling. An explicit `compat.supportsStrictMode` provider or model setting
+overrides that inference for both the Google Generative AI and Vertex APIs,
+matching upstream Pi after #12371. A required constraint fails before dispatch
+when strict sampling or schema conversion is unavailable. A preferred constraint
+falls back to ordinary tool calling. When any tool is strict, the bound request uses
 `VALIDATED` mode and its transformed schemas are also used for budget
 reservation and recorded tool decisions. As in upstream Pi, string and numeric
 `const` schema values are rewritten to single-element `enum` values in both
 strict and ordinary Google tool declarations. pi-rs retains its existing
 explicit `AUTO` mode for ordinary calls.
 
-This comparison uses upstream Pi `463e17f8dc08a76a1e24e55db37f88de81b4b118`
-(`FETCH_HEAD`, 2026-11-15); the Google strict-mode and schema conversion logic
-is also present in its `v1.5.2` tag. pi-rs additionally rejects strict schemas
-that cannot be safely normalized for local tool execution; `prefer` falls back
+The schema conversion was compared with upstream Pi
+`463e17f8dc08a76a1e24e55db37f88de81b4b118` and is also present in `v1.5.2`.
+pi-rs additionally rejects strict schemas that cannot be safely normalized for
+local tool execution. `prefer` falls back
 and `require` fails in that case.
 Declaration-only Google streams resolve constraints but reject an effective
 strict decision, because those APIs cannot retain it for tool normalization;
