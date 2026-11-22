@@ -109,7 +109,7 @@ struct SourceBlock {
     pending: bool,
 }
 
-fn include_line_indent(source: &str, start: usize) -> usize {
+pub(super) fn include_line_indent(source: &str, start: usize) -> usize {
     let line = source[..start].rfind('\n').map_or(0, |index| index + 1);
     if source[line..start].bytes().all(|byte| byte == b' ') {
         line
@@ -137,7 +137,10 @@ fn parse_blocks(
                     // A space token here would add a spurious blank line.
                     let start = if matches!(
                         tag,
-                        Tag::Heading { .. } | Tag::BlockQuote(_) | Tag::CodeBlock(_)
+                        Tag::Paragraph
+                            | Tag::Heading { .. }
+                            | Tag::BlockQuote(_)
+                            | Tag::CodeBlock(_)
                     ) {
                         include_line_indent(source, local.start)
                     } else {
