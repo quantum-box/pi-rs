@@ -23,6 +23,12 @@ const LEGACY_QWEN_TOKEN_PLAN_CN: &str =
 
 pub(super) const PROVIDERS: &[Builtin] = &[
     Builtin {
+        id: "google-vertex",
+        endpoint: "https://aiplatform.googleapis.com/v1",
+        env: "GOOGLE_CLOUD_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "openai",
         endpoint: "https://api.openai.com/v1/responses",
         env: "OPENAI_API_KEY",
@@ -295,6 +301,7 @@ impl Builtin {
             id: Arc::from(self.id),
             adapter: match self.id {
                 "openai" | "xai" | "meta" => Adapter::OpenAiResponses,
+                "google-vertex" => Adapter::GoogleVertex,
                 "mistral" => Adapter::MistralConversations,
                 "azure" => Adapter::AzureResponses,
                 "openai-codex" => Adapter::CodexResponses,
@@ -316,6 +323,7 @@ impl Builtin {
                 "cloudflare-ai-gateway",
             ) => Some(""),
             (Adapter::CodexResponses, "openai-codex") => Some(self.endpoint),
+            (Adapter::GoogleVertex, "google-vertex") => Some(self.endpoint),
             (Adapter::OpenAiResponses, "openai" | "xai" | "meta") => Some(self.endpoint),
             (Adapter::MistralConversations, "mistral") => Some(self.endpoint),
             (Adapter::ChatCompletions, id)
@@ -324,6 +332,7 @@ impl Builtin {
                     "openai"
                         | "xai"
                         | "meta"
+                        | "google-vertex"
                         | "openai-codex"
                         | "minimax"
                         | "minimax-cn"

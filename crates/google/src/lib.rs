@@ -43,6 +43,8 @@ pub struct Google {
     client: Client,
     http_proxies: Vec<reqwest::Proxy>,
     endpoint: Url,
+    vertex: bool,
+    vertex_bearer: Option<HeaderValue>,
     api_key: HeaderValue,
     provider: Arc<str>,
     replay_scope: Arc<str>,
@@ -94,6 +96,8 @@ impl Google {
             client,
             http_proxies: Vec::new(),
             endpoint,
+            vertex: false,
+            vertex_bearer: None,
             api_key,
             provider: Arc::from("google"),
             replay_scope: Arc::from("google"),
@@ -114,7 +118,45 @@ impl Google {
         })
     }
 
-    /// Set the per-read HTTP idle timeout; `None` disables it.
+    /// Use Vertex AI's publisher model collection with a Cloud API key or access token.
+    pub fn with_vertex(mut self, bearer: bool) -> Result<Self> {
+        self.vertex = true;
+        self.probe_context = false;
+        if self.provider.as_ref() == "google" {
+            self.provider = Arc::from("google-vertex");
+        }
+        if self.replay_scope.as_ref() == "google" {
+            self.replay_scope =
+                pi_rs_core::endpoint_replay_scope("google-vertex", self.endpoint.as_str()).into();
+        }
+        if bearer {
+            let mut auth = HeaderValue::from_str(&format!(
+                "Bearer {}",
+                self.api_key.to_str().unwrap_or_default(),
+            ))
+            .map_err(|_| Error::Config("invalid Google Vertex access token".into()))?;
+            auth.set_sensitive(true);
+            self.vertex_bearer = Some(auth);
+        }
+        Ok(self)
+    }
+
+    fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let request = match &self.vertex_bearer {
+            Some(bearer) => request.header(reqwest::header::AUTHORIZATION, bearer.clone()),
+            None => request.header("x-goog-api-key", self.api_key.clone()),
+        };
+        request.headers(self.headers.clone())
+    }
+
+    fn api(&self) -> ModelApi {
+        if self.vertex {
+            ModelApi::GoogleVertex
+        } else {
+            ModelApi::GoogleGenerativeAi
+        }
+    }
+
     pub fn with_http_idle_timeout(self, timeout: Option<Duration>) -> Result<Self> {
         let proxies = self.http_proxies.clone();
         self.with_http_options(timeout, &proxies)
@@ -171,7 +213,7 @@ impl Google {
     }
 
     pub fn with_context_probe(mut self, enabled: bool) -> Self {
-        self.probe_context = enabled;
+        self.probe_context = enabled && !self.vertex;
         self
     }
     pub fn with_thinking(mut self, thinking: Option<&str>) -> Self {
@@ -372,7 +414,11 @@ impl Google {
     fn url(&self, resource: Option<&str>) -> Url {
         let mut url = self.endpoint.clone();
         let mut segments = url.path_segments_mut().expect("HTTP base URL");
-        segments.pop_if_empty().push("models");
+        segments.pop_if_empty();
+        if self.vertex {
+            segments.extend(["publishers", "google"]);
+        }
+        segments.push("models");
         if let Some(resource) = resource {
             segments.push(resource);
         }
@@ -382,10 +428,7 @@ impl Google {
 
     async fn read_model(&self, url: Url) -> Result<Value> {
         let response = self
-            .client
-            .get(url)
-            .header("x-goog-api-key", self.api_key.clone())
-            .headers(self.headers.clone())
+            .authenticate(self.client.get(url))
             .timeout(Duration::from_secs(10))
             .send()
             .await
@@ -867,11 +910,28 @@ impl pi_rs_core::PreparedToolDispatch for PreparedGoogleDispatch {
     }
 }
 
+#[cfg(test)]
 fn wire_request(
     request: &ModelRequest,
     thinking: Option<&str>,
     replay_scope: &str,
     edited_scope: &str,
+) -> Result<Value> {
+    wire_request_for_api(
+        request,
+        thinking,
+        replay_scope,
+        edited_scope,
+        ModelApi::GoogleGenerativeAi,
+    )
+}
+
+fn wire_request_for_api(
+    request: &ModelRequest,
+    thinking: Option<&str>,
+    replay_scope: &str,
+    edited_scope: &str,
+    api: ModelApi,
 ) -> Result<Value> {
     let identity = identity(replay_scope, model_id(&request.model));
     let gemini_v3 = gemini_major(&identity.model).is_some_and(|version| version >= 3);
@@ -925,7 +985,7 @@ fn wire_request(
                         } else {
                             identity.clone()
                         }
-                        && replay.supports_api(ModelApi::GoogleGenerativeAi)
+                        && replay.supports_api(api)
                 }) {
                     let mut first_call = true;
                     replay
@@ -1137,7 +1197,13 @@ impl Model for Google {
         }
         pi_rs_core::protected_model_fingerprint(&(
             headers,
-            "google-v5",
+            if self.vertex_bearer.is_some() {
+                "google-vertex-adc-v3"
+            } else if self.vertex {
+                "google-vertex-v3"
+            } else {
+                "google-v5"
+            },
             self.endpoint.as_str(),
             self.provider.as_ref(),
             self.replay_scope.as_ref(),
@@ -1200,7 +1266,9 @@ impl Model for Google {
         let thinking = self.thinking.as_deref();
         let edited_scope =
             pi_rs_core::endpoint_replay_scope(&self.replay_scope, self.endpoint.as_str());
-        let mut body = wire_request(&request, thinking, &self.replay_scope, &edited_scope)?;
+        let api = self.api();
+        let mut body =
+            wire_request_for_api(&request, thinking, &self.replay_scope, &edited_scope, api)?;
         if let Some((schemas, validated)) = &self.bound_tools
             && let Some(tools) = body
                 .pointer_mut("/tools/0/functionDeclarations")
@@ -1248,10 +1316,7 @@ impl Model for Google {
             Progress::WaitingForModel,
         );
         let response = self
-            .client
-            .post(url)
-            .header("x-goog-api-key", self.api_key.clone())
-            .headers(self.headers.clone())
+            .authenticate(self.client.post(url))
             .json(&body)
             .send()
             .await
@@ -1281,7 +1346,7 @@ impl Model for Google {
         Ok(Box::pin(async_stream::try_stream! {
             let mut stream = response.bytes_stream().eventsource();
             let mut metadata = ModelMetadata {
-                provider_api: Some(ModelApi::GoogleGenerativeAi),
+                provider_api: Some(api),
                 replay_identity: Some(identity(&edited_scope, &model)),
                 ..ModelMetadata::default()
             };
@@ -1507,6 +1572,91 @@ mod tests {
             fallback.reservation_request().tools[0].parameters["properties"]["x"]["enum"],
             json!(["a"])
         );
+    }
+
+    #[tokio::test]
+    async fn vertex_uses_publisher_resources_and_separates_key_from_bearer_auth() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        for bearer in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let base = if bearer {
+                "/v1/projects/fixture/locations/us-central1"
+            } else {
+                "/v1"
+            };
+            let worker = std::thread::spawn(move || {
+                let (socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).unwrap();
+                assert_eq!(
+                    line.trim(),
+                    format!(
+                        "POST {base}/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse HTTP/1.1"
+                    )
+                );
+                let mut headers = String::new();
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    socket.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    let line = line.to_ascii_lowercase();
+                    if let Some(value) = line.strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    headers.push_str(&line);
+                }
+                assert_eq!(
+                    headers.contains("authorization: bearer vertex-fixture"),
+                    bearer
+                );
+                assert_eq!(headers.contains("x-goog-api-key: vertex-fixture"), !bearer);
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["contents"][0]["parts"][0]["text"], "hello");
+                let body = format!(
+                    "data: {}\n\n",
+                    json!({
+                        "responseId":"vertex-fixture",
+                        "candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[{"text":"result"}]}}]
+                    }),
+                );
+                write!(
+                    socket.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                ).unwrap();
+            });
+            let client = Google::new(&format!("http://{address}{base}"), "vertex-fixture")
+                .unwrap()
+                .with_vertex(bearer)
+                .unwrap();
+            let request = ModelRequest {
+                model: "gemini-2.5-flash".into(),
+                messages: vec![Message::User {
+                    content: "hello".into(),
+                }],
+                tools: vec![],
+                max_output_tokens: 64,
+            };
+            let mut stream = client.stream(request).await.unwrap();
+            let mut saw_vertex = false;
+            while let Some(event) = stream.next().await {
+                if let ModelEvent::Metadata(metadata) = event.unwrap() {
+                    saw_vertex |= metadata.provider_api == Some(ModelApi::GoogleVertex);
+                }
+            }
+            assert!(saw_vertex);
+            worker.join().unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2517,6 +2667,58 @@ mod tests {
                 }
             );
             assert!(parts[1].get("thoughtSignature").is_none());
+        }
+    }
+
+    #[test]
+    fn default_vertex_sdk_replay_is_bound_to_its_provider_and_endpoint() {
+        let endpoint = "https://vertex.example/v1/projects/one/locations/global";
+        let gemini = Google::new(endpoint, "fixture").unwrap();
+        let vertex = gemini.clone().with_vertex(false).unwrap();
+        let other_vertex = Google::new(
+            "https://vertex.example/v1/projects/two/locations/global",
+            "fixture",
+        )
+        .unwrap()
+        .with_vertex(false)
+        .unwrap();
+        let custom = gemini
+            .clone()
+            .with_provider("configured", "configured-route")
+            .with_vertex(false)
+            .unwrap();
+        assert_eq!(custom.provider.as_ref(), "configured");
+        assert_eq!(custom.replay_scope.as_ref(), "configured-route");
+        assert_eq!(vertex.provider.as_ref(), "google-vertex");
+        for (origin, target, matching) in [
+            (&gemini, &gemini, true),
+            (&vertex, &vertex, true),
+            (&gemini, &vertex, false),
+            (&vertex, &gemini, false),
+            (&vertex, &other_vertex, false),
+        ] {
+            let request = ModelRequest {
+                model: "gemini-3-pro".into(),
+                messages: vec![Message::Assistant {
+                    content: String::new(),
+                    calls: vec![ToolCall {
+                        id: "call".into(),
+                        name: "test".into(),
+                        arguments: "{}".into(),
+                    }],
+                    replay: Some(Box::new(ProviderReplay {
+                        identity: identity(&origin.replay_scope, "gemini-3-pro"),
+                        blocks: vec![
+                            json!({"functionCall":{"name":"test","args":{}},"thoughtSignature":"fixture-signature"}),
+                        ],
+                    })),
+                }],
+                tools: vec![],
+                max_output_tokens: 32,
+            };
+            let body = wire_request_for_api(&request, None, &target.replay_scope, "", target.api())
+                .unwrap();
+            assert_eq!(body.to_string().contains("fixture-signature"), matching);
         }
     }
 
