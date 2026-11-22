@@ -135,7 +135,11 @@ containing glob characters takes precedence over glob expansion across providers
 with an optional thinking suffix applied to the selected models.
 With no explicit provider or endpoint, a known `--model` ID can select the only
 authenticated matching provider across catalogs, including a gateway model
-whose literal ID starts with another provider's name. Bedrock environment
+whose literal ID starts with another provider's name. Unqualified partial IDs
+and display names also search the known catalogs. When the matches span
+providers, configured credentials narrow the matches before Pi's alias and
+model ID ordering is applied. A best model ID shared across eligible
+providers requires an explicit provider. Bedrock environment
 credentials count during provider selection. When no matching provider has
 visible credentials, a configured default Bedrock provider can use the SDK
 credential chain. An inline key does not

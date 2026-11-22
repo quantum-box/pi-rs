@@ -397,12 +397,45 @@ fn resolve_cli_catalog_model(
     let profiles = &args.model_profiles;
     let value = value.trim();
     let suffix = thinking_suffix(value).map(|(id, level)| (id, Some(level)));
+    let catalogs: Vec<_> = profiles
+        .providers()
+        .map(|provider| {
+            let models = profiles.model_ids(&provider);
+            (provider, models)
+        })
+        .collect();
     for (reference, thinking) in std::iter::once((value, None)).chain(suffix) {
         let named = qualified_model(reference, profiles);
+        let candidate = |provider: &Provider, id: String, named: bool| {
+            let endpoint = profiles
+                .model_endpoint(provider, &id)
+                .unwrap_or_else(|| profiles.endpoint(provider));
+            let credential = args.configured_model_credential(provider, endpoint);
+            let bedrock_chain = *provider == Provider::Bedrock
+                && endpoint.is_empty()
+                && profiles.model_adapter(provider, &id) == super::providers::Adapter::Bedrock
+                && credential.is_none();
+            let authenticated = !inline
+                && match credential {
+                    Some(credential) => {
+                        !matches!(credential, super::model_auth::Credential::Invalid)
+                    }
+                    None => *provider == Provider::Ollama || (bedrock_chain && ambient_bedrock),
+                };
+            Match {
+                choice: ScopedChoice {
+                    provider: provider.clone(),
+                    model: id,
+                    thinking: thinking.map(str::to_owned),
+                },
+                named,
+                authenticated,
+                bedrock_chain,
+            }
+        };
         let mut matches = Vec::new();
-        for provider in profiles.providers() {
-            let models = profiles.model_ids(&provider);
-            let explicit = named.as_ref().filter(|(named, _)| &provider == named);
+        for (provider, models) in &catalogs {
+            let explicit = named.as_ref().filter(|(named, _)| provider == named);
             let known = models
                 .iter()
                 .find(|model| explicit.is_some_and(|(_, id)| model.eq_ignore_ascii_case(id)))
@@ -415,43 +448,62 @@ fn resolve_cli_catalog_model(
             // qualified match. A named partial match can compete with raw IDs.
             let id = known.cloned().or_else(|| {
                 let (_, id) = explicit?;
-                let names = aliases(profiles, &provider, &models);
-                let candidates = search_ids(&models, &names);
+                let names = aliases(profiles, provider, models);
+                let candidates = search_ids(models, &names);
                 exact(id, &candidates, provider.id())
                     .or_else(|| partial(id, &candidates, provider.id()))
-                    .map(|model| canonical(model.clone(), &models, &names))
+                    .map(|model| canonical(model.clone(), models, &names))
             });
-            let Some(id) = id else {
-                continue;
-            };
-            let endpoint = profiles
-                .model_endpoint(&provider, &id)
-                .unwrap_or_else(|| profiles.endpoint(&provider));
-            let credential = args.configured_model_credential(&provider, endpoint);
-            let bedrock_chain = provider == Provider::Bedrock
-                && endpoint.is_empty()
-                && profiles.model_adapter(&provider, &id) == super::providers::Adapter::Bedrock
-                && credential.is_none();
-            let authenticated = !inline
-                && match credential {
-                    Some(credential) => {
-                        !matches!(credential, super::model_auth::Credential::Invalid)
-                    }
-                    None => provider == Provider::Ollama || (bedrock_chain && ambient_bedrock),
-                };
-            matches.push(Match {
-                choice: ScopedChoice {
-                    provider,
-                    model: id,
-                    thinking: thinking.map(str::to_owned),
-                },
-                named: explicit.is_some(),
-                authenticated,
-                bedrock_chain,
-            });
+            if let Some(id) = id {
+                matches.push(candidate(provider, id, explicit.is_some()));
+            }
         }
         if matches.is_empty() {
-            continue;
+            let query = reference.to_lowercase();
+            if query.is_empty() {
+                continue;
+            }
+            let mut fuzzy = Vec::new();
+            for (provider, models) in &catalogs {
+                fuzzy.extend(models.iter().filter_map(|id| {
+                    let matched = id.to_lowercase().contains(&query)
+                        || profiles
+                            .model(provider, id)
+                            .and_then(|model| model.name)
+                            .is_some_and(|name| name.to_lowercase().contains(&query));
+                    matched.then(|| candidate(provider, id.clone(), false))
+                }));
+            }
+            let Some(first) = fuzzy.first() else {
+                continue;
+            };
+            let multiple_providers = fuzzy
+                .iter()
+                .any(|candidate| candidate.choice.provider != first.choice.provider);
+            if multiple_providers && fuzzy.iter().any(|candidate| candidate.authenticated) {
+                fuzzy.retain(|candidate| candidate.authenticated);
+            }
+            let locale = super::locale::select(|name| std::env::var(name).ok());
+            let collator = super::locale::collator(&locale).map_err(|error| {
+                Error::Config(format!("Cannot initialize model collation: {error}"))
+            })?;
+            let best = fuzzy
+                .iter()
+                .max_by(|left, right| {
+                    let left = &left.choice.model;
+                    let right = &right.choice.model;
+                    is_alias(left)
+                        .cmp(&is_alias(right))
+                        .then_with(|| collator.compare(left, right))
+                })
+                .expect("nonempty fuzzy candidates")
+                .choice
+                .model
+                .clone();
+            matches = fuzzy
+                .into_iter()
+                .filter(|candidate| candidate.choice.model == best)
+                .collect();
         }
         let usable_count = matches.iter().filter(|model| model.authenticated).count();
         if matches.len() == 1 {

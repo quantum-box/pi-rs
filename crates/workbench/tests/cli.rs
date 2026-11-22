@@ -7785,6 +7785,79 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
 }
 
 #[test]
+fn bare_model_patterns_search_provider_catalogs_before_local_model_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    let models = json!({"providers":{
+        "relay-one":{"api":"openai-completions","baseUrl":"https://one.example/v1","apiKey":"fixture",
+            "models":[{"id":"widget-a","name":"Widget Alpha"},{"id":"widget-z-20260101","name":"Widget Snapshot"}]},
+        "relay-two":{"api":"openai-completions","baseUrl":"https://two.example/v1",
+            "models":[{"id":"widget-z","name":"Widget Pro"},{"id":"widget-a","name":"Widget Alpha"}]}
+    }});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    let run = |query: &str, inline: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_pi"));
+        cmd.current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--mode",
+                "rpc",
+                "--no-session",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                query,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if inline {
+            cmd.args(["--api-key", "inline-fixture"]);
+        }
+        let mut process = cmd.spawn().unwrap();
+        if let Err(error) = process
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n")
+        {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+        process.wait_with_output().unwrap()
+    };
+    for (query, inline, provider, model) in [
+        ("Widget", false, "relay-one", "widget-a"),
+        ("Widget:high", false, "relay-one", "widget-a"),
+        ("Widget", true, "relay-two", "widget-z"),
+        ("widget-z-20260101", false, "relay-one", "widget-z-20260101"),
+        ("Widget Pro", false, "relay-two", "widget-z"),
+    ] {
+        let result = run(query, inline);
+        assert!(
+            result.status.success(),
+            "{query}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output = String::from_utf8(result.stdout).unwrap();
+        let response: Value = output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|reply| reply["id"] == "state")
+            .unwrap();
+        assert_eq!(response["data"]["model"]["provider"], provider, "{query}");
+        assert_eq!(response["data"]["model"]["id"], model, "{query}");
+    }
+    let ambiguous = run("Widget Alpha", true);
+    assert!(!ambiguous.status.success());
+    let stderr = String::from_utf8(ambiguous.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "relay-one/widget-a, relay-two/widget-a. --api-key does not choose a provider."
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn default_model_and_provider_are_read_as_separate_fields() {
     for (settings, provider, model) in [
         (
