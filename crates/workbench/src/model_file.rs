@@ -131,8 +131,8 @@ impl ModelFileReadGrants {
 fn api_name(api: NativeModelApi) -> &'static str {
     match api {
         NativeModelApi::OpenAiChat => "openai-completions",
-        NativeModelApi::OpenAiResponses => "openai-responses",
-        NativeModelApi::ChatGptResponses => "openai-codex-responses",
+        NativeModelApi::OpenAiResponses | NativeModelApi::ChatGptResponses => "openai-responses",
+        NativeModelApi::OpenAiCodexResponses => "openai-codex-responses",
         NativeModelApi::AnthropicMessages => "anthropic-messages",
         NativeModelApi::GoogleGemini => "google-generative-ai",
     }
