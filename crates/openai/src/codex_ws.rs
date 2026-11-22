@@ -1057,7 +1057,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (retry, next_attempt) = tokio::sync::oneshot::channel();
-        let session = uuid::Uuid::new_v4().to_string();
+        let session = format!("fixture-affinity-{}", uuid::Uuid::new_v4());
         let expected_session =
             (has_session && cache != pi_rs_core::CacheRetention::None).then(|| session.clone());
         let server = tokio::spawn(async move {
