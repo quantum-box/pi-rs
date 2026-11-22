@@ -318,7 +318,7 @@ where
             return Err(error("cannot refresh credentials in a read-only store"));
         }
     };
-    let stored = super::config::read_object_unlocked(&path)?;
+    let stored = super::config::read_auth_object_locked(&guard)?;
     let value = parse(&stored)?.ok_or_else(|| error("credentials not configured"))?;
     let previous = stored["anthropic"].clone();
     guard.check()?;
