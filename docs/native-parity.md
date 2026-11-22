@@ -2438,6 +2438,12 @@ word highlighting in fullscreen and regular mode.
 
 ### Terminal input and redraw checkpoint
 
+Editor history retains the 100 most recent distinct prompts. Repeating a prompt
+moves it to the most recent position. Reopening a session or navigating the
+session tree re-adds the visible branch's prompts in order. Earlier entries
+remain available until the history reaches its limit, matching
+[Pi’s editor history behavior](https://github.com/earendil-works/pi/commit/06a20368a74233e21725511a3268742e3dea65c3).
+
 Unix terminal input uses the level-triggered reader to retain input when resize
 notifications arrive alongside key events. A committed PTY regression exercises
 16 resize/input sequences and verifies terminal restoration. Terminal mode
