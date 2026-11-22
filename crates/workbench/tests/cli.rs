@@ -8716,6 +8716,60 @@ fn kimi_auth_commands_wait_for_refresh_after_sigint() {
     }
 }
 
+#[test]
+fn auth_check_with_model_uses_catalog_resolution_without_crossing_endpoints() {
+    let root = tempfile::tempdir().unwrap();
+    let models = json!({"providers":{
+        "relay-one":{"api":"openai-completions","baseUrl":"https://one.example/v1","apiKey":"fixture-one",
+            "models":[{"id":"widget-a","name":"Widget Alpha"},{"id":"widget-b","baseUrl":"https://other.example/v1"}]},
+        "relay-two":{"api":"openai-completions","baseUrl":"https://two.example/v1",
+            "models":[{"id":"widget-z","name":"Widget Pro"},{"id":"widget-a","name":"Widget Alpha"}]}
+    }});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    for (model, code, provider, status, reason) in [
+        ("Widget Alpha", 0, "relay-one", "ready", None),
+        ("Widget:high", 0, "relay-one", "ready", None),
+        (
+            "Widget Pro",
+            1,
+            "relay-two",
+            "not_ready",
+            Some("credentials_not_configured"),
+        ),
+        (
+            "relay-one/widget-b",
+            1,
+            "relay-one",
+            "not_ready",
+            Some("credentials_not_configured"),
+        ),
+        (
+            "unknown-local-catalog-id",
+            2,
+            "unknown-local-catalog-id",
+            "invalid",
+            Some("invalid_state"),
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["auth", "check", "--model", model, "--json", "--no-refresh"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{model}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["provider"], provider);
+        assert_eq!(response["status"], status);
+        assert_eq!(response["reason"].as_str(), reason);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn auth_check_reads_readonly_store_and_environment_keys() {

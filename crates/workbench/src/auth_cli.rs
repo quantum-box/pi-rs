@@ -106,6 +106,25 @@ fn candidates(args: &Cli) -> Result<Vec<Candidate>> {
     Ok(matches)
 }
 
+fn check_candidate(args: &Cli) -> Result<Option<Candidate>> {
+    if !args.model_explicit || args.provider_argument.is_some() {
+        return candidates(args).map(|mut candidates| candidates.pop());
+    }
+    let model = args.model.trim();
+    if let Some(choice) = model_selection::cli_catalog_model(args, model, false)? {
+        return Ok(Some(Candidate {
+            provider: choice.provider,
+            model: Some(choice.model),
+        }));
+    }
+    // An explicit native provider/model still identifies a route when its
+    // server uses model IDs that are absent from the local catalog.
+    if model_selection::qualified_model(model, &args.model_profiles).is_some() {
+        return candidates(args).map(|mut candidates| candidates.pop());
+    }
+    Err(Error::Config(format!("Model \"{model}\" not found")))
+}
+
 async fn resolve(
     args: &Cli,
     candidate: &Candidate,
@@ -304,7 +323,6 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
             return Err(error);
         }
     }
-    let candidates = candidates(&args)?;
     if let AuthCommand::Check {
         json,
         credentials,
@@ -316,7 +334,8 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
         let mut auth_type = None;
         let mut output_credential = None;
         let mut provider = name;
-        if let [candidate] = candidates.as_slice() {
+        let candidate = check_candidate(&args);
+        if let Ok(Some(candidate)) = &candidate {
             provider = candidate.provider.id();
             match resolve(&args, candidate, no_refresh, Duration::ZERO, None).await {
                 Ok(Some(value)) => {
@@ -342,7 +361,7 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
                     reason = Some("invalid_state");
                 }
             }
-        } else if candidates.len() > 1 {
+        } else if candidate.is_err() {
             status = "invalid";
             reason = Some("invalid_state");
         }
@@ -378,7 +397,7 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
         AuthCommand::Check { .. } => unreachable!("check already returned"),
     };
     let mut matches = Vec::new();
-    for candidate in &candidates {
+    for candidate in &candidates(&args)? {
         if let Some(credential) = resolve(&args, candidate, false, minimum, Some(kind)).await?
             && let Some(value) = credential.value
         {
