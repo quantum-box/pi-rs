@@ -2696,6 +2696,10 @@ impl CodingTool {
         } else {
             path
         };
+        self.canonical_path(&path)
+    }
+
+    fn canonical_path(&self, path: &Path) -> Result<PathBuf> {
         let resolved = path.canonicalize().map_err(|error| {
             if self.unrestricted
                 && error.kind() == std::io::ErrorKind::NotFound
@@ -3075,7 +3079,7 @@ impl CodingTool {
                 .parent()
                 .ok_or_else(|| Error::Config("invalid parent".into()))?;
         }
-        self.path(&ancestor.to_string_lossy())?;
+        self.canonical_path(ancestor)?;
         check_mutation_cancelled(cancellation)?;
         std::fs::create_dir_all(parent).map_err(|error| {
             if self.unrestricted && cfg!(unix) {
@@ -3084,14 +3088,14 @@ impl CodingTool {
                 error.into()
             }
         })?;
-        let parent = self.path(&parent.to_string_lossy())?;
+        let parent = self.canonical_path(parent)?;
         let mut destination = parent.join(
             target
                 .file_name()
                 .ok_or_else(|| Error::Config("file name missing".into()))?,
         );
         if destination.symlink_metadata().is_ok() {
-            let existing = self.path(&destination.to_string_lossy())?;
+            let existing = self.canonical_path(&destination)?;
             if !existing.is_file() {
                 if self.unrestricted && cfg!(unix) && existing.is_dir() {
                     return Err(std::io::Error::new(
@@ -4687,6 +4691,39 @@ mod tests {
             for name in ["read", "write", "edit", "bash"] {
                 assert!(declarations.iter().any(|tool| tool.spec.name == name));
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_preserves_the_filesystem_spelling_of_a_symlink_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let actual = root.join("real\u{00a0}dir");
+        let lookalike = root.join("real dir");
+        std::fs::create_dir(&actual).unwrap();
+        std::fs::create_dir(&lookalike).unwrap();
+        std::fs::write(actual.join("file"), "original").unwrap();
+        std::fs::write(lookalike.join("file"), "untouched").unwrap();
+        std::os::unix::fs::symlink(&actual, root.join("alias")).unwrap();
+
+        for unrestricted in [false, true] {
+            let tool = CodingTool {
+                root: root.clone(),
+                unrestricted,
+                shell: ShellConfig::default(),
+                kind: Kind::Write,
+            };
+            tool.write(&json!({"path":"alias/file", "content":"updated"}))
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(actual.join("file")).unwrap(),
+                "updated"
+            );
+            assert_eq!(
+                std::fs::read_to_string(lookalike.join("file")).unwrap(),
+                "untouched"
+            );
         }
     }
 
