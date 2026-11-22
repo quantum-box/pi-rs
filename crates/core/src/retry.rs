@@ -1037,6 +1037,25 @@ where
     provider_context_overflow_stream_or_empty(stream, secrets, false).await
 }
 
+/// Recognize context overflow in an already bounded provider error body.
+#[doc(hidden)]
+pub fn provider_context_overflow_from_bytes(
+    bytes: &[u8],
+    complete: bool,
+    secrets: &[String],
+) -> bool {
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(value) => provider_context_overflow(&value, secrets),
+        Err(_) if !complete => provider_prefix_value(bytes)
+            .is_some_and(|value| provider_context_overflow(&value, secrets)),
+        Err(_) => {
+            let text = String::from_utf8_lossy(bytes);
+            !text.trim_start().starts_with(['{', '['])
+                && context_overflow_error(&mask_provider_secrets(&text, secrets))
+        }
+    }
+}
+
 /// Recognize an empty, completely received body only when the caller has
 /// established that the provider and status use Pi's bodyless-overflow rule.
 #[doc(hidden)]
@@ -1066,16 +1085,7 @@ where
         if bytes.is_empty() && empty_is_overflow {
             return true;
         }
-        match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(value) => provider_context_overflow(&value, secrets),
-            Err(_) => {
-                let text = String::from_utf8_lossy(&bytes);
-                if text.trim_start().starts_with(['{', '[']) {
-                    return false;
-                }
-                context_overflow_error(&mask_provider_secrets(&text, secrets))
-            }
-        }
+        provider_context_overflow_from_bytes(&bytes, true, secrets)
     })
     .await
     .unwrap_or(false)
@@ -1084,6 +1094,22 @@ where
 #[cfg(test)]
 mod overflow_tests {
     use super::{context_overflow_error, provider_context_overflow};
+
+    #[test]
+    fn bounded_overflow_uses_an_error_field_without_scanning_metadata() {
+        let body = br#"{"error":{"code":"context_length_exceeded"},"metadata":"unfinished"#;
+        assert!(super::provider_context_overflow_from_bytes(
+            body,
+            false,
+            &[]
+        ));
+        let metadata = br#"{"metadata":"context_length_exceeded","unfinished":""#;
+        assert!(!super::provider_context_overflow_from_bytes(
+            metadata,
+            false,
+            &[]
+        ));
+    }
 
     #[tokio::test]
     async fn bodyless_overflow_requires_complete_successful_stream() {
