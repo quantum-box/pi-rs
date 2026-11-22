@@ -23,7 +23,7 @@ const MAX_BRACE_DEPTH: usize = 16;
 
 // Expand only syntax whose Node semantics we can establish. Bounds apply to
 // the whole expansion, before any filesystem traversal or matcher compilation.
-fn expand_diagnostic_braces(pattern: &str) -> Option<Vec<String>> {
+pub(super) fn expand_diagnostic_braces(pattern: &str) -> Option<Vec<String>> {
     fn expand(pattern: &str, depth: usize, out: &mut Vec<String>, bytes: &mut usize) -> Option<()> {
         if depth > MAX_BRACE_DEPTH || pattern.len() > MAX_BRACE_INPUT {
             return None;
@@ -190,7 +190,7 @@ fn expand_diagnostic_braces(pattern: &str) -> Option<Vec<String>> {
 
 // One top-level negation with literal alternatives and a simple component
 // suffix. Anything more complex must keep using the diagnostic fallback.
-fn negative_extglob_regex(pattern: &str) -> Option<fancy_regex::Regex> {
+pub(super) fn negative_extglob_regex(pattern: &str) -> Option<fancy_regex::Regex> {
     if pattern.len() > MAX_EXTGLOB_PATTERN
         || !pattern.is_ascii()
         || pattern.contains(['[', ']', '{', '}'])

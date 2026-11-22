@@ -63,6 +63,25 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
     native_message_chars(message).div_ceil(4)
 }
 
+/// Estimate visible assistant text and finalized tool calls using Pi's normalization.
+pub fn estimate_assistant_output_tokens(
+    visible_utf16_units: u64,
+    calls: &[crate::ToolCall],
+) -> u64 {
+    assistant_output_chars(visible_utf16_units, calls).div_ceil(4)
+}
+
+fn assistant_output_chars(visible_utf16_units: u64, calls: &[crate::ToolCall]) -> u64 {
+    calls.iter().fold(visible_utf16_units, |chars, call| {
+        let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .map(|value| pi_json_chars(&value))
+            .unwrap_or_else(|_| text_chars(&call.arguments));
+        chars
+            .saturating_add(text_chars(&call.name))
+            .saturating_add(arguments)
+    })
+}
+
 fn native_message_chars(message: &Message) -> u64 {
     if let Message::Tool {
         content,
@@ -87,14 +106,7 @@ fn pi_message_chars(message: &Message) -> u64 {
         Message::UserWithImages { content, images } => text_chars(content)
             .saturating_add((images.len() as u64).saturating_mul(ESTIMATED_IMAGE_CHARS)),
         Message::Assistant { content, calls, .. } => {
-            calls.iter().fold(text_chars(content), |chars, call| {
-                let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
-                    .map(|value| pi_json_chars(&value))
-                    .unwrap_or_else(|_| text_chars(&call.arguments));
-                chars
-                    .saturating_add(text_chars(&call.name))
-                    .saturating_add(arguments)
-            })
+            assistant_output_chars(text_chars(content), calls)
         }
         Message::Tool {
             content,

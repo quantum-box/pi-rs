@@ -1799,6 +1799,11 @@ impl AgentSession {
     pub fn registered_tool_info(&self) -> Vec<crate::RegisteredToolInfo> {
         self.registry.registered_tool_info()
     }
+    /// Snapshot configured custom-message renderers for the host presentation.
+    pub fn custom_message_renderers(&self) -> crate::CustomMessageRenderers {
+        self.registry.custom_message_renderers()
+    }
+
     /// Inspect configured extension commands, including collision-resolved
     /// invocation names and extension provenance. Prompt templates, skills and
     /// built-in host commands remain the host's responsibility. Per-request
@@ -2162,6 +2167,86 @@ impl AgentSession {
         self.refresh_input_hooks()?;
         Ok(())
     }
+    /// Server declarations owned by the loaded extensions.
+    pub fn registered_mcp_servers(&self) -> &[crate::RegisteredMcpServer] {
+        self.registry.registered_mcp_servers()
+    }
+
+    /// Register or update an MCP declaration for a loaded extension and notify subscribers.
+    pub async fn register_mcp_server(
+        &mut self,
+        extension_id: &str,
+        server: crate::McpServerDeclaration,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        let mut journal = self
+            .session
+            .try_lock()
+            .map_err(|_| Error::Session("session journal is in use".into()))?;
+        let mut registry = self.registry.as_ref().clone();
+        registry.register_mcp_server(extension_id, server)?;
+        self.registry = Arc::new(registry);
+        self.refresh_run_config();
+        self.notify_mcp_servers_changed(&mut journal, extension_id)
+            .await;
+        drop(journal);
+        if let Err(error) = self.drain_idle_triggers().await {
+            self.report_mcp_change_error(extension_id, &error);
+        }
+        Ok(())
+    }
+
+    /// Remove a declaration owned by the given extension and notify subscribers if it existed.
+    pub async fn unregister_mcp_server(&mut self, extension_id: &str, name: &str) -> Result<bool> {
+        self.ensure_open()?;
+        let mut journal = self
+            .session
+            .try_lock()
+            .map_err(|_| Error::Session("session journal is in use".into()))?;
+        let mut registry = self.registry.as_ref().clone();
+        if !registry.unregister_mcp_server(extension_id, name) {
+            return Ok(false);
+        }
+        self.registry = Arc::new(registry);
+        self.refresh_run_config();
+        self.notify_mcp_servers_changed(&mut journal, extension_id)
+            .await;
+        drop(journal);
+        if let Err(error) = self.drain_idle_triggers().await {
+            self.report_mcp_change_error(extension_id, &error);
+        }
+        Ok(true)
+    }
+
+    async fn notify_mcp_servers_changed(&self, session: &mut Session, extension_id: &str) {
+        let events = self.events.as_ref().expect("open session");
+        if let Err(error) = crate::lifecycle::notify_idle_with_host(
+            &self.registry,
+            session,
+            crate::LifecycleEvent::McpServersChange {
+                servers: self.registry.registered_mcp_servers().to_vec(),
+            },
+            self.limits.tool_timeout,
+            &mut |notification| emit(events, &notification),
+        )
+        .await
+        {
+            self.report_mcp_change_error(extension_id, &error);
+        }
+    }
+
+    fn report_mcp_change_error(&self, extension_id: &str, error: &Error) {
+        let events = self.events.as_ref().expect("open session");
+        emit(
+            events,
+            &Notification::ExtensionLifecycleError {
+                extension: extension_id,
+                event: "mcp_servers_change",
+                message: &error.to_string(),
+            },
+        );
+    }
+
     /// Check out a branch after validating that its selected model is registered.
     pub fn checkout(&mut self, record: u64) -> Result<()> {
         self.ensure_open()?;

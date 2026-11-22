@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use pi_rs::{Error, Event, Result, Session};
+use pi_rs::{Error, Event, Record, Result, Session};
 use serde::Serialize;
 
 pub fn validate_name(value: &str) -> std::result::Result<String, String> {
@@ -884,6 +884,56 @@ pub(super) fn tree_context_text(content: &pi_rs::ContextContent) -> std::borrow:
     }
 }
 
+pub(super) fn tree_imported_system_text<'a>(
+    session: &Session,
+    record: &'a Record,
+) -> Option<&'a str> {
+    let Event::SystemCheckpoint { content, .. } = &record.event else {
+        return None;
+    };
+    let source = tree_parent(session, record)?;
+    matches!(&source.event, Event::SourceEntry { format, entry }
+        if format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "system")
+    .then_some(content.as_str())
+}
+
+pub(super) fn tree_assistant_completion<'a>(
+    session: &'a Session,
+    assistant: &Record,
+) -> Option<&'a Record> {
+    let Event::Assistant {
+        request_id: Some(request_id),
+        ..
+    } = &assistant.event
+    else {
+        return None;
+    };
+    let parent = tree_parent(session, assistant)?;
+    matches!(parent.event, Event::ModelFinished { request_id: id, .. } if id == *request_id)
+        .then_some(parent)
+}
+
+pub(super) fn tree_completion_error<'a>(
+    session: &'a Session,
+    completion: &Record,
+) -> Option<&'a str> {
+    let source = tree_parent(session, completion)?;
+    let Event::SourceEntry { format, entry } = &source.event else {
+        return None;
+    };
+    if format == "pi" && entry["message"]["role"] == "assistant" {
+        entry["message"]["errorMessage"].as_str()
+    } else {
+        None
+    }
+}
+
+fn tree_parent<'a>(session: &'a Session, record: &Record) -> Option<&'a Record> {
+    session
+        .records()
+        .get(record.parent?.checked_sub(1)? as usize)
+}
+
 pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
     use std::borrow::Cow;
 
@@ -892,9 +942,18 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
         .get(id.saturating_sub(1) as usize)
         .filter(|record| record.id == id)
         .and_then(|record| match &record.event {
-            Event::User { content, .. }
-            | Event::UserWithImages { content, .. }
-            | Event::Assistant { content, .. } => Some(Cow::Borrowed(content.as_str())),
+            Event::User { content, .. } | Event::UserWithImages { content, .. } => {
+                Some(Cow::Borrowed(content.as_str()))
+            }
+            Event::Assistant { content, .. } => {
+                if content.is_empty() {
+                    tree_assistant_completion(session, record)
+                        .and_then(|completion| tree_completion_error(session, completion))
+                        .map(Cow::Borrowed)
+                } else {
+                    Some(Cow::Borrowed(content.as_str()))
+                }
+            }
             Event::BashExecution { execution } => Some(Cow::Borrowed(execution.command.as_str())),
             Event::ToolFinished {
                 outcome:
@@ -933,10 +992,19 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
                 failure: Some(_),
                 partial,
                 ..
-            } => Some(Cow::Borrowed(partial.as_str())),
+            } => {
+                if partial.is_empty() {
+                    tree_completion_error(session, record).map(Cow::Borrowed)
+                } else {
+                    Some(Cow::Borrowed(partial.as_str()))
+                }
+            }
             Event::Compacted { summary, .. }
             | Event::CompactionSummaryMessage { summary, .. }
             | Event::BranchSummary { summary, .. } => Some(Cow::Borrowed(summary.as_str())),
+            Event::SystemCheckpoint { .. } => {
+                tree_imported_system_text(session, record).map(Cow::Borrowed)
+            }
             _ => None,
         })
         .filter(|text| !text.trim().is_empty())
