@@ -1,6 +1,7 @@
 //! Terminal image placements for the Kitty and iTerm2 protocols used by Pi.
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Write};
+use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -216,6 +217,20 @@ pub struct Placement {
     rows: usize,
     offset: usize,
 }
+
+impl Placement {
+    pub fn intersects(&self, row: usize, rows: &Range<usize>, columns: &Range<usize>) -> bool {
+        let top = row.saturating_sub(self.offset);
+        let bottom = row + (self.rows - self.offset);
+        !rows.is_empty()
+            && !columns.is_empty()
+            && rows.start < bottom
+            && top < rows.end
+            && columns.start < self.column + self.columns
+            && self.column < columns.end
+    }
+}
+
 /// Count the contiguous visible portion of one image, excluding following text or widgets.
 pub fn visible_rows(lines: &[Line]) -> usize {
     let Some(first) = lines.first().and_then(|line| line.image.as_ref()) else {
@@ -538,6 +553,24 @@ mod tests {
             cleanup: Cleanup::default(),
             crops: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn image_intersection_includes_clipped_placements_but_excludes_adjacent_cells() {
+        let mut placement = Placement {
+            image: fixture(),
+            columns: 10,
+            column: 3,
+            rows: 8,
+            offset: 5,
+        };
+        assert!(placement.intersects(0, &(1..2), &(12..20)));
+        assert!(!placement.intersects(0, &(3..4), &(12..20)));
+        assert!(!placement.intersects(0, &(1..2), &(13..20)));
+        placement.offset += 2;
+        assert!(placement.intersects(2, &(0..1), &(3..4)));
+        let empty_rows = Range { start: 1, end: 1 };
+        assert!(!placement.intersects(2, &empty_rows, &(3..4)));
     }
     #[test]
     fn capability_detection_is_conservative_and_accepts_explicit_override() {
