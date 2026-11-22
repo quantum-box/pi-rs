@@ -182,7 +182,41 @@ pub fn sanitized_provider_error(
     value: &serde_json::Value,
     secrets: &[String],
 ) -> serde_json::Value {
-    let mut value = value.clone();
+    let mut value = if let Some(text) = value
+        .as_str()
+        .filter(|text| text.trim_start().starts_with('{'))
+    {
+        // A credential can span multiple JSON tokens. Mask those echoes before
+        // parsing, then scrub decoded fields for escaped credential values.
+        let masked = mask_provider_secrets(text, secrets);
+        let encoded = masked.replace('\0', "\\u0000");
+        static VALUES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let values = VALUES.get_or_init(|| {
+            regex::Regex::new(
+                r#"("(?:\\.|[^"\\])*")|[A-Za-z0-9+.-]*(?:\\u0000){2}(?:[A-Za-z0-9+.-]|\\u0000)*"#,
+            )
+            .expect("static JSON strings and redacted values")
+        });
+        let encoded = values.replace_all(&encoded, |captures: &regex::Captures<'_>| {
+            // Keep masked strings intact and use null for an unquoted value.
+            captures
+                .get(1)
+                .map_or("null", |value| value.as_str())
+                .to_owned()
+        });
+        match serde_json::from_str::<serde_json::Value>(&encoded) {
+            Ok(value) if value.get("error").is_some() || masked == text => value,
+            masked_result => match serde_json::from_str::<serde_json::Value>(text) {
+                // Never treat root metadata as the error if masking removed
+                // the nested error or made a valid JSON envelope unreadable.
+                Ok(original) if original.get("error").is_some() => serde_json::Value::Null,
+                Ok(_) => masked_result.unwrap_or_default(),
+                Err(_) => masked_result.unwrap_or(serde_json::Value::String(masked)),
+            },
+        }
+    } else {
+        value.clone()
+    };
     fn scrub(value: &mut serde_json::Value, secrets: &[String]) {
         match value {
             serde_json::Value::String(text) => *text = mask_provider_secrets(text, secrets),
@@ -202,8 +236,10 @@ pub fn sanitized_provider_error(
 #[doc(hidden)]
 pub fn permanent_provider_error(value: &serde_json::Value, secrets: &[String]) -> bool {
     let value = sanitized_provider_error(value, secrets);
-    let value = &value;
-    let error = value.get("error").unwrap_or(value);
+    is_permanent_provider_error(value.get("error").unwrap_or(&value))
+}
+
+fn is_permanent_provider_error(error: &serde_json::Value) -> bool {
     if let Some(text) = error.as_str() {
         return permanent_limit_text(text.as_bytes(), true);
     }
@@ -228,14 +264,18 @@ pub fn permanent_provider_error(value: &serde_json::Value, secrets: &[String]) -
 fn transient_pattern() -> &'static regex::Regex {
     static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     PATTERN.get_or_init(|| regex::Regex::new(concat!(
-            r"overloaded|server_busy|servers are currently busy|currently experiencing high demand|model is at capacity|rate.?limit|too many requests|",
-            r"service.?(?:is.?)?(?:temporarily.?)?unavailable|server.?error|internal.?error|provider.?returned.?(?:an.?)?error|",
+            r"overloaded|server_busy|servers are currently busy|currently experiencing high demand|model is at capacity|admission ceiling|rate.?limit|too many requests|",
+            r"service.?(?:is.?)?(?:temporarily.?)?unavailable|provider.?(?:is.?)?temporarily.?unavailable|server.?error|internal.?error|provider.?returned.?(?:an.?)?error|",
             r"exceeded request buffer limit while retrying upstream|unable to forward upstream|upstream.?request.?failed|upstream_stream_read_error|stream was interrupted|http/?2 stream failed|",
-            r"network.?error|connection.?error|connection.?refused|connection.?lost|other side closed|fetch failed|request to \S+ failed, reason:|",
+            r"network.?error|connection.?error|connection.?refused|connection.?lost|connection.?closed|other side closed|fetch failed|request to \S+ failed, reason:|",
+            r"(?:^|[^a-z0-9_])(?:econnreset|econnaborted|econnrefused|etimedout|epipe)(?:$|[^a-z0-9_])|connection reset by peer|",
             r"getaddrinfo|enotfound|eai_again|upstream.?connect|reset before headers|socket hang up|socket connection was closed|timed? out|timeout|terminated|",
-            r"websocket.?closed|websocket.?error|ended without|stream ended before message_stop|stream ended before a terminal response event|",
-            r"http2 request did not get a response|stream disconnected before completion|pending stream has been canceled|retry delay|you can retry your request|",
-            r"try your request again|please retry your request|resourceexhausted|subscription_sharing_usage_unavailable|subscription_sharing_user_unavailable"
+            r"websocket.?closed|websocket.?error|websocket.?connection.?limit.?reached|",
+            r"ended without|stream ended before message_stop|stream ended before a terminal response event|http2 request did not get a response|",
+            r"provider finish_reason: error|returned an empty response|stopped before completing the response|stream disconnected before completion|cut short after the reply had begun|",
+            r"ended the response before it was complete|connection to the provider was reset|reported a failure while generating the response|pending stream has been canceled|",
+            r"retry delay|you can retry your request|try your request again|please retry your request|repeat the request later|",
+            r"resourceexhausted|subscription_sharing_usage_unavailable|subscription_sharing_user_unavailable"
         )).expect("valid provider retry pattern"))
 }
 
@@ -245,25 +285,29 @@ fn transient_header_expression(text: &str) -> bool {
         regex::Regex::new(&format!("^(?:{})$", transient_pattern().as_str()))
             .expect("valid provider retry pattern")
     });
-    whole.is_match(text) || matches!(text, "429" | "500" | "502" | "503" | "504" | "520" | "524")
+    whole.is_match(text)
+        || matches!(
+            text,
+            "429" | "500" | "502" | "503" | "504" | "520" | "524" | "525" | "api_error"
+        )
 }
 
 /// Recognize Pi's transient provider messages without scanning unrelated
 /// metadata. Permanent quota markers always take precedence.
 #[doc(hidden)]
 pub fn retryable_provider_error(value: &serde_json::Value, secrets: &[String]) -> bool {
-    if permanent_provider_error(value, secrets) {
-        return false;
-    }
     let value = sanitized_provider_error(value, secrets);
     let error = value.get("error").unwrap_or(&value);
+    if is_permanent_provider_error(error) {
+        return false;
+    }
     let matches = |text: &str| {
         let lower = text.to_ascii_lowercase();
         let pattern = transient_pattern();
         if pattern.is_match(&lower) {
             return true;
         }
-        ["429", "500", "502", "503", "504", "520", "524"]
+        ["429", "500", "502", "503", "504", "520", "524", "525"]
             .iter()
             .any(|code| {
                 lower.match_indices(code).any(|(index, _)| {
@@ -286,10 +330,15 @@ pub fn retryable_provider_error(value: &serde_json::Value, secrets: &[String]) -
             let Some(value) = object.get(*key) else {
                 return false;
             };
-            value.as_str().is_some_and(matches)
-                || value
-                    .as_u64()
-                    .is_some_and(|code| matches!(code, 429 | 500 | 502 | 503 | 504 | 520 | 524))
+            (*key == "type"
+                && value
+                    .as_str()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("api_error"))
+                && !is_provider_context_overflow(error))
+                || value.as_str().is_some_and(matches)
+                || value.as_u64().is_some_and(|code| {
+                    matches!(code, 429 | 500 | 502 | 503 | 504 | 520 | 524 | 525)
+                })
         })
 }
 
@@ -704,6 +753,99 @@ mod quota_tests {
     }
 
     #[test]
+    fn classifies_temporary_gateway_and_stream_failures() {
+        for message in [
+            "The upstream provider is temporarily unavailable. Try again shortly.",
+            "The provider ended the response before it was complete.",
+            "The connection to the provider was reset. Retry shortly.",
+            "The provider reported a failure while generating the response.",
+            "Provider returned an empty response",
+            "The model stopped before completing the response.",
+            "Repeat the request later.",
+            "Reaching this model's admission ceiling",
+            "525 SSL handshake failed",
+            "Provider finish_reason: error",
+            "read ECONNRESET",
+            "Rate limit reached: token limit exceeded",
+            "rate_limit: token limit exceeded",
+        ] {
+            assert!(
+                retryable_provider_error(&serde_json::json!(message), &[]),
+                "{message}"
+            );
+        }
+        for value in [
+            serde_json::json!({"code": 525}),
+            serde_json::json!({"error": {"type":"api_error","message":"Please try again."}}),
+            serde_json::json!(r#"{"error":{"type":"api_error","message":"Please try again."}}"#),
+        ] {
+            assert!(retryable_provider_error(&value, &[]), "{value}");
+        }
+        for value in [
+            serde_json::json!("Provider unavailable"),
+            serde_json::json!("reference ECONEPIPE_12"),
+            serde_json::json!("reference 15259"),
+            serde_json::json!("Provider finish_reason: content_filter"),
+            serde_json::json!("Upstream response did not include complete usage data"),
+            serde_json::json!(
+                r#"{"error":{"message":"invalid request"},"details":{"type":"api_error"}}"#
+            ),
+            serde_json::json!(
+                r#"{"error":{"type":"api_error","message":"Monthly quota exceeded"}}"#
+            ),
+        ] {
+            assert!(!retryable_provider_error(&value, &[]), "{value}");
+        }
+    }
+
+    #[test]
+    fn encoded_errors_redact_before_and_after_parsing() {
+        let entire = r#"{"message":"rate limit"}"#.to_owned();
+        let value = serde_json::json!(entire);
+        assert!(!retryable_provider_error(&value, &[entire]));
+
+        let token = "fixture-billing-token".to_owned();
+        let encoded = serde_json::json!(
+            r#"{"error":{"type":"api_error","message":"try again fixture-billing-token"}}"#
+        );
+        assert!(!permanent_provider_error(
+            &encoded,
+            std::slice::from_ref(&token)
+        ));
+        assert!(retryable_provider_error(&encoded, &[token]));
+
+        let escaped = serde_json::json!(r#"{"error":{"message":"fixture-\u0062illing-token"}}"#);
+        assert!(!permanent_provider_error(
+            &escaped,
+            &["fixture-billing-token".to_owned()]
+        ));
+
+        let invalid_after_masking = serde_json::json!(
+            r#"{"error":{"message":"invalid request"},"details":42639,"request_id":"rate limit"}"#
+        );
+        assert!(!retryable_provider_error(
+            &invalid_after_masking,
+            &["42639".to_owned()]
+        ));
+        let quota =
+            serde_json::json!(r#"{"error":{"type":"insufficient_quota"},"request_id":42639}"#);
+        for secret in ["42639", "263"] {
+            assert!(permanent_provider_error(&quota, &[secret.to_owned()]));
+            assert!(!retryable_provider_error(
+                &invalid_after_masking,
+                &[secret.to_owned()]
+            ));
+        }
+
+        let redacted_key =
+            serde_json::json!(r#"{"error":{"message":"invalid request"},"message":"rate limit"}"#);
+        assert!(!retryable_provider_error(
+            &redacted_key,
+            &["error".to_owned()]
+        ));
+    }
+
+    #[test]
     fn transient_patterns_and_secret_masking_follow_pi() {
         let partial_secret = ["sk-provider-billing-secret".to_owned()];
         assert!(!permanent_limit_body(
@@ -1005,11 +1147,12 @@ pub(crate) fn context_overflow_error(message: &str) -> bool {
 /// configured secrets. Request IDs and other envelope metadata are ignored.
 #[doc(hidden)]
 pub fn provider_context_overflow(value: &serde_json::Value, secrets: &[String]) -> bool {
-    if permanent_provider_error(value, secrets) {
-        return false;
-    }
     let value = sanitized_provider_error(value, secrets);
     let error = value.get("error").unwrap_or(&value);
+    !is_permanent_provider_error(error) && is_provider_context_overflow(error)
+}
+
+fn is_provider_context_overflow(error: &serde_json::Value) -> bool {
     if let Some(text) = error.as_str() {
         return context_overflow_error(text);
     }
