@@ -5399,7 +5399,9 @@ vision headers.
 Native sign-in leaves account model policies as configured. Use
 `pi login github-copilot --enterprise-url company.ghe.com` or
 `/login github-copilot company.ghe.com` for an Enterprise account. The
-saved domain directs future refreshes, including for credentials imported
+terminal sign-in picker prompts for the domain and accepts a blank entry
+for github.com. The saved domain directs future refreshes, including for
+credentials imported
 from Pi. The inference token can select an official Copilot proxy or an
 API host bound to that Enterprise domain. Sign-in and refresh use HTTPS,
 and the verification link must belong to the selected GitHub host.

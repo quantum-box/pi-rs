@@ -691,6 +691,7 @@ enum LocalEditor {
     ProviderKey(super::Provider),
     VertexLogin(VertexLoginField),
     CloudflareLogin(CloudflareLoginField),
+    CopilotEnterpriseDomain,
     BedrockProfile,
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
@@ -3934,7 +3935,11 @@ fn slash(
             let enterprise = rest
                 .split_once(char::is_whitespace)
                 .map(|(_, domain)| domain.trim());
-            start_copilot_login(view, &args.settings, enterprise)
+            if let Some(enterprise) = enterprise {
+                start_copilot_login(view, &args.settings, Some(enterprise))?;
+            } else {
+                edit_copilot_enterprise(view);
+            }
         }
         "/login" | "/logout" => {
             let login = name == "/login";
@@ -5873,6 +5878,9 @@ pub(super) async fn run(
                                 LocalEditor::CloudflareLogin(field) => {
                                     advance_cloudflare_login(field, text.trim(), &mut args, &mut view)
                                 }
+                                LocalEditor::CopilotEnterpriseDomain => {
+                                    start_copilot_login(&mut view, &args.settings, Some(&text))
+                                }
                                 LocalEditor::ProviderKey(provider) => super::model_auth::save(
                                     provider,
                                     args.model_endpoint_for(
@@ -7375,13 +7383,26 @@ fn start_codex_login(
     view.remote_task = Some(task);
 }
 
+fn edit_copilot_enterprise(view: &mut View) {
+    let dialog = crate::ui::dialog::Dialog::new(
+        uuid::Uuid::new_v4(),
+        pi_rs::UiRequest::Input {
+            title: "GitHub Enterprise URL/domain (blank for github.com)".into(),
+            placeholder: Some("company.ghe.com".into()),
+            initial_value: None,
+            timeout: None,
+        },
+    );
+    view.local_editor = Some((LocalEditor::CopilotEnterpriseDomain, dialog));
+}
+
 fn start_copilot_login(
     view: &mut View,
     settings: &crate::config::Settings,
     enterprise: Option<&str>,
-) {
+) -> Result<()> {
     let settings = settings.clone();
-    let enterprise = enterprise.map(str::to_owned);
+    let enterprise = super::copilot_auth::enterprise_domain(enterprise)?;
     let control = super::meta_auth::LoginControl::default();
     let task_control = control.clone();
     let mut task = RemoteTask::start(
@@ -7406,6 +7427,7 @@ fn start_copilot_login(
     );
     task.meta_login_control = Some(control);
     view.remote_task = Some(task);
+    Ok(())
 }
 
 fn start_xai_login(view: &mut View, settings: &crate::config::Settings) {
@@ -8553,7 +8575,7 @@ fn select(
         Selection::LoginCodexDevice => {
             start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
         }
-        Selection::LoginCopilot => start_copilot_login(view, &args.settings, None),
+        Selection::LoginCopilot => edit_copilot_enterprise(view),
         Selection::LoginXai => start_xai_login(view, &args.settings),
         Selection::LoginMeta => start_meta_login(view, &args.settings),
         Selection::LoginKimi => start_kimi_login(view, &args.settings),
@@ -9618,6 +9640,23 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copilot_login_prompts_before_starting_device_authorization() {
+        use super::{Cli, KeyCode, KeyEvent, KeyModifiers, Keys, LocalEditor, View};
+        use clap::Parser;
+
+        let mut args = Cli::parse_from(["pi", "--offline"]);
+        let mut view = View::default();
+        super::slash("/login github-copilot", &mut args, &mut view, None).unwrap();
+        assert!(view.remote_task.is_none());
+        let (editor, mut dialog) = view.local_editor.take().unwrap();
+        assert!(matches!(editor, LocalEditor::CopilotEnterpriseDomain));
+        assert!(matches!(
+            dialog.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &Keys::default()),
+            Some(pi_rs::UiResponse::Text(value)) if value.is_empty()
+        ));
+    }
+
     #[test]
     fn cloudflare_login_validates_fixed_identifiers_in_gateway_templates() {
         let base = "https://gateway.ai.cloudflare.com/v1/fixed/{CLOUDFLARE_GATEWAY_ID}/compat";
