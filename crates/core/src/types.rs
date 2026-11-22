@@ -646,6 +646,33 @@ pub struct ProviderReplay {
 }
 
 impl ProviderReplay {
+    /// Preserve the recorded Anthropic effort without placing private data on the wire.
+    pub fn record_anthropic_effort(&mut self, effort: &str) {
+        if let Some(effort) = Self::valid_anthropic_effort(effort) {
+            self.blocks
+                .retain(|block| block.get("_pi_anthropic_effort").is_none());
+            self.blocks
+                .push(serde_json::json!({"_pi_anthropic_effort":effort}));
+        }
+    }
+
+    pub fn anthropic_effort(&self) -> Option<&'static str> {
+        self.blocks.iter().find_map(|block| {
+            Self::valid_anthropic_effort(block.get("_pi_anthropic_effort")?.as_str()?)
+        })
+    }
+
+    pub fn valid_anthropic_effort(effort: &str) -> Option<&'static str> {
+        match effort {
+            "low" => Some("low"),
+            "medium" => Some("medium"),
+            "high" => Some("high"),
+            "xhigh" => Some("xhigh"),
+            "max" => Some("max"),
+            _ => None,
+        }
+    }
+
     pub fn is_context_edit(&self) -> bool {
         self.blocks
             .iter()
