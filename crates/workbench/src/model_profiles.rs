@@ -1519,6 +1519,21 @@ impl Profiles {
         .collect()
     }
 
+    pub fn anthropic_inline_tool_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> BTreeSet<String> {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+            self.chat_compatibility(provider, metadata)
+                .supports_anthropic_tool_changes()
+        })
+        .into_iter()
+        .filter_map(|(id, supported)| supported.then_some(id))
+        .collect()
+    }
+
     pub fn anthropic_managed_effort_models(
         &self,
         provider: &Provider,
@@ -2648,6 +2663,39 @@ mod tests {
                 "claude-sonnet-5-5".into(),
             ])
         );
+    }
+
+    #[test]
+    fn anthropic_inline_tools_require_both_capabilities_on_the_final_route() {
+        let profiles = Profiles::parse(&json!({"providers":{"proxy":{
+            "api":"anthropic-messages", "baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMidConvoSystemMessages":true,"supportsMidConvoToolChanges":true},
+            "models":[
+                {"id":"enabled"},
+                {"id":"no-inline-tools","compat":{"supportsMidConvoToolChanges":false}},
+                {"id":"no-system","compat":{"supportsMidConvoSystemMessages":false}},
+                {"id":"other-endpoint","baseUrl":"http://localhost:2/v1"},
+                {"id":"other-api","api":"openai-completions"}
+            ]
+        }}}))
+        .unwrap();
+        let proxy = profiles.provider("proxy").unwrap();
+        assert_eq!(
+            profiles.anthropic_inline_tool_models(&proxy, "enabled", None),
+            BTreeSet::from(["enabled".into()])
+        );
+        assert_eq!(
+            profiles.anthropic_inline_tool_models(&proxy, "enabled", Some("http://localhost:3/v1")),
+            BTreeSet::from(["enabled".into(), "other-endpoint".into()])
+        );
+        let bundled = Profiles::default().anthropic_inline_tool_models(
+            &Provider::Anthropic,
+            "claude-opus-4-8",
+            None,
+        );
+        assert!(bundled.contains("claude-opus-4-8"));
+        assert!(bundled.contains("claude-sonnet-5-5"));
+        assert!(!bundled.contains("claude-sonnet-5"));
     }
 
     #[test]

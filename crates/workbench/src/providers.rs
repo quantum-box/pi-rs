@@ -759,6 +759,7 @@ impl Client {
         match self {
             Self::Ollama(client) => client.uses_tool_transcript(model),
             Self::OpenAi(client) => client.supports_tool_transcript(model),
+            Self::Anthropic(client) => client.supports_tool_transcript(model),
             Self::Deferred(client) => client
                 .estimation_client()
                 .is_some_and(|client| client.uses_tool_transcript(model)),
@@ -777,6 +778,9 @@ impl Client {
             }
             Self::OpenAi(client) => {
                 Self::OpenAi(client.with_tool_transcript(request, tool_transcript))
+            }
+            Self::Anthropic(client) => {
+                Self::Anthropic(client.with_tool_transcript(request, tool_transcript))
             }
             other => other,
         }
@@ -1378,6 +1382,11 @@ impl Client {
                         &args.model,
                         args.explicit_endpoint_for(&args.provider),
                         thinking,
+                    ))
+                    .with_inline_tool_models(args.model_profiles.anthropic_inline_tool_models(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
                     ))
                     .with_mid_conversation_system_models(
                         args.model_profiles

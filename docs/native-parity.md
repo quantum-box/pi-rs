@@ -4297,9 +4297,8 @@ The direct Anthropic catalog includes Claude Fable 5.2 from Pi v1.6.0.
 The model accepts text and images, has a one-million-token context window
 and a 128,000-token model output limit, and adds xhigh and max to its standard
 effort levels.
-The catalog retains Pi 1.6.0's mid-conversation system and tool-change
-capability flags for the direct Messages route. Native Messages supports
-the system checkpoints. Inline tool changes still require adapter support.
+Native Messages uses the catalog's Pi 1.6.0 capability flags for
+mid-conversation system checkpoints and inline tool changes.
 The catalog includes Pi's model-specific pricing, prompt-cache lifetimes,
 and image limits. The direct Anthropic catalog uses Pi v1.6.0's ordered
 server-side fallback targets for Fable 5 and Fable 5.2. Models can set or clear
@@ -5621,9 +5620,19 @@ for direct Claude, GitHub Copilot, and OpenCode Zen. Model and provider profiles
 can override the capability. Native system updates are sent before the next
 emitted assistant turn or at the end of the transcript, preserving tool-call
 and tool-result adjacency. Other Messages models use one combined initial
-system prompt. Terminal and SDK tool declarations still represent the current
-tool set. Live requests using these models and authenticated gateways were
-unverified.
+system prompt. With both `supportsMidConvoSystemMessages` and
+`supportsMidConvoToolChanges`, Anthropic Messages uses the initial tool list,
+including Pi's deferred placeholder, and sends later additions, redefinitions
+and removals as system blocks. Historical declarations retain their compatible
+sampling constraints, and the active dispatch uses its prepared decisions.
+The active tool list is used when the initial list is empty, history cannot
+preserve required sampling, or historical names collide under OAuth. A
+removal references a tool only while its declaration is active. Native
+retains the required inline-tools beta alongside custom beta headers when
+it sends inline changes. Loopback
+fixtures cover tool-result adjacency, historical strict sampling, beta
+selection and cache placement. Live requests
+using these models and authenticated gateways were unverified.
 
 ### Model-specific chat API checkpoint
 

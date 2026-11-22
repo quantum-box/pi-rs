@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 pub struct ChatCompatibility {
     supports_store: Option<bool>,
     supports_mid_convo_system_messages: Option<bool>,
+    supports_mid_convo_tool_changes: Option<bool>,
     supports_mid_convo_tool_additions: Option<bool>,
     supports_additional_tools: Option<bool>,
     supports_tool_search: Option<bool>,
@@ -391,6 +392,12 @@ impl ChatCompatibility {
             && self.supports_mid_convo_tool_additions == Some(true)
     }
 
+    /// Whether Anthropic can declare tool changes in native system messages.
+    pub fn supports_anthropic_tool_changes(&self) -> bool {
+        self.supports_mid_conversation_system_messages()
+            && self.supports_mid_convo_tool_changes == Some(true)
+    }
+
     /// Whether Responses can declare changes or additions in the transcript.
     pub fn responses_tool_transcript(&self) -> (bool, bool) {
         (
@@ -433,6 +440,9 @@ impl ChatCompatibility {
             supports_mid_convo_system_messages: model
                 .supports_mid_convo_system_messages
                 .or(self.supports_mid_convo_system_messages),
+            supports_mid_convo_tool_changes: model
+                .supports_mid_convo_tool_changes
+                .or(self.supports_mid_convo_tool_changes),
             supports_mid_convo_tool_additions: model
                 .supports_mid_convo_tool_additions
                 .or(self.supports_mid_convo_tool_additions),

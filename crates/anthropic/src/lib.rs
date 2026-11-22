@@ -7,9 +7,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use pi_rs_core::{
-    AnthropicInputTransformations, AssistantDiagnostic, ChatPrice, Error, ImageContent, Message,
-    Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
-    ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, Usage,
+    AnthropicInputTransformations, AssistantDiagnostic, BoundToolTranscript, ChatPrice, Error,
+    ImageContent, Message, Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
+    ProviderReplay, ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, ToolDeclaration,
+    ToolSpec, ToolTranscriptChange, Usage,
 };
 use reqwest::{
     Client, Response, Url,
@@ -68,6 +69,8 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const EFFORT_BETA: &str = "mid-conversation-output-config-2026-07-01";
 const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+const INLINE_TOOLS_BETA: &str = "inline-tools-2026-09-15";
+const DEFERRED_TOOL_PLACEHOLDER: &str = "__pi_deferred_placeholder__";
 const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 const OAUTH_BETAS: &str = "claude-code-20250219,oauth-2025-04-20";
 
@@ -133,6 +136,8 @@ pub struct Anthropic {
     strict_tool_support: bool,
     strict_tool_models: Option<Arc<BTreeMap<String, bool>>>,
     mid_conversation_system_models: Arc<BTreeSet<String>>,
+    inline_tool_models: Arc<BTreeSet<String>>,
+    tool_transcript: Option<BoundToolTranscript>,
     progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
 }
@@ -247,6 +252,8 @@ impl Anthropic {
             strict_tool_support: false,
             strict_tool_models: None,
             mid_conversation_system_models: Arc::default(),
+            inline_tool_models: Arc::default(),
+            tool_transcript: None,
             progress: None,
             reasoning: None,
         })
@@ -256,6 +263,68 @@ impl Anthropic {
     pub fn with_mid_conversation_system_models(mut self, models: BTreeSet<String>) -> Self {
         self.mid_conversation_system_models = Arc::new(models);
         self
+    }
+
+    /// Enable native tool checkpoints on the specified models of this route.
+    pub fn with_inline_tool_models(mut self, models: BTreeSet<String>) -> Self {
+        self.inline_tool_models = Arc::new(models);
+        self
+    }
+
+    pub fn supports_tool_transcript(&self, model: &str) -> bool {
+        self.mid_conversation_system_models.contains(model)
+            && self.inline_tool_models.contains(model)
+    }
+
+    pub fn with_tool_transcript(
+        mut self,
+        request: &ModelRequest,
+        changes: &[ToolTranscriptChange],
+    ) -> Self {
+        self.tool_transcript = None;
+        if self.supports_tool_transcript(&request.model) && !changes.is_empty() {
+            self.tool_transcript = BoundToolTranscript::bind(request, changes);
+        }
+        self
+    }
+
+    fn inline_tools(
+        &self,
+        request: &ModelRequest,
+        prepared: Option<&AnthropicWireTools>,
+        check_final_tools: bool,
+    ) -> Option<InlineTools> {
+        let changes = self.tool_transcript.as_ref()?.changes_for(request)?;
+        let strict = self
+            .strict_tool_models
+            .as_ref()
+            .map_or(self.strict_tool_support, |models| {
+                models.get(&request.model).copied().unwrap_or(false)
+            });
+        let encode = |declaration: &ToolDeclaration| {
+            prepared
+                .and_then(|tools| {
+                    let index = tools
+                        .source
+                        .iter()
+                        .position(|active| active == declaration)?;
+                    tools.declarations.get(index).cloned()
+                })
+                .or_else(|| {
+                    resolve_anthropic_wire_tool(declaration, strict)
+                        .ok()
+                        .map(|(wire, _)| wire)
+                })
+        };
+        InlineTools::project(
+            changes,
+            request,
+            prepared,
+            encode,
+            self.tool_input_is_eager(&request.model),
+            check_final_tools,
+            self.oauth,
+        )
     }
 
     /// Use per-tool eager input streaming, or the legacy beta when disabled.
@@ -320,7 +389,10 @@ impl Anthropic {
             client: self.clone(),
             request: request.clone(),
             reservation,
-            wire_tools,
+            wire_tools: AnthropicWireTools {
+                source: declarations.to_vec(),
+                declarations: wire_tools,
+            },
             effective,
             snapshot,
         }))
@@ -567,6 +639,7 @@ impl Anthropic {
         mut request: reqwest::RequestBuilder,
         interleaved: bool,
         legacy_tool_streaming: bool,
+        inline_tools: bool,
         supports_managed_effort: bool,
         has_fallbacks: bool,
     ) -> reqwest::RequestBuilder {
@@ -598,7 +671,7 @@ impl Anthropic {
                 );
             }
         }
-        if has_fallbacks || supports_managed_effort {
+        if has_fallbacks || supports_managed_effort || inline_tools {
             let mut value = headers
                 .get(&beta)
                 .map_or_else(Vec::new, |value| value.as_bytes().to_vec());
@@ -606,6 +679,7 @@ impl Anthropic {
                 has_fallbacks.then_some(FALLBACK_BETA),
                 supports_managed_effort.then_some(EFFORT_BETA),
                 supports_managed_effort.then_some(THINKING_BINDING_BETA),
+                inline_tools.then_some(INLINE_TOOLS_BETA),
             ]
             .into_iter()
             .flatten()
@@ -628,16 +702,18 @@ impl Anthropic {
         request.headers(headers)
     }
 
+    fn tool_input_is_eager(&self, model: &str) -> bool {
+        self.eager_tool_input_models
+            .get(model)
+            .copied()
+            .unwrap_or(self.eager_tool_input_streaming)
+    }
+
     fn configure_tool_input_streaming(&self, model: &str, body: &mut Value) -> bool {
         let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
             return false;
         };
-        let eager = self
-            .eager_tool_input_models
-            .get(model)
-            .copied()
-            .unwrap_or(self.eager_tool_input_streaming);
-        if eager {
+        if self.tool_input_is_eager(model) {
             for tool in tools {
                 tool["eager_input_streaming"] = json!(true);
             }
@@ -1050,6 +1126,112 @@ async fn read_json(mut response: Response) -> Result<Value> {
     serde_json::from_slice(&bytes).map_err(|_| Error::Model("invalid Anthropic response".into()))
 }
 
+struct InlineTools {
+    initial: Vec<Value>,
+    updates: BTreeMap<usize, Vec<Value>>,
+}
+
+fn deferred_tool_placeholder() -> Value {
+    json!({
+        "name": DEFERRED_TOOL_PLACEHOLDER,
+        "description": "Reserved placeholder. Never available. Never call this.",
+        "input_schema": {"type":"object","properties":{},"required":[]},
+        "defer_loading": true,
+    })
+}
+
+fn tool_definition(tool: &ToolSpec) -> Value {
+    json!({
+        "name": tool.name,
+        "description": tool.description,
+        "input_schema": anthropic_input_schema(&tool.parameters, false),
+    })
+}
+
+impl InlineTools {
+    fn project(
+        changes: &[ToolTranscriptChange],
+        request: &ModelRequest,
+        prepared_tools: Option<&AnthropicWireTools>,
+        encode: impl Fn(&ToolDeclaration) -> Option<Value>,
+        eager: bool,
+        check_final_tools: bool,
+        oauth: bool,
+    ) -> Option<Self> {
+        let (initial, later) = changes.split_first()?;
+        if initial.message_index != 0 || initial.added.is_empty() {
+            // Anthropic requires at least one non-deferred top-level declaration.
+            return None;
+        }
+        if changes.iter().any(|change| {
+            change.message_index > request.messages.len()
+                || change
+                    .added
+                    .iter()
+                    .any(|tool| tool.spec.name == DEFERRED_TOOL_PLACEHOLDER)
+        }) {
+            return None;
+        }
+        let mut active: BTreeMap<_, _> = initial
+            .added
+            .iter()
+            .map(|tool| (&tool.spec.name, tool))
+            .collect();
+        if active.len() != initial.added.len()
+            || (oauth && !unique_oauth_tools(active.keys().copied()))
+        {
+            return None;
+        }
+        let mut updates = BTreeMap::<usize, Vec<Value>>::new();
+        for change in later {
+            let update = updates.entry(change.message_index).or_default();
+            for name in &change.removed {
+                if active.remove(name).is_some()
+                    && !change.added.iter().any(|tool| tool.spec.name == *name)
+                {
+                    update.push(json!({
+                        "type":"tool_removal", "tool":{"type":"tool_reference","name":name}
+                    }));
+                }
+            }
+            for tool in &change.added {
+                active.insert(&tool.spec.name, tool);
+                let mut definition = encode(tool)?;
+                if eager {
+                    definition["eager_input_streaming"] = json!(true);
+                }
+                update.push(json!({
+                    "type":"tool_addition", "tool":{"type":"tool_definition","definition":definition}
+                }));
+            }
+            if oauth && !unique_oauth_tools(active.keys().copied()) {
+                return None;
+            }
+        }
+        // Keep native constraints authoritative if an extension rewrites the
+        // final tool definitions after history was prepared.
+        if check_final_tools
+            && (active.len() != request.tools.len()
+                || request
+                    .tools
+                    .iter()
+                    .any(|tool| active.get(&tool.name).map(|active| &active.spec) != Some(tool))
+                || prepared_tools.is_some_and(|prepared| {
+                    prepared
+                        .source
+                        .iter()
+                        .any(|decl| active.get(&decl.spec.name).copied() != Some(decl))
+                }))
+        {
+            return None;
+        }
+        Some(Self {
+            initial: initial.added.iter().map(encode).collect::<Option<_>>()?,
+            updates,
+        })
+    }
+}
+
 fn tool_result_content(
     content: &str,
     is_structured: Option<bool>,
@@ -1087,23 +1269,42 @@ fn encode_request(
     allow_empty_signature: bool,
     supports_mid_conversation_system: bool,
     replay_effort: bool,
+    inline_tools: Option<InlineTools>,
 ) -> Result<Value> {
+    let (tools, mut updates) = match inline_tools {
+        Some(inline) => (inline.initial, inline.updates),
+        None => (
+            request.tools.iter().map(|tool| {
+                json!({"name":tool.name,"description":tool.description,"input_schema":tool.parameters})
+            }).collect(),
+            BTreeMap::new(),
+        ),
+    };
     let mut system = Vec::new();
     let mut pending_system = Vec::new();
     let mut pending_error_images = Vec::new();
     let mut tool_names = BTreeMap::new();
     let mut turns: Vec<(&str, Vec<Value>, Option<&'static str>)> = Vec::new();
+    let end = request.messages.len();
     for (index, message) in request.messages.into_iter().enumerate() {
         let mut prior_effort = None;
         let is_tool_result = matches!(&message, Message::Tool { .. });
+        let mut tool_update = updates.remove(&index).unwrap_or_default();
+        if !matches!(message, Message::System { .. }) && !tool_update.is_empty() {
+            pending_system.push(("system", std::mem::take(&mut tool_update), None));
+        }
         let (role, blocks) = match message {
             Message::System { content } => {
                 if index == 0 || !supports_mid_conversation_system {
                     if !content.is_empty() {
                         system.push(content);
                     }
-                } else if let Some(block) = text_block(content) {
-                    pending_system.push(("system", vec![block], None));
+                } else {
+                    let mut blocks: Vec<_> = text_block(content).into_iter().collect();
+                    blocks.append(&mut tool_update);
+                    if !blocks.is_empty() {
+                        pending_system.push(("system", blocks, None));
+                    }
                 }
                 continue;
             }
@@ -1200,7 +1401,8 @@ fn encode_request(
         if !is_tool_result && let Some(("user", content, _)) = turns.last_mut() {
             content.append(&mut pending_error_images);
         }
-        // System updates cannot separate an assistant tool call from its result.
+        // Pi holds updates until the next assistant message or the end of the transcript.
+        // This leaves every assistant tool call adjacent to its results.
         if role == "assistant" {
             turns.append(&mut pending_system);
         }
@@ -1222,6 +1424,9 @@ fn encode_request(
     if let Some(("user", content, _)) = turns.last_mut() {
         content.append(&mut pending_error_images);
     }
+    if let Some(blocks) = updates.remove(&end) {
+        pending_system.push(("system", blocks, None));
+    }
     turns.append(&mut pending_system);
     let messages: Vec<_> = turns
         .into_iter()
@@ -1236,10 +1441,8 @@ fn encode_request(
     if !system.is_empty() {
         body["system"] = json!(system.join("\n\n"));
     }
-    if !request.tools.is_empty() {
-        body["tools"] = json!(request.tools.into_iter().map(|tool| {
-            json!({"name":tool.name,"description":tool.description,"input_schema":tool.parameters})
-        }).collect::<Vec<_>>());
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
     }
     Ok(body)
 }
@@ -1270,7 +1473,7 @@ fn apply_cache_control(body: &mut Value, retention: CacheRetention, cache_tools:
             .and_then(|blocks| blocks.last_mut())
         && matches!(
             block["type"].as_str(),
-            Some("text" | "image" | "tool_result")
+            Some("text" | "image" | "tool_result" | "tool_addition" | "tool_removal")
         )
     {
         block["cache_control"] = control;
@@ -1305,6 +1508,13 @@ fn oauth_tool_name(name: &str) -> &str {
         .unwrap_or(name)
 }
 
+fn unique_oauth_tools<'a>(names: impl IntoIterator<Item = &'a String>) -> bool {
+    let mut canonical = BTreeSet::new();
+    names
+        .into_iter()
+        .all(|name| canonical.insert(oauth_tool_name(name).to_ascii_lowercase()))
+}
+
 fn prepare_oauth_request(body: &mut Value, retention: CacheRetention) {
     let mut identity =
         json!({"type":"text", "text":"You are Claude Code, Anthropic's official CLI for Claude."});
@@ -1329,10 +1539,14 @@ fn prepare_oauth_request(body: &mut Value, retention: CacheRetention) {
         for message in messages {
             if let Some(blocks) = message["content"].as_array_mut() {
                 for block in blocks {
-                    if block["type"] == "tool_use"
-                        && let Some(name) = block["name"].as_str()
-                    {
-                        block["name"] = json!(oauth_tool_name(name));
+                    let tool = match block["type"].as_str() {
+                        Some("tool_use") => block,
+                        Some("tool_addition") => &mut block["tool"]["definition"],
+                        Some("tool_removal") => &mut block["tool"],
+                        _ => continue,
+                    };
+                    if let Some(name) = tool["name"].as_str() {
+                        tool["name"] = json!(oauth_tool_name(name));
                     }
                 }
             }
@@ -1605,11 +1819,16 @@ impl StreamUsage {
     }
 }
 
+struct AnthropicWireTools {
+    source: Vec<ToolDeclaration>,
+    declarations: Vec<Value>,
+}
+
 struct PreparedAnthropicDispatch {
     client: Anthropic,
     request: ModelRequest,
     reservation: ModelRequest,
-    wire_tools: Vec<Value>,
+    wire_tools: AnthropicWireTools,
     effective: Vec<pi_rs_core::EffectiveToolDeclaration>,
     snapshot: pi_rs_core::ToolDecisionSnapshot,
 }
@@ -1707,45 +1926,10 @@ fn resolve_tools(
     let mut wire = Vec::new();
     let mut effective = Vec::new();
     for declaration in declarations {
-        let spec = &declaration.spec;
-        // Removing a root constraint would change what strict sampling promises.
-        // Fall back or fail before advertising such a decision.
-        let root_combinator = ["anyOf", "oneOf", "allOf"]
-            .iter()
-            .any(|key| spec.parameters.get(key).is_some());
-        let strict = match &declaration.constrained_sampling {
-            Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => {
-                pi_rs_core::resolve_strict_tool_schema(
-                    &spec.name,
-                    &spec.parameters,
-                    *strict,
-                    supported && !root_combinator,
-                    anthropic_unsupported_keyword,
-                )
-                .map_err(|error| Error::Config(error.to_string()))?
-            }
-            _ => None,
-        };
-        let sampling = if strict.is_some() {
-            pi_rs_core::EffectiveToolSampling::StrictJsonSchema {
-                original_schema: spec.parameters.clone(),
-                normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
-            }
-        } else {
-            pi_rs_core::EffectiveToolSampling::Unconstrained
-        };
-        let schema = anthropic_input_schema(
-            strict.as_ref().unwrap_or(&spec.parameters),
-            strict.is_some(),
-        );
-        let mut tool =
-            json!({"name":spec.name,"description":spec.description,"input_schema":schema});
-        if strict.is_some() {
-            tool["strict"] = json!(true);
-        }
+        let (tool, sampling) = resolve_anthropic_wire_tool(declaration, supported)?;
         wire.push(tool);
         effective.push(pi_rs_core::EffectiveToolDeclaration {
-            spec: spec.clone(),
+            spec: declaration.spec.clone(),
             sampling,
         });
     }
@@ -1754,10 +1938,66 @@ fn resolve_tools(
     Ok((wire, effective))
 }
 
+fn resolve_anthropic_wire_tool(
+    declaration: &ToolDeclaration,
+    supported: bool,
+) -> Result<(Value, pi_rs_core::EffectiveToolSampling)> {
+    let spec = &declaration.spec;
+    // Removing a root constraint would change what strict sampling promises.
+    // Fall back or fail before advertising such a decision.
+    let root_combinator = ["anyOf", "oneOf", "allOf"]
+        .iter()
+        .any(|key| spec.parameters.get(key).is_some());
+    let strict = match &declaration.constrained_sampling {
+        Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => {
+            pi_rs_core::resolve_strict_tool_schema(
+                &spec.name,
+                &spec.parameters,
+                *strict,
+                supported && !root_combinator,
+                anthropic_unsupported_keyword,
+            )
+            .map_err(|error| Error::Config(error.to_string()))?
+        }
+        _ => None,
+    };
+    let sampling = if strict.is_some() {
+        pi_rs_core::EffectiveToolSampling::StrictJsonSchema {
+            original_schema: spec.parameters.clone(),
+            normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
+        }
+    } else {
+        pi_rs_core::EffectiveToolSampling::Unconstrained
+    };
+    let schema = anthropic_input_schema(
+        strict.as_ref().unwrap_or(&spec.parameters),
+        strict.is_some(),
+    );
+    let mut tool = json!({"name":spec.name,"description":spec.description,"input_schema":schema});
+    if strict.is_some() {
+        tool["strict"] = json!(true);
+    }
+    Ok((tool, sampling))
+}
+
 #[async_trait::async_trait]
 impl Model for Anthropic {
     fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
         self.mid_conversation_system_models.contains(model)
+    }
+
+    fn uses_tool_transcript(&self, model: &str) -> bool {
+        self.supports_tool_transcript(model)
+    }
+
+    async fn prepare_context_with_tool_transcript<'a>(
+        &'a self,
+        request: &ModelRequest,
+        changes: &[ToolTranscriptChange],
+    ) -> Result<Option<Arc<dyn Model + 'a>>> {
+        Ok(self.supports_tool_transcript(&request.model).then(|| {
+            Arc::new(self.clone().with_tool_transcript(request, changes)) as Arc<dyn Model>
+        }))
     }
 
     async fn prepare_tool_dispatch<'a>(
@@ -1845,6 +2085,27 @@ impl Model for Anthropic {
         } else {
             pi_rs_core::protected_model_fingerprint(&identity)
         }?;
+        if self.tool_transcript.is_some() {
+            return None;
+        }
+        let base = if self.mid_conversation_system_models.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "mid-conversation-system-v1",
+                self.mid_conversation_system_models.as_ref(),
+            ))?
+        };
+        let base = if self.inline_tool_models.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "inline-tools-v1",
+                self.inline_tool_models.as_ref(),
+            ))?
+        };
         let base = if self.eager_tool_input_streaming && self.eager_tool_input_models.is_empty() {
             base
         } else {
@@ -1925,6 +2186,29 @@ impl Model for Anthropic {
             }
             _ => Some(base),
         }
+    }
+
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        let mut base = request.clone();
+        base.messages.clear();
+        let messages = request
+            .messages
+            .iter()
+            .map(|message| self.estimate_message_tokens(request, message))
+            .fold(0, u64::saturating_add);
+        let mut tools = pi_rs_core::estimate_request_tokens(&base);
+        if let Some(mut inline) = self.inline_tools(request, None, false) {
+            inline.initial.push(deferred_tool_placeholder());
+            let checkpoints = inline
+                .updates
+                .values()
+                .map(|blocks| pi_rs_core::estimate_replay_tokens(blocks))
+                .fold(0, u64::saturating_add);
+            tools = tools.max(
+                pi_rs_core::estimate_replay_tokens(&inline.initial).saturating_add(checkpoints),
+            );
+        }
+        tools.saturating_add(messages)
     }
 
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
@@ -2085,7 +2369,7 @@ impl Anthropic {
     async fn stream_detailed_with_tools(
         &self,
         mut request: ModelRequest,
-        wire_tools: Option<Vec<Value>>,
+        wire_tools: Option<AnthropicWireTools>,
     ) -> Result<pi_rs_core::DetailedModelStream> {
         let discovered = if self.thinking_level.is_some() {
             self.model(&request.model).await
@@ -2122,15 +2406,10 @@ impl Anthropic {
         let edited_scope = pi_rs_core::endpoint_replay_scope(&replay_scope, self.endpoint.as_str());
         let oauth_tool_names: Vec<String> = if self.oauth {
             let names: Vec<String> = request.tools.iter().map(|tool| tool.name.clone()).collect();
-            for (index, name) in names.iter().enumerate() {
-                if names[..index]
-                    .iter()
-                    .any(|other| other.eq_ignore_ascii_case(name))
-                {
-                    return Err(Error::Config(
-                        "Anthropic OAuth tool names must be unique ignoring case".into(),
-                    ));
-                }
+            if !unique_oauth_tools(&names) {
+                return Err(Error::Config(
+                    "Anthropic OAuth tool names must be unique ignoring case".into(),
+                ));
             }
             names
         } else {
@@ -2138,6 +2417,16 @@ impl Anthropic {
         };
         let copilot = (self.provider.as_ref() == "github-copilot")
             .then(|| pi_rs_core::copilot_request_headers(&request.messages).collect::<Vec<_>>());
+        let has_active_tools = !request.tools.is_empty();
+        let wire_tools = wire_tools.or_else(|| {
+            self.supports_tool_transcript(&request.model)
+                .then(|| AnthropicWireTools {
+                    source: Vec::new(),
+                    declarations: request.tools.iter().map(tool_definition).collect(),
+                })
+        });
+        let inline_tools = self.inline_tools(&request, wire_tools.as_ref(), true);
+        let native_tool_changes = inline_tools.is_some();
         let mut thinking = json!({});
         let managed_effort_model = self.managed_effort_models.get(&requested_model).copied();
         let supports_managed_effort = managed_effort_model.is_some();
@@ -2178,11 +2467,13 @@ impl Anthropic {
             self.mid_conversation_system_models
                 .contains(&requested_model),
             active_effort.is_some(),
+            inline_tools,
         )?;
-        if let Some(tools) = wire_tools
-            && !tools.is_empty()
+        if !native_tool_changes
+            && let Some(tools) = wire_tools
+            && !tools.declarations.is_empty()
         {
-            body["tools"] = json!(tools);
+            body["tools"] = json!(tools.declarations);
         }
         let fallbacks = self
             .fallback_models
@@ -2200,6 +2491,12 @@ impl Anthropic {
         let legacy_tool_streaming =
             self.configure_tool_input_streaming(&requested_model, &mut body);
         apply_cache_control(&mut body, self.cache_retention, self.cache_tools);
+        if native_tool_changes {
+            body["tools"]
+                .as_array_mut()
+                .expect("initial tools")
+                .push(deferred_tool_placeholder());
+        }
         if self.oauth {
             prepare_oauth_request(&mut body, self.cache_retention);
         }
@@ -2239,7 +2536,8 @@ impl Anthropic {
         let request = self.authenticate(
             request.json(&body),
             interleaved,
-            legacy_tool_streaming,
+            legacy_tool_streaming && has_active_tools,
+            native_tool_changes,
             supports_managed_effort,
             !fallbacks.is_empty(),
         );
@@ -2992,6 +3290,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap();
         let (wire, _) = super::resolve_tools(&request, &[declaration], false).unwrap();
@@ -3174,9 +3473,11 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap();
-        let other = encode_request(request, &custom.replay_scope, "", false, false, false).unwrap();
+        let other =
+            encode_request(request, &custom.replay_scope, "", false, false, false, None).unwrap();
         assert!(same.to_string().contains("secret"));
         assert!(!other.to_string().contains("secret"));
     }
@@ -4343,7 +4644,7 @@ mod tests {
             tools: vec![],
             max_output_tokens: 16,
         };
-        let body = encode_request(request, "anthropic", &scope, false, false, false).unwrap();
+        let body = encode_request(request, "anthropic", &scope, false, false, false, None).unwrap();
         assert_eq!(
             body["messages"][0]["content"],
             json!([{"type":"text","text":"first \n"},{"type":"text","text":"second"},{"type":"thinking","thinking":"secret","signature":"sig"}])
@@ -4378,10 +4679,19 @@ mod tests {
             tools: vec![],
             max_output_tokens: 16,
         };
-        let same =
-            encode_request(request.clone(), "anthropic", &scope_a, false, false, false).unwrap();
+        let same = encode_request(
+            request.clone(),
+            "anthropic",
+            &scope_a,
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(same["messages"][1]["content"][0]["thinking"], "secret");
-        let other = encode_request(request, "anthropic", &scope_b, false, false, false).unwrap();
+        let other =
+            encode_request(request, "anthropic", &scope_b, false, false, false, None).unwrap();
         assert_eq!(other["messages"].as_array().unwrap().len(), 1);
         assert!(!other.to_string().contains("secret"));
     }
@@ -4415,14 +4725,23 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
             same["messages"][0]["content"],
             json!([{"type":"thinking","thinking":"secret","signature":"signed"},{"type":"text","text":"answer"}])
         );
-        let other =
-            encode_request(make("other"), "anthropic", "anthropic", false, false, false).unwrap();
+        let other = encode_request(
+            make("other"),
+            "anthropic",
+            "anthropic",
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             other["messages"][0]["content"],
             json!([{"type":"text","text":"answer"}])
@@ -4472,7 +4791,7 @@ mod tests {
                 system("last instruction"),
             ],
         };
-        let mut native = encode_request(request.clone(), "", "", false, true, false).unwrap();
+        let mut native = encode_request(request.clone(), "", "", false, true, false, None).unwrap();
         assert_eq!(native["system"], "base");
         assert_eq!(
             native["messages"]
@@ -4511,12 +4830,330 @@ mod tests {
             json!({"type":"ephemeral"})
         );
 
-        let folded = encode_request(request, "", "", false, false, false).unwrap();
+        let folded = encode_request(request, "", "", false, false, false, None).unwrap();
         assert_eq!(
             folded["system"],
             "base\n\nwhile the tool runs\n\nnext instruction\n\nlast instruction"
         );
         assert_eq!(folded["messages"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn inline_tool_history_falls_back_when_required_schema_or_oauth_names_are_unsafe() {
+        let request = ModelRequest {
+            model: "claude".into(),
+            messages: vec![Message::User {
+                content: "next".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 32,
+        };
+        let models = BTreeSet::from([request.model.clone()]);
+        let route = |client: Anthropic| {
+            client
+                .with_mid_conversation_system_models(models.clone())
+                .with_inline_tool_models(models.clone())
+        };
+        let named = |name: &str| ToolDeclaration {
+            spec: ToolSpec {
+                name: name.into(),
+                description: name.into(),
+                parameters: json!({"type":"object","properties":{}}),
+            },
+            constrained_sampling: None,
+        };
+        let mut strict = named("read");
+        strict.constrained_sampling = Some(pi_rs_core::ToolConstraint::JsonSchema {
+            strict: pi_rs_core::StrictToolPolicy::Require,
+        });
+        let history = [
+            ToolTranscriptChange {
+                message_index: 0,
+                added: vec![strict],
+                removed: vec![],
+            },
+            ToolTranscriptChange {
+                message_index: 1,
+                added: vec![],
+                removed: vec!["read".into(), "stale".into()],
+            },
+        ];
+        let api_key = route(Anthropic::new("http://localhost/v1/messages", "fixture").unwrap());
+        assert!(
+            api_key
+                .clone()
+                .with_tool_transcript(&request, &history)
+                .inline_tools(&request, None, true)
+                .is_none()
+        );
+        let supported = api_key
+            .with_strict_tool_support(true)
+            .with_tool_transcript(&request, &history);
+        let inline = supported.inline_tools(&request, None, true).unwrap();
+        assert_eq!(inline.initial[0]["strict"], true);
+        assert_eq!(inline.updates[&1].len(), 1);
+        assert_eq!(inline.updates[&1][0]["tool"]["name"], "read");
+
+        let history = [
+            ToolTranscriptChange {
+                message_index: 0,
+                added: vec![named("read"), named("Read")],
+                removed: vec![],
+            },
+            ToolTranscriptChange {
+                message_index: 1,
+                added: vec![],
+                removed: vec!["read".into(), "Read".into()],
+            },
+        ];
+        let oauth =
+            route(Anthropic::with_oauth_token("http://localhost/v1/messages", "fixture").unwrap())
+                .with_tool_transcript(&request, &history);
+        assert!(oauth.inline_tools(&request, None, true).is_none());
+    }
+
+    #[tokio::test]
+    async fn inline_tool_changes_are_sent_with_the_stable_initial_catalog() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            (0..5).map(|_| {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = BufReader::new(&mut socket);
+                let mut headers = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(request.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    headers.push(line.to_ascii_lowercase());
+                }
+                let length = headers.iter().find_map(|line| {
+                    line.strip_prefix("content-length: ")?.trim().parse().ok()
+                }).unwrap();
+                let mut bytes = vec![0; length];
+                request.read_exact(&mut bytes).unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                (headers, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }).collect::<Vec<_>>()
+        });
+        let model = "claude";
+        let models = BTreeSet::from([model.into()]);
+        let client = Anthropic::new(&endpoint, "fixture")
+            .unwrap()
+            .with_context_probe(false)
+            .with_mid_conversation_system_models(models.clone())
+            .with_inline_tool_models(models)
+            .with_strict_tool_support(true)
+            .with_cache_retention(CacheRetention::Short, true);
+        let make_tool = |name: &str, description: &str| ToolDeclaration {
+            spec: ToolSpec {
+                name: name.into(),
+                description: description.into(),
+                parameters: json!({"type":"object","properties":{}}),
+            },
+            constrained_sampling: None,
+        };
+        let read = make_tool("read", "old");
+        let mut write = make_tool("write", "initial only");
+        write.constrained_sampling = Some(pi_rs_core::ToolConstraint::JsonSchema {
+            strict: pi_rs_core::StrictToolPolicy::Require,
+        });
+        let redefined = make_tool("read", "new");
+        let added = make_tool("search", "new name");
+        let start = ToolTranscriptChange {
+            message_index: 0,
+            added: vec![read, write],
+            removed: vec![],
+        };
+        let mut initial = ModelRequest {
+            model: model.into(),
+            messages: vec![
+                Message::System {
+                    content: "base prompt".into(),
+                },
+                Message::User {
+                    content: "prompt".into(),
+                },
+            ],
+            tools: start.added.iter().map(|tool| tool.spec.clone()).collect(),
+            max_output_tokens: 32,
+        };
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "fixture".into(),
+            summary: false,
+        };
+        let prepared = client
+            .clone()
+            .with_tool_transcript(&initial, std::slice::from_ref(&start))
+            .prepare_bound_tool_dispatch(&initial, &start.added, &context)
+            .unwrap();
+        drop(prepared.dispatch().await.unwrap());
+
+        initial.messages.extend([
+            Message::Assistant {
+                content: String::new(),
+                calls: vec![ToolCall {
+                    id: "call".into(),
+                    name: "write".into(),
+                    arguments: "{}".into(),
+                }],
+                replay: None,
+            },
+            Message::System {
+                content: "updated instructions".into(),
+            },
+            Message::Tool {
+                call_id: "call".into(),
+                content: json!({"data":{"content":[
+                    {"type":"text","text":"failed"},
+                    {"type":"image","mimeType":"image/png","data":"Zml4dHVyZQ=="}
+                ]}})
+                .to_string(),
+                is_error: true,
+                is_structured: Some(true),
+            },
+        ]);
+        initial.tools = vec![redefined.spec.clone(), added.spec.clone()];
+        let change = ToolTranscriptChange {
+            message_index: 3,
+            added: vec![redefined, added],
+            removed: vec!["read".into(), "write".into()],
+        };
+        let bound = client
+            .clone()
+            .with_tool_transcript(&initial, &[start.clone(), change.clone()]);
+        assert!(bound.estimate_request_tokens(&initial) > client.estimate_request_tokens(&initial));
+        let mut reservation = initial.clone();
+        reservation.tools[0].parameters["additionalProperties"] = json!(false);
+        assert!(bound.inline_tools(&reservation, None, true).is_none());
+        assert!(
+            bound.estimate_request_tokens(&reservation)
+                > client.estimate_request_tokens(&reservation)
+        );
+        drop(bound.stream(initial.clone()).await.unwrap());
+        drop(
+            bound
+                .clone()
+                .with_headers(HeaderMap::from_iter([(
+                    HeaderName::from_static("anthropic-beta"),
+                    HeaderValue::from_static("custom-feature"),
+                )]))
+                .with_managed_effort_models(BTreeMap::from([(model.into(), true)]))
+                .with_thinking(Some("high"))
+                .stream(initial.clone())
+                .await
+                .unwrap(),
+        );
+        // A bound history for a different request falls back to current tools.
+        initial.messages.push(Message::User {
+            content: "new request".into(),
+        });
+        drop(bound.stream(initial.clone()).await.unwrap());
+        assert!(
+            InlineTools::project(
+                std::slice::from_ref(&change),
+                &initial,
+                None,
+                |tool| Some(tool_definition(&tool.spec)),
+                true,
+                true,
+                false
+            )
+            .is_none()
+        );
+        let remove_all = ToolTranscriptChange {
+            message_index: initial.messages.len() - 1,
+            added: vec![],
+            removed: initial.tools.drain(..).map(|tool| tool.name).collect(),
+        };
+        drop(
+            client
+                .with_eager_tool_input_streaming(false, BTreeMap::new())
+                .with_tool_transcript(&initial, &[start, change, remove_all])
+                .stream(initial)
+                .await
+                .unwrap(),
+        );
+
+        let mut requests = server.join().unwrap().into_iter();
+        let (first_headers, first) = requests.next().unwrap();
+        let (headers, body) = requests.next().unwrap();
+        let (managed_headers, managed) = requests.next().unwrap();
+        assert!(managed_headers.iter().any(|header| {
+            header.trim_end()
+                == format!(
+                    "anthropic-beta: custom-feature,{EFFORT_BETA},{THINKING_BINDING_BETA},{INLINE_TOOLS_BETA}"
+                )
+        }));
+        assert_eq!(managed["output_config"]["effort"], "low");
+        assert_eq!(managed["messages"][3], body["messages"][3]);
+        assert_eq!(managed["messages"][4], effort_message("high"));
+        let (fallback_headers, fallback) = requests.next().unwrap();
+        let (removed_headers, removed) = requests.next().unwrap();
+        assert!(
+            !removed_headers
+                .iter()
+                .any(|line| line.contains(FINE_GRAINED_TOOL_STREAMING_BETA))
+        );
+        assert_eq!(
+            removed["messages"].as_array().unwrap().last().unwrap()["content"][1]["type"],
+            "tool_removal"
+        );
+        let has_beta = |headers: Vec<String>| {
+            headers.iter().any(|line| {
+                line.starts_with("anthropic-beta: ") && line.contains(INLINE_TOOLS_BETA)
+            })
+        };
+        assert!(has_beta(first_headers));
+        assert!(has_beta(headers));
+        assert!(!has_beta(fallback_headers));
+        assert!(has_beta(removed_headers));
+        assert_eq!(first["tools"], body["tools"]);
+        assert_eq!(body["tools"][1]["name"], "write");
+        assert_eq!(body["tools"][1]["strict"], true);
+        assert_eq!(
+            body["tools"][1]["input_schema"]["additionalProperties"],
+            false
+        );
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["tools"][2]["name"], DEFERRED_TOOL_PLACEHOLDER);
+        assert_eq!(body["tools"][2]["defer_loading"], true);
+        assert!(body["tools"][2].get("eager_input_streaming").is_none());
+        assert!(body["tools"][2].get("cache_control").is_none());
+        assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            body["messages"][2]["content"][1]["text"],
+            "Images from the error result of tool call call (write):"
+        );
+        assert_eq!(body["messages"][2]["content"][2]["type"], "image");
+        let update = body["messages"][3]["content"].as_array().unwrap();
+        assert_eq!(update.len(), 4);
+        assert_eq!(update[0]["text"], "updated instructions");
+        assert_eq!(
+            update[1],
+            json!({"type":"tool_removal","tool":{"type":"tool_reference","name":"write"}})
+        );
+        assert_eq!(update[2]["tool"]["definition"]["description"], "new");
+        assert_eq!(
+            update[3]["tool"]["definition"]["eager_input_streaming"],
+            true
+        );
+        assert_eq!(update[3]["cache_control"]["type"], "ephemeral");
+        assert!(
+            update[3]["tool"]["definition"]
+                .get("cache_control")
+                .is_none()
+        );
+        assert_eq!(fallback["tools"][0]["description"], "new");
+        assert_eq!(fallback["tools"][0]["input_schema"]["required"], json!([]));
+        assert_eq!(fallback["tools"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -4589,7 +5226,8 @@ mod tests {
                 },
             ],
         };
-        let body = encode_request(request.clone(), "anthropic", "", false, true, true).unwrap();
+        let body =
+            encode_request(request.clone(), "anthropic", "", false, true, true, None).unwrap();
         let result = &body["messages"][2]["content"];
         assert_eq!(result[0]["tool_use_id"], "failed");
         assert_eq!(result[0]["is_error"], true);
@@ -4618,7 +5256,8 @@ mod tests {
         let mut trailing = request;
         trailing.messages.pop();
         trailing.messages.remove(3);
-        let mut trailing = encode_request(trailing, "anthropic", "", false, true, true).unwrap();
+        let mut trailing =
+            encode_request(trailing, "anthropic", "", false, true, true, None).unwrap();
         assert_eq!(result, &trailing["messages"][2]["content"]);
         apply_cache_control(&mut trailing, CacheRetention::Short, true);
         assert_eq!(
@@ -4657,6 +5296,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap();
         let blocks = body["messages"]
