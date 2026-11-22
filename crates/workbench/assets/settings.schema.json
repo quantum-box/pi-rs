@@ -21,7 +21,15 @@
         "enabled": { "type": "boolean" },
         "maxRetries": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
         "baseDelayMs": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-        "maxAgentDelayMs": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+        "maxAgentDelayMs": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "provider": {
+          "type": "object",
+          "properties": {
+            "maxRetries": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "maxRetryDelayMs": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            "timeoutMs": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+          }
+        }
       }
     },
     "compaction": {
@@ -110,6 +118,12 @@
     },
     "treeFilterMode": {
       "enum": ["default", "no-tools", "user-only", "labeled-only", "all"]
+    },
+    "warnings": {
+      "type": "object",
+      "properties": {
+        "anthropicExtraUsage": { "type": "boolean", "default": true }
+      }
     },
     "extensions": {
       "type": "array",

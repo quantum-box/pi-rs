@@ -206,6 +206,10 @@ enum ProtocolRequest {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
     },
+    TurnEndBoundary {
+        event: pi_rs_core::TurnEndBoundary,
+        state: Option<ExtensionState>,
+    },
     AfterProviderResponse {
         event: pi_rs_core::ProviderResponseEvent,
         state: Option<ExtensionState>,
@@ -407,10 +411,14 @@ struct Description {
     mcp_server_declarations: Vec<pi_rs_core::McpServerDeclaration>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     mcp_servers_change_hook: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    mcp_registry_host_calls: bool,
     #[serde(default)]
     lifecycle_hook: bool,
     #[serde(default)]
     agent_before_settle_hook: bool,
+    #[serde(default)]
+    turn_end_boundary_hook: bool,
     #[serde(default)]
     lifecycle_host_calls: bool,
     #[serde(default)]
@@ -901,6 +909,22 @@ impl ExecutableExtension {
 
 #[async_trait::async_trait]
 impl Extension for ExecutableExtension {
+    fn handles_turn_end_boundary(&self) -> bool {
+        self.description.turn_end_boundary_hook
+    }
+
+    async fn turn_end_boundary(
+        &self,
+        event: &pi_rs_core::TurnEndBoundary,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<pi_rs_core::BoundaryDecision> {
+        self.request_async(ProtocolRequest::TurnEndBoundary {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+
     fn handles_agent_before_settle(&self) -> bool {
         self.description.agent_before_settle_hook
     }
@@ -1279,6 +1303,40 @@ impl Extension for ExecutableExtension {
         })
         .await
     }
+    fn handles_mcp_registry(&self) -> bool {
+        self.description.mcp_registry_host_calls
+    }
+
+    async fn lifecycle_with_mcp_registry(
+        &self,
+        event: &LifecycleEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+        mcp: Arc<dyn pi_rs_core::McpRegistryHost>,
+    ) -> ExtensionResult<()> {
+        if matches!(event, LifecycleEvent::McpServersChange { .. })
+            && !self.handles_mcp_servers_change()
+        {
+            return Ok(());
+        }
+        if !self.handles_mcp_registry() {
+            return self.lifecycle_with_host(event, state, host).await;
+        }
+        let request = ProtocolRequest::Lifecycle {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let endpoint = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancellation = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            call_duplex_inner(&endpoint, request, host, &cancellation, &runtime, Some(mcp))
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
     async fn lifecycle_with_host(
         &self,
         event: &LifecycleEvent,
@@ -2507,10 +2565,19 @@ struct DuplexRequest {
     has_keyed_messages: bool,
     #[serde(default)]
     has_prevalidated_calls: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    has_mcp_registry: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DuplexFrame {
+    ListMcpServers,
+    RegisterMcpServer {
+        server: pi_rs_core::McpServerDeclaration,
+    },
+    UnregisterMcpServer {
+        name: String,
+    },
     ListCustomEntries {
         #[serde(default)]
         custom_type: Option<String>,
@@ -2945,10 +3012,21 @@ fn serve_bash_stream(extension: Arc<dyn Extension>) -> Result<()> {
 
 fn call_duplex<T: serde::de::DeserializeOwned>(
     endpoint: &Endpoint,
+    request: ProtocolRequest,
+    host: Arc<dyn ToolHost>,
+    cancellation: &CancellationToken,
+    runtime: &tokio::runtime::Handle,
+) -> ExtensionResult<T> {
+    call_duplex_inner(endpoint, request, host, cancellation, runtime, None)
+}
+
+fn call_duplex_inner<T: serde::de::DeserializeOwned>(
+    endpoint: &Endpoint,
     mut request: ProtocolRequest,
     host: Arc<dyn ToolHost>,
     cancellation: &CancellationToken,
     runtime: &tokio::runtime::Handle,
+    mcp: Option<Arc<dyn pi_rs_core::McpRegistryHost>>,
 ) -> ExtensionResult<T> {
     project_overflow_reason(&mut request, endpoint.compaction_overflow_reason_v1);
     if let ProtocolRequest::Lifecycle {
@@ -2993,7 +3071,10 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
             let frame = read_duplex_frame_with_presence(&mut output, presence);
             let terminal = !matches!(
                 frame,
-                Ok(DuplexFrame::Call { .. }
+                Ok(DuplexFrame::ListMcpServers
+                    | DuplexFrame::RegisterMcpServer { .. }
+                    | DuplexFrame::UnregisterMcpServer { .. }
+                    | DuplexFrame::Call { .. }
                     | DuplexFrame::CheckedCall { .. }
                     | DuplexFrame::SendMessage { .. }
                     | DuplexFrame::AppendEntry { .. }
@@ -3018,6 +3099,7 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
             has_custom_entry_read: host.supports_custom_entry_read(),
             has_keyed_messages: host.supports_keyed_messages(),
             has_prevalidated_calls: host.supports_prevalidated_call_accounting(),
+            has_mcp_registry: mcp.is_some(),
         })
         .map_err(|error| error.to_string())?,
     )?;
@@ -3031,6 +3113,30 @@ fn call_duplex<T: serde::de::DeserializeOwned>(
             return Err(error);
         }
         match frames.recv_timeout(Duration::from_millis(5)) {
+            Ok(Ok(
+                frame @ (DuplexFrame::ListMcpServers
+                | DuplexFrame::RegisterMcpServer { .. }
+                | DuplexFrame::UnregisterMcpServer { .. }),
+            )) => {
+                let response: ExtensionResult<Value> = runtime.block_on(async {
+                    let Some(mcp) = &mcp else {
+                        return Err("MCP registry access is unavailable".into());
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err("native extension cancelled during MCP registration".into()),
+                        result = async {
+                            match frame {
+                                DuplexFrame::ListMcpServers => encode(mcp.mcp_servers().await),
+                                DuplexFrame::RegisterMcpServer { server } => encode(mcp.register_mcp_server(server).await),
+                                DuplexFrame::UnregisterMcpServer { name } => encode(mcp.unregister_mcp_server(&name).await),
+                                _ => unreachable!("matched MCP registry frames"),
+                            }
+                        } => result,
+                    }
+                });
+                send(serde_json::to_value(response).map_err(|error| error.to_string())?)?;
+            }
             Ok(Ok(DuplexFrame::ListCustomEntries { custom_type })) => {
                 let response = runtime.block_on(async {
                     tokio::select! {
@@ -3401,6 +3507,51 @@ impl ToolHost for RemoteHost {
         .await
     }
 }
+struct RemoteMcpRegistry(Arc<RemoteHost>);
+
+impl RemoteMcpRegistry {
+    async fn request<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        frame: DuplexFrame,
+    ) -> ExtensionResult<T> {
+        let host = self.0.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut io = host
+                .io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            if !host
+                .entry_lifetime
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err("MCP registry callback has finished".into());
+            }
+            duplex_write_line(&mut io.1, &frame)?;
+            duplex_read_line::<ExtensionResult<T>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+}
+
+#[async_trait::async_trait]
+impl pi_rs_core::McpRegistryHost for RemoteMcpRegistry {
+    async fn mcp_servers(&self) -> ExtensionResult<Vec<pi_rs_core::RegisteredMcpServer>> {
+        self.request(DuplexFrame::ListMcpServers).await
+    }
+    async fn register_mcp_server(
+        &self,
+        server: pi_rs_core::McpServerDeclaration,
+    ) -> ExtensionResult<()> {
+        self.request(DuplexFrame::RegisterMcpServer { server })
+            .await
+    }
+    async fn unregister_mcp_server(&self, name: &str) -> ExtensionResult<bool> {
+        self.request(DuplexFrame::UnregisterMcpServer { name: name.into() })
+            .await
+    }
+}
+
 fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
     let mut input = std::io::BufReader::new(std::io::stdin());
     let request: DuplexRequest = duplex_read_line(&mut input).map_err(Error::Config)?;
@@ -3429,7 +3580,19 @@ fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let response = runtime.block_on(dispatch_with_host(extension, request.request, host.clone()));
+    let mcp = request
+        .has_mcp_registry
+        .then(|| Arc::new(RemoteMcpRegistry(host.clone())) as Arc<dyn pi_rs_core::McpRegistryHost>);
+    let response = if mcp.is_some() {
+        runtime.block_on(dispatch_inner(
+            extension,
+            request.request,
+            Some(host.clone()),
+            mcp,
+        ))
+    } else {
+        runtime.block_on(dispatch_with_host(extension, request.request, host.clone()))
+    };
     host.entry_lifetime
         .store(false, std::sync::atomic::Ordering::Release);
     let mut io = host
@@ -3814,7 +3977,7 @@ async fn dispatch(
     extension: Arc<dyn Extension>,
     request: ProtocolRequest,
 ) -> ExtensionResult<Value> {
-    dispatch_inner(extension, request, None).await
+    dispatch_inner(extension, request, None, None).await
 }
 
 async fn dispatch_with_host(
@@ -3822,13 +3985,14 @@ async fn dispatch_with_host(
     request: ProtocolRequest,
     host: Arc<dyn ToolHost>,
 ) -> ExtensionResult<Value> {
-    dispatch_inner(extension, request, Some(host)).await
+    dispatch_inner(extension, request, Some(host), None).await
 }
 
 async fn dispatch_inner(
     extension: Arc<dyn Extension>,
     request: ProtocolRequest,
     host: Option<Arc<dyn ToolHost>>,
+    mcp: Option<Arc<dyn pi_rs_core::McpRegistryHost>>,
 ) -> ExtensionResult<Value> {
     let host_available = host.is_some();
     let host = host.unwrap_or_else(|| Arc::new(DetachedHost));
@@ -3873,8 +4037,10 @@ async fn dispatch_inner(
             user_bash_operations_hook: extension.handles_user_bash_operations(),
             mcp_server_declarations: extension.mcp_server_declarations(),
             mcp_servers_change_hook: extension.handles_mcp_servers_change(),
+            mcp_registry_host_calls: extension.handles_mcp_registry(),
             lifecycle_hook: extension.handles_lifecycle(),
             agent_before_settle_hook: extension.handles_agent_before_settle(),
+            turn_end_boundary_hook: extension.handles_turn_end_boundary(),
             lifecycle_host_calls: true,
             tool_hook_host_calls: true,
             before_tool_host_calls: true,
@@ -4028,7 +4194,15 @@ async fn dispatch_inner(
             }
         }
         ProtocolRequest::Lifecycle { event, state } => {
-            if host.supports_custom_messages()
+            if let Some(mcp) = mcp
+                && extension.handles_mcp_registry()
+            {
+                let result = extension
+                    .lifecycle_with_mcp_registry(&event, state.as_ref(), host.clone(), mcp)
+                    .await;
+                host.close_custom_entry_scope();
+                encode(result)
+            } else if host.supports_custom_messages()
                 || host.supports_custom_entries()
                 || host.supports_custom_entry_read()
             {
@@ -4040,6 +4214,9 @@ async fn dispatch_inner(
             } else {
                 encode(extension.lifecycle(&event, state.as_ref()).await)
             }
+        }
+        ProtocolRequest::TurnEndBoundary { event, state } => {
+            encode(extension.turn_end_boundary(&event, state.as_ref()).await)
         }
         ProtocolRequest::AfterProviderResponse { event, state } => encode(
             extension
@@ -5558,6 +5735,57 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
     }
 
     #[tokio::test]
+    async fn actionable_turn_end_negotiates_separately_from_observation() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "turn-boundary"
+            }
+
+            fn handles_turn_end_boundary(&self) -> bool {
+                true
+            }
+
+            async fn turn_end_boundary(
+                &self,
+                event: &pi_rs_core::TurnEndBoundary,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<pi_rs_core::BoundaryDecision> {
+                assert_eq!(event.message_entry_id, 4);
+                assert_eq!(event.tool_result_entry_ids, [5]);
+                Ok(pi_rs_core::BoundaryDecision {
+                    entries: Some(event.entries.clone()),
+                    should_continue: Some(true),
+                })
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["turn_end_boundary_hook"], true);
+        assert_eq!(description["lifecycle_hook"], false);
+        let entry = serde_json::json!({"type":"context_edit","targetId":4,"replacement":null});
+        let request = serde_json::from_value(serde_json::json!({
+            "type": "turn_end_boundary",
+            "event": {
+                "runId": "00000000-0000-0000-0000-000000000000",
+                "turnIndex": 0, "messageEntryId":4,
+                "message":{"role":"assistant","content":"answer","calls":[]},
+                "toolResultEntryIds":[5], "toolResults":[],
+                "outcome": "completed", "entries":[entry], "continue":false,
+                "context":{"contextMessages":[],"pendingMessages":[],"canContinue":false}
+            }
+        }))
+        .unwrap();
+        let response = dispatch(extension, request).await.unwrap();
+        assert_eq!(response["entries"][0], entry);
+        assert_eq!(response["continue"], true);
+    }
+
+    #[tokio::test]
     async fn agent_before_settle_capability_carries_structural_decisions() {
         struct Hook;
 
@@ -6941,6 +7169,56 @@ else:
             )
             .await
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_live_mcp_registration_executable_uses_scoped_duplex_requests() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    descriptor={'id':'register-mcp','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'session_lifecycle_hook':True,'mcp_registry_host_calls':True}
+    print(json.dumps({'version':1,'response':{'Ok':descriptor}}))
+else:
+    request=json.loads(sys.stdin.readline())
+    assert request['has_mcp_registry'] and request['request']['event']['type']=='session_start'
+    print(json.dumps({'type':'register_mcp_server','server':{'name':'fixture','config':{'command':'fixture'}}}), flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'list_mcp_servers'}), flush=True)
+    snapshot=json.loads(sys.stdin.readline())['Ok']
+    assert snapshot[0]['name']=='fixture' and snapshot[0]['extensionId']=='register-mcp'
+    print(json.dumps({'type':'unregister_mcp_server','name':'missing'}), flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':False}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}), flush=True)
+"##;
+
+        struct NoModel;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Model for NoModel {
+            async fn stream(&self, _: ModelRequest) -> Result<pi_rs_core::ModelStream> {
+                panic!("registration must not run a model")
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("register-mcp");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        assert!(extension.handles_mcp_registry());
+        let mut session = pi_rs_core::SessionBuilder::new(Arc::new(NoModel), "fixture")
+            .extension(Arc::new(extension))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session.start().await.unwrap();
+        let servers = session.registered_mcp_servers();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].server.name, "fixture");
+        assert_eq!(servers[0].extension_id, "register-mcp");
     }
 
     #[cfg(unix)]

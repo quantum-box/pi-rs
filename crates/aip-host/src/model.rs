@@ -66,6 +66,10 @@ impl pi_rs_core::PreparedToolDispatch for PreparedBudgetDispatch<'_> {
 
 #[async_trait::async_trait]
 impl Model for BudgetedModel<'_> {
+    fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
+        self.inner.supports_mid_conversation_system_messages(model)
+    }
+
     fn minimum_output_tokens(&self) -> u32 {
         self.inner.minimum_output_tokens()
     }
@@ -279,6 +283,10 @@ struct PreparedBudgetedModel<'a, 'b> {
 
 #[async_trait::async_trait]
 impl Model for PreparedBudgetedModel<'_, '_> {
+    fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
+        self.inner.supports_mid_conversation_system_messages(model)
+    }
+
     fn minimum_output_tokens(&self) -> u32 {
         self.inner.minimum_output_tokens()
     }

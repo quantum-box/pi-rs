@@ -68,6 +68,10 @@ impl Stream {
         self.aborted
     }
 
+    pub fn mark_aborted(&mut self, aborted: bool) {
+        self.aborted |= aborted;
+    }
+
     pub fn suppress_summary_record(&self, event: &Value) -> bool {
         self.summary
             && event["type"] == "record"

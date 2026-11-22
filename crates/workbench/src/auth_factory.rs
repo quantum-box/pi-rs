@@ -30,6 +30,16 @@ impl AuthFileReadGrants {
     /// supplied here. This performs no network I/O, shell execution, OAuth,
     /// or process-environment lookup. Run the file read off the UI thread.
     pub fn load(&self) -> Result<HostAuthSnapshot> {
+        self.load_with_variables(|_, _| None)
+    }
+
+    /// Load saved keys with an explicit source for variables absent from a saved
+    /// entry. The host can grant variable names separately for each route.
+    /// Variables are resolved while taking the snapshot.
+    pub fn load_with_variables(
+        &self,
+        mut lookup: impl FnMut(&AuthRoute, &str) -> Option<String>,
+    ) -> Result<HostAuthSnapshot> {
         if !self.file.is_absolute()
             || self
                 .file
@@ -61,7 +71,7 @@ impl AuthFileReadGrants {
             .map_err(|_| Error::Config("invalid auth file: expected a JSON object".into()))?;
         for route in &self.routes {
             if let Some(saved) = credentials.get(&route.provider)
-                && let Some(key) = api_key(saved, &route.endpoint)?
+                && let Some(key) = api_key(saved, &route.endpoint, |name| lookup(route, name))?
             {
                 snapshot.register(
                     &route.provider,
@@ -74,7 +84,11 @@ impl AuthFileReadGrants {
     }
 }
 
-fn api_key(saved: &Value, endpoint: &str) -> Result<Option<String>> {
+fn api_key(
+    saved: &Value,
+    endpoint: &str,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<Option<String>> {
     if saved["type"] != "api_key" {
         return Ok(None);
     }
@@ -96,7 +110,9 @@ fn api_key(saved: &Value, endpoint: &str) -> Result<Option<String>> {
             saved["env"]
                 .get(name)
                 .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
                 .map(str::to_owned)
+                .or_else(|| lookup(name))
         })?
     };
     if resolved.as_deref().is_some_and(|key| !valid_api_key(key)) {
