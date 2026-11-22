@@ -35,7 +35,7 @@ jobs:
       - id: chrome
         uses: browser-actions/setup-chrome@48483d551c22a1fe6154c6a195ccc6d5773dc8c4 # v2
       - name: Test browser preview adapter
-        run: node --test examples/browser-preview/tachyon-gateway.test.mjs
+        run: node --test examples/browser-preview/tachyon-gateway.test.mjs examples/browser-preview/smoke-lifecycle.test.mjs
       - name: Install Rust and target
         run: |
           rustup toolchain install 1.89.0 --profile minimal --component clippy --component rustfmt

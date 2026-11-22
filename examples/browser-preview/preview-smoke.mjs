@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { stopChild, waitForSocketOpen } from './smoke-lifecycle.mjs';
 
 const dist = path.resolve(process.argv[2] || 'examples/browser-preview/dist');
 const chrome = process.argv[3] || process.env.CHROME_BIN;
@@ -34,7 +35,7 @@ try {
     child.stderr.on('data', chunk => { stderr += chunk; const match = stderr.match(/DevTools listening on (ws:\/\/[^\s]+)/); if (match) { clearTimeout(timer); resolve(match[1]); } });
     child.on('exit', () => { clearTimeout(timer); reject(Error('Chrome exited: ' + stderr)); });
   });
-  socket = new WebSocket(endpoint); await once(socket, 'open');
+  socket = new WebSocket(endpoint); await waitForSocketOpen(socket);
   let next = 0, workerAttached = false, stubbedModules = 0;
   const pending = new Map();
   const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
@@ -97,7 +98,9 @@ try {
   console.log('preview smoke passed (HTML, WASM initialization, browser session, worker and rendered response)');
 } finally {
   socket?.close();
-  if (child && child.exitCode === null) { child.kill('SIGKILL'); await once(child, 'close'); }
-  site.closeAllConnections(); site.close();
-  await rm(profile, {recursive:true, force:true});
+  try { await stopChild(child); }
+  finally {
+    site.closeAllConnections(); site.close();
+    await rm(profile, {recursive:true, force:true});
+  }
 }
