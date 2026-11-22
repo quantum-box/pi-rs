@@ -5424,8 +5424,11 @@ mod tests {
                 "route",
                 role,
                 pi_rs_core::ModelApi::OpenaiCodexResponses,
-                true,
-                Some("high"),
+                ResponsesProjection {
+                    supports_mid_conversation_system: true,
+                    active_effort: Some("high"),
+                    ..ResponsesProjection::default()
+                },
             );
             assert!(body.get("instructions").is_none());
             assert_eq!(
