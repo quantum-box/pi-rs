@@ -4187,12 +4187,21 @@ The direct Anthropic catalog includes Claude Fable 5.2 from Pi v1.6.0.
 The model accepts text and images, has a one-million-token context window
 and a 128,000-token model output limit, and adds xhigh and max to its standard
 effort levels.
-The catalog records Pi 1.6.0's mid-conversation system and tool-change
-capability flags for the direct Messages route. Using both capabilities in
-direct Messages requests still requires separate adapter support.
+The catalog retains Pi 1.6.0's mid-conversation system and tool-change
+capability flags for the direct Messages route. Native Messages supports
+the system checkpoints. Inline tool changes still require adapter support.
 The catalog includes Pi's model-specific pricing, prompt-cache lifetimes,
-and image limits. Provider-side model fallback requests and fallback pricing
-remain open. Live Fable 5.2 inference was unverified.
+and image limits. The direct Anthropic catalog uses Pi v1.6.0's ordered
+server-side fallback targets for Fable 5 and Fable 5.2. Models can set or clear
+`compat.allowedFallbackModels` in `models.json`. Requests omit the fallback
+field for an empty list and retain the required fallback beta alongside custom
+betas when candidates are present. Pi sends only the declared model ID for
+each candidate to the selected endpoint. Native applies the fallback price
+when the returned model ID and current provider both match a declared
+candidate, and retains the requested model for continuation. A fallback after recognized response content
+fails as in Pi. Loopback tests covered the beta header, target order, and
+fallback billing. Live Fable 5.2 inference and server-side fallback were
+unverified.
 
 Native Anthropic streams expose individual text and thinking block boundaries,
 and show redacted thinking as `[Reasoning redacted]` while retaining its opaque

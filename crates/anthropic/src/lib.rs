@@ -7,15 +7,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use pi_rs_core::{
-    AnthropicInputTransformations, AssistantDiagnostic, Error, ImageContent, Message, Model,
-    ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
+    AnthropicInputTransformations, AssistantDiagnostic, ChatPrice, Error, ImageContent, Message,
+    Model, ModelApi, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
     ReportedUsageCost, ResolvedModelIdentity, Result, ToolCall, Usage,
 };
 use reqwest::{
     Client, Response, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
@@ -65,6 +65,7 @@ impl ThinkingDisplay {
 }
 
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const EFFORT_BETA: &str = "mid-conversation-output-config-2026-07-01";
 const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
@@ -83,6 +84,25 @@ pub use pi_rs_core::CacheRetention;
 
 type ReasoningObserver = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// A server-side fallback target with the catalog price used if it answers.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct AnthropicFallbackModel {
+    pub provider: String,
+    pub model: String,
+    pub cost: ChatPrice,
+}
+
+impl AnthropicFallbackModel {
+    pub fn valid_list(models: &[Self]) -> bool {
+        models.len() <= 3
+            && models.iter().all(|target| {
+                !target.provider.trim().is_empty()
+                    && !target.model.trim().is_empty()
+                    && target.cost.valid()
+            })
+    }
+}
+
 #[derive(Clone)]
 pub struct Anthropic {
     client: Client,
@@ -100,6 +120,7 @@ pub struct Anthropic {
     thinking_display: ThinkingDisplay,
     interleaved_thinking: bool,
     managed_effort_models: Arc<BTreeMap<String, bool>>,
+    fallback_models: Arc<BTreeMap<String, Vec<AnthropicFallbackModel>>>,
     eager_tool_input_streaming: bool,
     eager_tool_input_models: Arc<BTreeMap<String, bool>>,
     configured_thinking: Option<CatalogEntry>,
@@ -211,6 +232,7 @@ impl Anthropic {
             thinking_display: ThinkingDisplay::default(),
             interleaved_thinking: true,
             managed_effort_models: Arc::default(),
+            fallback_models: Arc::default(),
             eager_tool_input_streaming: true,
             eager_tool_input_models: Arc::default(),
             configured_thinking: None,
@@ -389,6 +411,22 @@ impl Anthropic {
         self
     }
 
+    /// Configure the ordered server-side fallback targets for each requested model.
+    pub fn with_fallback_models(
+        mut self,
+        mut models: BTreeMap<String, Vec<AnthropicFallbackModel>>,
+    ) -> Result<Self> {
+        if models
+            .values()
+            .any(|targets| !AnthropicFallbackModel::valid_list(targets))
+        {
+            return Err(Error::Config("invalid Anthropic fallback targets".into()));
+        }
+        models.retain(|_, targets| !targets.is_empty());
+        self.fallback_models = Arc::new(models);
+        Ok(self)
+    }
+
     /// Use known thinking capabilities for a gateway that lacks a Models API.
     pub fn with_configured_thinking(mut self, level: &str, adaptive: bool, disable: bool) -> Self {
         self.thinking_level = Some(level.into());
@@ -449,7 +487,7 @@ impl Anthropic {
         url.path_segments_mut().ok()?.push(model);
         let details = tokio::time::timeout(Duration::from_secs(2), async {
             let response = send(
-                self.authenticate(self.client.get(url), false, false, false),
+                self.authenticate(self.client.get(url), false, false, false, false),
                 &self.error_secrets(),
             )
             .await
@@ -514,6 +552,7 @@ impl Anthropic {
         interleaved: bool,
         legacy_tool_streaming: bool,
         supports_managed_effort: bool,
+        has_fallbacks: bool,
     ) -> reqwest::RequestBuilder {
         request = request
             .header("anthropic-version", API_VERSION)
@@ -543,11 +582,18 @@ impl Anthropic {
                 );
             }
         }
-        if supports_managed_effort {
+        if has_fallbacks || supports_managed_effort {
             let mut value = headers
                 .get(&beta)
                 .map_or_else(Vec::new, |value| value.as_bytes().to_vec());
-            for feature in [EFFORT_BETA, THINKING_BINDING_BETA] {
+            for feature in [
+                has_fallbacks.then_some(FALLBACK_BETA),
+                supports_managed_effort.then_some(EFFORT_BETA),
+                supports_managed_effort.then_some(THINKING_BINDING_BETA),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 if !value
                     .split(|byte| *byte == b',')
                     .any(|entry| entry.trim_ascii() == feature.as_bytes())
@@ -629,7 +675,7 @@ impl Anthropic {
                 url.query_pairs_mut().append_pair("after_id", cursor);
             }
             let response = send(
-                self.authenticate(self.client.get(url), false, false, false),
+                self.authenticate(self.client.get(url), false, false, false, false),
                 &self.error_secrets(),
             )
             .await?;
@@ -1829,6 +1875,15 @@ impl Model for Anthropic {
                 self.mid_conversation_system_models.as_ref(),
             ))?
         };
+        let base = if self.fallback_models.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "anthropic-fallback-v1",
+                self.fallback_models.as_ref(),
+            ))?
+        };
         match &self.strict_tool_models {
             // A map containing only unsupported models cannot change any
             // successful request's sampling compared with the default.
@@ -2100,6 +2155,19 @@ impl Anthropic {
         {
             body["tools"] = json!(tools);
         }
+        let fallbacks = self
+            .fallback_models
+            .get(&requested_model)
+            .cloned()
+            .unwrap_or_default();
+        if !fallbacks.is_empty() {
+            body["fallbacks"] = Value::Array(
+                fallbacks
+                    .iter()
+                    .map(|target| json!({"model": target.model}))
+                    .collect(),
+            );
+        }
         let legacy_tool_streaming =
             self.configure_tool_input_streaming(&requested_model, &mut body);
         apply_cache_control(&mut body, self.cache_retention, self.cache_tools);
@@ -2138,6 +2206,7 @@ impl Anthropic {
             interleaved,
             legacy_tool_streaming,
             supports_managed_effort,
+            !fallbacks.is_empty(),
         ))
         .await?;
         pi_rs_core::observe_provider_response(
@@ -2179,6 +2248,7 @@ impl Anthropic {
             let mut calls = BTreeMap::<u64, Call>::new();
             let mut blocks = BTreeMap::<u64, ResponseBlock>::new();
             let mut usage = StreamUsage::default();
+            let mut fallback_price = None;
             let mut metadata = ModelMetadata {
                 provider_api: Some(ModelApi::AnthropicMessages),
                 replay_identity: Some(ResolvedModelIdentity { provider: edited_scope, model: requested_model.clone() }),
@@ -2194,7 +2264,8 @@ impl Anthropic {
                 let value: Value = serde_json::from_str(&event.data)
                     .map_err(|_| Error::Model("malformed Anthropic SSE event".into()))?;
                 let previous = metadata.clone();
-                match value["type"].as_str() {
+                let event_type = value["type"].as_str();
+                match event_type {
                     Some("message_start") if !started => {
                         started = true;
                         let message = &value["message"];
@@ -2205,6 +2276,11 @@ impl Anthropic {
                             provider: provider.to_string(),
                             model: message["model"].as_str().unwrap_or(&requested_model).into(),
                         });
+                        if let Some(response_model) = message["model"].as_str().filter(|id| *id != requested_model) {
+                            fallback_price = fallbacks.iter()
+                                .find(|target| target.provider == provider.as_ref() && target.model == response_model)
+                                .map(|target| &target.cost);
+                        }
                         usage.update(&message["usage"], &mut metadata);
                         input_transformations = AnthropicInputTransformations::from_value(&message["input_transformations"]);
                     }
@@ -2428,6 +2504,21 @@ impl Anthropic {
                         })?;
                     }
                     _ => {}
+                }
+                if matches!(event_type, Some("message_start" | "message_delta"))
+                    && let Some(price) = fallback_price
+                    && let Some(input_tokens) = usage.total_input()
+                    && let Some(cost) = price.estimate(
+                        Usage { input_tokens, output_tokens: usage.output.unwrap_or_default() },
+                        &metadata,
+                    )
+                    && let Some(total) = cost.total()
+                {
+                    metadata.cost_breakdown = Some(cost);
+                    if metadata.cost_from_provider != Some(true) {
+                        metadata.cost_usd = Some(total);
+                        metadata.cost_from_provider = Some(false);
+                    }
                 }
                 if metadata != previous {
                     yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata.clone())));
@@ -3333,6 +3424,130 @@ mod tests {
             |event| matches!(event, ModelEvent::Reasoning(text) if text == "[Reasoning redacted]")
         ));
         worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fallback_targets_and_resolved_model_pricing_are_bound_to_the_request() {
+        use std::io::Write;
+        for (response_model, expect_price, enable_fallback, custom_beta) in [
+            ("backup", true, true, None),
+            ("backup", true, true, Some("custom-feature")),
+            ("backup", true, true, Some(FALLBACK_BETA)),
+            ("different-provider", false, true, None),
+            ("unlisted", false, true, None),
+            ("primary", false, true, None),
+            ("backup", false, false, None),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let (headers, request) = read_fixture_request(&mut socket);
+                assert_eq!(request["model"], "primary");
+                assert_eq!(request["messages"][0]["role"], "user");
+                assert_eq!(request["messages"][1]["role"], "system");
+                assert_eq!(request["messages"][1]["content"][0]["text"], "checkpoint");
+                assert_eq!(
+                    headers.matches(FALLBACK_BETA).count(),
+                    usize::from(enable_fallback)
+                );
+                if let Some(custom_beta) = custom_beta {
+                    assert!(headers.contains(custom_beta));
+                }
+                if enable_fallback {
+                    assert_eq!(
+                        request["fallbacks"],
+                        json!([{"model":"backup"}, {"model":"different-provider"}])
+                    );
+                } else {
+                    assert!(request.get("fallbacks").is_none());
+                }
+                let events = [
+                    json!({"type":"message_start","message":{
+                        "model":response_model, "usage":{
+                            "input_tokens":1_000_000,"cache_read_input_tokens":1_000_000,
+                            "cache_creation_input_tokens":2_000_000,
+                            "cache_creation":{"ephemeral_1h_input_tokens":1_000_000}
+                        }
+                    }}),
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"ok"}}),
+                    json!({"type":"content_block_stop","index":0}),
+                    json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2_000_000}}),
+                    json!({"type":"message_stop"}),
+                ];
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = Anthropic::new(&format!("http://{address}/v1/messages"), "key")
+                .unwrap()
+                .with_context_probe(false);
+            let model = if let Some(custom_beta) = custom_beta {
+                let mut headers = HeaderMap::new();
+                headers.insert("anthropic-beta", HeaderValue::from_static(custom_beta));
+                model.with_headers(headers)
+            } else {
+                model
+            };
+            let original_identity = model.context_identity().unwrap();
+            let model =
+                model.with_mid_conversation_system_models(BTreeSet::from(["primary".into()]));
+            let base_identity = model.context_identity().unwrap();
+            assert_ne!(base_identity, original_identity);
+            let price = json!({"input":5,"output":25,"cacheRead":0.5,"cacheWrite":6.25});
+            let targets: Vec<AnthropicFallbackModel> = serde_json::from_value(json!([
+                {"provider":"anthropic","model":"backup","cost":price},
+                {"provider":"proxy","model":"different-provider","cost":price}
+            ]))
+            .unwrap();
+            let model = model
+                .with_fallback_models(BTreeMap::from([(
+                    "primary".into(),
+                    if enable_fallback { targets } else { vec![] },
+                )]))
+                .unwrap();
+            assert_eq!(
+                model.context_identity().unwrap() != base_identity,
+                enable_fallback
+            );
+            let mut stream = model
+                .stream(ModelRequest {
+                    model: "primary".into(),
+                    messages: vec![
+                        Message::User {
+                            content: "hello".into(),
+                        },
+                        Message::System {
+                            content: "checkpoint".into(),
+                        },
+                    ],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                })
+                .await
+                .unwrap();
+            let mut final_metadata = None;
+            while let Some(event) = stream.next().await {
+                if let ModelEvent::Metadata(metadata) = event.unwrap() {
+                    final_metadata = Some(metadata);
+                }
+            }
+            worker.join().unwrap();
+            let metadata = final_metadata.unwrap();
+            assert_eq!(metadata.resolved_model.unwrap().model, response_model);
+            if expect_price {
+                assert_eq!(
+                    metadata.cost_breakdown,
+                    pi_rs_core::UsageCostBreakdown::new(5.0, 50.0, 0.5, 16.25)
+                );
+                assert_eq!(metadata.cost_usd.unwrap().as_f64(), Some(71.75));
+                assert_eq!(metadata.cost_from_provider, Some(false));
+            } else {
+                assert!(metadata.cost_breakdown.is_none());
+            }
+        }
     }
 
     #[tokio::test]
@@ -4561,6 +4776,7 @@ mod tests {
                     false,
                     legacy_streaming,
                     false,
+                    false,
                 )
                 .build()
                 .unwrap();
@@ -4626,6 +4842,7 @@ mod tests {
                 .authenticate(
                     client.client.post(DEFAULT_ENDPOINT),
                     interleaved,
+                    false,
                     false,
                     false,
                 )
