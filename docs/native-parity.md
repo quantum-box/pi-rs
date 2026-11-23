@@ -124,18 +124,42 @@ and discards that typeahead.
 Saving a default model writes Pi's `defaultProvider` and literal `defaultModel`
 together. If a saved model falls outside a nonempty model scope, it is added to
 that scope and to a configured `enabledModels` list. Legacy qualified defaults
-without `defaultProvider` are still accepted. Cycling models shows the selected display
-name and the active thinking level for reasoning models. Consecutive notices
+without `defaultProvider` are still accepted. When the selected built-in
+provider needs a model and no saved, explicit or scoped selection applies,
+pi-rs prefers Pi's default model if it is in the effective catalog. It uses
+the first available entry when that default is missing. When no model, provider,
+endpoint or inline credential is specified and no scope or saved default
+selects the model, startup considers authenticated models in Pi's provider
+preference order. Automatic selection uses the known catalog and existing
+endpoint bindings, without refreshing OAuth or invoking credential commands
+to choose a model. Native Ollama remains the fallback when the known catalog
+has no authenticated model. Cycling models shows
+the selected display name and the active thinking level for reasoning models. Consecutive notices
 reuse the trailing status in both fullscreen and regular mode, before it enters
 scrollback. The tool-output, thinking-visibility, and thinking-level shortcuts
 report the new state using the same status row, as in Pi.
+During a streamed prompt, model and thinking shortcuts acknowledge a prepared
+selection without changing the request in flight. A queued follow-up uses the
+new route and effort. Cycling models uses the destination's scoped or per-model
+thinking level, then the global default, then the current level. The worker
+commits the selection before the next request,
+or at settlement when the current prompt finishes without a follow-up. pi-rs
+uses the accepted model's configured image resize profile for new clipboard
+pastes and queued attachments.
 Model scopes (`--models` and `enabledModels`) add all available providers that
 share an exact unqualified model ID and warn about the ambiguity. A literal ID
 containing glob characters takes precedence over glob expansion across providers,
-with an optional thinking suffix applied to the selected models.
+with an optional thinking suffix applied to the selected models. Bare partial
+scope matches are ranked across the available catalogs. If the winning ID is
+shared, all matching providers are included and a warning names them.
+The native exact display-name shortcut remains available for scopes.
 With no explicit provider or endpoint, a known `--model` ID can select the only
 authenticated matching provider across catalogs, including a gateway model
-whose literal ID starts with another provider's name. Bedrock environment
+whose literal ID starts with another provider's name. Unqualified partial IDs
+and display names also search the known catalogs. Pi ranks whole and partial
+display-name matches together. When the matches span providers, configured credentials narrow the matches before Pi's alias and
+model ID ordering is applied. A best model ID shared across eligible
+providers requires an explicit provider. Bedrock environment
 credentials count during provider selection. When no matching provider has
 visible credentials, a configured default Bedrock provider can use the SDK
 credential chain. An inline key does not
@@ -716,7 +740,9 @@ reported without preventing other discovered resources from loading.
 Completed tool arguments repair invalid string escapes and unescaped control
 characters as Pi does. Incomplete JSON and non-object values produce a tool
 error containing the received arguments. The original model response remains
-in the journal; subsequent model requests use the repaired object.
+in the journal; subsequent model requests use the repaired object. For a
+failed repair, Pi's syntax positions refer to the repaired text. The
+`Received arguments` block displays the original model response.
 
 When all sibling timestamps are valid, `get_tree` sorts them in chronological
 order and retains append order for the same instant. This includes imported timestamps with UTC offsets and ISO year, year-month, and date forms
@@ -1133,8 +1159,29 @@ and the CLI closes connections after each run.
 In the terminal, `/mcp` now opens a server list with each server's status,
 scope, tool count and exposure. Select one to inspect its description and
 the announced tools with their effective exposure. The view reflects the
-configuration loaded by the running session. Use the CLI MCP commands to
-manage configuration and credentials.
+configuration loaded by the running session. Reconnect restarts the selected
+server and updates the available tools in the current session. The previous
+tools are withdrawn if reconnection fails. If the selected server changed
+on disk, reload the session before reconnecting. Terminal and loopback model
+checks covered a stale tool being replaced, a failed restart withdrawing that
+tool, and a later retry restoring access. Enable and Disable update the
+configuration scope shown for the server and take effect in the current
+session. The project-only action adds an override for a global server in a
+trusted project. Exposure changes between codemode, deferred and direct
+save to the server's effective configuration scope and update the model's
+tool declarations without restarting the connection. Per-tool overrides
+retain precedence. Extension-registered servers retain their extension scope
+and their extension controls their enabled state and exposure. The manager offers Sign in for a server requiring OAuth
+and Sign out for a live OAuth connection. Sign-in opens the browser, checks
+the applied configuration before saving credentials, and reconnects the
+server. Sign-in can validate a read-only trusted project without creating
+a project lock file there. Sign-out clears the selected server's stored credentials and removes
+its live tools. The sign-in panel shows the authorization URL and can accept
+a pasted redirect URL if the browser cannot reach the loopback callback.
+Both routes validate the callback origin, path and OAuth state. Loopback
+tests covered nonstandard metadata discovery, browser and pasted callbacks,
+a rejected state, sign-out and a reconnect failure after sign-in. Hosted
+OAuth with a pi-rs client identity still requires live acceptance.
 
 Trusted project overrides of a global MCP server reject unknown fields and
 invalid values before applying any part of that override, so a typo or
@@ -1154,11 +1201,21 @@ is a known Pi-fidelity limitation rather than exact profile matching. Native
 resource tools remain namespaced per server and aggregate that server's pages.
 If a resource or template omits its name, native uses its URI or URI template
 in full and paged listings, matching Pi. Explicit empty names are preserved.
+Tool and resource discovery treat an empty next cursor as the end of the list.
+Full listings stop with an error on a repeated cursor or a continuation beyond
+1,000 pages, matching Pi. Native also applies the bound to its prompt listings
+and omits opaque cursor values from duplicate-cursor errors.
 Within the existing initialization deadline, HTTP connections retry after
 250 ms and 1 second on transient network errors, HTTP 408, 429, and 5xx
 other than 501. Remote resource reads and listings, including paged listings
 and templates, retry once on those HTTP statuses. Cancellation interrupts the
 resource retry wait, and ordinary tool calls are sent once on these failures.
+For stdio and streamable HTTP tool calls, progress notifications matching the
+request's MCP progress token renew its idle timeout. The live tool result shows
+the server's message or `Progress N[/total]` when no message was supplied.
+Progress for another request does not extend the deadline. The CLI can cancel
+an active tool call even while progress is arriving. Resource requests retain
+their fixed deadlines.
 
 Loopback fixtures verified stdio discovery and tool execution, HTTP bearer
 headers, resource reading, and the model/tool/model round trip. Credentials
@@ -1834,8 +1891,11 @@ the execution boundary for the pending codemode sandbox.
 Codemode supports OpenAI Decisions classifier models, including the pinned
 GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
 and the Decisions-specific 504 retry exclusion. Native image validation and
-endpoint-bound credentials continue to apply. Classifier usage identifies its
-calculated costs as estimates with `totalFromProvider: false`.
+endpoint-bound credentials continue to apply. Classifier usage splits cached
+reads and writes out of the reported input total, as in upstream Pi. GPT-6 Luna
+prices both cache categories at the input rate in the standard and long-context
+tiers. Calculated costs carry `totalFromProvider: false`. Loopback responses
+cover cache reporting. Live authenticated usage was unverified.
 An OpenAI key explicitly saved for `/v1/responses`, including by the provider
 key UI, does not authorize `/v1/decisions`; use an endpointless Pi auth entry or
 `OPENAI_API_KEY` for the official Decisions endpoint.
@@ -1952,13 +2012,14 @@ remaining CLI aliases still require parity work.
 
 ### Legacy settings migration
 
-User and trusted-project settings independently migrate Pi's legacy
-`queueMode` to `steeringMode` and the legacy `skills` object to skill paths
-and `enableSkillCommands` before merging. Explicit modern keys win within
-their layer; project settings retain their usual precedence and untrusted
-project settings are ignored. Configured skill paths remain relative to their
-own settings file. Loading does not rewrite the original files. Regression
-tests exercise actual skill discovery, queue selection, precedence and trust.
+User and trusted-project settings migrate Pi's legacy keys before merging.
+`queueMode` becomes `steeringMode`, the legacy `skills` object becomes skill
+paths and `enableSkillCommands`, and boolean `websockets` selects Codex
+`transport` of `websocket` or `sse`. Explicit modern keys win within their
+layer. Trusted project settings retain their usual precedence. Configured
+skill paths remain relative to their settings file. Loading does not rewrite
+the original files. Regression tests cover skill discovery, queue selection,
+transport, precedence, and trust.
 
 ### Upstream session import checkpoint
 
@@ -2045,15 +2106,18 @@ image decoding and size limits as the local read tool. File text precedes the
 prompt, empty files are skipped, UTF-8 BOMs are stripped from text files, and
 malformed UTF-8 in text attachments is decoded with replacement characters.
 Attachment file tags contain the literal resolved filename, including `&`,
-quotes and angle brackets, matching Pi's model-visible prompt text. Native
-canonicalizes paths for local reads, so a symlink or Windows canonical path
-can still differ from Pi's lexically resolved filename.
+quotes and angle brackets, matching Pi's model-visible prompt text. Text and
+image tags retain the resolved symlink name used to request the attachment.
+The native reader follows the link to read its contents and keeps its existing
+input limits.
 For CLI attachments, image detection does not infer a format from the file
 extension. Malformed PNG headers and animated PNGs detected within the first
 4,100 bytes are treated as text. JPEG, GIF, WebP and BMP content detection
 also follows Pi; unsupported image formats are treated as text.
-Images are referenced by a single-line file tag and sent as separate image
-content. The TUI, print and JSON modes send separate positional messages as
+Image tags contain only conversion or resize hints, or the image omission
+notice if processing fails. Conversion hints are retained when automatic
+resizing is disabled. Successful images are sent as separate image content.
+The TUI, print and JSON modes send separate positional messages as
 successive turns in the same session. Attachments belong to the first turn.
 The TUI remains available for input after the startup turns. Text output
 prints the final answer, and JSON emits each turn. Piped stdin is decoded as
@@ -2473,7 +2537,8 @@ fenced code.
 Terminal Markdown hides HTML comments in prose, quotes, and lists, matching Pi
 v1.6.0. Comment-only blocks do not leave extra blank rows. Visible text after a
 block comment keeps its row and any preceding blank line inside a list. Other
-literal HTML and comment markers inside code remain visible.
+literal HTML and comment markers inside code remain visible. Indented comments
+that continue a paragraph retain its indentation and inline formatting.
 
 Level-one headings use underlining, lower-level headings retain their markers,
 and code blocks show language-labelled fences with indented syntax highlighting.
@@ -2702,8 +2767,11 @@ finishes. Settings, theme and hotkey commands are handled before streaming
 input is queued. Tests cover schema diagnostics and dialog error layout.
 The terminal lists shared settings in Pi's order and uses Pi's labels and
 boolean values for those rows. Native controls and JSON editors remain
-available after the shared settings. The transport, changelog, installation
-telemetry controls are still open. The Warnings submenu includes the default-on
+available after the shared settings. The Transport row cycles through SSE,
+WebSocket, cached WebSocket, and automatic selection in Pi's order. It updates
+the next request in a running Codex session and retains the normal settings
+precedence. Native providers without multiple transports retain their existing
+connection behavior. The changelog and installation telemetry controls are still open. The Warnings submenu includes the default-on
 Anthropic extra-usage warning. The terminal shows it once when the active model
 uses Anthropic subscription OAuth or a configured subscription token on the
 official endpoint. The warning check uses configured credentials without
@@ -3069,12 +3137,12 @@ schemas. An imported declaration cannot enable an unavailable or disabled tool.
 
 On ordinary turns, models that support mid-conversation instructions receive
 the original system prompt followed by checkpoint updates at their conversation
-positions, with named sections rendered as replacements or removals. An imported
-compaction snapshot supplies the leading prompt. Native compaction preserves
-checkpoint positions among retained messages when it has no prompt snapshot.
-A checkpoint inside a tool batch follows its results to preserve provider
-tool-call pairing. Models
-without that capability receive the fully resolved leading prompt. Extension
+positions, with named sections rendered as replacements or removals. Imported
+compaction snapshots supply the leading prompt and tool declarations before
+retained messages. Native compaction keeps checkpoint positions among retained
+messages when it has no snapshot. A checkpoint inside a tool batch follows its
+results to preserve provider tool-call pairing. Models without that capability
+receive the fully resolved leading prompt. Extension
 message hooks see the ordered checkpoints. Edits to other messages preserve
 checkpoint placement. If a hook edits system messages on a route that needs
 one prompt, the adapter joins the hook's current system text in order.
@@ -3671,16 +3739,28 @@ RPC supports `set_auto_retry` and `abort_retry`, with `auto_retry_start` and
 error. The initial OpenAI Responses (including Azure), OpenAI-compatible Chat
 Completions, and Anthropic Messages HTTP requests honor `retry.provider.maxRetries`
 (default 0), `maxRetryDelayMs` (default 60000, 0 disables the ceiling), and
-`timeoutMs` (to receive response headers on each attempt). They honor `x-should-retry`, `Retry-After-Ms`, and
-`Retry-After` before accepting a response stream. As in Pi 1.6, this opt-in
+`timeoutMs` (to receive response headers on each attempt). They honor
+`x-should-retry`, `Retry-After-Ms`, and `Retry-After` before accepting a response
+stream. As in Pi 1.6, this opt-in
 policy uses HTTP retry hints and status before processing the error body. The
 agent still uses the final provider error to distinguish quota exhaustion and
 other permanent failures. A server delay above the ceiling stops the provider
 retry and can trigger the agent's separately configured retry. Native reports
 the requested delay and ceiling without echoing the provider body. This policy
 also loads legacy
-`retry.maxDelayMs` when the replacement is unset. Google Gemini and Codex-specific
-provider retries and summary-specific retry policy remain open.
+`retry.maxDelayMs` when the replacement is unset.
+
+The Codex HTTP stream applies the same configured attempt count, deadline, and
+delay ceiling using Codex's own policy. It uses exponential backoff from one
+second and handles numeric or HTTP-date retry delays before accepting the stream.
+Native keeps its bounded, redacted error handling and stops immediately for
+permanent quota errors, context overflow, and oversized requests. Codex
+WebSocket timeouts and summary-specific retry policy remain open.
+
+Google Gemini and Vertex AI honor the configured retry count for HTTP 408,
+409, 429, and server errors, using exponential backoff. Pi 1.6's Google adapters
+receive no retry headers from the SDK and leave transport errors and
+`retry.provider.timeoutMs` outside this policy.
 
 Tests cover recovery, request and retry caps, queued input, wait cancellation,
 dropped-wait cleanup and usage-settlement failures. Loopback RPC checks verify
@@ -4378,9 +4458,8 @@ The direct Anthropic catalog includes Claude Fable 5.2 from Pi v1.6.0.
 The model accepts text and images, has a one-million-token context window
 and a 128,000-token model output limit, and adds xhigh and max to its standard
 effort levels.
-The catalog retains Pi 1.6.0's mid-conversation system and tool-change
-capability flags for the direct Messages route. Native Messages supports
-the system checkpoints. Inline tool changes still require adapter support.
+Native Messages uses the catalog's Pi 1.6.0 capability flags for
+mid-conversation system checkpoints and inline tool changes.
 The catalog includes Pi's model-specific pricing, prompt-cache lifetimes,
 and image limits. The direct Anthropic catalog uses Pi v1.6.0's ordered
 server-side fallback targets for Fable 5 and Fable 5.2. Models can set or clear
@@ -4783,6 +4862,43 @@ A loopback server held the final argument fragment until the RPC client
 observed the first one. The fixture covered stable indexes after
 reasoning, final arguments and tool output, and abort before completion.
 
+### Provider sign-in from the CLI
+
+`pi auth login <provider>` requires a terminal and uses provider IDs or
+display names. It prefers account authorization where supported.
+`--api-key` prompts without echoing the credential, and saves it for the
+configured endpoint. Bedrock also offers an AWS profile or the existing
+credential chain. Vertex also offers ADC or a service account file.
+Cloudflare routes with account or gateway placeholders prompt for the
+identifiers and reject values that conflict with a configured gateway route.
+Fixed Cloudflare endpoints prompt for the API key only.
+`--no-browser` selects copy-code or device authorization for Anthropic,
+Codex and Radius respectively. Other account flows print their sign-in
+instructions without opening a browser. GitHub Copilot asks for an Enterprise
+domain before starting device authorization. An empty answer uses github.com.
+The OpenAI subscription continues to
+use pi-rs's separate `openai-chatgpt` provider identity. Its CLI sign-in
+also accepts the full redirect URL from a browser on another device after
+checking the same callback URL, state, and client ID as loopback sign-in.
+Saved credentials are applied when the next command loads the model configuration.
+Local terminal and CLI fixtures cover masked key input, command parsing, and
+cancelling a pending browser sign-in with Ctrl-C.
+Real OAuth sign-in and inference were unverified.
+
+### Provider credential logout
+
+`pi auth logout <provider>` removes the saved key or OAuth entry from
+`auth.json` under the shared lock. It accepts provider IDs, built-in display
+names, and the `name` configured in `models.json`. A stored extension
+credential can be removed by exact ID even when its extension is not loaded
+or `models.json` cannot be read. An exact stored ID or configured provider ID
+takes precedence over a display name. Ambiguous display names require an
+explicit ID. Environment and model-file credentials are
+unchanged. Native ChatGPT plan revocation and Radius gateway isolation still
+apply. A malformed ChatGPT plan credential can be removed locally when it
+cannot be used for revocation. Tests use local credentials without calling
+live OAuth endpoints.
+
 ### Radius OAuth
 
 `pi login radius` signs in through a local browser callback with PKCE
@@ -4866,6 +4982,20 @@ startup and transient discovery failures can use the matching cache.
 Successful empty catalogs remain authoritative. Live authenticated Radius
 discovery for this release was unverified.
 [Pi AI 1.6.0 distribution](https://www.npmjs.com/package/@earendil-works/pi-ai/v/1.6.0)
+
+The bundled and account-scoped Radius catalogs retain advertised prices and
+image input limits. JSON model listings and RPC model discovery expose those
+fields when available. Partial explicit settings override matching fields.
+Current-model RPC responses reuse discovered metadata when the discovery
+credential can be identified. Missing or
+invalid optional metadata leaves the model available, including when loading
+an older cache.
+Radius applies catalog resize limits to outgoing images after resolving the
+account and route. When discovery is unavailable, the matching account cache
+or the official gateway's bundled profile supplies the limits. Initial image
+preparation uses the normal attachment limits and explicit resize settings.
+`images.autoResize` controls both stages. Live authenticated Radius image
+requests were unverified.
 
 ### Single-shot JSON event stream
 
@@ -5243,7 +5373,19 @@ Codemode lists classifier and image entries using `models.getModelsOfType`,
 `models.getAvailableOfType`, and `models.getModelOfType`. Scripts invoke System
 One classifiers with `models.classify` and OpenRouter image models with
 `models.generateImages`. Model credentials remain in the native host and
-provider responses enter the same journal as other nested tool calls. Native
+provider responses enter the same journal as other nested tool calls.
+Codemode also lists and runs GitHub Copilot's `microsoft-decision-1` classifier
+from Pi 1.6.0 via `/v1/systemone`. A saved Copilot subscription, a key saved
+for the official Copilot chat endpoint, or `COPILOT_GITHUB_TOKEN` makes it available. Discovery does not refresh the
+subscription or filter this classifier by the subscription's chat model list.
+Requests with a saved subscription use the token's official individual,
+business or enterprise Copilot host. A saved Enterprise domain also scopes
+the account's classifier route, just as it scopes the chat route.
+An unversioned custom base also uses
+`/v1/systemone` relative to its configured path. Native also accepts an
+explicit versioned base or classifier endpoint. Custom endpoints need their
+own scoped credentials. Live Copilot classifier requests were not verified.
+Native
 `models.json` also accepts configured entries with `type: "classifier"` or
 `type: "image"` for supported endpoints.
 Cloudflare Workers AI System One classifiers include Pi's five pinned catalog
@@ -5496,8 +5638,10 @@ matches the previous conversation. `websocket` sends the full history on
 the connection, and `sse` uses HTTP directly. WebSocket requests omit the
 HTTP-only `stream` flag as specified by the [Responses WebSocket protocol](https://developers.openai.com/api/reference/resources/responses/websocket-events).
 An unavailable WebSocket
-upgrade falls back to HTTP SSE before any inference request is sent. Native
-provider-response hooks receive the sanitized HTTP handshake status and
+upgrade falls back to HTTP SSE before any inference request is sent.
+`websocketConnectTimeoutMs` controls the opening deadline independently of
+`httpIdleTimeoutMs`. It defaults to 15000 and accepts 0 or `"disabled"` to
+remove the opening deadline. Native provider-response hooks receive the sanitized HTTP handshake status and
 headers when a connection is opened. An upgrade failure or interrupted
 WebSocket response makes later attempts use SSE for up to a minute, including
 with prompt-cache retention disabled. With no session key, the cooldown
@@ -5515,6 +5659,13 @@ An explicit connection-limit rejection before output opens a new connection
 once. Stream error statuses distinguish retryable service failures from
 terminal account limits. Native HTTP SSE uses a zstd-compressed JSON body
 when compression succeeds. The WebSocket request stays a JSON text frame.
+Responses can carry JSON as text or binary WebSocket messages. Binary UTF-8
+decoding removes a leading BOM and replaces malformed byte sequences, as Pi
+does. Ping, pong and empty decoded messages do not reset the configured HTTP
+idle deadline for a response.
+The native client retains its per-attempt interruption policy. Loopback
+fixtures cover both frame handling and the deadline. Authenticated acceptance
+of these transport cases was unverified.
 
 OpenAI Responses and Codex models with `compat.supportsOpenAIGrammarTools` advertise grammar
 tools as custom tools. They choose a nonempty Lark definition before a regex
@@ -5524,10 +5675,52 @@ on the current request. Historical function arguments retain their full JSON
 when they cannot be represented as a single string. Models without the
 capability and the pi-rs ChatGPT plan namespace use function tools.
 
-Provider tool search remains open.
+Responses and Codex can anchor tool declarations to the session transcript.
+Models with `supportsAdditionalTools` and mid-conversation system messages
+receive `additional_tools` items and notices for removals. When a tool
+batch moves multiple changes to the same position, removal and reactivation
+retain their recorded order. Models with
+`supportsToolSearch` and mid-conversation system messages can receive synthetic
+search results for later additions. Removals and redefinitions start a new
+top-level tool set on that route. The agent keeps the request's active tool
+permissions as the authority for execution. Changed loadouts follow the
+session branch and retain native historical declarations after extension
+removal. Imported declarations can also explain retained calls for tools no
+longer registered. Sampling constraints travel with their recorded declarations.
+Responses projects historical grammar calls using the declaration at their
+position, including the original raw-input argument. This keeps a historical
+call replayable when a later definition renames the argument. Pi 1.6.0 uses
+the latest argument name in that case. Legacy declarations without a recorded
+constraint remain plain tools. When an extension rewrites the request, tools
+use the final
+top-level declaration list. Loopback tests cover successive requests and
+replay. Live Codex and Responses tool search were unverified.
 Authentication and grammar tool streaming were exercised with fixtures.
 Live sign-in and inference were unverified because no account was available
 for acceptance.
+
+Chat Completions models that advertise both `supportsMidConvoSystemMessages`
+and `supportsMidConvoToolAdditions` replay append-only tool loadout changes
+as system messages with a `tools` array. Removals and redefinitions fold into
+the top-level declarations, and later additions keep their conversation
+position. Like Pi, this route uses the latest definition of a redeclared
+grammar tool for replay. Calls with incompatible historical arguments keep
+their full JSON. This covers compatible Kimi routes in the bundled catalog. Routes
+without both flags send the active top-level declarations. Compared the
+published Pi Moonshot request payloads and exercised native request projection
+with fixtures. Live Kimi tool additions were unverified.
+
+Chat Completions sends consecutive tool results before a single user message
+containing their attached images. The shared caption and image order match Pi.
+An automatic tool-list update anchored within
+that group is sent after the results and their images. Synthetic assistant
+messages include any reasoning field required by the configured provider. The native adapter keeps structured tool
+output in the result text and moves its image bytes to that user message.
+Custom model compatibility settings can
+include tool names on results, insert an assistant turn before the next user
+message, preserve empty assistant content, or send an empty tools array when
+the transcript has tool history. Loopback checks covered grouped images and
+the configured payload. Live verification on compatible servers remains open.
 
 ### GitHub Copilot
 
@@ -5537,7 +5730,9 @@ advertise thinking effort on Chat Completions use its reasoning-effort field.
 Copilot Messages and Responses expose strict sampling for supported tools.
 Ordinary Responses function declarations explicitly send `strict: false` to
 prevent Copilot from imposing strict sampling and filling optional fields.
-Projection of Copilot's transcript-level `additional_tools` remains open.
+Copilot Responses models with `supportsAdditionalTools` receive transcript-level
+`additional_tools` items through the same Responses adapter. A published Pi
+fixture confirmed the request shape. Live Copilot tool updates were unverified.
 `COPILOT_GITHUB_TOKEN` supplies a short-lived Copilot API token.
 `pi login github-copilot` and `/login github-copilot` support GitHub.com's
 device authorization and store a Pi-compatible OAuth entry. pi-rs can also
@@ -5549,11 +5744,18 @@ on `slow_down` and adds five seconds when it supplies no interval. Saved OAuth
 tokens can route to individual, business, or enterprise Copilot inference hosts. Requests carry the Copilot initiator and
 vision headers.
 
-Native sign-in leaves account model policies as configured. Authentication
-through private GitHub Enterprise domains remains unsupported. The published
-Pi AI package and local HTTP fixtures were used to compare the catalog and
-wire behavior. Live GitHub device authorization and Copilot inference were
-unverified because no subscription credentials were available.
+Native sign-in leaves account model policies as configured. Use
+`pi login github-copilot --enterprise-url company.ghe.com` or
+`/login github-copilot company.ghe.com` for an Enterprise account. The
+terminal sign-in picker prompts for the domain and accepts a blank entry
+for github.com. The saved domain directs future refreshes, including for
+credentials imported
+from Pi. The inference token can select an official Copilot proxy or an
+API host bound to that Enterprise domain. Sign-in and refresh use HTTPS,
+and the verification link must belong to the selected GitHub host.
+Local fixtures cover Enterprise endpoints, polling, refresh and routing.
+Live GitHub device authorization and Copilot inference were unverified
+because no subscription credentials were available.
 
 ### OpenRouter browser authorization
 
@@ -5636,6 +5838,9 @@ split it into separate output lines. Scoped `find` preserves its filename spelli
 
 `pi auth check` reports configured credential readiness for a provider
 or model. It supports JSON output and a read-only `--no-refresh` check.
+A bare model reference uses the CLI catalog resolver without using stored
+credentials to break ties, as Pi does for auth checks. Native qualified uncatalogued model IDs
+remain usable for checking their provider route.
 `print-api-key` and `print-bearer-token` explicitly resolve their own
 credential type. Model-specific endpoints are respected. Radius bearer
 tokens use the normal refresh path and accept `--min-expiry`. Kimi bearer
@@ -5734,9 +5939,19 @@ for direct Claude, GitHub Copilot, and OpenCode Zen. Model and provider profiles
 can override the capability. Native system updates are sent before the next
 emitted assistant turn or at the end of the transcript, preserving tool-call
 and tool-result adjacency. Other Messages models use one combined initial
-system prompt. Terminal and SDK tool declarations still represent the current
-tool set. Live requests using these models and authenticated gateways were
-unverified.
+system prompt. With both `supportsMidConvoSystemMessages` and
+`supportsMidConvoToolChanges`, Anthropic Messages uses the initial tool list,
+including Pi's deferred placeholder, and sends later additions, redefinitions
+and removals as system blocks. Historical declarations retain their compatible
+sampling constraints, and the active dispatch uses its prepared decisions.
+The active tool list is used when the initial list is empty, history cannot
+preserve required sampling, or historical names collide under OAuth. A
+removal references a tool only while its declaration is active. Native
+retains the required inline-tools beta alongside custom beta headers when
+it sends inline changes. Loopback
+fixtures cover tool-result adjacency, historical strict sampling, beta
+selection and cache placement. Live requests
+using these models and authenticated gateways were unverified.
 
 ### Model-specific chat API checkpoint
 
@@ -6062,6 +6277,27 @@ credential classification. Offline and loopback checks covered priority,
 endpoint isolation, and explicit proxy keys. A live request with an OAuth
 environment token remains unverified.
 
+When the official Anthropic Messages route has no other credential,
+native supports workload identity federation with
+`ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, and
+`ANTHROPIC_IDENTITY_TOKEN_FILE`. Optional `ANTHROPIC_SERVICE_ACCOUNT_ID`
+and `ANTHROPIC_WORKSPACE_ID` scope the exchange. Explicit authentication
+headers take precedence in Messages requests and credential checks. Credential
+exports use the selected API key or Bearer authorization header when present.
+Native exchanges at the official Anthropic endpoint
+and shares the access token in memory. It rereads the identity file on
+exchange, starts a background exchange within 120 seconds of expiry,
+waits for a fresh token within 30 seconds, and invalidates a token rejected
+with HTTP 401 by Messages, model listing, or model lookup for the next request.
+`pi auth check --no-refresh` checks the identity
+file locally or reports a configured authentication header without running
+its command. A regular check exchanges the assertion when needed, and
+`print-bearer-token` can export the access token with a requested minimum
+lifetime. The identity assertion is never returned by the auth commands.
+Loopback tests cover the exchange, concurrent access, and file rotation.
+A live federation
+exchange and Messages request remain unverified.
+
 ### Published input limits and cache lifetimes checkpoint
 
 The bundled Anthropic and Gemini catalogs retain Pi's declared request
@@ -6101,9 +6337,10 @@ before dispatch, uses the original affinity and tool definitions, and
 stops on a changed context or the 30-minute limit. A completed cache miss
 retains its billed usage and schedules another decision on the normal cadence,
 measured from the refresh request's start to protect the cache lifetime.
-Failed refreshes and local model timeouts stop warming without
-recording usage because the provider may still be processing the request. Pi
-waits for the refresh to settle and also retries errors.
+Like Pi, each cache refresh disables provider HTTP retries while preserving
+the configured HTTP attempt timeout. Failed refreshes and local model timeouts
+stop native warming without recording usage because the provider may still be
+processing the request. Pi can schedule another refresh after the first settles.
 Refresh usage is journaled and projected as a Pi usage entry. Response
 content stays out of the conversation. This checkpoint covers idle
 requests with thinking off. Streaming warming and extension decisions
@@ -6392,11 +6629,22 @@ metadata is forwarded to AWS for service-side validation. The effective options
 are part of the protected prepared-request identity. Published Pi and signed
 loopback requests verified the payload; live AWS verification was unavailable.
 
-Not yet supported: non-image multimodal inputs, workbench-specific thinking
-display controls, guardrails, prompt management ARNs, live account-specific
-model discovery, and workbench proxy/idle-timeout settings. Custom model endpoints in workbench configuration are rejected;
-callers embedding the adapter can pass a configured AWS SDK client, including a
-test endpoint, through `Bedrock::new`.
+The workbench applies `httpProxy`, proxy environment variables, and
+`NO_PROXY` exclusions to Bedrock Runtime and supported AWS credential
+requests. Instance and container metadata endpoints use direct connections.
+Loopback CLI tests cover proxy selection, role assumption, metadata bypass,
+and CONNECT authentication. As in Pi after upstream #12365, the SSO portal
+and SSO OIDC token refresh use the configured HTTPS proxy. Loopback tests
+observe CONNECT requests for role credentials from both environment and
+Workbench-selected profiles, and for refresh with an expired cached SSO
+token. A live SSO sign-in and successful refresh against AWS were not
+verified. The AWS SDK retains its own HTTP timeouts.
+
+Additional Bedrock features remain outside this workbench integration,
+including non-image inputs, workbench-specific thinking display controls,
+guardrails, prompt management ARNs, and live account-specific model discovery.
+Workbench model profiles reject custom Bedrock endpoints. Embedders can
+provide a configured AWS SDK client through `Bedrock::new`.
 
 ### External editor result
 
@@ -6487,8 +6735,9 @@ separators and commas in nested containers. They also identify a raw control
 after a surrogate in another string if no other parse error occurs first.
 Malformed object property names and separators, object trailing commas, missing
 array separators and trailing text after a complete JSON value also use Pi's
-position-aware wording. Other malformed records, including array trailing
-commas, retain the native parser's diagnostics. Malformed numbers use Pi's
+position-aware wording. Unexpected values and array trailing commas use Pi's
+quoted input excerpt. Unmapped malformed records retain the native parser's
+diagnostics. Malformed numbers use Pi's
 position-aware wording for leading zeroes and missing digits after a minus
 sign, decimal point or exponent.
 
@@ -6537,6 +6786,19 @@ unrelated metadata, incomplete numeric values and undelimited numbers are ignore
 Known credentials and configured header values are redacted before error fields
 are classified, including for stream errors.
 Other provider adapters still need equivalent quota classification.
+
+### Provider stream retry classification
+
+The native error classifier recognizes upstream Pi's transient gateway stream
+failures, including temporary provider unavailability, incomplete replies, and
+connection resets. It recognizes Cloudflare 525 in provider error text or codes.
+Chat Completions finish reasons `error` and `network_error` reach the agent's
+configured retry policy. Quota and billing failures still take precedence.
+A generic `api_error` preserves explicit context overflow unless the provider
+also signals a transient failure. Content-filter stops and a generic provider unavailable error remain permanent.
+Tests cover structured and textual provider errors, quota precedence, and
+loopback Chat Completions streams. Live gateway failures were unverified.
+[Upstream retry classifier](https://github.com/earendil-works/pi/blob/9c4652688590abb836b40ebd1e4725ecf9a7c7d1/packages/ai/src/utils/retry.ts)
 
 ### Bedrock quota retry classification
 
@@ -6693,22 +6955,23 @@ interpreted as patterns; this preserves native glob precedence for ambiguous pat
 ### Google Generative AI constrained tools
 
 The native Google adapter resolves JSON Schema tool constraints before dispatch.
-Gemini 3 and later default to strict support; other model IDs default to no
-strict support. An explicit `compat.supportsStrictMode` provider or model
-setting overrides that inference in pi-rs (upstream Pi derives this capability
-from the model ID). A required constraint fails before dispatch when strict
-sampling or schema conversion is unavailable; a preferred constraint falls
-back to ordinary tool calling. When any tool is strict, the bound request uses
+Gemini 3 and later default to strict support, including IDs with a host prefix
+such as `gateway-gemini-4-argon`. Other model IDs default to ordinary tool
+calling. An explicit `compat.supportsStrictMode` provider or model setting
+overrides that inference for both the Google Generative AI and Vertex APIs,
+matching upstream Pi after #12371. A required constraint fails before dispatch
+when strict sampling or schema conversion is unavailable. A preferred constraint
+falls back to ordinary tool calling. When any tool is strict, the bound request uses
 `VALIDATED` mode and its transformed schemas are also used for budget
 reservation and recorded tool decisions. As in upstream Pi, string and numeric
 `const` schema values are rewritten to single-element `enum` values in both
 strict and ordinary Google tool declarations. pi-rs retains its existing
 explicit `AUTO` mode for ordinary calls.
 
-This comparison uses upstream Pi `463e17f8dc08a76a1e24e55db37f88de81b4b118`
-(`FETCH_HEAD`, 2026-11-15); the Google strict-mode and schema conversion logic
-is also present in its `v1.5.2` tag. pi-rs additionally rejects strict schemas
-that cannot be safely normalized for local tool execution; `prefer` falls back
+The schema conversion was compared with upstream Pi
+`463e17f8dc08a76a1e24e55db37f88de81b4b118` and is also present in `v1.5.2`.
+pi-rs additionally rejects strict schemas that cannot be safely normalized for
+local tool execution. `prefer` falls back
 and `require` fails in that case.
 Declaration-only Google streams resolve constraints but reject an effective
 strict decision, because those APIs cannot retain it for tool normalization;
