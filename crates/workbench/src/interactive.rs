@@ -746,9 +746,9 @@ struct ThemeSettings {
     stage: ThemeSettingsStage,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ModelListIntent {
-    Select,
+    Select { query: String },
     Cycle { reverse: bool },
     Scope,
     ThinkingSettings,
@@ -4390,10 +4390,14 @@ fn slash(
             if active.is_none() {
                 args.reload_model_profiles()?;
             }
-            if rest.is_empty() {
-                start_model_picker(args, view, ModelListIntent::Select);
-            } else {
+            if super::model_selection::qualified_model(rest, &args.model_profiles).is_some()
+                || super::model_selection::thinking_suffix(rest).is_some()
+            {
                 select_model_input(args, view, active, rest, false)?;
+            } else if let Some(model) = exact_model_query(args, rest, &view.available_models) {
+                select_model_input(args, view, active, &model, false)?;
+            } else {
+                start_model_picker(args, view, ModelListIntent::Select { query: rest.into() });
             }
         }
         "/scoped-models" => {
@@ -5479,7 +5483,7 @@ pub(super) async fn run(
             && view.dialog().is_none()
             && let Some(discovery) = &view.model_list
         {
-            let intent = discovery.intent;
+            let intent = discovery.intent.clone();
             match discovery.receiver.try_recv() {
                 Ok(Ok(models)) => {
                     view.model_list = None;
@@ -5532,9 +5536,23 @@ pub(super) async fn run(
                                     view.append(&error.to_string());
                                 }
                             }
-                            ModelListIntent::Select => {
+                            ModelListIntent::Select { query } => {
                                 view.available_models = models.clone();
-                                view.picker = Some(Picker::new(
+                                let selection = exact_model_query(&args, &query, &models);
+                                if let Some(model) = selection {
+                                    if let Err(error) = select_model_input(
+                                        &mut args,
+                                        &mut view,
+                                        worker.as_mut(),
+                                        &model,
+                                        false,
+                                    ) {
+                                        view.append(&error.to_string());
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
+                                let mut picker = Picker::new(
                                     "Select model",
                                     models
                                         .into_iter()
@@ -5553,7 +5571,9 @@ pub(super) async fn run(
                                             selection: Selection::Model(model),
                                         })
                                         .collect(),
-                                ));
+                                );
+                                picker.paste(&query);
+                                view.picker = Some(picker);
                             }
                         }
                     }
@@ -7142,7 +7162,13 @@ pub(super) async fn run(
                         if !is_busy(&worker)
                             || worker.as_ref().is_some_and(|active| active.busy) =>
                     {
-                        start_model_picker(&args, &mut view, ModelListIntent::Select)
+                        start_model_picker(
+                            &args,
+                            &mut view,
+                            ModelListIntent::Select {
+                                query: String::new(),
+                            },
+                        )
                     }
                     "tui.input.submit" if view.editor.continued_line() => {}
                     "tui.input.submit" | "app.message.followUp" => {
@@ -7730,6 +7756,31 @@ fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut Vie
         provider.id()
     ));
     result
+}
+
+fn exact_model_query(args: &Cli, query: &str, catalog: &[String]) -> Option<String> {
+    if query.is_empty() {
+        return None;
+    }
+    let scoped;
+    let models = if args.model_scope.is_empty() {
+        catalog
+    } else {
+        scoped = args
+            .model_scope
+            .iter()
+            .map(super::model_selection::ScopedChoice::qualified)
+            .collect::<Vec<_>>();
+        &scoped
+    };
+    let mut matches = models.iter().filter(|reference| {
+        super::model_selection::qualified_model(reference, &args.model_profiles)
+            .is_some_and(|(_, id)| id.eq_ignore_ascii_case(query))
+    });
+    let first = matches.next()?;
+    matches
+        .all(|reference| reference == first)
+        .then(|| first.clone())
 }
 
 fn select_model_input(
@@ -8362,6 +8413,7 @@ fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
         return;
     }
     let args = args.clone();
+    let thinking = matches!(intent, ModelListIntent::ThinkingSettings);
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| {
@@ -8370,7 +8422,7 @@ fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
                 .build()?;
             let catalogs = match runtime.block_on(super::model_selection::catalogs(&args, false)) {
                 Ok(catalogs) => catalogs,
-                Err(_) if matches!(intent, ModelListIntent::ThinkingSettings) => Vec::new(),
+                Err(_) if thinking => Vec::new(),
                 Err(error) => return Err(error),
             };
             let mut models: Vec<_> = catalogs
@@ -8382,7 +8434,7 @@ fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
                         .map(move |model| format!("{}/{model}", catalog.provider.id()))
                 })
                 .collect();
-            if matches!(intent, ModelListIntent::ThinkingSettings) {
+            if thinking {
                 let current = format!("{}/{}", args.provider.id(), args.model);
                 models.retain(|model| model != &current);
                 models.insert(0, current);
@@ -10412,6 +10464,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(selected.thinking.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn bare_model_queries_require_an_exact_unambiguous_id() {
+        use clap::Parser;
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        let models = [
+            "ollama/chat-model",
+            "openai/chat-model",
+            "openai/other-model",
+        ]
+        .map(str::to_owned);
+        assert_eq!(super::exact_model_query(&args, "chat", &models), None);
+        assert_eq!(super::exact_model_query(&args, "chat-model", &models), None);
+        assert_eq!(
+            super::exact_model_query(&args, "OTHER-MODEL", &models).as_deref(),
+            Some("openai/other-model")
+        );
+        args.model_scope
+            .push(super::super::model_selection::ScopedChoice {
+                provider: super::super::Provider::Ollama,
+                model: "chat-model".into(),
+                thinking: Some("low".into()),
+            });
+        assert_eq!(
+            super::exact_model_query(&args, "chat-model", &models).as_deref(),
+            Some("ollama/chat-model")
+        );
     }
 
     #[test]
@@ -13198,7 +13278,9 @@ exit {exit}
         let (sender, receiver) = std::sync::mpsc::channel();
         view.model_list = Some(super::ModelDiscovery {
             receiver,
-            intent: super::ModelListIntent::Select,
+            intent: super::ModelListIntent::Select {
+                query: String::new(),
+            },
         });
         view.picker = Some(super::Picker::new("Select model", vec![]));
         view.invalidate_model_catalog();

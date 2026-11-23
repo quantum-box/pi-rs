@@ -4597,7 +4597,9 @@ Live account verification remains separate work.
 ### Live provider selection checkpoint
 
 The terminal model picker searches the available Ollama, Anthropic, and Google catalogs.
-Use `/model anthropic/<id>` or `/model ollama/<id>` to select a model directly,
+An exact, unambiguous bare `/model` reference selects that model. Other bare
+queries open the model picker with the search field filled in, as in Pi.
+Use `/model anthropic/<id>` or `/model ollama/<id>` for native direct selection,
 or send the provider and model ID with RPC `set_model`. The worker reconnects
 for the next prompt and keeps the current session. Reopening a session
 restores the recorded provider when its connection is available and the CLI
