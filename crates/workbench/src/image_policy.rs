@@ -218,9 +218,22 @@ impl Model for WorkbenchModel {
         })))
     }
 
+    fn uses_tool_transcript(&self, model: &str) -> bool {
+        self.client.uses_tool_transcript(model)
+    }
+
     async fn prepare_context<'a>(
         &'a self,
         request: &ModelRequest,
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        self.prepare_context_with_tool_transcript(request, &[])
+            .await
+    }
+
+    async fn prepare_context_with_tool_transcript<'a>(
+        &'a self,
+        request: &ModelRequest,
+        tool_transcript: &[pi_rs::ToolTranscriptChange],
     ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
         let support = self
             .strict_policy
@@ -240,23 +253,31 @@ impl Model for WorkbenchModel {
         } else {
             client
         };
-        let identity = identity.and_then(|mut identity| {
-            if let Some(supported) = strict {
-                identity =
-                    pi_rs::fingerprint_model_context(&("final-strict-v1", identity, supported))?;
-            }
-            if let Some(supported) = grammar {
-                identity =
-                    pi_rs::fingerprint_model_context(&("final-grammar-v1", identity, supported))?;
-            }
-            pi_rs::fingerprint_model_context(&(
-                "workbench-policy-v2",
-                identity,
-                self.block_images,
-                self.supports_images,
-                self.session_affinity,
-            ))
-        });
+        let identity = identity
+            .filter(|_| tool_transcript.is_empty())
+            .and_then(|mut identity| {
+                if let Some(supported) = strict {
+                    identity = pi_rs::fingerprint_model_context(&(
+                        "final-strict-v1",
+                        identity,
+                        supported,
+                    ))?;
+                }
+                if let Some(supported) = grammar {
+                    identity = pi_rs::fingerprint_model_context(&(
+                        "final-grammar-v1",
+                        identity,
+                        supported,
+                    ))?;
+                }
+                pi_rs::fingerprint_model_context(&(
+                    "workbench-policy-v2",
+                    identity,
+                    self.block_images,
+                    self.supports_images,
+                    self.session_affinity,
+                ))
+            });
         Ok(Some(std::sync::Arc::new(PreparedWorkbenchModel {
             bound_model: self.strict_policy.as_ref().map(|_| request.model.clone()),
             inner: WorkbenchModel {
@@ -265,7 +286,8 @@ impl Model for WorkbenchModel {
                     policy.bound_support = support;
                     std::sync::Arc::new(policy)
                 }),
-                client,
+                client: client
+                    .with_tool_transcript(&self.filtered(request.clone()), tool_transcript),
                 block_images: self.block_images,
                 supports_images: self.supports_images,
                 session_affinity: self.session_affinity,
@@ -478,6 +500,10 @@ impl pi_rs::PreparedToolDispatch for PreparedWorkbenchToolDispatch {
 
 #[async_trait::async_trait]
 impl Model for PreparedWorkbenchModel {
+    fn uses_tool_transcript(&self, model: &str) -> bool {
+        self.inner.uses_tool_transcript(model)
+    }
+
     fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
         self.inner.supports_mid_conversation_system_messages(model)
     }

@@ -694,6 +694,7 @@ enum LocalEditor {
     ProviderKey(super::Provider),
     VertexLogin(VertexLoginField),
     CloudflareLogin(CloudflareLoginField),
+    CopilotEnterpriseDomain,
     BedrockProfile,
     BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
@@ -1178,8 +1179,16 @@ fn markdown_input(text: &str, kind: pi_rs::MarkdownMessageType) -> Option<&str> 
     (!text.is_empty()).then_some(text)
 }
 
+struct LiveModelChoice {
+    id: uuid::Uuid,
+    selected: Cli,
+    status: String,
+}
+
 #[derive(Default)]
 struct View {
+    live_model_choices: VecDeque<LiveModelChoice>,
+    live_model_applied: Option<Cli>,
     async_transitions: bool,
     pending_transition: Option<std::sync::mpsc::Receiver<Result<Cli>>>,
     regular: RegularState,
@@ -1304,6 +1313,7 @@ impl View {
             }
             Some(Entry::Tool {
                 id: String::new(),
+                call_id: None,
                 name: if tool.name.is_empty() {
                     "tool".into()
                 } else {
@@ -1506,7 +1516,7 @@ impl View {
         let (sender, receiver) = std::sync::mpsc::channel();
         self.clipboard = Some(receiver);
         let auto_resize = args.settings.resize_model_images();
-        let profile = args.model_image_resize();
+        let profile = self.accepted_model(args).model_image_resize();
         std::thread::spawn(move || {
             let _ = sender.send(super::clipboard::read(auto_resize, profile));
         });
@@ -2265,7 +2275,106 @@ impl View {
         }
     }
 
+    fn accepted_model<'a>(&'a self, args: &'a Cli) -> &'a Cli {
+        self.live_model_applied.as_ref().unwrap_or(args)
+    }
+
+    fn model_display(&self, args: &Cli) -> String {
+        let selected = self.accepted_model(args);
+        format!(
+            "{} · {}",
+            selected.configured_model_name(&selected.model),
+            selected.thinking.as_deref().unwrap_or("default")
+        )
+    }
+
+    fn model_choice<'a>(&'a self, args: &'a Cli) -> &'a Cli {
+        self.live_model_choices
+            .back()
+            .map(|choice| &choice.selected)
+            .unwrap_or_else(|| self.accepted_model(args))
+    }
+
+    fn stage_model_choice(
+        &mut self,
+        worker: &mut Worker,
+        selected: Cli,
+        status: String,
+    ) -> Result<()> {
+        if self.live_model_choices.len() >= 32 {
+            return Err(Error::Config("Model selection is still pending".into()));
+        }
+        let id = uuid::Uuid::new_v4();
+        worker.send(json!({
+            "type": "select_live_model",
+            "id": id,
+            "provider": selected.provider.id(),
+            "model": selected.model,
+            "thinking": selected.thinking,
+            "reported_thinking": super::thinking::reported(&selected).is_some(),
+            "reported_reasoning": super::thinking::adopted_reasoning(&selected),
+        }))?;
+        self.live_model_choices.push_back(LiveModelChoice {
+            id,
+            selected,
+            status,
+        });
+        Ok(())
+    }
+
+    fn accept_model_choice(&mut self, value: &Value, mode: Option<TuiMode>) {
+        let Some(index) = self
+            .live_model_choices
+            .iter()
+            .position(|choice| value["id"] == json!(choice.id))
+        else {
+            return;
+        };
+        let Some(mut choice) = self.live_model_choices.remove(index) else {
+            return;
+        };
+        if value["success"] == true {
+            if let Some(previous) = self.live_model_applied.take() {
+                choice
+                    .selected
+                    .selection_events
+                    .splice(0..0, previous.selection_events);
+            }
+            self.live_model_applied = Some(choice.selected);
+            self.show_status(mode, choice.status);
+        } else {
+            self.append(value["error"].as_str().unwrap_or("Could not switch models"));
+        }
+    }
+
+    fn finish_model_choice(&mut self, args: &mut Cli) -> bool {
+        let Some(mut selected) = self.live_model_applied.take() else {
+            return false;
+        };
+
+        args.provider = selected.provider;
+        args.model = selected.model;
+        args.endpoint = selected.endpoint;
+        args.thinking = selected.thinking;
+        args.thinking_profile = selected.thinking_profile;
+        args.selection_events.append(&mut selected.selection_events);
+        true
+    }
+
     fn receive_worker(&mut self, mut value: Value, args: &mut Cli) {
+        if value["type"] == "response" && value["command"] == "select_live_model" {
+            self.accept_model_choice(&value, args.tui_mode);
+            return;
+        }
+        if value["type"] == "live_model_reverted" {
+            self.live_model_applied = None;
+            self.append(
+                value["error"]
+                    .as_str()
+                    .unwrap_or("Could not save model selection"),
+            );
+            return;
+        }
         if value["type"] == "response" && value["command"] == "set_session_label" {
             if let Ok(request) = serde_json::from_value(value["id"].take())
                 && let Some(picker) = &mut self.picker
@@ -2492,6 +2601,7 @@ impl View {
                     let id = format!("unattributed-{}", record.id);
                     self.lines.push(Entry::Tool {
                         id: id.clone(),
+                        call_id: None,
                         name: format!("{tool_name} (unattributed, call {call_id})"),
                         arguments: String::new(),
                         output: String::new(),
@@ -2505,6 +2615,7 @@ impl View {
                 pi_rs::Event::BashExecution { execution } => {
                     self.lines.push(Entry::Tool {
                         id: format!("shell-{}", record.id),
+                        call_id: None,
                         name: if execution.exclude_from_context {
                             "bash (excluded)"
                         } else {
@@ -2632,6 +2743,7 @@ impl View {
         }
         self.lines.push(Entry::Tool {
             id: invocation.operation_id.to_string(),
+            call_id: Some(invocation.call.id.clone()),
             name: invocation.call.name.clone(),
             arguments: invocation.call.arguments.clone(),
             output: String::new(),
@@ -2728,6 +2840,30 @@ impl View {
             *finished = true;
         }
     }
+    fn update_tool_progress(&mut self, event: &Value) {
+        let (Some(call_id), Some(tool_name), Some(content)) = (
+            event["toolCallId"].as_str(),
+            event["toolName"].as_str(),
+            event["partialResult"]["content"].as_array(),
+        ) else {
+            return;
+        };
+        if let Some(Entry::Tool { output, .. }) = self.lines.iter_mut().rev().find(|entry| {
+            matches!(entry,
+                Entry::Tool { call_id: Some(id), name, finished: false, .. }
+                if id == call_id && name == tool_name
+            )
+        }) {
+            let text = content
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            *output = crate::ui::render::strip_shell_ansi(&text);
+        }
+    }
+
     fn restore_queue(&mut self, response: &Value) -> Result<()> {
         if response["success"] != true {
             return Err(Error::Config(
@@ -2766,6 +2902,7 @@ impl View {
                 self.shell_running = true;
                 self.lines.push(Entry::Tool {
                     id: value["executionId"].as_str().unwrap_or_default().into(),
+                    call_id: None,
                     name: if value["excludeFromContext"] == true { "bash (excluded)" } else { "bash" }.into(),
                     arguments: json!({"command":value["command"]}).to_string(),
                     output: String::new(),
@@ -2865,6 +3002,7 @@ impl View {
                     append_indexed(&mut self.text_items, &mut self.streaming, &mut self.text_items_consistent, index, delta);
                 } else { self.streaming.push_str(delta); self.text_items_consistent = false; }
             }
+            Some("tool_execution_update") => self.update_tool_progress(value),
             Some("mcp_server") => self.append(&format!(
                 "MCP {} · {} · {}",
                 value["name"].as_str().unwrap_or(""),
@@ -2924,6 +3062,7 @@ impl View {
                             for call in calls {
                                 self.lines.push(Entry::Tool {
                                     id: call["operation_id"].as_str().unwrap_or_default().into(),
+                                    call_id: call["call"]["id"].as_str().map(str::to_owned),
                                     name: call["call"]["name"].as_str().unwrap_or("tool").into(),
                                     arguments: call["call"]["arguments"]
                                         .as_str()
@@ -3489,11 +3628,7 @@ impl View {
         queue!(out, MoveTo(0, (height - 2) as u16))?;
         Line::themed(&args.workspace.display().to_string(), theme, "dim").draw(&mut out, width)?;
         queue!(out, MoveTo(0, (height - 1) as u16))?;
-        let model = format!(
-            "{} · {}",
-            args.configured_model_name(&args.model),
-            args.thinking.as_deref().unwrap_or("default")
-        );
+        let model = self.model_display(args);
         let model_width = UnicodeWidthStr::width(model.as_str());
         let usage = format!("↑↓ 確定 {} tokens", self.tokens);
         let usage = clip(&usage, width.saturating_sub(model_width + 1));
@@ -3648,15 +3783,7 @@ impl View {
             theme,
             "dim",
         ));
-        lines.push(Line::themed(
-            &format!(
-                "{} · {}",
-                args.configured_model_name(&args.model),
-                args.thinking.as_deref().unwrap_or("default")
-            ),
-            theme,
-            "dim",
-        ));
+        lines.push(Line::themed(&self.model_display(args), theme, "dim"));
         let session = Session::snapshot(&args.session)?;
         let (messages, _) = super::rpc_messages::snapshot(&session);
         let mut output = format!(
@@ -3956,12 +4083,7 @@ impl View {
             queue!(out, Print("\r\n"))?;
         }
         Line::themed(
-            &format!(
-                "↑↓ {} tokens · {} · {}",
-                self.tokens,
-                args.configured_model_name(&args.model),
-                args.thinking.as_deref().unwrap_or("default")
-            ),
+            &format!("↑↓ {} tokens · {}", self.tokens, self.model_display(args)),
             theme,
             "dim",
         )
@@ -4319,13 +4441,25 @@ fn slash(
         "/login" if rest.eq_ignore_ascii_case("openai-codex device") => {
             start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
         }
-        "/login" if rest.eq_ignore_ascii_case("github-copilot") => {
-            start_copilot_login(view, &args.settings)
-        }
         "/login" if rest.eq_ignore_ascii_case("github-copilot api-key") => edit_provider_key(
             super::Provider::named("github-copilot").expect("built-in Copilot provider"),
             view,
         ),
+        "/login"
+            if rest
+                .split_whitespace()
+                .next()
+                .is_some_and(|provider| provider.eq_ignore_ascii_case("github-copilot")) =>
+        {
+            let enterprise = rest
+                .split_once(char::is_whitespace)
+                .map(|(_, domain)| domain.trim());
+            if let Some(enterprise) = enterprise {
+                start_copilot_login(view, &args.settings, Some(enterprise))?;
+            } else {
+                edit_copilot_enterprise(view);
+            }
+        }
         "/login" | "/logout" => {
             let login = name == "/login";
             if rest.is_empty() {
@@ -5350,7 +5484,9 @@ pub(super) async fn run(
                             }
                             ModelListIntent::Cycle { reverse } => {
                                 view.available_models = models;
-                                if let Err(error) = cycle_model(&mut args, &mut view, reverse) {
+                                if let Err(error) =
+                                    cycle_model(&mut args, &mut view, &mut worker, reverse)
+                                {
                                     view.append(&error.to_string());
                                 }
                             }
@@ -5565,6 +5701,9 @@ pub(super) async fn run(
                     }
                 }
                 if settled {
+                    if view.finish_model_choice(&mut args) {
+                        active.adopt_live_model(&args);
+                    }
                     active.busy = false;
                     cancel_running_extension_editor(&mut external_editor, None);
                     view.dialogs.clear();
@@ -5610,6 +5749,8 @@ pub(super) async fn run(
                 if let Some(pending) = view.pending_share.take() {
                     start_share_upload(&mut view, pending, None);
                 }
+                view.live_model_choices.clear();
+                view.live_model_applied = None;
                 view.settle();
                 view.cache_warming_status = None;
                 cancel_running_extension_editor(&mut external_editor, None);
@@ -6280,6 +6421,9 @@ pub(super) async fn run(
                                 LocalEditor::CloudflareLogin(field) => {
                                     advance_cloudflare_login(field, text.trim(), &mut args, &mut view)
                                 }
+                                LocalEditor::CopilotEnterpriseDomain => {
+                                    start_copilot_login(&mut view, &args.settings, Some(&text))
+                                }
                                 LocalEditor::ProviderKey(provider) => super::model_auth::save(
                                     provider,
                                     args.model_endpoint_for(
@@ -6900,23 +7044,19 @@ pub(super) async fn run(
                             Err(error) => view.append(&error.to_string()),
                         }
                     }
-                    "app.model.cycleForward" | "app.model.cycleBackward" if !is_busy(&worker) => {
-                        if let Err(error) =
-                            cycle_model(&mut args, &mut view, action == "app.model.cycleBackward")
-                        {
+                    "app.model.cycleForward" | "app.model.cycleBackward" => {
+                        if let Err(error) = cycle_model(
+                            &mut args,
+                            &mut view,
+                            &mut worker,
+                            action == "app.model.cycleBackward",
+                        ) {
                             view.append(&error.to_string());
                         }
                     }
-                    "app.thinking.cycle" if !is_busy(&worker) => {
-                        match super::thinking::cycle(&mut args) {
-                            Ok(Some(level)) => {
-                                view.show_status(args.tui_mode, format!("Thinking level: {level}"));
-                            }
-                            Ok(None) => view.show_status(
-                                args.tui_mode,
-                                "Current model does not support thinking".into(),
-                            ),
-                            Err(error) => view.append(&error.to_string()),
+                    "app.thinking.cycle" => {
+                        if let Err(error) = cycle_thinking(&mut args, &mut view, &mut worker) {
+                            view.append(&error.to_string());
                         }
                     }
                     "app.tools.expand" => {
@@ -7069,9 +7209,10 @@ pub(super) async fn run(
                             } else {
                                 "steer"
                             };
-                            match Worker::control(
+                            match Worker::control_with_image_model(
                                 &mut worker,
                                 &args,
+                                view.accepted_model(&args),
                                 json!({"type":kind,"content":input,"images":view.draft_images}),
                             ) {
                                 Ok(()) => view.draft_images.clear(),
@@ -7464,12 +7605,6 @@ fn edit_cloudflare_login(view: &mut View, field: CloudflareLoginField) {
     view.local_editor = Some((LocalEditor::CloudflareLogin(field), dialog));
 }
 
-fn cloudflare_login_matches_gateway_base(base: &str, account: &str, gateway: &str) -> bool {
-    super::cloudflare_gateway::Route::new(account, gateway).is_some_and(|route| {
-        super::cloudflare_gateway::Route::from_configured(base, Some(&route)) == Some(route)
-    })
-}
-
 fn advance_cloudflare_login(
     field: &CloudflareLoginField,
     text: &str,
@@ -7518,7 +7653,7 @@ fn advance_cloudflare_login(
             provider,
             (provider == &args.provider).then_some(args.model.as_str()),
         )
-        && !cloudflare_login_matches_gateway_base(base, account, gateway)
+        && !super::cloudflare_gateway::Route::matches_configured(base, account, gateway)
     {
         return Err(Error::Config(
             "Enter identifiers that match the configured Cloudflare route".into(),
@@ -7606,10 +7741,16 @@ fn save_default_model(args: &mut Cli) -> Result<()> {
     Ok(())
 }
 
-fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
+fn cycle_model(
+    args: &mut Cli,
+    view: &mut View,
+    worker: &mut Option<Worker>,
+    reverse: bool,
+) -> Result<()> {
     use super::model_selection::{ScopedChoice, next_model, qualified_model};
+    let current = view.model_choice(args);
     let discovered;
-    let choices = if args.model_scope.is_empty() {
+    let choices = if current.model_scope.is_empty() {
         if view.available_models.is_empty() {
             start_model_picker(args, view, ModelListIntent::Cycle { reverse });
             return Ok(());
@@ -7617,7 +7758,7 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
         discovered = view
             .available_models
             .iter()
-            .filter_map(|model| qualified_model(model, &args.model_profiles))
+            .filter_map(|model| qualified_model(model, &current.model_profiles))
             .map(|(provider, model)| ScopedChoice {
                 provider,
                 model: model.to_owned(),
@@ -7626,34 +7767,74 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
             .collect::<Vec<_>>();
         discovered.as_slice()
     } else {
-        args.model_scope.as_slice()
+        current.model_scope.as_slice()
     };
-    let status = if let Some(choice) = next_model(args, choices, reverse) {
-        args.change_model(
+    let Some(choice) = next_model(current, choices, reverse) else {
+        let text = if current.model_scope.is_empty() {
+            "Only one model available"
+        } else {
+            "Only one model in scope"
+        };
+        view.show_status(args.tui_mode, text.into());
+        return Ok(());
+    };
+    if let Some(worker) = worker.as_mut().filter(|worker| worker.busy) {
+        let mut current = current.clone();
+        current.selection_events.clear();
+        let selected = current.prepare_model_change(
             choice.provider,
             choice.model,
             choice.thinking,
             pi_rs::ModelSelectSource::Cycle,
         )?;
-        let name = args
-            .model_profiles
-            .model(&args.provider, &args.model)
-            .and_then(|model| model.name)
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| args.model.clone());
-        let mut status = format!("Switched to {name}");
-        if let Some(level) = args.thinking.as_deref().filter(|level| *level != "off")
-            && super::thinking::adopted_reasoning(args) == Some(true)
-        {
-            status.push_str(&format!(" (thinking: {level})"));
+        let status = model_cycle_status(&selected);
+        return view.stage_model_choice(worker, selected, status);
+    }
+    args.change_model(
+        choice.provider,
+        choice.model,
+        choice.thinking,
+        pi_rs::ModelSelectSource::Cycle,
+    )?;
+    view.show_status(args.tui_mode, model_cycle_status(args));
+    Ok(())
+}
+
+fn model_cycle_status(args: &Cli) -> String {
+    let name = args
+        .model_profiles
+        .model(&args.provider, &args.model)
+        .and_then(|model| model.name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| args.model.clone());
+    let mut status = format!("Switched to {name}");
+    if let Some(level) = args.thinking.as_deref().filter(|level| *level != "off")
+        && super::thinking::adopted_reasoning(args) == Some(true)
+    {
+        status.push_str(&format!(" (thinking: {level})"));
+    }
+    status
+}
+
+fn cycle_thinking(args: &mut Cli, view: &mut View, worker: &mut Option<Worker>) -> Result<()> {
+    let level = if let Some(worker) = worker.as_mut().filter(|worker| worker.busy) {
+        let mut selected = view.model_choice(args).clone();
+        selected.selection_events.clear();
+        if let Some(level) = super::thinking::next_level(&mut selected) {
+            super::thinking::select(&mut selected, &level);
+            return view.stage_model_choice(worker, selected, format!("Thinking level: {level}"));
         }
-        status
-    } else if args.model_scope.is_empty() {
-        "Only one model available".into()
+        None
     } else {
-        "Only one model in scope".into()
+        super::thinking::cycle(args)?
     };
-    view.show_status(args.tui_mode, status);
+    view.show_status(
+        args.tui_mode,
+        level.map_or_else(
+            || "Current model does not support thinking".into(),
+            |level| format!("Thinking level: {level}"),
+        ),
+    );
     Ok(())
 }
 
@@ -7802,20 +7983,43 @@ fn start_codex_login(
     view.remote_task = Some(task);
 }
 
-fn start_copilot_login(view: &mut View, settings: &crate::config::Settings) {
+fn edit_copilot_enterprise(view: &mut View) {
+    let dialog = crate::ui::dialog::Dialog::new(
+        uuid::Uuid::new_v4(),
+        pi_rs::UiRequest::Input {
+            title: "GitHub Enterprise URL/domain (blank for github.com)".into(),
+            placeholder: Some("company.ghe.com".into()),
+            initial_value: None,
+            timeout: None,
+        },
+    );
+    view.local_editor = Some((LocalEditor::CopilotEnterpriseDomain, dialog));
+}
+
+fn start_copilot_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    enterprise: Option<&str>,
+) -> Result<()> {
     let settings = settings.clone();
+    let enterprise = super::copilot_auth::enterprise_domain(enterprise)?;
     let control = super::meta_auth::LoginControl::default();
     let task_control = control.clone();
     let mut task = RemoteTask::start(
         "Signing in to GitHub Copilot",
         "GitHub Copilot login cancelled",
         move |sender| async move {
-            super::copilot_auth::login(&settings, task_control, |url, code| {
-                let _ = sender.send(RemoteEvent::DeviceCode {
-                    url: url.to_string(),
-                    code: code.to_owned(),
-                });
-            })
+            super::copilot_auth::login(
+                &settings,
+                enterprise.as_deref(),
+                task_control,
+                |url, code| {
+                    let _ = sender.send(RemoteEvent::DeviceCode {
+                        url: url.to_string(),
+                        code: code.to_owned(),
+                    });
+                },
+            )
             .await?;
             let _ = sender.send(RemoteEvent::RefreshModelKeys);
             Ok(vec!["Signed in to GitHub Copilot".into()])
@@ -7823,6 +8027,7 @@ fn start_copilot_login(view: &mut View, settings: &crate::config::Settings) {
     );
     task.meta_login_control = Some(control);
     view.remote_task = Some(task);
+    Ok(())
 }
 
 fn start_xai_login(view: &mut View, settings: &crate::config::Settings) {
@@ -8581,6 +8786,19 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
         },
         queue_setting("steeringMode", "Steering mode", pi_rs::InputKind::Steer),
         queue_setting("followUpMode", "Follow-up mode", pi_rs::InputKind::FollowUp),
+        {
+            let transport = args.settings.string("transport").unwrap_or("auto");
+            let next = match transport {
+                "sse" => "websocket",
+                "websocket" => "websocket-cached",
+                "websocket-cached" => "auto",
+                _ => "sse",
+            };
+            Item {
+                label: format!("Transport · {transport}"),
+                selection: Selection::Setting("transport".into(), json!(next)),
+            }
+        },
         Item {
             label: format!("Session share destination · {share}"),
             selection: Selection::Setting(
@@ -8980,7 +9198,7 @@ fn select(
         Selection::LoginCodexDevice => {
             start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
         }
-        Selection::LoginCopilot => start_copilot_login(view, &args.settings),
+        Selection::LoginCopilot => edit_copilot_enterprise(view),
         Selection::LoginXai => start_xai_login(view, &args.settings),
         Selection::LoginMeta => start_meta_login(view, &args.settings),
         Selection::LoginKimi => start_kimi_login(view, &args.settings),
@@ -9121,10 +9339,12 @@ fn select(
             } else {
                 args.settings.set_user(&key, value.clone())?;
             }
-            if key == "cacheWarming"
-                && let Some(worker) = worker
-            {
-                worker.send(json!({"type":"cache_warming_changed"}))?;
+            if let Some(worker) = worker {
+                match key.as_str() {
+                    "cacheWarming" => worker.send(json!({"type":"cache_warming_changed"}))?,
+                    "transport" => worker.send(json!({"type":"transport_changed"}))?,
+                    _ => {}
+                }
             }
             match key.as_str() {
                 "expandTools" => view.set_expand_tools(value.as_bool().unwrap_or(false)),
@@ -10049,6 +10269,23 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn copilot_login_prompts_before_starting_device_authorization() {
+        use super::{Cli, KeyCode, KeyEvent, KeyModifiers, Keys, LocalEditor, View};
+        use clap::Parser;
+
+        let mut args = Cli::parse_from(["pi", "--offline"]);
+        let mut view = View::default();
+        super::slash("/login github-copilot", &mut args, &mut view, None).unwrap();
+        assert!(view.remote_task.is_none());
+        let (editor, mut dialog) = view.local_editor.take().unwrap();
+        assert!(matches!(editor, LocalEditor::CopilotEnterpriseDomain));
+        assert!(matches!(
+            dialog.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &Keys::default()),
+            Some(pi_rs::UiResponse::Text(value)) if value.is_empty()
+        ));
+    }
+
+    #[test]
     fn subscription_warning_respects_settings_and_only_appears_once() {
         use clap::Parser;
 
@@ -10084,21 +10321,6 @@ mod tests {
         let mut view = super::View::default();
         view.maybe_warn_about_anthropic_subscription(&args);
         assert!(view.lines.is_empty());
-    }
-
-    #[test]
-    fn cloudflare_login_validates_fixed_identifiers_in_gateway_templates() {
-        let base = "https://gateway.ai.cloudflare.com/v1/fixed/{CLOUDFLARE_GATEWAY_ID}/compat";
-        assert!(cloudflare_login_matches_gateway_base(
-            base,
-            "fixed",
-            "other-gateway"
-        ));
-        assert!(!cloudflare_login_matches_gateway_base(
-            base,
-            "wrong",
-            "other-gateway"
-        ));
     }
 
     #[test]
@@ -12368,6 +12590,40 @@ exit {exit}
         );
         assert!(
             matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, description: None, .. }) if text == "/skill:review")
+        );
+    }
+
+    #[test]
+    fn mcp_tool_progress_renders_in_pending_row_until_final_result() {
+        use super::*;
+
+        let mut view = View::default();
+        view.receive(&json!({"type":"record","record":{"event":{"type":"assistant","content":"","invocations":[
+            {"operation_id":"run","call":{"id":"call","name":"mcp__fixture__work","arguments":"{}"}},
+            {"operation_id":"other","call":{"id":"other","name":"mcp__fixture__work","arguments":"{}"}}
+        ]}}}));
+        let update = json!({
+            "type": "tool_execution_update",
+            "toolCallId": "call",
+            "toolName": "mcp__fixture__work",
+            "partialResult": {"content": [{"type":"text","text":"working\u{1b}[31m"}]},
+        });
+        view.receive(&update);
+        let theme = crate::ui::theme::Theme::system();
+        let pending = view.lines[0].render(&theme, 80, false, true, Default::default());
+        assert!(
+            pending
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text == "working")
+        );
+        assert!(matches!(view.lines[1], Entry::Tool { ref output, .. } if output.is_empty()));
+        view.receive(&json!({"type":"record","record":{"event":{
+            "type":"tool_finished","operation_id":"run","outcome":{"status":"succeeded","detail":"done"}
+        }}}));
+        view.receive(&update);
+        assert!(
+            matches!(view.lines[0], Entry::Tool { ref output, finished: true, .. } if output == "done")
         );
     }
 
