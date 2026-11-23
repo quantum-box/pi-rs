@@ -5911,7 +5911,8 @@ public metadata support use dynamic registration in auto mode.
 
 A loopback OAuth fixture covered both document paths, dynamic registration,
 and precedence. The hosted documents are supplied by the configured
-application identity. [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#client-id-metadata-documents)
+application identity. Real-service sign-in, token refresh, and sign-out with a
+hosted pi-rs client identity remain unverified. [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#client-id-metadata-documents)
 
 `images.autoResize` controls CLI file attachments, clipboard image
 encoding and the native `read` tool. With resizing disabled, supported
