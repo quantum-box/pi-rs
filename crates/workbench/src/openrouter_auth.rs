@@ -17,6 +17,14 @@ pub(super) async fn login(
     settings: &super::config::Settings,
     announce: impl FnOnce(&Url, oneshot::Sender<String>),
 ) -> Result<()> {
+    login_with_browser(settings, true, announce).await
+}
+
+pub(super) async fn login_with_browser(
+    settings: &super::config::Settings,
+    open_browser: bool,
+    announce: impl FnOnce(&Url, oneshot::Sender<String>),
+) -> Result<()> {
     let proxies = super::http_proxy::configured(settings)?;
     let idle_timeout = settings.http_idle_timeout();
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
@@ -30,7 +38,9 @@ pub(super) async fn login(
     let authorization = authorization_url(&callback, &verifier);
     let (manual, input) = oneshot::channel();
     announce(&authorization, manual);
-    let _ = pi_rs_workbench::oauth_callback::open_browser(authorization.as_str()).await;
+    if open_browser {
+        let _ = pi_rs_workbench::oauth_callback::open_browser(authorization.as_str()).await;
+    }
 
     let incoming = tokio::time::timeout(Duration::from_secs(300), async {
         tokio::select! {

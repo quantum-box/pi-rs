@@ -698,6 +698,7 @@ impl SessionStore for BoundaryPreviewStore {
 pub struct Session {
     auto_compaction: crate::AutoCompactionControl,
     retry: crate::RetryControl,
+    pub(crate) live_model: Option<crate::LiveModelControl>,
     store: Box<dyn SessionStore>,
     records: Vec<Record>,
     record_metadata: BTreeMap<u64, serde_json::Value>,
@@ -715,6 +716,7 @@ impl Session {
         Self {
             auto_compaction: self.auto_compaction.clone(),
             retry: self.retry.clone(),
+            live_model: None,
             store: Box::new(BoundaryPreviewStore {
                 metadata: self.supports_record_metadata(),
                 record_limit: self.store.encoded_record_limit(),
@@ -784,6 +786,11 @@ impl Session {
     /// Attach a host-owned control across successive openings of this session.
     pub fn set_auto_compaction_control(&mut self, control: crate::AutoCompactionControl) {
         self.auto_compaction = control;
+    }
+
+    /// Attach a control for changing the configured route between model requests.
+    pub fn set_live_model_control(&mut self, control: crate::LiveModelControl) {
+        self.live_model = Some(control);
     }
 
     /// Hold an exclusive OS lock for the lifetime of the session.
@@ -877,6 +884,7 @@ impl Session {
         let mut session = Self {
             auto_compaction: crate::AutoCompactionControl::default(),
             retry: crate::RetryControl::default(),
+            live_model: None,
             store: Box::new(store),
             records,
             record_metadata,
@@ -4542,6 +4550,7 @@ pub(crate) struct SystemTranscript {
 pub(crate) struct SystemTranscriptFallback {
     collapsed: String,
     projected: Vec<String>,
+    insertions: Vec<usize>,
 }
 
 impl SystemTranscript {
@@ -4553,6 +4562,7 @@ impl SystemTranscript {
             return None;
         }
         let collapsed = std::mem::replace(content, self.leading);
+        let insertions = self.updates.iter().map(|(position, _)| *position).collect();
         let mut updates = self.updates.into_iter().peekable();
         let mut projected = Vec::with_capacity(messages.len() + updates.len());
         for (index, message) in std::mem::take(messages).into_iter().enumerate() {
@@ -4566,6 +4576,7 @@ impl SystemTranscript {
         Some(SystemTranscriptFallback {
             collapsed,
             projected: system_messages(messages).map(str::to_owned).collect(),
+            insertions,
         })
     }
 }
@@ -4578,6 +4589,18 @@ fn system_messages(messages: &[Message]) -> impl Iterator<Item = &str> {
 }
 
 impl SystemTranscriptFallback {
+    pub(crate) fn inserted_count(&self) -> usize {
+        self.insertions.len()
+    }
+
+    /// At a shared checkpoint, the tool declaration is emitted before its system text.
+    pub(crate) fn project_tool_boundary(&self, index: usize) -> usize {
+        index
+            + self
+                .insertions
+                .partition_point(|position| *position < index)
+    }
+
     pub(crate) fn finish(
         self,
         model: &dyn crate::Model,
