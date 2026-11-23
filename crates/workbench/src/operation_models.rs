@@ -1083,13 +1083,31 @@ impl Operations {
         let mut args = self.args.clone();
         args.settings = http.settings;
         args.model_keys = Keys::load_async().await.ok()?;
+        if cached_only {
+            let gateway =
+                super::radius_auth::Gateway::configured_with_settings(&args.settings).ok()?;
+            let endpoint = args.model_endpoint_for(&Provider::Radius, None);
+            if endpoint != gateway.model_endpoint().as_str() {
+                return None;
+            }
+            // Cache access needs the account identity. Header commands are
+            // irrelevant, and an unresolved credential command has no identity.
+            let token = match args.model_credential_for(&Provider::Radius, endpoint) {
+                Some(credential) => Some(credential.literal()?.to_owned()),
+                None => None,
+            };
+            return PiMessages::radius(endpoint, token, gateway)
+                .ok()
+                .map(|client| {
+                    client
+                        .with_context_probe(false)
+                        .with_radius_catalog_cache(http.radius)
+                });
+        }
         let client = args
             .connect_provider(&Provider::Radius, None)
             .ok()?
-            .with_context_probes(!args.offline && !cached_only);
-        if cached_only && matches!(client, Client::Deferred(_)) {
-            return None;
-        }
+            .with_context_probes(!args.offline);
         match client.resolve_affinity_headers().await.ok()?.0 {
             Client::PiMessages(client) => Some(client.with_radius_catalog_cache(http.radius)),
             _ => None,
@@ -2042,6 +2060,16 @@ mod tests {
             }
         });
         for mode in ["online", "offline"] {
+            if mode == "offline" {
+                std::fs::write(
+                    home.path().join("models.json"),
+                    json!({
+                        "providers":{"radius":{"headers":{"x-fixture-tenant":"!exit 9"}}}
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            }
             let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
             child.args(["--exact","operation_models::tests::radius_catalog_discovers_and_invokes_account_classifiers"])
                 .env("PI_RS_HOME", home.path())
