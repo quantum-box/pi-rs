@@ -16,21 +16,18 @@ use sha2::{Digest, Sha256};
 
 // MCP tools use the core tool output limit. A projected payload must fit it too.
 const MAX_MODEL_CONTENT_BYTES: usize = 1024 * 1024;
-const MAX_OUTPUT_FILES: usize = 64;
 const TEXT_PREVIEW_BYTES: usize = 20 * 1024;
-const MAX_OUTPUT_FILE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Default)]
 struct ResourceOutputs {
     directory: Option<tempfile::TempDir>,
-    files: BTreeMap<([u8; 32], String), (PathBuf, usize)>,
-    bytes: usize,
+    files: BTreeMap<([u8; 32], String), PathBuf>,
 }
 
 impl ResourceOutputs {
     fn save(&mut self, data: &[u8], extension: &str) -> io::Result<PathBuf> {
         let key = (Sha256::digest(data).into(), extension.to_owned());
-        if let Some((path, _)) = self.files.get(&key) {
+        if let Some(path) = self.files.get(&key) {
             if unchanged(path, data) {
                 return Ok(path.clone());
             }
@@ -38,13 +35,6 @@ impl ResourceOutputs {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
-            }
-        }
-        let new = !self.files.contains_key(&key);
-        if new && self.at_capacity(data.len()) {
-            self.remove_missing_files();
-            if self.at_capacity(data.len()) {
-                return Err(io::Error::other("native MCP output file limit reached"));
             }
         }
         let directory = match &self.directory {
@@ -59,29 +49,8 @@ impl ResourceOutputs {
             .tempfile_in(directory.path())?;
         file.write_all(data)?;
         let (_, path) = file.keep().map_err(|error| error.error)?;
-        self.files.insert(key, (path.clone(), data.len()));
-        if new {
-            self.bytes += data.len();
-        }
+        self.files.insert(key, path.clone());
         Ok(path)
-    }
-
-    fn at_capacity(&self, size: usize) -> bool {
-        self.files.len() >= MAX_OUTPUT_FILES || self.bytes + size > MAX_OUTPUT_FILE_BYTES
-    }
-
-    fn remove_missing_files(&mut self) {
-        let mut bytes = 0;
-        self.files.retain(|_, (path, size)| {
-            let missing = path
-                .symlink_metadata()
-                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
-            if missing {
-                bytes += *size;
-            }
-            !missing
-        });
-        self.bytes -= bytes;
     }
 }
 
@@ -888,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_model_content_uses_bounded_private_binary_paths() {
+    fn mcp_model_content_uses_private_files_and_replaces_modified_copies() {
         assert_eq!(
             resource_extension("mock://example/a.pdf?param=value"),
             ".pdf"
@@ -901,25 +870,17 @@ mod tests {
         let file = outputs.save(b"hello", ".pdf").unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), b"hello");
         assert_eq!(outputs.save(b"hello", ".pdf").unwrap(), file);
-        assert_eq!(outputs.bytes, 5);
         std::fs::write(&file, b"changed").unwrap();
         let restored = outputs.save(b"hello", ".pdf").unwrap();
         assert_ne!(file, restored);
         assert_eq!(std::fs::read(&restored).unwrap(), b"hello");
-        assert_eq!(outputs.bytes, 5);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(restored.metadata().unwrap().permissions().mode() & 0o077, 0);
         }
-        outputs.bytes = MAX_OUTPUT_FILE_BYTES;
-        assert!(outputs.save(b"new", ".pdf").is_err());
-        std::fs::remove_file(&restored).unwrap();
-        let next = outputs.save(b"new", ".pdf").unwrap();
-        assert_eq!(outputs.bytes, MAX_OUTPUT_FILE_BYTES - 2);
-        assert_eq!(outputs.files.len(), 1);
         drop(outputs);
-        assert!(!next.exists());
+        assert!(!restored.exists());
     }
 
     #[test]

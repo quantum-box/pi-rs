@@ -2038,8 +2038,8 @@ text blocks. When a local shell tool is available, embedded non-image binary
 resources can be saved to private temporary files. Text beyond 20 KiB shows
 its beginning and end with a link to the full text when an available local
 tool can read it. Output remains inline when a file cannot be used. Repeated
-projections reuse files up to the native process quota. Deleted files free
-space in that quota, and the CLI cleans its temporary files on normal shutdown. Formats marked as
+projections reuse files, and the CLI cleans its temporary files on normal
+shutdown. The native limit on the size of each tool result still applies. Formats marked as
 images that the provider cannot attach stay subject to the native image policy.
 
 Programmatic shell calls return output,
