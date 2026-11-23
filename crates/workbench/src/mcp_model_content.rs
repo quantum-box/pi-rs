@@ -751,6 +751,26 @@ mod tests {
     }
 
     #[test]
+    fn mcp_model_content_truncates_text_in_place_between_images() {
+        let original = tool_content(json!({"content":[
+            {"type":"text","text":"first ".repeat(2000)},
+            {"type":"image","data":"YQ==","mimeType":"image/png"},
+            {"type":"text","text":"middle ".repeat(2000)},
+            {"type":"image","data":"Yg==","mimeType":"image/png"},
+            {"type":"text","text":"last caption"},
+        ]}));
+        let (output, structured) = project_result(&original, "fixture", "get", None).unwrap();
+        assert!(structured);
+        let value: Value = serde_json::from_str(&output).unwrap();
+        let blocks = &value["data"]["content"];
+        assert!(blocks[0]["text"].as_str().unwrap().contains("truncated"));
+        assert_eq!(blocks[1]["data"], "YQ==");
+        assert!(blocks[2]["text"].as_str().unwrap().contains("middle"));
+        assert_eq!(blocks[3]["data"], "Yg==");
+        assert_eq!(blocks[4]["text"], "last caption");
+    }
+
+    #[test]
     fn mcp_model_content_detects_the_local_cli_file_tools() {
         use pi_rs::Extension;
         let workspace = tempfile::tempdir().unwrap();
