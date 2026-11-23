@@ -1,7 +1,7 @@
 //! Project MCP call results into the provider request without changing the journal.
 use std::{
     collections::BTreeMap,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::PathBuf,
     sync::{Mutex, OnceLock},
 };
@@ -30,8 +30,15 @@ struct ResourceOutputs {
 impl ResourceOutputs {
     fn save(&mut self, data: &[u8], extension: &str) -> io::Result<PathBuf> {
         let key = (Sha256::digest(data).into(), extension.to_owned());
-        if let Some(path) = self.files.get(&key).filter(|path| path.is_file()) {
-            return Ok(path.clone());
+        if let Some(path) = self.files.get(&key) {
+            if unchanged(path, data) {
+                return Ok(path.clone());
+            }
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
         let new = !self.files.contains_key(&key);
         if new
@@ -58,6 +65,16 @@ impl ResourceOutputs {
         }
         Ok(path)
     }
+}
+
+fn unchanged(path: &std::path::Path, data: &[u8]) -> bool {
+    let mut saved = Vec::new();
+    path.symlink_metadata()
+        .is_ok_and(|metadata| metadata.is_file())
+        && std::fs::File::open(path)
+            .and_then(|file| file.take(data.len() as u64 + 1).read_to_end(&mut saved))
+            .is_ok()
+        && saved == data
 }
 
 // Estimation and dispatch can project the same history repeatedly.
@@ -246,8 +263,15 @@ fn project_result_with_files(
     if let Some(data) = distinct_data {
         projected.push(text(serde_json::to_string_pretty(data).ok()?));
     }
-    limit_text_preview(&mut projected, files);
-    let (output, structured) = encode_blocks(&projected);
+    let spilled = limit_text_preview(&mut projected, files);
+    let (mut output, mut structured) = encode_blocks(&projected);
+    if output.len() > MAX_MODEL_CONTENT_BYTES
+        && !spilled
+        && let Some(data) = distinct_data
+    {
+        *projected.last_mut().expect("structured content added") = text(data.to_string());
+        (output, structured) = encode_blocks(&projected);
+    }
     Some(if output.len() <= MAX_MODEL_CONTENT_BYTES {
         (output, structured)
     } else {
@@ -255,10 +279,10 @@ fn project_result_with_files(
     })
 }
 
-fn limit_text_preview(projected: &mut Vec<Value>, files: FileReaders) {
+fn limit_text_preview(projected: &mut Vec<Value>, files: FileReaders) -> bool {
     let full = joined_text(projected);
     if full.len() <= TEXT_PREVIEW_BYTES {
-        return;
+        return false;
     }
     let page_by_line = files.read
         && full
@@ -269,11 +293,11 @@ fn limit_text_preview(projected: &mut Vec<Value>, files: FileReaders) {
     } else if files.shell {
         "read byte ranges with the local shell"
     } else {
-        return;
+        return false;
     };
     // Keep the inline form if there is no usable copy on disk.
     let Ok(path) = save_output_file(full.as_bytes(), ".txt") else {
-        return;
+        return false;
     };
     let mut head = TEXT_PREVIEW_BYTES / 2;
     let mut tail = full.len() - TEXT_PREVIEW_BYTES / 2;
@@ -286,14 +310,40 @@ fn limit_text_preview(projected: &mut Vec<Value>, files: FileReaders) {
     let tokens = full.len().div_ceil(4);
     let total_lines = full.lines().count();
     let removed = full[head..tail].chars().count();
-    let location = format!("[Full output: {} ({hint})]", path.display());
-    let preview = format!(
-        "Warning: truncated output (original token count: {tokens})\nTotal output lines: {total_lines}\n\n{}…{removed} chars truncated…{}\n\n{location}",
-        &full[..head],
-        &full[tail..]
-    );
-    projected.retain(|block| block["type"] != "text");
-    projected.insert(0, text(preview));
+    let mut offset = 0;
+    let mut notice = Some(format!("…{removed} chars truncated…"));
+    let mut header = Some(format!(
+        "Warning: truncated output (original token count: {tokens})\nTotal output lines: {total_lines}\n"
+    ));
+    projected.retain_mut(|block| {
+        let Some(body) = block["text"].as_str() else {
+            return true;
+        };
+        let end = offset + body.len();
+        let mut preview = header.take().unwrap_or_default();
+        if offset < head {
+            preview.push_str(&body[..head.min(end) - offset]);
+        }
+        if end >= head
+            && let Some(notice) = notice.take()
+        {
+            preview.push_str(&notice);
+        }
+        if end > tail {
+            preview.push_str(&body[tail.max(offset) - offset..]);
+        }
+        offset = end + 1;
+        if preview.is_empty() {
+            return false;
+        }
+        *block = text(preview);
+        true
+    });
+    projected.push(text(format!(
+        "\n[Full output: {} ({hint})]",
+        path.display()
+    )));
+    true
 }
 
 fn encode_limited_blocks(projected: &[Value]) -> (String, bool) {
@@ -774,15 +824,20 @@ mod tests {
         assert_eq!(std::fs::read(&file).unwrap(), b"hello");
         assert_eq!(outputs.save(b"hello", ".pdf").unwrap(), file);
         assert_eq!(outputs.bytes, 5);
+        std::fs::write(&file, b"changed").unwrap();
+        let restored = outputs.save(b"hello", ".pdf").unwrap();
+        assert_ne!(file, restored);
+        assert_eq!(std::fs::read(&restored).unwrap(), b"hello");
+        assert_eq!(outputs.bytes, 5);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o077, 0);
+            assert_eq!(restored.metadata().unwrap().permissions().mode() & 0o077, 0);
         }
         outputs.bytes = MAX_OUTPUT_FILE_BYTES;
         assert!(outputs.save(b"new", ".pdf").is_err());
         drop(outputs);
-        assert!(!file.exists());
+        assert!(!restored.exists());
     }
 
     #[test]
