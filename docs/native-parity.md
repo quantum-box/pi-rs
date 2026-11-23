@@ -140,14 +140,18 @@ scrollback. The tool-output, thinking-visibility, and thinking-level shortcuts
 report the new state using the same status row, as in Pi.
 During a streamed prompt, model cycling, the Ctrl+L model picker, and
 the /model command can select the model for the next request. Ctrl+S in the
-picker also saves the accepted choice as the default. Model and thinking
-shortcuts acknowledge a prepared selection without changing the request in flight. A queued follow-up uses the
+picker also saves the accepted choice as the default. /thinking can select
+or save a reasoning level while the prompt streams. These controls acknowledge
+a prepared selection without changing the request in flight. A queued follow-up uses the
 new route and effort. Cycling models uses the destination's scoped or per-model
 thinking level, then the global default, then the current level. The worker
 commits the selection before the next request,
 or at settlement when the current prompt finishes without a follow-up. pi-rs
 uses the accepted model's configured image resize profile for new clipboard
-pastes and queued attachments.
+pastes and queued attachments. Regular and fullscreen PTY comparisons against
+Pi v1.6.0 held the first model response open while exercising the pickers,
+direct commands, and Save as Default. The queued follow-up used the newly
+selected model or thinking level, and only saving changed the global default.
 Model scopes (`--models` and `enabledModels`) add all available providers that
 share an exact unqualified model ID and warn about the ambiguity. A literal ID
 containing glob characters takes precedence over glob expansion across providers,
@@ -946,6 +950,23 @@ initially empty entries out of the transcript, and shows an error row for
 failed renderers. Entry renderers share the native styled-row format. The
 terminal retains up to 4,000 custom-entry candidates separately from
 ordinary transcript history and gives already visible entries priority.
+
+### Native Markdown transformers
+
+Normal user Markdown, including user text that follows a skill block, and
+assistant text and visible thinking use the native extension chain in
+load order. Hooks see content width after transcript padding. Assistant
+text and thinking use the journal's aggregated blocks with outer whitespace
+trimmed for the callback. Restored messages provide the Rust journal record ID
+and timestamp, while live text
+reports its current streaming state. A failed hook leaves the preceding
+Markdown for later hooks. Asynchronous terminal callbacks let the original
+text render while a transformation is pending. Regular and fullscreen
+terminals use the same display path, and SDK hosts can apply the chain to
+their own views. The terminal allows one second per callback and skips inputs
+or replacements over 256 KiB. The terminal's Markdown renderer processes
+Mermaid blocks after the extension chain. The persisted message and model
+context retain their original content.
 
 ### Terminal and native-extension checkpoint
 
@@ -3306,7 +3327,10 @@ Konsole 25.04.2 also displayed the iTerm2 OSC 1337 protocol in both modes.
 Screenshots of the macOS pi-rs process relayed to Konsole in an isolated Linux
 display matched the visible bands of the 320×480 pasteboard PNG. Fullscreen
 sent a 320×208 crop and regular mode sent the full image for viewport
-clipping. Visual acceptance in the iTerm2 application remains open.
+clipping. Visual acceptance in the iTerm2 application remains open. The
+remaining check is to paste an image taller than the viewport, scroll it
+through both edges in fullscreen and regular mode, and verify that the image
+does not cover the editor or leave pixels behind after redraw and resize.
 
 ### Image cell-sizing checkpoint
 
@@ -5133,6 +5157,15 @@ the running extension and delivers the resulting snapshots in mutation
 order. An executable negotiates this access through
 `mcp_registry_host_calls` and the duplex capability advertisement. SDK forks
 have their own snapshot of the active MCP registrations.
+Workbench reconciles these declarations at its next catalog refresh, before
+preparing the next model request. It reconnects changed definitions and
+retires the connections and tools for removed ones. A model reply keeps
+the tool identities advertised to its request. A retired endpoint cannot
+receive a queued call, and its replacement appears on the next request.
+MCP inspection shows
+the current declarations with cached connection status. An explicit
+Workbench refresh retries a disconnected declaration. Configured namespaces
+retain their precedence across refreshes.
 
 Native extensions can subscribe to assistant `message_start`,
 `message_update`, and `message_end` through the message lifecycle callback.

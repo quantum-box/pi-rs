@@ -57,6 +57,11 @@ enum Request {
         record_id: u64,
         options: pi_rs::CustomMessageRenderOptions,
     },
+    TransformTranscriptMarkdown {
+        id: Uuid,
+        markdown: String,
+        context: pi_rs::MarkdownTransformContext,
+    },
     CheckSessionTransition {
         id: Uuid,
         event: pi_rs::BeforeSessionTransition,
@@ -1062,6 +1067,7 @@ async fn run_worker(
             "custom_message_renderers":messages.types().collect::<Vec<_>>(),
             "custom_entry_renderers":entries.types().collect::<Vec<_>>(),
             "tool_rendering":true,
+            "markdown_transformers":!runtime.registry.markdown_transformers().is_empty()
         }));
     } else {
         output(json!({"type":"backend_ready"}));
@@ -2179,6 +2185,7 @@ fn read_requests(
     let entry_renderers = registry.custom_entry_renderers();
     let tool_renderers = registry.tool_renderers();
     let tool_cwd = shell.cwd.clone();
+    let markdown_transformers = registry.markdown_transformers();
     let prepare_in_background =
         registry.has_input_hooks() || registry.has_resource_discovery_hooks();
     let processor = Arc::new(queue::Processor {
@@ -2195,6 +2202,7 @@ fn read_requests(
     let share_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let render_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let tool_render_slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let markdown_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let (queue_requests, queue) = mpsc::channel(32);
     let queue = prepare_in_background.then(|| runtime.spawn(processor.clone().run(queue)));
     std::thread::spawn(move || {
@@ -2296,6 +2304,29 @@ fn read_requests(
                         _ => output(
                             json!({"type":"transcript_extension_rendered","id":id,"rendered":null}),
                         ),
+                    }
+                }
+                Request::TransformTranscriptMarkdown {
+                    id,
+                    markdown,
+                    context,
+                } => {
+                    if render_transcript
+                        && !markdown_transformers.is_empty()
+                        && let Ok(slot) = markdown_slots.clone().try_acquire_owned()
+                    {
+                        let transformers = markdown_transformers.clone();
+                        runtime.spawn(async move {
+                            let transformed = transformers
+                                .transform(&markdown, &context, std::time::Duration::from_secs(1))
+                                .await;
+                            drop(slot);
+                            output(json!({"type":"transcript_markdown_transformed","id":id,"transformed":transformed}));
+                        });
+                    } else {
+                        output(
+                            json!({"type":"transcript_markdown_transformed","id":id,"retry":render_transcript && !markdown_transformers.is_empty()}),
+                        );
                     }
                 }
                 Request::ReadSession {

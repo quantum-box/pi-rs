@@ -80,6 +80,17 @@ with no renderer, or whose first render returns no content, stays out of
 the terminal transcript. Renderer failures show an error row. SDK hosts
 can render journal entries through `AgentSession::custom_entry_renderers`.
 
+To customize normal message Markdown for display, return `true` from
+`handles_markdown_transform` and implement `transform_markdown`. The context
+identifies user, assistant, or assistant thinking text and supplies the
+available content width and streaming status. A restored message includes
+its journal record ID and timestamp when available. Returning `None` keeps
+the current text for the next extension. The terminal runs these hooks in
+extension load order and renders the result with its Markdown theme. Embedded
+views can obtain the same chain through `AgentSession::markdown_transformers`.
+The callback receives only display text and context. The session journal and
+provider request continue to use the original message.
+
 Executable hosts advertising `command_failure_classification_v1` accept the
 `command_effects_classified_v1` request. Its successful protocol envelope
 contains a typed `Ok` effects value or an `Err` containing `Callback` or
