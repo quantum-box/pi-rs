@@ -259,6 +259,13 @@ pub enum SummaryKind {
     Branch,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CustomEntryPresentation {
+    Pending,
+    Included,
+    Omitted,
+}
+
 #[derive(Clone)]
 pub enum Entry {
     Notice(String),
@@ -279,6 +286,12 @@ pub enum Entry {
         custom_type: String,
         text: String,
         rendered: Option<pi_rs::RenderedCustomMessage>,
+    },
+    CustomRecord {
+        id: u64,
+        custom_type: String,
+        presentation: CustomEntryPresentation,
+        rendered: Option<pi_rs::RenderedExtensionContent>,
     },
     Summary {
         id: u64,
@@ -400,7 +413,12 @@ impl Entry {
                 lines.push(Line::default());
                 lines
             }
+            Self::CustomRecord { rendered: None, .. } => return Vec::new(),
             Self::CustomMessage {
+                rendered: Some(rendered),
+                ..
+            }
+            | Self::CustomRecord {
                 rendered: Some(rendered),
                 ..
             } => {

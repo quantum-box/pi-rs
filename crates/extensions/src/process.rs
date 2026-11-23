@@ -9,8 +9,10 @@ use std::time::{Duration, Instant};
 use pi_rs_core::{
     CacheWarmingAction, CacheWarmingDecision, CancellationToken, Compaction, Decision, Error,
     Extension, ExtensionFlag, ExtensionFlagValue, ExtensionResult, ExtensionState, InputAction,
-    InputEvent, LifecycleEvent, Message, ModelRequest, Outcome, RequestPurpose, Result, Tool,
-    ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec, TreeDecision, TreePreparation,
+    InputEvent, LifecycleEvent, Message, ModelRequest, Outcome, RenderedExtensionRows,
+    RequestPurpose, Result, Tool, ToolContext, ToolExecution, ToolHost, ToolRenderContext,
+    ToolRenderShell, ToolRenderers, ToolReply, ToolSectionRenderer, ToolSpec, TreeDecision,
+    TreePreparation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -51,6 +53,18 @@ struct Endpoint {
 }
 
 impl Endpoint {
+    async fn request_async<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        request: ProtocolRequest,
+    ) -> ExtensionResult<T> {
+        let path = self.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
     fn project_outcome(&self, outcome: &Outcome) -> Outcome {
         if self.structured_text_result && self.text_result_v2 {
             outcome.clone()
@@ -187,6 +201,10 @@ enum ProtocolRequest {
         state: Option<ExtensionState>,
         timeout_secs: Option<f64>,
     },
+    MessageLifecycle {
+        event: pi_rs_core::MessageLifecycleEvent,
+        state: Option<ExtensionState>,
+    },
     Lifecycle {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
@@ -213,9 +231,17 @@ enum ProtocolRequest {
         metadata: Option<Value>,
         state: Option<ExtensionState>,
     },
+    RenderToolSection {
+        section: ToolSection,
+        context: ToolRenderContext,
+    },
     RenderCustomMessage {
         message: pi_rs_core::CustomMessage,
         options: pi_rs_core::CustomMessageRenderOptions,
+    },
+    RenderCustomEntry {
+        entry: pi_rs_core::CustomEntryRecord,
+        options: pi_rs_core::CustomEntryRenderOptions,
     },
     DiscoverResources {
         event: pi_rs_core::ResourceDiscoveryEvent,
@@ -352,6 +378,8 @@ struct Description {
     commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     flags: Vec<ExtensionFlag>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    custom_entry_renderers: Vec<String>,
     tools: Vec<DescriptionTool>,
     #[serde(default)]
     host_calls: bool,
@@ -392,6 +420,8 @@ struct Description {
     mcp_registry_host_calls: bool,
     #[serde(default)]
     lifecycle_hook: bool,
+    #[serde(default)]
+    message_lifecycle_hook: bool,
     #[serde(default)]
     agent_before_settle_hook: bool,
     #[serde(default)]
@@ -653,10 +683,36 @@ fn messages_patch(
     (trial == updated).then_some(patch)
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ToolSection {
+    Call,
+    Result,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct DescriptionToolRenderers {
+    shell: ToolRenderShell,
+    call: bool,
+    result: bool,
+}
+
+impl From<ToolRenderers> for DescriptionToolRenderers {
+    fn from(renderers: ToolRenderers) -> Self {
+        Self {
+            shell: renderers.shell,
+            call: renderers.call.is_some(),
+            result: renderers.result.is_some(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct DescriptionTool {
     spec: ToolSpec,
     execution: ToolExecution,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    renderers: Option<DescriptionToolRenderers>,
     #[serde(default)]
     can_poll: bool,
     #[serde(default)]
@@ -817,12 +873,7 @@ impl ExecutableExtension {
         &self,
         request: ProtocolRequest,
     ) -> ExtensionResult<T> {
-        let path = self.endpoint.clone();
-        let guard = CancelOnDrop(CancellationToken::new());
-        let cancelled = guard.0.clone();
-        tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
-            .await
-            .map_err(|error| error.to_string())?
+        self.endpoint.request_async(request).await
     }
 }
 
@@ -892,6 +943,7 @@ impl Extension for ExecutableExtension {
                     endpoint: self.endpoint.clone(),
                     spec: tool.spec.clone(),
                     execution: tool.execution,
+                    renderers: tool.renderers,
                     can_poll: tool.can_poll,
                     transactional: tool.transactional,
                     prepares_arguments: tool.prepares_arguments,
@@ -1099,6 +1151,24 @@ impl Extension for ExecutableExtension {
     fn handles_model_selection(&self) -> bool {
         self.description.model_selection_hook
     }
+    fn custom_entry_renderer_types(&self) -> Vec<&str> {
+        self.description
+            .custom_entry_renderers
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+    async fn render_custom_entry(
+        &self,
+        entry: &pi_rs_core::CustomEntryRecord,
+        options: &pi_rs_core::CustomEntryRenderOptions,
+    ) -> ExtensionResult<Option<pi_rs_core::RenderedExtensionContent>> {
+        self.request_async(ProtocolRequest::RenderCustomEntry {
+            entry: entry.clone(),
+            options: options.clone(),
+        })
+        .await
+    }
     fn handles_resource_discovery(&self) -> bool {
         self.description.resource_discovery_hook
     }
@@ -1134,6 +1204,25 @@ impl Extension for ExecutableExtension {
             .await
             .map_err(|error| error.to_string())?
     }
+    fn handles_message_lifecycle(&self) -> bool {
+        self.description.message_lifecycle_hook
+    }
+
+    async fn message_lifecycle(
+        &self,
+        event: &pi_rs_core::MessageLifecycleEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<Message>> {
+        if !self.handles_message_lifecycle() {
+            return Ok(None);
+        }
+        self.request_async(ProtocolRequest::MessageLifecycle {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+
     fn handles_after_provider_response(&self) -> bool {
         self.description.after_provider_response_hook
     }
@@ -1168,6 +1257,7 @@ impl Extension for ExecutableExtension {
         })
         .await
     }
+
     fn handles_session_lifecycle(&self) -> bool {
         self.description.session_lifecycle_hook
     }
@@ -2169,6 +2259,7 @@ struct ExecutableTool {
     endpoint: Endpoint,
     spec: ToolSpec,
     execution: ToolExecution,
+    renderers: Option<DescriptionToolRenderers>,
     can_poll: bool,
     transactional: bool,
     prepares_arguments: bool,
@@ -2228,8 +2319,48 @@ impl ExecutableTool {
         }
     }
 }
+struct ExecutableToolRenderer {
+    endpoint: Endpoint,
+    tool_name: String,
+    section: ToolSection,
+}
+
+#[async_trait::async_trait]
+impl ToolSectionRenderer for ExecutableToolRenderer {
+    async fn render(
+        &self,
+        context: &ToolRenderContext,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        if context.tool_name != self.tool_name {
+            return Err("tool renderer received a different tool name".into());
+        }
+        self.endpoint
+            .request_async(ProtocolRequest::RenderToolSection {
+                section: self.section,
+                context: context.clone(),
+            })
+            .await
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for ExecutableTool {
+    fn tool_renderers(&self) -> Option<ToolRenderers> {
+        let renderers = self.renderers?;
+        let section = |section| -> Arc<dyn ToolSectionRenderer> {
+            Arc::new(ExecutableToolRenderer {
+                endpoint: self.endpoint.clone(),
+                tool_name: self.spec.name.clone(),
+                section,
+            })
+        };
+        Some(ToolRenderers {
+            shell: renderers.shell,
+            call: renderers.call.then(|| section(ToolSection::Call)),
+            result: renderers.result.then(|| section(ToolSection::Result)),
+        })
+    }
+
     async fn prepare_arguments(&self, arguments: Value) -> ExtensionResult<Value> {
         if !self.prepares_arguments {
             return Ok(arguments);
@@ -3860,6 +3991,11 @@ async fn dispatch_inner(
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            custom_entry_renderers: extension
+                .custom_entry_renderer_types()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             flags: extension.cli_flags(),
             host_calls: true,
             command_entries: extension.supports_command_entries(),
@@ -3880,6 +4016,7 @@ async fn dispatch_inner(
             mcp_servers_change_hook: extension.handles_mcp_servers_change(),
             mcp_registry_host_calls: extension.handles_mcp_registry(),
             lifecycle_hook: extension.handles_lifecycle(),
+            message_lifecycle_hook: extension.handles_message_lifecycle(),
             agent_before_settle_hook: extension.handles_agent_before_settle(),
             turn_end_boundary_hook: extension.handles_turn_end_boundary(),
             lifecycle_host_calls: true,
@@ -3920,6 +4057,7 @@ async fn dispatch_inner(
                 .map(|tool| DescriptionTool {
                     spec: tool.spec(),
                     execution: tool.execution(),
+                    renderers: tool.tool_renderers().map(DescriptionToolRenderers::from),
                     can_poll: tool.can_poll(),
                     transactional: true,
                     prepares_arguments: true,
@@ -4034,6 +4172,9 @@ async fn dispatch_inner(
                 }
             }
         }
+        ProtocolRequest::MessageLifecycle { event, state } => {
+            encode(extension.message_lifecycle(&event, state.as_ref()).await)
+        }
         ProtocolRequest::Lifecycle { event, state } => {
             if let Some(mcp) = mcp
                 && extension.handles_mcp_registry()
@@ -4088,6 +4229,22 @@ async fn dispatch_inner(
                 )
                 .await,
         ),
+        ProtocolRequest::RenderToolSection { section, context } => {
+            let renderers = extension
+                .tools()
+                .into_iter()
+                .find(|tool| tool.spec().name == context.tool_name)
+                .and_then(|tool| tool.tool_renderers());
+            let renderer = renderers.and_then(|renderers| match section {
+                ToolSection::Call => renderers.call,
+                ToolSection::Result if context.result.is_some() => renderers.result,
+                ToolSection::Result => None,
+            });
+            match renderer {
+                Some(renderer) => encode(renderer.render(&context).await),
+                None => Ok(Value::Null),
+            }
+        }
         ProtocolRequest::RenderCustomMessage { message, options } => {
             if !message.display
                 || !extension
@@ -4097,6 +4254,15 @@ async fn dispatch_inner(
                 return encode(Ok(Option::<pi_rs_core::RenderedCustomMessage>::None));
             }
             encode(extension.render_custom_message(&message, &options).await)
+        }
+        ProtocolRequest::RenderCustomEntry { entry, options } => {
+            if !extension
+                .custom_entry_renderer_types()
+                .contains(&entry.entry.custom_type.as_str())
+            {
+                return encode(Ok(Option::<pi_rs_core::RenderedExtensionContent>::None));
+            }
+            encode(extension.render_custom_entry(&entry, &options).await)
         }
         ProtocolRequest::DiscoverResources { event, state } => {
             if host.supports_custom_messages()
@@ -4659,6 +4825,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_message_lifecycle_is_negotiated_and_returns_native_message() {
+        struct Rewrite;
+        #[async_trait::async_trait]
+        impl Extension for Rewrite {
+            fn id(&self) -> &str {
+                "rewrite"
+            }
+
+            fn handles_message_lifecycle(&self) -> bool {
+                true
+            }
+
+            async fn message_lifecycle(
+                &self,
+                event: &pi_rs_core::MessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Message>> {
+                let pi_rs_core::MessageLifecycleEvent::End {
+                    message: Message::Assistant { calls, content, .. },
+                    status: pi_rs_core::MessageStatus::Complete,
+                } = event
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(Message::Assistant {
+                    content: format!("{content}/edited"),
+                    calls: calls.clone(),
+                    replay: None,
+                }))
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Rewrite);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["message_lifecycle_hook"], true);
+        let output = dispatch(
+            extension,
+            ProtocolRequest::MessageLifecycle {
+                event: pi_rs_core::MessageLifecycleEvent::End {
+                    message: Message::Assistant {
+                        content: "raw".into(),
+                        calls: vec![],
+                        replay: None,
+                    },
+                    status: pi_rs_core::MessageStatus::Complete,
+                },
+                state: None,
+            },
+        )
+        .await
+        .unwrap();
+        let edited: Message = serde_json::from_value(output).unwrap();
+        assert!(matches!(edited, Message::Assistant { content, .. } if content == "raw/edited"));
+    }
+
+    #[tokio::test]
     async fn native_mcp_registration_negotiates_declarations_and_change_events() {
         use std::sync::Mutex;
         let legacy: Description = serde_json::from_value(serde_json::json!({
@@ -5121,6 +5345,197 @@ mod tests {
         message["message"]["display"] = false.into();
         let request = serde_json::from_value(message).unwrap();
         assert!(dispatch(extension, request).await.unwrap().is_null());
+    }
+
+    #[tokio::test]
+    async fn tool_renderer_capability_and_request_round_trip() {
+        struct RenderedExtension;
+        struct RenderedTool;
+        struct Echo;
+
+        #[async_trait::async_trait]
+        impl ToolSectionRenderer for Echo {
+            async fn render(
+                &self,
+                context: &ToolRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                assert_eq!(context.tool_call_id, "example-call");
+                assert_eq!(context.args["path"], "notes");
+                assert!(context.expanded);
+                Ok(Some(RenderedExtensionRows {
+                    lines: vec![vec![pi_rs_core::UiComponentSpan {
+                        text: context.args["path"].as_str().unwrap().into(),
+                        color: Some("accent".into()),
+                        ..Default::default()
+                    }]],
+                    padding: context.output_pad,
+                    background: None,
+                }))
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for RenderedTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "owned".into(),
+                    description: "Example tool".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+
+            fn tool_renderers(&self) -> Option<ToolRenderers> {
+                Some(ToolRenderers {
+                    shell: ToolRenderShell::SelfFramed,
+                    call: Some(Arc::new(Echo)),
+                    result: None,
+                })
+            }
+
+            async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+                panic!("rendering must not execute the tool")
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Extension for RenderedExtension {
+            fn id(&self) -> &str {
+                "tool-renderer"
+            }
+
+            fn tools(&self) -> Vec<Arc<dyn Tool>> {
+                vec![Arc::new(RenderedTool)]
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(RenderedExtension);
+        let mut description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(
+            description["tools"][0]["renderers"],
+            serde_json::json!({"shell": "self", "call": true, "result": false})
+        );
+        description["tools"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("renderers");
+        let legacy = serde_json::from_value::<Description>(description).unwrap();
+        assert!(legacy.tools[0].renderers.is_none());
+
+        let mut context = ToolRenderContext::new(
+            "owned",
+            "example-call",
+            serde_json::json!({"path": "notes"}),
+            ".",
+        );
+        context.expanded = true;
+        context.output_pad = 2;
+        let request = ProtocolRequest::RenderToolSection {
+            section: ToolSection::Call,
+            context: context.clone(),
+        };
+        let request = serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        let response = dispatch(extension.clone(), request).await.unwrap();
+        assert_eq!(response["lines"][0][0]["text"], "notes");
+        assert_eq!(response["lines"][0][0]["color"], "accent");
+        assert_eq!(response["padding"], 2);
+
+        context.result = Some(pi_rs_core::ToolRenderResult {
+            content: serde_json::json!([{"type": "text", "text": "result"}]),
+            details: None,
+            is_partial: false,
+            is_error: false,
+            duration_ms: Some(10),
+        });
+        let unsupported = ProtocolRequest::RenderToolSection {
+            section: ToolSection::Result,
+            context: context.clone(),
+        };
+        assert!(
+            dispatch(extension.clone(), unsupported)
+                .await
+                .unwrap()
+                .is_null()
+        );
+        context.tool_name = "unknown".into();
+        let unknown = ProtocolRequest::RenderToolSection {
+            section: ToolSection::Call,
+            context,
+        };
+        assert!(dispatch(extension, unknown).await.unwrap().is_null());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_tool_renderer_requests_only_advertised_sections() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("extension");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+IFS= read -r request
+case "$request" in
+    *'"type":"describe"'*)
+        cat "$(dirname "$0")/description.json"
+        ;;
+    *'"type":"render_tool_section"'*)
+        case "$request" in *'"section":"call"'*) ;; *) exit 2 ;; esac
+        case "$request" in *'"toolName":"owned"'*) ;; *) exit 2 ;; esac
+        printf '%s\n' '{"version":1,"response":{"Ok":{"lines":[[{"text":"remote call","color":"accent"}]]}}}'
+        ;;
+    *)
+        exit 2
+        ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let description = serde_json::json!({
+            "version": 1,
+            "response": {"Ok": {
+                "id": "renderer",
+                "dependencies": [],
+                "commands": [],
+                "tools": [{
+                    "spec": {"name": "owned", "description": "Example", "parameters": {"type": "object"}},
+                    "execution": "sequential",
+                    "renderers": {"shell": "default", "call": true, "result": false}
+                }]
+            }}
+        });
+        std::fs::write(
+            directory.path().join("description.json"),
+            format!("{description}\n"),
+        )
+        .unwrap();
+        let extension = ExecutableExtension::load_async(executable).await.unwrap();
+        let mut registry = pi_rs_core::Registry::default();
+        registry.register(Arc::new(extension)).unwrap();
+        let renderers = registry
+            .tool_renderers()
+            .resolve("owned", &|| None)
+            .unwrap();
+        assert!(renderers.result.is_none());
+        let mut context = ToolRenderContext::new("owned", "call-id", Value::Null, ".");
+        context.tool_name = "different".into();
+        assert!(
+            renderers
+                .call
+                .as_ref()
+                .unwrap()
+                .render(&context)
+                .await
+                .is_err()
+        );
+        context.tool_name = "owned".into();
+        let rendered = renderers.render(&context, Duration::from_secs(1)).await;
+        let rows = rendered.call.unwrap();
+        assert_eq!(rows.lines[0][0].text, "remote call");
+        assert_eq!(rows.lines[0][0].color.as_deref(), Some("accent"));
     }
 
     #[tokio::test]

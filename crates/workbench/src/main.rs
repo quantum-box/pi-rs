@@ -721,7 +721,10 @@ impl Cli {
         if thinking.is_some() {
             selected.thinking = thinking;
         } else {
-            if matches!(source, pi_rs::ModelSelectSource::Cycle) {
+            if matches!(
+                source,
+                pi_rs::ModelSelectSource::Set | pi_rs::ModelSelectSource::Cycle
+            ) {
                 selected.thinking = selected
                     .settings
                     .string("defaultThinkingLevel")
