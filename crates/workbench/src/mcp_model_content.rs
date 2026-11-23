@@ -69,17 +69,34 @@ fn project_result(
 ) -> Option<(String, bool)> {
     let value: Value = serde_json::from_str(content).ok()?;
     let response = value.get("data")?;
-    let blocks = response.get("content")?.as_array()?;
-    let mut projected = if blocks.is_empty() {
+    let mut projected = if tool == "read_resource"
+        && let Some(resources) = response["contents"].as_array()
+    {
+        resources
+            .iter()
+            .map(|resource| {
+                project_block(
+                    &json!({"type":"resource","resource":resource}),
+                    server,
+                    read_tool,
+                )
+            })
+            .collect::<Option<Vec<_>>>()?
+    } else if let Some(blocks) = response["content"]
+        .as_array()
+        .filter(|blocks| !blocks.is_empty())
+    {
+        blocks
+            .iter()
+            .map(|block| project_block(block, server, read_tool))
+            .collect::<Option<Vec<_>>>()?
+    } else if response["content"].is_array() {
         match response.get("structuredContent") {
             Some(structured) => vec![text(serde_json::to_string_pretty(structured).ok()?)],
             None => Vec::new(),
         }
     } else {
-        blocks
-            .iter()
-            .map(|block| project_block(block, server, read_tool))
-            .collect::<Option<Vec<_>>>()?
+        return None;
     };
     let mut text_content = joined_text(&projected);
     if text_content.is_empty() && response["isError"] == true {
@@ -278,6 +295,12 @@ mod tests {
             "uri":"mock://binary","mimeType":"application/octet-stream","blob":"YQ==",
         }}]}));
         assert_eq!(project_result(&binary, "fixture", "get", None), None);
+        let read = tool_content(json!({"contents":[{"uri":"mock://notes","text":"contents"}]}));
+        assert_eq!(
+            project_result(&read, "fixture", "read_resource", None),
+            Some(("contents".into(), false))
+        );
+        assert_eq!(project_result(&read, "fixture", "other", None), None);
         let data_only = tool_content(json!({"content":[],"structuredContent":{"a":1}}));
         assert_eq!(
             project_result(&data_only, "fixture", "get", None),
