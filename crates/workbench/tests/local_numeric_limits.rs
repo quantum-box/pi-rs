@@ -1,6 +1,6 @@
 use futures_util::stream;
 use pi_rs::*;
-use pi_rs_workbench::coding::CodingTools;
+use pi_rs_workbench::coding::{CodingTools, ReadImageModel};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
@@ -90,6 +90,23 @@ impl Model for Script {
                 name: name.into(),
                 arguments: args.to_string(),
             })
+            .chain(
+                [
+                    ("read-bad-syntax", r#"{"path":?"#),
+                    ("read-not-object", "[1]"),
+                ]
+                .into_iter()
+                .map(|(id, raw)| ToolCall {
+                    id: id.into(),
+                    name: "read".into(),
+                    arguments: raw.into(),
+                }),
+            )
+            .chain([ToolCall {
+                id: "ls-large-malformed".into(),
+                name: "ls".into(),
+                arguments: format!("{{\"path\":\"{}", "界".repeat(400_000)),
+            }])
             .collect()
         } else {
             vec![]
@@ -109,7 +126,11 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
     }
     let mut registry = Registry::default();
     registry
-        .register(Arc::new(CodingTools::local(root.path()).unwrap()))
+        .register(Arc::new(
+            CodingTools::local(root.path())
+                .unwrap()
+                .with_read_image_model(ReadImageModel::default()),
+        ))
         .unwrap();
     let model = Script(Mutex::new(vec![]));
     let agent = Agent {
@@ -155,6 +176,14 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
     }
     for (call_id, diagnostic) in [
         (
+            "read-bad-syntax",
+            "Invalid arguments for tool \"read\": Unexpected token '?', \"{\"path\":?\" is not valid JSON\n\nReceived arguments:\n{\"path\":?",
+        ),
+        (
+            "read-not-object",
+            "Invalid arguments for tool \"read\": Tool arguments must be a JSON object\n\nReceived arguments:\n[1]",
+        ),
+        (
             "ls-invalid",
             "Validation failed for tool \"ls\":\n  - limit: expected number, got string\n\nReceived arguments:\n{\n  \"limit\": \" true \"\n}",
         ),
@@ -198,6 +227,20 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
             Event::ToolStarted { operation_id, .. } if operation_id == invocation.operation_id
         )));
     }
+    let OperationState::Finished(Outcome::TextResult {
+        output,
+        details: Some(details),
+        is_error: true,
+    }) = &tool_results["ls-large-malformed"]
+    else {
+        panic!("large malformed arguments lost the parsing result");
+    };
+    assert!(output.starts_with("Invalid arguments for tool \"ls\": Unterminated string in JSON"));
+    assert!(output.contains("\n\nReceived arguments:\n"));
+    assert!(output.ends_with("界\n[Received arguments truncated]"));
+    assert!(output.len() < 66 * 1024);
+    assert_eq!(*details, json!({}));
+
     let requests = model.0.lock().unwrap();
     let replies: std::collections::HashMap<_, _> = requests[1]
         .messages

@@ -201,6 +201,10 @@ enum ProtocolRequest {
         state: Option<ExtensionState>,
         timeout_secs: Option<f64>,
     },
+    MessageLifecycle {
+        event: pi_rs_core::MessageLifecycleEvent,
+        state: Option<ExtensionState>,
+    },
     Lifecycle {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
@@ -230,6 +234,10 @@ enum ProtocolRequest {
     RenderCustomMessage {
         message: pi_rs_core::CustomMessage,
         options: pi_rs_core::CustomMessageRenderOptions,
+    },
+    RenderCustomEntry {
+        entry: pi_rs_core::CustomEntryRecord,
+        options: pi_rs_core::CustomEntryRenderOptions,
     },
     DiscoverResources {
         event: pi_rs_core::ResourceDiscoveryEvent,
@@ -366,6 +374,8 @@ struct Description {
     commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     flags: Vec<ExtensionFlag>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    custom_entry_renderers: Vec<String>,
     tools: Vec<DescriptionTool>,
     #[serde(default)]
     host_calls: bool,
@@ -406,6 +416,8 @@ struct Description {
     mcp_registry_host_calls: bool,
     #[serde(default)]
     lifecycle_hook: bool,
+    #[serde(default)]
+    message_lifecycle_hook: bool,
     #[serde(default)]
     agent_before_settle_hook: bool,
     #[serde(default)]
@@ -1133,6 +1145,24 @@ impl Extension for ExecutableExtension {
     fn handles_model_selection(&self) -> bool {
         self.description.model_selection_hook
     }
+    fn custom_entry_renderer_types(&self) -> Vec<&str> {
+        self.description
+            .custom_entry_renderers
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+    async fn render_custom_entry(
+        &self,
+        entry: &pi_rs_core::CustomEntryRecord,
+        options: &pi_rs_core::CustomEntryRenderOptions,
+    ) -> ExtensionResult<Option<pi_rs_core::RenderedExtensionContent>> {
+        self.request_async(ProtocolRequest::RenderCustomEntry {
+            entry: entry.clone(),
+            options: options.clone(),
+        })
+        .await
+    }
     fn handles_resource_discovery(&self) -> bool {
         self.description.resource_discovery_hook
     }
@@ -1168,6 +1198,25 @@ impl Extension for ExecutableExtension {
             .await
             .map_err(|error| error.to_string())?
     }
+    fn handles_message_lifecycle(&self) -> bool {
+        self.description.message_lifecycle_hook
+    }
+
+    async fn message_lifecycle(
+        &self,
+        event: &pi_rs_core::MessageLifecycleEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<Message>> {
+        if !self.handles_message_lifecycle() {
+            return Ok(None);
+        }
+        self.request_async(ProtocolRequest::MessageLifecycle {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+
     fn handles_after_provider_response(&self) -> bool {
         self.description.after_provider_response_hook
     }
@@ -1185,6 +1234,7 @@ impl Extension for ExecutableExtension {
         })
         .await
     }
+
     fn handles_session_lifecycle(&self) -> bool {
         self.description.session_lifecycle_hook
     }
@@ -3918,6 +3968,11 @@ async fn dispatch_inner(
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            custom_entry_renderers: extension
+                .custom_entry_renderer_types()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             flags: extension.cli_flags(),
             host_calls: true,
             command_entries: extension.supports_command_entries(),
@@ -3938,6 +3993,7 @@ async fn dispatch_inner(
             mcp_servers_change_hook: extension.handles_mcp_servers_change(),
             mcp_registry_host_calls: extension.handles_mcp_registry(),
             lifecycle_hook: extension.handles_lifecycle(),
+            message_lifecycle_hook: extension.handles_message_lifecycle(),
             agent_before_settle_hook: extension.handles_agent_before_settle(),
             turn_end_boundary_hook: extension.handles_turn_end_boundary(),
             lifecycle_host_calls: true,
@@ -4092,6 +4148,9 @@ async fn dispatch_inner(
                 }
             }
         }
+        ProtocolRequest::MessageLifecycle { event, state } => {
+            encode(extension.message_lifecycle(&event, state.as_ref()).await)
+        }
         ProtocolRequest::Lifecycle { event, state } => {
             if let Some(mcp) = mcp
                 && extension.handles_mcp_registry()
@@ -4166,6 +4225,15 @@ async fn dispatch_inner(
                 return encode(Ok(Option::<pi_rs_core::RenderedCustomMessage>::None));
             }
             encode(extension.render_custom_message(&message, &options).await)
+        }
+        ProtocolRequest::RenderCustomEntry { entry, options } => {
+            if !extension
+                .custom_entry_renderer_types()
+                .contains(&entry.entry.custom_type.as_str())
+            {
+                return encode(Ok(Option::<pi_rs_core::RenderedExtensionContent>::None));
+            }
+            encode(extension.render_custom_entry(&entry, &options).await)
         }
         ProtocolRequest::DiscoverResources { event, state } => {
             if host.supports_custom_messages()
@@ -4725,6 +4793,64 @@ mod tests {
         assert!(!description.before_summary_compaction_v1);
         assert!(!description.compaction_overflow_reason_v1);
         assert!(!description.compaction_lifecycle_v1);
+    }
+
+    #[tokio::test]
+    async fn native_message_lifecycle_is_negotiated_and_returns_native_message() {
+        struct Rewrite;
+        #[async_trait::async_trait]
+        impl Extension for Rewrite {
+            fn id(&self) -> &str {
+                "rewrite"
+            }
+
+            fn handles_message_lifecycle(&self) -> bool {
+                true
+            }
+
+            async fn message_lifecycle(
+                &self,
+                event: &pi_rs_core::MessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Message>> {
+                let pi_rs_core::MessageLifecycleEvent::End {
+                    message: Message::Assistant { calls, content, .. },
+                    status: pi_rs_core::MessageStatus::Complete,
+                } = event
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(Message::Assistant {
+                    content: format!("{content}/edited"),
+                    calls: calls.clone(),
+                    replay: None,
+                }))
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Rewrite);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["message_lifecycle_hook"], true);
+        let output = dispatch(
+            extension,
+            ProtocolRequest::MessageLifecycle {
+                event: pi_rs_core::MessageLifecycleEvent::End {
+                    message: Message::Assistant {
+                        content: "raw".into(),
+                        calls: vec![],
+                        replay: None,
+                    },
+                    status: pi_rs_core::MessageStatus::Complete,
+                },
+                state: None,
+            },
+        )
+        .await
+        .unwrap();
+        let edited: Message = serde_json::from_value(output).unwrap();
+        assert!(matches!(edited, Message::Assistant { content, .. } if content == "raw/edited"));
     }
 
     #[tokio::test]
