@@ -294,9 +294,10 @@ fn limit_text_preview(projected: &mut Vec<Value>, files: FileReaders) -> Option<
     if full.len() <= TEXT_PREVIEW_BYTES {
         return None;
     }
+    // The local reader drops LF but counts CR as part of a line.
     let page_by_line = files.read
         && full
-            .lines()
+            .split('\n')
             .all(|line| line.len() <= pi_rs_workbench::coding::READ_PAGE_BYTES);
     let hint = if page_by_line {
         "read it with offset/limit"
@@ -869,6 +870,28 @@ mod tests {
         )
         .unwrap();
         assert!(output.ends_with(" (read it with offset/limit)]"));
+    }
+
+    #[test]
+    fn mcp_model_content_counts_crlf_in_the_read_page_budget() {
+        let limit = pi_rs_workbench::coding::READ_PAGE_BYTES;
+        let body = format!("{}\r\nlast line", "x".repeat(limit));
+        let original = tool_content(json!({"content":[{"type":"text","text":body}]}));
+        let project =
+            |readers| project_result_with_files(&original, "fixture", "get", None, readers);
+        assert_eq!(
+            project(FileReaders {
+                read: true,
+                shell: false
+            }),
+            Some((body, false))
+        );
+        let (preview, _) = project(FileReaders {
+            read: true,
+            shell: true,
+        })
+        .unwrap();
+        assert!(preview.ends_with(" (read byte ranges with the local shell)]"));
     }
 
     #[test]
