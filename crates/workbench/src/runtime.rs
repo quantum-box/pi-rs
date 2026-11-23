@@ -4,7 +4,7 @@ use pi_rs::{
     Agent, CancellationToken, Extension, ExtensionUi, Limits, ProjectResources, Registry, Result,
     Session, UiRequest, UiResponse,
 };
-use pi_rs_workbench::coding::{CodingTools, ShellConfig, ShellContext};
+use pi_rs_workbench::coding::{CodingTools, ReadImageModel, ShellConfig, ShellContext};
 use pi_rs_workbench::{CommandPolicy, ProjectInstructions, Tools, WorkbenchContext};
 use serde_json::json;
 use std::sync::Arc;
@@ -13,16 +13,17 @@ use std::time::Duration;
 pub struct Runtime {
     pub auto_compaction: pi_rs::AutoCompactionControl,
     pub retry: pi_rs::RetryControl,
-    provider: super::image_policy::WorkbenchModel,
-    read_image_model: pi_rs_workbench::coding::ReadImageModel,
+    pub(super) provider: super::image_policy::WorkbenchModel,
     pub registry: Registry,
     pub extension_sources: std::collections::BTreeMap<String, std::path::PathBuf>,
     shell: ShellConfig,
+    read_image_model: ReadImageModel,
     system_prompt: String,
     pub resources: resources::Resources,
     resource_origins: ResourceOrigins,
     catalog: Arc<LiveMcpCatalog>,
-    mcp_sign_in: std::collections::VecDeque<mcp_config::PendingSignIn>,
+    mcp_sign_in: std::collections::VecDeque<String>,
+    mcp_auth_required: std::collections::BTreeMap<String, mcp_config::PendingSignIn>,
     mcp_inspection: Vec<mcp_config::Inspection>,
 }
 
@@ -357,14 +358,7 @@ impl Runtime {
             }
         }
         self.shell.set_context_with_external_id(
-            ShellContext {
-                id: session_id,
-                path: (!args.no_session && !args.ephemeral_worker_session)
-                    .then(|| args.session.clone()),
-                provider: args.provider.id().into(),
-                model: args.model.clone(),
-                reasoning_level: Some(args.thinking.clone().unwrap_or_else(|| "off".into())),
-            },
+            shell_session_context(args, session),
             session.external_session_id(),
         );
         self.auto_compaction.set_token_settings(
@@ -379,6 +373,47 @@ impl Runtime {
             limits: effective_limits(args),
         }
     }
+    pub(super) fn refresh_read_image_policy(&self, args: &Cli) {
+        set_read_image_policy(
+            &self.read_image_model,
+            &args.model_profiles,
+            &args.provider,
+            &args.model,
+        );
+    }
+
+    pub(super) fn live_tool_model_context<'a>(
+        &self,
+        args: &'a Cli,
+        session: &Session,
+    ) -> impl FnMut(&pi_rs::Record) + use<'a> {
+        let shell = self.shell.clone();
+        let policy = self.read_image_model.clone();
+        let profiles = &args.model_profiles;
+        let mut context = shell_session_context(args, session);
+        let external_id = session.external_session_id();
+        move |record| {
+            let pi_rs::Event::ModelSelected {
+                model,
+                provider,
+                thinking,
+            } = &record.event
+            else {
+                return;
+            };
+            let provider = provider
+                .as_deref()
+                .unwrap_or(super::providers::Provider::Ollama.id());
+            if let Some(provider) = profiles.provider(provider) {
+                set_read_image_policy(&policy, profiles, &provider, model);
+            }
+            context.provider = provider.into();
+            context.model = model.clone();
+            context.reasoning_level = Some(thinking.clone().unwrap_or_else(|| "off".into()));
+            shell.set_context_with_external_id(context.clone(), external_id.clone());
+        }
+    }
+
     pub fn mcp_status(&self, args: &Cli) -> Result<()> {
         let servers = self.catalog.current_servers(&self.registry);
         for (name, value) in
@@ -396,20 +431,233 @@ impl Runtime {
         }
         Ok(())
     }
-    pub async fn inspect_mcp(
-        &self,
+    pub async fn manage_mcp(
+        &mut self,
         args: &Cli,
         ui: &dyn ExtensionUi,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let servers = self.catalog.current_servers(&self.registry);
-        let mut inspection = self.mcp_inspection.clone();
-        inspection.extend(mcp_config::registered_inspection(
-            args,
-            &self.registry.registered_mcp_servers(),
-            &self.catalog.configured_namespaces,
-        )?);
-        mcp_config::inspect_servers(&inspection, &servers, ui, cancel).await
+        let mut status: Option<(String, &str)> = None;
+        loop {
+            let servers = self.catalog.current_servers(&self.registry);
+            let mut inspection = self.mcp_inspection.clone();
+            let declared = mcp_config::registered_inspection(
+                args,
+                &self.registry.registered_mcp_servers(),
+                &self.catalog.configured_namespaces,
+            )?;
+            inspection.retain(|entry| !entry.is_extension());
+            inspection.extend(declared);
+            let selected = status
+                .as_ref()
+                .map(|(name, message)| (name.as_str(), *message));
+            let Some(mut request) = mcp_config::inspect_servers(
+                &inspection,
+                &servers,
+                &self.mcp_auth_required,
+                selected,
+                args.trusted,
+                ui,
+                cancel,
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            let result = match request.action {
+                mcp_config::ManagerAction::Reconnect => self
+                    .reconnect_mcp(args, &request.name, &request.config, cancel)
+                    .await
+                    .map(|()| "Reconnected"),
+                mcp_config::ManagerAction::SetEnabled { enabled, .. } => {
+                    self.set_mcp_enabled(args, &mut request, enabled, cancel)
+                        .await
+                }
+                mcp_config::ManagerAction::SetExposure(exposure) => self
+                    .set_mcp_exposure(args, &request, exposure, cancel)
+                    .await
+                    .map(|()| "Exposure updated"),
+                mcp_config::ManagerAction::SignIn => {
+                    self.mcp_sign_in.retain(|name| name != &request.name);
+                    self.sign_in_mcp(args, &request.name, &request.config, ui, cancel)
+                        .await
+                        .map(|()| "Signed in")
+                }
+                mcp_config::ManagerAction::SignOut => self
+                    .sign_out_mcp(args, &request.name, &request.config, cancel)
+                    .await
+                    .map(|()| "Signed out"),
+            };
+            let message = match result {
+                Ok(message) => message,
+                Err(pi_rs::Error::Cancelled) => return Err(pi_rs::Error::Cancelled),
+                Err(pi_rs::Error::AuthorizationRequired { .. }) => "Sign-in required",
+                Err(_) => "MCP update failed. Check the configuration or reload if it changed.",
+            };
+            status = Some((request.name, message));
+        }
+    }
+
+    async fn set_mcp_enabled(
+        &mut self,
+        args: &Cli,
+        request: &mut mcp_config::ManagerRequest,
+        enabled: bool,
+        cancel: &CancellationToken,
+    ) -> Result<&'static str> {
+        let updated = mcp_config::edit_manager_config(args, request, cancel).await?;
+        request.config = updated.config.clone().expect("validated MCP configuration");
+        self.update_mcp_inspection(updated);
+        if enabled {
+            self.reconnect_mcp(args, &request.name, &request.config, cancel)
+                .await?;
+            Ok("Enabled")
+        } else {
+            let catalog = self.catalog.clone();
+            let _mutation = catalog.refresh.lock().await;
+            self.disconnect_mcp(&catalog, &request.name).await?;
+            Ok("Disabled")
+        }
+    }
+
+    async fn set_mcp_exposure(
+        &mut self,
+        args: &Cli,
+        request: &mcp_config::ManagerRequest,
+        exposure: &str,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let catalog = self.catalog.clone();
+        let _mutation = catalog.refresh.lock().await;
+        let mut servers = catalog.servers();
+        let staged = if let Some(index) = servers
+            .iter()
+            .position(|server| server.server_name == request.name)
+        {
+            let updated = Arc::new(servers[index].with_exposure(exposure.into()));
+            let mut registry = self.registry.clone();
+            registry.replace(updated.clone())?;
+            servers[index] = updated;
+            let system_prompt = catalog.select_mcp_tools(&mut registry, &servers)?;
+            Some((registry, system_prompt))
+        } else {
+            None
+        };
+        let updated = mcp_config::edit_manager_config(args, request, cancel).await?;
+        if let Some((registry, system_prompt)) = staged {
+            self.registry = registry;
+            self.system_prompt = system_prompt;
+            catalog.state.lock().expect("MCP catalog").servers = servers;
+        }
+        self.update_mcp_inspection(updated);
+        Ok(())
+    }
+
+    fn update_mcp_inspection(&mut self, updated: mcp_config::Inspection) {
+        if let Some(pending) = self.mcp_auth_required.get_mut(&updated.name)
+            && let Some(config) = &updated.config
+        {
+            pending.config = config.clone();
+        }
+        if let Some(entry) = self
+            .mcp_inspection
+            .iter_mut()
+            .find(|entry| entry.name == updated.name)
+        {
+            *entry = updated;
+        }
+    }
+
+    async fn disconnect_mcp(
+        &mut self,
+        catalog: &LiveMcpCatalog,
+        name: &str,
+    ) -> Result<Option<usize>> {
+        let mut servers = catalog.servers();
+        let Some(index) = servers.iter().position(|server| server.server_name == name) else {
+            return Ok(None);
+        };
+        let old = servers.remove(index);
+        let mut registry = self.registry.clone();
+        registry.unregister(old.id())?;
+        let prompt = catalog.select_mcp_tools(&mut registry, &servers);
+        self.registry = registry;
+        catalog.state.lock().expect("MCP catalog").servers = servers;
+        catalog.close_in_background(old);
+        self.system_prompt = prompt?;
+        Ok(Some(index))
+    }
+
+    async fn reconnect_mcp(
+        &mut self,
+        args: &Cli,
+        name: &str,
+        config: &pi_rs_workbench::mcp::ServerConfig,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let registrations = self.registry.clone();
+        let check_config = || {
+            mcp_config::check_manager_connection(
+                args,
+                &registrations.registered_mcp_servers(),
+                name,
+                config,
+            )
+        };
+        let catalog = self.catalog.clone();
+        let _mutation = catalog.refresh.lock().await;
+        check_config()?;
+        if cancel.is_cancelled() {
+            return Err(pi_rs::Error::Cancelled);
+        }
+        let index = self.disconnect_mcp(&catalog, name).await?;
+        let mut servers = catalog.servers();
+        check_config()?;
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(pi_rs::Error::Cancelled),
+            result = mcp_config::connect(args, name, config) => result,
+        };
+        let replacement = match result {
+            Ok(server) => Arc::new(server),
+            Err(error) => {
+                if let pi_rs::Error::AuthorizationRequired { challenge, .. } = &error {
+                    self.mcp_auth_required.insert(
+                        name.into(),
+                        mcp_config::PendingSignIn {
+                            name: name.into(),
+                            config: config.clone(),
+                            challenge: challenge.clone(),
+                        },
+                    );
+                }
+                return Err(error);
+            }
+        };
+        servers.insert(index.unwrap_or(servers.len()), replacement.clone());
+        let apply = (|| {
+            check_config()?;
+            let mut registry = self.registry.clone();
+            registry.register(replacement.clone())?;
+            let prompt = catalog.select_mcp_tools(&mut registry, &servers)?;
+            self.registry = registry;
+            self.system_prompt = prompt;
+            let declaration = catalog.declared_configs(&self.registry).remove(name);
+            let mut state = catalog.state.lock().expect("MCP catalog");
+            if let Some(declaration) = declaration {
+                state.declarations.insert(name.to_owned(), declaration);
+            }
+            state.installed_ids.insert(replacement.id().to_owned());
+            state.servers = servers;
+            Ok(())
+        })();
+        if apply.is_err() {
+            replacement.close().await;
+        } else {
+            self.mcp_sign_in.retain(|pending| pending != name);
+            self.mcp_auth_required.remove(name);
+        }
+        apply
     }
 
     pub async fn refresh_mcp(&mut self, _args: &Cli) -> Result<()> {
@@ -422,32 +670,117 @@ impl Runtime {
         Ok(())
     }
 
+    async fn sign_in_mcp(
+        &mut self,
+        args: &Cli,
+        name: &str,
+        config: &pi_rs_workbench::mcp::ServerConfig,
+        ui: &dyn ExtensionUi,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let mut pending = self
+            .mcp_auth_required
+            .get(name)
+            .filter(|pending| &pending.config == config)
+            .cloned()
+            .ok_or_else(|| pi_rs::Error::Config("MCP server no longer needs sign-in".into()))?;
+        mcp_config::check_manager_connection(
+            args,
+            &self.registry.registered_mcp_servers(),
+            name,
+            config,
+        )?;
+        if pending.challenge.is_none() {
+            // Explicit OAuth can report missing credentials before making an
+            // HTTP request. Ask the server directly for its challenge when no
+            // earlier handshake discovered one, including after sign-out.
+            let mut probe = config.clone();
+            probe.oauth = None;
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(pi_rs::Error::Cancelled),
+                result = mcp_config::connect(args, name, &probe) => result,
+            };
+            match result {
+                Err(pi_rs::Error::AuthorizationRequired { challenge, .. }) => {
+                    pending.challenge = challenge;
+                }
+                Ok(connection) => connection.close().await,
+                Err(_) => {}
+            }
+        }
+        mcp_config::manager_login(
+            args,
+            &self.registry.registered_mcp_servers(),
+            &pending,
+            ui,
+            cancel,
+        )
+        .await?;
+        self.mcp_auth_required.remove(name);
+        self.reconnect_mcp(args, name, config, cancel).await
+    }
+
+    async fn sign_out_mcp(
+        &mut self,
+        args: &Cli,
+        name: &str,
+        config: &pi_rs_workbench::mcp::ServerConfig,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        mcp_config::check_manager_connection(
+            args,
+            &self.registry.registered_mcp_servers(),
+            name,
+            config,
+        )?;
+        let catalog = self.catalog.clone();
+        let _mutation = catalog.refresh.lock().await;
+        let connected_oauth = catalog
+            .current_servers(&self.registry)
+            .iter()
+            .any(|server| server.server_name == name && server.uses_oauth());
+        let url = config
+            .url
+            .as_deref()
+            .filter(|_| connected_oauth)
+            .ok_or_else(|| {
+                pi_rs::Error::Config("MCP server has no active OAuth connection".into())
+            })?;
+        if cancel.is_cancelled() {
+            return Err(pi_rs::Error::Cancelled);
+        }
+        pi_rs_workbench::mcp_auth::logout(name, url).await?;
+        self.mcp_sign_in.retain(|pending| pending != name);
+        self.mcp_auth_required
+            .entry(name.into())
+            .or_insert_with(|| mcp_config::PendingSignIn {
+                name: name.into(),
+                config: config.clone(),
+                challenge: None,
+            });
+        self.disconnect_mcp(&catalog, name).await?;
+        Ok(())
+    }
+
     pub async fn authorize_pending_mcp(
         &mut self,
         args: &Cli,
         ui: &dyn ExtensionUi,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        while let Some(mcp_config::PendingSignIn {
-            name,
-            config,
-            challenge,
-        }) = self.mcp_sign_in.front().cloned()
-        {
-            let current = || {
-                mcp_config::registered_configurations(
-                    args,
-                    &self.registry.registered_mcp_servers(),
-                )?
-                .remove(&name)
-                .map(serde_json::from_value::<pi_rs_workbench::mcp::ServerConfig>)
-                .transpose()
-                .map_err(pi_rs::Error::from)
+        while let Some(name) = self.mcp_sign_in.front().cloned() {
+            let Some(pending) = self.mcp_auth_required.get(&name).cloned() else {
+                self.mcp_sign_in.pop_front();
+                continue;
             };
-            if args
-                .disable_extension
-                .contains(&format!("mcp-{}", name.replace('-', "_")))
-                || current()?.as_ref() != Some(&config)
+            if mcp_config::check_manager_connection(
+                args,
+                &self.registry.registered_mcp_servers(),
+                &name,
+                &pending.config,
+            )
+            .is_err()
             {
                 self.mcp_sign_in.pop_front();
                 continue;
@@ -465,76 +798,32 @@ impl Runtime {
             if cancel.is_cancelled() {
                 return Err(pi_rs::Error::Cancelled);
             }
-            if confirmation != Ok(UiResponse::Confirmed(true)) {
-                self.mcp_sign_in.pop_front();
-                continue;
-            }
-            let url = config.url.as_deref().expect("OAuth requires HTTP");
-            let result = async {
-                if current()?.as_ref() != Some(&config) {
-                    return Err(pi_rs::Error::Config(
-                        "MCP configuration changed before sign-in".into(),
-                    ));
-                }
-                pi_rs_workbench::mcp_auth::login_configured_with_http_options(
-                    &name,
-                    url,
-                    config.oauth_client(),
-                    challenge.as_deref(),
-                    &[],
-                    Some(&super::http_proxy::configured_mcp(&args.settings)?),
-                    |_| {},
-                )
-                .await?;
-                if current()?.as_ref() != Some(&config) {
-                    return Err(pi_rs::Error::Config(
-                        "MCP configuration changed during sign-in".into(),
-                    ));
-                }
-                pi_rs_workbench::mcp::McpExtension::connect_with_proxy_hosts(
-                    &name,
-                    &config,
-                    &args.workspace,
-                    None,
-                    Some(super::http_proxy::configured_mcp(&args.settings)?),
-                )
-                .await
-            }
-            .await;
             self.mcp_sign_in.pop_front();
-            let extension = match result {
-                Ok(extension) => Arc::new(extension),
-                Err(error) => {
-                    eprintln!("MCP {name}: {error}");
-                    continue;
+            if confirmation == Ok(UiResponse::Confirmed(true))
+                && let Err(error) = self
+                    .sign_in_mcp(args, &name, &pending.config, ui, cancel)
+                    .await
+            {
+                if matches!(error, pi_rs::Error::Cancelled) {
+                    return Err(error);
                 }
-            };
-            let _refresh = self.catalog.refresh.lock().await;
-            match current() {
-                Ok(refreshed) if refreshed.as_ref() == Some(&config) => {}
-                outcome => {
-                    extension.close().await;
-                    outcome?;
-                    continue;
-                }
-            }
-            if let Err(error) = self.registry.register(extension.clone()) {
-                extension.close().await;
                 eprintln!("MCP {name}: {error}");
-                continue;
             }
-            let mut state = self.catalog.state.lock().expect("MCP catalog");
-            state.installed_ids.insert(extension.id().into());
-            state.servers.push(extension);
         }
         Ok(())
     }
 
+    pub fn update_codex_transport(&mut self, settings: &super::config::Settings) {
+        if let super::providers::Client::OpenAi(client) = &mut self.provider.client {
+            *client = client
+                .clone()
+                .with_codex_transport(settings.codex_transport());
+        }
+    }
+
     pub fn configure_model_options(&mut self, args: &Cli, reported: bool) -> Result<()> {
-        let provider = model_client(args, reported, true)?;
-        self.read_image_model
-            .set(&args.model, provider.supports_images);
-        self.provider = provider;
+        self.provider = model_client(args, reported, true)?;
+        self.refresh_read_image_policy(args);
         Ok(())
     }
     pub async fn session_lifecycle(
@@ -1071,21 +1360,7 @@ impl LiveMcpCatalog {
                 }
             }
         }
-        let (selection, documents, hidden) = tool_discovery(&self.args, &servers)?;
-        if self.builtin_tool_search {
-            registry.replace(Arc::new(pi_rs_extensions::tool_search::ToolSearch::new(
-                documents,
-            )))?;
-        }
-        let resources = self.resources.lock().expect("resource catalog").clone();
-        let system_prompt = select_tools(
-            &mut registry,
-            &selection,
-            &hidden,
-            &resources,
-            &self.args,
-            &servers,
-        )?;
+        let system_prompt = self.select_mcp_tools(&mut registry, &servers)?;
         let mut installed_ids = previous.installed_ids.clone();
         installed_ids.extend(servers.iter().map(|server| server.id().to_owned()));
         Ok(PreparedMcpRefresh {
@@ -1309,12 +1584,11 @@ async fn configure_after(
             .map(|url| (url, std::env::var("PI_RS_ORDERS_TOKEN").ok()));
         registry.register(Arc::new(Tools::new(&args.workspace, order_config)?))?;
         let shell = shell_config(args);
-        let read_image_model = pi_rs_workbench::coding::ReadImageModel::default();
+        let read_image_model = ReadImageModel::default();
         registry.register(Arc::new(
             CodingTools::local(&args.workspace)?
                 .with_shell_config(shell.clone())
                 .with_image_resize(args.settings.resize_model_images())
-                .with_image_profile(args.model_image_resize())
                 .with_read_image_model(read_image_model.clone()),
         ))?;
         let extra = mcp_config::discover_registered(
@@ -1367,7 +1641,12 @@ async fn configure_after(
         });
         registry.set_refresher(catalog.clone());
         let provider = model_client(args, super::thinking::reported(args).is_some(), true)?;
-        read_image_model.set(&args.model, provider.supports_images);
+        set_read_image_policy(
+            &read_image_model,
+            &args.model_profiles,
+            &args.provider,
+            &args.model,
+        );
 
         // Subprocesses must inherit the frontend's live controls rather than
         // re-resolving them from project settings when a worker is replaced.
@@ -1402,7 +1681,16 @@ async fn configure_after(
             resources: local_resources,
             resource_origins: ResourceOrigins::default(),
             catalog,
-            mcp_sign_in: discovered.sign_in.into(),
+            mcp_sign_in: discovered
+                .sign_in
+                .iter()
+                .map(|pending| pending.name.clone())
+                .collect(),
+            mcp_auth_required: discovered
+                .sign_in
+                .into_iter()
+                .map(|pending| (pending.name.clone(), pending))
+                .collect(),
             mcp_inspection: discovered.inspection,
         })
     }
@@ -1414,7 +1702,31 @@ async fn configure_after(
     result
 }
 
-fn effective_limits(args: &Cli) -> Limits {
+fn set_read_image_policy(
+    policy: &ReadImageModel,
+    profiles: &super::model_profiles::Profiles,
+    provider: &super::providers::Provider,
+    model: &str,
+) {
+    let profile = profiles.model(provider, model);
+    policy.set_profile(
+        model,
+        profile.as_ref().and_then(|model| model.supports_images()),
+        profile.as_ref().and_then(|model| model.image_resize()),
+    );
+}
+
+fn shell_session_context(args: &Cli, session: &Session) -> ShellContext {
+    ShellContext {
+        id: session.session_id(),
+        path: (!args.no_session && !args.ephemeral_worker_session).then(|| args.session.clone()),
+        provider: args.provider.id().into(),
+        model: args.model.clone(),
+        reasoning_level: Some(args.thinking.clone().unwrap_or_else(|| "off".into())),
+    }
+}
+
+pub(super) fn effective_limits(args: &Cli) -> Limits {
     Limits {
         model_requests: args.max_requests,
         output_tokens_per_request: args.effective_max_output_tokens(),

@@ -5,6 +5,7 @@
   "properties": {
     "httpProxy": { "type": "string" },
     "httpIdleTimeoutMs": { "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "string" }] },
+    "websocketConnectTimeoutMs": { "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "string" }] },
     "fullscreenExitOutput": { "enum": ["transcript", "resume-hint"] },
     "fullscreenScrollbar": { "enum": ["auto", "always", "hidden"] },
     "fullscreenCopyOnSelect": { "type": "boolean" },
@@ -81,6 +82,9 @@
     },
     "showCacheMissNotices": {
       "type": "boolean"
+    },
+    "transport": {
+      "enum": ["sse", "websocket", "websocket-cached", "auto"]
     },
     "cacheWarming": {
       "enum": ["off", "streaming", "idle"]

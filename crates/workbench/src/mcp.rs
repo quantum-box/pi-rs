@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use pi_rs::{Error, Extension, Outcome, Result, Tool, ToolContext, ToolSpec};
 use rmcp::{
     RoleClient,
-    model::{CallToolResponse, ProtocolVersion, SubscriptionFilter},
+    model::{
+        CallToolResponse, ErrorData, PaginatedRequestParams, ProtocolVersion, SubscriptionFilter,
+    },
     service::{
         ClientInitializeError, ClientLifecycleMode, ClientServiceExt, NotificationContext,
         RunningService, ServiceError,
@@ -29,6 +31,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::mcp_progress::{self, ProgressTransport, ToolProgress};
 use crate::mcp_provider_auth::ProviderClient;
 pub use crate::mcp_provider_auth::TokenResolver;
 use crate::mcp_resource_compat::ResourceCompatibility;
@@ -141,6 +144,7 @@ struct NativeClient {
     workspace_root: Option<WorkspaceRoot>,
     interaction: Arc<std::sync::Mutex<Option<Interaction>>>,
     catalog: Arc<CatalogSignal>,
+    progress: Arc<ToolProgress>,
     dispatch_closed: Arc<std::sync::Mutex<crate::mcp_oauth_client::DispatchState>>,
 }
 
@@ -151,6 +155,10 @@ struct WorkspaceRoot {
 }
 
 impl NativeClient {
+    fn progress_transport<T>(&self, transport: T) -> ProgressTransport<T> {
+        ProgressTransport::new(transport, self.progress.clone())
+    }
+
     async fn for_server(name: &str, workspace: &Path) -> Self {
         let workspace_root = tokio::fs::canonicalize(workspace)
             .await
@@ -207,6 +215,10 @@ struct CatalogSnapshot {
     signal: Arc<CatalogSignal>,
     revision: u64,
     checked_at: Instant,
+    definitions: Vec<rmcp::model::Tool>,
+    has_resources: bool,
+    has_prompts: bool,
+    instructions: Option<String>,
 }
 
 const CATALOG_FALLBACK: Duration = Duration::from_secs(30);
@@ -535,14 +547,14 @@ pub struct McpExtension {
     id: String,
     tools: Vec<Arc<dyn Tool>>,
     server_tool_names: Vec<String>,
-    has_resources: bool,
     deferred: BTreeSet<String>,
     has_codemode: bool,
     has_deferred: bool,
     pub server_name: String,
     pub description: String,
     connection: Arc<Connection>,
-    catalog: CatalogSnapshot,
+    catalog: Arc<CatalogSnapshot>,
+    exposure: Option<String>,
 }
 
 /// HTTP transport settings supplied by an embedding host.
@@ -726,28 +738,22 @@ impl McpExtension {
             let initialize = async {
                 let service = match owned_stdio {
                     Some(owner) => {
-                        NativeClient::for_server(name, workspace)
-                            .await
-                            .serve_with_lifecycle(
-                                ResourceCompatibility(crate::mcp_log::LoggingTransport::new(
-                                    owned_stdio_transport(wrapped, owner)?,
-                                    Some(Arc::from(name)),
-                                )),
-                                lifecycle,
-                            )
-                            .await
+                        let native = NativeClient::for_server(name, workspace).await;
+                        let transport = crate::mcp_log::LoggingTransport::new(
+                            owned_stdio_transport(wrapped, owner)?,
+                            Some(Arc::from(name)),
+                        );
+                        let transport = native.progress_transport(ResourceCompatibility(transport));
+                        native.serve_with_lifecycle(transport, lifecycle).await
                     }
                     None => {
-                        NativeClient::for_server(name, workspace)
-                            .await
-                            .serve_with_lifecycle(
-                                ResourceCompatibility(crate::mcp_log::LoggingTransport::new(
-                                    TokioChildProcess::new(wrapped)?,
-                                    Some(Arc::from(name)),
-                                )),
-                                lifecycle,
-                            )
-                            .await
+                        let native = NativeClient::for_server(name, workspace).await;
+                        let transport = crate::mcp_log::LoggingTransport::new(
+                            TokioChildProcess::new(wrapped)?,
+                            Some(Arc::from(name)),
+                        );
+                        let transport = native.progress_transport(ResourceCompatibility(transport));
+                        native.serve_with_lifecycle(transport, lifecycle).await
                     }
                 };
                 service.map_err(|error| {
@@ -897,13 +903,13 @@ impl McpExtension {
             closed: AtomicBool::new(false),
             page_outputs: std::sync::Mutex::new(VecDeque::new()),
         });
-        Self::discover(connection).await
+        Self::discover(connection, config.exposure.clone()).await
     }
 
     /// Reload definitions while keeping the established transport and remote state.
     pub async fn refresh(&self) -> Result<Self> {
         drop(self.connection.active_service().await?);
-        Self::discover(self.connection.clone()).await
+        Self::discover(self.connection.clone(), self.exposure.clone()).await
     }
 
     /// Keep a notified catalog between turns and poll when notifications are unavailable.
@@ -922,12 +928,22 @@ impl McpExtension {
             }
         }
         drop(service);
-        Self::discover(self.connection.clone()).await.map(Some)
+        Self::discover(self.connection.clone(), self.exposure.clone())
+            .await
+            .map(Some)
     }
 
-    async fn discover(connection: Arc<Connection>) -> Result<Self> {
-        let name = connection.name.clone();
-        let config = connection.config.clone();
+    /// Rebuild the local declarations from the last catalog without restarting the server.
+    pub fn with_exposure(&self, exposure: String) -> Self {
+        Self::from_catalog(
+            self.connection.clone(),
+            self.catalog.clone(),
+            Some(exposure),
+        )
+    }
+
+    async fn discover(connection: Arc<Connection>, exposure: Option<String>) -> Result<Self> {
+        let name = &connection.name;
         let timeout = connection.timeout;
         let service = connection.service.lock().await;
         let info = service.peer_info();
@@ -938,7 +954,12 @@ impl McpExtension {
             .as_ref()
             .is_some_and(|info| info.capabilities.tools.is_some())
         {
-            tokio::time::timeout(timeout, service.list_all_tools())
+            let service = &*service;
+            let listing = all_pages("tools/list", |params| async move {
+                let result = service.list_tools(Some(params)).await?;
+                Ok((result.tools, result.next_cursor))
+            });
+            tokio::time::timeout(timeout, listing)
                 .await
                 .map_err(|_| Error::Config(format!("MCP {name} tool discovery timed out")))?
                 .map_err(|error| {
@@ -947,29 +968,46 @@ impl McpExtension {
         } else {
             Vec::new()
         };
-        let server_tool_names = definitions
-            .iter()
-            .map(|tool| tool.name.to_string())
-            .collect();
-        let has_resources = info
-            .as_ref()
-            .is_some_and(|info| info.capabilities.resources.is_some());
-        drop(service);
-        let catalog = CatalogSnapshot {
+        let catalog = Arc::new(CatalogSnapshot {
             signal,
             revision,
             checked_at: Instant::now(),
-        };
+            definitions,
+            has_resources: info
+                .as_ref()
+                .is_some_and(|info| info.capabilities.resources.is_some()),
+            has_prompts: info
+                .as_ref()
+                .is_some_and(|info| info.capabilities.prompts.is_some()),
+            instructions: info.and_then(|info| info.instructions.clone()),
+        });
+        drop(service);
+        Ok(Self::from_catalog(connection, catalog, exposure))
+    }
+
+    fn from_catalog(
+        connection: Arc<Connection>,
+        catalog: Arc<CatalogSnapshot>,
+        exposure: Option<String>,
+    ) -> Self {
+        let name = connection.name.clone();
+        let mut config = connection.config.clone();
+        config.exposure = exposure.clone();
+        let server_tool_names = catalog
+            .definitions
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
         let prefix = format!("mcp__{}__", normalize(&name));
         let mut counts = BTreeMap::<String, usize>::new();
-        for definition in &definitions {
+        for definition in &catalog.definitions {
             *counts.entry(normalize(&definition.name)).or_default() += 1;
         }
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
         let mut deferred = BTreeSet::new();
         let mut has_codemode = false;
         let mut has_deferred = false;
-        for definition in definitions {
+        for definition in &catalog.definitions {
             if !tool_enabled(&config, &definition.name) {
                 continue;
             }
@@ -983,7 +1021,8 @@ impl McpExtension {
                 name: format!("{prefix}{normalized}{suffix}"),
                 description: definition
                     .description
-                    .map(|description| description.into_owned())
+                    .as_deref()
+                    .map(str::to_owned)
                     .unwrap_or_else(|| definition.name.to_string()),
                 parameters: Value::Object((*definition.input_schema).clone()),
             };
@@ -997,15 +1036,12 @@ impl McpExtension {
             }
             tools.push(Arc::new(McpTool {
                 connection: connection.clone(),
-                remote_name: definition.name.into_owned(),
+                remote_name: definition.name.to_string(),
                 spec,
                 resource: false,
             }));
         }
-        if info
-            .clone()
-            .is_some_and(|info| info.capabilities.resources.is_some())
-        {
+        if catalog.has_resources {
             for (name, policy, description, parameters) in [
                 (
                     "list_resources",
@@ -1065,10 +1101,7 @@ impl McpExtension {
                 }));
             }
         }
-        if info
-            .as_ref()
-            .is_some_and(|info| info.capabilities.prompts.is_some())
-        {
+        if catalog.has_prompts {
             for (name, description, parameters) in [
                 (
                     "list_prompts",
@@ -1110,23 +1143,19 @@ impl McpExtension {
         }
         let description = config
             .description
-            .clone()
             .or_else(|| {
-                info.clone()
-                    .and_then(|info| info.instructions.clone())
-                    .and_then(|instructions| {
-                        instructions
-                            .lines()
-                            .find(|line| !line.trim().is_empty())
-                            .map(str::to_owned)
-                    })
+                catalog.instructions.as_deref().and_then(|instructions| {
+                    instructions
+                        .lines()
+                        .find(|line| !line.trim().is_empty())
+                        .map(str::to_owned)
+                })
             })
             .unwrap_or_default();
-        Ok(Self {
+        Self {
             id: format!("mcp-{}", normalize(&name)),
             tools,
             server_tool_names,
-            has_resources,
             deferred,
             has_codemode,
             has_deferred,
@@ -1134,7 +1163,8 @@ impl McpExtension {
             description,
             connection,
             catalog,
-        })
+            exposure,
+        }
     }
     /// Original server tool names from this discovery snapshot, including hidden tools.
     pub fn remote_tool_names(&self) -> &[String] {
@@ -1142,12 +1172,17 @@ impl McpExtension {
     }
 
     pub fn remote_tool_exposure(&self, name: &str) -> &str {
-        tool_exposure(&self.connection.config, name)
+        tool_exposure_with_default(&self.connection.config, name, self.exposure.as_deref())
+    }
+
+    /// Whether the running HTTP connection uses saved MCP OAuth credentials.
+    pub fn uses_oauth(&self) -> bool {
+        self.connection.identity().oauth_generation.is_some()
     }
 
     /// Whether the server advertised the resources capability at discovery.
     pub fn offers_resources(&self) -> bool {
-        self.has_resources
+        self.catalog.has_resources
     }
 
     pub fn has_deferred(&self) -> bool {
@@ -1375,7 +1410,10 @@ async fn start_http_service<C: StreamableHttpClient + Clone>(
         );
         let result = native
             .clone()
-            .serve_with_lifecycle(ResourceCompatibility(transport), lifecycle.clone())
+            .serve_with_lifecycle(
+                native.progress_transport(ResourceCompatibility(transport)),
+                lifecycle.clone(),
+            )
             .await;
         match (result, delay) {
             (Err(error), Some(delay)) if transient_http_initialization(&error) => {
@@ -1457,17 +1495,33 @@ impl McpTool {
         }
         let attempt = || async {
             let dispatch_cancel = context.cancellation.child_token();
+            let (progress, updates) = mcp_progress::channel(self.connection.timeout);
+            // Keep the idle deadline independent of a slow or unavailable UI.
+            let report = async {
+                if let Some(host) = host.as_ref().filter(|host| host.supports_progress()) {
+                    mcp_progress::report(
+                        host.as_ref(),
+                        &self.connection.name,
+                        &self.remote_name,
+                        updates.clone(),
+                    )
+                    .await;
+                }
+                std::future::pending::<()>().await;
+            };
             tokio::select! {
+                biased;
                 _ = context.cancellation.cancelled() => {
                     Err(CallError::Other("MCP request cancelled after dispatch".into()))
                 }
                 _ = async {
-                    tokio::time::sleep(self.connection.timeout).await;
+                    mcp_progress::wait_for_idle(updates.clone()).await;
                     dispatch_cancel.cancel();
                 } => {
                     Err(CallError::Other("MCP request timed out after dispatch".into()))
                 }
-                result = self.call_once(&arguments, &context, host.as_ref(), &dispatch_cancel) => result,
+                _ = report => unreachable!("tool progress reporter is pending until the request ends"),
+                result = self.call_once(&arguments, &context, host.as_ref(), &dispatch_cancel, progress) => result,
             }
         };
         let mut may_retry_read = self.resource
@@ -1726,6 +1780,7 @@ impl McpTool {
         context: &ToolContext,
         host: Option<&Arc<dyn pi_rs::ToolHost>>,
         dispatch_cancel: &pi_rs::CancellationToken,
+        progress: mcp_progress::UpdatesSender,
     ) -> std::result::Result<CallResult, CallError> {
         if self.resource {
             return self.invoke_resource(arguments).await.map(CallResult::Data);
@@ -1734,6 +1789,11 @@ impl McpTool {
             json!({"name":self.remote_name,"arguments":arguments,"_meta":{"operationId":context.operation_id.to_string()}}),
         )?;
         let service = self.connection.active_service().await?;
+        let _progress = service.service().progress.register(
+            context.operation_id,
+            self.connection.timeout,
+            progress,
+        );
         let interaction = service.service().interaction.clone();
         *interaction
             .lock()
@@ -1776,13 +1836,25 @@ impl McpTool {
     }
     async fn invoke_resource(&self, arguments: &Value) -> std::result::Result<Value, CallError> {
         let service = self.connection.active_service().await?;
+        let service = &*service;
         match self.remote_name.as_str() {
             "list_resources" => {
-                let resources = service.list_all_resources().await.map_err(call_error)?;
+                let resources = all_pages("resources/list", |params| async move {
+                    let result = service.list_resources(Some(params)).await?;
+                    Ok((result.resources, result.next_cursor))
+                })
+                .await
+                .map_err(call_error)?;
                 Ok(json!({"resources": visible_resource_listing(serde_json::to_value(resources)?)}))
             }
             "list_resource_templates" => {
-                let templates = templates_or_empty(service.list_all_resource_templates().await)?;
+                let templates = templates_or_empty(
+                    all_pages("resources/templates/list", |params| async move {
+                        let result = service.list_resource_templates(Some(params)).await?;
+                        Ok((result.resource_templates, result.next_cursor))
+                    })
+                    .await,
+                )?;
                 Ok(
                     json!({"resourceTemplates": visible_resource_listing(serde_json::to_value(templates)?)}),
                 )
@@ -1813,7 +1885,12 @@ impl McpTool {
                 ))
             }
             "list_prompts" => {
-                let prompts = service.list_all_prompts().await.map_err(call_error)?;
+                let prompts = all_pages("prompts/list", |params| async move {
+                    let result = service.list_prompts(Some(params)).await?;
+                    Ok((result.prompts, result.next_cursor))
+                })
+                .await
+                .map_err(call_error)?;
                 Ok(json!({"prompts":prompts}))
             }
             "get_prompt" => {
@@ -1841,6 +1918,42 @@ impl McpTool {
             _ => Err(Error::Config("unknown MCP resource operation".into()).into()),
         }
     }
+}
+
+const MAX_LIST_PAGES: usize = 1_000;
+
+async fn all_pages<T, F>(
+    method: &str,
+    mut list: impl FnMut(PaginatedRequestParams) -> F,
+) -> std::result::Result<Vec<T>, ServiceError>
+where
+    F: std::future::Future<Output = std::result::Result<(Vec<T>, Option<String>), ServiceError>>,
+{
+    let invalid = |message| ServiceError::McpError(ErrorData::invalid_request(message, None));
+    let mut items = Vec::new();
+    let mut cursor = None;
+    let mut seen = BTreeSet::new();
+    for _ in 0..MAX_LIST_PAGES {
+        let mut params = PaginatedRequestParams::default();
+        params.cursor = cursor;
+        let (page, next) = list(params).await?;
+        items.extend(page);
+        let Some(next) = nonempty_cursor(next) else {
+            return Ok(items);
+        };
+        if !seen.insert(next.clone()) {
+            // Cursors are opaque server-provided data and can contain secrets.
+            return Err(invalid(format!("MCP {method} returned a duplicate cursor")));
+        }
+        cursor = Some(next);
+    }
+    Err(invalid(format!(
+        "MCP {method} exceeded {MAX_LIST_PAGES} pages"
+    )))
+}
+
+fn nonempty_cursor(cursor: Option<String>) -> Option<String> {
+    cursor.filter(|value| !value.is_empty())
 }
 
 // Servers can provide resources without implementing resource templates.
@@ -1878,7 +1991,7 @@ fn resource_page(server: &str, key: &str, items: Value, cursor: Option<String>) 
         .collect();
     let mut result = json!({"server": server});
     result[key] = json!(items);
-    if let Some(cursor) = cursor {
+    if let Some(cursor) = nonempty_cursor(cursor) {
         result["nextCursor"] = json!(cursor);
     }
     result
@@ -1925,6 +2038,14 @@ fn connection_identity(name: &str, config: &ServerConfig, workspace: &Path) -> R
 
 /// Returns the effective configured exposure for a remote tool name.
 pub fn tool_exposure<'a>(config: &'a ServerConfig, name: &str) -> &'a str {
+    tool_exposure_with_default(config, name, config.exposure.as_deref())
+}
+
+fn tool_exposure_with_default<'a>(
+    config: &'a ServerConfig,
+    name: &str,
+    default: Option<&'a str>,
+) -> &'a str {
     config
         .tool_exposure
         .get(name)
@@ -1942,8 +2063,8 @@ pub fn tool_exposure<'a>(config: &'a ServerConfig, name: &str) -> &'a str {
                 })
                 .map(|(_, value)| value)
         })
-        .or(config.exposure.as_ref())
         .map(String::as_str)
+        .or(default)
         .unwrap_or("codemode")
 }
 fn tool_enabled(config: &ServerConfig, name: &str) -> bool {
@@ -2198,6 +2319,199 @@ pub async fn resolve_value_with_cleanup(value: &str, cleanup: Option<&Children>)
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct ProgressHost(std::sync::Mutex<Vec<Value>>);
+
+    #[async_trait::async_trait]
+    impl pi_rs::ToolHost for ProgressHost {
+        fn tools(&self) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn supports_progress(&self) -> bool {
+            true
+        }
+
+        async fn report_progress(&self, value: Value) -> pi_rs::ExtensionResult<()> {
+            self.0.lock().unwrap().push(value);
+            Ok(())
+        }
+
+        async fn call(&self, _name: &str, _arguments: Value) -> Outcome {
+            panic!("fixture does not call nested tools")
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn matching_tool_progress_renews_idle_timeout_and_reports_updates() {
+        assert_tool_progress("matching").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unmatched_tool_progress_does_not_renew_idle_timeout() {
+        assert_tool_progress("unmatched").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_progress_does_not_prevent_cancellation() {
+        assert_tool_progress("cancelled").await;
+    }
+
+    async fn assert_tool_progress(case: &str) {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (client, server) = tokio::io::duplex(8192);
+        let (server_rx, mut server_tx) = tokio::io::split(server);
+        let cancellation = pi_rs::CancellationToken::new();
+        let cancel_fixture = cancellation.clone();
+        let case = case.to_owned();
+        let fixture_case = case.clone();
+        let fixture = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_rx).lines();
+            let init: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(init["method"], "initialize");
+            let reply = json!({
+                "jsonrpc": "2.0",
+                "id": init["id"],
+                "result": {
+                    "protocolVersion": init["params"]["protocolVersion"],
+                    "capabilities": {"tools":{}},
+                    "serverInfo": {"name":"fixture", "version":"1"}
+                }
+            });
+            server_tx
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            let notification: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(notification["method"], "notifications/initialized");
+            let call: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(call["method"], "tools/call");
+            let token = &call["params"]["_meta"]["progressToken"];
+            assert!(!token.is_null());
+            let token = if fixture_case == "unmatched" {
+                json!("unrelated")
+            } else {
+                token.clone()
+            };
+            for params in [
+                json!({"progressToken":token,"progress":1,"total":3}),
+                json!({"progressToken":token,"progress":2,"message":"working"}),
+            ] {
+                tokio::time::sleep(Duration::from_millis(70)).await;
+                let update =
+                    json!({"jsonrpc":"2.0","method":"notifications/progress","params":params});
+                let _ = server_tx.write_all(format!("{update}\n").as_bytes()).await;
+            }
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            if fixture_case == "cancelled" {
+                cancel_fixture.cancel();
+            } else {
+                let reply = json!({"jsonrpc":"2.0","id":call["id"],"result":{"content":[{"type":"text","text":"done"}]}});
+                let _ = server_tx.write_all(format!("{reply}\n").as_bytes()).await;
+            }
+            // Keep the connection open until the client receives the last message.
+            let _ = lines.next_line().await;
+        });
+        let (client_rx, client_tx) = tokio::io::split(client);
+        let native = NativeClient::default();
+        let dispatch = native.dispatch_closed.clone();
+        let transport = native.progress_transport(AsyncRwTransport::new(client_rx, client_tx));
+        let service = native
+            .serve_with_lifecycle(transport, ClientLifecycleMode::Initialize)
+            .await
+            .unwrap();
+        let tool = McpTool {
+            connection: Arc::new(Connection {
+                identity: RwLock::new(ConnectionIdentity {
+                    digest: "fixture".into(),
+                    oauth_generation: None,
+                }),
+                service: tokio::sync::Mutex::new(service),
+                timeout: Duration::from_millis(120),
+                name: "fixture".into(),
+                config: serde_json::from_value(json!({"command":"fixture"})).unwrap(),
+                workspace: PathBuf::new(),
+                provider_token: None,
+                http_options: None,
+                closed: AtomicBool::new(false),
+                page_outputs: std::sync::Mutex::new(VecDeque::new()),
+            }),
+            remote_name: "work".into(),
+            spec: ToolSpec {
+                name: "work".into(),
+                description: "fixture".into(),
+                parameters: json!({"type":"object"}),
+            },
+            resource: false,
+        };
+        let host = Arc::new(ProgressHost::default());
+        let result = tool
+            .invoke_with_host(
+                json!({}),
+                ToolContext {
+                    operation_id: Uuid::new_v4(),
+                    cancellation,
+                },
+                None,
+                host.clone(),
+            )
+            .await;
+        let updates = host.0.lock().unwrap();
+        if case == "unmatched" {
+            assert!(updates.is_empty());
+            assert!(matches!(result, Outcome::Unknown(error) if error.contains("timed out")));
+            assert!(dispatch.lock().unwrap().closed);
+        } else {
+            assert_eq!(
+                updates.as_slice(),
+                [
+                    json!({"content":[{"type":"text","text":"Progress 1/3"}],"details":{"server":"fixture","tool":"work"}}),
+                    json!({"content":[{"type":"text","text":"working"}],"details":{"server":"fixture","tool":"work"}}),
+                ]
+            );
+            if case == "cancelled" {
+                assert!(matches!(result, Outcome::Unknown(error) if error.contains("cancelled")));
+                assert!(dispatch.lock().unwrap().closed);
+            } else {
+                assert!(
+                    matches!(result, Outcome::Structured { data, .. } if data["content"][0]["text"] == "done")
+                );
+                assert!(!dispatch.lock().unwrap().closed);
+            }
+        }
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn pagination_preserves_items_and_treats_empty_cursors_as_terminal() {
+        let mut calls = 0;
+        let items = all_pages("resources/list", |params| {
+            calls += 1;
+            let page = if calls == 1 {
+                assert!(params.cursor.is_none());
+                (vec!["first"], Some(" through ".into()))
+            } else {
+                assert_eq!(params.cursor.as_deref(), Some(" through "));
+                (vec!["last"], Some(String::new()))
+            };
+            std::future::ready(Ok(page))
+        })
+        .await
+        .unwrap();
+        assert_eq!(items, ["first", "last"]);
+        assert_eq!(calls, 2);
+        assert!(
+            resource_page("fixture", "resources", json!([]), Some(String::new()))
+                .get("nextCursor")
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn mcp_client_lists_only_its_workspace_root() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -2287,6 +2601,47 @@ mod tests {
                 .unwrap(),
             physical.canonicalize().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn pagination_rejects_cycles_and_limits_pages() {
+        let mut calls = 0;
+        let error = all_pages("tools/list", |params| {
+            calls += 1;
+            let next = match params.cursor.as_deref() {
+                None | Some("another") => "opaque-secret",
+                Some("opaque-secret") => "another",
+                value => panic!("unexpected cursor {value:?}"),
+            };
+            std::future::ready(Ok((Vec::<()>::new(), Some(next.into()))))
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(calls, 3);
+        assert!(error.contains("duplicate cursor") && !error.contains("opaque-secret"));
+
+        for terminal_at_limit in [false, true] {
+            let mut calls = 0;
+            let results = all_pages("resources/templates/list", |_| {
+                calls += 1;
+                let next =
+                    (!(terminal_at_limit && calls == MAX_LIST_PAGES)).then(|| calls.to_string());
+                std::future::ready(Ok((vec![calls], next)))
+            })
+            .await;
+            assert_eq!(calls, MAX_LIST_PAGES);
+            if terminal_at_limit {
+                assert_eq!(results.unwrap().len(), MAX_LIST_PAGES);
+            } else {
+                assert!(
+                    results
+                        .unwrap_err()
+                        .to_string()
+                        .contains("exceeded 1000 pages")
+                );
+            }
+        }
     }
 
     #[tokio::test]
