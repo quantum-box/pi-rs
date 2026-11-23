@@ -221,7 +221,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -267,6 +269,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -284,11 +287,18 @@ dependencies = [
 name = "durable-store"
 version = "0.1.0"
 dependencies = [
+ "durable-task-schema",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
  "uuid",
 ]
+
+[[package]]
+name = "durable-task-schema"
+version = "0.1.0"
 
 [[package]]
 name = "email_address"
@@ -498,9 +508,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -539,6 +551,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
 dependencies = [
  "hashbrown 0.14.5",
+]
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
 ]
 
 [[package]]
@@ -1070,8 +1091,17 @@ dependencies = [
  "base64 0.22.1",
  "cap-std",
  "chrono",
+ "fluent-uri",
  "futures-util",
+ "getrandom 0.3.4",
+ "hmac",
+ "http",
+ "js-sys",
  "jsonschema",
+ "libc",
+ "pi-rs-tool-arguments",
+ "regex",
+ "ryu-js",
  "serde",
  "serde_json",
  "sha2",
@@ -1080,6 +1110,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "wasm-bindgen",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1089,12 +1121,14 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "durable-store",
+ "durable-task-schema",
  "futures-util",
  "jsonschema",
  "pi-rs-core",
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "unicode-normalization",
@@ -1117,6 +1151,13 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "pi-rs-tool-arguments"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -1470,6 +1511,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1548,6 +1595,16 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
 
 [[package]]
 name = "slab"
@@ -1684,6 +1741,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
