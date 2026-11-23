@@ -98,9 +98,22 @@ arguments, result and view state. Callbacks return semantic theme roles
 and styled rows for the host to lay out. The call renderer runs before
 the result renderer. Each has its own deadline and fallback. The host also owns
 the tool panel framing and image display. These callbacks do not execute
-tools or change their recorded results. This SDK API is in-process.
-Terminal integration and executable renderer registration are tracked
-separately.
+tools or change their recorded results.
+
+Executable extensions can supply renderers on their own tool definitions
+using `Tool::tool_renderers`. Each advertised tool can include a
+`tools[].renderers` object in `Describe` with `shell` (`default` or `self`),
+`call` and `result` (booleans). The host sends a v1 `render_tool_section`
+request with `section` (`call` or `result`) and a camel-case `context`.
+The successful response envelope contains styled rows or `null` for
+fallback. Keep advertised sections stable across flag configurations
+because the initial capability check runs before configured flags take
+effect. Return `null` when a callback should opt out for a particular call.
+
+Call and result requests run in separate processes, so executable renderers
+should use the supplied context for their inputs. Resolver wrappers for
+other tools use the in-process API. Workbench terminal integration is
+tracked separately.
 
 ## Share SDK extension events
 
