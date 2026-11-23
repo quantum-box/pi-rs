@@ -2835,7 +2835,8 @@ WebSocket, cached WebSocket, and automatic selection in Pi's order. It updates
 the next request in a running Codex session, including sessions that
 resolve their credentials at request time, and retains the normal settings precedence. Native providers without multiple transports retain their existing
 connection behavior. HTTP idle timeout edits apply to subsequent provider
-requests in the running session without interrupting an active turn. The
+requests in the running session, including Codemode classifier and image calls,
+without interrupting an active turn. The
 changelog and installation telemetry controls are still open. The Warnings submenu includes the default-on
 Anthropic extra-usage warning. The terminal shows it once when the active model
 uses Anthropic subscription OAuth or a configured subscription token on the

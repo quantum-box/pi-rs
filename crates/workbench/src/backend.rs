@@ -1058,7 +1058,7 @@ async fn run_worker(
                     .settings
                     .apply_worker_settings(&settings, &["httpIdleTimeoutMs"]);
                 if updated.settings.http_idle_timeout() != args.settings.http_idle_timeout() {
-                    runtime.configure_model_options(&updated, model_reports_thinking)?;
+                    runtime.update_http_idle_timeout(&updated, model_reports_thinking)?;
                 }
                 args.settings = updated.settings;
                 Ok::<(), Error>(())

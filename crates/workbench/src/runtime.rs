@@ -14,6 +14,7 @@ pub struct Runtime {
     pub auto_compaction: pi_rs::AutoCompactionControl,
     pub retry: pi_rs::RetryControl,
     pub(super) provider: super::image_policy::WorkbenchModel,
+    operation_models: Option<super::operation_models::Operations>,
     pub registry: Registry,
     pub extension_sources: std::collections::BTreeMap<String, std::path::PathBuf>,
     shell: ShellConfig,
@@ -841,6 +842,15 @@ impl Runtime {
         self.provider.client.update_codex_transport(settings);
     }
 
+    pub fn update_http_idle_timeout(&mut self, args: &Cli, reported: bool) -> Result<()> {
+        let provider = model_client(args, reported, true)?;
+        if let Some(operations) = &self.operation_models {
+            operations.update_http_client(args)?;
+        }
+        self.provider = provider;
+        Ok(())
+    }
+
     pub fn configure_model_options(&mut self, args: &Cli, reported: bool) -> Result<()> {
         self.provider = model_client(args, reported, true)?;
         self.refresh_read_image_policy(args);
@@ -1539,10 +1549,10 @@ async fn configure_after(
                 Vec::new(),
             )));
         }
-        if enabled("builtin:codemode")? {
+        let operation_models = if enabled("builtin:codemode")? {
             let mut operations = super::operation_models::Operations::new(args)?;
             operations.discover_llama().await;
-            extensions.push(Arc::new(operations));
+            extensions.push(Arc::new(operations.clone()));
             extensions.push(Arc::new(pi_rs_extensions::codemode::Codemode {
                 only: only_code,
                 inline_budget: args.settings.value()["codemode"]["inlineBudget"]
@@ -1551,7 +1561,10 @@ async fn configure_after(
                     .min(100_000) as usize,
                 timeout: Duration::MAX,
             }));
-        }
+            Some(operations)
+        } else {
+            None
+        };
         if let Some(project) = &args.project
             && !args.no_context_files
         {
@@ -1718,6 +1731,7 @@ async fn configure_after(
                     .unwrap_or_else(|| args.settings.auto_compaction_enabled()),
             ),
             provider,
+            operation_models,
             read_image_model,
             registry,
             extension_sources,

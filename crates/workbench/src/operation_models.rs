@@ -1,6 +1,6 @@
 //! Configured classifier and image models used by the native codemode host.
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use pi_rs::{Error, Extension, Outcome, Result, Tool, ToolContext, ToolExecution, ToolSpec};
@@ -1024,11 +1024,35 @@ impl Entry {
 #[derive(Clone)]
 pub(super) struct Operations {
     args: Cli,
-    client: reqwest::Client,
+    client: Arc<RwLock<reqwest::Client>>,
 }
 
 impl Operations {
     pub fn new(args: &Cli) -> Result<Self> {
+        Ok(Self::with_client(args.clone(), Self::http_client(args)?))
+    }
+
+    fn with_client(args: Cli, client: reqwest::Client) -> Self {
+        Self {
+            args,
+            client: Arc::new(RwLock::new(client)),
+        }
+    }
+
+    pub(super) fn update_http_client(&self, args: &Cli) -> Result<()> {
+        let client = Self::http_client(args)?;
+        *self.client.write().expect("model operation HTTP client") = client;
+        Ok(())
+    }
+
+    fn current_client(&self) -> reqwest::Client {
+        self.client
+            .read()
+            .expect("model operation HTTP client")
+            .clone()
+    }
+
+    fn http_client(args: &Cli) -> Result<reqwest::Client> {
         let mut builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -1039,12 +1063,9 @@ impl Operations {
         if let Some(timeout) = args.settings.http_idle_timeout() {
             builder = builder.read_timeout(timeout);
         }
-        Ok(Self {
-            args: args.clone(),
-            client: builder.build().map_err(|_| {
-                Error::Config("could not initialize model operation HTTP client".into())
-            })?,
-        })
+        builder
+            .build()
+            .map_err(|_| Error::Config("could not initialize model operation HTTP client".into()))
     }
 
     pub async fn discover_llama(&mut self) {
@@ -1066,8 +1087,9 @@ impl Operations {
             None => None,
         };
         let cache = super::config::agent_dir().join("llama-classifier-models.json");
-        let client = (!self.args.offline).then_some(&self.client);
-        let discovered = llama_discovery::catalogue(client, &root, key.as_deref(), cache).await;
+        let client = (!self.args.offline).then(|| self.current_client());
+        let discovered =
+            llama_discovery::catalogue(client.as_ref(), &root, key.as_deref(), cache).await;
         let configured = &mut self.args.model_profiles.operations_mut().0;
         for entry in discovered {
             if !configured.iter().any(|model| {
@@ -1352,12 +1374,12 @@ impl Operations {
         let resolved = entry.resolved_cloudflare(keys)?;
         let entry = &resolved;
         initialize_result(entry, data);
+        let client = self.current_client();
         let (payload, image_opt_in) = match entry.api {
             Api::LlamaCppClassifier => {
                 let questions = llama_cpp::prepare(context)?;
                 let (_, headers) = self.request_target(entry, keys).await?;
-                data["answers"] =
-                    llama_cpp::classify(&self.client, entry, &headers, questions).await?;
+                data["answers"] = llama_cpp::classify(&client, entry, &headers, questions).await?;
                 return Ok(());
             }
             Api::SystemOne | Api::WorkersAiSystemOne => classifier_payload(entry, context)?,
@@ -1373,7 +1395,7 @@ impl Operations {
                 HeaderValue::from_static("true"),
             );
         }
-        let body = send_model_json(&self.client, endpoint, &headers, &payload, entry.api).await?;
+        let body = send_model_json(&client, endpoint, &headers, &payload, entry.api).await?;
         let result_body = if matches!(entry.api, Api::WorkersAiSystemOne) {
             classifier_response(&body)?
         } else {
@@ -1471,6 +1493,63 @@ async fn send_model_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn http_idle_timeout_is_updated_for_registered_model_operations() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let settings = root.path().join("settings.json");
+        let load = |timeout| {
+            std::fs::write(&settings, json!({"httpIdleTimeoutMs":timeout}).to_string()).unwrap();
+            super::super::config::Settings::load_from_paths(root.path(), false, &settings).unwrap()
+        };
+        let mut args = Cli::parse_from(["pi"]);
+        args.settings = load(0);
+        let operations = Operations::new(&args).unwrap();
+        let registered = operations.clone();
+        let previous_client = registered.current_client();
+        args.settings = load(100);
+        operations.update_http_client(&args).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let _ = socket.read(&mut [0; 1024]).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        assert!(
+            registered
+                .current_client()
+                .get(&endpoint)
+                .send()
+                .await
+                .unwrap_err()
+                .is_timeout()
+        );
+        assert_eq!(
+            previous_client
+                .get(&endpoint)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        server.await.unwrap();
+    }
 
     #[test]
     fn explicit_llama_classifiers_inherit_keys_only_for_the_matching_router() {
@@ -1585,10 +1664,8 @@ mod tests {
         let mut args = Cli::parse_from(["pi"]);
         args.model_profiles =
             super::super::model_profiles::Profiles::parse(&json!({"providers":{}})).unwrap();
-        let operation = Operations {
-            args,
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-        };
+        let operation =
+            Operations::with_client(args, reqwest::Client::builder().no_proxy().build().unwrap());
         let context = || ToolContext {
             operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
             cancellation: Default::default(),
@@ -2006,10 +2083,10 @@ mod tests {
                 .len(),
             1
         );
-        let operation = Operations {
-            args: Cli::parse_from(["pi"]),
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-        };
+        let operation = Operations::with_client(
+            Cli::parse_from(["pi"]),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        );
         let context = json!({"state":{"text":"fixture"},"questions":{"ok":{"type":"bool","instructions":"classify","criteria":{"true":"yes","false":"no"}}}});
         let mut result = json!({});
         tokio::time::timeout(
@@ -2327,10 +2404,10 @@ mod tests {
             )
             .await;
         assert_eq!(available.len(), 1);
-        let operation = Operations {
-            args: Cli::parse_from(["pi"]),
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-        };
+        let operation = Operations::with_client(
+            Cli::parse_from(["pi"]),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        );
         let context = json!({"state":{}, "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}}});
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -2380,10 +2457,7 @@ mod tests {
         let mut args = Cli::parse_from(["pi"]);
         args.model_profiles =
             super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
-        let operation = Operations {
-            args,
-            client: reqwest::Client::new(),
-        };
+        let operation = Operations::with_client(args, reqwest::Client::new());
         let context = || ToolContext {
             operation_id: uuid::Uuid::new_v4(),
             cancellation: Default::default(),
@@ -2437,10 +2511,8 @@ mod tests {
         ]}}});
         let mut args = Cli::parse_from(["pi"]);
         args.model_profiles = super::super::model_profiles::Profiles::parse(&config).unwrap();
-        let operation = Operations {
-            args,
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-        };
+        let operation =
+            Operations::with_client(args, reqwest::Client::builder().no_proxy().build().unwrap());
         let fixture = operation
             .chat_models(Some("relay"), Some("fixture"), false)
             .pop()
@@ -2529,10 +2601,10 @@ mod tests {
             .iter()
             .find(|entry| entry.provider == "relay" && entry.model.id == "fixture")
             .unwrap();
-        let operation = Operations {
-            args: Cli::parse_from(["pi"]),
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-        };
+        let operation = Operations::with_client(
+            Cli::parse_from(["pi"]),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        );
         let mut data = json!({"stopReason":"stop", "output":[]});
         let context = json!({"input":[{"type":"text","text":"draw"}]});
         tokio::time::timeout(
@@ -2644,10 +2716,10 @@ mod tests {
                     .unwrap();
             let mut args = Cli::parse_from(["pi"]);
             args.model_profiles = profiles;
-            let operation = Operations {
+            let operation = Operations::with_client(
                 args,
-                client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            };
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            );
             let outcome = tokio::time::timeout(
                 Duration::from_secs(10),
                 operation.invoke(json!({"action":"generateImages", "provider":"relay", "id":"fixture", "context":{"input":[{"type":"text","text":"draw"}]}}), ToolContext {
@@ -2674,10 +2746,8 @@ mod tests {
         let mut args = Cli::parse_from(["pi"]);
         args.model_profiles =
             super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
-        let operation = Operations {
-            args,
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-        };
+        let operation =
+            Operations::with_client(args, reqwest::Client::builder().no_proxy().build().unwrap());
         let cancellation = pi_rs::CancellationToken::new();
         cancellation.cancel();
         let outcome = operation.invoke(json!({"action":"generateImages", "provider":"relay", "id":"fixture", "context":{"input":[{"type":"text","text":"draw"}]}}), ToolContext {
@@ -2706,10 +2776,10 @@ mod tests {
             .iter()
             .find(|entry| entry.provider == "relay")
             .unwrap();
-        let operation = Operations {
-            args: Cli::parse_from(["pi"]),
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-        };
+        let operation = Operations::with_client(
+            Cli::parse_from(["pi"]),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        );
         let mut data = json!({"stopReason":"stop", "output":[]});
         assert!(
             operation
@@ -2736,10 +2806,8 @@ mod tests {
         let mut args = Cli::parse_from(["pi"]);
         args.model_profiles =
             super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
-        let operation = Operations {
-            args,
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-        };
+        let operation =
+            Operations::with_client(args, reqwest::Client::builder().no_proxy().build().unwrap());
         let entry = operation
             .args
             .model_profiles
@@ -2908,10 +2976,10 @@ mod tests {
             );
             let context = json!({"state":{"text":"test"}, "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}},
                 "images":[{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}]});
-            let operation = Operations {
-                args: Cli::parse_from(["pi"]),
-                client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            };
+            let operation = Operations::with_client(
+                Cli::parse_from(["pi"]),
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            );
             let mut data = json!({});
             let result = tokio::time::timeout(
                 Duration::from_secs(10),
@@ -3051,10 +3119,10 @@ mod tests {
                 &json!({"cloudflare-workers-ai":{"type":"api_key", "key":"destination-key", "endpoint":entry.endpoint.as_str()}}),
             );
             let context = json!({"state":{"text":"test"}, "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}}});
-            let operation = Operations {
-                args: Cli::parse_from(["pi"]),
-                client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            };
+            let operation = Operations::with_client(
+                Cli::parse_from(["pi"]),
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            );
             tokio::time::timeout(
                 Duration::from_secs(10),
                 operation.perform(entry, &context, &keys, &mut json!({})),
@@ -3157,10 +3225,10 @@ mod tests {
                 {"type":kind,"id":"alternate","api":api,"baseUrl":alternate_base,"input":["text"],"headers":{"X-Model-Secret":"model-value","X-Shared":"model-value"}}
             ]}});
             let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
-            let operation = Operations {
-                args: Cli::parse_from(["pi"]),
-                client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            };
+            let operation = Operations::with_client(
+                Cli::parse_from(["pi"]),
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            );
             for id in ["primary", "alternate"] {
                 let entry = catalogue
                     .0
@@ -3973,10 +4041,10 @@ mod tests {
                 .unwrap();
             let context = json!({"state":{"text":"test"}, "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}},
                 "images":if with_image { json!([{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}]) } else { json!([]) }});
-            let operation = Operations {
-                args: Cli::parse_from(["pi"]),
-                client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            };
+            let operation = Operations::with_client(
+                Cli::parse_from(["pi"]),
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            );
             let mut data = json!({});
             tokio::time::timeout(
                 Duration::from_secs(10),
