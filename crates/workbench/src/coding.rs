@@ -743,6 +743,10 @@ impl Tool for LiveReadTool {
         self.tool.output_limit()
     }
 
+    fn pi_argument_diagnostics(&self) -> bool {
+        self.tool.pi_argument_diagnostics()
+    }
+
     async fn prepare_arguments(&self, arguments: Value) -> pi_rs::ExtensionResult<Value> {
         self.tool.prepare_arguments(arguments).await
     }

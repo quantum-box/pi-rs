@@ -26,6 +26,18 @@ enum TurnNormalized {
 const MAX_PI_ARGUMENT_ISSUES: usize = 32;
 const MAX_PI_ARGUMENT_PREVIEW_BYTES: usize = 64 * 1024;
 
+fn bounded_pi_parse_error(mut error: String, raw: &str) -> String {
+    if raw.len() > MAX_PI_ARGUMENT_PREVIEW_BYTES && error.ends_with(raw) {
+        let mut end = MAX_PI_ARGUMENT_PREVIEW_BYTES;
+        while !raw.is_char_boundary(end) {
+            end -= 1;
+        }
+        error.truncate(error.len() - raw.len() + end);
+        error.push_str("\n[Received arguments truncated]");
+    }
+    error
+}
+
 fn pi_argument_diagnostic(
     name: &str,
     validator: &jsonschema::Validator,
@@ -1890,6 +1902,20 @@ impl Agent<'_> {
         let args = match turn_model_arguments(invocation, validated.as_ref()) {
             Ok(arguments) => arguments,
             Err(error) => {
+                if tool.tool.pi_argument_diagnostics() {
+                    let parse_error = if validated.is_some() {
+                        crate::parse_tool_arguments(&call.arguments).err()
+                    } else {
+                        Some(error.clone())
+                    };
+                    if let Some(parse_error) = parse_error {
+                        let parse_error = bounded_pi_parse_error(parse_error, &call.arguments);
+                        return Ok(TurnNormalized::ArgumentRejected(format!(
+                            "Invalid arguments for tool \"{}\": {parse_error}",
+                            call.name
+                        )));
+                    }
+                }
                 return Ok(TurnNormalized::Skipped(format!(
                     "Invalid arguments for tool \"{}\": {error}",
                     call.name
