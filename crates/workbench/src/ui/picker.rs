@@ -1210,6 +1210,26 @@ impl Picker {
         line
     }
 
+    fn tree_input_prefix(&self) -> Option<String> {
+        let tree = self.tree.as_ref()?;
+        match &self.session_action {
+            Some(SessionAction::Label(id, _)) => Some(format!("Label record {id} · ")),
+            None => Some(format!("{} · {} · ", self.title, tree.filter.name())),
+            _ => None,
+        }
+    }
+
+    pub fn tree_input_cursor(&self, width: usize, height: usize) -> Option<(usize, usize)> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let prefix = self.tree_input_prefix()?;
+        // Tree search and labels edit at the end of the input.
+        let column =
+            (prefix.width() + super::render::clean(&self.query.text).width()).min(width - 1);
+        Some((0, column))
+    }
+
     pub fn render(&self, theme: &Theme, width: usize, height: usize, keys: &Keys) -> Vec<Line> {
         self.render_in_terminal(theme, width, height, height, keys)
     }
@@ -1250,12 +1270,10 @@ impl Picker {
                 Line::themed(&hint, theme, "dim"),
             ];
         }
-        let filter = self
-            .tree
-            .as_ref()
-            .map_or_else(String::new, |tree| format!(" · {}", tree.filter.name()));
         let settings = matches!(self.title.as_str(), "Settings" | "Warnings");
-        let prefix = format!("{}{filter} · ", self.title);
+        let prefix = self
+            .tree_input_prefix()
+            .unwrap_or_else(|| format!("{} · ", self.title));
         let mut lines = vec![match self.title.as_str() {
             "Settings" => self.settings_heading(&prefix, theme, width),
             "Warnings" => Line::themed(&self.title, theme, "accent"),
@@ -2820,6 +2838,46 @@ mod tests {
                 .all(|span| { span.text.chars().all(|character| !character.is_control()) })
         );
     }
+    #[test]
+    fn tree_cursor_tracks_search_and_label_input_in_terminal_columns() {
+        let mut picker = Picker::tree(
+            vec![Item {
+                label: "猫 thread".into(),
+                selection: Selection::Checkout(1),
+            }],
+            [(1, (None, TreeEntryKind::User))].into(),
+            Default::default(),
+            1,
+            TreeFilter::Default,
+        );
+        let keys = Keys::default();
+        picker.input(
+            KeyEvent::new(KeyCode::Char('猫'), KeyModifiers::NONE),
+            &keys,
+        );
+        assert_eq!(
+            picker.tree_input_cursor(80, 12),
+            Some((0, "Session tree · default · 猫".width()))
+        );
+        assert_eq!(picker.tree_input_cursor(12, 12), Some((0, 11)));
+        assert_eq!(picker.tree_input_cursor(80, 0), None);
+
+        picker.input(
+            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
+            &keys,
+        );
+        picker.paste("界");
+        assert_eq!(
+            picker.tree_input_cursor(80, 12),
+            Some((0, "Label record 1 · 界".width()))
+        );
+        picker.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &keys);
+        assert_eq!(
+            picker.tree_input_cursor(80, 12),
+            Some((0, "Session tree · default · 猫".width()))
+        );
+    }
+
     #[test]
     fn tree_folding_search_navigation_and_labels_preserve_record_identity() {
         let entries = [

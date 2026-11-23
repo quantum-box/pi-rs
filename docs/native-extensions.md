@@ -74,6 +74,12 @@ host-defined deadline, and apply their own palette. RPC and HTML exports
 retain the original custom-message content. This API uses native styled
 rows. Pi extensions can return arbitrary interactive TypeScript components.
 
+For UI-only custom entries, use `custom_entry_renderer_types` and
+`render_custom_entry`. Entry data remains outside model context. An entry
+with no renderer, or whose first render returns no content, stays out of
+the terminal transcript. Renderer failures show an error row. SDK hosts
+can render journal entries through `AgentSession::custom_entry_renderers`.
+
 Executable hosts advertising `command_failure_classification_v1` accept the
 `command_effects_classified_v1` request. Its successful protocol envelope
 contains a typed `Ok` effects value or an `Err` containing `Callback` or
@@ -98,9 +104,22 @@ arguments, result and view state. Callbacks return semantic theme roles
 and styled rows for the host to lay out. The call renderer runs before
 the result renderer. Each has its own deadline and fallback. The host also owns
 the tool panel framing and image display. These callbacks do not execute
-tools or change their recorded results. This SDK API is in-process.
-Terminal integration and executable renderer registration are tracked
-separately.
+tools or change their recorded results.
+
+Executable extensions can supply renderers on their own tool definitions
+using `Tool::tool_renderers`. Each advertised tool can include a
+`tools[].renderers` object in `Describe` with `shell` (`default` or `self`),
+`call` and `result` (booleans). The host sends a v1 `render_tool_section`
+request with `section` (`call` or `result`) and a camel-case `context`.
+The successful response envelope contains styled rows or `null` for
+fallback. Keep advertised sections stable across flag configurations
+because the initial capability check runs before configured flags take
+effect. Return `null` when a callback should opt out for a particular call.
+
+Call and result requests run in separate processes, so executable renderers
+should use the supplied context for their inputs. Resolver wrappers for
+other tools use the in-process API. Workbench terminal integration is
+tracked separately.
 
 ## Customize the header and footer
 
