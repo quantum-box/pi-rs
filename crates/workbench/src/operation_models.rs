@@ -12,6 +12,9 @@ use serde_json::{Map, Value, json};
 use super::{
     Cli,
     model_auth::{Credential, Keys},
+    pi_messages::{PiMessages, RadiusCatalogCache},
+    providers::{Client, Provider},
+    radius_catalog,
 };
 
 mod decisions;
@@ -366,13 +369,27 @@ struct Compat {
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
-struct Cost {
+pub(super) struct Cost {
     input: f64,
     output: f64,
     cache_read: f64,
     cache_write: f64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tiers: Vec<CostTier>,
+}
+
+impl Cost {
+    pub(super) fn valid(&self) -> bool {
+        let valid_rates = |rates: [f64; 4]| {
+            rates
+                .iter()
+                .all(|rate| rate.is_finite() && (0.0..=1_000_000.0).contains(rate))
+        };
+        valid_rates([self.input, self.output, self.cache_read, self.cache_write])
+            && self.tiers.iter().all(|tier| {
+                valid_rates([tier.input, tier.output, tier.cache_read, tier.cache_write])
+            })
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -542,20 +559,7 @@ impl Catalogue {
                         configured.id
                     )));
                 }
-                if [
-                    configured.cost.input,
-                    configured.cost.output,
-                    configured.cost.cache_read,
-                    configured.cost.cache_write,
-                ]
-                .iter()
-                .any(|cost| !cost.is_finite() || *cost < 0.0 || *cost > 1_000_000.0)
-                    || configured.cost.tiers.iter().any(|tier| {
-                        [tier.input, tier.output, tier.cache_read, tier.cache_write]
-                            .iter()
-                            .any(|cost| !cost.is_finite() || *cost < 0.0 || *cost > 1_000_000.0)
-                    })
-                {
+                if !configured.cost.valid() {
                     return Err(Error::Config(format!(
                         "invalid operation model cost for {name}/{}",
                         configured.id
@@ -1036,6 +1040,7 @@ pub(super) struct Operations {
 struct HttpOptions {
     client: reqwest::Client,
     settings: super::config::Settings,
+    radius: RadiusCatalogCache,
 }
 
 impl Operations {
@@ -1047,15 +1052,22 @@ impl Operations {
         let settings = args.settings.clone();
         Self {
             args,
-            http: Arc::new(RwLock::new(HttpOptions { client, settings })),
+            http: Arc::new(RwLock::new(HttpOptions {
+                client,
+                settings,
+                radius: RadiusCatalogCache::default(),
+            })),
         }
     }
 
     pub(super) fn update_http_client(&self, args: &Cli) -> Result<()> {
         let client = Self::http_client(args)?;
         let settings = args.settings.clone();
-        *self.http.write().expect("model operation HTTP options") =
-            HttpOptions { client, settings };
+        *self.http.write().expect("model operation HTTP options") = HttpOptions {
+            client,
+            settings,
+            radius: RadiusCatalogCache::default(),
+        };
         Ok(())
     }
 
@@ -1064,6 +1076,80 @@ impl Operations {
             .read()
             .expect("model operation HTTP options")
             .clone()
+    }
+
+    async fn radius_client(&self, cached_only: bool) -> Result<Option<PiMessages>> {
+        let http = self.current_http();
+        let mut args = self.args.clone();
+        args.settings = http.settings;
+        args.model_keys = Keys::load_async().await?;
+        if cached_only {
+            let gateway = super::radius_auth::Gateway::configured_with_settings(&args.settings)?;
+            let endpoint = args.model_endpoint_for(&Provider::Radius, None);
+            if endpoint != gateway.model_endpoint().as_str() {
+                return Ok(None);
+            }
+            // Cache access needs the account identity. Header commands are
+            // irrelevant, and an unresolved credential command has no identity.
+            let token = match args.model_credential_for(&Provider::Radius, endpoint) {
+                Some(credential) => match credential.literal() {
+                    Some(token) => Some(token.to_owned()),
+                    None => return Ok(None),
+                },
+                None => None,
+            };
+            let client = PiMessages::radius(endpoint, token, gateway)?
+                .with_context_probe(false)
+                .with_radius_catalog_cache(http.radius);
+            return Ok(Some(client));
+        }
+        let client = args
+            .connect_provider(&Provider::Radius, None)?
+            .with_context_probes(!args.offline);
+        Ok(match client.resolve_affinity_headers().await?.0 {
+            Client::PiMessages(client) => Some(client.with_radius_catalog_cache(http.radius)),
+            _ => None,
+        })
+    }
+
+    async fn radius_classifiers(
+        &self,
+        cancel: &pi_rs::CancellationToken,
+        available_only: bool,
+    ) -> Result<Vec<Entry>> {
+        let discover = async {
+            let Ok(Some(radius)) = self
+                .radius_client(self.args.offline || !available_only)
+                .await
+            else {
+                return Vec::new();
+            };
+            let Ok(Some(catalog)) = radius.catalog().await else {
+                return Vec::new();
+            };
+            radius_entries(&catalog)
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Error::Cancelled),
+            entries = discover => Ok(entries),
+        }
+    }
+
+    async fn radius_classifier(
+        &self,
+        model_id: Option<&str>,
+    ) -> Result<Option<(Entry, String, HeaderMap)>> {
+        let Some(radius) = self.radius_client(false).await? else {
+            return Ok(None);
+        };
+        let Some((catalog, token)) = radius.classifier_catalog_with_token().await? else {
+            return Ok(None);
+        };
+        Ok(radius_entries(&catalog)
+            .into_iter()
+            .find(|entry| Some(entry.model.id.as_str()) == model_id)
+            .map(|entry| (entry, token, radius.context_headers())))
     }
 
     fn http_client(args: &Cli) -> Result<reqwest::Client> {
@@ -1117,6 +1203,40 @@ impl Operations {
     }
 }
 
+fn radius_entries(catalog: &radius_catalog::Catalog) -> Vec<Entry> {
+    let mut base = catalog.base.clone();
+    let path = base.path().trim_end_matches('/');
+    let path = path.strip_suffix("/messages").unwrap_or(path);
+    base.set_path(&format!("{path}/"));
+    let endpoint = base.join("classify").expect("validated Radius base URL");
+    catalog
+        .classifiers
+        .iter()
+        .map(|model| Entry {
+            provider: "radius".into(),
+            model: Configured {
+                id: model.id.clone(),
+                name: Some(model.name.clone()),
+                api: Some(Api::PiClassifier),
+                base_url: None,
+                input: Some(model.input.clone()),
+                output: None,
+                input_limits: None,
+                context_window: Some(model.context_window),
+                cost: model.cost.clone(),
+                headers: BTreeMap::new(),
+                compat: Compat::default(),
+            },
+            api: Api::PiClassifier,
+            base: base.clone(),
+            endpoint: endpoint.clone(),
+            api_key: None,
+            cloudflare_default: false,
+            llama_root: None,
+        })
+        .collect()
+}
+
 impl Extension for Operations {
     fn id(&self) -> &str {
         "native-model-operations"
@@ -1158,6 +1278,16 @@ impl Tool for Operations {
                     && Some(model.provider.as_str()) == provider
                     && Some(model.model.id.as_str()) == args["id"].as_str()
             });
+            let found = if !found && kind == Some(Kind::Classifier) && provider == Some("radius") {
+                match self.radius_classifiers(&context.cancellation, true).await {
+                    Ok(entries) => entries
+                        .iter()
+                        .any(|entry| Some(entry.model.id.as_str()) == args["id"].as_str()),
+                    Err(error) => return Outcome::Failed(error.to_string()),
+                }
+            } else {
+                found
+            };
             return if found {
                 Outcome::Structured {
                     data: json!(true),
@@ -1229,15 +1359,31 @@ impl Tool for Operations {
             let entries = if kind == Kind::Chat {
                 self.chat_models(provider, args["id"].as_str(), args["available"] == true)
             } else {
-                catalogue
-                    .list(
-                        kind,
-                        provider,
-                        args["id"].as_str(),
-                        args["available"] == true,
-                        &keys,
-                    )
-                    .await
+                let id = args["id"].as_str();
+                let mut entries = catalogue
+                    .list(kind, provider, id, args["available"] == true, &keys)
+                    .await;
+                if kind == Kind::Classifier && provider.is_none_or(|provider| provider == "radius")
+                {
+                    let discovered = match self
+                        .radius_classifiers(&context.cancellation, args["available"] == true)
+                        .await
+                    {
+                        Ok(entries) => entries,
+                        Err(error) => return Outcome::Failed(error.to_string()),
+                    };
+                    for entry in discovered.into_iter().filter(|entry| {
+                        id.is_none_or(|id| entry.model.id == id)
+                            && !catalogue.0.iter().any(|model| {
+                                model.provider == "radius"
+                                    && model.api.kind() == Kind::Classifier
+                                    && model.model.id == entry.model.id
+                            })
+                    }) {
+                        entries.push(entry.descriptor());
+                    }
+                }
+                entries
             };
             return Outcome::Structured {
                 data: json!(entries),
@@ -1249,11 +1395,26 @@ impl Tool for Operations {
         } else {
             Kind::Image
         };
-        let Some(model) = catalogue.0.iter().find(|model| {
+        let configured = catalogue.0.iter().find(|model| {
             model.api.kind() == kind
                 && Some(model.provider.as_str()) == provider
                 && Some(model.model.id.as_str()) == args["id"].as_str()
-        }) else {
+        });
+        let radius =
+            if configured.is_none() && kind == Kind::Classifier && provider == Some("radius") {
+                let binding = tokio::select! {
+                    biased;
+                    _ = context.cancellation.cancelled() => Err(Error::Cancelled),
+                    result = self.radius_classifier(args["id"].as_str()) => result,
+                };
+                match binding {
+                    Ok(binding) => binding,
+                    Err(error) => return Outcome::Failed(error.to_string()),
+                }
+            } else {
+                None
+            };
+        let Some(model) = configured.or(radius.as_ref().map(|(model, _, _)| model)) else {
             return Outcome::Failed("unknown model for this operation".into());
         };
         let mut data = json!({
@@ -1284,7 +1445,15 @@ impl Tool for Operations {
         let result = if has_images && self.args.settings.block_model_images() {
             Err(Error::Config(super::image_policy::BLOCKED_IMAGE.into()))
         } else {
-            let operation = self.perform(model, &args["context"], &keys, &mut data);
+            let operation = self.perform_authenticated(
+                model,
+                &args["context"],
+                &keys,
+                radius
+                    .as_ref()
+                    .map(|(_, token, headers)| (token.as_str(), headers)),
+                &mut data,
+            );
             tokio::select! {
                 biased;
                 _ = context.cancellation.cancelled() => Err(Error::Cancelled),
@@ -1378,6 +1547,7 @@ impl Operations {
         entries
     }
 
+    #[cfg(test)]
     async fn perform(
         &self,
         entry: &Entry,
@@ -1385,10 +1555,24 @@ impl Operations {
         keys: &Keys,
         data: &mut Value,
     ) -> Result<()> {
+        self.perform_authenticated(entry, context, keys, None, data)
+            .await
+    }
+
+    async fn perform_authenticated(
+        &self,
+        entry: &Entry,
+        context: &Value,
+        keys: &Keys,
+        radius_auth: Option<(&str, &HeaderMap)>,
+        data: &mut Value,
+    ) -> Result<()> {
         let resolved = entry.resolved_cloudflare(keys)?;
         let entry = &resolved;
         initialize_result(entry, data);
-        let HttpOptions { client, settings } = self.current_http();
+        let HttpOptions {
+            client, settings, ..
+        } = self.current_http();
         let (payload, image_opt_in) = match entry.api {
             Api::LlamaCppClassifier => {
                 let questions = llama_cpp::prepare(context)?;
@@ -1401,7 +1585,16 @@ impl Operations {
             Api::PiClassifier => (pi_classifier::payload(entry, context)?, false),
             Api::OpenRouterImages => (image_payload(entry, context)?, false),
         };
-        let (endpoint, mut headers) = self.request_target(entry, keys, &settings).await?;
+        let (endpoint, mut headers) = if let Some((token, configured)) = radius_auth {
+            let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| Error::Config("invalid Radius classifier credential".into()))?;
+            authorization.set_sensitive(true);
+            let mut headers = configured.clone();
+            headers.insert(reqwest::header::AUTHORIZATION, authorization);
+            (entry.endpoint.clone(), headers)
+        } else {
+            self.request_target(entry, keys, &settings).await?
+        };
         // Pi adds the automatic classifier image opt-in as request options,
         // after provider and model headers have been combined.
         if image_opt_in {
@@ -1724,6 +1917,192 @@ mod tests {
             operation.invoke(args, context()).await,
             Outcome::Failed(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn radius_catalog_discovers_and_invokes_account_classifiers() {
+        use clap::Parser;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        const CHILD: &str = "PI_RS_RADIUS_CLASSIFIER_FIXTURE_MODE";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let mut args = Cli::parse_from(["pi"]);
+            args.model_profiles =
+                super::super::model_profiles::Profiles::load(&Keys::default()).unwrap();
+            args.offline = mode == "offline";
+            let operation = Operations::new(&args).unwrap();
+            let context = || ToolContext {
+                operation_id: uuid::Uuid::nil(),
+                cancellation: Default::default(),
+            };
+            if !args.offline {
+                let list = json!({"action":"list","type":"classifier","provider":"radius"});
+                let Outcome::Structured { data, .. } = operation.invoke(list, context()).await
+                else {
+                    panic!("unfiltered Radius catalogue lookup failed");
+                };
+                assert_eq!(data, json!([]));
+            }
+            let list = json!({"action":"list","type":"classifier","provider":"radius","available":!args.offline});
+            let cancelled = context();
+            cancelled.cancellation.cancel();
+            assert!(matches!(
+                operation.invoke(list.clone(), cancelled).await,
+                Outcome::Failed(error) if error == Error::Cancelled.to_string()
+            ));
+            let Outcome::Structured { data, .. } = operation.invoke(list, context()).await else {
+                panic!("Radius classifier discovery failed");
+            };
+            assert_eq!(data.as_array().unwrap().len(), 1, "{data}");
+            assert_eq!(data[0]["api"], "pi-classifier");
+            assert_eq!(data[0]["contextWindow"], 8192);
+            if !args.offline {
+                assert_eq!(data[0]["id"], "radius-judge");
+                let operation = Operations::new(&args).unwrap();
+                let Outcome::Structured { data, .. } = operation.invoke(
+                    json!({"action":"list","type":"classifier","provider":"radius","available":true}), context()
+                ).await else {
+                    panic!("cached account catalog should cover transient failure");
+                };
+                assert_eq!(data[0]["id"], "radius-judge");
+                let classify = json!({"action":"classify","provider":"radius","id":"radius-judge",
+                    "context":{"state":{"fixture":true},"questions":{
+                        "q":{"type":"bool","instructions":"match?","criteria":{"true":"yes","false":"no"}}
+                    }}
+                });
+                let Outcome::Structured { data, .. } = operation.invoke(classify, context()).await
+                else {
+                    panic!("Radius classifier invocation failed");
+                };
+                assert_eq!(data["answers"]["q"]["probability"], 0.8, "{data}");
+                assert_eq!(data["stopReason"], "stop", "{data}");
+                let gateway = super::super::radius_auth::Gateway::configured().unwrap();
+                std::fs::write(
+                    super::super::config::agent_dir().join("auth.json"),
+                    json!({
+                        "radius":{"type":"api_key","key":"rotated-fixture-key",
+                        "endpoint":gateway.model_endpoint().as_str()}
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                let Outcome::Structured { data, .. } = operation
+                    .invoke(
+                        json!({"action":"list","type":"classifier","provider":"radius","available":true}),
+                        context(),
+                    )
+                    .await
+                else {
+                    panic!("rotated Radius catalogue discovery failed");
+                };
+                assert_eq!(data[0]["id"], "rotated-judge", "{data}");
+            } else {
+                assert_eq!(data[0]["id"], "rotated-judge", "{data}");
+            }
+            return;
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        let base = format!("{gateway}/relay/v1/messages");
+        std::fs::write(
+            home.path().join("models.json"),
+            json!({"providers":{"radius":{"headers":{"x-fixture-tenant":"test"}}}}).to_string(),
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            for (method, key, transient) in [
+                ("GET /v1/config HTTP/1.1", "radius-fixture-key", false),
+                ("GET /v1/config HTTP/1.1", "radius-fixture-key", true),
+                ("GET /v1/config HTTP/1.1", "radius-fixture-key", false),
+                (
+                    "POST /relay/v1/classify HTTP/1.1",
+                    "radius-fixture-key",
+                    false,
+                ),
+                ("GET /v1/config HTTP/1.1", "rotated-fixture-key", false),
+            ] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut request = BufReader::new(socket);
+                let mut line = String::new();
+                request.read_line(&mut line).await.unwrap();
+                assert_eq!(line.trim_end(), method);
+                let mut length = 0;
+                let mut authorized = false;
+                let mut tenant = false;
+                loop {
+                    line.clear();
+                    assert!(request.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (name, value) = line.split_once(':').unwrap();
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    if name.eq_ignore_ascii_case("authorization") {
+                        authorized = value.trim() == format!("Bearer {key}");
+                    }
+                    if name.eq_ignore_ascii_case("x-fixture-tenant") {
+                        tenant = value.trim() == "test";
+                    }
+                }
+                assert!(authorized, "{method}");
+                if transient {
+                    request.get_mut().write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
+                if method.starts_with("POST") {
+                    assert!(tenant);
+                }
+                let result = if method.starts_with("GET") {
+                    json!({"baseUrl":base,"models":[],"classifiers":[
+                        {"id":if key == "rotated-fixture-key" {"rotated-judge"} else {"radius-judge"},
+                        "name":"Judge","contextWindow":8192,"input":["text"],"cost":{"input":1.2}},
+                        {"id":"bad","name":"Bad","contextWindow":0,"input":["text"],"cost":{"input":1.2}},
+                    ]})
+                } else {
+                    let mut body = vec![0; length];
+                    request.read_exact(&mut body).await.unwrap();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["model"], "radius-judge");
+                    assert_eq!(body["context"]["state"], json!({"fixture":true}));
+                    json!({"answers":{"q":{"type":"bool","probability":0.8}}})
+                }.to_string();
+                request.get_mut().write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{result}", result.len(),
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        for mode in ["online", "offline"] {
+            if mode == "offline" {
+                std::fs::write(
+                    home.path().join("models.json"),
+                    json!({
+                        "providers":{"radius":{"headers":{"x-fixture-tenant":"!exit 9"}}}
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            }
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact","operation_models::tests::radius_catalog_discovers_and_invokes_account_classifiers"])
+                .env("PI_RS_HOME", home.path())
+                .env("PI_RADIUS_GATEWAY", &gateway)
+                .env("RADIUS_API_KEY", "radius-fixture-key")
+                .env(CHILD, mode)
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(15), child.output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        server.await.unwrap();
     }
 
     #[test]

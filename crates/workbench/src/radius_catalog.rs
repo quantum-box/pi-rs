@@ -14,8 +14,10 @@ use super::model_profiles::{InputLimits, ModelMetadata};
 
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 pub(super) struct Catalog {
+    pub base: Url,
     pub endpoint: Url,
     pub models: Vec<Model>,
+    pub classifiers: Vec<Classifier>,
 }
 
 impl Catalog {
@@ -25,6 +27,16 @@ impl Catalog {
             .find(|model| model.id == id)
             .map(|model| &model.metadata)
     }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Classifier {
+    pub id: String,
+    pub name: String,
+    pub input: Vec<String>,
+    pub context_window: u32,
+    pub cost: super::operation_models::Cost,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -120,6 +132,8 @@ impl Model {
 struct Config {
     base_url: String,
     models: Vec<Value>,
+    #[serde(default)]
+    classifiers: Value,
 }
 
 pub(super) async fn load(client: &Client, gateway: &Url, token: &str) -> Result<Catalog> {
@@ -172,6 +186,7 @@ fn parse(config: Config, gateway: &Url) -> Result<Catalog> {
             "Radius model endpoint must match the authenticated gateway origin".into(),
         ));
     }
+    let base = endpoint.clone();
     let path = endpoint.path().trim_end_matches('/');
     let path = if path.ends_with("/messages") {
         path.to_owned()
@@ -198,7 +213,28 @@ fn parse(config: Config, gateway: &Url) -> Result<Catalog> {
             model
         })
         .collect();
-    Ok(Catalog { endpoint, models })
+    seen.clear();
+    let classifiers = config
+        .classifiers
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|model| serde_json::from_value::<Classifier>(model.clone()).ok())
+        .filter(|model| {
+            !model.id.trim().is_empty()
+                && model.id.len() <= 256
+                && !model.name.is_empty()
+                && model.context_window > 0
+                && model.cost.valid()
+                && seen.insert(model.id.clone())
+        })
+        .collect();
+    Ok(Catalog {
+        base,
+        endpoint,
+        models,
+        classifiers,
+    })
 }
 
 pub(super) fn baseline(gateway: &Url) -> Option<Arc<Catalog>> {
@@ -244,7 +280,8 @@ pub(super) fn remember(gateway: &Url, account: &str, catalog: &Catalog) -> Resul
         &cache_path(),
         &json!({
             "origin":gateway.as_str(), "account":account,
-            "baseUrl":catalog.endpoint.as_str(), "models":catalog.models,
+            "baseUrl":catalog.base.as_str(), "models":catalog.models,
+            "classifiers":catalog.classifiers,
         }),
     )
 }
@@ -294,6 +331,7 @@ mod tests {
                 Config {
                     base_url: "https://gateway.example/v1".into(),
                     models,
+                    classifiers: Value::Null,
                 },
                 &gateway,
             )

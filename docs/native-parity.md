@@ -1949,7 +1949,11 @@ the execution boundary for the pending codemode sandbox.
 Codemode accepts configured `pi-classifier` models and uses Pi's
 `POST <baseUrl>/classify` protocol, including image blocks, bounded response
 probabilities, provider usage and the classifier retry policy. Native endpoint
-credential binding and image validation apply.
+credential binding and image validation apply. Radius classifier models are
+discovered from the active account's gateway configuration during available-model
+lookups and explicit resolution. Unfiltered and offline lists use the matching
+cached catalog when the current account can be identified without running a
+credential command.
 
 Codemode supports OpenAI Decisions classifier models, including the pinned
 GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,

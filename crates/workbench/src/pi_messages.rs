@@ -54,10 +54,14 @@ pub(super) struct PiMessages {
 #[derive(Clone)]
 struct Radius {
     gateway: Gateway,
-    catalog: Arc<tokio::sync::Mutex<Option<CachedCatalog>>>,
+    catalog: RadiusCatalogCache,
 }
 
+#[derive(Clone, Default)]
+pub(super) struct RadiusCatalogCache(Arc<tokio::sync::Mutex<Option<CachedCatalog>>>);
+
 struct CachedCatalog {
+    gateway: Url,
     binding: String,
     token_hash: Option<[u8; 32]>,
     value: Arc<radius_catalog::Catalog>,
@@ -72,7 +76,7 @@ impl PiMessages {
         let mut client = Self::build("radius", endpoint, token)?;
         client.radius = Some(Radius {
             gateway,
-            catalog: Arc::new(tokio::sync::Mutex::new(None)),
+            catalog: RadiusCatalogCache::default(),
         });
         Ok(client)
     }
@@ -118,6 +122,13 @@ impl PiMessages {
         })
     }
 
+    pub(super) fn with_radius_catalog_cache(mut self, cache: RadiusCatalogCache) -> Self {
+        if let Some(radius) = &mut self.radius {
+            radius.catalog = cache;
+        }
+        self
+    }
+
     pub(super) fn with_context_probe(mut self, enabled: bool) -> Self {
         self.probe_catalog = enabled;
         self
@@ -156,7 +167,7 @@ impl PiMessages {
             .ok_or_else(|| Error::Config("Radius credentials were removed. Sign in again.".into()))
     }
 
-    async fn catalog(&self) -> Result<Option<Arc<radius_catalog::Catalog>>> {
+    pub(super) async fn catalog(&self) -> Result<Option<Arc<radius_catalog::Catalog>>> {
         let Some(radius) = &self.radius else {
             return Ok(None);
         };
@@ -177,6 +188,19 @@ impl PiMessages {
         self.catalog_for(&binding, Some(&token)).await
     }
 
+    pub(super) async fn classifier_catalog_with_token(
+        &self,
+    ) -> Result<Option<(Arc<radius_catalog::Catalog>, String)>> {
+        if self.radius.is_none() {
+            return Ok(None);
+        }
+        let (token, binding) = self.access().await?;
+        let catalog = self
+            .catalog_for(&binding, self.probe_catalog.then_some(token.as_str()))
+            .await?;
+        Ok(catalog.map(|catalog| (catalog, token)))
+    }
+
     async fn catalog_for(
         &self,
         binding: &str,
@@ -186,31 +210,36 @@ impl PiMessages {
             return Ok(None);
         };
         let token_hash = token.map(|token| <[u8; 32]>::from(Sha256::digest(token.as_bytes())));
-        let mut cached = radius.catalog.lock().await;
+        let gateway = radius.gateway.url("/");
+        let mut cached = radius.catalog.0.lock().await;
         if let Some(cached) = cached.as_ref().filter(|cached| {
-            cached.binding == binding && (token.is_none() || cached.token_hash == token_hash)
+            cached.gateway == gateway
+                && cached.binding == binding
+                && (token.is_none() || cached.token_hash == token_hash)
         }) {
             return Ok(Some(cached.value.clone()));
         }
-        let gateway = radius.gateway.url("/");
         let fallback = || {
             radius_catalog::cached(&gateway, binding).or_else(|| radius_catalog::baseline(&gateway))
         };
-        let value = if let Some(token) = token {
+        let (value, confirmed_token_hash) = if let Some(token) = token {
             match radius_catalog::load(&self.client, &gateway, token).await {
                 Ok(catalog) => {
                     let _ = radius_catalog::remember(&gateway, binding, &catalog);
-                    Some(Arc::new(catalog))
+                    (Some(Arc::new(catalog)), token_hash)
                 }
-                Err(error @ Error::RetryableModel(_)) => Some(fallback().ok_or(error)?),
+                // A fallback can serve this request, but does not confirm
+                // what the gateway offers for the current token.
+                Err(error @ Error::RetryableModel(_)) => (Some(fallback().ok_or(error)?), None),
                 Err(error) => return Err(error),
             }
         } else {
-            fallback()
+            (fallback(), None)
         };
         *cached = value.as_ref().map(|value| CachedCatalog {
+            gateway,
             binding: binding.to_owned(),
-            token_hash,
+            token_hash: confirmed_token_hash,
             value: value.clone(),
         });
         Ok(value)
@@ -267,7 +296,7 @@ impl PiMessages {
         self.radius
             .as_ref()
             .and_then(|radius| {
-                let cache = radius.catalog.try_lock().ok()?;
+                let cache = radius.catalog.0.try_lock().ok()?;
                 Some(
                     cache
                         .as_ref()?
@@ -282,7 +311,7 @@ impl PiMessages {
     }
 
     pub(super) async fn discovered_catalog(&self) -> Option<Arc<radius_catalog::Catalog>> {
-        let cache = self.radius.as_ref()?.catalog.lock().await;
+        let cache = self.radius.as_ref()?.catalog.0.lock().await;
         cache.as_ref().map(|entry| entry.value.clone())
     }
 
@@ -1196,13 +1225,17 @@ mod tool_status_tests {
             Gateway::configured().unwrap(),
         )
         .unwrap();
-        let cache = &client.radius.as_ref().unwrap().catalog;
+        let radius = client.radius.as_ref().unwrap();
+        let cache = &radius.catalog.0;
         let update = |endpoint: &str| CachedCatalog {
+            gateway: radius.gateway.url("/"),
             binding: key_binding("token"),
             token_hash: Some(Sha256::digest(b"token").into()),
             value: Arc::new(radius_catalog::Catalog {
                 endpoint: Url::parse(endpoint).unwrap(),
+                base: Url::parse(endpoint).unwrap(),
                 models: vec![],
+                classifiers: vec![],
             }),
         };
         *cache.lock().await = Some(update("https://one.example/v1"));
