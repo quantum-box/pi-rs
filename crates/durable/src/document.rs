@@ -2445,40 +2445,49 @@ impl<'a> TaskDocuments<'a> {
         &mut self,
         task: &crate::task::Task,
         adapter: &crate::task_tool::TaskTool,
-    ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+    ) -> Result<Option<crate::extension::ToolBlockResult>, crate::runtime::Error> {
+        use crate::runtime::Error;
         let key = crate::task_scheduler::woken_conversation_terminal_key(task.id());
-        if self.store.get(&key).map_err(|e| e.to_string())?.is_none() {
+        if self.store.get(&key)?.is_none() {
             self.signals.batch.checks.push(Check {
                 key,
                 expected: Expected::Missing,
             });
             return Ok(None);
         }
-        let identity = adapter.identity().ok_or("child identity unavailable")?;
+        let identity = adapter
+            .identity()
+            .ok_or_else(|| Error::Invalid("child identity unavailable".into()))?;
         if task.kind() != Some(identity.kind.as_str())
             || task.definition_version() != identity.definition_version
             || !adapter.handler().conversation_woken_cancel_enabled()
         {
-            return Err("child woken identity changed".into());
+            return Err(Error::Invalid("child woken identity changed".into()));
         }
         let lease = adapter
             .handler()
             .conversation_cleanup_identity_lease()
-            .map_err(|e| format!("child identity lease unavailable: {e:?}"))?;
+            .map_err(|e| match e {
+                crate::nested_identity::LeaseFailure::Busy => Error::TaskPublicationBusy,
+                crate::nested_identity::LeaseFailure::Mismatch => {
+                    Error::Invalid("child identity changed".into())
+                }
+            })?;
         let child = self
             .child_reads
             .get(&task.id())
             .and_then(Option::as_ref)
-            .ok_or("missing child read")?;
+            .ok_or_else(|| Error::Invalid("missing child read".into()))?;
         if child.task != *task {
-            return Err("child task changed".into());
+            return Err(Error::Invalid("child task changed".into()));
         }
-        let boundary = self.store.put_version().map_err(|e| e.to_string())?;
+        let boundary = self.store.put_version()?;
         let (value, checks) =
-            crate::task_scheduler::woken_terminal_after_checks(self.store, child, boundary)?;
+            crate::task_scheduler::woken_terminal_after_checks(self.store, child, boundary)
+                .map_err(Error::Invalid)?;
         let selected = identity
             .conversation_selection()
-            .ok_or("child selection missing")?;
+            .ok_or_else(|| Error::Invalid("child selection missing".into()))?;
         let existing = self
             .child_selection_leases
             .iter()
@@ -2486,15 +2495,14 @@ impl<'a> TaskDocuments<'a> {
             .map(|(_, lease)| lease.clone());
         let (parent_checks, descendant_leases, registry_lease, selection_lease) = self
             .input_validator
-            .ok_or("child result harness unavailable")?
+            .ok_or_else(|| Error::Invalid("child result harness unavailable".into()))?
             .checkpointable_parent_result_read_checks(
                 &self.task, child, boundary, selected, existing,
-            )
-            .map_err(|e| e.to_string())?;
+            )?;
         let crate::async_task_tool::DurableTaskResult::Rich { task_content_v1 } =
-            serde_json::from_value(value).map_err(|e| e.to_string())?
+            serde_json::from_value(value)?
         else {
-            return Err("invalid child after result".into());
+            return Err(Error::Invalid("invalid child after result".into()));
         };
         self.signals.batch.checks.extend(parent_checks);
         self.signals.batch.checks.extend(checks);
