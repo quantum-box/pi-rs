@@ -10010,6 +10010,39 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn live_model_changes_use_the_latest_thinking_default() {
+        use clap::Parser;
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = workspace.path().join(".pi");
+        std::fs::create_dir(&directory).unwrap();
+        let settings = |level: &str| {
+            std::fs::write(
+                directory.join("settings.json"),
+                serde_json::json!({"defaultThinkingLevel":level}).to_string(),
+            )
+            .unwrap();
+            super::super::config::Settings::load(workspace.path(), true).unwrap()
+        };
+        let mut args = super::Cli::parse_from(["pi", "--offline", "--model", "before"]);
+        args.settings = settings("medium");
+        let view = super::View {
+            live_model_applied: Some(args.clone()),
+            ..Default::default()
+        };
+        args.settings = settings("high");
+        let selected = view
+            .prepare_live_choice(&args)
+            .prepare_model_change(
+                args.provider.clone(),
+                "after".into(),
+                None,
+                pi_rs::ModelSelectSource::Cycle,
+            )
+            .unwrap();
+        assert_eq!(selected.thinking.as_deref(), Some("high"));
+    }
+
+    #[test]
     fn model_picker_waits_for_the_worker_before_adopting_a_selection() {
         use clap::Parser;
         let mut args = super::Cli::parse_from(["pi", "--model", "before"]);
