@@ -2832,8 +2832,8 @@ The terminal lists shared settings in Pi's order and uses Pi's labels and
 boolean values for those rows. Native controls and JSON editors remain
 available after the shared settings. The Transport row cycles through SSE,
 WebSocket, cached WebSocket, and automatic selection in Pi's order. It updates
-the next request in a running Codex session and retains the normal settings
-precedence. Native providers without multiple transports retain their existing
+the next request in a running Codex session, including sessions that
+resolve their credentials at request time, and retains the normal settings precedence. Native providers without multiple transports retain their existing
 connection behavior. The changelog and installation telemetry controls are still open. The Warnings submenu includes the default-on
 Anthropic extra-usage warning. The terminal shows it once when the active model
 uses Anthropic subscription OAuth or a configured subscription token on the

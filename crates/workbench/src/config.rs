@@ -238,7 +238,11 @@ impl Settings {
             .find(|(path, _)| path == base || matches!((path.canonicalize(), base.canonicalize()), (Ok(a), Ok(b)) if a == b))
             .map(|(_, value)| value)
     }
-    fn load_from_paths(workspace: &Path, trusted: bool, user_path: &Path) -> Result<Self> {
+    pub(super) fn load_from_paths(
+        workspace: &Path,
+        trusted: bool,
+        user_path: &Path,
+    ) -> Result<Self> {
         Self::load_from_paths_with_previous(workspace, trusted, user_path, None)
     }
     fn load_from_paths_with_previous(

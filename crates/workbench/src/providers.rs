@@ -825,6 +825,24 @@ impl Client {
         }
     }
 
+    pub(super) fn update_codex_transport(&mut self, settings: &super::config::Settings) {
+        match self {
+            Self::OpenAi(client) => {
+                *client = client
+                    .clone()
+                    .with_codex_transport(settings.codex_transport());
+            }
+            Self::Deferred(client) if client.adapter == Adapter::CodexResponses => {
+                if let Some((args, _)) = &mut client.options {
+                    args.settings
+                        .apply_worker_settings(settings, &["transport"]);
+                    client.estimator = Arc::new(OnceLock::new());
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn with_http_settings(self, settings: &super::config::Settings) -> Result<Self> {
         self.with_http_settings_and_env(settings, None)
     }
@@ -6103,6 +6121,49 @@ mod estimation_tests {
         assert_eq!(first_identity, repeated_identity);
         assert_ne!(first_identity, second_identity);
         assert!(prepared.context_identity().is_some());
+    }
+
+    #[test]
+    fn live_codex_transport_updates_deferred_model_options() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        let load =
+            || super::super::config::Settings::load_from_paths(root.path(), false, &path).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"transport":"websocket","httpIdleTimeoutMs":100}"#,
+        )
+        .unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.provider = Provider::named("openai-codex").unwrap();
+        args.settings = load();
+        let mut client = Client::deferred(
+            args.provider.clone(),
+            Adapter::CodexResponses,
+            args.provider.default_endpoint(),
+            Some(Credential::Literal("fixture".into())),
+            RequestHeaders::default(),
+        )
+        .with_model_options(&args, false)
+        .unwrap();
+        let Client::Deferred(deferred) = &client else {
+            unreachable!()
+        };
+        let _ = deferred.estimation_client();
+        assert!(deferred.estimator.get().is_some());
+
+        std::fs::write(&path, r#"{"transport":"sse","httpIdleTimeoutMs":200}"#).unwrap();
+        client.update_codex_transport(&load());
+        let Client::Deferred(deferred) = &client else {
+            unreachable!()
+        };
+        let (stored, _) = deferred.options.as_ref().unwrap();
+        assert_eq!(
+            stored.settings.codex_transport(),
+            pi_rs::openai::CodexTransport::Sse
+        );
+        assert_eq!(stored.settings.http_idle_timeout_ms(), 100);
+        assert!(deferred.estimator.get().is_none());
     }
 
     #[test]
