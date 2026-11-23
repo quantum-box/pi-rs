@@ -34,11 +34,16 @@ pub(super) fn project_tool_results(request: &mut ModelRequest) {
                 content,
                 is_structured,
                 ..
-            } if let Some(name) = calls.remove(call_id.as_str())
-                && let Some((prefix, tool)) = mcp_tool_name(name, &readable)
-                && let Some(server) = prefix.strip_prefix("mcp__")
-                && *is_structured != Some(false) =>
-            {
+            } if *is_structured != Some(false) => {
+                let Some((prefix, tool)) = calls
+                    .remove(call_id.as_str())
+                    .and_then(|name| mcp_tool_name(name, &readable))
+                else {
+                    continue;
+                };
+                let Some(server) = prefix.strip_prefix("mcp__") else {
+                    continue;
+                };
                 let read_tool = readable.get(prefix).copied();
                 if let Some((text, structured)) = project_result(content, server, tool, read_tool) {
                     *content = text;
