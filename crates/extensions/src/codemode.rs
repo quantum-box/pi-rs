@@ -1,7 +1,7 @@
 //! A bounded QuickJS runner that reaches external effects only through ToolHost.
 #[cfg(test)]
 use pi_rs_core::ModelRequest;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::{Future, poll_fn};
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -247,20 +247,7 @@ impl Extension for Codemode {
         _: Option<&ExtensionState>,
     ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let original_tools = request.tools.clone();
-        let mut declarations = String::new();
-        for tool in request.tools.iter().filter(|tool| {
-            !matches!(
-                tool.name.as_str(),
-                "codemode" | "tool_search" | MODEL_OPERATION
-            )
-        }) {
-            let entry = describe(tool);
-            if declarations.len() + entry.len() > self.inline_budget.saturating_mul(4) {
-                break;
-            }
-            declarations.push_str(&entry);
-            declarations.push('\n');
-        }
+        let declarations = inline_declarations(&request.tools, self.inline_budget);
         if let Some(tool) = request
             .tools_mut()
             .iter_mut()
@@ -893,6 +880,52 @@ fn normalize_namespace(name: &str) -> String {
     let name = name.strip_prefix("mcp__").unwrap_or(&name);
     format!("mcp__{}", name.split("__").next().unwrap_or(name))
 }
+fn inline_declarations(tools: &[ToolSpec], mut budget: usize) -> String {
+    let mut groups = BTreeMap::<String, Vec<(usize, usize)>>::new();
+    let mut sections = Vec::new();
+    for tool in tools
+        .iter()
+        .filter(|tool| !matches!(tool.name.as_str(), ID | "tool_search" | MODEL_OPERATION))
+    {
+        let section = describe(tool);
+        let cost = section.encode_utf16().count().div_ceil(4);
+        groups
+            .entry(tool_namespace(&tool.name))
+            .or_default()
+            .push((sections.len(), cost));
+        sections.push(section);
+    }
+
+    let mut queues = groups
+        .values()
+        .map(|entries| {
+            let mut ordered = entries.clone();
+            ordered.sort_by_key(|&(_, cost)| cost);
+            ordered.into_iter().peekable()
+        })
+        .collect::<Vec<_>>();
+    let mut selected = vec![false; sections.len()];
+    while !queues.is_empty() {
+        queues.retain_mut(|queue| {
+            let Some((index, cost)) = queue.next().filter(|&(_, cost)| cost <= budget) else {
+                return false;
+            };
+            budget -= cost;
+            selected[index] = true;
+            queue.peek().is_some()
+        });
+    }
+
+    let mut result = String::new();
+    for &(index, _) in groups.values().flatten() {
+        if selected[index] {
+            result.push_str(&sections[index]);
+            result.push('\n');
+        }
+    }
+    result
+}
+
 fn describe(tool: &ToolSpec) -> String {
     format!(
         "{}\n{}(args: {}): Promise<unknown>;",
@@ -4184,6 +4217,38 @@ mod tests {
         };
         assert_eq!(data["isError"], false, "{data}");
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn inline_declarations_select_by_utf16_cost_and_share_the_budget_between_namespaces() {
+        let tool = |name: &str, description: String| ToolSpec {
+            name: name.into(),
+            description,
+            parameters: json!({"type":"object"}),
+        };
+        let tools = [
+            tool("mcp__a__expensive", "expensive".repeat(20)),
+            tool("mcp__a__unicode", "猫😀".repeat(10)),
+            tool("mcp__a__small", "a".into()),
+            tool("mcp__b__other", "b".into()),
+            tool("read", "native".into()),
+        ];
+        let cost = |index: usize| describe(&tools[index]).encode_utf16().count().div_ceil(4);
+        let unicode_budget = cost(4) + cost(2) + cost(3) + cost(1);
+        assert_eq!(
+            inline_declarations(&tools, unicode_budget),
+            [4, 1, 2, 3]
+                .map(|index| describe(&tools[index]) + "\n")
+                .concat()
+        );
+        let first_round = cost(4) + cost(2) + cost(3);
+        assert_eq!(
+            inline_declarations(&tools, first_round),
+            [4, 2, 3]
+                .map(|index| describe(&tools[index]) + "\n")
+                .concat()
+        );
+        assert!(inline_declarations(&tools, 0).is_empty());
     }
 
     #[test]

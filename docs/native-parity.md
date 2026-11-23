@@ -2005,6 +2005,11 @@ The native full transcript also records the status header and image locations.
 If the native result size limit omits inline image locations, a transcript
 includes every location.
 
+The Codemode inline budget gives each tool namespace a turn to include
+its least expensive remaining declaration. The estimate uses one token per
+four UTF-16 code units, rounded up per declaration, matching Pi's selection
+rule. The native declarations retain their existing text format.
+
 MCP tools default to codemode exposure. `--exposure direct`, `deferred`,
 `codemode` and `hidden` select another mode when adding a server. The root
 `autoEnableCodemode` MCP setting controls automatic activation. Explicit tool
