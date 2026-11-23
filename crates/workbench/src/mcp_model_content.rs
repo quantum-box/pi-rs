@@ -100,10 +100,7 @@ fn project_result(
     let mut projected = if is_resource_read(tool)
         && let Some(resources) = response["contents"].as_array()
     {
-        resources
-            .iter()
-            .map(|resource| project_resource(resource))
-            .collect::<Vec<_>>()
+        resources.iter().map(project_resource).collect::<Vec<_>>()
     } else {
         let blocks = response["content"].as_array()?;
         blocks
