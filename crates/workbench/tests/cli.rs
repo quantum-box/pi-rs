@@ -7473,6 +7473,121 @@ fn http_idle_timeout_resets_on_data_and_can_be_disabled() {
 }
 
 #[test]
+fn persistent_worker_applies_http_idle_timeout_edits() {
+    let root = tempfile::tempdir().unwrap();
+    let settings = root.path().join("settings.json");
+    let write_settings = |timeout| {
+        std::fs::write(
+            &settings,
+            json!({"httpIdleTimeoutMs":timeout,"retry":{"enabled":false}}).to_string(),
+        )
+        .unwrap();
+    };
+    write_settings(0);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = std::thread::spawn(move || {
+        for should_timeout in [false, true, false] {
+            loop {
+                let (mut socket, _) = listener.accept().unwrap();
+                let (request, _) = read_rpc_model_fixture_request(&socket, |_| Ok(())).unwrap();
+                if request.starts_with("GET ") {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                assert!(
+                    request.starts_with("POST /v1/chat/completions "),
+                    "{request}"
+                );
+                std::thread::sleep(Duration::from_millis(700));
+                let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                let result = socket.write_all(response);
+                if !should_timeout {
+                    result.unwrap();
+                }
+                break;
+            }
+        }
+    });
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .arg("--session")
+        .arg(root.path().join("session.jsonl"))
+        .args([
+            "--no-trust",
+            "--no-mcp",
+            "--offline",
+            "--model",
+            "test-fixture",
+            "--endpoint",
+            &endpoint,
+            "--model-timeout-secs",
+            "5",
+            "serve",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (events, received) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(event) = serde_json::from_str::<Value>(&line) {
+                let _ = events.send(event);
+            }
+        }
+    });
+
+    for (updated, expected_success) in [(None, true), (Some(150), false), (Some(0), true)] {
+        if let Some(timeout) = updated {
+            write_settings(timeout);
+            writeln!(input, "{}", json!({"type":"http_idle_timeout_changed"})).unwrap();
+        }
+        writeln!(input, "{}", json!({"type":"prompt","content":"hello"})).unwrap();
+        input.flush().unwrap();
+        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let settled = loop {
+            let event = received
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("worker did not settle: {error}; events: {events:?}");
+                });
+            if event["type"] == "agent_settled" {
+                break event;
+            }
+            events.push(event);
+        };
+        assert_eq!(settled["success"], expected_success, "{events:?}");
+        if !expected_success {
+            assert!(
+                events.iter().any(|event| {
+                    event["type"] == "error"
+                        && event["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("HTTP idle timeout"))
+                }),
+                "{events:?}"
+            );
+        }
+    }
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    reader.join().unwrap();
+    server.join().unwrap();
+}
+
+#[test]
 fn http_idle_timeout_applies_to_native_provider_streams() {
     for (provider, endpoint_path) in [
         ("anthropic", "/v1/messages"),

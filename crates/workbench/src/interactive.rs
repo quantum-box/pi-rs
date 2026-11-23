@@ -9456,6 +9456,9 @@ fn select(
                 match key.as_str() {
                     "cacheWarming" => worker.send(json!({"type":"cache_warming_changed"}))?,
                     "transport" => worker.send(json!({"type":"transport_changed"}))?,
+                    "httpIdleTimeoutMs" => {
+                        worker.send(json!({"type":"http_idle_timeout_changed"}))?
+                    }
                     _ => {}
                 }
             }

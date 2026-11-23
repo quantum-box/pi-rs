@@ -46,6 +46,7 @@ enum Request {
     },
     CacheWarmingChanged,
     TransportChanged,
+    HttpIdleTimeoutChanged,
     RenderTranscriptExtension {
         id: Uuid,
         record_id: u64,
@@ -207,6 +208,7 @@ struct LiveModelRun {
     latest: Option<(
         Arc<pi_rs::LiveModelSelection>,
         super::image_policy::WorkbenchModel,
+        bool,
     )>,
 }
 
@@ -835,6 +837,7 @@ async fn run_worker(
             .ok()
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or((SessionStartReason::Startup, None));
+    let mut model_reports_thinking = super::thinking::reported(&args).is_some();
     let mut runtime = runtime::configure(&args, true).await?;
     if args.mode == Some(super::OutputMode::Rpc) {
         super::output(
@@ -1043,6 +1046,28 @@ async fn run_worker(
             }
             continue;
         }
+        if matches!(request, Request::HttpIdleTimeoutChanged) {
+            let result = (|| {
+                let settings = args.settings.reload_with_fallback(
+                    &args.workspace,
+                    args.trusted,
+                    &args.settings,
+                )?;
+                let mut updated = args.clone();
+                updated
+                    .settings
+                    .apply_worker_settings(&settings, &["httpIdleTimeoutMs"]);
+                if updated.settings.http_idle_timeout() != args.settings.http_idle_timeout() {
+                    runtime.configure_model_options(&updated, model_reports_thinking)?;
+                }
+                args.settings = updated.settings;
+                Ok::<(), Error>(())
+            })();
+            if let Err(error) = result {
+                output(json!({"type":"error","message":error.to_string()}));
+            }
+            continue;
+        }
         if let Request::CheckSessionTransition { id, event } = request {
             let result = tokio::select! {
                 result = async {
@@ -1156,6 +1181,7 @@ async fn run_worker(
             args.thinking = thinking;
             args.session = session;
             runtime.configure_model_options(&args, reported_thinking)?;
+            model_reports_thinking = reported_thinking;
             refresh_snapshot(&snapshot, &Session::open(&args.session)?);
             if switched {
                 notify_session_lifecycle(
@@ -1731,7 +1757,7 @@ async fn run_worker(
             state.live_model.take()
         };
         let adopted = if let Some(mut live) = live
-            && let Some((selection, adapter)) = live.latest.take()
+            && let Some((selection, adapter, reported_thinking)) = live.latest.take()
         {
             let persist = |session: &mut Session| {
                 if session.host_binding().is_some() {
@@ -1747,7 +1773,7 @@ async fn run_worker(
                 || Session::open(&args.session).and_then(|mut session| persist(&mut session)),
                 persist,
             ) {
-                Ok(()) => Some((live.args, adapter)),
+                Ok(()) => Some((live.args, adapter, reported_thinking)),
                 Err(error) => {
                     output(json!({"type":"live_model_reverted","error":error.to_string()}));
                     None
@@ -1772,8 +1798,9 @@ async fn run_worker(
                 .filter(|_| result.is_ok() && completed_shells.is_empty() && adopted.is_none()),
         );
         drop(cache_capture);
-        if let Some((selected, adapter)) = adopted {
+        if let Some((selected, adapter, reported_thinking)) = adopted {
             args = selected;
+            model_reports_thinking = reported_thinking;
             runtime.refresh_read_image_policy(&args);
             runtime.provider = adapter;
         }
@@ -2402,6 +2429,7 @@ fn read_requests(
                         Request::Configure { .. }
                             | Request::CacheWarmingChanged
                             | Request::TransportChanged
+                            | Request::HttpIdleTimeoutChanged
                             | Request::CheckSessionTransition { .. }
                             | Request::SessionInfoChanged { .. }
                             | Request::SelectionChanged { .. }
@@ -2478,7 +2506,7 @@ fn select_live_model(
         .filter(|live| live.id == id)
         .ok_or_else(unavailable)?;
     live.control.select(selection.clone());
-    live.latest = Some((selection, adapter));
+    live.latest = Some((selection, adapter, reported_thinking));
     live.args = args;
     // Keep the acknowledgement ordered before the run's settlement event.
     control_response(
