@@ -197,10 +197,8 @@ fn project_block(block: &Value, server: &str, read_tool: Option<&str>) -> Value 
         Some("image") => block["data"]
             .as_str()
             .zip(block["mimeType"].as_str())
-            .map_or_else(
-                || text("[invalid image omitted]"),
-                |(data, mime)| valid_image(data, mime),
-            ),
+            .and_then(|(data, mime)| provider_image(data, mime))
+            .unwrap_or_else(|| block.clone()),
         Some("audio") => {
             let mime = block["mimeType"].as_str().unwrap_or("unknown type");
             text(format!("[audio {mime} omitted]"))
@@ -222,8 +220,10 @@ fn project_resource(resource: &Value) -> Value {
     }
     let mime = resource["mimeType"].as_str().unwrap_or_default();
     if let Some(blob) = resource["blob"].as_str() {
-        if mime.starts_with("image/") {
-            return valid_image(blob, mime);
+        if mime.starts_with("image/")
+            && let Some(image) = provider_image(blob, mime)
+        {
+            return image;
         }
         let media = mime
             .split_once(';')
@@ -284,18 +284,13 @@ fn joined_text(blocks: &[Value]) -> String {
         .join("\n")
 }
 
-fn valid_image(data: &str, mime_type: &str) -> Value {
+fn provider_image(data: &str, mime_type: &str) -> Option<Value> {
     let image = ImageContent {
         data: data.into(),
         mime_type: mime_type.into(),
     };
-    if image.validate().is_ok() {
-        json!({"type":"image","data":image.data,"mimeType":image.mime_type})
-    } else {
-        text(format!(
-            "[unsupported or invalid image {mime_type} omitted]"
-        ))
-    }
+    image.validate().ok()?;
+    Some(json!({"type":"image","data":image.data,"mimeType":image.mime_type}))
 }
 
 fn format_size(bytes: u64) -> String {
@@ -445,6 +440,19 @@ mod tests {
         assert!(!structured);
         assert_eq!(output, format!("notes\n{data}"));
         assert!(output.len() <= MAX_MODEL_CONTENT_BYTES);
+    }
+
+    #[test]
+    fn mcp_model_content_preserves_unsupported_image_resources() {
+        let original = tool_content(json!({"content":[
+            {"type":"resource","resource":{"uri":"mock://vector","mimeType":"image/svg+xml","blob":"PHN2Zy8+"}},
+            {"type":"resource","resource":{"uri":"mock://scan","mimeType":"image/tiff","blob":"dGlmZg=="}}
+        ]}));
+        let (output, structured) = project_result(&original, "fixture", "get", None).unwrap();
+        assert!(structured);
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["data"]["content"][0]["text"], "<svg/>");
+        assert_eq!(value["data"]["content"][1]["resource"]["blob"], "dGlmZg==");
     }
 
     #[test]
