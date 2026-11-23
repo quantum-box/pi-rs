@@ -1709,6 +1709,7 @@ impl Session {
                 request_id.and_then(|request_id| completions.get(&request_id).copied());
             if completion.is_some_and(|(metadata, failure)| {
                 failure.is_some()
+                    || metadata.assistant_text_edited
                     || matches!(
                         metadata.finish_reason.as_deref(),
                         Some("error" | "aborted" | "cancelled")
@@ -1823,6 +1824,7 @@ impl Session {
                 request_id.and_then(|request_id| completions.get(&request_id).copied());
             if completion.is_some_and(|(metadata, failure)| {
                 failure.is_some()
+                    || metadata.assistant_text_edited
                     || matches!(
                         metadata.finish_reason.as_deref(),
                         Some("error" | "aborted" | "cancelled")
