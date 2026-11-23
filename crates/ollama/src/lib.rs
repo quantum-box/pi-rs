@@ -1384,6 +1384,11 @@ impl Ollama {
             ModelProgress::WaitingForModel,
         );
         let mistral = self.mistral.is_some();
+        let api = if mistral {
+            ModelApi::MistralConversations
+        } else {
+            ModelApi::OpenaiCompletions
+        };
         let wire_tools = wire_tools.unwrap_or_else(|| ChatWireTools {
             declarations: request
                 .tools
@@ -1608,7 +1613,7 @@ impl Ollama {
             let mut usage = None;
             let mut reported_cached_input = None;
             let mut metadata = ModelMetadata {
-                provider_api: Some(if mistral { ModelApi::MistralConversations } else { ModelApi::OpenaiCompletions }),
+                provider_api: Some(api),
                 replay_identity: Some(identity.clone()),
                 ..ModelMetadata::default()
             };
@@ -1646,7 +1651,7 @@ impl Ollama {
                 }
                 if observe_stream && let Ok(raw) = serde_json::from_str::<Value>(&event.data) {
                     pi_rs_core::observe_provider_stream(
-                        &loading_probe.provider, ModelApi::OpenaiCompletions, &requested_model,
+                        &loading_probe.provider, api, &requested_model,
                         &raw, &error_secrets, &loading_probe.headers,
                     ).await;
                 }
