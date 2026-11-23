@@ -1156,6 +1156,7 @@ struct LiveModelChoice {
     id: uuid::Uuid,
     selected: Cli,
     status: String,
+    save_default: bool,
 }
 
 #[derive(Default)]
@@ -1976,6 +1977,7 @@ impl View {
         worker: &mut Worker,
         selected: Cli,
         status: String,
+        save_default: bool,
     ) -> Result<()> {
         if self.live_model_choices.len() >= 32 {
             return Err(Error::Config("Model selection is still pending".into()));
@@ -1994,11 +1996,12 @@ impl View {
             id,
             selected,
             status,
+            save_default,
         });
         Ok(())
     }
 
-    fn accept_model_choice(&mut self, value: &Value, mode: Option<TuiMode>) {
+    fn accept_model_choice(&mut self, value: &Value, args: &mut Cli) {
         let Some(index) = self
             .live_model_choices
             .iter()
@@ -2016,8 +2019,15 @@ impl View {
                     .selection_events
                     .splice(0..0, previous.selection_events);
             }
+            if choice.save_default
+                && let Err(error) =
+                    save_default_model(args, &choice.selected.provider, &choice.selected.model)
+            {
+                self.append(&error.to_string());
+            } else {
+                self.show_status(args.tui_mode, choice.status);
+            }
             self.live_model_applied = Some(choice.selected);
-            self.show_status(mode, choice.status);
         } else {
             self.append(value["error"].as_str().unwrap_or("Could not switch models"));
         }
@@ -2039,7 +2049,7 @@ impl View {
 
     fn receive_worker(&mut self, mut value: Value, args: &mut Cli) {
         if value["type"] == "response" && value["command"] == "select_live_model" {
-            self.accept_model_choice(&value, args.tui_mode);
+            self.accept_model_choice(&value, args);
             return;
         }
         if value["type"] == "live_model_reverted" {
@@ -3997,9 +4007,18 @@ fn slash(
                 start_share_upload(view, pending, None);
             }
         }
-        "/model" if rest.is_empty() => {
-            args.reload_model_profiles()?;
-            start_model_picker(args, view, ModelListIntent::Select);
+        "/model" => {
+            let active = worker
+                .and_then(|slot| slot.as_mut())
+                .filter(|worker| worker.busy);
+            if active.is_none() {
+                args.reload_model_profiles()?;
+            }
+            if rest.is_empty() {
+                start_model_picker(args, view, ModelListIntent::Select);
+            } else {
+                select_model_input(args, view, active, rest, false)?;
+            }
         }
         "/scoped-models" => {
             args.reload_model_profiles()?;
@@ -4253,11 +4272,6 @@ fn slash(
                     remove_provider_key(provider, args, view)?;
                 }
             }
-        }
-        "/model" => {
-            args.reload_model_profiles()?;
-            select_model_input(args, view, rest)?;
-            view.append(&format!("Model › {rest}"));
         }
         "/thinking" if rest.is_empty() => {
             let default = args
@@ -6242,15 +6256,12 @@ pub(super) async fn run(
                         Input::Save(selection) => {
                             let result = match selection {
                                 Selection::Model(model) => select_model_input(
-                                    &mut args, &mut view, &model,
-                                )
-                                .and_then(|()| {
-                                    let configured =
-                                        format!("{}/{}", args.provider.id(), args.model);
-                                    save_default_model(&mut args)?;
-                                    view.append(&format!("Default model: {configured}"));
-                                    Ok(())
-                                }),
+                                    &mut args,
+                                    &mut view,
+                                    worker.as_mut(),
+                                    &model,
+                                    true,
+                                ),
                                 Selection::Thinking(thinking) => {
                                     super::thinking::set(&mut args, &thinking).and_then(|()| {
                                         args.settings
@@ -6729,7 +6740,10 @@ pub(super) async fn run(
                         )?;
                     }
                     "tui.input.tab" => complete_input(&args, &mut view),
-                    "app.model.select" if !is_busy(&worker) => {
+                    "app.model.select"
+                        if !is_busy(&worker)
+                            || worker.as_ref().is_some_and(|active| active.busy) =>
+                    {
                         start_model_picker(&args, &mut view, ModelListIntent::Select)
                     }
                     "tui.input.submit" if view.editor.continued_line() => {}
@@ -6822,7 +6836,11 @@ pub(super) async fn run(
                                 view.append(&error.to_string());
                                 view.editor.replace(input);
                             }
-                        } else if matches!(input.trim(), "/session" | "/share" | "/tree")
+                        } else if (matches!(input.trim(), "/session" | "/share" | "/tree")
+                            || (input.starts_with("/model")
+                                && input.split_whitespace().next() == Some("/model")
+                                && (!is_busy(&worker)
+                                    || worker.as_ref().is_some_and(|active| active.busy))))
                             && view.draft_images.is_empty()
                         {
                             if let Err(error) =
@@ -7313,40 +7331,72 @@ fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut Vie
     result
 }
 
-fn select_model_input(args: &mut Cli, view: &mut View, input: &str) -> Result<()> {
-    let provider = super::model_selection::qualified_model(input, &args.model_profiles)
-        .map_or_else(|| args.provider.clone(), |(provider, _)| provider);
+fn select_model_input(
+    args: &mut Cli,
+    view: &mut View,
+    worker: Option<&mut Worker>,
+    input: &str,
+    save_default: bool,
+) -> Result<()> {
+    let current = view.model_choice(args);
+    let provider = super::model_selection::qualified_model(input, &current.model_profiles)
+        .map_or_else(|| current.provider.clone(), |(provider, _)| provider);
     let available = view
         .available_models
         .iter()
-        .filter_map(|model| super::model_selection::qualified_model(model, &args.model_profiles))
+        .filter_map(|model| super::model_selection::qualified_model(model, &current.model_profiles))
         .filter(|(candidate, _)| *candidate == provider)
         .map(|(_, model)| model.to_owned())
         .collect::<Vec<_>>();
-    let selected = super::model_selection::split_with_profiles(
+    let selection = super::model_selection::split_with_profiles(
         input,
         &available,
         &provider,
-        &args.model_profiles,
+        &current.model_profiles,
     )?;
+    let status = if save_default {
+        format!("Default model: {}/{}", provider.id(), selection.model)
+    } else {
+        format!("Model: {}", selection.model)
+    };
+    if let Some(worker) = worker.filter(|worker| worker.busy) {
+        let mut current = current.clone();
+        current.selection_events.clear();
+        let selected = current.prepare_model_change(
+            provider,
+            selection.model,
+            selection.thinking,
+            pi_rs::ModelSelectSource::Set,
+        )?;
+        return view.stage_model_choice(worker, selected, status, save_default);
+    }
     args.change_model(
         provider,
-        selected.model,
-        selected.thinking,
+        selection.model,
+        selection.thinking,
         pi_rs::ModelSelectSource::Set,
-    )
+    )?;
+    if save_default {
+        save_current_default_model(args)?;
+    }
+    view.show_status(args.tui_mode, status);
+    Ok(())
 }
 
-fn save_default_model(args: &mut Cli) -> Result<()> {
-    let qualified = format!("{}/{}", args.provider.id(), args.model);
+fn save_current_default_model(args: &mut Cli) -> Result<()> {
+    save_default_model(args, &args.provider.clone(), &args.model.clone())
+}
+
+fn save_default_model(args: &mut Cli, provider: &super::Provider, model: &str) -> Result<()> {
+    let qualified = format!("{}/{model}", provider.id());
     let add_to_scope = !args.model_scope.is_empty()
         && !args
             .model_scope
             .iter()
-            .any(|choice| choice.provider == args.provider && choice.model == args.model);
+            .any(|choice| &choice.provider == provider && choice.model == model);
     let mut values = vec![
-        ("defaultProvider".into(), json!(args.provider.id())),
-        ("defaultModel".into(), json!(args.model)),
+        ("defaultProvider".into(), json!(provider.id())),
+        ("defaultModel".into(), json!(model)),
     ];
     if add_to_scope {
         let mut enabled = args.settings.strings("enabledModels");
@@ -7362,8 +7412,8 @@ fn save_default_model(args: &mut Cli) -> Result<()> {
     args.settings.set_user_values(&values)?;
     if add_to_scope {
         args.model_scope.push(super::model_selection::ScopedChoice {
-            provider: args.provider.clone(),
-            model: args.model.clone(),
+            provider: provider.clone(),
+            model: model.into(),
             thinking: None,
         });
     }
@@ -7379,7 +7429,7 @@ fn cycle_model(
     use super::model_selection::{ScopedChoice, next_model, qualified_model};
     let current = view.model_choice(args);
     let discovered;
-    let choices = if current.model_scope.is_empty() {
+    let choices = if args.model_scope.is_empty() {
         if view.available_models.is_empty() {
             start_model_picker(args, view, ModelListIntent::Cycle { reverse });
             return Ok(());
@@ -7396,10 +7446,10 @@ fn cycle_model(
             .collect::<Vec<_>>();
         discovered.as_slice()
     } else {
-        current.model_scope.as_slice()
+        args.model_scope.as_slice()
     };
     let Some(choice) = next_model(current, choices, reverse) else {
-        let text = if current.model_scope.is_empty() {
+        let text = if args.model_scope.is_empty() {
             "Only one model available"
         } else {
             "Only one model in scope"
@@ -7417,7 +7467,7 @@ fn cycle_model(
             pi_rs::ModelSelectSource::Cycle,
         )?;
         let status = model_cycle_status(&selected);
-        return view.stage_model_choice(worker, selected, status);
+        return view.stage_model_choice(worker, selected, status, false);
     }
     args.change_model(
         choice.provider,
@@ -7451,7 +7501,12 @@ fn cycle_thinking(args: &mut Cli, view: &mut View, worker: &mut Option<Worker>) 
         selected.selection_events.clear();
         if let Some(level) = super::thinking::next_level(&mut selected) {
             super::thinking::select(&mut selected, &level);
-            return view.stage_model_choice(worker, selected, format!("Thinking level: {level}"));
+            return view.stage_model_choice(
+                worker,
+                selected,
+                format!("Thinking level: {level}"),
+                false,
+            );
         }
         None
     } else {
@@ -8767,7 +8822,7 @@ fn select(
             slash(&format!("/fork {id}"), args, view, Some(worker))?;
         }
         Selection::Model(model) => {
-            select_model_input(args, view, &model)?;
+            select_model_input(args, view, worker.as_mut(), &model, false)?;
         }
         Selection::Completion { range, text, .. } => insert_completion(view, range, &text),
         Selection::LoginProvider(provider) if provider.id() == "amazon-bedrock" => {
@@ -8848,7 +8903,7 @@ fn select(
         Selection::LoginRadius(method) => start_radius_login(view, &args.settings, method)?,
         Selection::LogoutRadius => start_radius_logout(view, &args.settings)?,
         Selection::Thinking(thinking) => super::thinking::set(args, &thinking)?,
-        Selection::SaveDefaultModel => save_default_model(args)?,
+        Selection::SaveDefaultModel => save_current_default_model(args)?,
         Selection::EditSetting(key) => {
             let default = match key.as_str() {
                 "theme" => json!(args.theme_setting().unwrap_or("system")),
@@ -9897,6 +9952,39 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_picker_waits_for_the_worker_before_adopting_a_selection() {
+        use clap::Parser;
+        let mut args = super::Cli::parse_from(["pi", "--model", "before"]);
+        let mut view = super::View::default();
+        let failed = uuid::Uuid::new_v4();
+        let accepted = uuid::Uuid::new_v4();
+        let mut selected = args.clone();
+        selected.model = "after".into();
+        for (id, save_default) in [(failed, true), (accepted, false)] {
+            view.live_model_choices.push_back(super::LiveModelChoice {
+                id,
+                selected: selected.clone(),
+                status: "Model: after".into(),
+                save_default,
+            });
+        }
+        assert_eq!(view.accepted_model(&args).model, "before");
+        view.accept_model_choice(
+            &serde_json::json!({"id":failed,"success":false,"error":"rejected"}),
+            &mut args,
+        );
+        assert_eq!(view.accepted_model(&args).model, "before");
+        view.accept_model_choice(
+            &serde_json::json!({"id":accepted,"success":true}),
+            &mut args,
+        );
+        assert_eq!(view.accepted_model(&args).model, "after");
+        assert_eq!(args.model, "before");
+        assert!(view.finish_model_choice(&mut args));
+        assert_eq!(args.model, "after");
+        assert!(view.live_model_choices.is_empty());
+    }
     #[test]
     fn copilot_login_prompts_before_starting_device_authorization() {
         use super::{Cli, KeyCode, KeyEvent, KeyModifiers, Keys, LocalEditor, View};

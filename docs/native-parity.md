@@ -138,8 +138,10 @@ the selected display name and the active thinking level for reasoning models. Co
 reuse the trailing status in both fullscreen and regular mode, before it enters
 scrollback. The tool-output, thinking-visibility, and thinking-level shortcuts
 report the new state using the same status row, as in Pi.
-During a streamed prompt, model and thinking shortcuts acknowledge a prepared
-selection without changing the request in flight. A queued follow-up uses the
+During a streamed prompt, model cycling, the Ctrl+L model picker, and
+the /model command can select the model for the next request. Ctrl+S in the
+picker also saves the accepted choice as the default. Model and thinking
+shortcuts acknowledge a prepared selection without changing the request in flight. A queued follow-up uses the
 new route and effort. Cycling models uses the destination's scoped or per-model
 thinking level, then the global default, then the current level. The worker
 commits the selection before the next request,
