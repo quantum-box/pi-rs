@@ -182,13 +182,12 @@ fn resource_link(block: &Value, server: &str, read_tool: Option<&str>) -> Option
         .as_str()
         .filter(|description| !description.is_empty())
         .map_or_else(String::new, |description| format!(": {description}"));
-    let read = read_tool.map_or_else(
-        String::new,
-        |tool| format!(". Read it with {tool} (server "{server}")"),
-    );
-    Some(text(
-        format!("[Resource {uri} "{title}"{details}{description}{read}]"),
-    ))
+    let read = read_tool.map_or_else(String::new, |tool| {
+        format!(r#". Read it with {tool} (server "{server}")"#)
+    });
+    Some(text(format!(
+        r#"[Resource {uri} "{title}"{details}{description}{read}]"#
+    )))
 }
 
 fn text(content: impl AsRef<str>) -> Value {
@@ -292,6 +291,7 @@ mod tests {
         let content = tool_content(json!({"content":[
             {"type":"resource","resource":{"uri":"mock://image","mimeType":"image/png","blob":"YQ=="}},
             {"type":"text","text":"caption"},
+            {"type":"resource","resource":{"uri":"mock://binary","mimeType":"application/octet-stream","blob":"dGVzdA=="}},
         ]}));
         let (projected, structured) =
             project_result(&content, "fixture", "get_image", None).unwrap();
@@ -306,6 +306,7 @@ mod tests {
         );
         assert!(caption.contains("caption"));
         assert!(!caption.contains("YQ=="));
+        assert!(caption.contains("dGVzdA=="));
     }
 
     #[test]
