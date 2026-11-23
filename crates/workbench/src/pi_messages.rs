@@ -156,7 +156,7 @@ impl PiMessages {
             .ok_or_else(|| Error::Config("Radius credentials were removed. Sign in again.".into()))
     }
 
-    async fn catalog(&self) -> Result<Option<Arc<radius_catalog::Catalog>>> {
+    pub(super) async fn catalog(&self) -> Result<Option<Arc<radius_catalog::Catalog>>> {
         let Some(radius) = &self.radius else {
             return Ok(None);
         };
@@ -175,6 +175,19 @@ impl PiMessages {
         }
         let (token, binding) = self.access().await?;
         self.catalog_for(&binding, Some(&token)).await
+    }
+
+    pub(super) async fn classifier_catalog_with_token(
+        &self,
+    ) -> Result<Option<(Arc<radius_catalog::Catalog>, String)>> {
+        if self.radius.is_none() {
+            return Ok(None);
+        }
+        let (token, binding) = self.access().await?;
+        let catalog = self
+            .catalog_for(&binding, self.probe_catalog.then_some(token.as_str()))
+            .await?;
+        Ok(catalog.map(|catalog| (catalog, token)))
     }
 
     async fn catalog_for(
@@ -1202,7 +1215,9 @@ mod tool_status_tests {
             token_hash: Some(Sha256::digest(b"token").into()),
             value: Arc::new(radius_catalog::Catalog {
                 endpoint: Url::parse(endpoint).unwrap(),
+                base: Url::parse(endpoint).unwrap(),
                 models: vec![],
+                classifiers: vec![],
             }),
         };
         *cache.lock().await = Some(update("https://one.example/v1"));
