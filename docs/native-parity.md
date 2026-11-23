@@ -2026,8 +2026,9 @@ When a result contains multiple resources, text resources keep their URIs.
 Embedded images use the provider's existing image path and respect the active
 image policy. The model still receives distinct structured content alongside
 text blocks. Embedded non-image binary resources are written to private
-temporary files for the local read tool. Repeated projections reuse a file,
-with native process limits on file count and total bytes. Formats marked as
+temporary files for the native CLI's local read tool. Repeated projections reuse
+a file, with native process limits on file count and total bytes. The CLI cleans
+up its temporary files on normal shutdown. Formats marked as
 images that the provider cannot attach stay subject to the native image policy.
 
 Programmatic shell calls return output,

@@ -58,10 +58,18 @@ impl BinaryOutputs {
     }
 }
 
+// Estimation and dispatch can project the same history repeatedly.
+static BINARY_OUTPUTS: OnceLock<Mutex<BinaryOutputs>> = OnceLock::new();
+
+pub(super) fn cleanup_binary_outputs() {
+    if let Some(outputs) = BINARY_OUTPUTS.get() {
+        let mut outputs = outputs.lock().unwrap_or_else(|error| error.into_inner());
+        *outputs = BinaryOutputs::default();
+    }
+}
+
 fn save_binary(data: &[u8], extension: &str) -> io::Result<PathBuf> {
-    // Estimation and dispatch can project the same history repeatedly.
-    static OUTPUTS: OnceLock<Mutex<BinaryOutputs>> = OnceLock::new();
-    OUTPUTS
+    BINARY_OUTPUTS
         .get_or_init(Mutex::default)
         .lock()
         .map_err(|_| io::Error::other("MCP binary output store unavailable"))?
@@ -628,6 +636,8 @@ mod tests {
         }
         outputs.bytes = MAX_BINARY_BYTES;
         assert!(outputs.save(b"new", ".pdf").is_err());
+        drop(outputs);
+        assert!(!file.exists());
     }
 
     #[test]
@@ -641,7 +651,10 @@ mod tests {
             .and_then(|output| output.strip_suffix(']'))
             .unwrap();
         assert!(!structured);
-        assert_eq!(std::fs::read(path).unwrap(), b"a");
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = pi_rs_workbench::coding::CodingTools::local(workspace.path()).unwrap();
+        let readable = tools.resolve_read_path(std::path::Path::new(path)).unwrap();
+        assert_eq!(std::fs::read(readable).unwrap(), b"a");
         assert_eq!(
             project_result(&binary, "fixture", "get", None),
             Some((output, false))
