@@ -46,7 +46,10 @@ at most once. A successful callback does not determine the interrupted Tool's
 outcome: the task fails for reconciliation and `abort_and_wait` can report
 pending cleanup. Woken roots and nested children with unsupported or uncertain
 owned work fail closed. Nested claims bind the exact foreground ancestry;
-callback markers retire atomically across it. A stopped callback is never
+callback markers retire atomically across it. A verified selected after result is
+available to the parent as `DurableTaskHost::child_result_with_after`, together with
+the uncertain original outcome. Parent settlement fences the child evidence
+and retains its identity lease through commit. A stopped callback is never
 replayed, and its receipt does not resolve the interrupted Tool outcome.
 With the non-default `experimental-graph-revision` feature, a woken root may
 also cancel after its recorded foreground owned-conversation graph has drained,

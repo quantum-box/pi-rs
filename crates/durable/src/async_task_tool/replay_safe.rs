@@ -1053,6 +1053,33 @@ impl DurableTaskHost for Host<'_, '_> {
             Some(NestedTaskResult::Cancelled) => Some(AsyncTaskResult::Cancelled),
         })
     }
+    async fn child_result_with_after(
+        &self,
+        child: &AsyncTaskCall,
+    ) -> Result<Option<(AsyncTaskResult, Option<crate::extension::ToolBlockResult>)>, String> {
+        let Some(result) = self.child_result(child).await? else {
+            return Ok(None);
+        };
+        if !matches!(result, AsyncTaskResult::Uncertain(_)) {
+            return Ok(Some((result, None)));
+        }
+        let mut docs = self.docs.lock().map_err(|e| e.to_string())?;
+        if !child.0.belongs_to(self.task.id()) {
+            return Err("child belongs to another parent".into());
+        }
+        let task = docs.get_owned_child(child.task_id())?;
+        let adapter = self.children.values().find(|adapter| {
+            adapter.identity().is_some_and(|identity| {
+                task.kind() == Some(identity.kind.as_str())
+                    && task.definition_version() == identity.definition_version
+            })
+        });
+        let after = match adapter {
+            Some(adapter) => docs.read_nested_woken_after(&task, adapter)?,
+            None => None,
+        };
+        Ok(Some((result, after)))
+    }
 }
 impl Host<'_, '_> {
     fn validate_wait(&self, calls: &[AsyncTaskCall]) -> Result<Vec<uuid::Uuid>, String> {
