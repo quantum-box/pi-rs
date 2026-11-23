@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use super::{
     Cli,
     model_auth::{Credential, Keys},
-    pi_messages::PiMessages,
+    pi_messages::{PiMessages, RadiusCatalogCache},
     providers::{Client, Provider},
     radius_catalog,
 };
@@ -1040,7 +1040,7 @@ pub(super) struct Operations {
 struct HttpOptions {
     client: reqwest::Client,
     settings: super::config::Settings,
-    radius: Arc<tokio::sync::OnceCell<Option<PiMessages>>>,
+    radius: RadiusCatalogCache,
 }
 
 impl Operations {
@@ -1055,7 +1055,7 @@ impl Operations {
             http: Arc::new(RwLock::new(HttpOptions {
                 client,
                 settings,
-                radius: Arc::default(),
+                radius: RadiusCatalogCache::default(),
             })),
         }
     }
@@ -1066,7 +1066,7 @@ impl Operations {
         *self.http.write().expect("model operation HTTP options") = HttpOptions {
             client,
             settings,
-            radius: Arc::default(),
+            radius: RadiusCatalogCache::default(),
         };
         Ok(())
     }
@@ -1080,21 +1080,17 @@ impl Operations {
 
     async fn radius_client(&self) -> Option<PiMessages> {
         let http = self.current_http();
-        http.radius
-            .get_or_init(|| async {
-                let mut args = self.args.clone();
-                args.settings = http.settings.clone();
-                let client = args
-                    .connect_provider(&Provider::Radius, None)
-                    .ok()?
-                    .with_context_probes(!args.offline);
-                match client.resolve_affinity_headers().await.ok()?.0 {
-                    Client::PiMessages(client) => Some(client),
-                    _ => None,
-                }
-            })
-            .await
-            .clone()
+        let mut args = self.args.clone();
+        args.settings = http.settings;
+        args.model_keys = Keys::load_async().await.ok()?;
+        let client = args
+            .connect_provider(&Provider::Radius, None)
+            .ok()?
+            .with_context_probes(!args.offline);
+        match client.resolve_affinity_headers().await.ok()?.0 {
+            Client::PiMessages(client) => Some(client.with_radius_catalog_cache(http.radius)),
+            _ => None,
+        }
     }
 
     async fn radius_classifiers(&self) -> Vec<Entry> {
@@ -1160,7 +1156,8 @@ impl Operations {
 
 fn radius_entries(catalog: &radius_catalog::Catalog) -> Vec<Entry> {
     let mut base = catalog.base.clone();
-    let path = base.path().trim_end_matches('/').to_owned();
+    let path = base.path().trim_end_matches('/');
+    let path = path.strip_suffix("/messages").unwrap_or(path);
     base.set_path(&format!("{path}/"));
     let endpoint = base.join("classify").expect("validated Radius base URL");
     catalog
@@ -1359,14 +1356,14 @@ impl Tool for Operations {
                 Ok(Some((catalog, token))) => radius_entries(&catalog)
                     .into_iter()
                     .find(|entry| Some(entry.model.id.as_str()) == args["id"].as_str())
-                    .map(|entry| (entry, token)),
+                    .map(|entry| (entry, token, radius.context_headers())),
                 Ok(None) => None,
                 Err(error) => return Outcome::Failed(error.to_string()),
             }
         } else {
             None
         };
-        let Some(model) = configured.or(radius.as_ref().map(|(model, _)| model)) else {
+        let Some(model) = configured.or(radius.as_ref().map(|(model, _, _)| model)) else {
             return Outcome::Failed("unknown model for this operation".into());
         };
         let mut data = json!({
@@ -1401,7 +1398,9 @@ impl Tool for Operations {
                 model,
                 &args["context"],
                 &keys,
-                radius.as_ref().map(|(_, token)| token.as_str()),
+                radius
+                    .as_ref()
+                    .map(|(_, token, headers)| (token.as_str(), headers)),
                 &mut data,
             );
             tokio::select! {
@@ -1514,7 +1513,7 @@ impl Operations {
         entry: &Entry,
         context: &Value,
         keys: &Keys,
-        radius_token: Option<&str>,
+        radius_auth: Option<(&str, &HeaderMap)>,
         data: &mut Value,
     ) -> Result<()> {
         let resolved = entry.resolved_cloudflare(keys)?;
@@ -1535,14 +1534,13 @@ impl Operations {
             Api::PiClassifier => (pi_classifier::payload(entry, context)?, false),
             Api::OpenRouterImages => (image_payload(entry, context)?, false),
         };
-        let (endpoint, mut headers) = if let Some(token) = radius_token {
+        let (endpoint, mut headers) = if let Some((token, configured)) = radius_auth {
             let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|_| Error::Config("invalid Radius classifier credential".into()))?;
             authorization.set_sensitive(true);
-            (
-                entry.endpoint.clone(),
-                HeaderMap::from_iter([(reqwest::header::AUTHORIZATION, authorization)]),
-            )
+            let mut headers = configured.clone();
+            headers.insert(reqwest::header::AUTHORIZATION, authorization);
+            (entry.endpoint.clone(), headers)
         } else {
             self.request_target(entry, keys, &settings).await?
         };
@@ -1891,9 +1889,9 @@ mod tests {
             };
             assert_eq!(data.as_array().unwrap().len(), 1, "{data}");
             assert_eq!(data[0]["api"], "pi-classifier");
-            assert_eq!(data[0]["id"], "radius-judge");
             assert_eq!(data[0]["contextWindow"], 8192);
             if !args.offline {
+                assert_eq!(data[0]["id"], "radius-judge");
                 let classify = json!({"action":"classify","provider":"radius","id":"radius-judge",
                     "context":{"state":{"fixture":true},"questions":{
                         "q":{"type":"bool","instructions":"match?","criteria":{"true":"yes","false":"no"}}
@@ -1905,6 +1903,28 @@ mod tests {
                 };
                 assert_eq!(data["answers"]["q"]["probability"], 0.8, "{data}");
                 assert_eq!(data["stopReason"], "stop", "{data}");
+                let gateway = super::super::radius_auth::Gateway::configured().unwrap();
+                std::fs::write(
+                    super::super::config::agent_dir().join("auth.json"),
+                    json!({
+                        "radius":{"type":"api_key","key":"rotated-fixture-key",
+                        "endpoint":gateway.model_endpoint().as_str()}
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                let Outcome::Structured { data, .. } = operation
+                    .invoke(
+                        json!({"action":"list","type":"classifier","provider":"radius"}),
+                        context(),
+                    )
+                    .await
+                else {
+                    panic!("rotated Radius catalogue discovery failed");
+                };
+                assert_eq!(data[0]["id"], "rotated-judge", "{data}");
+            } else {
+                assert_eq!(data[0]["id"], "rotated-judge", "{data}");
             }
             return;
         }
@@ -1925,6 +1945,7 @@ mod tests {
                 assert_eq!(line.trim_end(), method);
                 let mut length = 0;
                 let mut authorized = false;
+                let mut tenant = false;
                 loop {
                     line.clear();
                     assert!(request.read_line(&mut line).await.unwrap() > 0);
@@ -1936,13 +1957,20 @@ mod tests {
                         length = value.trim().parse().unwrap();
                     }
                     if name.eq_ignore_ascii_case("authorization") {
-                        authorized = value.trim() == "Bearer radius-fixture-key";
+                        authorized = value.trim() == format!("Bearer {key}");
+                    }
+                    if name.eq_ignore_ascii_case("x-fixture-tenant") {
+                        tenant = value.trim() == "test";
                     }
                 }
-                assert!(authorized);
+                assert!(authorized, "{method}");
+                if method.starts_with("POST") {
+                    assert!(tenant);
+                }
                 let result = if method.starts_with("GET") {
                     json!({"baseUrl":base,"models":[],"classifiers":[
-                        {"id":"radius-judge","name":"Judge","contextWindow":8192,"input":["text"],"cost":{"input":1.2}},
+                        {"id":if key == "rotated-fixture-key" {"rotated-judge"} else {"radius-judge"},
+                        "name":"Judge","contextWindow":8192,"input":["text"],"cost":{"input":1.2}},
                         {"id":"bad","name":"Bad","contextWindow":0,"input":["text"],"cost":{"input":1.2}},
                     ]})
                 } else {
