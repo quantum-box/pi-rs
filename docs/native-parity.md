@@ -148,7 +148,10 @@ thinking level, then the global default, then the current level. The worker
 commits the selection before the next request,
 or at settlement when the current prompt finishes without a follow-up. pi-rs
 uses the accepted model's configured image resize profile for new clipboard
-pastes and queued attachments.
+pastes and queued attachments. Regular and fullscreen PTY comparisons against
+Pi v1.6.0 held the first model response open while exercising the pickers,
+direct commands, and Save as Default. The queued follow-up used the newly
+selected model or thinking level, and only saving changed the global default.
 Model scopes (`--models` and `enabledModels`) add all available providers that
 share an exact unqualified model ID and warn about the ambiguity. A literal ID
 containing glob characters takes precedence over glob expansion across providers,
@@ -3276,7 +3279,10 @@ Konsole 25.04.2 also displayed the iTerm2 OSC 1337 protocol in both modes.
 Screenshots of the macOS pi-rs process relayed to Konsole in an isolated Linux
 display matched the visible bands of the 320×480 pasteboard PNG. Fullscreen
 sent a 320×208 crop and regular mode sent the full image for viewport
-clipping. Visual acceptance in the iTerm2 application remains open.
+clipping. Visual acceptance in the iTerm2 application remains open. The
+remaining check is to paste an image taller than the viewport, scroll it
+through both edges in fullscreen and regular mode, and verify that the image
+does not cover the editor or leave pixels behind after redraw and resize.
 
 ### Image cell-sizing checkpoint
 
