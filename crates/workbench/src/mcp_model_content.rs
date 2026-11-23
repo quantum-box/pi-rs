@@ -133,7 +133,50 @@ fn project_result(
         *projected.last_mut().expect("structured content added") = text(data.to_string());
     }
     let (output, structured) = encode_blocks(&projected);
-    (output.len() <= MAX_MODEL_CONTENT_BYTES).then_some((output, structured))
+    Some(if output.len() <= MAX_MODEL_CONTENT_BYTES {
+        (output, structured)
+    } else {
+        encode_limited_blocks(&projected)
+    })
+}
+
+fn encode_limited_blocks(projected: &[Value]) -> (String, bool) {
+    // Text may expand when escaped in an image-bearing JSON envelope. Leave
+    // room for the envelope and notice, and reserve the complete media first.
+    let mut available = MAX_MODEL_CONTENT_BYTES - 512;
+    let mut blocks = Vec::new();
+    let mut omitted_media = false;
+    for block in projected.iter().filter(|block| block["type"] != "text") {
+        let bytes = block.to_string().len() + 1;
+        if bytes <= available {
+            available -= bytes;
+            blocks.push(block.clone());
+        } else {
+            omitted_media = true;
+        }
+    }
+    let mut preview = joined_text(projected);
+    let text_limit = if blocks.is_empty() {
+        available
+    } else {
+        available / 6
+    };
+    let truncated_text = preview.len() > text_limit;
+    if truncated_text {
+        let mut boundary = text_limit;
+        while !preview.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        preview.truncate(boundary);
+    }
+    if truncated_text {
+        preview.push_str("\n[MCP text truncated at the native output limit]");
+    }
+    if omitted_media {
+        preview.push_str("\n[MCP resource content omitted at the native output limit]");
+    }
+    blocks.insert(0, text(preview));
+    encode_blocks(&blocks)
 }
 
 fn encode_blocks(projected: &[Value]) -> (String, bool) {
@@ -402,6 +445,23 @@ mod tests {
         assert!(!structured);
         assert_eq!(output, format!("notes\n{data}"));
         assert!(output.len() <= MAX_MODEL_CONTENT_BYTES);
+    }
+
+    #[test]
+    fn mcp_model_content_keeps_images_when_text_expands_past_the_output_limit() {
+        let original = tool_content(json!({"content":[
+            {"type":"resource","resource":{"uri":"mock://image","mimeType":"image/png","blob":"YQ=="}},
+            {"type":"resource","resource":{"uri":"mock://text","mimeType":"text/plain",
+                "blob":STANDARD.encode(vec![0; 270_000])}},
+        ]}));
+        assert!(original.len() < MAX_MODEL_CONTENT_BYTES);
+        let (projected, structured) = project_result(&original, "fixture", "get", None).unwrap();
+        assert!(structured);
+        assert!(projected.len() <= MAX_MODEL_CONTENT_BYTES);
+        let (text, images) = pi_rs::extract_tool_images(projected);
+        assert!(text.contains("MCP text truncated"));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, "YQ==");
     }
 
     #[test]
