@@ -1493,6 +1493,20 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Branch-local entry types this extension can render for its host.
+    fn custom_entry_renderer_types(&self) -> Vec<&str> {
+        Vec::new()
+    }
+
+    /// Render a branch-local entry without session or model access.
+    async fn render_custom_entry(
+        &self,
+        _entry: &CustomEntryRecord,
+        _options: &crate::CustomEntryRenderOptions,
+    ) -> ExtensionResult<Option<crate::RenderedExtensionContent>> {
+        Ok(None)
+    }
+
     /// Opt in to observing HTTP metadata before consuming a provider response body.
     fn handles_after_provider_response(&self) -> bool {
         false
@@ -2162,6 +2176,20 @@ impl Registry {
         let mut renderers = crate::CustomMessageRenderers::default();
         for extension in &self.extensions {
             for custom_type in extension.custom_message_renderer_types() {
+                renderers
+                    .renderers
+                    .entry(custom_type.to_owned())
+                    .or_insert_with(|| extension.clone());
+            }
+        }
+        renderers
+    }
+
+    /// Snapshot the first renderer registered for each custom entry type.
+    pub fn custom_entry_renderers(&self) -> crate::CustomEntryRenderers {
+        let mut renderers = crate::CustomEntryRenderers::default();
+        for extension in &self.extensions {
+            for custom_type in extension.custom_entry_renderer_types() {
                 renderers
                     .renderers
                     .entry(custom_type.to_owned())
