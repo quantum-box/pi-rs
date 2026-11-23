@@ -1215,6 +1215,10 @@ Within the existing initialization deadline, HTTP connections retry after
 other than 501. Remote resource reads and listings, including paged listings
 and templates, retry once on those HTTP statuses. Cancellation interrupts the
 resource retry wait, and ordinary tool calls are sent once on these failures.
+The client accepts numeric request IDs echoed as strings in streamed HTTP
+responses. Matching progress tokens can also be echoed as canonical decimal
+strings, as in Pi. Leading-zero strings remain distinct tokens.
+
 For stdio and streamable HTTP tool calls, progress notifications matching the
 request's MCP progress token renew its idle timeout. The live tool result shows
 the server's message or `Progress N[/total]` when no message was supplied.
