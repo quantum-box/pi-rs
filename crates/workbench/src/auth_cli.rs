@@ -1,15 +1,26 @@
-//! Check or explicitly print credentials using the normal endpoint-bound auth sources.
+//! Manage credentials using the normal endpoint-bound auth sources.
 use std::io::{self, Write};
 use std::time::Duration;
 
 use clap::Subcommand;
 use pi_rs::{Error, Result};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{Cli, Provider, model_selection, radius_auth};
 
 #[derive(Clone, Subcommand)]
 pub(super) enum AuthCommand {
+    /// Sign in with a provider account or save an API key.
+    #[command(override_usage = "pi auth login <provider> [--api-key] [--no-browser]")]
+    Login {
+        provider: String,
+        #[arg(long, hide = true, action = clap::ArgAction::SetTrue, overrides_with = "use_api_key")]
+        use_api_key: bool,
+        #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "no_browser")]
+        no_browser: bool,
+    },
+    /// Remove a saved credential for a provider.
+    Logout { provider: String },
     /// Check whether a provider has usable credentials.
     Check {
         #[arg(long)]
@@ -37,6 +48,7 @@ struct Candidate {
 enum AuthType {
     ApiKey,
     OAuth,
+    UnresolvedAuthorization,
 }
 
 struct Resolved {
@@ -106,6 +118,26 @@ fn candidates(args: &Cli) -> Result<Vec<Candidate>> {
     Ok(matches)
 }
 
+fn check_candidate(args: &Cli) -> Result<Option<Candidate>> {
+    let model = args.model.trim();
+    if !args.model_explicit
+        || args.provider_argument.is_some()
+        || model_selection::qualified_model(model, &args.model_profiles).is_some()
+    {
+        // Keep the existing provider-constrained lookup, including native
+        // qualified IDs for models not present in the local catalog.
+        return candidates(args).map(|mut candidates| candidates.pop());
+    }
+    // Pi's auth-check catalog does not refresh availability, so credential
+    // presence does not disambiguate the model.
+    let choice = model_selection::cli_catalog_model(args, model, true)?
+        .ok_or_else(|| Error::Config(format!("Model \"{model}\" not found")))?;
+    Ok(Some(Candidate {
+        provider: choice.provider,
+        model: Some(choice.model),
+    }))
+}
+
 async fn resolve(
     args: &Cli,
     candidate: &Candidate,
@@ -119,6 +151,75 @@ async fn resolve(
         .and_then(|id| args.model_profiles.model_endpoint(provider, id))
         .unwrap_or_else(|| args.model_profiles.endpoint(provider));
     if let Some(credential) = args.configured_model_credential(provider, endpoint) {
+        if let super::model_auth::Credential::AnthropicFederation(federation) = &credential {
+            if model.is_some_and(|id| {
+                args.model_profiles.model_adapter(provider, id)
+                    != super::providers::Adapter::Anthropic
+            }) {
+                return Ok(None);
+            }
+            let headers = args
+                .model_profiles
+                .header_settings(provider, endpoint, model)
+                .with_environment(args.model_keys.environment(
+                    provider,
+                    endpoint,
+                    &args.model_profiles,
+                ));
+            let selected = if no_refresh {
+                headers.anthropic_auth_without_refresh().await?
+            } else {
+                let (headers, selected) = headers.resolve_anthropic_auth().await?;
+                selected.map(|name| {
+                    let value = headers[&name].clone();
+                    (name, Some(value))
+                })
+            };
+            if let Some((name, value)) = selected {
+                let value = value
+                    .as_ref()
+                    .map(|value| value.to_str().expect("validated Anthropic header"));
+                let (kind, value) = match (name.as_str(), value) {
+                    ("x-api-key", value) => (AuthType::ApiKey, value.map(str::trim)),
+                    ("authorization", None) => (AuthType::UnresolvedAuthorization, None),
+                    ("authorization", Some(value)) => {
+                        let mut parts = value.split_ascii_whitespace();
+                        match (parts.next(), parts.next(), parts.next()) {
+                            (Some(scheme), Some(token), None)
+                                if scheme.eq_ignore_ascii_case("bearer") =>
+                            {
+                                (AuthType::OAuth, Some(token))
+                            }
+                            _ => (AuthType::ApiKey, None),
+                        }
+                    }
+                    _ => (AuthType::ApiKey, None),
+                };
+                return Ok(wanted
+                    .is_none_or(|wanted| wanted == kind)
+                    .then(|| Resolved {
+                        kind,
+                        value: value.map(str::to_owned),
+                    }));
+            }
+            if wanted == Some(AuthType::ApiKey) {
+                return Ok(None);
+            }
+            let value = if no_refresh {
+                federation.check_identity_file().await?;
+                None
+            } else {
+                Some(
+                    federation
+                        .access_with_minimum(&args.settings, minimum)
+                        .await?,
+                )
+            };
+            return Ok(Some(Resolved {
+                kind: AuthType::OAuth,
+                value,
+            }));
+        }
         if matches!(credential, super::model_auth::Credential::BedrockChain) {
             return Ok(
                 (wanted.is_none() && bedrock_ambient_configured(false)).then_some(Resolved {
@@ -252,6 +353,115 @@ fn emit(line: &str) -> Result<()> {
     Ok(())
 }
 
+fn auth_type(entry: &Value) -> Option<AuthType> {
+    match entry["type"].as_str() {
+        Some("api_key") => Some(AuthType::ApiKey),
+        Some("oauth") => Some(AuthType::OAuth),
+        _ => None,
+    }
+}
+
+fn radius_refresh_pending(entry: &Value) -> bool {
+    entry
+        .get(radius_auth::REFRESH_PENDING)
+        .is_some_and(|pending| pending != false)
+}
+
+async fn logout(settings: &super::config::Settings, reference: &str) -> Result<i32> {
+    use super::{auth_lock, config, model_auth, model_profiles};
+
+    let printable = |value: &str| -> String {
+        value
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect()
+    };
+    let path = config::agent_dir().join("auth.json");
+    let data = config::read_auth_object(&path).await?;
+    let exact = auth_type(&data[reference]).is_some();
+    let profiles = match model_profiles::Profiles::load(&model_auth::Keys::parse(&data)) {
+        Ok(profiles) => profiles,
+        Err(_) if exact => model_profiles::Profiles::default(),
+        Err(error) => return Err(error),
+    };
+    let (provider, id) = if exact {
+        (profiles.provider(reference), reference.to_owned())
+    } else {
+        let provider = profiles.auth_provider(reference)?;
+        let id = provider.as_ref().map_or(reference, Provider::id).to_owned();
+        (provider, id)
+    };
+    let id = id.as_str();
+    let name = printable(provider.as_ref().map_or(reference, |provider| {
+        profiles.provider_display_name(provider)
+    }));
+    let stored = auth_type(&data[id]);
+    if provider.is_none() && stored.is_none() {
+        let mut ids: Vec<_> = data
+            .as_object()
+            .expect("auth object")
+            .iter()
+            .filter(|(_, entry)| auth_type(entry).is_some())
+            .map(|(id, _)| printable(id))
+            .collect();
+        ids.sort_unstable();
+        eprintln!("Unknown provider \"{name}\".");
+        let saved = if ids.is_empty() {
+            "none".into()
+        } else {
+            ids.join(", ")
+        };
+        eprintln!("Stored credentials: {saved}");
+        return Ok(1);
+    }
+
+    let removed = match id {
+        "openai-chatgpt" if stored != Some(AuthType::ApiKey) => {
+            super::chatgpt_auth::logout(settings)
+                .await?
+                .then_some(AuthType::OAuth)
+        }
+        "radius" if stored == Some(AuthType::OAuth) || radius_refresh_pending(&data[id]) => {
+            radius_auth::Gateway::configured_with_settings(settings)?
+                .logout()
+                .await?
+                .then_some(AuthType::OAuth)
+        }
+        _ if stored.is_some() => {
+            let guard = auth_lock::acquire_async(&path).await?;
+            let data = config::read_auth_object_locked(&guard)?;
+            let current = auth_type(&data[id]);
+            if current.is_some()
+                && (id != "radius"
+                    || (current == Some(AuthType::ApiKey) && !radius_refresh_pending(&data[id])))
+                && (id != "openai-chatgpt" || current == Some(AuthType::ApiKey))
+            {
+                config::update_object_locked(&path, Some(&guard), |entries| {
+                    entries.remove(id);
+                    Ok(())
+                })?;
+                current
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    match removed {
+        Some(AuthType::OAuth) => emit(&format!("Logged out of {name}."))?,
+        Some(AuthType::ApiKey) => emit(&format!(
+            "Removed stored API key for {name}. Environment variables and models.json config are unchanged."
+        ))?,
+        Some(AuthType::UnresolvedAuthorization) => {
+            emit(&format!("Removed stored credentials for {name}."))?;
+        }
+        None => emit(&format!(
+            "No stored credentials for {name}. Environment variables and models.json config are unchanged."
+        ))?,
+    }
+    Ok(0)
+}
+
 pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
     // Auth commands are dispatched before normal interactive configuration is loaded.
     // Honor existing trust decisions without prompting in this noninteractive command.
@@ -271,6 +481,17 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
         return Err(Error::Config(
             "omit --api-key when resolving configured credentials".into(),
         ));
+    }
+    if let AuthCommand::Login {
+        provider,
+        use_api_key,
+        no_browser,
+    } = command
+    {
+        return super::auth_login::login(&args, &provider, use_api_key, no_browser).await;
+    }
+    if let AuthCommand::Logout { provider } = command {
+        return logout(&args.settings, &provider).await;
     }
     let name = args
         .provider_argument
@@ -304,7 +525,6 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
             return Err(error);
         }
     }
-    let candidates = candidates(&args)?;
     if let AuthCommand::Check {
         json,
         credentials,
@@ -316,7 +536,8 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
         let mut auth_type = None;
         let mut output_credential = None;
         let mut provider = name;
-        if let [candidate] = candidates.as_slice() {
+        let candidate = check_candidate(&args);
+        if let Ok(Some(candidate)) = &candidate {
             provider = candidate.provider.id();
             match resolve(&args, candidate, no_refresh, Duration::ZERO, None).await {
                 Ok(Some(value)) => {
@@ -326,11 +547,11 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
                     } else {
                         status = "ready";
                         reason = None;
-                        auth_type = Some(if value.kind == AuthType::OAuth {
-                            "oauth"
-                        } else {
-                            "api_key"
-                        });
+                        auth_type = match value.kind {
+                            AuthType::ApiKey => Some("api_key"),
+                            AuthType::OAuth => Some("oauth"),
+                            AuthType::UnresolvedAuthorization => None,
+                        };
                         if credentials {
                             output_credential = value.value;
                         }
@@ -342,7 +563,7 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
                     reason = Some("invalid_state");
                 }
             }
-        } else if candidates.len() > 1 {
+        } else if candidate.is_err() {
             status = "invalid";
             reason = Some("invalid_state");
         }
@@ -375,9 +596,12 @@ pub(super) async fn run(mut args: Cli, command: AuthCommand) -> Result<i32> {
             min_expiry.unwrap_or(Duration::from_secs(30 * 60)),
             "OAuth bearer token",
         ),
-        AuthCommand::Check { .. } => unreachable!("check already returned"),
+        AuthCommand::Check { .. } | AuthCommand::Login { .. } | AuthCommand::Logout { .. } => {
+            unreachable!("credential management already returned")
+        }
     };
     let mut matches = Vec::new();
+    let candidates = candidates(&args)?;
     for candidate in &candidates {
         if let Some(credential) = resolve(&args, candidate, false, minimum, Some(kind)).await?
             && let Some(value) = credential.value
