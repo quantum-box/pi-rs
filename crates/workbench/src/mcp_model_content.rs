@@ -26,6 +26,9 @@ struct ResourceOutputs {
 
 impl ResourceOutputs {
     fn save(&mut self, data: &[u8], extension: &str) -> io::Result<PathBuf> {
+        if data.len() > MAX_MODEL_CONTENT_BYTES {
+            return Err(io::Error::other("native MCP tool output limit reached"));
+        }
         let key = (Sha256::digest(data).into(), extension.to_owned());
         if let Some(path) = self.files.get(&key) {
             if unchanged(path, data) {
@@ -250,7 +253,19 @@ fn project_result_with_files(
         })
     });
     if let Some(data) = distinct_data {
-        projected.push(text(serde_json::to_string_pretty(data).ok()?));
+        let pretty = serde_json::to_string_pretty(data).ok()?;
+        let other_bytes: usize = projected
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .map(|body| body.len() + 1)
+            .sum();
+        projected.push(text(
+            if other_bytes + pretty.len() <= MAX_MODEL_CONTENT_BYTES {
+                pretty
+            } else {
+                data.to_string()
+            },
+        ));
     }
     let location = limit_text_preview(&mut projected, files);
     if let Some(location) = &location {
@@ -709,7 +724,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),
-            format!("notes\n{}", serde_json::to_string_pretty(&data).unwrap())
+            format!("notes\n{data}")
         );
     }
 
@@ -867,6 +882,11 @@ mod tests {
             ".bin"
         );
         let mut outputs = ResourceOutputs::default();
+        assert!(
+            outputs
+                .save(&vec![0; MAX_MODEL_CONTENT_BYTES + 1], ".bin")
+                .is_err()
+        );
         let file = outputs.save(b"hello", ".pdf").unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), b"hello");
         assert_eq!(outputs.save(b"hello", ".pdf").unwrap(), file);
