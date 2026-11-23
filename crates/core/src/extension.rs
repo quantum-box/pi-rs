@@ -1493,6 +1493,20 @@ pub trait Extension: Send + Sync {
         Ok(None)
     }
 
+    /// Opt in to display-only Markdown transformations.
+    fn handles_markdown_transform(&self) -> bool {
+        false
+    }
+
+    /// Transform normal user, assistant, or thinking Markdown for display.
+    async fn transform_markdown(
+        &self,
+        _markdown: &str,
+        _context: &crate::MarkdownTransformContext,
+    ) -> ExtensionResult<Option<String>> {
+        Ok(None)
+    }
+
     /// Opt in to observing HTTP metadata before consuming a provider response body.
     fn handles_after_provider_response(&self) -> bool {
         false
@@ -2183,6 +2197,18 @@ impl Registry {
             }
         }
         renderers
+    }
+
+    /// Snapshot Markdown transformers in extension load order.
+    pub fn markdown_transformers(&self) -> crate::MarkdownTransformers {
+        crate::MarkdownTransformers {
+            extensions: self
+                .extensions
+                .iter()
+                .filter(|extension| extension.handles_markdown_transform())
+                .cloned()
+                .collect(),
+        }
     }
 
     /// Whether a registered extension without a source path is a host built-in.
