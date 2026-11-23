@@ -889,7 +889,7 @@ fn exact<'a>(value: &str, available: &'a [String], provider: &str) -> Option<&'a
         })
 }
 
-fn thinking_suffix(value: &str) -> Option<(&str, &str)> {
+pub(super) fn thinking_suffix(value: &str) -> Option<(&str, &str)> {
     let (model, thinking) = value.rsplit_once(':')?;
     (!model.is_empty()
         && matches!(
