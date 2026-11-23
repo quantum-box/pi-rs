@@ -505,17 +505,23 @@ impl Runtime {
         enabled: bool,
         cancel: &CancellationToken,
     ) -> Result<&'static str> {
-        let updated = mcp_config::edit_manager_config(args, request, cancel).await?;
-        request.config = updated.config.clone().expect("validated MCP configuration");
-        self.update_mcp_inspection(updated);
         if enabled {
+            let updated = mcp_config::edit_manager_config(args, request, cancel).await?;
+            request.config = updated.config.clone().expect("validated MCP configuration");
+            self.update_mcp_inspection(updated);
             self.reconnect_mcp(args, &request.name, &request.config, cancel)
                 .await?;
             Ok("Enabled")
         } else {
             let catalog = self.catalog.clone();
             let _mutation = catalog.refresh.lock().await;
-            self.disconnect_mcp(&catalog, &request.name).await?;
+            let disconnect = self.prepare_mcp_disconnect(&catalog, &request.name)?;
+            let updated = mcp_config::edit_manager_config(args, request, cancel).await?;
+            request.config = updated.config.clone().expect("validated MCP configuration");
+            self.update_mcp_inspection(updated);
+            if let Some(disconnect) = disconnect {
+                self.apply_mcp_disconnect(&catalog, disconnect);
+            }
             Ok("Disabled")
         }
     }
@@ -568,11 +574,11 @@ impl Runtime {
         }
     }
 
-    async fn disconnect_mcp(
-        &mut self,
+    fn prepare_mcp_disconnect(
+        &self,
         catalog: &LiveMcpCatalog,
         name: &str,
-    ) -> Result<Option<usize>> {
+    ) -> Result<Option<McpDisconnect>> {
         let mut servers = catalog.servers();
         let Some(index) = servers.iter().position(|server| server.server_name == name) else {
             return Ok(None);
@@ -580,12 +586,21 @@ impl Runtime {
         let old = servers.remove(index);
         let mut registry = self.registry.clone();
         registry.try_unregister(old.id())?;
-        let prompt = catalog.select_mcp_tools(&mut registry, &servers);
-        self.registry = registry;
-        catalog.state.lock().expect("MCP catalog").servers = servers;
-        catalog.close_in_background(old);
-        self.system_prompt = prompt?;
-        Ok(Some(index))
+        let system_prompt = catalog.select_mcp_tools(&mut registry, &servers)?;
+        Ok(Some(McpDisconnect {
+            index,
+            old,
+            servers,
+            registry,
+            system_prompt,
+        }))
+    }
+
+    fn apply_mcp_disconnect(&mut self, catalog: &LiveMcpCatalog, disconnect: McpDisconnect) {
+        self.registry = disconnect.registry;
+        self.system_prompt = disconnect.system_prompt;
+        catalog.state.lock().expect("MCP catalog").servers = disconnect.servers;
+        catalog.close_in_background(disconnect.old);
     }
 
     async fn reconnect_mcp(
@@ -610,7 +625,13 @@ impl Runtime {
         if cancel.is_cancelled() {
             return Err(pi_rs::Error::Cancelled);
         }
-        let index = self.disconnect_mcp(&catalog, name).await?;
+        let index = self
+            .prepare_mcp_disconnect(&catalog, name)?
+            .map(|disconnect| {
+                let index = disconnect.index;
+                self.apply_mcp_disconnect(&catalog, disconnect);
+                index
+            });
         let mut servers = catalog.servers();
         check_config()?;
         let result = tokio::select! {
@@ -750,6 +771,7 @@ impl Runtime {
         if cancel.is_cancelled() {
             return Err(pi_rs::Error::Cancelled);
         }
+        let disconnect = self.prepare_mcp_disconnect(&catalog, name)?;
         pi_rs_workbench::mcp_auth::logout(name, url).await?;
         self.mcp_sign_in.retain(|pending| pending != name);
         self.mcp_auth_required
@@ -759,7 +781,9 @@ impl Runtime {
                 config: config.clone(),
                 challenge: None,
             });
-        self.disconnect_mcp(&catalog, name).await?;
+        if let Some(disconnect) = disconnect {
+            self.apply_mcp_disconnect(&catalog, disconnect);
+        }
         Ok(())
     }
 
@@ -1099,6 +1123,14 @@ struct LiveMcpCatalog {
     state: std::sync::Mutex<McpCatalogState>,
     refresh: tokio::sync::Mutex<()>,
     closing: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+struct McpDisconnect {
+    index: usize,
+    old: Arc<pi_rs_workbench::mcp::McpExtension>,
+    servers: Vec<Arc<pi_rs_workbench::mcp::McpExtension>>,
+    registry: Registry,
+    system_prompt: String,
 }
 
 #[derive(Clone)]
