@@ -11581,22 +11581,30 @@ async fn exercise_nested_woken_owned(selected: bool, cut: NestedOwnedCut) {
             })
             .await
             .unwrap();
-            if selected {
-                let observed = tokio::time::timeout(Duration::from_secs(10), async {
-                    loop {
-                        assert!(resumed.try_wait().unwrap().is_none());
-                        if let Ok(result) =
-                            std::fs::read_to_string(dir.path().join("observed-child"))
-                            && (result.starts_with("Err(")
-                                || result.contains("Some(ToolBlockResult"))
-                        {
-                            break result;
+            let observed = if selected {
+                Some(
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            assert!(resumed.try_wait().unwrap().is_none());
+                            if let Ok(result) =
+                                std::fs::read_to_string(dir.path().join("observed-child"))
+                                && (result.starts_with("Err(")
+                                    || result.contains("Some(ToolBlockResult"))
+                            {
+                                break result;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                         }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .unwrap();
+                    })
+                    .await,
+                )
+            } else {
+                None
+            };
+            resumed.kill().unwrap();
+            resumed.wait().unwrap();
+            if let Some(observed) = observed {
+                let observed = observed.expect("parent never received the child evidence");
                 assert!(observed.starts_with("Some((Uncertain("), "{observed}");
                 assert!(observed.contains("Some(ToolBlockResult"), "{observed}");
                 assert!(dir.path().join("read-twice-ok").exists());
@@ -11605,8 +11613,6 @@ async fn exercise_nested_woken_owned(selected: bool, cut: NestedOwnedCut) {
                 std::fs::read_to_string(dir.path().join("nested-cancelled")).unwrap(),
                 "called\n"
             );
-            resumed.kill().unwrap();
-            resumed.wait().unwrap();
             return;
         }
         resumed.kill().unwrap();

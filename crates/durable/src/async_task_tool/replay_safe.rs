@@ -964,6 +964,7 @@ struct Host<'a, 'b> {
     docs: Mutex<&'a mut crate::document::TaskDocuments<'b>>,
     children: &'a HashMap<String, Arc<TaskTool>>,
     started: Mutex<HashSet<uuid::Uuid>>,
+    cancellation: &'a pi_rs_core::CancellationToken,
 }
 
 #[async_trait::async_trait]
@@ -1063,22 +1064,43 @@ impl DurableTaskHost for Host<'_, '_> {
         if !matches!(result, AsyncTaskResult::Uncertain(_)) {
             return Ok(Some((result, None)));
         }
-        let mut docs = self.docs.lock().map_err(|e| e.to_string())?;
-        if !child.0.belongs_to(self.task.id()) {
-            return Err("child belongs to another parent".into());
+        // Recheck the evidence after contention without holding the document lock.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if self.cancellation.is_cancelled() {
+                return Err("child result read cancelled".into());
+            }
+            let after = {
+                let mut docs = self.docs.lock().map_err(|e| e.to_string())?;
+                if !child.0.belongs_to(self.task.id()) {
+                    return Err("child belongs to another parent".into());
+                }
+                let task = docs.get_owned_child(child.task_id())?;
+                let adapter = self.children.values().find(|adapter| {
+                    adapter.identity().is_some_and(|identity| {
+                        task.kind() == Some(identity.kind.as_str())
+                            && task.definition_version() == identity.definition_version
+                    })
+                });
+                match adapter {
+                    Some(adapter) => docs.read_nested_woken_after(&task, adapter),
+                    None => Ok(None),
+                }
+            };
+            match after {
+                Ok(after) => return Ok(Some((result, after))),
+                Err(crate::runtime::Error::TaskPublicationBusy)
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::select! {
+                        biased;
+                        _ = self.cancellation.cancelled() => return Err("child result read cancelled".into()),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                    }
+                }
+                Err(error) => return Err(error.to_string()),
+            }
         }
-        let task = docs.get_owned_child(child.task_id())?;
-        let adapter = self.children.values().find(|adapter| {
-            adapter.identity().is_some_and(|identity| {
-                task.kind() == Some(identity.kind.as_str())
-                    && task.definition_version() == identity.definition_version
-            })
-        });
-        let after = match adapter {
-            Some(adapter) => docs.read_nested_woken_after(&task, adapter)?,
-            None => None,
-        };
-        Ok(Some((result, after)))
     }
 }
 impl Host<'_, '_> {
@@ -3239,6 +3261,7 @@ impl Handler for Executor {
             docs: Mutex::new(docs),
             children: &self.children,
             started: Mutex::new(HashSet::new()),
+            cancellation,
         };
         let (result, args, no_dispatch) = runtime.block_on(async {
             let args = match saved_args {
