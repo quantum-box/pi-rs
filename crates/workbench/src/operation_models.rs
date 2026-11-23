@@ -1932,11 +1932,17 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gateway = format!("http://{}", listener.local_addr().unwrap());
-        let base = format!("{gateway}/relay/v1");
+        let base = format!("{gateway}/relay/v1/messages");
+        std::fs::write(
+            home.path().join("models.json"),
+            json!({"providers":{"radius":{"headers":{"x-fixture-tenant":"test"}}}}).to_string(),
+        )
+        .unwrap();
         let server = tokio::spawn(async move {
-            for method in [
-                "GET /v1/config HTTP/1.1",
-                "POST /relay/v1/classify HTTP/1.1",
+            for (method, key) in [
+                ("GET /v1/config HTTP/1.1", "radius-fixture-key"),
+                ("POST /relay/v1/classify HTTP/1.1", "radius-fixture-key"),
+                ("GET /v1/config HTTP/1.1", "rotated-fixture-key"),
             ] {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut request = BufReader::new(socket);
