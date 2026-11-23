@@ -2333,6 +2333,9 @@ struct CodingTool {
     kind: Kind,
 }
 
+#[doc(hidden)]
+pub const READ_PAGE_BYTES: usize = crate::tool_output::MAX_BYTES;
+
 fn read_page_parameter(pi_numeric: bool) -> Value {
     if pi_numeric {
         json!({"type":"number"})

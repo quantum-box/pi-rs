@@ -1,5 +1,10 @@
 //! Project MCP call results into the provider request without changing the journal.
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    io::{self, Read, Write},
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+};
 
 use base64::{
     Engine,
@@ -7,11 +12,103 @@ use base64::{
 };
 use pi_rs::{ImageContent, Message, ModelRequest};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 // MCP tools use the core tool output limit. A projected payload must fit it too.
 const MAX_MODEL_CONTENT_BYTES: usize = 1024 * 1024;
+const TEXT_PREVIEW_BYTES: usize = 20 * 1024;
+
+#[derive(Default)]
+struct ResourceOutputs {
+    directory: Option<tempfile::TempDir>,
+    files: BTreeMap<([u8; 32], String), PathBuf>,
+}
+
+impl ResourceOutputs {
+    fn save(&mut self, data: &[u8], extension: &str) -> io::Result<PathBuf> {
+        if data.len() > MAX_MODEL_CONTENT_BYTES {
+            return Err(io::Error::other("native MCP tool output limit reached"));
+        }
+        let key = (Sha256::digest(data).into(), extension.to_owned());
+        if let Some(path) = self.files.get(&key) {
+            if unchanged(path, data) {
+                return Ok(path.clone());
+            }
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let directory = match &self.directory {
+            Some(directory) => directory,
+            None => self
+                .directory
+                .insert(tempfile::Builder::new().prefix("pi-mcp-").tempdir()?),
+        };
+        let mut file = tempfile::Builder::new()
+            .prefix("resource-")
+            .suffix(extension)
+            .tempfile_in(directory.path())?;
+        file.write_all(data)?;
+        let (_, path) = file.keep().map_err(|error| error.error)?;
+        self.files.insert(key, path.clone());
+        Ok(path)
+    }
+}
+
+fn unchanged(path: &std::path::Path, data: &[u8]) -> bool {
+    let mut saved = Vec::new();
+    path.symlink_metadata()
+        .is_ok_and(|metadata| metadata.is_file())
+        && std::fs::File::open(path)
+            .and_then(|file| file.take(data.len() as u64 + 1).read_to_end(&mut saved))
+            .is_ok()
+        && saved == data
+}
+
+// Estimation and dispatch can project the same history repeatedly.
+static RESOURCE_OUTPUTS: OnceLock<Mutex<ResourceOutputs>> = OnceLock::new();
+
+pub(super) fn cleanup_output_files() {
+    if let Some(outputs) = RESOURCE_OUTPUTS.get() {
+        let mut outputs = outputs.lock().unwrap_or_else(|error| error.into_inner());
+        *outputs = ResourceOutputs::default();
+    }
+}
+
+fn save_output_file(data: &[u8], extension: &str) -> io::Result<PathBuf> {
+    RESOURCE_OUTPUTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .map_err(|_| io::Error::other("MCP output file store unavailable"))?
+        .save(data, extension)
+}
+
+#[derive(Clone, Copy)]
+struct FileReaders {
+    read: bool,
+    shell: bool,
+}
+
+impl FileReaders {
+    fn from_request(request: &ModelRequest) -> Self {
+        // CodingTools' remote adapters use the strict integer read offsets
+        // and bounded shell schema. Neither can read files on this host.
+        Self {
+            read: request.tools.iter().any(|tool| {
+                tool.name == "read" && tool.parameters["properties"]["offset"]["type"] == "number"
+            }),
+            shell: request.tools.iter().any(|tool| {
+                matches!(tool.name.as_str(), "bash" | "powershell")
+                    && tool.parameters["properties"]["timeout"] == json!({"type":"number"})
+            }),
+        }
+    }
+}
 
 pub(super) fn project_tool_results(request: &mut ModelRequest) {
+    let files = FileReaders::from_request(request);
     let readable = request
         .tools
         .iter()
@@ -45,7 +142,9 @@ pub(super) fn project_tool_results(request: &mut ModelRequest) {
                     continue;
                 };
                 let read_tool = readable.get(prefix).copied();
-                if let Some((text, structured)) = project_result(content, server, tool, read_tool) {
+                if let Some((text, structured)) =
+                    project_result_with_files(content, server, tool, read_tool, files)
+                {
                     *content = text;
                     *is_structured = Some(structured);
                 } else if is_structured.is_none()
@@ -89,11 +188,31 @@ fn is_resource_read(name: &str) -> bool {
     suffix.is_empty()
 }
 
+#[cfg(test)]
 fn project_result(
     content: &str,
     server: &str,
     tool: &str,
     read_tool: Option<&str>,
+) -> Option<(String, bool)> {
+    project_result_with_files(
+        content,
+        server,
+        tool,
+        read_tool,
+        FileReaders {
+            read: true,
+            shell: true,
+        },
+    )
+}
+
+fn project_result_with_files(
+    content: &str,
+    server: &str,
+    tool: &str,
+    read_tool: Option<&str>,
+    files: FileReaders,
 ) -> Option<(String, bool)> {
     let value: Value = serde_json::from_str(content).ok()?;
     let response = value.get("data")?;
@@ -102,7 +221,7 @@ fn project_result(
     {
         resources
             .iter()
-            .map(|resource| project_resource(resource, resources.len() > 1))
+            .map(|resource| project_resource(resource, resources.len() > 1, files.shell))
             .collect::<Vec<_>>()
     } else {
         let blocks = response["content"].as_array()?;
@@ -114,7 +233,7 @@ fn project_result(
             > 1;
         blocks
             .iter()
-            .map(|block| project_block(block, server, read_tool, multiple_resources))
+            .map(|block| project_block(block, server, read_tool, multiple_resources, files.shell))
             .collect()
     };
     if response["isError"] == true {
@@ -134,25 +253,114 @@ fn project_result(
         })
     });
     if let Some(data) = distinct_data {
-        projected.push(text(serde_json::to_string_pretty(data).ok()?));
-        let (output, structured) = encode_blocks(&projected);
-        if output.len() <= MAX_MODEL_CONTENT_BYTES {
-            return Some((output, structured));
-        }
-        *projected.last_mut().expect("structured content added") = text(data.to_string());
+        let pretty = serde_json::to_string_pretty(data).ok()?;
+        let other_bytes: usize = projected
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .map(|body| body.len() + 1)
+            .sum();
+        projected.push(text(
+            if other_bytes + pretty.len() <= MAX_MODEL_CONTENT_BYTES {
+                pretty
+            } else {
+                data.to_string()
+            },
+        ));
     }
-    let (output, structured) = encode_blocks(&projected);
+    let location = limit_text_preview(&mut projected, files);
+    if let Some(location) = &location {
+        projected.push(text(location));
+    }
+    let (mut output, mut structured) = encode_blocks(&projected);
+    if output.len() > MAX_MODEL_CONTENT_BYTES
+        && location.is_none()
+        && let Some(data) = distinct_data
+    {
+        *projected.last_mut().expect("structured content added") = text(data.to_string());
+        (output, structured) = encode_blocks(&projected);
+    }
     Some(if output.len() <= MAX_MODEL_CONTENT_BYTES {
         (output, structured)
     } else {
-        encode_limited_blocks(&projected)
+        if location.is_some() {
+            projected.pop();
+        }
+        encode_limited_blocks(&projected, location.as_deref())
     })
 }
 
-fn encode_limited_blocks(projected: &[Value]) -> (String, bool) {
+fn limit_text_preview(projected: &mut Vec<Value>, files: FileReaders) -> Option<String> {
+    let full = joined_text(projected);
+    if full.len() <= TEXT_PREVIEW_BYTES {
+        return None;
+    }
+    // The local reader drops LF but counts CR as part of a line.
+    let page_by_line = files.read
+        && full
+            .split('\n')
+            .all(|line| line.len() <= pi_rs_workbench::coding::READ_PAGE_BYTES);
+    let hint = if page_by_line {
+        "read it with offset/limit"
+    } else if files.shell {
+        "read byte ranges with the local shell"
+    } else {
+        return None;
+    };
+    // Keep the inline form if there is no usable copy on disk.
+    let Ok(path) = save_output_file(full.as_bytes(), ".txt") else {
+        return None;
+    };
+    let mut head = TEXT_PREVIEW_BYTES / 2;
+    let mut tail = full.len() - TEXT_PREVIEW_BYTES / 2;
+    while !full.is_char_boundary(head) {
+        head -= 1;
+    }
+    while !full.is_char_boundary(tail) {
+        tail += 1;
+    }
+    let tokens = full.len().div_ceil(4);
+    let total_lines = full.lines().count();
+    let removed = full[head..tail].chars().count();
+    let mut offset = 0;
+    let mut notice = Some(format!("…{removed} chars truncated…"));
+    let mut header = Some(format!(
+        "Warning: truncated output (original token count: {tokens})\nTotal output lines: {total_lines}\n"
+    ));
+    projected.retain_mut(|block| {
+        let Some(body) = block["text"].as_str() else {
+            return true;
+        };
+        let end = offset + body.len();
+        let mut preview = header.take().unwrap_or_default();
+        if offset < head {
+            preview.push_str(&body[..head.min(end) - offset]);
+        }
+        if end >= head
+            && let Some(notice) = notice.take()
+        {
+            preview.push_str(&notice);
+        }
+        if end > tail {
+            preview.push_str(&body[tail.max(offset) - offset..]);
+        }
+        offset = end + 1;
+        if preview.is_empty() {
+            return false;
+        }
+        *block = text(preview);
+        true
+    });
+    Some(format!("\n[Full output: {} ({hint})]", path.display()))
+}
+
+fn encode_limited_blocks(projected: &[Value], location: Option<&str>) -> (String, bool) {
     // Text may expand when escaped in an image-bearing JSON envelope. Leave
     // room for the envelope and notice, and reserve the complete media first.
-    let mut available = MAX_MODEL_CONTENT_BYTES - 512;
+    let location = location.map(text);
+    let location_bytes = location
+        .as_ref()
+        .map_or(0, |block| block.to_string().len() + 1);
+    let mut available = (MAX_MODEL_CONTENT_BYTES - 512).saturating_sub(location_bytes);
     let mut blocks = Vec::new();
     let mut omitted_media = false;
     for block in projected.iter().filter(|block| block["type"] != "text") {
@@ -185,6 +393,7 @@ fn encode_limited_blocks(projected: &[Value]) -> (String, bool) {
         preview.push_str("\n[MCP resource content omitted at the native output limit]");
     }
     blocks.insert(0, text(preview));
+    blocks.extend(location);
     encode_blocks(&blocks)
 }
 
@@ -205,6 +414,7 @@ fn project_block(
     server: &str,
     read_tool: Option<&str>,
     multiple_resources: bool,
+    binary_file: bool,
 ) -> Value {
     match block["type"].as_str() {
         Some("text") => block.clone(),
@@ -217,7 +427,7 @@ fn project_block(
             let mime = block["mimeType"].as_str().unwrap_or("unknown type");
             text(format!("[audio {mime} omitted]"))
         }
-        Some("resource") => project_resource(&block["resource"], multiple_resources),
+        Some("resource") => project_resource(&block["resource"], multiple_resources, binary_file),
         Some("resource_link") => {
             resource_link(block, server, read_tool).unwrap_or_else(|| block.clone())
         }
@@ -228,7 +438,7 @@ fn project_block(
     }
 }
 
-fn project_resource(resource: &Value, identify: bool) -> Value {
+fn project_resource(resource: &Value, identify: bool, binary_file: bool) -> Value {
     let content_text = |content: &str| {
         if identify && let Some(uri) = resource["uri"].as_str() {
             text(format!("[Resource {uri}]\n{content}"))
@@ -251,19 +461,59 @@ fn project_resource(resource: &Value, identify: bool) -> Value {
             .map_or(mime, |(media, _)| media)
             .trim()
             .to_ascii_lowercase();
-        if (media.starts_with("text/")
+        let textual = media.starts_with("text/")
             || media == "application/json"
             || media.ends_with("+json")
-            || media.ends_with("+xml"))
-            && let Ok(decoded) = STANDARD
-                .decode(blob)
-                .or_else(|_| STANDARD_NO_PAD.decode(blob))
-        {
+            || media.ends_with("+xml");
+        if textual && let Ok(decoded) = decode_blob(blob) {
             return content_text(&String::from_utf8_lossy(&decoded));
         }
+        // Keep unsupported image formats subject to the native image policy.
+        if binary_file && !media.starts_with("image/") {
+            let uri = resource["uri"].as_str().unwrap_or("unknown URI");
+            if let Some(output) = binary_resource(uri, mime, blob) {
+                return output;
+            }
+        }
     }
-    // Preserve the payload for native consumers until a readable file can be offered.
     json!({"type":"resource","resource":resource})
+}
+
+fn decode_blob(blob: &str) -> std::result::Result<Vec<u8>, base64::DecodeError> {
+    STANDARD
+        .decode(blob)
+        .or_else(|_| STANDARD_NO_PAD.decode(blob))
+}
+
+fn binary_resource(uri: &str, mime: &str, blob: &str) -> Option<Value> {
+    if blob.len() > MAX_MODEL_CONTENT_BYTES {
+        return None;
+    }
+    let mime = if mime.is_empty() {
+        "unknown type"
+    } else {
+        mime
+    };
+    let data = decode_blob(blob).ok()?;
+    let size = format_size(data.len() as u64);
+    let extension = resource_extension(uri);
+    let path = save_output_file(&data, &extension).ok()?;
+    Some(text(format!(
+        "[Binary resource {uri} ({mime}, {size}) saved to {}]",
+        path.display()
+    )))
+}
+
+fn resource_extension(uri: &str) -> String {
+    let url = reqwest::Url::parse(uri).ok();
+    let path = url.as_ref().map_or(uri, |url| url.path());
+    path.rsplit_once('.')
+        .map(|(_, extension)| extension)
+        .filter(|extension| {
+            (1..=8).contains(&extension.len())
+                && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .map_or_else(|| ".bin".into(), |extension| format!(".{extension}"))
 }
 
 fn resource_link(block: &Value, server: &str, read_tool: Option<&str>) -> Option<Value> {
@@ -404,7 +654,12 @@ mod tests {
         );
         assert!(caption.contains("caption"));
         assert!(!caption.contains("YQ=="));
-        assert!(caption.contains("dGVzdA=="));
+        assert!(
+            caption.contains(
+                "[Binary resource mock://binary (application/octet-stream, 4B) saved to "
+            )
+        );
+        assert!(!caption.contains("dGVzdA=="));
     }
 
     #[test]
@@ -459,8 +714,19 @@ mod tests {
         }));
         let (output, structured) = project_result(&original, "fixture", "get", None).unwrap();
         assert!(!structured);
-        assert_eq!(output, format!("notes\n{data}"));
-        assert!(output.len() <= MAX_MODEL_CONTENT_BYTES);
+        assert!(output.contains("notes\n"));
+        assert!(output.contains("Warning: truncated output"));
+        assert!(output.len() < TEXT_PREVIEW_BYTES + 1024);
+        let path = output
+            .split_once("[Full output: ")
+            .unwrap()
+            .1
+            .strip_suffix(" (read byte ranges with the local shell)]")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            format!("notes\n{data}")
+        );
     }
 
     #[test]
@@ -491,9 +757,173 @@ mod tests {
         assert!(structured);
         assert!(projected.len() <= MAX_MODEL_CONTENT_BYTES);
         let (text, images) = pi_rs::extract_tool_images(projected);
-        assert!(text.contains("MCP text truncated"));
+        assert!(text.contains("Warning: truncated output"));
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].data, "YQ==");
+    }
+
+    #[test]
+    fn mcp_model_content_keeps_the_saved_path_with_large_media() {
+        let original = tool_content(json!({"content":[
+            {"type":"resource","resource":{"uri":"mock://image",
+              "mimeType":"image/png","blob":STANDARD.encode(vec![0; 735_000])}},
+            {"type":"resource","resource":{"uri":"mock://text",
+              "mimeType":"text/plain","blob":STANDARD.encode(vec![0; 23_000])}},
+        ]}));
+        assert!(original.len() < MAX_MODEL_CONTENT_BYTES);
+        let (output, structured) = project_result(&original, "fixture", "get", None).unwrap();
+        assert!(structured);
+        assert!(output.len() <= MAX_MODEL_CONTENT_BYTES);
+        let value: Value = serde_json::from_str(&output).unwrap();
+        let content = value["data"]["content"].as_array().unwrap();
+        assert!(content.iter().any(|block| block["type"] == "image"));
+        let location = content.last().unwrap()["text"].as_str().unwrap();
+        let path = location
+            .strip_prefix("\n[Full output: ")
+            .unwrap()
+            .strip_suffix(" (read it with offset/limit)]")
+            .unwrap();
+        let saved = std::fs::read(path).unwrap();
+        let body = saved.strip_prefix(b"[Resource mock://text]\n").unwrap();
+        assert_eq!(body.len(), 23_000);
+        assert!(body.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn mcp_model_content_truncates_text_in_place_between_images() {
+        let original = tool_content(json!({"content":[
+            {"type":"text","text":"first ".repeat(2000)},
+            {"type":"image","data":"YQ==","mimeType":"image/png"},
+            {"type":"text","text":"middle ".repeat(2000)},
+            {"type":"image","data":"Yg==","mimeType":"image/png"},
+            {"type":"text","text":"last caption"},
+        ]}));
+        let (output, structured) = project_result(&original, "fixture", "get", None).unwrap();
+        assert!(structured);
+        let value: Value = serde_json::from_str(&output).unwrap();
+        let blocks = &value["data"]["content"];
+        assert!(blocks[0]["text"].as_str().unwrap().contains("truncated"));
+        assert_eq!(blocks[1]["data"], "YQ==");
+        assert!(blocks[2]["text"].as_str().unwrap().contains("middle"));
+        assert_eq!(blocks[3]["data"], "Yg==");
+        assert_eq!(blocks[4]["text"], "last caption");
+    }
+
+    #[test]
+    fn mcp_model_content_detects_the_local_cli_file_tools() {
+        use pi_rs::Extension;
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = pi_rs_workbench::coding::CodingTools::local(workspace.path()).unwrap();
+        let mut request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            max_output_tokens: 1,
+            tools: tools.tools().iter().map(|tool| tool.spec()).collect(),
+        };
+        let local = FileReaders::from_request(&request);
+        assert!(local.read && local.shell);
+        let wrapper = pi_rs_workbench::coding::CodingTools::local(workspace.path())
+            .unwrap()
+            .with_read_operations(std::sync::Arc::new(
+                pi_rs_workbench::coding::LocalReadOperations,
+            ))
+            .unwrap()
+            .with_bash_operations(pi_rs_workbench::coding::create_local_bash_operations(None))
+            .unwrap();
+        // These are the same adapters used with remote operations. On Windows
+        // a separate PowerShell tool stays local, even when bash is wrapped.
+        request.tools = wrapper
+            .tools()
+            .iter()
+            .map(|tool| tool.spec())
+            .filter(|spec| spec.name == "read" || spec.name == "bash")
+            .collect();
+        let remote = FileReaders::from_request(&request);
+        assert!(!remote.read && !remote.shell);
+    }
+
+    #[test]
+    fn mcp_model_content_keeps_inline_output_without_usable_file_tools() {
+        let long = "x".repeat(TEXT_PREVIEW_BYTES * 3);
+        let original = tool_content(json!({"content":[{"type":"text","text":long}]}));
+        for read in [false, true] {
+            let output = project_result_with_files(
+                &original,
+                "fixture",
+                "get",
+                None,
+                FileReaders { read, shell: false },
+            );
+            assert_eq!(output, Some((long.clone(), false)));
+        }
+        let short_lines = "line\n".repeat(TEXT_PREVIEW_BYTES);
+        let original = tool_content(json!({"content":[{"type":"text","text":short_lines}]}));
+        let (output, _) = project_result_with_files(
+            &original,
+            "fixture",
+            "get",
+            None,
+            FileReaders {
+                read: true,
+                shell: false,
+            },
+        )
+        .unwrap();
+        assert!(output.ends_with(" (read it with offset/limit)]"));
+    }
+
+    #[test]
+    fn mcp_model_content_counts_crlf_in_the_read_page_budget() {
+        let limit = pi_rs_workbench::coding::READ_PAGE_BYTES;
+        let body = format!("{}\r\nlast line", "x".repeat(limit));
+        let original = tool_content(json!({"content":[{"type":"text","text":body}]}));
+        let project =
+            |readers| project_result_with_files(&original, "fixture", "get", None, readers);
+        assert_eq!(
+            project(FileReaders {
+                read: true,
+                shell: false
+            }),
+            Some((body, false))
+        );
+        let (preview, _) = project(FileReaders {
+            read: true,
+            shell: true,
+        })
+        .unwrap();
+        assert!(preview.ends_with(" (read byte ranges with the local shell)]"));
+    }
+
+    #[test]
+    fn mcp_model_content_uses_private_files_and_replaces_modified_copies() {
+        assert_eq!(
+            resource_extension("mock://example/a.pdf?param=value"),
+            ".pdf"
+        );
+        assert_eq!(
+            resource_extension("mock://example/../../a.unusual-extension"),
+            ".bin"
+        );
+        let mut outputs = ResourceOutputs::default();
+        assert!(
+            outputs
+                .save(&vec![0; MAX_MODEL_CONTENT_BYTES + 1], ".bin")
+                .is_err()
+        );
+        let file = outputs.save(b"hello", ".pdf").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"hello");
+        assert_eq!(outputs.save(b"hello", ".pdf").unwrap(), file);
+        std::fs::write(&file, b"changed").unwrap();
+        let restored = outputs.save(b"hello", ".pdf").unwrap();
+        assert_ne!(file, restored);
+        assert_eq!(std::fs::read(&restored).unwrap(), b"hello");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(restored.metadata().unwrap().permissions().mode() & 0o077, 0);
+        }
+        drop(outputs);
+        assert!(!restored.exists());
     }
 
     #[test]
@@ -501,9 +931,19 @@ mod tests {
         let binary = tool_content(json!({"content":[{"type":"resource","resource":{
             "uri":"mock://binary","mimeType":"application/octet-stream","blob":"YQ==",
         }}]}));
+        let (output, structured) = project_result(&binary, "fixture", "get", None).unwrap();
+        let path = output
+            .strip_prefix("[Binary resource mock://binary (application/octet-stream, 1B) saved to ")
+            .and_then(|output| output.strip_suffix(']'))
+            .unwrap();
+        assert!(!structured);
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = pi_rs_workbench::coding::CodingTools::local(workspace.path()).unwrap();
+        let readable = tools.resolve_read_path(std::path::Path::new(path)).unwrap();
+        assert_eq!(std::fs::read(readable).unwrap(), b"a");
         assert_eq!(
             project_result(&binary, "fixture", "get", None),
-            Some((binary.clone(), true))
+            Some((output, false))
         );
         let read = tool_content(json!({"contents":[{"uri":"mock://notes","text":"contents"}]}));
         assert_eq!(

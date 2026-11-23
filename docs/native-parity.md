@@ -2034,8 +2034,13 @@ send text, embedded text resources, and resource links in the model-facing view.
 When a result contains multiple resources, text resources keep their URIs.
 Embedded images use the provider's existing image path and respect the active
 image policy. The model still receives distinct structured content alongside
-text blocks. Binary resources stay in the native envelope until exporting
-the payload as a readable file is supported.
+text blocks. When a local shell tool is available, embedded non-image binary
+resources can be saved to private temporary files. Text beyond 20 KiB shows
+its beginning and end with a link to the full text when an available local
+tool can read it. Output remains inline when a file cannot be used. Repeated
+projections reuse files, and the CLI cleans its temporary files on normal
+shutdown. The native limit on the size of each tool result still applies. Formats marked as
+images that the provider cannot attach stay subject to the native image policy.
 
 Programmatic shell calls return output,
 exit status, truncation and elapsed time, including nonzero exit statuses.
