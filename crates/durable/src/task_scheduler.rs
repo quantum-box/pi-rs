@@ -2881,12 +2881,12 @@ pub(crate) fn on_pending_graph_scope_retry(id: Uuid, hook: impl FnOnce() + Send 
         .unwrap()
         .insert(id, Box::new(hook));
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "experimental-graph-scope"))]
 fn known_woken_busy_retry_hooks() -> &'static BoundaryHooks {
     static HOOKS: OnceLock<BoundaryHooks> = OnceLock::new();
     HOOKS.get_or_init(Default::default)
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "experimental-graph-scope"))]
 pub(crate) fn on_known_woken_busy_retry(id: Uuid, hook: impl FnOnce() + Send + 'static) {
     known_woken_busy_retry_hooks()
         .lock()

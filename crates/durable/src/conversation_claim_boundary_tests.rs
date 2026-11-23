@@ -9486,6 +9486,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                 });
             }
             if graph_aba == 27 {
+                #[cfg(feature = "experimental-graph-scope")]
                 if std::env::var("PI_TEST_WOKEN_OWNED_CUT").ok().as_deref() == Some("busy") {
                     let control = std::path::PathBuf::from(
                         std::env::var_os("PI_TEST_WOKEN_OWNED_CONTROL").unwrap(),
