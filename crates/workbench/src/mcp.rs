@@ -1070,7 +1070,7 @@ impl McpExtension {
                 (
                     "read_resource",
                     "read_resource",
-                    "Read a resource URI from this MCP server",
+                    READ_RESOURCE_DESCRIPTION,
                     json!({"type":"object","properties":{"uri":{"type":"string"}},"required":["uri"],"additionalProperties":false}),
                 ),
             ] {
@@ -2198,6 +2198,9 @@ fn normalize(name: &str) -> String {
         })
         .collect()
 }
+#[doc(hidden)]
+pub const READ_RESOURCE_DESCRIPTION: &str = "Read a resource URI from this MCP server";
+
 const MIN_MCP_TIMEOUT: Duration = Duration::from_millis(1);
 const MAX_MCP_TIMEOUT: Duration = Duration::from_secs(3600);
 

@@ -1,5 +1,5 @@
 //! Project MCP call results into the provider request without changing the journal.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use base64::{
     Engine,
@@ -15,8 +15,12 @@ pub(super) fn project_tool_results(request: &mut ModelRequest) {
     let readable = request
         .tools
         .iter()
-        .filter_map(|spec| spec.name.strip_suffix("__read_resource"))
-        .collect::<BTreeSet<_>>();
+        .filter(|spec| spec.description == pi_rs_workbench::mcp::READ_RESOURCE_DESCRIPTION)
+        .filter_map(|spec| {
+            let (prefix, name) = spec.name.rsplit_once("__")?;
+            is_resource_read(name).then_some((prefix, spec.name.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut calls = BTreeMap::new();
     for message in &mut request.messages {
         match message {
@@ -35,12 +39,8 @@ pub(super) fn project_tool_results(request: &mut ModelRequest) {
                 && let Some(server) = prefix.strip_prefix("mcp__")
                 && pi_rs::tool_content_is_structured(content, *is_structured) =>
             {
-                let read_tool = readable
-                    .contains(prefix)
-                    .then(|| format!("{prefix}__read_resource"));
-                if let Some((text, structured)) =
-                    project_result(content, server, tool, read_tool.as_deref())
-                {
+                let read_tool = readable.get(prefix).copied();
+                if let Some((text, structured)) = project_result(content, server, tool, read_tool) {
                     *content = text;
                     *is_structured = Some(structured);
                 }
@@ -50,15 +50,25 @@ pub(super) fn project_tool_results(request: &mut ModelRequest) {
     }
 }
 
-fn mcp_tool_name<'a>(name: &'a str, readable: &BTreeSet<&str>) -> Option<(&'a str, &'a str)> {
+fn mcp_tool_name<'a>(name: &'a str, readable: &BTreeMap<&str, &str>) -> Option<(&'a str, &'a str)> {
     for (separator, _) in name.rmatch_indices("__") {
         let (prefix, suffix) = name.split_at(separator);
-        if readable.contains(prefix) {
+        if readable.contains_key(prefix) {
             return Some((prefix, &suffix[2..]));
         }
     }
     let (server, tool) = name.strip_prefix("mcp__")?.split_once("__")?;
     Some((&name[..5 + server.len()], tool))
+}
+
+fn is_resource_read(name: &str) -> bool {
+    let Some(mut suffix) = name.strip_prefix("read_resource") else {
+        return false;
+    };
+    while let Some(rest) = suffix.strip_prefix("_resource") {
+        suffix = rest;
+    }
+    suffix.is_empty()
 }
 
 fn project_result(
@@ -69,7 +79,7 @@ fn project_result(
 ) -> Option<(String, bool)> {
     let value: Value = serde_json::from_str(content).ok()?;
     let response = value.get("data")?;
-    let mut projected = if tool == "read_resource"
+    let mut projected = if is_resource_read(tool)
         && let Some(resources) = response["contents"].as_array()
     {
         resources
@@ -247,8 +257,8 @@ mod tests {
             model: "fixture".into(),
             max_output_tokens: 1,
             tools: vec![ToolSpec {
-                name: "mcp__fixture__read_resource".into(),
-                description: "".into(),
+                name: "mcp__fixture__read_resource_resource".into(),
+                description: pi_rs_workbench::mcp::READ_RESOURCE_DESCRIPTION.into(),
                 parameters: json!({"type":"object"}),
             }],
             messages: vec![Message::Assistant {
@@ -277,7 +287,7 @@ mod tests {
         assert_eq!(request.messages[2], original.messages[2]);
         assert_eq!(request.messages[1], Message::Tool {
             call_id: "mcp".into(),
-            content: "hello\n[Resource mock://notes \"Notes\" (text/plain, 2.0KB): Read me. Read it with mcp__fixture__read_resource (server \"fixture\")]\n[audio audio/wav omitted]\n{\n  \"internal\": \"raw result retained\"\n}".into(),
+            content: "hello\n[Resource mock://notes \"Notes\" (text/plain, 2.0KB): Read me. Read it with mcp__fixture__read_resource_resource (server \"fixture\")]\n[audio audio/wav omitted]\n{\n  \"internal\": \"raw result retained\"\n}".into(),
             is_error: false,
             is_structured: Some(false),
         });
