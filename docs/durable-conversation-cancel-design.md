@@ -437,7 +437,10 @@ history entries fail closed. History values are limited to 16 KiB each and
 keys to 512 bytes; larger values also fail closed. Before loading graph data,
 the feature rejects scans exceeding 16 MiB or 100,000 current-plus-history
 records. These database-wide limits can conservatively hold a receipt even when
-only an unrelated graph is large. This feature is disabled by
+only an unrelated graph is large. The size checks and graph traversal run inside
+the receipt's SQLite write transaction, so other writers can wait for a large
+scan even when their graphs are independent. These limits cap a single scan;
+they do not establish a latency guarantee. This feature is disabled by
 default pending broader compatibility and performance validation. Databases that already contain the older key-only history retain it without a
 size limit for compatibility with older readers, so their total database growth
 remains unbounded. New feature-enabled databases only install the bounded v2
