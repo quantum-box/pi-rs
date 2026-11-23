@@ -2032,8 +2032,10 @@ execution. Tests cover rollback, interruption, memory/stack limits, output
 truncation and parallel script calls through the core execution host. The
 first-line `@options` parser accepts indented directives and zero output tokens,
 rejects unsupported or invalid fields and misplaced directives, and preserves
-script line numbers. The native JSON code argument differs from Pi's
-provider-specific raw-code input.
+script line numbers. Compatible OpenAI Responses providers use Pi's raw
+JavaScript grammar, with the same code field used internally and by providers
+that use JSON function arguments. The parser trims JavaScript whitespace and
+uses the same Pi-compatible JSON syntax diagnostics as settings and RPC.
 Non-chat model APIs and remaining execution-limit differences remain open.
 
 Classifier results include their API and invocation timestamp even if the
