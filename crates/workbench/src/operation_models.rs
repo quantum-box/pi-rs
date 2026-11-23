@@ -1078,40 +1078,38 @@ impl Operations {
             .clone()
     }
 
-    async fn radius_client(&self, cached_only: bool) -> Option<PiMessages> {
+    async fn radius_client(&self, cached_only: bool) -> Result<Option<PiMessages>> {
         let http = self.current_http();
         let mut args = self.args.clone();
         args.settings = http.settings;
-        args.model_keys = Keys::load_async().await.ok()?;
+        args.model_keys = Keys::load_async().await?;
         if cached_only {
-            let gateway =
-                super::radius_auth::Gateway::configured_with_settings(&args.settings).ok()?;
+            let gateway = super::radius_auth::Gateway::configured_with_settings(&args.settings)?;
             let endpoint = args.model_endpoint_for(&Provider::Radius, None);
             if endpoint != gateway.model_endpoint().as_str() {
-                return None;
+                return Ok(None);
             }
             // Cache access needs the account identity. Header commands are
             // irrelevant, and an unresolved credential command has no identity.
             let token = match args.model_credential_for(&Provider::Radius, endpoint) {
-                Some(credential) => Some(credential.literal()?.to_owned()),
+                Some(credential) => match credential.literal() {
+                    Some(token) => Some(token.to_owned()),
+                    None => return Ok(None),
+                },
                 None => None,
             };
-            return PiMessages::radius(endpoint, token, gateway)
-                .ok()
-                .map(|client| {
-                    client
-                        .with_context_probe(false)
-                        .with_radius_catalog_cache(http.radius)
-                });
+            let client = PiMessages::radius(endpoint, token, gateway)?
+                .with_context_probe(false)
+                .with_radius_catalog_cache(http.radius);
+            return Ok(Some(client));
         }
         let client = args
-            .connect_provider(&Provider::Radius, None)
-            .ok()?
+            .connect_provider(&Provider::Radius, None)?
             .with_context_probes(!args.offline);
-        match client.resolve_affinity_headers().await.ok()?.0 {
+        Ok(match client.resolve_affinity_headers().await?.0 {
             Client::PiMessages(client) => Some(client.with_radius_catalog_cache(http.radius)),
             _ => None,
-        }
+        })
     }
 
     async fn radius_classifiers(
@@ -1120,7 +1118,7 @@ impl Operations {
         available_only: bool,
     ) -> Result<Vec<Entry>> {
         let discover = async {
-            let Some(radius) = self
+            let Ok(Some(radius)) = self
                 .radius_client(self.args.offline || !available_only)
                 .await
             else {
@@ -1142,7 +1140,7 @@ impl Operations {
         &self,
         model_id: Option<&str>,
     ) -> Result<Option<(Entry, String, HeaderMap)>> {
-        let Some(radius) = self.radius_client(false).await else {
+        let Some(radius) = self.radius_client(false).await? else {
             return Ok(None);
         };
         let Some((catalog, token)) = radius.classifier_catalog_with_token().await? else {
