@@ -2,7 +2,7 @@
 
 ## Nested and woken cancellation groundwork
 
-Upstream `main` at `780bf31fcaeb252fa9b68df3964c735eae75bde3`
+Upstream `main` at `ff0e0ff17008d5e7da979b032694a0bfec2248d5`
 uses the same ToolTask cancellation path for nested calls and for a woken
 execution interrupted after intent. It passes the last parked checkpoint and
 prepared arguments, disallows nested work from `cancel`, and runs abort or
