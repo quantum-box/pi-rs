@@ -1909,6 +1909,12 @@ mod tests {
                 cancellation: Default::default(),
             };
             let list = json!({"action":"list","type":"classifier","provider":"radius"});
+            let cancelled = context();
+            cancelled.cancellation.cancel();
+            assert!(matches!(
+                operation.invoke(list.clone(), cancelled).await,
+                Outcome::Failed(error) if error == Error::Cancelled.to_string()
+            ));
             let Outcome::Structured { data, .. } = operation.invoke(list, context()).await else {
                 panic!("Radius classifier discovery failed");
             };
