@@ -1601,6 +1601,9 @@ fn new_rpc_session_uses_latest_worker_queue_fallback() {
                 "--no-session",
                 "--mode",
                 "rpc",
+                // Switch providers below to start a new worker with the updated queue settings.
+                "--provider",
+                "ollama",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -4949,6 +4952,136 @@ fn read_rpc_model_fixture_request(
 }
 
 #[test]
+fn radius_attachments_use_the_current_accounts_resize_profile() {
+    use base64::Engine;
+    use image::GenericImageView;
+    use sha2::{Digest, Sha256};
+
+    let root = tempfile::tempdir().unwrap();
+    image::RgbImage::new(40, 20)
+        .save(root.path().join("fixture.png"))
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let origin = format!("http://{}/", listener.local_addr().unwrap());
+    let mut models =
+        json!({"providers":{"radius":{"models":[{"id":"fixture","input":["text","image"]}]}}});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    let account = format!("key:{:x}", Sha256::digest(b"matching-key"));
+    let mut catalog = json!({
+        "origin":origin,"account":account,"baseUrl":format!("{origin}v1"),
+        "models":[{"id":"fixture","name":"Fixture","reasoning":false,"input":["text","image"],
+            "contextWindow":131072,"maxTokens":4096,"inputLimits":{"images":{"resize":{"maxWidth":16}}}}]
+    });
+    std::fs::write(root.path().join("radius-models.json"), catalog.to_string()).unwrap();
+    catalog["models"][0]["inputLimits"]["images"]["resize"]["maxWidth"] = json!(24);
+    let discovered = catalog.to_string();
+
+    let worker = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let mut dimensions = Vec::new();
+        while dimensions.len() < 4 && Instant::now() < deadline {
+            let (mut socket, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("Radius fixture failed: {error}"),
+            };
+            let (request, body) = read_rpc_model_fixture_request(&socket, |_| Ok(())).unwrap();
+            if request.starts_with("GET /v1/config ") {
+                if dimensions.len() == 3 {
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{discovered}", discovered.len()).unwrap();
+                } else {
+                    socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
+                continue;
+            }
+            let path = request.split_ascii_whitespace().nth(1).unwrap();
+            assert!(
+                request.starts_with("POST ") && matches!(path, "/v1/messages" | "/messages"),
+                "{request}"
+            );
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            let image = payload["context"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+                .find(|part| part["type"] == "image")
+                .unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(image["data"].as_str().unwrap())
+                .unwrap();
+            dimensions.push((
+                path.to_owned(),
+                image::load_from_memory(&bytes).unwrap().dimensions(),
+            ));
+            let reply = concat!(
+                "data: {\"type\":\"text_start\",\"contentIndex\":0}\n\n",
+                "data: {\"type\":\"text_end\",\"contentIndex\":0,\"content\":\"ok\"}\n\n",
+                "data: {\"type\":\"done\",\"reason\":\"stop\"}\n\n",
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        }
+        dimensions
+    });
+
+    for key in [
+        Some("matching-key"),
+        Some("different-key"),
+        None,
+        Some("matching-key"),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("PI_RADIUS_GATEWAY", &origin)
+            .env_remove("RADIUS_API_KEY");
+        if let Some(key) = key {
+            command.env("RADIUS_API_KEY", key);
+            models["providers"]["radius"]
+                .as_object_mut()
+                .unwrap()
+                .remove("apiKey");
+        } else {
+            models["providers"]["radius"]["apiKey"] = json!("!echo matching-key");
+        }
+        std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+        let output = command
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-session",
+                "--provider",
+                "radius",
+                "--model",
+                "fixture",
+                "--print",
+                "describe",
+                "@fixture.png",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    assert_eq!(
+        worker.join().unwrap(),
+        [
+            ("/v1/messages".into(), (16, 8)),
+            ("/messages".into(), (40, 20)),
+            ("/v1/messages".into(), (16, 8)),
+            ("/v1/messages".into(), (24, 12)),
+        ]
+    );
+}
+
+#[test]
 fn rpc_model_fixture_waits_for_request_on_nonblocking_accepted_socket() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -7857,6 +7990,82 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
 }
 
 #[test]
+fn bare_model_patterns_search_provider_catalogs_before_local_model_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    let models = json!({"providers":{
+        "relay-one":{"api":"openai-completions","baseUrl":"https://one.example/v1","apiKey":"fixture",
+            "models":[{"id":"widget-a","name":"Widget Alpha"},{"id":"widget-z-20260101","name":"Widget Snapshot"},
+                {"id":"crystal-a","name":"Crystal"},{"id":"crystal-z","name":"Crystal Next"}]},
+        "relay-two":{"api":"openai-completions","baseUrl":"https://two.example/v1",
+            "models":[{"id":"widget-z","name":"Widget Pro"},{"id":"widget-a","name":"Widget Alpha"}]}
+    }});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    let run = |query: &str, inline: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_pi"));
+        cmd.current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--mode",
+                "rpc",
+                "--no-session",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                query,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if inline {
+            cmd.args(["--api-key", "inline-fixture"]);
+        }
+        let mut process = cmd.spawn().unwrap();
+        if let Err(error) = process
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n")
+        {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+        process.wait_with_output().unwrap()
+    };
+    for (query, inline, provider, model) in [
+        ("Widget", false, "relay-one", "widget-a"),
+        ("Widget:high", false, "relay-one", "widget-a"),
+        ("Widget", true, "relay-two", "widget-z"),
+        ("widget-z-20260101", false, "relay-one", "widget-z-20260101"),
+        ("Widget Pro", false, "relay-two", "widget-z"),
+        ("Crystal", false, "relay-one", "crystal-z"),
+        ("relay-one/Crystal", false, "relay-one", "crystal-a"),
+    ] {
+        let result = run(query, inline);
+        assert!(
+            result.status.success(),
+            "{query}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output = String::from_utf8(result.stdout).unwrap();
+        let response: Value = output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|reply| reply["id"] == "state")
+            .unwrap();
+        assert_eq!(response["data"]["model"]["provider"], provider, "{query}");
+        assert_eq!(response["data"]["model"]["id"], model, "{query}");
+    }
+    let ambiguous = run("Widget Alpha", true);
+    assert!(!ambiguous.status.success());
+    let stderr = String::from_utf8(ambiguous.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "relay-one/widget-a, relay-two/widget-a. --api-key does not choose a provider."
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn default_model_and_provider_are_read_as_separate_fields() {
     for (settings, provider, model) in [
         (
@@ -7904,6 +8113,172 @@ fn default_model_and_provider_are_read_as_separate_fields() {
         let after = events.iter().find(|event| event["id"] == "after").unwrap();
         assert_eq!(after["data"]["model"]["provider"], provider);
         assert_eq!(after["data"]["model"]["id"], model);
+    }
+}
+
+#[test]
+fn automatic_startup_uses_radius_catalogs_without_making_a_request() {
+    let root = tempfile::tempdir().unwrap();
+    let server = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    server.set_nonblocking(true).unwrap();
+    let address = server.local_addr().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command.env_clear();
+    for name in ["PATH", "SystemRoot", "HOME", "USERPROFILE", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let mut child = command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .env("PI_RADIUS_GATEWAY", format!("http://{address}"))
+        .env("RADIUS_API_KEY", "radius-fixture")
+        .env("GEMINI_API_KEY", "google-fixture")
+        .args(["--mode", "rpc", "--no-session", "--no-mcp", "--offline"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["id"] == "state")
+        .unwrap();
+    assert_eq!(state["data"]["model"]["provider"], "google");
+    assert_eq!(
+        server.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn startup_chooses_authenticated_models_in_pi_provider_order() {
+    let root = tempfile::tempdir().unwrap();
+    let route = "https://example.invalid/v1";
+    let models = json!({"providers":{"relay":{
+        "api":"openai-completions", "baseUrl":route, "apiKey":"relay-fixture", "models":[{"id":"local-model"}]
+    }}});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    for (anthropic, google, extra, expected_provider, expected_model) in [
+        (true, true, vec![], "anthropic", "claude-opus-5-5"),
+        (false, true, vec![], "google", "gemini-4-argon"),
+        (false, false, vec![], "relay", "local-model"),
+        (
+            true,
+            true,
+            vec!["--provider", "ollama"],
+            "ollama",
+            "qwen2.5:7b",
+        ),
+        (
+            true,
+            true,
+            vec!["--api-key", "inline-fixture"],
+            "ollama",
+            "qwen2.5:7b",
+        ),
+        (
+            true,
+            true,
+            vec!["--models", "google/gemini-4-argon"],
+            "google",
+            "gemini-4-argon",
+        ),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command.env_clear();
+        for name in ["PATH", "SystemRoot", "HOME", "USERPROFILE", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        if anthropic {
+            command.env("ANTHROPIC_API_KEY", "anthropic-fixture");
+        }
+        if google {
+            command.env("GEMINI_API_KEY", "google-fixture");
+        }
+        let mut process = command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["--mode", "rpc", "--no-session", "--no-mcp", "--offline"])
+            .args(extra)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
+        let output = process.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for id in ["state", "after"] {
+            let event = events.iter().find(|event| event["id"] == id).unwrap();
+            assert_eq!(event["data"]["model"]["provider"], expected_provider);
+            assert_eq!(event["data"]["model"]["id"], expected_model);
+        }
+    }
+}
+
+#[test]
+fn selected_builtin_provider_uses_its_pi_default_without_a_model() {
+    for (settings, provider_args) in [
+        (json!({}), vec!["--provider", "google"]),
+        (json!({"defaultProvider":"google"}), vec![]),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("settings.json"), settings.to_string()).unwrap();
+        let mut process = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("GEMINI_API_KEY", "fixture")
+            .args(["--mode", "rpc", "--no-session", "--no-mcp", "--offline"])
+            .args(provider_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
+        let output = process.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for id in ["state", "after"] {
+            let event = events.iter().find(|event| event["id"] == id).unwrap();
+            assert_eq!(event["data"]["model"]["provider"], "google");
+            assert_eq!(event["data"]["model"]["id"], "gemini-4-argon");
+        }
     }
 }
 
@@ -8712,6 +9087,74 @@ fn kimi_auth_commands_wait_for_refresh_after_sigint() {
     }
 }
 
+#[test]
+fn auth_check_with_model_uses_catalog_resolution_without_crossing_endpoints() {
+    let root = tempfile::tempdir().unwrap();
+    let models = json!({"providers":{
+        "relay-one":{"api":"openai-completions","baseUrl":"https://one.example/v1","apiKey":"fixture-one",
+            "models":[{"id":"widget-a","name":"Widget Alpha"},{"id":"widget-b","baseUrl":"https://other.example/v1"}]},
+        "relay-two":{"api":"openai-completions","baseUrl":"https://two.example/v1",
+            "models":[{"id":"widget-z","name":"Widget Pro"},{"id":"widget-a","name":"Widget Alpha"},{"id":"relay-one/local-only"}]}
+    }});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    for (model, code, provider, status, reason) in [
+        ("relay-one/Widget Alpha", 0, "relay-one", "ready", None),
+        ("relay-one/local-only", 0, "relay-one", "ready", None),
+        (
+            "Widget Alpha",
+            2,
+            "Widget Alpha",
+            "invalid",
+            Some("invalid_state"),
+        ),
+        (
+            "Widget:high",
+            1,
+            "relay-two",
+            "not_ready",
+            Some("credentials_not_configured"),
+        ),
+        (
+            "Widget Pro",
+            1,
+            "relay-two",
+            "not_ready",
+            Some("credentials_not_configured"),
+        ),
+        (
+            "relay-one/widget-b",
+            1,
+            "relay-one",
+            "not_ready",
+            Some("credentials_not_configured"),
+        ),
+        (
+            "unknown-local-catalog-id",
+            2,
+            "unknown-local-catalog-id",
+            "invalid",
+            Some("invalid_state"),
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["auth", "check", "--model", model, "--json", "--no-refresh"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{model}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["provider"], provider);
+        assert_eq!(response["status"], status);
+        assert_eq!(response["reason"].as_str(), reason);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn auth_check_reads_readonly_store_and_environment_keys() {
@@ -9294,6 +9737,184 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn anthropic_federation_auth_check_without_refresh_uses_only_the_identity_file() {
+    let root = tempfile::tempdir().unwrap();
+    let identity = root.path().join("jwt");
+    let assertion = "local-test-identity";
+    std::fs::write(&identity, assertion).unwrap();
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("ANTHROPIC_OAUTH_TOKEN")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env("ANTHROPIC_FEDERATION_RULE_ID", "federation-rule")
+            .env("ANTHROPIC_ORGANIZATION_ID", "organization")
+            .env("ANTHROPIC_IDENTITY_TOKEN_FILE", &identity)
+            .args(["--provider", "anthropic", "auth"]);
+        command
+    };
+    let check = || {
+        command()
+            .args(["check", "--json", "--no-refresh"])
+            .output()
+            .unwrap()
+    };
+    let output = check();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["status"], "ready");
+    assert_eq!(status["authType"], "oauth");
+    assert!(status.get("credentials").is_none());
+    assert_eq!(std::fs::read_to_string(&identity).unwrap(), assertion);
+
+    std::fs::write(&identity, "").unwrap();
+    let output = check();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["reason"], "invalid_state");
+
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"anthropic":{
+            "headers":{"Authorization":"Bearer fixture-header"}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let output = check();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["status"], "ready");
+    assert_eq!(status["authType"], "oauth");
+    assert!(status.get("credentials").is_none());
+
+    let output = command()
+        .args(["check", "--json", "--credentials", "--no-refresh"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["authType"], "oauth");
+    assert_eq!(status["credentials"], "fixture-header");
+
+    let export = command().arg("print-bearer-token").output().unwrap();
+    assert!(export.status.success(), "{export:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&export.stdout).trim(),
+        "fixture-header"
+    );
+    let export = command().arg("print-api-key").output().unwrap();
+    assert!(!export.status.success());
+
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"anthropic":{"headers":{"x-api-key":"fixture-key"}}}}).to_string(),
+    )
+    .unwrap();
+    let export = command().arg("print-api-key").output().unwrap();
+    assert!(export.status.success(), "{export:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&export.stdout).trim(),
+        "fixture-key"
+    );
+    let export = command().arg("print-bearer-token").output().unwrap();
+    assert!(!export.status.success());
+    assert!(String::from_utf8_lossy(&export.stderr).contains("No usable OAuth bearer token"));
+
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"anthropic":{
+            "headers":{"Authorization":"!pi-rs-missing-auth-fixture-command"}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let output = check();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(status.get("authType").is_none());
+
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"anthropic":{
+            "headers":{"Authorization":"Bearer fixture-header", "x-other":"invalid\nvalue"}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let output = command().args(["check", "--json"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["reason"], "invalid_state");
+}
+
+#[test]
+fn auth_login_distinguishes_the_key_switch_from_the_global_key_option() {
+    let root = tempfile::tempdir().unwrap();
+    let invoke = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        ["auth", "login", "--api-key", "Anthropic"],
+        ["auth", "login", "Anthropic", "--api-key"],
+    ] {
+        let output = invoke(&args);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("requires an interactive terminal")
+        );
+    }
+    let output = invoke(&["auth", "login", "Anthropic", "--api-key", "--no-browser"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--no-browser only applies to account sign-in")
+    );
+    let output = invoke(&["--api-key", "unused-fixture", "auth", "login", "Anthropic"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("omit --api-key when resolving configured credentials")
+    );
+    assert!(!root.path().join("auth.json").exists());
+}
+
+#[test]
+fn legacy_enterprise_login_passes_the_domain_to_copilot_only() {
+    let root = tempfile::tempdir().unwrap();
+    for (provider, expected) in [
+        ("github-copilot", "invalid GitHub Enterprise domain"),
+        ("anthropic", "--enterprise-url requires github-copilot"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "login",
+                provider,
+                "--enterprise-url",
+                "http://insecure.example",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{output:?}"
+        );
+    }
+    assert!(!root.path().join("auth.json").exists());
 }
 
 #[test]

@@ -49,6 +49,12 @@ pub(super) struct RequestHeaders {
     env: Option<serde_json::Map<String, Value>>,
 }
 
+const ANTHROPIC_AUTH_HEADERS: [HeaderName; 3] = [
+    AUTHORIZATION,
+    HeaderName::from_static("x-api-key"),
+    HeaderName::from_static("cf-aig-authorization"),
+];
+
 impl RequestHeaders {
     #[cfg(test)]
     pub(super) fn for_test(name: &str, value: &str) -> Self {
@@ -86,21 +92,70 @@ impl RequestHeaders {
     }
 
     pub async fn resolve(&self, provider: &Provider, token: Option<&str>) -> Result<HeaderMap> {
+        self.authenticate(self.resolve_values().await?, provider, token)
+    }
+
+    pub(super) async fn resolve_anthropic_auth(&self) -> Result<(HeaderMap, Option<HeaderName>)> {
+        let mut headers = self.resolve_values().await?;
+        for name in ANTHROPIC_AUTH_HEADERS {
+            if let Some(value) = headers
+                .get(&name)
+                .filter(|value| !value.as_bytes().trim_ascii().is_empty())
+            {
+                value
+                    .to_str()
+                    .map_err(|_| Error::Config("invalid Anthropic authentication header".into()))?;
+                return Ok((headers, Some(name)));
+            }
+            headers.remove(name);
+        }
+        Ok((headers, None))
+    }
+
+    pub(super) async fn anthropic_auth_without_refresh(
+        &self,
+    ) -> Result<Option<(HeaderName, Option<HeaderValue>)>> {
+        for name in ANTHROPIC_AUTH_HEADERS {
+            let Some(value) = self.values.get(name.as_str()) else {
+                continue;
+            };
+            if let Some(command) = value.strip_prefix('!') {
+                if !command.trim().is_empty() {
+                    return Ok(Some((name, None)));
+                }
+                continue;
+            }
+            let value = self.resolve_value(name.as_str(), value).await?;
+            if !value.trim().is_empty() {
+                let header = sensitive_header(name.as_str(), &value)?;
+                header
+                    .to_str()
+                    .map_err(|_| Error::Config("invalid Anthropic authentication header".into()))?;
+                return Ok(Some((name, Some(header))));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn resolve_values(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::with_capacity(self.values.len());
         for (name, value) in &self.values {
-            let resolved = if value.starts_with('!') {
-                pi_rs_workbench::mcp::resolve_value(value)
-                    .await
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-            } else {
-                expand_value_with_env(value, self.env.as_ref())
-            };
-            let value = resolved
-                .ok_or_else(|| Error::Config(format!("could not resolve model header {name}")))?;
+            let value = self.resolve_value(name, value).await?;
             Self::insert(&mut headers, name, &value)?;
         }
-        self.authenticate(headers, provider, token)
+        Ok(headers)
+    }
+
+    async fn resolve_value(&self, name: &str, value: &str) -> Result<String> {
+        let resolved = if value.starts_with('!') {
+            pi_rs_workbench::mcp::resolve_value(value)
+                .await
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        } else {
+            expand_value_with_env(value, self.env.as_ref())
+        };
+        resolved.ok_or_else(|| Error::Config(format!("could not resolve model header {name}")))
     }
 
     fn insert(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {
@@ -111,7 +166,7 @@ impl RequestHeaders {
         Ok(())
     }
 
-    fn authenticate(
+    pub(super) fn authenticate(
         &self,
         mut headers: HeaderMap,
         provider: &Provider,
@@ -280,7 +335,7 @@ impl ModelCompatibility {
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct InputLimits {
+pub(super) struct InputLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_request_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -288,7 +343,7 @@ struct InputLimits {
 }
 
 impl InputLimits {
-    fn overlay(self, newer: Self) -> Self {
+    pub(super) fn overlay(self, newer: Self) -> Self {
         Self {
             max_request_bytes: newer.max_request_bytes.or(self.max_request_bytes),
             images: match (self.images, newer.images) {
@@ -298,8 +353,12 @@ impl InputLimits {
         }
     }
 
-    fn valid(self) -> bool {
+    pub(super) fn valid(self) -> bool {
         self.max_request_bytes != Some(0) && self.images.is_none_or(ImageLimits::valid)
+    }
+
+    pub(super) fn image_resize(self) -> Option<ImageResizeProfile> {
+        self.images?.resize
     }
 }
 
@@ -533,7 +592,11 @@ impl ModelMetadata {
     }
 
     pub fn image_resize(&self) -> Option<ImageResizeProfile> {
-        self.input_limits.as_ref()?.images.as_ref()?.resize
+        self.input_limits?.image_resize()
+    }
+
+    pub(super) fn input_limits(&self) -> Option<InputLimits> {
+        self.input_limits
     }
 
     pub fn supports_images(&self) -> Option<bool> {
@@ -1374,6 +1437,35 @@ impl Profiles {
         selected: &str,
         explicit_endpoint: Option<&str>,
     ) -> (bool, BTreeMap<String, bool>) {
+        self.responses_route_policy(
+            provider,
+            selected,
+            explicit_endpoint,
+            ChatCompatibility::supports_mid_conversation_system_messages,
+        )
+    }
+
+    pub fn responses_tool_transcript_policy(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> ((bool, bool), BTreeMap<String, (bool, bool)>) {
+        self.responses_route_policy(
+            provider,
+            selected,
+            explicit_endpoint,
+            ChatCompatibility::responses_tool_transcript,
+        )
+    }
+
+    fn responses_route_policy<T: PartialEq + Default>(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+        capability: fn(&ChatCompatibility) -> T,
+    ) -> (T, BTreeMap<String, T>) {
         let adapter = self.model_adapter(provider, selected);
         let endpoint = |id: &str| {
             explicit_endpoint
@@ -1381,9 +1473,7 @@ impl Profiles {
                 .unwrap_or_else(|| self.endpoint(provider))
         };
         let selected_endpoint = endpoint(selected);
-        let default = self
-            .chat_compatibility(provider, None)
-            .supports_mid_conversation_system_messages();
+        let default = capability(&self.chat_compatibility(provider, None));
         let overrides = self
             .entries
             .get(provider.id())
@@ -1400,10 +1490,13 @@ impl Profiles {
             .map(|id| {
                 let same_route = self.model_adapter(provider, &id) == adapter
                     && endpoint(&id) == selected_endpoint;
-                let supported = same_route
-                    && self
-                        .chat_compatibility(provider, self.model(provider, &id).as_ref())
-                        .supports_mid_conversation_system_messages();
+                let supported = if same_route {
+                    capability(
+                        &self.chat_compatibility(provider, self.model(provider, &id).as_ref()),
+                    )
+                } else {
+                    T::default()
+                };
                 (id, supported)
             })
             .filter(|(_, supported)| *supported != default)
@@ -1548,6 +1641,21 @@ impl Profiles {
         })
         .into_iter()
         .filter_map(|(model, value)| value.map(|temperature| (model, temperature)))
+        .collect()
+    }
+
+    pub fn anthropic_inline_tool_models(
+        &self,
+        provider: &Provider,
+        selected: &str,
+        explicit_endpoint: Option<&str>,
+    ) -> BTreeSet<String> {
+        self.anthropic_route_models(provider, selected, explicit_endpoint, |metadata| {
+            self.chat_compatibility(provider, metadata)
+                .supports_anthropic_tool_changes()
+        })
+        .into_iter()
+        .filter_map(|(id, supported)| supported.then_some(id))
         .collect()
     }
 
@@ -2706,6 +2814,39 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_inline_tools_require_both_capabilities_on_the_final_route() {
+        let profiles = Profiles::parse(&json!({"providers":{"proxy":{
+            "api":"anthropic-messages", "baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsMidConvoSystemMessages":true,"supportsMidConvoToolChanges":true},
+            "models":[
+                {"id":"enabled"},
+                {"id":"no-inline-tools","compat":{"supportsMidConvoToolChanges":false}},
+                {"id":"no-system","compat":{"supportsMidConvoSystemMessages":false}},
+                {"id":"other-endpoint","baseUrl":"http://localhost:2/v1"},
+                {"id":"other-api","api":"openai-completions"}
+            ]
+        }}}))
+        .unwrap();
+        let proxy = profiles.provider("proxy").unwrap();
+        assert_eq!(
+            profiles.anthropic_inline_tool_models(&proxy, "enabled", None),
+            BTreeSet::from(["enabled".into()])
+        );
+        assert_eq!(
+            profiles.anthropic_inline_tool_models(&proxy, "enabled", Some("http://localhost:3/v1")),
+            BTreeSet::from(["enabled".into(), "other-endpoint".into()])
+        );
+        let bundled = Profiles::default().anthropic_inline_tool_models(
+            &Provider::Anthropic,
+            "claude-opus-4-8",
+            None,
+        );
+        assert!(bundled.contains("claude-opus-4-8"));
+        assert!(bundled.contains("claude-sonnet-5-5"));
+        assert!(!bundled.contains("claude-sonnet-5"));
+    }
+
+    #[test]
     fn anthropic_selected_uncatalogued_model_keeps_provider_capability() {
         for configured in [None, Some(false), Some(true)] {
             let profiles = Profiles::parse(&json!({"providers":{"proxy":{
@@ -3312,6 +3453,61 @@ mod tests {
                 .session_affinity(&chatgpt, "gpt", "https://example.test")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn responses_tool_transcript_capabilities_follow_the_active_route() {
+        let profiles = Profiles::default();
+        let openai = Provider::named("openai").unwrap();
+        let (default, models) =
+            profiles.responses_tool_transcript_policy(&openai, "gpt-6-luna", None);
+        assert_eq!(default, (false, false));
+        assert_eq!(models.get("gpt-6-luna"), Some(&(true, true)));
+        assert!(!models.contains_key("gpt-5-mini"));
+
+        let profiles = Profiles::parse(&json!({"providers":{"fixture":{
+            "api":"openai-responses","baseUrl":"http://localhost:1/v1",
+            "compat":{"supportsAdditionalTools":true,"supportsToolSearch":true},
+            "models":[
+                {"id":"selected"},
+                {"id":"search-only","compat":{"supportsAdditionalTools":false}},
+                {"id":"other-api","api":"openai-completions"},
+                {"id":"other-endpoint","baseUrl":"http://localhost:2/v1"}
+            ]
+        }}}))
+        .unwrap();
+        let provider = profiles.provider("fixture").unwrap();
+        assert_eq!(
+            profiles.responses_tool_transcript_policy(&provider, "selected", None),
+            (
+                (true, true),
+                BTreeMap::from([
+                    ("search-only".into(), (false, true)),
+                    ("other-api".into(), (false, false)),
+                    ("other-endpoint".into(), (false, false)),
+                ])
+            )
+        );
+    }
+
+    #[test]
+    fn copilot_responses_uses_additional_tools_on_supported_models() {
+        let profiles = Profiles::default();
+        let copilot = Provider::named("github-copilot").unwrap();
+        let selected = "gpt-6.1-sol";
+        assert_eq!(
+            profiles.model_adapter(&copilot, selected),
+            Adapter::OpenAiResponses
+        );
+        let (default, tools) = profiles.responses_tool_transcript_policy(&copilot, selected, None);
+        let (_, system) =
+            profiles.responses_mid_conversation_system_policy(&copilot, selected, None);
+        assert_eq!(default, (false, false));
+        for model in [selected, "gpt-6.2-sol"] {
+            assert_eq!(tools.get(model), Some(&(true, false)));
+            assert_eq!(system.get(model), Some(&true));
+        }
+        assert!(!tools.contains_key("claude-fable-5.2"));
     }
 
     #[test]
