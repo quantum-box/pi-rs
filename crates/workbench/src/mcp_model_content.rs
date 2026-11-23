@@ -100,12 +100,21 @@ fn project_result(
     let mut projected = if is_resource_read(tool)
         && let Some(resources) = response["contents"].as_array()
     {
-        resources.iter().map(project_resource).collect::<Vec<_>>()
+        resources
+            .iter()
+            .map(|resource| project_resource(resource, resources.len() > 1))
+            .collect::<Vec<_>>()
     } else {
         let blocks = response["content"].as_array()?;
+        let multiple_resources = blocks
+            .iter()
+            .filter(|block| block["type"] == "resource")
+            .take(2)
+            .count()
+            > 1;
         blocks
             .iter()
-            .map(|block| project_block(block, server, read_tool))
+            .map(|block| project_block(block, server, read_tool, multiple_resources))
             .collect()
     };
     if response["isError"] == true {
@@ -191,7 +200,12 @@ fn encode_blocks(projected: &[Value]) -> (String, bool) {
     }
 }
 
-fn project_block(block: &Value, server: &str, read_tool: Option<&str>) -> Value {
+fn project_block(
+    block: &Value,
+    server: &str,
+    read_tool: Option<&str>,
+    multiple_resources: bool,
+) -> Value {
     match block["type"].as_str() {
         Some("text") => block.clone(),
         Some("image") => block["data"]
@@ -203,7 +217,7 @@ fn project_block(block: &Value, server: &str, read_tool: Option<&str>) -> Value 
             let mime = block["mimeType"].as_str().unwrap_or("unknown type");
             text(format!("[audio {mime} omitted]"))
         }
-        Some("resource") => project_resource(&block["resource"]),
+        Some("resource") => project_resource(&block["resource"], multiple_resources),
         Some("resource_link") => {
             resource_link(block, server, read_tool).unwrap_or_else(|| block.clone())
         }
@@ -214,9 +228,16 @@ fn project_block(block: &Value, server: &str, read_tool: Option<&str>) -> Value 
     }
 }
 
-fn project_resource(resource: &Value) -> Value {
+fn project_resource(resource: &Value, identify: bool) -> Value {
+    let content_text = |content: &str| {
+        if identify && let Some(uri) = resource["uri"].as_str() {
+            text(format!("[Resource {uri}]\n{content}"))
+        } else {
+            text(content)
+        }
+    };
     if let Some(content) = resource["text"].as_str() {
-        return text(content);
+        return content_text(content);
     }
     let mime = resource["mimeType"].as_str().unwrap_or_default();
     if let Some(blob) = resource["blob"].as_str() {
@@ -238,7 +259,7 @@ fn project_resource(resource: &Value) -> Value {
                 .decode(blob)
                 .or_else(|_| STANDARD_NO_PAD.decode(blob))
         {
-            return text(String::from_utf8_lossy(&decoded));
+            return content_text(&String::from_utf8_lossy(&decoded));
         }
     }
     // Preserve the payload for native consumers until a readable file can be offered.
@@ -451,7 +472,10 @@ mod tests {
         let (output, structured) = project_result(&original, "fixture", "get", None).unwrap();
         assert!(structured);
         let value: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(value["data"]["content"][0]["text"], "<svg/>");
+        assert_eq!(
+            value["data"]["content"][0]["text"],
+            "[Resource mock://vector]\n<svg/>"
+        );
         assert_eq!(value["data"]["content"][1]["resource"]["blob"], "dGlmZg==");
     }
 
