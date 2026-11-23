@@ -1946,6 +1946,11 @@ the execution boundary for the pending codemode sandbox.
 
 ### Codemode OpenAI Decisions checkpoint
 
+Codemode accepts configured `pi-classifier` models and uses Pi's
+`POST <baseUrl>/classify` protocol, including image blocks, bounded response
+probabilities, provider usage and the classifier retry policy. Native endpoint
+credential binding and image validation apply.
+
 Codemode supports OpenAI Decisions classifier models, including the pinned
 GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
 and the Decisions-specific 504 retry exclusion. Native image validation and
