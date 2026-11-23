@@ -222,22 +222,24 @@ impl PiMessages {
         let fallback = || {
             radius_catalog::cached(&gateway, binding).or_else(|| radius_catalog::baseline(&gateway))
         };
-        let value = if let Some(token) = token {
+        let (value, confirmed_token_hash) = if let Some(token) = token {
             match radius_catalog::load(&self.client, &gateway, token).await {
                 Ok(catalog) => {
                     let _ = radius_catalog::remember(&gateway, binding, &catalog);
-                    Some(Arc::new(catalog))
+                    (Some(Arc::new(catalog)), token_hash)
                 }
-                Err(error @ Error::RetryableModel(_)) => Some(fallback().ok_or(error)?),
+                // A fallback can serve this request, but does not confirm
+                // what the gateway offers for the current token.
+                Err(error @ Error::RetryableModel(_)) => (Some(fallback().ok_or(error)?), None),
                 Err(error) => return Err(error),
             }
         } else {
-            fallback()
+            (fallback(), None)
         };
         *cached = value.as_ref().map(|value| CachedCatalog {
             gateway,
             binding: binding.to_owned(),
-            token_hash,
+            token_hash: confirmed_token_hash,
             value: value.clone(),
         });
         Ok(value)

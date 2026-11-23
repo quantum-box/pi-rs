@@ -1957,6 +1957,13 @@ mod tests {
             assert_eq!(data[0]["contextWindow"], 8192);
             if !args.offline {
                 assert_eq!(data[0]["id"], "radius-judge");
+                let operation = Operations::new(&args).unwrap();
+                let Outcome::Structured { data, .. } = operation.invoke(
+                    json!({"action":"list","type":"classifier","provider":"radius","available":true}), context()
+                ).await else {
+                    panic!("cached account catalog should cover transient failure");
+                };
+                assert_eq!(data[0]["id"], "radius-judge");
                 let classify = json!({"action":"classify","provider":"radius","id":"radius-judge",
                     "context":{"state":{"fixture":true},"questions":{
                         "q":{"type":"bool","instructions":"match?","criteria":{"true":"yes","false":"no"}}
@@ -2004,10 +2011,16 @@ mod tests {
         )
         .unwrap();
         let server = tokio::spawn(async move {
-            for (method, key) in [
-                ("GET /v1/config HTTP/1.1", "radius-fixture-key"),
-                ("POST /relay/v1/classify HTTP/1.1", "radius-fixture-key"),
-                ("GET /v1/config HTTP/1.1", "rotated-fixture-key"),
+            for (method, key, transient) in [
+                ("GET /v1/config HTTP/1.1", "radius-fixture-key", false),
+                ("GET /v1/config HTTP/1.1", "radius-fixture-key", true),
+                ("GET /v1/config HTTP/1.1", "radius-fixture-key", false),
+                (
+                    "POST /relay/v1/classify HTTP/1.1",
+                    "radius-fixture-key",
+                    false,
+                ),
+                ("GET /v1/config HTTP/1.1", "rotated-fixture-key", false),
             ] {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut request = BufReader::new(socket);
@@ -2035,6 +2048,10 @@ mod tests {
                     }
                 }
                 assert!(authorized, "{method}");
+                if transient {
+                    request.get_mut().write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
                 if method.starts_with("POST") {
                     assert!(tenant);
                 }
