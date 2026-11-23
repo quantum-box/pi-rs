@@ -2020,7 +2020,11 @@ MCP tools default to codemode exposure. `--exposure direct`, `deferred`,
 exclusions also prevent script access. Codemode receives the MCP call result,
 including `content`, `structuredContent`, and `isError` when a server returns
 a tool error. Connection and transport failures reject the script's call.
-The client's tool result omits the server's top-level `_meta`.
+The client's tool result omits the server's top-level `_meta`. Direct calls
+send text, embedded text resources, and resource links in the model-facing view.
+Embedded images use the provider's existing image path and respect the active
+image policy. For binary resources, the native envelope remains available
+while exporting the payload as a readable file remains open.
 
 Programmatic shell calls return output,
 exit status, truncation and elapsed time, including nonzero exit statuses.

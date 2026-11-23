@@ -271,7 +271,7 @@ impl Model for WorkbenchModel {
                     ))?;
                 }
                 pi_rs::fingerprint_model_context(&(
-                    "workbench-policy-v2",
+                    "workbench-policy-v3",
                     identity,
                     self.block_images,
                     self.supports_images,
@@ -298,7 +298,7 @@ impl Model for WorkbenchModel {
     }
     fn context_identity(&self) -> Option<String> {
         pi_rs::fingerprint_model_context(&(
-            "workbench-policy-v2",
+            "workbench-policy-v3",
             self.client.context_identity()?,
             self.block_images,
             self.supports_images,
@@ -312,13 +312,20 @@ impl Model for WorkbenchModel {
     }
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
         let mut one = request.clone();
-        one.messages = vec![message.clone()];
+        one.messages.clear();
+        if let Message::Tool { call_id, .. } = message
+            && let Some(call) = request.messages.iter().rev().find(|entry| {
+                matches!(entry, Message::Assistant { calls, .. } if calls.iter().any(|call| call.id == *call_id))
+            })
+        {
+            one.messages.push(call.clone());
+        }
+        one.messages.push(message.clone());
         let filtered = self.filtered(one);
-        filtered
-            .messages
-            .iter()
-            .map(|m| self.client.estimate_message_tokens(&filtered, m))
-            .fold(0_u64, u64::saturating_add)
+        self.client.estimate_message_tokens(
+            &filtered,
+            filtered.messages.last().expect("single message estimate"),
+        )
     }
 
     async fn context_window(&self, model: &str) -> Option<u32> {
@@ -825,6 +832,7 @@ impl WorkbenchModel {
     }
 
     fn filtered(&self, mut request: ModelRequest) -> ModelRequest {
+        super::mcp_model_content::project_tool_results(&mut request);
         if self.block_images {
             remove_images(&mut request.messages, BLOCKED_IMAGE, BLOCKED_IMAGE);
         } else if self.supports_images == Some(false) {
@@ -2041,7 +2049,7 @@ mod measured_anchor_policy_tests {
             .unwrap()
             .unwrap();
         let expected = pi_rs::fingerprint_model_context(&(
-            "workbench-policy-v2",
+            "workbench-policy-v3",
             old_identity.unwrap(),
             false,
             Option::<bool>::None,

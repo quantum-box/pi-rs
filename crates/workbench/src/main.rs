@@ -37,6 +37,7 @@ mod interactive;
 mod kimi_auth;
 mod locale;
 mod mcp_config;
+mod mcp_model_content;
 mod meta_auth;
 mod model_auth;
 mod model_listing;
