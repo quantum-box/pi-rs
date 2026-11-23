@@ -11123,12 +11123,24 @@ async fn nested_woken_real_callback_records_receipt_once() {
 #[cfg(all(unix, not(feature = "experimental-graph-revision")))]
 #[tokio::test]
 async fn nested_woken_with_owned_conversation_remains_fail_closed() {
-    exercise_nested_woken_owned_rejection(false, false, 0).await;
-    exercise_nested_woken_owned_rejection(true, false, 0).await;
+    exercise_nested_woken_owned(false, NestedOwnedCut::Refused).await;
+    exercise_nested_woken_owned(true, NestedOwnedCut::Refused).await;
 }
 
 #[cfg(unix)]
-async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool, automatic: u8) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NestedOwnedCut {
+    Refused,
+    Callback,
+    Receipt,
+    LiveSettlement,
+    LateOutcome,
+    #[cfg(feature = "experimental-graph-revision")]
+    GraphMark,
+}
+
+#[cfg(unix)]
+async fn exercise_nested_woken_owned(selected: bool, cut: NestedOwnedCut) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
     if selected {
@@ -11204,15 +11216,15 @@ async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool, autom
             ])
             .env("PI_TEST_NESTED_WOKEN_DIR", dir.path())
             .env("PI_TEST_NESTED_OWNED_GRAPH_PROBE", "1");
-        if mark {
+        if cut == NestedOwnedCut::GraphMark {
             probe.env("PI_TEST_NESTED_OWNED_GRAPH_MARK", "1");
         }
         assert!(probe.status().unwrap().success());
-        if mark {
+        if cut == NestedOwnedCut::GraphMark {
             return;
         }
     }
-    if automatic == 1 || automatic == 4 {
+    if matches!(cut, NestedOwnedCut::Callback | NestedOwnedCut::LateOutcome) {
         std::fs::write(dir.path().join("block-cancel"), b"hold").unwrap();
     }
     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -11226,11 +11238,11 @@ async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool, autom
         .env("PI_TEST_WOKEN_REAL", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if automatic == 2 {
+    if cut == NestedOwnedCut::Receipt {
         command.env("PI_TEST_WOKEN_HOLD_AFTER_RECEIPT", dir.path());
     }
     let mut resumed = command.spawn().unwrap();
-    if automatic != 0 {
+    if cut != NestedOwnedCut::Refused {
         tokio::time::timeout(Duration::from_secs(15), async {
             while !dir.path().join("nested-cancelled").exists() {
                 assert!(resumed.try_wait().unwrap().is_none());
@@ -11239,7 +11251,7 @@ async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool, autom
         })
         .await
         .unwrap();
-        if automatic == 4 {
+        if cut == NestedOwnedCut::LateOutcome {
             let store = durable_store::Store::open(&path).unwrap();
             let claim = store
                 .get(&crate::task_scheduler::woken_conversation_claim_key(
@@ -11332,7 +11344,7 @@ async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool, autom
             reopened.wait().unwrap();
             return;
         }
-        if automatic == 1 {
+        if cut == NestedOwnedCut::Callback {
             let store = durable_store::Store::open(&path).unwrap();
             let task_marker = format!("durable/task-callback-start/{}", edge.task);
             let crate::task::TaskOwner::Task(ancestor) = edge.task_owner else {
@@ -11441,7 +11453,7 @@ async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool, autom
         })
         .await
         .unwrap();
-        if automatic == 2 {
+        if cut == NestedOwnedCut::Receipt {
             tokio::time::timeout(Duration::from_secs(10), async {
                 while !dir.path().join("woken-receipt").exists() {
                     assert!(resumed.try_wait().unwrap().is_none());
@@ -11451,7 +11463,7 @@ async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool, autom
             .await
             .unwrap();
         }
-        if automatic == 3 {
+        if cut == NestedOwnedCut::LiveSettlement {
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     assert!(resumed.try_wait().unwrap().is_none());
@@ -11670,36 +11682,36 @@ async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool, autom
 #[cfg(all(unix, feature = "experimental-graph-revision"))]
 #[tokio::test]
 async fn nested_woken_owned_callback_kill_does_not_replay() {
-    exercise_nested_woken_owned_rejection(false, false, 1).await;
-    exercise_nested_woken_owned_rejection(true, false, 1).await;
+    exercise_nested_woken_owned(false, NestedOwnedCut::Callback).await;
+    exercise_nested_woken_owned(true, NestedOwnedCut::Callback).await;
 }
 
 #[cfg(all(unix, feature = "experimental-graph-revision"))]
 #[tokio::test]
 async fn nested_woken_owned_late_result_fences_callback_receipt() {
-    exercise_nested_woken_owned_rejection(false, false, 4).await;
-    exercise_nested_woken_owned_rejection(true, false, 4).await;
+    exercise_nested_woken_owned(false, NestedOwnedCut::LateOutcome).await;
+    exercise_nested_woken_owned(true, NestedOwnedCut::LateOutcome).await;
 }
 
 #[cfg(all(unix, feature = "experimental-graph-revision"))]
 #[tokio::test]
 async fn nested_woken_owned_graph_live_terminal_preserves_receipt() {
-    exercise_nested_woken_owned_rejection(false, false, 3).await;
-    exercise_nested_woken_owned_rejection(true, false, 3).await;
+    exercise_nested_woken_owned(false, NestedOwnedCut::LiveSettlement).await;
+    exercise_nested_woken_owned(true, NestedOwnedCut::LiveSettlement).await;
 }
 
 #[cfg(all(unix, feature = "experimental-graph-revision"))]
 #[tokio::test]
 async fn nested_woken_owned_graph_automatic_callback() {
-    exercise_nested_woken_owned_rejection(false, false, 2).await;
-    exercise_nested_woken_owned_rejection(true, false, 2).await;
+    exercise_nested_woken_owned(false, NestedOwnedCut::Receipt).await;
+    exercise_nested_woken_owned(true, NestedOwnedCut::Receipt).await;
 }
 
 #[cfg(all(unix, feature = "experimental-graph-revision"))]
 #[tokio::test]
 async fn nested_woken_owned_graph_mark_requires_ancestor_fence() {
-    exercise_nested_woken_owned_rejection(false, true, 0).await;
-    exercise_nested_woken_owned_rejection(true, true, 0).await;
+    exercise_nested_woken_owned(false, NestedOwnedCut::GraphMark).await;
+    exercise_nested_woken_owned(true, NestedOwnedCut::GraphMark).await;
 }
 
 #[cfg(unix)]
