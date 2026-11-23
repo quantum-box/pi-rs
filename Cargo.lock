@@ -2928,6 +2928,7 @@ dependencies = [
  "eventsource-stream",
  "futures-util",
  "pi-rs-core",
+ "regex",
  "reqwest 0.12.28",
  "ring",
  "serde",

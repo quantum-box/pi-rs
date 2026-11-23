@@ -11,6 +11,7 @@ mod extension_boundary;
 mod host_auth;
 mod journal;
 mod lifecycle;
+mod live_model;
 mod mcp_registration;
 mod model_catalog;
 mod model_price;
@@ -28,6 +29,7 @@ mod strict_tool_schema;
 mod tokens;
 mod tool_execution_snapshot;
 mod tool_render;
+mod tool_transcript;
 mod types;
 mod ui;
 mod ui_prompt;
@@ -53,10 +55,13 @@ pub use lifecycle::{
     notify_filtered_with_ui as notify_extension_lifecycle_filtered_with_ui,
     notify_in_session as notify_extension_lifecycle_in_session,
 };
+pub use live_model::{LiveModelControl, LiveModelSelection};
 pub use mcp_registration::{McpRegistryHost, McpServerDeclaration, RegisteredMcpServer};
 pub use model_catalog::*;
 pub use model_price::ChatPrice;
-pub use pi_rs_tool_arguments::{StreamingJson, parse_tool_arguments};
+pub use pi_rs_tool_arguments::{
+    JSON_DIAGNOSTIC_RETRY_LIMIT, StreamingJson, json_syntax_diagnostic, parse_tool_arguments,
+};
 pub use provider_response::{
     ProviderResponseEvent, observe_provider_response, observes_provider_response,
 };
@@ -79,6 +84,9 @@ pub use tokens::{
 pub use tokio_util::sync::CancellationToken;
 pub use tool_execution_snapshot::{ToolExecutionSnapshot, ValidatedToolExecutionSnapshot};
 pub use tool_render::*;
+pub use tool_transcript::{
+    BoundToolTranscript, ToolTranscriptMode, ToolTranscriptPlan, plan_tool_transcript,
+};
 pub use types::*;
 pub use ui::*;
 pub use ui_prompt::{UiPromptKind, UiPromptReason};

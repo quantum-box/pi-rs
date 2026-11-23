@@ -163,6 +163,9 @@ impl Settings {
         &self.diagnostics
     }
     pub(super) fn apply_queue_reload(&mut self, reloaded: &Self) {
+        self.apply_worker_settings(reloaded, &["steeringMode", "followUpMode"]);
+    }
+    pub(super) fn apply_worker_settings(&mut self, reloaded: &Self, keys: &[&str]) {
         for (base, layer) in &mut self.resource_layers {
             let Some((_, incoming)) = reloaded
                 .resource_layers
@@ -174,7 +177,7 @@ impl Settings {
             let Some(object) = layer.as_object_mut() else {
                 continue;
             };
-            for key in ["steeringMode", "followUpMode"] {
+            for &key in keys {
                 if let Some(value) = incoming.get(key) {
                     object.insert(key.into(), value.clone());
                 } else {
@@ -192,7 +195,7 @@ impl Settings {
                 let Some(object) = layer.as_object_mut() else {
                     continue;
                 };
-                for key in ["steeringMode", "followUpMode"] {
+                for &key in keys {
                     if let Some(value) = incoming.get(key) {
                         object.insert(key.into(), value.clone());
                     } else {
@@ -318,12 +321,20 @@ impl Settings {
     pub fn http_idle_timeout_ms(&self) -> u64 {
         self.value
             .get("httpIdleTimeoutMs")
-            .and_then(parse_http_idle_timeout)
+            .and_then(parse_timeout_setting)
             .unwrap_or(300_000)
     }
     pub fn http_idle_timeout(&self) -> Option<std::time::Duration> {
         let value = self.http_idle_timeout_ms();
         (value > 0).then(|| std::time::Duration::from_millis(value))
+    }
+    pub fn websocket_connect_timeout(&self) -> Option<std::time::Duration> {
+        let millis = self
+            .value
+            .get("websocketConnectTimeoutMs")
+            .and_then(parse_timeout_setting)
+            .unwrap_or(15_000);
+        (millis > 0).then(|| std::time::Duration::from_millis(millis))
     }
     pub fn strings(&self, key: &str) -> Vec<String> {
         self.value
@@ -359,6 +370,11 @@ impl Settings {
                 Ok((base, entries))
             })
             .collect()
+    }
+    pub(super) fn codex_transport(&self) -> pi_rs::openai::CodexTransport {
+        self.string("transport")
+            .and_then(pi_rs::openai::CodexTransport::named)
+            .unwrap_or_default()
     }
     pub fn value(&self) -> &Value {
         &self.value
@@ -398,6 +414,18 @@ impl Settings {
             timeout: number("timeoutMs").map(std::time::Duration::from_millis),
         }
     }
+    /// Suppress retries for a request-only settings copy.
+    pub fn disable_provider_retries(&mut self) {
+        if let Some(provider) = self
+            .value
+            .get_mut("retry")
+            .and_then(|retry| retry.get_mut("provider"))
+            .and_then(Value::as_object_mut)
+        {
+            provider.insert("maxRetries".into(), Value::from(0));
+        }
+    }
+
     pub fn set_auto_retry_enabled(&mut self, enabled: bool) -> Result<()> {
         self.set_user_member("retry", "enabled", Value::Bool(enabled))?;
         self.live_auto_retry = Some(enabled);
@@ -669,7 +697,7 @@ fn read_settings_layer(
     }
 }
 
-fn parse_http_idle_timeout(value: &Value) -> Option<u64> {
+fn parse_timeout_setting(value: &Value) -> Option<u64> {
     let number = match value {
         Value::Number(number) => number.as_f64()?,
         Value::String(value) => {
@@ -734,16 +762,24 @@ pub fn validate_settings(value: &Value, path: &Path) -> Result<()> {
             (field, error.masked().to_string())
         })
         .collect();
-    if let Some(timeout) = normalized.get("httpIdleTimeoutMs")
-        && parse_http_idle_timeout(timeout).is_none()
-        && !errors
-            .iter()
-            .any(|(field, _)| field == "/httpIdleTimeoutMs")
-    {
-        errors.push((
-            "/httpIdleTimeoutMs".into(),
-            "invalid HTTP idle timeout".into(),
-        ));
+    for (key, field, message) in [
+        (
+            "httpIdleTimeoutMs",
+            "/httpIdleTimeoutMs",
+            "invalid HTTP idle timeout",
+        ),
+        (
+            "websocketConnectTimeoutMs",
+            "/websocketConnectTimeoutMs",
+            "invalid WebSocket connect timeout",
+        ),
+    ] {
+        if let Some(timeout) = normalized.get(key)
+            && parse_timeout_setting(timeout).is_none()
+            && !errors.iter().any(|(existing, _)| existing == field)
+        {
+            errors.push((field.into(), message.into()));
+        }
     }
     if !errors.is_empty() {
         errors.sort();
@@ -779,6 +815,13 @@ fn migrate_legacy_settings(value: &mut Value) {
         && let Some(mode) = settings.remove("queueMode")
     {
         settings.insert("steeringMode".into(), mode);
+    }
+    if !settings.contains_key("transport")
+        && let Some(enabled) = settings.get("websockets").and_then(Value::as_bool)
+    {
+        let transport = if enabled { "websocket" } else { "sse" };
+        settings.insert("transport".into(), Value::String(transport.into()));
+        settings.remove("websockets");
     }
     if let Some(retry) = settings.get_mut("retry").and_then(Value::as_object_mut)
         && let Some(delay) = retry.remove("maxDelayMs").filter(Value::is_number)
@@ -1119,7 +1162,7 @@ fn read_json_object(
                 let reason = if path.file_name().is_some_and(|name| name == "settings.json")
                     && let Ok(text) = std::str::from_utf8(input)
                 {
-                    super::rpc::json_syntax_diagnostic(text, &error)
+                    pi_rs::json_syntax_diagnostic(text, &error)
                 } else {
                     error.to_string()
                 };
@@ -1337,6 +1380,50 @@ mod tests {
         assert_eq!(saved["skills"], global_value["skills"]);
         assert_eq!(saved["queueMode"], "all");
         assert_eq!(saved["hideThinkingBlock"], true);
+    }
+
+    #[test]
+    fn legacy_websocket_settings_migrate_per_layer_without_rewriting() {
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let project = workspace.join(".pi/settings.json");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        let global = directory.path().join("settings.json");
+
+        for (user, local, trusted, untrusted) in [
+            (
+                json!({"websockets":true}),
+                json!({"websockets":false}),
+                "sse",
+                "websocket",
+            ),
+            (
+                json!({"websockets":false}),
+                json!({"transport":"websocket-cached","websockets":true}),
+                "websocket-cached",
+                "sse",
+            ),
+            (
+                json!({"transport":"auto","websockets":false}),
+                json!({"websockets":"true"}),
+                "auto",
+                "auto",
+            ),
+        ] {
+            let user = user.to_string();
+            let local = local.to_string();
+            std::fs::write(&global, &user).unwrap();
+            std::fs::write(&project, &local).unwrap();
+            for (trust, expected) in [(true, trusted), (false, untrusted)] {
+                let settings =
+                    super::Settings::load_from_paths(&workspace, trust, &global).unwrap();
+                assert_eq!(settings.string("transport"), Some(expected));
+            }
+            assert_eq!(std::fs::read_to_string(&global).unwrap(), user);
+            assert_eq!(std::fs::read_to_string(&project).unwrap(), local);
+        }
     }
 
     #[test]
@@ -1948,6 +2035,34 @@ mod tests {
     }
 
     #[test]
+    fn websocket_connect_timeout_has_its_own_default_and_supports_disabling() {
+        use std::time::Duration;
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.websocket_connect_timeout(),
+            Some(Duration::from_secs(15))
+        );
+        settings.value = json!({"websocketConnectTimeoutMs":"25.9","httpIdleTimeoutMs":"disabled"});
+        validate_settings(settings.value(), Path::new("settings.json")).unwrap();
+        assert_eq!(
+            settings.websocket_connect_timeout(),
+            Some(Duration::from_millis(25))
+        );
+        assert!(settings.http_idle_timeout().is_none());
+        for timeout in [json!(0), json!("disabled")] {
+            settings.value = json!({"websocketConnectTimeoutMs":timeout});
+            validate_settings(settings.value(), Path::new("settings.json")).unwrap();
+            assert!(settings.websocket_connect_timeout().is_none());
+        }
+        let error = validate_settings(
+            &json!({"websocketConnectTimeoutMs":"later"}),
+            Path::new("settings.json"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("/websocketConnectTimeoutMs"));
+    }
+
+    #[test]
     fn http_idle_timeout_has_pi_defaults_and_supports_disabling() {
         let mut settings = super::Settings::default();
         assert_eq!(settings.http_idle_timeout_ms(), 300_000);
@@ -2518,6 +2633,23 @@ mod tests {
         assert_eq!(retry.max_retries, 0);
         assert_eq!(retry.base_delay_ms, 0);
         assert_eq!(retry.max_agent_delay_ms, 42);
+    }
+
+    #[test]
+    fn disabling_provider_retries_preserves_unrecognized_settings() {
+        for value in [
+            json!({}),
+            json!({"retry":false}),
+            json!({"retry":{"provider":"invalid"}}),
+        ] {
+            let mut settings = Settings {
+                value: value.clone(),
+                ..Settings::default()
+            };
+            settings.disable_provider_retries();
+            assert_eq!(settings.value(), &value);
+            assert_eq!(settings.provider_retry(), pi_rs::ProviderRetry::default());
+        }
     }
 
     #[test]

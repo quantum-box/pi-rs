@@ -289,6 +289,7 @@ pub enum Entry {
     Image(std::sync::Arc<super::images::InlineImage>),
     Tool {
         id: String,
+        call_id: Option<String>,
         name: String,
         arguments: String,
         output: String,
@@ -1815,6 +1816,8 @@ fn markdown_at_depth_with_refs(
     hyperlinks: bool,
     preserve_source: bool,
 ) -> Vec<Line> {
+    let parsed = super::markdown_spaces::inline_indented_comments(parsed);
+    let parsed = parsed.as_ref();
     if let Some(lines) = markdown_with_block_spacing(
         (text, parsed, reference_source),
         theme,
@@ -2190,6 +2193,8 @@ fn markdown_plain_at_depth(
     let mut last_heading_separator = None;
     let mut last_code_separator = None;
     let mut last_rule_separator = None;
+    let comment_prefix = super::markdown_spaces::INLINE_COMMENT_PREFIX;
+    let restore_comment_spaces = parsed.contains(comment_prefix) && !text.contains(comment_prefix);
     let protected_text = protect_bare_links(parsed, options, reference_source);
     let list_math = super::math_blocks::list_blocks(parsed);
     let mut events = insert_list_math(
@@ -2376,7 +2381,13 @@ fn markdown_plain_at_depth(
                 }
             }
             Event::Start(Tag::Link { dest_url, id, .. }) => {
-                let raw_label = id.strip_prefix("\0pi-marked-label:").map(str::to_owned);
+                let raw_label = id.strip_prefix("\0pi-marked-label:").map(|label| {
+                    if restore_comment_spaces {
+                        label.replace(comment_prefix, " ")
+                    } else {
+                        label.to_owned()
+                    }
+                });
                 links.push((dest_url.into_string(), String::new(), raw_label));
             }
             Event::End(TagEnd::Link) => {
@@ -2767,6 +2778,9 @@ fn markdown_plain_at_depth(
                             merged = text[range.clone()].to_owned();
                         }
                     }
+                    if restore_comment_spaces && merged.contains(comment_prefix) {
+                        merged = merged.replace(comment_prefix, " ");
+                    }
                     let preceding = text.as_bytes()[..range.start]
                         .iter()
                         .rev()
@@ -2944,6 +2958,11 @@ fn markdown_plain_at_depth(
                 }
             }
             Event::Code(text) => {
+                let text = if restore_comment_spaces && text.contains(comment_prefix) {
+                    text.replace(comment_prefix, " ").into()
+                } else {
+                    text
+                };
                 if let Some((_, label, _)) = links.last_mut() {
                     label.push_str(&text);
                 }
@@ -3176,6 +3195,49 @@ fn flush(spans: &mut Vec<Span>, lines: &mut Vec<Line>, width: usize, prefix: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_preserves_indentation_around_html_comments() {
+        let theme = Theme::system();
+        for (source, expected) in [
+            ("one\n  <!-- hidden --> text", vec!["one", "  text"]),
+            ("one\n  <!-- hidden --> **text**", vec!["one", "  text"]),
+            ("one\n  <!-- hidden -->\nnext", vec!["one", "", "next"]),
+            ("one\n\n  <!-- hidden --> text", vec!["one", "", "text"]),
+            ("  <!-- hidden --> text", vec!["text"]),
+            (
+                "[one\n  <!-- hidden --> text](https://example.com)",
+                vec!["one", "  text (https://example.com)"],
+            ),
+            (
+                "first `one\n  <!-- hidden --> text` end",
+                vec!["first one   <!-- hidden --> text end"],
+            ),
+            (
+                "> - one\n\n>   <!-- hidden --> text",
+                vec!["│ - one", "", "│ text"],
+            ),
+        ] {
+            let rendered: Vec<String> = markdown(source, &theme, 36)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                        .trim_end()
+                        .into()
+                })
+                .collect();
+            assert_eq!(rendered, expected, "{source:?}");
+        }
+        assert!(
+            markdown("one\n  <!-- c --> **text**", &theme, 36)[1]
+                .spans
+                .iter()
+                .any(|span| span.bold && span.text == "text")
+        );
+    }
 
     #[test]
     fn markdown_hides_html_comments_without_hiding_literal_code() {
@@ -5235,6 +5297,7 @@ mod tests {
             .join("\n");
         let entry = Entry::Tool {
             id: "edit-14".into(),
+            call_id: None,
             name: "edit".into(),
             arguments: r#"{"file_path":"sample.txt"}"#.into(),
             output,
@@ -5293,6 +5356,7 @@ mod tests {
         .unwrap();
         let entry = Entry::Tool {
             id: "test".into(),
+            call_id: None,
             name: "codemode".into(),
             arguments: "{}".into(),
             output: "before\n[image]\nafter".into(),
