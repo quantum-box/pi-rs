@@ -1156,7 +1156,12 @@ struct LiveModelChoice {
     id: uuid::Uuid,
     selected: Cli,
     status: String,
-    save_default: bool,
+    persist: Option<SelectionDefault>,
+}
+
+enum SelectionDefault {
+    Model,
+    Thinking(String),
 }
 
 #[derive(Default)]
@@ -1977,7 +1982,7 @@ impl View {
         worker: &mut Worker,
         selected: Cli,
         status: String,
-        save_default: bool,
+        persist: Option<SelectionDefault>,
     ) -> Result<()> {
         if self.live_model_choices.len() >= 32 {
             return Err(Error::Config("Model selection is still pending".into()));
@@ -1996,7 +2001,7 @@ impl View {
             id,
             selected,
             status,
-            save_default,
+            persist,
         });
         Ok(())
     }
@@ -2019,13 +2024,18 @@ impl View {
                     .selection_events
                     .splice(0..0, previous.selection_events);
             }
-            if choice.save_default
-                && let Err(error) =
+            let saved = match choice.persist {
+                Some(SelectionDefault::Model) => {
                     save_default_model(args, &choice.selected.provider, &choice.selected.model)
-            {
-                self.append(&error.to_string());
-            } else {
-                self.show_status(args.tui_mode, choice.status);
+                }
+                Some(SelectionDefault::Thinking(level)) => {
+                    args.settings.set_user("defaultThinkingLevel", json!(level))
+                }
+                None => Ok(()),
+            };
+            match saved {
+                Ok(()) => self.show_status(args.tui_mode, choice.status),
+                Err(error) => self.append(&error.to_string()),
             }
             self.live_model_applied = Some(choice.selected);
         } else {
@@ -4279,10 +4289,11 @@ fn slash(
                 .string("defaultThinkingLevel")
                 .unwrap_or("off")
                 .to_owned();
-            let current = args.thinking.clone().unwrap_or_else(|| "off".into());
+            let mut selected = view.model_choice(args).clone();
+            let current = selected.thinking.clone().unwrap_or_else(|| "off".into());
             let mut picker = Picker::new(
                 "Thinking level",
-                super::thinking::available(args)
+                super::thinking::available(&mut selected)
                     .into_iter()
                     .map(|level| Item {
                         label: format!(
@@ -4297,7 +4308,15 @@ fn slash(
             picker.focus_thinking(&current);
             view.picker = Some(picker);
         }
-        "/thinking" => super::thinking::set(args, rest)?,
+        "/thinking" => {
+            select_thinking_input(
+                args,
+                view,
+                worker.and_then(|slot| slot.as_mut()),
+                rest,
+                false,
+            )?;
+        }
         "/new" => {
             if Worker::check_session_transition(
                 worker,
@@ -6262,14 +6281,13 @@ pub(super) async fn run(
                                     &model,
                                     true,
                                 ),
-                                Selection::Thinking(thinking) => {
-                                    super::thinking::set(&mut args, &thinking).and_then(|()| {
-                                        args.settings
-                                            .set_user("defaultThinkingLevel", json!(thinking))?;
-                                        view.append(&format!("Default thinking level: {thinking}"));
-                                        Ok(())
-                                    })
-                                }
+                                Selection::Thinking(thinking) => select_thinking_input(
+                                    &mut args,
+                                    &mut view,
+                                    worker.as_mut(),
+                                    &thinking,
+                                    true,
+                                ),
                                 _ => Ok(()),
                             };
                             if let Err(error) = result {
@@ -6837,8 +6855,11 @@ pub(super) async fn run(
                                 view.editor.replace(input);
                             }
                         } else if (matches!(input.trim(), "/session" | "/share" | "/tree")
-                            || (input.starts_with("/model")
-                                && input.split_whitespace().next() == Some("/model")
+                            || (input.starts_with('/')
+                                && matches!(
+                                    input.split_whitespace().next(),
+                                    Some("/model" | "/thinking")
+                                )
                                 && (!is_busy(&worker)
                                     || worker.as_ref().is_some_and(|active| active.busy))))
                             && view.draft_images.is_empty()
@@ -7368,7 +7389,8 @@ fn select_model_input(
             selection.thinking,
             pi_rs::ModelSelectSource::Set,
         )?;
-        return view.stage_model_choice(worker, selected, status, save_default);
+        let persist = save_default.then_some(SelectionDefault::Model);
+        return view.stage_model_choice(worker, selected, status, persist);
     }
     args.change_model(
         provider,
@@ -7467,7 +7489,7 @@ fn cycle_model(
             pi_rs::ModelSelectSource::Cycle,
         )?;
         let status = model_cycle_status(&selected);
-        return view.stage_model_choice(worker, selected, status, false);
+        return view.stage_model_choice(worker, selected, status, None);
     }
     args.change_model(
         choice.provider,
@@ -7495,6 +7517,37 @@ fn model_cycle_status(args: &Cli) -> String {
     status
 }
 
+fn select_thinking_input(
+    args: &mut Cli,
+    view: &mut View,
+    worker: Option<&mut Worker>,
+    requested: &str,
+    save_default: bool,
+) -> Result<()> {
+    let status_prefix = if save_default {
+        "Default thinking level"
+    } else {
+        "Thinking level"
+    };
+    if let Some(worker) = worker.filter(|worker| worker.busy) {
+        let mut selected = view.model_choice(args).clone();
+        selected.selection_events.clear();
+        let level = super::thinking::resolve(&mut selected, requested)?;
+        super::thinking::select(&mut selected, &level);
+        let status = format!("{status_prefix}: {level}");
+        let persist = save_default.then_some(SelectionDefault::Thinking(level));
+        return view.stage_model_choice(worker, selected, status, persist);
+    }
+    super::thinking::set(args, requested)?;
+    let level = args.thinking.as_deref().unwrap_or("off");
+    if save_default {
+        args.settings
+            .set_user("defaultThinkingLevel", json!(level))?;
+    }
+    view.show_status(args.tui_mode, format!("{status_prefix}: {level}"));
+    Ok(())
+}
+
 fn cycle_thinking(args: &mut Cli, view: &mut View, worker: &mut Option<Worker>) -> Result<()> {
     let level = if let Some(worker) = worker.as_mut().filter(|worker| worker.busy) {
         let mut selected = view.model_choice(args).clone();
@@ -7505,7 +7558,7 @@ fn cycle_thinking(args: &mut Cli, view: &mut View, worker: &mut Option<Worker>) 
                 worker,
                 selected,
                 format!("Thinking level: {level}"),
-                false,
+                None,
             );
         }
         None
@@ -8902,7 +8955,9 @@ fn select(
         Selection::RadiusMethods => show_radius_methods(view),
         Selection::LoginRadius(method) => start_radius_login(view, &args.settings, method)?,
         Selection::LogoutRadius => start_radius_logout(view, &args.settings)?,
-        Selection::Thinking(thinking) => super::thinking::set(args, &thinking)?,
+        Selection::Thinking(thinking) => {
+            select_thinking_input(args, view, worker.as_mut(), &thinking, false)?;
+        }
         Selection::SaveDefaultModel => save_current_default_model(args)?,
         Selection::EditSetting(key) => {
             let default = match key.as_str() {
@@ -9961,12 +10016,15 @@ mod tests {
         let accepted = uuid::Uuid::new_v4();
         let mut selected = args.clone();
         selected.model = "after".into();
-        for (id, save_default) in [(failed, true), (accepted, false)] {
+        for (id, persist) in [
+            (failed, Some(super::SelectionDefault::Model)),
+            (accepted, None),
+        ] {
             view.live_model_choices.push_back(super::LiveModelChoice {
                 id,
                 selected: selected.clone(),
                 status: "Model: after".into(),
-                save_default,
+                persist,
             });
         }
         assert_eq!(view.accepted_model(&args).model, "before");

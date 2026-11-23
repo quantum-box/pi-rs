@@ -178,11 +178,23 @@ pub(super) fn adjust(args: &mut Cli) {
 }
 
 pub(super) fn set(args: &mut Cli, requested: &str) -> Result<()> {
+    let level = resolve(args, requested)?;
+    persist(args, &level)
+}
+
+pub(super) fn resolve(args: &mut Cli, requested: &str) -> Result<String> {
     let levels = available(args);
-    if !LEVELS.contains(&requested) && !levels.iter().any(|level| level == requested) {
-        return Err(Error::Config("invalid thinking level".into()));
+    if let Some(level) = levels
+        .iter()
+        .find(|level| level.eq_ignore_ascii_case(requested))
+    {
+        return Ok(level.clone());
     }
-    persist(args, clamp(requested, &levels))
+    let requested = LEVELS
+        .iter()
+        .find(|level| level.eq_ignore_ascii_case(requested))
+        .ok_or_else(|| Error::Config("invalid thinking level".into()))?;
+    Ok(clamp(requested, &levels).into())
 }
 
 pub(super) fn cycle(args: &mut Cli) -> Result<Option<String>> {
@@ -253,6 +265,8 @@ mod tests {
         );
         assert_eq!(adopted_reasoning(&args), Some(true));
         assert!(reported(&args).is_none());
+        assert_eq!(resolve(&mut args, "hIgH").unwrap(), "high");
+        assert!(resolve(&mut args, "invalid").is_err());
     }
 
     #[test]
