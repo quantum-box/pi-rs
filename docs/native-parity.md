@@ -738,11 +738,14 @@ home-relative paths and local file URLs are accepted. A missing resource is
 reported without preventing other discovered resources from loading.
 
 Completed tool arguments repair invalid string escapes and unescaped control
-characters as Pi does. Incomplete JSON and non-object values produce a tool
-error containing the received arguments. The original model response remains
-in the journal; subsequent model requests use the repaired object. For a
-failed repair, Pi's syntax positions refer to the repaired text. The
-`Received arguments` block displays the original model response.
+characters as Pi does. For local coding tools, malformed JSON (including
+incomplete documents) and non-object values produce Pi-style tool errors
+containing the original argument text. Native limits the echoed text to a
+64 KiB preview so oversized inputs retain the parsing diagnostic. These errors
+carry empty details and appear in JSON and RPC result events and reopened
+session messages. For a failed repair, Pi's syntax positions refer to the
+repaired text. The journal keeps the original model response, used for the
+`Received arguments` preview. Subsequent model requests use the repaired object for valid calls.
 
 When all sibling timestamps are valid, `get_tree` sorts them in chronological
 order and retains append order for the same instant. This includes imported timestamps with UTC offsets and ISO year, year-month, and date forms
