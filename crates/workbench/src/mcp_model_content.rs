@@ -778,7 +778,10 @@ mod tests {
             .unwrap()
             .strip_suffix(" (read it with offset/limit)]")
             .unwrap();
-        assert_eq!(std::fs::read(path).unwrap(), vec![0; 23_000]);
+        let saved = std::fs::read(path).unwrap();
+        let body = saved.strip_prefix(b"[Resource mock://text]\n").unwrap();
+        assert_eq!(body.len(), 23_000);
+        assert!(body.iter().all(|byte| *byte == 0));
     }
 
     #[test]
