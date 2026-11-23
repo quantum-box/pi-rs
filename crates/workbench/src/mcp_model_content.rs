@@ -23,14 +23,14 @@ const MAX_OUTPUT_FILE_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Default)]
 struct ResourceOutputs {
     directory: Option<tempfile::TempDir>,
-    files: BTreeMap<([u8; 32], String), PathBuf>,
+    files: BTreeMap<([u8; 32], String), (PathBuf, usize)>,
     bytes: usize,
 }
 
 impl ResourceOutputs {
     fn save(&mut self, data: &[u8], extension: &str) -> io::Result<PathBuf> {
         let key = (Sha256::digest(data).into(), extension.to_owned());
-        if let Some(path) = self.files.get(&key) {
+        if let Some((path, _)) = self.files.get(&key) {
             if unchanged(path, data) {
                 return Ok(path.clone());
             }
@@ -41,11 +41,11 @@ impl ResourceOutputs {
             }
         }
         let new = !self.files.contains_key(&key);
-        if new
-            && (self.files.len() >= MAX_OUTPUT_FILES
-                || self.bytes + data.len() > MAX_OUTPUT_FILE_BYTES)
-        {
-            return Err(io::Error::other("native MCP output file limit reached"));
+        if new && self.at_capacity(data.len()) {
+            self.remove_missing_files();
+            if self.at_capacity(data.len()) {
+                return Err(io::Error::other("native MCP output file limit reached"));
+            }
         }
         let directory = match &self.directory {
             Some(directory) => directory,
@@ -59,11 +59,29 @@ impl ResourceOutputs {
             .tempfile_in(directory.path())?;
         file.write_all(data)?;
         let (_, path) = file.keep().map_err(|error| error.error)?;
-        self.files.insert(key, path.clone());
+        self.files.insert(key, (path.clone(), data.len()));
         if new {
             self.bytes += data.len();
         }
         Ok(path)
+    }
+
+    fn at_capacity(&self, size: usize) -> bool {
+        self.files.len() >= MAX_OUTPUT_FILES || self.bytes + size > MAX_OUTPUT_FILE_BYTES
+    }
+
+    fn remove_missing_files(&mut self) {
+        let mut bytes = 0;
+        self.files.retain(|_, (path, size)| {
+            let missing = path
+                .symlink_metadata()
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+            if missing {
+                bytes += *size;
+            }
+            !missing
+        });
+        self.bytes -= bytes;
     }
 }
 
@@ -896,8 +914,12 @@ mod tests {
         }
         outputs.bytes = MAX_OUTPUT_FILE_BYTES;
         assert!(outputs.save(b"new", ".pdf").is_err());
+        std::fs::remove_file(&restored).unwrap();
+        let next = outputs.save(b"new", ".pdf").unwrap();
+        assert_eq!(outputs.bytes, MAX_OUTPUT_FILE_BYTES - 2);
+        assert_eq!(outputs.files.len(), 1);
         drop(outputs);
-        assert!(!restored.exists());
+        assert!(!next.exists());
     }
 
     #[test]
