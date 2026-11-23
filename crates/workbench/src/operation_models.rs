@@ -1078,7 +1078,7 @@ impl Operations {
             .clone()
     }
 
-    async fn radius_client(&self, discovery: bool) -> Option<PiMessages> {
+    async fn radius_client(&self, cached_only: bool) -> Option<PiMessages> {
         let http = self.current_http();
         let mut args = self.args.clone();
         args.settings = http.settings;
@@ -1086,8 +1086,8 @@ impl Operations {
         let client = args
             .connect_provider(&Provider::Radius, None)
             .ok()?
-            .with_context_probes(!args.offline);
-        if discovery && args.offline && matches!(client, Client::Deferred(_)) {
+            .with_context_probes(!args.offline && !cached_only);
+        if cached_only && matches!(client, Client::Deferred(_)) {
             return None;
         }
         match client.resolve_affinity_headers().await.ok()?.0 {
@@ -1096,9 +1096,16 @@ impl Operations {
         }
     }
 
-    async fn radius_classifiers(&self, cancel: &pi_rs::CancellationToken) -> Result<Vec<Entry>> {
+    async fn radius_classifiers(
+        &self,
+        cancel: &pi_rs::CancellationToken,
+        available_only: bool,
+    ) -> Result<Vec<Entry>> {
         let discover = async {
-            let Some(radius) = self.radius_client(true).await else {
+            let Some(radius) = self
+                .radius_client(self.args.offline || !available_only)
+                .await
+            else {
                 return Vec::new();
             };
             let Ok(Some(catalog)) = radius.catalog().await else {
@@ -1256,7 +1263,7 @@ impl Tool for Operations {
                     && Some(model.model.id.as_str()) == args["id"].as_str()
             });
             let found = if !found && kind == Some(Kind::Classifier) && provider == Some("radius") {
-                match self.radius_classifiers(&context.cancellation).await {
+                match self.radius_classifiers(&context.cancellation, true).await {
                     Ok(entries) => entries
                         .iter()
                         .any(|entry| Some(entry.model.id.as_str()) == args["id"].as_str()),
@@ -1342,7 +1349,10 @@ impl Tool for Operations {
                     .await;
                 if kind == Kind::Classifier && provider.is_none_or(|provider| provider == "radius")
                 {
-                    let discovered = match self.radius_classifiers(&context.cancellation).await {
+                    let discovered = match self
+                        .radius_classifiers(&context.cancellation, args["available"] == true)
+                        .await
+                    {
                         Ok(entries) => entries,
                         Err(error) => return Outcome::Failed(error.to_string()),
                     };
@@ -1908,7 +1918,15 @@ mod tests {
                 operation_id: uuid::Uuid::nil(),
                 cancellation: Default::default(),
             };
-            let list = json!({"action":"list","type":"classifier","provider":"radius"});
+            if !args.offline {
+                let list = json!({"action":"list","type":"classifier","provider":"radius"});
+                let Outcome::Structured { data, .. } = operation.invoke(list, context()).await
+                else {
+                    panic!("unfiltered Radius catalogue lookup failed");
+                };
+                assert_eq!(data, json!([]));
+            }
+            let list = json!({"action":"list","type":"classifier","provider":"radius","available":!args.offline});
             let cancelled = context();
             cancelled.cancellation.cancel();
             assert!(matches!(
@@ -1946,7 +1964,7 @@ mod tests {
                 .unwrap();
                 let Outcome::Structured { data, .. } = operation
                     .invoke(
-                        json!({"action":"list","type":"classifier","provider":"radius"}),
+                        json!({"action":"list","type":"classifier","provider":"radius","available":true}),
                         context(),
                     )
                     .await
