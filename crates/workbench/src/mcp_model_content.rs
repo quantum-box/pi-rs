@@ -337,7 +337,7 @@ fn limit_text_preview(projected: &mut Vec<Value>, files: FileReaders) -> Option<
         }
         offset = end + 1;
         if preview.is_empty() {
-            return None;
+            return false;
         }
         *block = text(preview);
         true
