@@ -37,12 +37,19 @@ pub(super) fn project_tool_results(request: &mut ModelRequest) {
             } if let Some(name) = calls.remove(call_id.as_str())
                 && let Some((prefix, tool)) = mcp_tool_name(name, &readable)
                 && let Some(server) = prefix.strip_prefix("mcp__")
-                && pi_rs::tool_content_is_structured(content, *is_structured) =>
+                && *is_structured != Some(false) =>
             {
                 let read_tool = readable.get(prefix).copied();
                 if let Some((text, structured)) = project_result(content, server, tool, read_tool) {
                     *content = text;
                     *is_structured = Some(structured);
+                } else if is_structured.is_none()
+                    && is_resource_read(tool)
+                    && serde_json::from_str::<Value>(content)
+                        .is_ok_and(|value| value["data"]["contents"].is_array())
+                {
+                    // Historical resource reads predate the structured provenance flag.
+                    *is_structured = Some(true);
                 }
             }
             _ => {}
@@ -337,6 +344,44 @@ mod tests {
         assert!(caption.contains("caption"));
         assert!(!caption.contains("YQ=="));
         assert!(caption.contains("dGVzdA=="));
+    }
+
+    #[test]
+    fn mcp_model_content_projects_legacy_structured_resource_reads() {
+        let mut request = ModelRequest {
+            model: "fixture".into(),
+            max_output_tokens: 1,
+            tools: vec![],
+            messages: vec![
+                Message::Assistant {
+                    content: "".into(),
+                    replay: None,
+                    calls: vec![ToolCall {
+                        id: "read".into(),
+                        name: "mcp__foo__bar__read_resource".into(),
+                        arguments: "{}".into(),
+                    }],
+                },
+                Message::Tool {
+                    call_id: "read".into(),
+                    content: tool_content(
+                        json!({"contents":[{"uri":"mock://notes","text":"notes"}]}),
+                    ),
+                    is_error: false,
+                    is_structured: None,
+                },
+            ],
+        };
+        project_tool_results(&mut request);
+        assert_eq!(
+            request.messages[1],
+            Message::Tool {
+                call_id: "read".into(),
+                content: "notes".into(),
+                is_error: false,
+                is_structured: Some(false),
+            }
+        );
     }
 
     #[test]
