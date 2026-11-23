@@ -264,7 +264,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn provider_response_hooks_run_in_order_before_body_and_report_errors() {
         let calls = Calls::default();
         let mut registry = Registry::default();
