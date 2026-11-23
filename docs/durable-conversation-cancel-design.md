@@ -455,3 +455,18 @@ plus SQLite index, page and WAL overhead. An older experimental v2 schema with
 different trigger definitions is rejected on reopen; mixed versions require
 coordination rather than automatic replacement. SQLite WAL growth can still
 exceed this bound while long-running readers prevent checkpointing.
+
+For a store used with both experimental features, stop and join its existing
+scheduler before opening it with the new binary. On Unix the protocol migration
+requires the scheduler owner lock; an active owner prevents migration. Preserve
+a backup before migration if returning to an older or default binary may be
+necessary. The v4 store cannot be opened by the current default build, and
+restoring the backup also discards writes made after that backup. Do not run old
+and new schedulers against the same store.
+
+An older binary predating the protocol check may still open a migrated store
+after the new scheduler stops, but its writes fail because that connection does
+not provide the v4 SQLite function. This is a write fence, not a guarantee that
+all old binaries refuse to start. Verify the selected binary and its features
+before restarting a migrated store; do not treat a successful old-process start
+as evidence of compatibility.
