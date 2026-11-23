@@ -138,8 +138,10 @@ the selected display name and the active thinking level for reasoning models. Co
 reuse the trailing status in both fullscreen and regular mode, before it enters
 scrollback. The tool-output, thinking-visibility, and thinking-level shortcuts
 report the new state using the same status row, as in Pi.
-During a streamed prompt, model and thinking shortcuts acknowledge a prepared
-selection without changing the request in flight. A queued follow-up uses the
+During a streamed prompt, model cycling, the Ctrl+L model picker, and
+the /model command can select the model for the next request. Ctrl+S in the
+picker also saves the accepted choice as the default. Model and thinking
+shortcuts acknowledge a prepared selection without changing the request in flight. A queued follow-up uses the
 new route and effort. Cycling models uses the destination's scoped or per-model
 thinking level, then the global default, then the current level. The worker
 commits the selection before the next request,
@@ -175,7 +177,7 @@ or custom models through the native fallback.
 | Sessions | Project-grouped journals, saved working directory, names and labels, searchable resume/tree/fork selectors and toggleable label timestamps, optional model-generated branch summaries, parent-session grouping, independent branch clone, native and upstream JSONL import, HTML/JSONL export, clipboard copy, Radius and GitHub Gist share, compaction, read-only child review | Remaining upstream message variants and display fidelity, remaining tree layout and navigation hooks |
 | Model access | Ollama, OpenAI-compatible Chat Completions, OpenAI and Codex Responses, Anthropic Messages, Google Gemini Generate Content, Radius Pi Messages, and Amazon Bedrock Converse streaming. The searchable chat catalog includes pinned first-party and gateway models. Named profiles support model-specific APIs and endpoints, scoped cycling, branch-local model and thinking choices, catalog costs, usage estimates, and retry settings. | Provider-specific transport and configuration limits are recorded in the model checkpoints below. |
 | Authentication | Host-supplied tokens, credential commands, endpoint-bound API keys, and Pi-compatible OAuth storage. Native sign-in supports Anthropic, Radius, OpenRouter, ChatGPT, OpenAI Codex, GitHub Copilot, Kimi Code, Meta, and xAI. Expiring subscription credentials can refresh or mint a replacement key when the provider supports it. | Live sign-in, refresh, and inference coverage is recorded in each provider checkpoint. |
-| Native extensions | Rust tool, prompt input, direct process execution, command-created branch-local custom entries and model-context messages, durable custom messages from native tools and supported callbacks during runs or while idle, user-shell result replacement and streaming operations, in-process shell spawn hooks, injectable model read, write, edit, shell, grep, find and ls operations, model and thinking selection, context and full-system context hooks, policy, command, state/migration, compaction, resource discovery and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, typed command-line flags, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, styled modal components and custom message renderers | Remaining Pi events and selection paths, custom entries and messages from all callbacks, custom entry and other renderers, resource provenance in other surfaces and general component render callbacks |
+| Native extensions | Rust tool, prompt input, direct process execution, command-created branch-local custom entries and model-context messages, durable custom messages from native tools and supported callbacks during runs or while idle, user-shell result replacement and streaming operations, in-process shell spawn hooks, injectable model read, write, edit, shell, grep, find and ls operations, model and thinking selection, context and full-system context hooks, policy, command, state/migration, compaction, resource discovery and agent/turn lifecycle hooks; standard notes/TODO/plan/review; separately built executable loading, typed command-line flags, scaffolding and native package distribution; correlated dialogs, notifications, status, editor access, positioned widgets, styled modal components and custom message and entry renderers | Remaining Pi events and selection paths, custom entries and messages from all callbacks, other renderers, resource provenance in other surfaces and general component render callbacks |
 | Project resources | Hierarchical AGENTS/CLAUDE and override files, trust persistence and prompt, user/trusted-project settings, skills discovery and forced invocation, argument-aware prompt templates, package resources and reload | Complete settings editor UI and remaining validation diagnostics |
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts with per-server resource pagination; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; automatic selection of configured hosted client metadata; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Live acceptance with a hosted pi-rs client identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
@@ -738,11 +740,14 @@ home-relative paths and local file URLs are accepted. A missing resource is
 reported without preventing other discovered resources from loading.
 
 Completed tool arguments repair invalid string escapes and unescaped control
-characters as Pi does. Incomplete JSON and non-object values produce a tool
-error containing the received arguments. The original model response remains
-in the journal; subsequent model requests use the repaired object. For a
-failed repair, Pi's syntax positions refer to the repaired text. The
-`Received arguments` block displays the original model response.
+characters as Pi does. For local coding tools, malformed JSON (including
+incomplete documents) and non-object values produce Pi-style tool errors
+containing the original argument text. Native limits the echoed text to a
+64 KiB preview so oversized inputs retain the parsing diagnostic. These errors
+carry empty details and appear in JSON and RPC result events and reopened
+session messages. For a failed repair, Pi's syntax positions refer to the
+repaired text. The journal keeps the original model response, used for the
+`Received arguments` preview. Subsequent model requests use the repaired object for valid calls.
 
 When all sibling timestamps are valid, `get_tree` sorts them in chronological
 order and retains append order for the same instant. This includes imported timestamps with UTC offsets and ISO year, year-month, and date forms
@@ -941,6 +946,16 @@ supports arbitrary components, custom entry renderers and additional
 renderer hooks. A separately built extension was exercised in the fullscreen
 and regular macOS terminal modes for live delivery, expansion, fallback,
 journal preservation and restored history.
+
+### Native custom entry renderers
+
+The terminal and Rust SDK can render branch-local custom entries without
+sending entry data to the model. The first registered renderer for each
+type wins. The terminal applies the active theme, leaves unregistered and
+initially empty entries out of the transcript, and shows an error row for
+failed renderers. Entry renderers share the native styled-row format. The
+terminal retains up to 4,000 custom-entry candidates separately from
+ordinary transcript history and gives already visible entries priority.
 
 ### Terminal and native-extension checkpoint
 
@@ -1460,8 +1475,9 @@ refresh, and selection for provider-less legacy history remain host-owned.
 
 
 Native SDK hosts can construct OpenAI-compatible chat, OpenAI Responses,
-ChatGPT Responses, Anthropic Messages and Gemini clients from an explicitly supplied credential snapshot,
-provider identity and endpoint, then register them in a host-owned model catalog.
+ChatGPT Responses, Anthropic Messages, Gemini and Amazon Bedrock ConverseStream
+clients from an explicitly supplied credential snapshot, provider identity and
+endpoint, then register them in a host-owned model catalog.
 The factory does not perform implicit credential or model discovery, OAuth
 refresh, proxy discovery, model metadata probes, or network I/O at construction. Gemini
 uses a base URL and appends model-specific streaming paths. Hosts own endpoint
@@ -1469,6 +1485,15 @@ policy and existing clients outlive replacement of the credential snapshot.
 Unauthenticated chat clients require a separate explicit factory method. Typed
 clients let hosts supply provider/model configuration; the factory does not
 automatically infer that configuration.
+
+Bedrock sends an authorized API key or bearer token using the bearer auth
+scheme. The generic catalog constructor obtains the region from a regional
+AWS Runtime hostname. A host with a custom Runtime endpoint supplies the
+region through the typed `bedrock_client` factory. The explicit endpoint, region
+and credentials take no input from AWS environment variables or profiles. This
+path uses a direct transport without proxy discovery. The AWS SDK still supplies its standard transport metadata. Hosts that use a
+rotating credential provider can supply their own AWS SDK configuration through
+`Bedrock::from_sdk_config`.
 
 
 `/thinking`, Shift+Tab and `--thinking` select a reasoning effort. Selection is
@@ -1504,7 +1529,8 @@ OAuth, and any credential writes.
 Embedded hosts can build an immutable catalog with
 `pi_rs_workbench::model_file::ModelFileReadGrants`. An explicit file path and
 exact provider, API, and declared base URL grants select custom chat models
-from strict Pi-format JSON. Provider fields are inherited unless the model
+from Pi-format JSON with line comments and trailing commas. Provider fields
+are inherited unless the model
 overrides them. The grant supplies the actual request endpoint and the model
 factory supplies its exact credential. The import applies descriptive
 `modelOverrides` to selected declarations, including partial prices. Transport options such as
@@ -1519,6 +1545,11 @@ Hosts may resolve saved key variables with
 route and variable name after checking saved inline values, and the loader
 never consults process environment variables itself. Catalog and key reloads
 produce independent snapshots.
+
+The optional file-key loader can use a provider's configured API key when the
+host grants the same route for file keys. Credentials already bound in the
+factory take precedence. Host-supplied variable values are resolved once per
+eligible route, and key commands remain outside this factory.
 
 ### Regular terminal checkpoint
 
@@ -3013,6 +3044,8 @@ terminal height, with a five-row minimum when space allows, and uses the
 visible row capacity for page movement.
 Searching includes records inside folded branches. Shift+L edits or removes a
 record label and returns to the current search, filter, and label-time setting.
+The terminal cursor follows the focused tree search or label input, including
+wide characters, so input methods anchor to that field as in Pi 1.6.
 Label edits made during a response are saved by the active session worker.
 Direct `/checkout` releases its journal lock before restoring the view.
 After tree navigation, the selected user message fills an empty editor. A draft
@@ -5110,6 +5143,20 @@ the running extension and delivers the resulting snapshots in mutation
 order. An executable negotiates this access through
 `mcp_registry_host_calls` and the duplex capability advertisement. SDK forks
 have their own snapshot of the active MCP registrations.
+
+Native extensions can subscribe to assistant `message_start`,
+`message_update`, and `message_end` through the message lifecycle callback.
+The stream notifications use native text, thinking and tool-call fragments
+and arrive before the corresponding public notifications. A completed
+`message_end` may replace text within the response limit while retaining the
+assistant role and the provider's tool decisions. Edits are reflected in the
+model's retained reply, journal and final RPC message. Native provider replay
+retains opaque reasoning, tool data and empty signed placeholders while
+replacing its visible text. Signatures on replaced visible text are not
+reused. Display layout is rebuilt after an edit, and context estimates use the
+edited text while billing retains measured usage. Failed and aborted
+attempts receive transient start and end notifications when needed. Executable extensions advertise
+`message_lifecycle_hook`. Summary requests stay outside the hook.
 
 Native extensions can subscribe to `after_provider_response` to observe the
 HTTP status and normalized headers from an agent turn. The OpenAI Responses,

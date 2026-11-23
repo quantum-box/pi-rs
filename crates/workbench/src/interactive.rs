@@ -11,7 +11,7 @@ use crate::ui::{
     mermaid::Mermaid,
     mouse_selection::MouseSelection,
     picker::{Input, Item, MouseInput, Picker, Selection, ThemeSettingsAction, TreeFilter},
-    render::{Entry, Line, SummaryKind, ToolPart, TranscriptOptions},
+    render::{CustomEntryPresentation, Entry, Line, SummaryKind, ToolPart, TranscriptOptions},
     theme::{Theme, ThemeWatcher},
     transcript_search::Search,
     viewport::{Viewport, Wheel},
@@ -1152,7 +1152,7 @@ struct TreeNavigationHandoff {
     clear_id: Option<uuid::Uuid>,
 }
 
-struct CustomMessageRenderPending {
+struct TranscriptExtensionRenderPending {
     request: uuid::Uuid,
     record: u64,
     options: pi_rs::CustomMessageRenderOptions,
@@ -1178,6 +1178,7 @@ struct LiveModelChoice {
     id: uuid::Uuid,
     selected: Cli,
     status: String,
+    save_default: bool,
 }
 
 #[derive(Default)]
@@ -1198,6 +1199,7 @@ struct View {
     ui_status: std::collections::BTreeMap<String, String>,
     widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
     lines: Vec<Entry>,
+    custom_entry_count: usize,
     custom_render_options: Option<pi_rs::CustomMessageRenderOptions>,
     tool_render_options: Option<super::backend::ToolRenderOptions>,
     tool_render_pending: Option<PendingToolRender>,
@@ -1208,7 +1210,7 @@ struct View {
     tool_render_attempted: std::collections::BTreeMap<String, super::backend::ToolRenderRecords>,
     tool_render_retry: std::collections::BTreeMap<String, super::backend::ToolRenderRecords>,
     custom_render_attempted: BTreeSet<u64>,
-    custom_render_pending: Option<CustomMessageRenderPending>,
+    custom_render_pending: Option<TranscriptExtensionRenderPending>,
     custom_render_redraw_at: Option<Instant>,
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
@@ -1596,16 +1598,74 @@ impl View {
 
     fn append_entry(&mut self, entry: Entry) {
         self.lines.push(entry);
-        if self.lines.len() > 4000 {
-            let removed = self.lines.len() - 4000;
-            for entry in self.lines.drain(..removed) {
-                if let Entry::CustomMessage { id, .. } = entry {
+        let ordinary = self.lines.len() - self.custom_entry_count;
+        let excess = ordinary.saturating_sub(4000);
+        if excess == 0 {
+            return;
+        }
+        let removed = if self.custom_entry_count == 0 {
+            excess
+        } else {
+            self.lines
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| !matches!(entry, Entry::CustomRecord { .. }))
+                .nth(excess - 1)
+                .expect("ordinary transcript entries")
+                .0
+                + 1
+        };
+        for entry in self.lines.drain(..removed) {
+            match entry {
+                Entry::CustomRecord { id, .. } => {
+                    self.custom_entry_count -= 1;
                     self.custom_render_attempted.remove(&id);
                 }
+                Entry::CustomMessage { id, .. } => {
+                    self.custom_render_attempted.remove(&id);
+                }
+                _ => {}
             }
-            self.regular.committed = self.regular.committed.saturating_sub(removed);
         }
+        self.regular.committed = self.regular.committed.saturating_sub(removed);
     }
+
+    fn show_custom_entry(&mut self, id: u64, entry: &pi_rs::CustomEntry) {
+        // Keep metadata-only placeholders out of the ordinary transcript limit
+        // while waiting for extensions to finish their startup discovery.
+        if self.custom_entry_count == 4000 {
+            let oldest = self
+                .lines
+                .iter()
+                .position(|line| {
+                    matches!(line, Entry::CustomRecord { presentation, .. }
+                        if *presentation != CustomEntryPresentation::Included)
+                })
+                .or_else(|| {
+                    self.lines
+                        .iter()
+                        .position(|line| matches!(line, Entry::CustomRecord { .. }))
+                })
+                .expect("retained custom entry");
+            let Entry::CustomRecord { id, rendered, .. } = self.lines.remove(oldest) else {
+                unreachable!("custom entry position")
+            };
+            self.custom_render_attempted.remove(&id);
+            if oldest < self.regular.committed {
+                self.regular.committed -= 1;
+                self.regular.redraw |= rendered.is_some();
+            }
+        } else {
+            self.custom_entry_count += 1;
+        }
+        self.lines.push(Entry::CustomRecord {
+            id,
+            custom_type: entry.custom_type.clone(),
+            presentation: CustomEntryPresentation::Pending,
+            rendered: None,
+        });
+    }
+
     fn maybe_warn_about_anthropic_subscription(&mut self, args: &Cli) {
         if self.anthropic_subscription_warning_shown
             || !args.settings.warn_anthropic_extra_usage()
@@ -1636,6 +1696,7 @@ impl View {
             ));
         }
     }
+
     fn show_custom_message(&mut self, id: u64, message: &pi_rs::CustomMessage) {
         if !message.display {
             return;
@@ -1669,6 +1730,16 @@ impl View {
             self.add_images(&images);
         }
     }
+    fn refresh_transcript_extension_renderers(&mut self) -> bool {
+        self.custom_render_pending = None;
+        for line in &mut self.lines {
+            if let Entry::CustomRecord { presentation, .. } = line {
+                *presentation = CustomEntryPresentation::Pending;
+            }
+        }
+        self.invalidate_custom_message_renderings()
+    }
+
     fn invalidate_tool_renderings(&mut self) -> bool {
         self.tool_render_cursor = None;
         self.tool_preview_cursor = None;
@@ -1938,11 +2009,11 @@ impl View {
         }
     }
 
-    fn render_tool_progress(&mut self, event: &Value) {
+    fn render_tool_progress(&mut self, event: &Value) -> bool {
         let (Some(call_id), Some(name)) =
             (event["toolCallId"].as_str(), event["toolName"].as_str())
         else {
-            return;
+            return false;
         };
         let mut matches = self.lines.iter_mut().rev().filter(|entry| {
             matches!(entry, Entry::Tool {
@@ -1957,16 +2028,16 @@ impl View {
             ..
         }) = matches.next()
         else {
-            return;
+            return false;
         };
         if matches.next().is_some() {
-            return;
+            return true;
         }
         let update = &event["partialResult"];
         let Some(blocks) = update["content"].as_array() else {
-            return;
+            return true;
         };
-        *output = display_tool_blocks(blocks);
+        *output = crate::ui::render::strip_shell_ansi(&display_tool_blocks(blocks));
         *parts = tool_result_parts(&update["content"], self.graphics.enabled());
         records.progress = records.progress.wrapping_add(1);
         self.partial_tool_results.insert(
@@ -1979,6 +2050,7 @@ impl View {
                 duration_ms: None,
             },
         );
+        true
     }
 
     fn invalidate_custom_message_renderings(&mut self) -> bool {
@@ -1986,7 +2058,8 @@ impl View {
         self.custom_render_redraw_at = None;
         let mut redrawn = false;
         for (index, entry) in self.lines.iter_mut().enumerate() {
-            if let Entry::CustomMessage { rendered, .. } = entry
+            if let Entry::CustomMessage { rendered, .. } | Entry::CustomRecord { rendered, .. } =
+                entry
                 && rendered.take().is_some()
             {
                 self.regular.redraw |= index < self.regular.committed;
@@ -1996,8 +2069,8 @@ impl View {
         redrawn
     }
 
-    fn prepare_custom_message_render(&mut self, worker: &mut Worker, args: &Cli) -> bool {
-        if worker.message_renderer_types.is_empty() {
+    fn prepare_transcript_extension_render(&mut self, worker: &mut Worker, args: &Cli) -> bool {
+        if worker.message_renderer_types.is_empty() && worker.entry_renderer_types.is_empty() {
             return false;
         }
         let options = pi_rs::CustomMessageRenderOptions {
@@ -2023,15 +2096,26 @@ impl View {
             {
                 Some(*id)
             }
+            Entry::CustomRecord {
+                id,
+                custom_type,
+                presentation,
+                ..
+            } if *presentation != CustomEntryPresentation::Omitted
+                && worker.entry_renderer_types.contains(custom_type)
+                && !self.custom_render_attempted.contains(id) =>
+            {
+                Some(*id)
+            }
             _ => None,
         });
         if let Some(record) = candidate {
             self.custom_render_attempted.insert(record);
             let request = uuid::Uuid::new_v4();
             if worker.send(json!({
-                "type":"render_custom_message","id":request,"record_id":record,"options":options,
+                "type":"render_transcript_extension","id":request,"record_id":record,"options":options,
             })).is_ok() {
-                self.custom_render_pending = Some(CustomMessageRenderPending {
+                self.custom_render_pending = Some(TranscriptExtensionRenderPending {
                     request,
                     record,
                     options,
@@ -2041,7 +2125,7 @@ impl View {
         changed
     }
 
-    fn receive_custom_message_render(&mut self, event: Value) -> bool {
+    fn receive_transcript_extension_render(&mut self, event: Value) -> bool {
         let Some(pending) = self.custom_render_pending.as_ref() else {
             return false;
         };
@@ -2054,26 +2138,43 @@ impl View {
             .expect("matching render request");
         if self.custom_render_options.as_ref() != Some(&pending.options)
             || !self.custom_render_attempted.contains(&pending.record)
-            || event["rendered"].is_null()
         {
             return false;
         }
-        let Ok(rendering) =
-            serde_json::from_value::<pi_rs::RenderedCustomMessage>(event["rendered"].clone())
-        else {
+        let Ok(rendering) = serde_json::from_value::<Option<pi_rs::RenderedExtensionContent>>(
+            event["rendered"].clone(),
+        ) else {
             return false;
         };
         for (index, entry) in self.lines.iter_mut().enumerate().rev() {
-            if let Entry::CustomMessage { id, rendered, .. } = entry
-                && *id == pending.record
-            {
-                *rendered = Some(rendering);
-                if index < self.regular.committed {
-                    self.custom_render_redraw_at
-                        .get_or_insert_with(|| Instant::now() + Duration::from_millis(150));
+            let target = match entry {
+                Entry::CustomMessage { id, rendered, .. } if *id == pending.record => rendered,
+                Entry::CustomRecord {
+                    id,
+                    presentation,
+                    rendered,
+                    ..
+                } if *id == pending.record => {
+                    if *presentation == CustomEntryPresentation::Pending {
+                        *presentation = if rendering.is_some() {
+                            CustomEntryPresentation::Included
+                        } else {
+                            CustomEntryPresentation::Omitted
+                        };
+                    }
+                    rendered
                 }
-                return true;
+                _ => continue,
+            };
+            if rendering.is_none() {
+                return false;
             }
+            *target = rendering;
+            if index < self.regular.committed {
+                self.custom_render_redraw_at
+                    .get_or_insert_with(|| Instant::now() + Duration::from_millis(150));
+            }
+            return true;
         }
         false
     }
@@ -2321,6 +2422,7 @@ impl View {
         worker: &mut Worker,
         selected: Cli,
         status: String,
+        save_default: bool,
     ) -> Result<()> {
         if self.live_model_choices.len() >= 32 {
             return Err(Error::Config("Model selection is still pending".into()));
@@ -2339,11 +2441,12 @@ impl View {
             id,
             selected,
             status,
+            save_default,
         });
         Ok(())
     }
 
-    fn accept_model_choice(&mut self, value: &Value, mode: Option<TuiMode>) {
+    fn accept_model_choice(&mut self, value: &Value, args: &mut Cli) {
         let Some(index) = self
             .live_model_choices
             .iter()
@@ -2361,8 +2464,15 @@ impl View {
                     .selection_events
                     .splice(0..0, previous.selection_events);
             }
+            if choice.save_default
+                && let Err(error) =
+                    save_default_model(args, &choice.selected.provider, &choice.selected.model)
+            {
+                self.append(&error.to_string());
+            } else {
+                self.show_status(args.tui_mode, choice.status);
+            }
             self.live_model_applied = Some(choice.selected);
-            self.show_status(mode, choice.status);
         } else {
             self.append(value["error"].as_str().unwrap_or("Could not switch models"));
         }
@@ -2384,7 +2494,7 @@ impl View {
 
     fn receive_worker(&mut self, mut value: Value, args: &mut Cli) {
         if value["type"] == "response" && value["command"] == "select_live_model" {
-            self.accept_model_choice(&value, args.tui_mode);
+            self.accept_model_choice(&value, args);
             return;
         }
         if value["type"] == "live_model_reverted" {
@@ -2460,6 +2570,7 @@ impl View {
                         | "branch_summary"
                         | "custom_message"
                         | "custom_message_delivered"
+                        | "custom_entry"
                 )
             )
             && let Ok(record) = serde_json::from_value::<pi_rs::Record>(value["record"].take())
@@ -2468,6 +2579,9 @@ impl View {
             | pi_rs::Event::CustomMessageDelivered { message, .. } = &record.event
             {
                 self.show_custom_message(record.id, message);
+            }
+            if let pi_rs::Event::CustomEntry { entry } = &record.event {
+                self.show_custom_entry(record.id, entry);
             }
             if matches!(record.event, pi_rs::Event::ModelRequested { .. }) {
                 self.cache_stats.select_provider(args.provider.id());
@@ -2517,6 +2631,7 @@ impl View {
         self.regular.committed = 0;
         self.regular.redraw = true;
         self.lines.clear();
+        self.custom_entry_count = 0;
         self.custom_render_redraw_at = None;
         // Keep an in-flight request as the only one until its response. The
         // cleared attempted set prevents it from updating the restored rows.
@@ -2580,6 +2695,7 @@ impl View {
             .collect();
         for record in session.branch() {
             match &record.event {
+                pi_rs::Event::CustomEntry { entry } => self.show_custom_entry(record.id, entry),
                 pi_rs::Event::CustomMessage { message }
                 | pi_rs::Event::CustomMessageDelivered { message, .. } => {
                     self.show_custom_message(record.id, message)
@@ -2952,7 +3068,11 @@ render_call_id: None,
                 self.text_items.clear();
                 self.streaming_tools.clear();
             }
-            Some("tool_execution_update") => self.render_tool_progress(value),
+            Some("tool_execution_update") => {
+                if !self.render_tool_progress(value) {
+                    self.update_tool_progress(value);
+                }
+            }
             Some("tool_call_delta") if !self.summarizing => {
                 if let Ok(delta) = serde_json::from_value::<pi_rs::ToolCallDelta>(value["toolCallDelta"].clone()) {
                     let tool = self.streaming_tools.entry(delta.index).or_insert_with(|| StreamingTool {
@@ -3009,7 +3129,6 @@ render_call_id: None,
                     append_indexed(&mut self.text_items, &mut self.streaming, &mut self.text_items_consistent, index, delta);
                 } else { self.streaming.push_str(delta); self.text_items_consistent = false; }
             }
-            Some("tool_execution_update") => self.update_tool_progress(value),
             Some("mcp_server") => self.append(&format!(
                 "MCP {} · {} · {}",
                 value["name"].as_str().unwrap_or(""),
@@ -3461,19 +3580,20 @@ render_call_id: None,
         if let Some(picker) = &self.picker {
             lines = picker.render_in_terminal(theme, width, body_height, height, keys);
         }
-        let dialog_cursor = self
-            .dialog()
-            .and_then(|dialog| dialog.cursor(width, body_height));
-        if let Some(dialog) = self.dialog() {
+        let modal_cursor = if let Some(dialog) = self.dialog() {
             lines = dialog.render(theme, width, body_height, keys);
-            if !hardware_cursor
-                && let Some((row, column)) = dialog_cursor
-                && let Some(line) = lines.get_mut(row)
-            {
-                line.mark_cursor(column);
-            }
+            dialog.cursor(width, body_height)
         } else {
             lines.extend(self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor));
+            self.picker
+                .as_ref()
+                .and_then(|picker| picker.tree_input_cursor(width, body_height))
+        };
+        if !hardware_cursor
+            && let Some((row, column)) = modal_cursor
+            && let Some(line) = lines.get_mut(row)
+        {
+            line.mark_cursor(column);
         }
         let modal = self.picker.is_some() || self.dialog().is_some();
         let start = if modal {
@@ -3671,7 +3791,7 @@ render_call_id: None,
                     queue!(out, Show)?;
                 }
             }
-        } else if let Some((row, column)) = dialog_cursor {
+        } else if let Some((row, column)) = modal_cursor {
             queue!(out, MoveTo(column as u16, (row + header_rows) as u16))?;
             if hardware_cursor {
                 queue!(out, Show)?;
@@ -3956,26 +4076,26 @@ render_call_id: None,
             }
         }
         let dialog_height = height - prompt_height - 4 - below.len();
-        let dialog_cursor = self
-            .dialog()
-            .and_then(|dialog| dialog.cursor(width, dialog_height));
-        if let Some(dialog) = self.dialog() {
+        let modal_cursor = if let Some(dialog) = self.dialog() {
             active = dialog.render(theme, width, dialog_height, keys);
-            if !hardware_cursor
-                && let Some((row, column)) = dialog_cursor
-                && let Some(line) = active.get_mut(row)
-            {
-                line.mark_cursor(column);
-            }
+            dialog.cursor(width, dialog_height)
         } else {
-            let available = height - prompt_height - 4 - below.len();
             let mut widgets = self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor);
-            widgets.truncate(available);
-            let keep = available.saturating_sub(widgets.len());
-            if active.len() > keep {
-                active.drain(..active.len() - keep);
-            }
+            widgets.truncate(dialog_height);
+            let keep = dialog_height.saturating_sub(widgets.len());
+            let hidden = active.len().saturating_sub(keep);
+            active.drain(..hidden);
             active.extend(widgets);
+            self.picker
+                .as_ref()
+                .and_then(|picker| picker.tree_input_cursor(width, keep))
+                .and_then(|(row, column)| row.checked_sub(hidden).map(|row| (row, column)))
+        };
+        if !hardware_cursor
+            && let Some((row, column)) = modal_cursor
+            && let Some(line) = active.get_mut(row)
+        {
+            line.mark_cursor(column);
         }
         let region_height = active.len() + prompt_height + 4 + below.len();
         let rows_to_match = self
@@ -4106,12 +4226,12 @@ render_call_id: None,
         .draw(&mut out, width)?;
         self.regular.cursor_row = active.len() + 1 + cursor;
         self.regular.region_height = region_height;
-        let (column, show_cursor) = if self.dialog().is_some() {
-            self.regular.cursor_row = dialog_cursor.map_or(0, |(row, _)| row);
-            (
-                dialog_cursor.map_or(0, |(_, column)| column),
-                dialog_cursor.is_some(),
-            )
+        let (column, show_cursor) = if let Some((row, column)) = modal_cursor {
+            self.regular.cursor_row = row;
+            (column, true)
+        } else if self.dialog().is_some() {
+            self.regular.cursor_row = 0;
+            (0, false)
         } else {
             (column, self.picker.is_none())
         };
@@ -4398,9 +4518,18 @@ fn slash(
                 start_share_upload(view, pending, None);
             }
         }
-        "/model" if rest.is_empty() => {
-            args.reload_model_profiles()?;
-            start_model_picker(args, view, ModelListIntent::Select);
+        "/model" => {
+            let active = worker
+                .and_then(|slot| slot.as_mut())
+                .filter(|worker| worker.busy);
+            if active.is_none() {
+                args.reload_model_profiles()?;
+            }
+            if rest.is_empty() {
+                start_model_picker(args, view, ModelListIntent::Select);
+            } else {
+                select_model_input(args, view, active, rest, false)?;
+            }
         }
         "/scoped-models" => {
             args.reload_model_profiles()?;
@@ -4654,11 +4783,6 @@ fn slash(
                     remove_provider_key(provider, args, view)?;
                 }
             }
-        }
-        "/model" => {
-            args.reload_model_profiles()?;
-            select_model_input(args, view, rest)?;
-            view.append(&format!("Model › {rest}"));
         }
         "/thinking" if rest.is_empty() => {
             let default = args
@@ -5446,7 +5570,7 @@ pub(super) async fn run(
             .is_some_and(|active| !active.busy && !active.bashing && !active.matches(&args))
             && let Some(mut old) = worker.take()
         {
-            if !old.message_renderer_types.is_empty() {
+            if !old.message_renderer_types.is_empty() || !old.entry_renderer_types.is_empty() {
                 startup_extensions = None;
                 view.custom_render_pending = None;
                 dirty |= view.invalidate_custom_message_renderings();
@@ -5627,8 +5751,10 @@ pub(super) async fn run(
                     active.message_renderer_types =
                         serde_json::from_value(value["custom_message_renderers"].clone())
                             .unwrap_or_default();
-                    view.custom_render_pending = None;
-                    dirty |= view.invalidate_custom_message_renderings();
+                    active.entry_renderer_types =
+                        serde_json::from_value(value["custom_entry_renderers"].clone())
+                            .unwrap_or_default();
+                    dirty |= view.refresh_transcript_extension_renderers();
                     active.tool_rendering = value["tool_rendering"] == true;
                     view.tool_render_pending = None;
                     view.tool_preview_pending = None;
@@ -5638,8 +5764,8 @@ pub(super) async fn run(
                     dirty |= view.receive_tool_render(value);
                     continue;
                 }
-                if value["type"] == "custom_message_rendered" {
-                    dirty |= view.receive_custom_message_render(value);
+                if value["type"] == "transcript_extension_rendered" {
+                    dirty |= view.receive_transcript_extension_render(value);
                     continue;
                 }
                 if value["type"] == "response" && value["command"] == "get_share_context" {
@@ -5778,7 +5904,7 @@ pub(super) async fn run(
                 }
                 dirty = true;
             }
-            dirty |= view.prepare_custom_message_render(active, &args);
+            dirty |= view.prepare_transcript_extension_render(active, &args);
             dirty |= view.prepare_tool_render(active, &args);
             if let Some(status) = active.child.try_wait()? {
                 let mut finished = worker.take().expect("active worker");
@@ -6663,15 +6789,12 @@ pub(super) async fn run(
                         Input::Save(selection) => {
                             let result = match selection {
                                 Selection::Model(model) => select_model_input(
-                                    &mut args, &mut view, &model,
-                                )
-                                .and_then(|()| {
-                                    let configured =
-                                        format!("{}/{}", args.provider.id(), args.model);
-                                    save_default_model(&mut args)?;
-                                    view.append(&format!("Default model: {configured}"));
-                                    Ok(())
-                                }),
+                                    &mut args,
+                                    &mut view,
+                                    worker.as_mut(),
+                                    &model,
+                                    true,
+                                ),
                                 Selection::Thinking(thinking) => {
                                     super::thinking::set(&mut args, &thinking).and_then(|()| {
                                         args.settings
@@ -7150,7 +7273,10 @@ pub(super) async fn run(
                         )?;
                     }
                     "tui.input.tab" => complete_input(&args, &mut view),
-                    "app.model.select" if !is_busy(&worker) => {
+                    "app.model.select"
+                        if !is_busy(&worker)
+                            || worker.as_ref().is_some_and(|active| active.busy) =>
+                    {
                         start_model_picker(&args, &mut view, ModelListIntent::Select)
                     }
                     "tui.input.submit" if view.editor.continued_line() => {}
@@ -7243,7 +7369,11 @@ pub(super) async fn run(
                                 view.append(&error.to_string());
                                 view.editor.replace(input);
                             }
-                        } else if matches!(input.trim(), "/session" | "/share" | "/tree")
+                        } else if (matches!(input.trim(), "/session" | "/share" | "/tree")
+                            || (input.starts_with("/model")
+                                && input.split_whitespace().next() == Some("/model")
+                                && (!is_busy(&worker)
+                                    || worker.as_ref().is_some_and(|active| active.busy))))
                             && view.draft_images.is_empty()
                         {
                             if let Err(error) =
@@ -7734,40 +7864,72 @@ fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut Vie
     result
 }
 
-fn select_model_input(args: &mut Cli, view: &mut View, input: &str) -> Result<()> {
-    let provider = super::model_selection::qualified_model(input, &args.model_profiles)
-        .map_or_else(|| args.provider.clone(), |(provider, _)| provider);
+fn select_model_input(
+    args: &mut Cli,
+    view: &mut View,
+    worker: Option<&mut Worker>,
+    input: &str,
+    save_default: bool,
+) -> Result<()> {
+    let current = view.model_choice(args);
+    let provider = super::model_selection::qualified_model(input, &current.model_profiles)
+        .map_or_else(|| current.provider.clone(), |(provider, _)| provider);
     let available = view
         .available_models
         .iter()
-        .filter_map(|model| super::model_selection::qualified_model(model, &args.model_profiles))
+        .filter_map(|model| super::model_selection::qualified_model(model, &current.model_profiles))
         .filter(|(candidate, _)| *candidate == provider)
         .map(|(_, model)| model.to_owned())
         .collect::<Vec<_>>();
-    let selected = super::model_selection::split_with_profiles(
+    let selection = super::model_selection::split_with_profiles(
         input,
         &available,
         &provider,
-        &args.model_profiles,
+        &current.model_profiles,
     )?;
+    let status = if save_default {
+        format!("Default model: {}/{}", provider.id(), selection.model)
+    } else {
+        format!("Model: {}", selection.model)
+    };
+    if let Some(worker) = worker.filter(|worker| worker.busy) {
+        let mut current = current.clone();
+        current.selection_events.clear();
+        let selected = current.prepare_model_change(
+            provider,
+            selection.model,
+            selection.thinking,
+            pi_rs::ModelSelectSource::Set,
+        )?;
+        return view.stage_model_choice(worker, selected, status, save_default);
+    }
     args.change_model(
         provider,
-        selected.model,
-        selected.thinking,
+        selection.model,
+        selection.thinking,
         pi_rs::ModelSelectSource::Set,
-    )
+    )?;
+    if save_default {
+        save_current_default_model(args)?;
+    }
+    view.show_status(args.tui_mode, status);
+    Ok(())
 }
 
-fn save_default_model(args: &mut Cli) -> Result<()> {
-    let qualified = format!("{}/{}", args.provider.id(), args.model);
+fn save_current_default_model(args: &mut Cli) -> Result<()> {
+    save_default_model(args, &args.provider.clone(), &args.model.clone())
+}
+
+fn save_default_model(args: &mut Cli, provider: &super::Provider, model: &str) -> Result<()> {
+    let qualified = format!("{}/{model}", provider.id());
     let add_to_scope = !args.model_scope.is_empty()
         && !args
             .model_scope
             .iter()
-            .any(|choice| choice.provider == args.provider && choice.model == args.model);
+            .any(|choice| &choice.provider == provider && choice.model == model);
     let mut values = vec![
-        ("defaultProvider".into(), json!(args.provider.id())),
-        ("defaultModel".into(), json!(args.model)),
+        ("defaultProvider".into(), json!(provider.id())),
+        ("defaultModel".into(), json!(model)),
     ];
     if add_to_scope {
         let mut enabled = args.settings.strings("enabledModels");
@@ -7783,8 +7945,8 @@ fn save_default_model(args: &mut Cli) -> Result<()> {
     args.settings.set_user_values(&values)?;
     if add_to_scope {
         args.model_scope.push(super::model_selection::ScopedChoice {
-            provider: args.provider.clone(),
-            model: args.model.clone(),
+            provider: provider.clone(),
+            model: model.into(),
             thinking: None,
         });
     }
@@ -7800,7 +7962,7 @@ fn cycle_model(
     use super::model_selection::{ScopedChoice, next_model, qualified_model};
     let current = view.model_choice(args);
     let discovered;
-    let choices = if current.model_scope.is_empty() {
+    let choices = if args.model_scope.is_empty() {
         if view.available_models.is_empty() {
             start_model_picker(args, view, ModelListIntent::Cycle { reverse });
             return Ok(());
@@ -7817,10 +7979,10 @@ fn cycle_model(
             .collect::<Vec<_>>();
         discovered.as_slice()
     } else {
-        current.model_scope.as_slice()
+        args.model_scope.as_slice()
     };
     let Some(choice) = next_model(current, choices, reverse) else {
-        let text = if current.model_scope.is_empty() {
+        let text = if args.model_scope.is_empty() {
             "Only one model available"
         } else {
             "Only one model in scope"
@@ -7838,7 +8000,7 @@ fn cycle_model(
             pi_rs::ModelSelectSource::Cycle,
         )?;
         let status = model_cycle_status(&selected);
-        return view.stage_model_choice(worker, selected, status);
+        return view.stage_model_choice(worker, selected, status, false);
     }
     args.change_model(
         choice.provider,
@@ -7872,7 +8034,12 @@ fn cycle_thinking(args: &mut Cli, view: &mut View, worker: &mut Option<Worker>) 
         selected.selection_events.clear();
         if let Some(level) = super::thinking::next_level(&mut selected) {
             super::thinking::select(&mut selected, &level);
-            return view.stage_model_choice(worker, selected, format!("Thinking level: {level}"));
+            return view.stage_model_choice(
+                worker,
+                selected,
+                format!("Thinking level: {level}"),
+                false,
+            );
         }
         None
     } else {
@@ -9188,7 +9355,7 @@ fn select(
             slash(&format!("/fork {id}"), args, view, Some(worker))?;
         }
         Selection::Model(model) => {
-            select_model_input(args, view, &model)?;
+            select_model_input(args, view, worker.as_mut(), &model, false)?;
         }
         Selection::Completion { range, text, .. } => insert_completion(view, range, &text),
         Selection::LoginProvider(provider) if provider.id() == "amazon-bedrock" => {
@@ -9269,7 +9436,7 @@ fn select(
         Selection::LoginRadius(method) => start_radius_login(view, &args.settings, method)?,
         Selection::LogoutRadius => start_radius_logout(view, &args.settings)?,
         Selection::Thinking(thinking) => super::thinking::set(args, &thinking)?,
-        Selection::SaveDefaultModel => save_default_model(args)?,
+        Selection::SaveDefaultModel => save_current_default_model(args)?,
         Selection::EditSetting(key) => {
             let default = match key.as_str() {
                 "theme" => json!(args.theme_setting().unwrap_or("system")),
@@ -10318,6 +10485,39 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_picker_waits_for_the_worker_before_adopting_a_selection() {
+        use clap::Parser;
+        let mut args = super::Cli::parse_from(["pi", "--model", "before"]);
+        let mut view = super::View::default();
+        let failed = uuid::Uuid::new_v4();
+        let accepted = uuid::Uuid::new_v4();
+        let mut selected = args.clone();
+        selected.model = "after".into();
+        for (id, save_default) in [(failed, true), (accepted, false)] {
+            view.live_model_choices.push_back(super::LiveModelChoice {
+                id,
+                selected: selected.clone(),
+                status: "Model: after".into(),
+                save_default,
+            });
+        }
+        assert_eq!(view.accepted_model(&args).model, "before");
+        view.accept_model_choice(
+            &serde_json::json!({"id":failed,"success":false,"error":"rejected"}),
+            &mut args,
+        );
+        assert_eq!(view.accepted_model(&args).model, "before");
+        view.accept_model_choice(
+            &serde_json::json!({"id":accepted,"success":true}),
+            &mut args,
+        );
+        assert_eq!(view.accepted_model(&args).model, "after");
+        assert_eq!(args.model, "before");
+        assert!(view.finish_model_choice(&mut args));
+        assert_eq!(args.model, "after");
+        assert!(view.live_model_choices.is_empty());
+    }
     #[test]
     fn copilot_login_prompts_before_starting_device_authorization() {
         use super::{Cli, KeyCode, KeyEvent, KeyModifiers, Keys, LocalEditor, View};
@@ -13309,6 +13509,69 @@ exit {exit}
     }
 
     #[test]
+    fn custom_entry_renderer_absence_omits_the_initial_row() {
+        use super::Entry;
+
+        let mut view = super::View::default();
+        view.append("ordinary history");
+        let entry = pi_rs::CustomEntry {
+            custom_type: "card".into(),
+            data: Some(serde_json::json!({"ignored":"private"})),
+        };
+        for id in 1..=4001 {
+            view.show_custom_entry(id, &entry);
+        }
+        assert_eq!(view.custom_entry_count, 4000);
+        assert!(matches!(view.lines[0], Entry::Notice(_)));
+        assert!(matches!(view.lines[1], Entry::CustomRecord { id: 2, .. }));
+        let Entry::CustomRecord { presentation, .. } = &mut view.lines[1] else {
+            unreachable!()
+        };
+        *presentation = super::CustomEntryPresentation::Included;
+        view.show_custom_entry(4002, &entry);
+        assert!(matches!(view.lines[1], Entry::CustomRecord { id: 2, .. }));
+        assert!(matches!(view.lines[2], Entry::CustomRecord { id: 4, .. }));
+        let options = pi_rs::CustomMessageRenderOptions::default();
+        view.custom_render_options = Some(options.clone());
+        let request = uuid::Uuid::new_v4();
+        view.custom_render_attempted.insert(4002);
+        view.custom_render_pending = Some(super::TranscriptExtensionRenderPending {
+            request,
+            record: 4002,
+            options,
+        });
+        assert!(
+            !view.receive_transcript_extension_render(serde_json::json!({
+                "id":request,"rendered":null,
+            }))
+        );
+        assert!(matches!(
+            view.lines.last(),
+            Some(Entry::CustomRecord {
+                presentation: super::CustomEntryPresentation::Omitted,
+                rendered: None,
+                ..
+            })
+        ));
+        view.invalidate_custom_message_renderings();
+        assert!(matches!(
+            view.lines.last(),
+            Some(Entry::CustomRecord {
+                presentation: super::CustomEntryPresentation::Omitted,
+                ..
+            })
+        ));
+        view.refresh_transcript_extension_renderers();
+        assert!(matches!(
+            view.lines.last(),
+            Some(Entry::CustomRecord {
+                presentation: super::CustomEntryPresentation::Pending,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn tool_renderer_response_is_discarded_when_call_state_changes() {
         let mut view = super::View::default();
         let operation_id = uuid::Uuid::new_v4();
@@ -13406,27 +13669,29 @@ exit {exit}
         let old_request = uuid::Uuid::new_v4();
         view.custom_render_options = Some(expanded.clone());
         view.custom_render_attempted.insert(14);
-        view.custom_render_pending = Some(super::CustomMessageRenderPending {
+        view.custom_render_pending = Some(super::TranscriptExtensionRenderPending {
             request: old_request,
             record: 14,
             options: collapsed,
         });
         let rendered = serde_json::json!({"lines":[[{"text":"details"}]]});
-        assert!(!view.receive_custom_message_render(serde_json::json!({
-            "id":old_request,"rendered":rendered
-        })));
+        assert!(
+            !view.receive_transcript_extension_render(serde_json::json!({
+                "id":old_request,"rendered":rendered
+            }))
+        );
         assert!(matches!(
             &view.lines[0],
             super::Entry::CustomMessage { rendered: None, .. }
         ));
 
         let active_request = uuid::Uuid::new_v4();
-        view.custom_render_pending = Some(super::CustomMessageRenderPending {
+        view.custom_render_pending = Some(super::TranscriptExtensionRenderPending {
             request: active_request,
             record: 14,
             options: expanded,
         });
-        assert!(view.receive_custom_message_render(serde_json::json!({
+        assert!(view.receive_transcript_extension_render(serde_json::json!({
             "id":active_request,"rendered":rendered
         })));
         assert!(matches!(

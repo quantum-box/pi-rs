@@ -738,7 +738,7 @@ fn project_settings_do_not_prevent_live_compaction_and_retry_toggles() {
         output_until(&mut master, |text| text.contains("Enter to send"));
     }
     master.write_all(b"/model openai/second\r").unwrap();
-    output_until(&mut master, |text| text.contains("Model › openai/second"));
+    output_until(&mut master, |text| text.contains("Model: second"));
     master.write_all(b"test worker restart\r").unwrap();
     output_until(&mut master, |text| {
         text.contains("automatic compaction is disabled")

@@ -1426,6 +1426,20 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Opt in to assistant message starts, streaming updates, and final messages.
+    fn handles_message_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// A completed message may be replaced with a message of the same role.
+    async fn message_lifecycle(
+        &self,
+        _event: &crate::MessageLifecycleEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<crate::Message>> {
+        Ok(None)
+    }
+
     /// Opt in to observing tool execution start and end events.
     fn handles_tool_execution_lifecycle(&self) -> bool {
         false
@@ -1468,6 +1482,20 @@ pub trait Extension: Send + Sync {
     /// Observe when an extension starts and stops waiting on a native UI prompt.
     fn handles_ui_prompt_lifecycle(&self) -> bool {
         false
+    }
+
+    /// Branch-local entry types this extension can render for its host.
+    fn custom_entry_renderer_types(&self) -> Vec<&str> {
+        Vec::new()
+    }
+
+    /// Render a branch-local entry without session or model access.
+    async fn render_custom_entry(
+        &self,
+        _entry: &CustomEntryRecord,
+        _options: &crate::CustomEntryRenderOptions,
+    ) -> ExtensionResult<Option<crate::RenderedExtensionContent>> {
+        Ok(None)
     }
 
     /// Opt in to observing HTTP metadata before consuming a provider response body.
@@ -2139,6 +2167,20 @@ impl Registry {
         let mut renderers = crate::CustomMessageRenderers::default();
         for extension in &self.extensions {
             for custom_type in extension.custom_message_renderer_types() {
+                renderers
+                    .renderers
+                    .entry(custom_type.to_owned())
+                    .or_insert_with(|| extension.clone());
+            }
+        }
+        renderers
+    }
+
+    /// Snapshot the first renderer registered for each custom entry type.
+    pub fn custom_entry_renderers(&self) -> crate::CustomEntryRenderers {
+        let mut renderers = crate::CustomEntryRenderers::default();
+        for extension in &self.extensions {
+            for custom_type in extension.custom_entry_renderer_types() {
                 renderers
                     .renderers
                     .entry(custom_type.to_owned())
