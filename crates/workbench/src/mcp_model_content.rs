@@ -104,17 +104,19 @@ fn project_result(
     {
         projected.push(text(serde_json::to_string_pretty(data).ok()?));
     }
-    let mut text_content = joined_text(&projected);
-    if text_content.is_empty() && response["isError"] == true {
-        text_content = format!("MCP tool {server}/{tool} returned an error");
-        projected.push(text(&text_content));
+    if response["isError"] == true {
+        // Some provider tool-result formats have no separate error field.
+        projected.insert(
+            0,
+            text(format!("MCP tool {server}/{tool} returned an error")),
+        );
     }
     let has_structured_blocks = projected.iter().any(|block| block["type"] != "text");
     let output = if has_structured_blocks {
         // Provider adapters recognize images in the native structured tool envelope.
         json!({"data":{"content":projected},"attachments":[]}).to_string()
     } else {
-        text_content
+        joined_text(&projected)
     };
     (output.len() <= MAX_MODEL_CONTENT_BYTES).then_some((output, has_structured_blocks))
 }
@@ -338,6 +340,16 @@ mod tests {
         assert_eq!(
             project_result(&data_only, "fixture", "get", None),
             Some(("{\n  \"a\": 1\n}".into(), false))
+        );
+        let with_error_text = tool_content(json!({
+            "content":[{"type":"text","text":"try again later"}],"isError":true
+        }));
+        assert_eq!(
+            project_result(&with_error_text, "fixture", "get", None),
+            Some((
+                "MCP tool fixture/get returned an error\ntry again later".into(),
+                false
+            ))
         );
         let error_only = tool_content(json!({"content":[],"isError":true}));
         assert_eq!(
