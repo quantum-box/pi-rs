@@ -278,7 +278,10 @@ fn project_result_with_files(
     Some(if output.len() <= MAX_MODEL_CONTENT_BYTES {
         (output, structured)
     } else {
-        encode_limited_blocks(&projected)
+        if location.is_some() {
+            projected.pop();
+        }
+        encode_limited_blocks(&projected, location.as_deref())
     })
 }
 
