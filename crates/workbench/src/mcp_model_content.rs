@@ -701,6 +701,35 @@ mod tests {
     }
 
     #[test]
+    fn mcp_model_content_detects_the_local_cli_file_tools() {
+        use pi_rs::Extension;
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = pi_rs_workbench::coding::CodingTools::local(workspace.path()).unwrap();
+        let mut request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            max_output_tokens: 1,
+            tools: tools.tools().iter().map(|tool| tool.spec()).collect(),
+        };
+        let local = FileReaders::from_request(&request);
+        assert!(local.read && local.shell);
+        for spec in &mut request.tools {
+            match spec.name.as_str() {
+                "read" => {
+                    spec.parameters["properties"]["offset"] = json!({"type":"integer","minimum":1})
+                }
+                "bash" | "powershell" => {
+                    spec.parameters["properties"]["timeout"] =
+                        json!({"type":"number","exclusiveMinimum":0})
+                }
+                _ => {}
+            }
+        }
+        let remote = FileReaders::from_request(&request);
+        assert!(!remote.read && !remote.shell);
+    }
+
+    #[test]
     fn mcp_model_content_keeps_inline_output_without_usable_file_tools() {
         let long = "x".repeat(TEXT_PREVIEW_BYTES * 3);
         let original = tool_content(json!({"content":[{"type":"text","text":long}]}));
