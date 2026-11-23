@@ -810,8 +810,24 @@ pub(crate) fn woken_after_candidate_checks(
     claim: &WokenConversationCancelClaim,
     boundary: u64,
 ) -> Result<(Value, u64, Vec<durable_store::Check>), String> {
-    let mut checks =
-        woken_conversation_claim_checks(store, task, claim, claim.cleanup_lease, boundary)?;
+    woken_after_candidate_checks_inner(store, task, claim, boundary, false)
+}
+
+fn woken_after_candidate_checks_inner(
+    store: &durable_store::Store,
+    task: &Task,
+    claim: &WokenConversationCancelClaim,
+    boundary: u64,
+    nested: bool,
+) -> Result<(Value, u64, Vec<durable_store::Check>), String> {
+    let mut checks = woken_conversation_claim_checks_inner(
+        store,
+        task,
+        claim,
+        claim.cleanup_lease,
+        boundary,
+        nested,
+    )?;
     let key = woken_conversation_receipt_key(task.id());
     let entry = store
         .get(&key)
@@ -901,7 +917,8 @@ pub(crate) fn woken_terminal_after_checks(
         || claim.cleanup_attempt != marker.cleanup_attempt
         || claim.woken_attempt != marker.woken_attempt
         || claim.task != task.task.id()
-        || task.task.owner() != &TaskOwner::Conversation(claim.conversation)
+        || !(task.task.owner() == &TaskOwner::Conversation(claim.conversation)
+            || matches!(task.task.owner(), TaskOwner::Task(_)))
         || Some(claim.kind.as_str()) != task.task.kind()
         || claim.definition_version != task.task.definition_version()
         || claim.checkpoint != *task.task.checkpoint()
@@ -932,6 +949,28 @@ pub(crate) fn woken_terminal_after_checks(
         claim.woken_attempt,
         boundary,
     )?;
+    if matches!(task.task.owner(), TaskOwner::Task(_)) {
+        let (conversation, _, ancestry_checks, ancestry_version) =
+            task_store::read_nested_cancel_claim_ancestry(store, task.task.id(), claim.claim_id)
+                .map_err(|e| e.to_string())?;
+        let ancestry_key = &ancestry_checks
+            .first()
+            .ok_or("missing nested ancestry")?
+            .key;
+        let claim_commit = store
+            .commit_for_version(&claim_key, claim_entry.version)
+            .map_err(|e| e.to_string())?;
+        let ancestry_commit = store
+            .commit_for_version(ancestry_key, ancestry_version)
+            .map_err(|e| e.to_string())?;
+        if conversation != claim.conversation
+            || claim_commit.is_none()
+            || claim_commit != ancestry_commit
+        {
+            return Err("nested terminal ancestry mismatch".into());
+        }
+        checks.extend(ancestry_checks);
+    }
     checks.extend([
         durable_store::Check {
             key,
@@ -3649,6 +3688,12 @@ pub struct PreparedSettlement {
     // Own start leases for staged conversation writes through commit,
     // retry, or disposal of the prepared settlement.
     _start_leases: Vec<durable_store::controls::MutationLease>,
+    _child_identity_leases: Vec<std::sync::Arc<crate::nested_identity::IdentityLease>>,
+    _child_registry_leases: Vec<std::sync::Arc<crate::task_driver::RegistryLease>>,
+    _child_selection_leases: Vec<(
+        crate::extension::StableExtensionSelection,
+        std::sync::Arc<crate::extension::SelectionStartLease>,
+    )>,
     transaction: crate::document::Transaction,
     notifications: Option<TaskNotificationAssembly>,
     running: task_store::StoredTask,
@@ -10926,6 +10971,97 @@ impl Scheduler {
                                 }
                                 let boundary =
                                     store.put_version().map_err(task_store::Error::from)?;
+                                let reg = self.registered(&running.task)?;
+                                let selected = reg
+                                    .conversation_checkpointable
+                                    .as_ref()
+                                    .is_some_and(|(_, _, selection)| selection.is_some());
+                                let selection_gate = selected
+                                    .then(|| {
+                                        self.validator
+                                            .as_ref()
+                                            .map(|h| h.checkpointable_extension_gate())
+                                    })
+                                    .flatten();
+                                let _selection = selection_gate
+                                    .as_ref()
+                                    .map(|gate| gate.lock())
+                                    .transpose()
+                                    .map_err(|_| Error::Poisoned)?;
+                                let _identity = if selected {
+                                    match reg.handler.conversation_cleanup_identity_lease() {
+                                        Ok(identity) => Some(identity),
+                                        Err(crate::nested_identity::LeaseFailure::Busy) => {
+                                            return Err(Error::Busy);
+                                        }
+                                        Err(crate::nested_identity::LeaseFailure::Mismatch) => None,
+                                    }
+                                } else {
+                                    None
+                                };
+                                let mut _nested_identity_leases = Vec::new();
+                                let after = if _identity.is_some() {
+                                    match (
+                                        self.validator.as_ref(),
+                                        woken_after_candidate_checks_inner(
+                                            store,
+                                            &running.task,
+                                            &claim,
+                                            boundary,
+                                            true,
+                                        ),
+                                    ) {
+                                        (Some(harness), Ok((_, version, mut checks))) => {
+                                            if let Ok((bound_conversation, binding)) = harness
+                                                .checkpointable_nested_cancel_conversation_checks(
+                                                    &running.task,
+                                                    &self.registry,
+                                                )
+                                            {
+                                                let records = self.ts().list()?;
+                                                let (uncertain, descendants, leases) =
+                                                    authenticated_unsafe_descendant_reconciliation(
+                                                        store,
+                                                        running.task.id(),
+                                                        &records,
+                                                        boundary,
+                                                        &self.registry,
+                                                        harness,
+                                                        None,
+                                                    )?;
+                                                #[cfg(feature = "experimental-graph-revision")]
+                                                let owned_checks = provisional_woken_owned_checks(
+                                                    harness, store, &running, boundary,
+                                                )
+                                                .ok();
+                                                #[cfg(not(feature = "experimental-graph-revision"))]
+                                                let owned_checks: Option<Vec<durable_store::Check>> = Some(Vec::new());
+                                                if bound_conversation == conversation
+                                                    && uncertain.is_none()
+                                                    && owned_checks.is_some()
+                                                    && !has_live_owned(
+                                                        store,
+                                                        running.task.id(),
+                                                        &records,
+                                                    )?
+                                                {
+                                                    checks.extend(owned_checks.unwrap());
+                                                    checks.extend(binding);
+                                                    checks.extend(descendants);
+                                                    _nested_identity_leases = leases;
+                                                    Some((version, checks))
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                };
                                 let mut next = running.clone();
                                 next.task.fail(reason).map_err(Error::Transition)?;
                                 let mut batch = self.ts().prepare_save(&[Save::Update(&next)])?;
@@ -10944,6 +11080,28 @@ impl Scheduler {
                                     batch.checks.push(durable_store::Check {
                                         key: task_store::callback_start_key(ancestor),
                                         expected: durable_store::Expected::Missing,
+                                    });
+                                }
+                                if let Some((receipt_version, checks)) = after {
+                                    let key = woken_conversation_terminal_key(running.task.id());
+                                    let marker = WokenConversationCancelTerminalMarker {
+                                        version: 1,
+                                        claim_id: claim.claim_id,
+                                        cleanup_attempt: claim.cleanup_attempt,
+                                        woken_attempt: claim.woken_attempt,
+                                        running_task_version: running.version,
+                                        terminal_task: next.task.clone(),
+                                        receipt_version,
+                                    };
+                                    batch.checks.extend(checks);
+                                    batch.checks.push(durable_store::Check {
+                                        key: key.clone(),
+                                        expected: durable_store::Expected::Missing,
+                                    });
+                                    batch.mutations.push(durable_store::Mutation::Put {
+                                        key,
+                                        value: serde_json::to_vec(&marker)
+                                            .map_err(|e| Error::Handler(e.to_string()))?,
                                     });
                                 }
                                 store
@@ -14171,27 +14329,44 @@ impl Scheduler {
                             None
                         };
                         let mut _nested_identity_leases = Vec::new();
-                        let after = if nested_ancestry.is_none()
-                            && _identity.is_some()
+                        let after = if _identity.is_some()
                             && task_marker.is_none()
                             && conversation_marker.is_none()
                         {
                             match (
                                 self.validator.as_ref(),
-                                woken_after_candidate_checks(
+                                woken_after_candidate_checks_inner(
                                     store,
                                     &item.task,
                                     &claim,
                                     recovery_graph_version,
+                                    nested_ancestry.is_some(),
                                 ),
                             ) {
                                 (Some(harness), Ok((_, version, mut checks))) => {
-                                    if let Ok(binding) = harness
-                                        .checkpointable_cancel_conversation_checks(
+                                    let binding = if nested_ancestry.is_some() {
+                                        harness
+                                            .checkpointable_nested_cancel_conversation_checks(
+                                                &item.task,
+                                                &self.registry,
+                                            )
+                                            .and_then(|(conversation, checks)| {
+                                                if conversation == claim.conversation {
+                                                    Ok(checks)
+                                                } else {
+                                                    Err(crate::runtime::Error::Invalid(
+                                                        "nested recovery conversation changed"
+                                                            .into(),
+                                                    ))
+                                                }
+                                            })
+                                    } else {
+                                        harness.checkpointable_cancel_conversation_checks(
                                             &item.task,
                                             &self.registry,
                                         )
-                                    {
+                                    };
+                                    if let Ok(binding) = binding {
                                         let records = self.ts().list()?;
                                         let (uncertain, descendants, leases) =
                                             authenticated_unsafe_descendant_reconciliation(
@@ -18098,6 +18273,9 @@ impl Scheduler {
         let mut prepared = PreparedSettlement {
             attachment: self.attachment.clone(),
             _start_leases: staged_start_leases,
+            _child_identity_leases: prepared_documents.child_identity_leases,
+            _child_registry_leases: prepared_documents.child_registry_leases,
+            _child_selection_leases: prepared_documents.child_selection_leases,
             transaction,
             notifications,
             running,
@@ -23851,6 +24029,9 @@ mod tests {
         let settlement = PreparedSettlement {
             attachment: second.attachment.clone(),
             _start_leases: Vec::new(),
+            _child_identity_leases: Vec::new(),
+            _child_registry_leases: Vec::new(),
+            _child_selection_leases: Vec::new(),
             transaction: crate::document::Transaction::new(),
             notifications: None,
             candidate: running.clone(),
@@ -28652,6 +28833,9 @@ mod tests {
             let mut prepared = PreparedSettlement {
                 attachment: scheduler.attachment.clone(),
                 _start_leases: Vec::new(),
+                _child_identity_leases: Vec::new(),
+                _child_registry_leases: Vec::new(),
+                _child_selection_leases: Vec::new(),
                 transaction,
                 notifications: None,
                 running: running.clone(),
@@ -28790,6 +28974,9 @@ mod tests {
         let mut prepared = PreparedSettlement {
             attachment: scheduler.attachment.clone(),
             _start_leases: Vec::new(),
+            _child_identity_leases: Vec::new(),
+            _child_registry_leases: Vec::new(),
+            _child_selection_leases: Vec::new(),
             transaction,
             notifications: None,
             running,

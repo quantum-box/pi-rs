@@ -857,6 +857,13 @@ pub trait DurableTaskHost: Send + Sync {
         input: serde_json::Value,
     ) -> Result<AsyncTaskCall, String>;
     async fn child_result(&self, child: &AsyncTaskCall) -> Result<Option<AsyncTaskResult>, String>;
+    /// Read the ordinary result and any authenticated supplemental after output.
+    async fn child_result_with_after(
+        &self,
+        child: &AsyncTaskCall,
+    ) -> Result<Option<(AsyncTaskResult, Option<crate::extension::ToolBlockResult>)>, String> {
+        Ok(self.child_result(child).await?.map(|result| (result, None)))
+    }
 }
 
 /// Explicit opt-in for Tools that can checkpoint and resume after a park.

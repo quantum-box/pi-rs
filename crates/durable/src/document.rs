@@ -2180,6 +2180,12 @@ pub struct TaskDocuments<'a> {
     pub(crate) task_input_storage: Option<std::sync::Arc<durable_store::Error>>,
     signals: StagedSignals,
     child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
+    child_identity_leases: Vec<std::sync::Arc<crate::nested_identity::IdentityLease>>,
+    child_registry_leases: Vec<std::sync::Arc<crate::task_driver::RegistryLease>>,
+    child_selection_leases: Vec<(
+        crate::extension::StableExtensionSelection,
+        std::sync::Arc<crate::extension::SelectionStartLease>,
+    )>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
     pub(crate) keyed_child_handlers:
         HashMap<String, std::sync::Arc<dyn crate::task_scheduler::Handler>>,
@@ -2206,6 +2212,12 @@ pub struct DetachedTaskDocuments {
     pub(crate) task_input_storage: Option<std::sync::Arc<durable_store::Error>>,
     signals: StagedSignals,
     child_reads: HashMap<uuid::Uuid, Option<crate::task_store::StoredTask>>,
+    child_identity_leases: Vec<std::sync::Arc<crate::nested_identity::IdentityLease>>,
+    child_registry_leases: Vec<std::sync::Arc<crate::task_driver::RegistryLease>>,
+    child_selection_leases: Vec<(
+        crate::extension::StableExtensionSelection,
+        std::sync::Arc<crate::extension::SelectionStartLease>,
+    )>,
     pub(crate) keyed_children: Vec<(String, crate::task::Task, crate::keyed_child::Prepared)>,
     pub(crate) keyed_child_handlers:
         HashMap<String, std::sync::Arc<dyn crate::task_scheduler::Handler>>,
@@ -2298,6 +2310,12 @@ impl DetachedTaskDocuments {
 pub(crate) struct PreparedTaskDocuments {
     pub(crate) owner: std::sync::Arc<durable_store::owner::OwnedStore>,
     pub(crate) reservation: crate::task_store::StoredTask,
+    pub(crate) child_identity_leases: Vec<std::sync::Arc<crate::nested_identity::IdentityLease>>,
+    pub(crate) child_registry_leases: Vec<std::sync::Arc<crate::task_driver::RegistryLease>>,
+    pub(crate) child_selection_leases: Vec<(
+        crate::extension::StableExtensionSelection,
+        std::sync::Arc<crate::extension::SelectionStartLease>,
+    )>,
     pub(crate) transaction: Transaction,
     pub(crate) document_batch: OwnedBatch,
     pub(crate) task_input: Option<TaskInputIntent>,
@@ -2348,6 +2366,9 @@ impl DetachedTaskDocuments {
             task_input_storage,
             signals,
             child_reads,
+            child_identity_leases,
+            child_registry_leases,
+            child_selection_leases,
             mut keyed_children,
             keyed_child_handlers,
         } = self;
@@ -2368,6 +2389,9 @@ impl DetachedTaskDocuments {
             task_input_storage,
             signals,
             child_reads,
+            child_identity_leases,
+            child_registry_leases,
+            child_selection_leases,
             keyed_children: Vec::new(),
             keyed_child_handlers: HashMap::new(),
         };
@@ -2384,6 +2408,9 @@ impl DetachedTaskDocuments {
         let mut transaction = Transaction::new();
         docs.stage_acquisitions(&mut transaction)?;
         docs.rebase_self_signal_check(current.version);
+        let child_identity_leases = std::mem::take(&mut docs.child_identity_leases);
+        let child_registry_leases = std::mem::take(&mut docs.child_registry_leases);
+        let child_selection_leases = std::mem::take(&mut docs.child_selection_leases);
         let mut document_batch = docs.into_batch()?;
         for check in &mut document_batch.checks {
             if check.key == parent_key {
@@ -2400,6 +2427,9 @@ impl DetachedTaskDocuments {
         Ok(PreparedTaskDocuments {
             owner,
             reservation: current.clone(),
+            child_identity_leases,
+            child_registry_leases,
+            child_selection_leases,
             transaction,
             document_batch,
             task_input,
@@ -2410,9 +2440,81 @@ impl DetachedTaskDocuments {
 }
 
 impl<'a> TaskDocuments<'a> {
-    /// Read unsafe child evidence together with a prefix fence for the
-    /// parent's eventual checked transition. Terminal state is checked by the
-    /// caller and its own child read remains part of the same transaction.
+    /// Keep the child identity and exact terminal evidence through the parent commit.
+    pub(crate) fn read_nested_woken_after(
+        &mut self,
+        task: &crate::task::Task,
+        adapter: &crate::task_tool::TaskTool,
+    ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+        let key = crate::task_scheduler::woken_conversation_terminal_key(task.id());
+        if self.store.get(&key).map_err(|e| e.to_string())?.is_none() {
+            self.signals.batch.checks.push(Check {
+                key,
+                expected: Expected::Missing,
+            });
+            return Ok(None);
+        }
+        let identity = adapter.identity().ok_or("child identity unavailable")?;
+        if task.kind() != Some(identity.kind.as_str())
+            || task.definition_version() != identity.definition_version
+            || !adapter.handler().conversation_woken_cancel_enabled()
+        {
+            return Err("child woken identity changed".into());
+        }
+        let lease = adapter
+            .handler()
+            .conversation_cleanup_identity_lease()
+            .map_err(|e| format!("child identity lease unavailable: {e:?}"))?;
+        let child = self
+            .child_reads
+            .get(&task.id())
+            .and_then(Option::as_ref)
+            .ok_or("missing child read")?;
+        if child.task != *task {
+            return Err("child task changed".into());
+        }
+        let boundary = self.store.put_version().map_err(|e| e.to_string())?;
+        let (value, checks) =
+            crate::task_scheduler::woken_terminal_after_checks(self.store, child, boundary)?;
+        let selected = identity
+            .conversation_selection()
+            .ok_or("child selection missing")?;
+        let existing = self
+            .child_selection_leases
+            .iter()
+            .find(|(selection, _)| selection == selected)
+            .map(|(_, lease)| lease.clone());
+        let (parent_checks, descendant_leases, registry_lease, selection_lease) = self
+            .input_validator
+            .ok_or("child result harness unavailable")?
+            .checkpointable_parent_result_read_checks(
+                &self.task, child, boundary, selected, existing,
+            )
+            .map_err(|e| e.to_string())?;
+        let crate::async_task_tool::DurableTaskResult::Rich { task_content_v1 } =
+            serde_json::from_value(value).map_err(|e| e.to_string())?
+        else {
+            return Err("invalid child after result".into());
+        };
+        self.signals.batch.checks.extend(parent_checks);
+        self.signals.batch.checks.extend(checks);
+        self.child_identity_leases
+            .extend(descendant_leases.into_iter().map(std::sync::Arc::new));
+        self.child_identity_leases.push(std::sync::Arc::new(lease));
+        self.child_registry_leases
+            .push(std::sync::Arc::new(registry_lease));
+        if !self
+            .child_selection_leases
+            .iter()
+            .any(|(selection, _)| selection == selected)
+        {
+            self.child_selection_leases
+                .push((selected.clone(), selection_lease));
+        }
+        Ok(Some(task_content_v1))
+    }
+
+    /// Read unsafe child evidence with a prefix fence for the parent transition.
     pub(crate) fn read_unsafe_child_evidence(
         &mut self,
         id: uuid::Uuid,
@@ -2621,6 +2723,9 @@ impl<'a> TaskDocuments<'a> {
             task_input_storage: None,
             signals: StagedSignals::new(),
             child_reads: HashMap::new(),
+            child_identity_leases: Vec::new(),
+            child_registry_leases: Vec::new(),
+            child_selection_leases: Vec::new(),
             keyed_children: Vec::new(),
             keyed_child_handlers: HashMap::new(),
             reads: HashMap::new(),
@@ -2659,6 +2764,9 @@ impl<'a> TaskDocuments<'a> {
             task_input_storage,
             signals,
             child_reads,
+            child_identity_leases,
+            child_registry_leases,
+            child_selection_leases,
             keyed_children,
             keyed_child_handlers,
         } = self;
@@ -2678,6 +2786,9 @@ impl<'a> TaskDocuments<'a> {
             task_input_storage,
             signals,
             child_reads,
+            child_identity_leases,
+            child_registry_leases,
+            child_selection_leases,
             keyed_children,
             keyed_child_handlers,
         })
@@ -2701,6 +2812,9 @@ impl<'a> TaskDocuments<'a> {
             task_input_storage: None,
             signals: StagedSignals::new(),
             child_reads: HashMap::new(),
+            child_identity_leases: Vec::new(),
+            child_registry_leases: Vec::new(),
+            child_selection_leases: Vec::new(),
             keyed_children: Vec::new(),
             keyed_child_handlers: HashMap::new(),
             revision: store.document_snapshot()?,
@@ -5287,6 +5401,9 @@ mod detached_task_documents_tests {
                 canonical_self_version: docs.signals.canonical_self_version,
             },
             child_reads: docs.child_reads.clone(),
+            child_identity_leases: docs.child_identity_leases.clone(),
+            child_registry_leases: docs.child_registry_leases.clone(),
+            child_selection_leases: docs.child_selection_leases.clone(),
             keyed_children: Vec::new(),
             keyed_child_handlers: HashMap::new(),
         };

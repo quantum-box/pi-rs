@@ -12217,6 +12217,76 @@ impl Harness {
         }
         Ok(())
     }
+    /// Revalidate selected definitions and the whole child graph for a parent result read.
+    pub(crate) fn checkpointable_parent_result_read_checks(
+        &self,
+        task: &crate::task::Task,
+        child: &crate::task_store::StoredTask,
+        boundary: u64,
+        selected: &crate::extension::StableExtensionSelection,
+        existing: Option<std::sync::Arc<crate::extension::SelectionStartLease>>,
+    ) -> Result<
+        (
+            Vec<Check>,
+            Vec<crate::nested_identity::IdentityLease>,
+            crate::task_driver::RegistryLease,
+            std::sync::Arc<crate::extension::SelectionStartLease>,
+        ),
+        Error,
+    > {
+        let selection_lease = match existing {
+            Some(lease) => lease,
+            None => std::sync::Arc::new(self.checkpointable_selection_start(selected)?),
+        };
+        let gate = self.checkpointable_extension_gate();
+        let _selection = gate.lock().map_err(|_| Error::Failed)?;
+        let driver = self
+            .task_driver
+            .try_lock()
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => Error::TaskPublicationBusy,
+                std::sync::TryLockError::Poisoned(_) => Error::Failed,
+            })?
+            .as_ref()
+            .and_then(|driver| driver.upgrade())
+            .ok_or_else(|| Error::Invalid("child result driver unavailable".into()))?;
+        let (registry, lease) = driver.lease_cleanup_registry()?;
+        let mut checks = self.checkpointable_conversation_checks(task, &registry)?;
+        let records = crate::task_store::TaskStore::new(self.owner.store())
+            .list()
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        let (uncertain, descendants, leases) =
+            crate::task_scheduler::authenticated_woken_terminal_descendants(
+                self.owner.store(),
+                child,
+                &records,
+                boundary,
+                &registry,
+                self,
+            )
+            .map_err(|e| match e {
+                crate::task_scheduler::Error::Busy => Error::TaskPublicationBusy,
+                _ => Error::Invalid(e.to_string()),
+            })?;
+        if uncertain.is_some() {
+            return Err(Error::Invalid(
+                "child descendants require reconciliation".into(),
+            ));
+        }
+        checks.extend(descendants);
+        for prefix in [
+            crate::task_store::PREFIX,
+            crate::ownership_edge::PREFIX,
+            b"runtime/conversation/",
+        ] {
+            checks.push(Check {
+                key: prefix.to_vec(),
+                expected: Expected::PrefixUnchangedSince(boundary),
+            });
+        }
+        Ok((checks, leases, lease, selection_lease))
+    }
+
     /// Provisional checks for a replay-safe checkpointable task tree rooted in
     /// this exact unhooked conversation call. Include unchanged in the same
     /// transaction as intent, admission, or settlement.

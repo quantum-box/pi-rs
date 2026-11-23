@@ -1188,6 +1188,19 @@ pub(crate) fn after_pending_enqueue_for_test(id: Uuid, hook: impl FnOnce() + Sen
         .insert(id, Box::new(hook));
 }
 
+#[cfg(test)]
+fn prepared_enqueue_hooks() -> &'static BoundaryHooks {
+    static HOOKS: std::sync::OnceLock<BoundaryHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn after_prepared_enqueue_for_test(id: Uuid, hook: impl FnOnce() + Send + 'static) {
+    prepared_enqueue_hooks()
+        .lock()
+        .unwrap()
+        .insert(id, Box::new(hook));
+}
+
 struct WorkerPool {
     jobs: Option<mpsc::Sender<Box<task_scheduler::DetachedInvocation>>>,
     done: mpsc::Receiver<WorkerEvent>,
@@ -1861,10 +1874,22 @@ impl Shared {
         };
         #[cfg(test)]
         let pending_task = pending.task_id();
+        #[cfg(test)]
+        let is_prepared = matches!(pending, PendingSettlement::Prepared { .. });
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(pending);
+        #[cfg(test)]
+        if is_prepared {
+            let hook = prepared_enqueue_hooks()
+                .lock()
+                .unwrap()
+                .remove(&pending_task);
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         #[cfg(test)]
         {
             let hook = pending_enqueue_hooks()
