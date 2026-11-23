@@ -11,7 +11,10 @@ use crate::ui::{
     mermaid::Mermaid,
     mouse_selection::MouseSelection,
     picker::{Input, Item, MouseInput, Picker, Selection, ThemeSettingsAction, TreeFilter},
-    render::{CustomEntryPresentation, Entry, Line, SummaryKind, ToolPart, TranscriptOptions},
+    render::{
+        CustomEntryPresentation, Entry, Line, SummaryKind, ToolPart, TranscriptMarkdown,
+        TranscriptOptions,
+    },
     theme::{Theme, ThemeWatcher},
     transcript_search::Search,
     viewport::{Viewport, Wheel},
@@ -1152,11 +1155,40 @@ struct TranscriptExtensionRenderPending {
     options: pi_rs::CustomMessageRenderOptions,
 }
 
+enum MarkdownTarget {
+    Recorded(usize),
+    StreamingAssistant,
+    StreamingThinking,
+}
+
+struct MarkdownPending {
+    request: uuid::Uuid,
+    target: MarkdownTarget,
+    context: pi_rs::MarkdownTransformContext,
+    original: String,
+}
+
+fn markdown_input(text: &str, kind: pi_rs::MarkdownMessageType) -> Option<&str> {
+    if text.len() > pi_rs::MarkdownTransformers::MAX_MARKDOWN_BYTES {
+        return None;
+    }
+    let text = match kind {
+        pi_rs::MarkdownMessageType::User => text,
+        _ => text.trim_matches(super::resources::is_prompt_space),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
 struct LiveModelChoice {
     id: uuid::Uuid,
     selected: Cli,
     status: String,
-    save_default: bool,
+    persist: Option<SelectionDefault>,
+}
+
+enum SelectionDefault {
+    Model,
+    Thinking(String),
 }
 
 #[derive(Default)]
@@ -1189,6 +1221,9 @@ struct View {
     custom_render_attempted: BTreeSet<u64>,
     custom_render_pending: Option<TranscriptExtensionRenderPending>,
     custom_render_redraw_at: Option<Instant>,
+    markdown_pending: Option<MarkdownPending>,
+    markdown_assistant: Option<TranscriptMarkdown>,
+    markdown_thinking: Option<TranscriptMarkdown>,
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
     theme_refresh_requested: bool,
@@ -1784,6 +1819,201 @@ impl View {
         self.invalidate_custom_message_renderings()
     }
 
+    fn clear_markdown_renderings(&mut self) -> bool {
+        self.markdown_pending = None;
+        let assistant = self.markdown_assistant.take();
+        let thinking = self.markdown_thinking.take();
+        let mut changed = assistant.is_some() || thinking.is_some();
+        for (index, entry) in self.lines.iter_mut().enumerate() {
+            if let Some(markdown) = entry.markdown_mut()
+                && let Some((_, Some(_))) = markdown.rendering.take()
+            {
+                self.regular.redraw |= index < self.regular.committed;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn prepare_markdown_transform(&mut self, worker: &mut Worker, args: &Cli) {
+        if !worker.markdown_transformers || self.markdown_pending.is_some() {
+            return;
+        }
+        let Ok((columns, _)) = terminal::size() else {
+            return;
+        };
+        let columns = usize::from(columns.max(1));
+        let body_width = columns.saturating_sub(usize::from(
+            args.tui_mode != Some(TuiMode::Regular)
+                && args.settings.string("fullscreenScrollbar") == Some("always")
+                && columns > 1,
+        ));
+        let width = body_width - 2 * args.settings.output_padding().min((body_width - 1) / 2);
+        let Some((target, context, original)) = self.markdown_candidate(width) else {
+            return;
+        };
+        let markdown = markdown_input(&original, context.message_type).expect("Markdown candidate");
+        let request = uuid::Uuid::new_v4();
+        if worker
+            .send(json!({
+                "type": "transform_transcript_markdown",
+                "id": request,
+                "markdown": markdown,
+                "context": context,
+            }))
+            .is_ok()
+        {
+            self.markdown_pending = Some(MarkdownPending {
+                request,
+                target,
+                context,
+                original,
+            });
+        }
+    }
+
+    fn markdown_candidate(
+        &self,
+        width: usize,
+    ) -> Option<(MarkdownTarget, pi_rs::MarkdownTransformContext, String)> {
+        use pi_rs::MarkdownMessageType::{Assistant, AssistantThinking};
+
+        for (target, kind, original, cached, visible) in [
+            (
+                MarkdownTarget::StreamingAssistant,
+                Assistant,
+                &self.streaming,
+                &self.markdown_assistant,
+                true,
+            ),
+            (
+                MarkdownTarget::StreamingThinking,
+                AssistantThinking,
+                &self.thinking,
+                &self.markdown_thinking,
+                self.thinking_expanded.unwrap_or(!self.hide_thinking),
+            ),
+        ] {
+            if visible
+                && markdown_input(original, kind).is_some()
+                && !cached
+                    .as_ref()
+                    .is_some_and(|cached| cached.original == *original && cached.attempted(width))
+            {
+                return Some((
+                    target,
+                    pi_rs::MarkdownTransformContext {
+                        message_type: kind,
+                        available_width: width,
+                        is_streaming: true,
+                        message_id: None,
+                        timestamp: None,
+                    },
+                    original.clone(),
+                ));
+            }
+        }
+
+        self.lines
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, entry)| {
+                let (kind, markdown) = entry.markdown(!self.hide_thinking)?;
+                if markdown.attempted(width) {
+                    return None;
+                }
+                markdown_input(&markdown.original, kind)?;
+                Some((
+                    MarkdownTarget::Recorded(index),
+                    pi_rs::MarkdownTransformContext {
+                        message_type: kind,
+                        available_width: width,
+                        is_streaming: false,
+                        message_id: markdown.record.as_ref().map(|(id, _)| *id),
+                        timestamp: markdown
+                            .record
+                            .as_ref()
+                            .and_then(|(_, timestamp)| timestamp.clone()),
+                    },
+                    markdown.original.clone(),
+                ))
+            })
+    }
+
+    fn receive_markdown_transform(&mut self, event: &Value) -> bool {
+        if self
+            .markdown_pending
+            .as_ref()
+            .is_none_or(|pending| event["id"] != json!(pending.request))
+        {
+            return false;
+        }
+        let pending = self
+            .markdown_pending
+            .take()
+            .expect("matching Markdown request");
+        if event["retry"] == true {
+            return false;
+        }
+        let replacement = event["transformed"].as_str().map(str::to_owned);
+        let changed = replacement.is_some();
+        let rendering = Some((pending.context.available_width, replacement));
+        match pending.target {
+            MarkdownTarget::Recorded(index) => {
+                let Some(entry) = self.lines.get_mut(index) else {
+                    return false;
+                };
+                if entry
+                    .markdown(!self.hide_thinking)
+                    .is_none_or(|(role, markdown)| {
+                        role != pending.context.message_type
+                            || markdown.original != pending.original
+                            || markdown.record.as_ref().map(|(id, _)| *id)
+                                != pending.context.message_id
+                    })
+                {
+                    return false;
+                }
+                entry
+                    .markdown_mut()
+                    .expect("matching Markdown entry")
+                    .rendering = rendering;
+                if changed && index < self.regular.committed {
+                    self.custom_render_redraw_at
+                        .get_or_insert_with(|| Instant::now() + Duration::from_millis(150));
+                }
+            }
+            MarkdownTarget::StreamingAssistant if self.streaming == pending.original => {
+                self.markdown_assistant = Some(TranscriptMarkdown {
+                    rendering,
+                    ..pending.original.into()
+                });
+            }
+            MarkdownTarget::StreamingThinking if self.thinking == pending.original => {
+                self.markdown_thinking = Some(TranscriptMarkdown {
+                    rendering,
+                    ..pending.original.into()
+                });
+            }
+            _ => return false,
+        }
+        changed
+    }
+
+    fn streaming_markdown(&self, thinking: bool) -> TranscriptMarkdown {
+        let (text, cached) = if thinking {
+            (&self.thinking, &self.markdown_thinking)
+        } else {
+            (&self.streaming, &self.markdown_assistant)
+        };
+        cached
+            .as_ref()
+            .filter(|cached| cached.original == *text)
+            .cloned()
+            .unwrap_or_else(|| text.clone().into())
+    }
+
     fn invalidate_custom_message_renderings(&mut self) -> bool {
         self.custom_render_attempted.clear();
         self.custom_render_redraw_at = None;
@@ -2148,12 +2378,20 @@ impl View {
             .unwrap_or_else(|| self.accepted_model(args))
     }
 
+    fn prepare_live_choice(&self, args: &Cli) -> Cli {
+        let mut selected = self.model_choice(args).clone();
+        selected.settings = args.settings.clone();
+        selected.model_scope.clone_from(&args.model_scope);
+        selected.selection_events.clear();
+        selected
+    }
+
     fn stage_model_choice(
         &mut self,
         worker: &mut Worker,
         selected: Cli,
         status: String,
-        save_default: bool,
+        persist: Option<SelectionDefault>,
     ) -> Result<()> {
         if self.live_model_choices.len() >= 32 {
             return Err(Error::Config("Model selection is still pending".into()));
@@ -2172,7 +2410,7 @@ impl View {
             id,
             selected,
             status,
-            save_default,
+            persist,
         });
         Ok(())
     }
@@ -2195,13 +2433,18 @@ impl View {
                     .selection_events
                     .splice(0..0, previous.selection_events);
             }
-            if choice.save_default
-                && let Err(error) =
+            let saved = match choice.persist {
+                Some(SelectionDefault::Model) => {
                     save_default_model(args, &choice.selected.provider, &choice.selected.model)
-            {
-                self.append(&error.to_string());
-            } else {
-                self.show_status(args.tui_mode, choice.status);
+                }
+                Some(SelectionDefault::Thinking(level)) => {
+                    args.settings.set_user("defaultThinkingLevel", json!(level))
+                }
+                None => Ok(()),
+            };
+            match saved {
+                Ok(()) => self.show_status(args.tui_mode, choice.status),
+                Err(error) => self.append(&error.to_string()),
             }
             self.live_model_applied = Some(choice.selected);
         } else {
@@ -2362,6 +2605,7 @@ impl View {
         self.regular.committed = 0;
         self.regular.redraw = true;
         self.lines.clear();
+        self.clear_markdown_renderings();
         self.custom_entry_count = 0;
         self.custom_render_redraw_at = None;
         // Keep an in-flight request as the only one until its response. The
@@ -2419,7 +2663,18 @@ impl View {
                 }
             })
             .collect();
-        for record in session.branch() {
+        let branch = session.branch();
+        let assistant_records: std::collections::HashMap<_, _> = branch
+            .iter()
+            .filter_map(|&record| match record.event {
+                pi_rs::Event::Assistant {
+                    request_id: Some(request_id),
+                    ..
+                } => Some((request_id, record)),
+                _ => None,
+            })
+            .collect();
+        for record in branch {
             match &record.event {
                 pi_rs::Event::CustomEntry { entry } => self.show_custom_entry(record.id, entry),
                 pi_rs::Event::CustomMessage { message }
@@ -2429,7 +2684,11 @@ impl View {
                 pi_rs::Event::User { content, .. }
                 | pi_rs::Event::UserWithImages { content, .. } => {
                     self.remember_prompt(content);
-                    self.lines.push(Entry::user(content.clone()));
+                    self.lines
+                        .push(Entry::user_markdown(TranscriptMarkdown::from_record(
+                            content.clone(),
+                            record,
+                        )));
                     if let pi_rs::Event::UserWithImages { images, .. } = &record.event {
                         self.append(&format!("{} attached image(s)", images.len()));
                         self.add_images(images);
@@ -2494,7 +2753,10 @@ impl View {
                         && let Some(reasoning) = &metadata.reasoning
                     {
                         self.lines.push(Entry::Thinking {
-                            text: reasoning.clone(),
+                            text: TranscriptMarkdown::from_record(
+                                reasoning.clone(),
+                                assistant_records.get(request_id).copied().unwrap_or(record),
+                            ),
                             expanded: None,
                         });
                     }
@@ -2517,7 +2779,11 @@ impl View {
                     ..
                 } => {
                     if !content.is_empty() {
-                        self.lines.push(Entry::Assistant(content.clone()));
+                        self.lines
+                            .push(Entry::Assistant(TranscriptMarkdown::from_record(
+                                content.clone(),
+                                record,
+                            )));
                     }
                     for invocation in invocations {
                         self.add_tool(invocation);
@@ -2871,6 +3137,11 @@ impl View {
                     }
                     Some("model_requested") => {
                         self.streaming_tools.clear();
+                        self.markdown_assistant = None;
+                        self.markdown_thinking = None;
+                        if self.markdown_pending.as_ref().is_some_and(|pending| pending.context.is_streaming) {
+                            self.markdown_pending = None;
+                        }
                         self.request_started = Some(Instant::now());
                         self.phase = Some("モデル応答待ち");
                     }
@@ -2881,7 +3152,7 @@ impl View {
                         let thinking = std::mem::take(&mut self.thinking);
                         self.thinking_items.clear();
                         if !thinking.is_empty() {
-                            self.lines.push(Entry::Thinking { text: thinking, expanded: self.thinking_expanded.take() });
+                            self.lines.push(Entry::Thinking { text: thinking.into(), expanded: self.thinking_expanded.take() });
                         } else {
                             self.thinking_expanded = None;
                         }
@@ -2963,7 +3234,7 @@ impl View {
         self.streaming_tools.clear();
         if !self.thinking.is_empty() {
             self.lines.push(Entry::Thinking {
-                text: std::mem::take(&mut self.thinking),
+                text: std::mem::take(&mut self.thinking).into(),
                 expanded: self.thinking_expanded.take(),
             });
         } else {
@@ -2971,7 +3242,7 @@ impl View {
         }
         if !self.streaming.is_empty() {
             self.lines
-                .push(Entry::Assistant(std::mem::take(&mut self.streaming)));
+                .push(Entry::Assistant(std::mem::take(&mut self.streaming).into()));
         }
         self.request_started = None;
         self.phase = None;
@@ -3266,7 +3537,7 @@ impl View {
             let start = lines.len();
             lines.extend(
                 Entry::Thinking {
-                    text: self.thinking.clone(),
+                    text: self.streaming_markdown(true),
                     expanded: self.thinking_expanded,
                 }
                 .render(
@@ -3283,7 +3554,7 @@ impl View {
             ));
         }
         if !self.streaming.is_empty() {
-            lines.extend(Entry::Assistant(self.streaming.clone()).render(
+            lines.extend(Entry::Assistant(self.streaming_markdown(false)).render(
                 theme,
                 body_width,
                 false,
@@ -3584,7 +3855,7 @@ impl View {
         if !self.thinking.is_empty() {
             lines.extend(
                 Entry::Thinking {
-                    text: self.thinking.clone(),
+                    text: self.streaming_markdown(true),
                     expanded: self.thinking_expanded,
                 }
                 .render(
@@ -3597,7 +3868,7 @@ impl View {
             );
         }
         if !self.streaming.is_empty() {
-            lines.extend(Entry::Assistant(self.streaming.clone()).render(
+            lines.extend(Entry::Assistant(self.streaming_markdown(false)).render(
                 theme,
                 width,
                 false,
@@ -3756,7 +4027,7 @@ impl View {
         if !committing {
             active.extend(
                 Entry::Thinking {
-                    text: self.thinking.clone(),
+                    text: self.streaming_markdown(true),
                     expanded: self.thinking_expanded,
                 }
                 .render(
@@ -3767,7 +4038,7 @@ impl View {
                     self.transcript_options(args, true),
                 ),
             );
-            active.extend(Entry::Assistant(self.streaming.clone()).render(
+            active.extend(Entry::Assistant(self.streaming_markdown(false)).render(
                 theme,
                 width,
                 false,
@@ -4464,10 +4735,11 @@ fn slash(
                 .string("defaultThinkingLevel")
                 .unwrap_or("off")
                 .to_owned();
-            let current = args.thinking.clone().unwrap_or_else(|| "off".into());
+            let mut selected = view.model_choice(args).clone();
+            let current = selected.thinking.clone().unwrap_or_else(|| "off".into());
             let mut picker = Picker::new(
                 "Thinking level",
-                super::thinking::available(args)
+                super::thinking::available(&mut selected)
                     .into_iter()
                     .map(|level| Item {
                         label: format!(
@@ -4482,7 +4754,15 @@ fn slash(
             picker.focus_thinking(&current);
             view.picker = Some(picker);
         }
-        "/thinking" => super::thinking::set(args, rest)?,
+        "/thinking" => {
+            select_thinking_input(
+                args,
+                view,
+                worker.and_then(|slot| slot.as_mut()),
+                rest,
+                false,
+            )?;
+        }
         "/new" => {
             if Worker::check_session_transition(
                 worker,
@@ -5237,10 +5517,14 @@ pub(super) async fn run(
             .is_some_and(|active| !active.busy && !active.bashing && !active.matches(&args))
             && let Some(mut old) = worker.take()
         {
-            if !old.message_renderer_types.is_empty() || !old.entry_renderer_types.is_empty() {
+            if old.markdown_transformers
+                || !old.message_renderer_types.is_empty()
+                || !old.entry_renderer_types.is_empty()
+            {
                 startup_extensions = None;
                 view.custom_render_pending = None;
                 dirty |= view.invalidate_custom_message_renderings();
+                dirty |= view.clear_markdown_renderings();
             }
             if view.clear_extension_chrome() {
                 startup_extensions = None;
@@ -5425,10 +5709,16 @@ pub(super) async fn run(
                     active.entry_renderer_types =
                         serde_json::from_value(value["custom_entry_renderers"].clone())
                             .unwrap_or_default();
+                    active.markdown_transformers = value["markdown_transformers"] == true;
+                    dirty |= view.clear_markdown_renderings();
                     dirty |= view.refresh_transcript_extension_renderers();
                 }
                 if value["type"] == "transcript_extension_rendered" {
                     dirty |= view.receive_transcript_extension_render(value);
+                    continue;
+                }
+                if value["type"] == "transcript_markdown_transformed" {
+                    dirty |= view.receive_markdown_transform(&value);
                     continue;
                 }
                 if value["type"] == "response" && value["command"] == "get_share_context" {
@@ -5568,9 +5858,11 @@ pub(super) async fn run(
                 dirty = true;
             }
             dirty |= view.prepare_transcript_extension_render(active, &args);
+            view.prepare_markdown_transform(active, &args);
             if let Some(status) = active.child.try_wait()? {
                 let mut finished = worker.take().expect("active worker");
                 view.custom_render_pending = None;
+                view.clear_markdown_renderings();
                 view.invalidate_custom_message_renderings();
                 for reader in finished.readers.drain(..) {
                     let _ = reader.join();
@@ -6455,14 +6747,13 @@ pub(super) async fn run(
                                     &model,
                                     true,
                                 ),
-                                Selection::Thinking(thinking) => {
-                                    super::thinking::set(&mut args, &thinking).and_then(|()| {
-                                        args.settings
-                                            .set_user("defaultThinkingLevel", json!(thinking))?;
-                                        view.append(&format!("Default thinking level: {thinking}"));
-                                        Ok(())
-                                    })
-                                }
+                                Selection::Thinking(thinking) => select_thinking_input(
+                                    &mut args,
+                                    &mut view,
+                                    worker.as_mut(),
+                                    &thinking,
+                                    true,
+                                ),
                                 _ => Ok(()),
                             };
                             if let Err(error) = result {
@@ -7030,8 +7321,11 @@ pub(super) async fn run(
                                 view.editor.replace(input);
                             }
                         } else if (matches!(input.trim(), "/session" | "/share" | "/tree")
-                            || (input.starts_with("/model")
-                                && input.split_whitespace().next() == Some("/model")
+                            || (input.starts_with('/')
+                                && matches!(
+                                    input.split_whitespace().next(),
+                                    Some("/model" | "/thinking")
+                                )
                                 && (!is_busy(&worker)
                                     || worker.as_ref().is_some_and(|active| active.busy))))
                             && view.draft_images.is_empty()
@@ -7554,15 +7848,14 @@ fn select_model_input(
         format!("Model: {}", selection.model)
     };
     if let Some(worker) = worker.filter(|worker| worker.busy) {
-        let mut current = current.clone();
-        current.selection_events.clear();
-        let selected = current.prepare_model_change(
+        let selected = view.prepare_live_choice(args).prepare_model_change(
             provider,
             selection.model,
             selection.thinking,
             pi_rs::ModelSelectSource::Set,
         )?;
-        return view.stage_model_choice(worker, selected, status, save_default);
+        let persist = save_default.then_some(SelectionDefault::Model);
+        return view.stage_model_choice(worker, selected, status, persist);
     }
     args.change_model(
         provider,
@@ -7652,16 +7945,14 @@ fn cycle_model(
         return Ok(());
     };
     if let Some(worker) = worker.as_mut().filter(|worker| worker.busy) {
-        let mut current = current.clone();
-        current.selection_events.clear();
-        let selected = current.prepare_model_change(
+        let selected = view.prepare_live_choice(args).prepare_model_change(
             choice.provider,
             choice.model,
             choice.thinking,
             pi_rs::ModelSelectSource::Cycle,
         )?;
         let status = model_cycle_status(&selected);
-        return view.stage_model_choice(worker, selected, status, false);
+        return view.stage_model_choice(worker, selected, status, None);
     }
     args.change_model(
         choice.provider,
@@ -7689,17 +7980,46 @@ fn model_cycle_status(args: &Cli) -> String {
     status
 }
 
+fn select_thinking_input(
+    args: &mut Cli,
+    view: &mut View,
+    worker: Option<&mut Worker>,
+    requested: &str,
+    save_default: bool,
+) -> Result<()> {
+    let status_prefix = if save_default {
+        "Default thinking level"
+    } else {
+        "Thinking level"
+    };
+    if let Some(worker) = worker.filter(|worker| worker.busy) {
+        let mut selected = view.prepare_live_choice(args);
+        let level = super::thinking::resolve(&mut selected, requested)?;
+        super::thinking::select(&mut selected, &level);
+        let status = format!("{status_prefix}: {level}");
+        let persist = save_default.then_some(SelectionDefault::Thinking(level));
+        return view.stage_model_choice(worker, selected, status, persist);
+    }
+    super::thinking::set(args, requested)?;
+    let level = args.thinking.as_deref().unwrap_or("off");
+    if save_default {
+        args.settings
+            .set_user("defaultThinkingLevel", json!(level))?;
+    }
+    view.show_status(args.tui_mode, format!("{status_prefix}: {level}"));
+    Ok(())
+}
+
 fn cycle_thinking(args: &mut Cli, view: &mut View, worker: &mut Option<Worker>) -> Result<()> {
     let level = if let Some(worker) = worker.as_mut().filter(|worker| worker.busy) {
-        let mut selected = view.model_choice(args).clone();
-        selected.selection_events.clear();
+        let mut selected = view.prepare_live_choice(args);
         if let Some(level) = super::thinking::next_level(&mut selected) {
             super::thinking::select(&mut selected, &level);
             return view.stage_model_choice(
                 worker,
                 selected,
                 format!("Thinking level: {level}"),
-                false,
+                None,
             );
         }
         None
@@ -9096,7 +9416,9 @@ fn select(
         Selection::RadiusMethods => show_radius_methods(view),
         Selection::LoginRadius(method) => start_radius_login(view, &args.settings, method)?,
         Selection::LogoutRadius => start_radius_logout(view, &args.settings)?,
-        Selection::Thinking(thinking) => super::thinking::set(args, &thinking)?,
+        Selection::Thinking(thinking) => {
+            select_thinking_input(args, view, worker.as_mut(), &thinking, false)?;
+        }
         Selection::SaveDefaultModel => save_current_default_model(args)?,
         Selection::EditSetting(key) => {
             let default = match key.as_str() {
@@ -10148,6 +10470,39 @@ fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn live_model_changes_use_the_latest_thinking_default() {
+        use clap::Parser;
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = workspace.path().join(".pi");
+        std::fs::create_dir(&directory).unwrap();
+        let settings = |level: &str| {
+            std::fs::write(
+                directory.join("settings.json"),
+                serde_json::json!({"defaultThinkingLevel":level}).to_string(),
+            )
+            .unwrap();
+            super::super::config::Settings::load(workspace.path(), true).unwrap()
+        };
+        let mut args = super::Cli::parse_from(["pi", "--offline", "--model", "before"]);
+        args.settings = settings("medium");
+        let view = super::View {
+            live_model_applied: Some(args.clone()),
+            ..Default::default()
+        };
+        args.settings = settings("high");
+        let selected = view
+            .prepare_live_choice(&args)
+            .prepare_model_change(
+                args.provider.clone(),
+                "after".into(),
+                None,
+                pi_rs::ModelSelectSource::Cycle,
+            )
+            .unwrap();
+        assert_eq!(selected.thinking.as_deref(), Some("high"));
+    }
+
+    #[test]
     fn model_picker_waits_for_the_worker_before_adopting_a_selection() {
         use clap::Parser;
         let mut args = super::Cli::parse_from(["pi", "--model", "before"]);
@@ -10156,12 +10511,15 @@ mod tests {
         let accepted = uuid::Uuid::new_v4();
         let mut selected = args.clone();
         selected.model = "after".into();
-        for (id, save_default) in [(failed, true), (accepted, false)] {
+        for (id, persist) in [
+            (failed, Some(super::SelectionDefault::Model)),
+            (accepted, None),
+        ] {
             view.live_model_choices.push_back(super::LiveModelChoice {
                 id,
                 selected: selected.clone(),
                 status: "Model: after".into(),
-                save_default,
+                persist,
             });
         }
         assert_eq!(view.accepted_model(&args).model, "before");
@@ -11119,6 +11477,68 @@ mod tests {
     }
 
     #[test]
+    fn markdown_rendering_uses_restored_metadata_and_rejects_stale_stream_chunks() {
+        use crate::ui::render::{Entry, TranscriptMarkdown};
+
+        assert_eq!(
+            super::markdown_input("\u{feff}", pi_rs::MarkdownMessageType::Assistant),
+            None
+        );
+        assert_eq!(
+            super::markdown_input("\u{0085}", pi_rs::MarkdownMessageType::Assistant),
+            Some("\u{0085}")
+        );
+        assert_eq!(
+            super::markdown_input("  ", pi_rs::MarkdownMessageType::User),
+            Some("  ")
+        );
+        let mut view = super::View::default();
+        view.lines.push(Entry::user_markdown(TranscriptMarkdown {
+            record: Some((24, Some("2026-11-21T07:00:00Z".into()))),
+            .."<skill name=\"tool\" location=\"SKILL.md\">\ninstructions\n</skill>\n\nOriginal prompt".into()
+        }));
+        let (target, context, original) = view.markdown_candidate(32).unwrap();
+        assert_eq!(original, "Original prompt");
+        assert_eq!(context.message_type, pi_rs::MarkdownMessageType::User);
+        assert!(!context.is_streaming);
+        assert_eq!(context.message_id, Some(24));
+        assert_eq!(context.timestamp.as_deref(), Some("2026-11-21T07:00:00Z"));
+        let request = uuid::Uuid::new_v4();
+        view.markdown_pending = Some(super::MarkdownPending {
+            request,
+            target,
+            context,
+            original,
+        });
+        assert!(view.receive_markdown_transform(&serde_json::json!({
+            "id": request, "transformed": "Display text"
+        })));
+        let (_, markdown) = view.lines[0].markdown(false).unwrap();
+        assert_eq!(markdown.original, "Original prompt");
+        assert_eq!(markdown.rendering, Some((32, Some("Display text".into()))));
+        assert!(view.markdown_candidate(32).is_none());
+        assert_eq!(view.markdown_candidate(80).unwrap().1.available_width, 80);
+
+        view.streaming = "partial".into();
+        let (target, context, original) = view.markdown_candidate(32).unwrap();
+        assert_eq!(context.message_type, pi_rs::MarkdownMessageType::Assistant);
+        assert!(context.is_streaming);
+        assert_eq!(context.message_id, None);
+        assert_eq!(context.timestamp, None);
+        view.markdown_pending = Some(super::MarkdownPending {
+            request,
+            target,
+            context,
+            original,
+        });
+        view.streaming.push_str(" text");
+        assert!(!view.receive_markdown_transform(&serde_json::json!({
+            "id": request, "transformed": "Stale"
+        })));
+        assert_eq!(view.markdown_candidate(32).unwrap().2, "partial text");
+    }
+
+    #[test]
     fn thinking_visibility_overrides_survive_settle_and_reset_globally() {
         use crate::ui::render::Entry;
         let mut view = super::View::default();
@@ -11150,7 +11570,7 @@ mod tests {
             .unwrap() = Some(false);
         view.settle();
         assert!(
-            matches!(&view.lines[2], Entry::Thinking { text, expanded: Some(false) } if text == "streamed")
+            matches!(&view.lines[2], Entry::Thinking { text, expanded: Some(false) } if text.original == "streamed")
         );
         assert!(
             view.panel_expansion(super::TranscriptPanel::StreamingThinking)
