@@ -1078,7 +1078,7 @@ impl Operations {
             .clone()
     }
 
-    async fn radius_client(&self) -> Option<PiMessages> {
+    async fn radius_client(&self, discovery: bool) -> Option<PiMessages> {
         let http = self.current_http();
         let mut args = self.args.clone();
         args.settings = http.settings;
@@ -1087,20 +1087,46 @@ impl Operations {
             .connect_provider(&Provider::Radius, None)
             .ok()?
             .with_context_probes(!args.offline);
+        if discovery && args.offline && matches!(client, Client::Deferred(_)) {
+            return None;
+        }
         match client.resolve_affinity_headers().await.ok()?.0 {
             Client::PiMessages(client) => Some(client.with_radius_catalog_cache(http.radius)),
             _ => None,
         }
     }
 
-    async fn radius_classifiers(&self) -> Vec<Entry> {
-        let Some(radius) = self.radius_client().await else {
-            return Vec::new();
+    async fn radius_classifiers(&self, cancel: &pi_rs::CancellationToken) -> Result<Vec<Entry>> {
+        let discover = async {
+            let Some(radius) = self.radius_client(true).await else {
+                return Vec::new();
+            };
+            let Ok(Some(catalog)) = radius.catalog().await else {
+                return Vec::new();
+            };
+            radius_entries(&catalog)
         };
-        let Ok(Some(catalog)) = radius.catalog().await else {
-            return Vec::new();
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Error::Cancelled),
+            entries = discover => Ok(entries),
+        }
+    }
+
+    async fn radius_classifier(
+        &self,
+        model_id: Option<&str>,
+    ) -> Result<Option<(Entry, String, HeaderMap)>> {
+        let Some(radius) = self.radius_client(false).await else {
+            return Ok(None);
         };
-        radius_entries(&catalog)
+        let Some((catalog, token)) = radius.classifier_catalog_with_token().await? else {
+            return Ok(None);
+        };
+        Ok(radius_entries(&catalog)
+            .into_iter()
+            .find(|entry| Some(entry.model.id.as_str()) == model_id)
+            .map(|entry| (entry, token, radius.context_headers())))
     }
 
     fn http_client(args: &Cli) -> Result<reqwest::Client> {
@@ -1229,14 +1255,16 @@ impl Tool for Operations {
                     && Some(model.provider.as_str()) == provider
                     && Some(model.model.id.as_str()) == args["id"].as_str()
             });
-            let found = found
-                || (kind == Some(Kind::Classifier)
-                    && provider == Some("radius")
-                    && self
-                        .radius_classifiers()
-                        .await
+            let found = if !found && kind == Some(Kind::Classifier) && provider == Some("radius") {
+                match self.radius_classifiers(&context.cancellation).await {
+                    Ok(entries) => entries
                         .iter()
-                        .any(|entry| Some(entry.model.id.as_str()) == args["id"].as_str()));
+                        .any(|entry| Some(entry.model.id.as_str()) == args["id"].as_str()),
+                    Err(error) => return Outcome::Failed(error.to_string()),
+                }
+            } else {
+                found
+            };
             return if found {
                 Outcome::Structured {
                     data: json!(true),
@@ -1314,7 +1342,11 @@ impl Tool for Operations {
                     .await;
                 if kind == Kind::Classifier && provider.is_none_or(|provider| provider == "radius")
                 {
-                    for entry in self.radius_classifiers().await.into_iter().filter(|entry| {
+                    let discovered = match self.radius_classifiers(&context.cancellation).await {
+                        Ok(entries) => entries,
+                        Err(error) => return Outcome::Failed(error.to_string()),
+                    };
+                    for entry in discovered.into_iter().filter(|entry| {
                         id.is_none_or(|id| entry.model.id == id)
                             && !catalogue.0.iter().any(|model| {
                                 model.provider == "radius"
@@ -1342,27 +1374,20 @@ impl Tool for Operations {
                 && Some(model.provider.as_str()) == provider
                 && Some(model.model.id.as_str()) == args["id"].as_str()
         });
-        let radius = if configured.is_none()
-            && kind == Kind::Classifier
-            && provider == Some("radius")
-            && let Some(radius) = self.radius_client().await
-        {
-            let binding = tokio::select! {
-                biased;
-                _ = context.cancellation.cancelled() => Err(Error::Cancelled),
-                result = radius.classifier_catalog_with_token() => result,
+        let radius =
+            if configured.is_none() && kind == Kind::Classifier && provider == Some("radius") {
+                let binding = tokio::select! {
+                    biased;
+                    _ = context.cancellation.cancelled() => Err(Error::Cancelled),
+                    result = self.radius_classifier(args["id"].as_str()) => result,
+                };
+                match binding {
+                    Ok(binding) => binding,
+                    Err(error) => return Outcome::Failed(error.to_string()),
+                }
+            } else {
+                None
             };
-            match binding {
-                Ok(Some((catalog, token))) => radius_entries(&catalog)
-                    .into_iter()
-                    .find(|entry| Some(entry.model.id.as_str()) == args["id"].as_str())
-                    .map(|entry| (entry, token, radius.context_headers())),
-                Ok(None) => None,
-                Err(error) => return Outcome::Failed(error.to_string()),
-            }
-        } else {
-            None
-        };
         let Some(model) = configured.or(radius.as_ref().map(|(model, _, _)| model)) else {
             return Outcome::Failed("unknown model for this operation".into());
         };
