@@ -1,6 +1,6 @@
 use futures_util::stream;
 use pi_rs::*;
-use pi_rs_workbench::coding::CodingTools;
+use pi_rs_workbench::coding::{CodingTools, ReadImageModel};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
@@ -126,7 +126,11 @@ async fn local_numeric_limits_pass_dispatch_and_match_pi_output() {
     }
     let mut registry = Registry::default();
     registry
-        .register(Arc::new(CodingTools::local(root.path()).unwrap()))
+        .register(Arc::new(
+            CodingTools::local(root.path())
+                .unwrap()
+                .with_read_image_model(ReadImageModel::default()),
+        ))
         .unwrap();
     let model = Script(Mutex::new(vec![]));
     let agent = Agent {
