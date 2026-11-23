@@ -1977,6 +1977,14 @@ impl View {
             .unwrap_or_else(|| self.accepted_model(args))
     }
 
+    fn prepare_live_choice(&self, args: &Cli) -> Cli {
+        let mut selected = self.model_choice(args).clone();
+        selected.settings = args.settings.clone();
+        selected.model_scope.clone_from(&args.model_scope);
+        selected.selection_events.clear();
+        selected
+    }
+
     fn stage_model_choice(
         &mut self,
         worker: &mut Worker,
@@ -7381,9 +7389,7 @@ fn select_model_input(
         format!("Model: {}", selection.model)
     };
     if let Some(worker) = worker.filter(|worker| worker.busy) {
-        let mut current = current.clone();
-        current.selection_events.clear();
-        let selected = current.prepare_model_change(
+        let selected = view.prepare_live_choice(args).prepare_model_change(
             provider,
             selection.model,
             selection.thinking,
@@ -7480,9 +7486,7 @@ fn cycle_model(
         return Ok(());
     };
     if let Some(worker) = worker.as_mut().filter(|worker| worker.busy) {
-        let mut current = current.clone();
-        current.selection_events.clear();
-        let selected = current.prepare_model_change(
+        let selected = view.prepare_live_choice(args).prepare_model_change(
             choice.provider,
             choice.model,
             choice.thinking,
@@ -7530,8 +7534,7 @@ fn select_thinking_input(
         "Thinking level"
     };
     if let Some(worker) = worker.filter(|worker| worker.busy) {
-        let mut selected = view.model_choice(args).clone();
-        selected.selection_events.clear();
+        let mut selected = view.prepare_live_choice(args);
         let level = super::thinking::resolve(&mut selected, requested)?;
         super::thinking::select(&mut selected, &level);
         let status = format!("{status_prefix}: {level}");
@@ -7550,8 +7553,7 @@ fn select_thinking_input(
 
 fn cycle_thinking(args: &mut Cli, view: &mut View, worker: &mut Option<Worker>) -> Result<()> {
     let level = if let Some(worker) = worker.as_mut().filter(|worker| worker.busy) {
-        let mut selected = view.model_choice(args).clone();
-        selected.selection_events.clear();
+        let mut selected = view.prepare_live_choice(args);
         if let Some(level) = super::thinking::next_level(&mut selected) {
             super::thinking::select(&mut selected, &level);
             return view.stage_model_choice(
