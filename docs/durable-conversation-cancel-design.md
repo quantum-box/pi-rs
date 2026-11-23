@@ -41,16 +41,17 @@ opts an unhooked conversation root or registered nested child into cancellation 
 an interrupted wake. This changes the persisted registration identity. The
 woken path binds the original attempt, cleanup attempt, identity, conversation
 and park proof to claim, first poll and receipt; a late Tool result blocks
-receipt settlement and remains reconciliation evidence. The callback is polled
+receipt settlement and remains reconciliation evidence. The callback is dispatched
 at most once. A successful callback does not determine the interrupted Tool's
 outcome: the task fails for reconciliation and `abort_and_wait` can report
 pending cleanup. Woken roots and nested children with unsupported or uncertain
 owned work fail closed. Nested claims bind the exact foreground ancestry;
 callback markers retire atomically across it. A stopped callback is never
 replayed, and its receipt does not resolve the interrupted Tool outcome.
-With the non-default `experimental-graph-revision` feature, a woken root may
-also cancel after its recorded foreground owned-conversation graph has drained,
-when every task reached through a conversation edge is replay-safe and terminal.
+With the non-default `experimental-graph-revision` feature, a woken root or
+registered nested child may also cancel after its recorded foreground
+owned-conversation graph has drained, when every task reached through a
+conversation edge is replay-safe and terminal.
 Legacy stores, missing or changed graph evidence, and unsafe owned-conversation
 tasks remain reconciliation-required. All recorded owned conversations are
 fenced through first poll and their durable markers retire with the receipt or
@@ -58,12 +59,13 @@ unknown outcome. Without this feature, owned-conversation cancellation remains
 disabled.
 A separate `register_conversation_unsafe_durable_tool_with_selected_hooks_and_at_most_once_woken_cancel`
 registration runs the replay-safe selected after hook with fenced memo and
-retains its rich result with the callback receipt and snapshot version. For a root, an atomic terminal marker binds it to the failed task. Root
-publication rechecks the selected identity, snapshot, ownership, original wake
-and absence of late results; it appends the after output while retaining a Blocked
-conversation and the uncertain Tool outcome. A nested child retains the rich
-after result in its receipt, but does not currently expose that result to its
-parent; the parent receives an uncertain outcome. A changed snapshot, selection or late result needs
+retains its rich result with the callback receipt and snapshot version. An
+atomic terminal marker binds a conversation root's result to the failed task.
+For a nested child, the rich result remains in the receipt for reconciliation;
+it is not yet published to the parent. Root publication rechecks the
+selected identity, snapshot, ownership, original wake and absence of late
+results; it appends the after output while retaining a Blocked conversation and
+the uncertain Tool outcome. A changed snapshot, selection or late result needs
 reconciliation. The current hook input uses the generic aborted diagnostic
 rather than upstream’s tool-specific interrupted diagnostic. After process loss recovery fails
 the original task for reconciliation and atomically retires only matching task
