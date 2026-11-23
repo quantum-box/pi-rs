@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use pi_rs_core::{
-    Extension, ExtensionResult, ExtensionState, Outcome, RequestPurpose, Tool, ToolContext,
-    ToolHost, ToolReply, ToolSpec,
+    Extension, ExtensionResult, ExtensionState, Outcome, RequestPurpose, Tool, ToolConstraint,
+    ToolContext, ToolGrammarVariants, ToolHost, ToolReply, ToolSpec, json_syntax_diagnostic,
 };
 use rquickjs::{
     AsyncContext, AsyncRuntime, Promise,
@@ -23,6 +23,15 @@ use serde_json::{Value, json};
 use crate::tool_search::{SearchDocument, rank};
 
 const ID: &str = "codemode";
+const SOURCE_GRAMMAR: &str = r#"
+start: options_source | plain_source
+options_source: OPTIONS_LINE NEWLINE SOURCE
+plain_source: SOURCE
+
+OPTIONS_LINE: /[ \t]*\/\/ @options:[^\r\n]*/
+NEWLINE: /\r?\n/
+SOURCE: /[\s\S]+/
+"#;
 const MODEL_OPERATION: &str = "pi_model_operation";
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_ITEMS: usize = 100_000;
@@ -98,9 +107,12 @@ fn worker_limit() -> usize {
         .unwrap_or(2)
 }
 
+fn javascript_whitespace(c: char) -> bool {
+    (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}'
+}
+
 fn parse_worker_limit(value: &str) -> Option<usize> {
-    let value =
-        value.trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}');
+    let value = value.trim_matches(javascript_whitespace);
     let radix_number = |digits: &str, radix| {
         (!digits.is_empty() && digits.chars().all(|c| c.is_ascii() && c.is_digit(radix)))
             .then(|| u64::from_str_radix(digits, radix).ok().map(|n| n as f64))
@@ -286,6 +298,14 @@ impl Tool for ScriptTool {
             description: "Run JavaScript in a QuickJS sandbox. Use await tools.<name>(args), models.getAvailableOfType(type), models.classify(model, context), models.generateImages(model, context), text(value), image(value), console.log, return, exit(), store(key,value), load(key), ALL_TOOLS, searchTools(query), describeTool(name), and describeNamespace(name). The sandbox has no filesystem, network, Node APIs or timers. Only emitted output reaches the model. A first-line // @options: JSON object may set max_output_tokens and timeout_ms. Store writes commit only after success.".into(),
             parameters: json!({"type":"object","properties":{"code":{"type":"string","minLength":1}},"required":["code"],"additionalProperties":false}),
         }
+    }
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        Some(ToolConstraint::Grammar {
+            variants: ToolGrammarVariants {
+                openai_lark: Some(SOURCE_GRAMMAR.into()),
+                openai_regex: None,
+            },
+        })
     }
     async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
         Outcome::Failed("codemode requires the native tool host".into())
@@ -489,18 +509,27 @@ struct Options {
 fn options(code: &str, maximum: Option<Duration>) -> Result<(Options, &str), String> {
     const PREFIX: &str = "// @options:";
     const FIELDS: &str = "`max_output_tokens` and `timeout_ms`";
-    if code.trim().is_empty() {
-        return Err("Expected JavaScript source text (non-empty)".into());
+    if code.trim_matches(javascript_whitespace).is_empty() {
+        return Err(
+            "Expected JavaScript source text (non-empty). Provide JS only, optionally with a first line `// @options: {\"max_output_tokens\": 1000}`.".into(),
+        );
     }
     for (index, line) in code.split('\n').enumerate().skip(1) {
-        if line.trim_start().starts_with(PREFIX) {
+        if line
+            .trim_start_matches(javascript_whitespace)
+            .starts_with(PREFIX)
+        {
             return Err(format!(
                 "The {PREFIX} line must be the first line of the input; found one on line {}",
                 index + 1
             ));
         }
     }
-    let first = code.split('\n').next().unwrap_or_default().trim_start();
+    let first = code
+        .split('\n')
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches(javascript_whitespace);
     let Some(directive) = first.strip_prefix(PREFIX) else {
         return Ok((
             Options {
@@ -512,19 +541,20 @@ fn options(code: &str, maximum: Option<Duration>) -> Result<(Options, &str), Str
     };
     // Keep the newline so errors point at the original source line.
     let source = code.find('\n').map(|index| &code[index..]).unwrap_or("");
-    if source.trim().is_empty() {
+    if source.trim_matches(javascript_whitespace).is_empty() {
         return Err(
             "The @options line must be followed by JavaScript source on subsequent lines".into(),
         );
     }
-    let directive = directive.trim();
+    let directive = directive.trim_matches(javascript_whitespace);
     if directive.is_empty() {
         return Err(format!(
             "@options must be a JSON object with supported fields {FIELDS}"
         ));
     }
     let value: Value = serde_json::from_str(directive).map_err(|error| {
-        format!("@options must be valid JSON with supported fields {FIELDS}: {error}")
+        let reason = json_syntax_diagnostic(directive, &error);
+        format!("@options must be valid JSON with supported fields {FIELDS}: {reason}")
     })?;
     let fields = value
         .as_object()
@@ -2464,6 +2494,21 @@ mod tests {
             )
     }
     #[test]
+    fn codemode_declares_the_raw_source_grammar_for_compatible_providers() {
+        let mut registry = pi_rs_core::Registry::default();
+        registry.register(Arc::new(Codemode::default())).unwrap();
+        let declarations = registry.active_tool_declarations();
+        assert_eq!(declarations.len(), 1);
+        let (syntax, definition, property) =
+            pi_rs_core::resolve_openai_tool_grammar(&declarations[0])
+                .unwrap()
+                .unwrap();
+        assert_eq!(syntax, pi_rs_core::ToolGrammarSyntax::Lark);
+        assert_eq!(definition, SOURCE_GRAMMAR);
+        assert_eq!(property, "code");
+    }
+
+    #[test]
     fn options_match_reference_source_validation() {
         let maximum = Some(Duration::from_secs(2));
         let (parsed, source) = options(
@@ -2474,6 +2519,27 @@ mod tests {
         assert_eq!(parsed.max_output_tokens, 0);
         assert_eq!(parsed.timeout, Some(Duration::from_millis(25)));
         assert_eq!(source, "\ntext(1)");
+        let (parsed, source) = options(
+            "\u{feff}// @options: \u{feff}{\"max_output_tokens\":2}\u{feff}\ntext(1)",
+            maximum,
+        )
+        .unwrap();
+        assert_eq!(parsed.max_output_tokens, 2);
+        assert_eq!(source, "\ntext(1)");
+        for (invalid, expected) in [
+            (
+                "\u{feff}",
+                "Expected JavaScript source text (non-empty). Provide JS only",
+            ),
+            ("text(1)\n\u{feff}// @options: {}", "found one on line 2"),
+            (
+                "// @options: {\ntext(1)",
+                "Expected property name or '}' in JSON",
+            ),
+        ] {
+            assert!(options(invalid, maximum).err().unwrap().contains(expected));
+        }
+        assert_eq!(options("\u{0085}", maximum).unwrap().1, "\u{0085}");
         for invalid in [
             "",
             "// @options: {}",

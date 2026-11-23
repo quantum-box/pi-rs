@@ -336,10 +336,10 @@ mod tests {
         let config = json!({"relay":{"baseUrl":format!("http://{address}/v1"),"apiKey":"fixture", "models":[{"type":"classifier","id":"judge","api":"openai-decisions"}]}});
         let catalog = Catalogue::parse(config.as_object().unwrap()).unwrap();
         let entry = catalog.0.iter().find(|e| e.provider == "relay").unwrap();
-        let operation = Operations {
-            args: Cli::parse_from(["pi"]),
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-        };
+        let operation = Operations::with_client(
+            Cli::parse_from(["pi"]),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        );
         let context = json!({"state":{},"questions":{"q":{"type":"bool","instructions":"ok?","criteria":{"true":"yes","false":"no"}}}});
         let mut data = json!({"answers":{}});
         let result = operation

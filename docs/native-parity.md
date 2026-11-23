@@ -1946,6 +1946,15 @@ the execution boundary for the pending codemode sandbox.
 
 ### Codemode OpenAI Decisions checkpoint
 
+Codemode accepts configured `pi-classifier` models and uses Pi's
+`POST <baseUrl>/classify` protocol, including image blocks, bounded response
+probabilities, provider usage and the classifier retry policy. Native endpoint
+credential binding and image validation apply. Radius classifier models are
+discovered from the active account's gateway configuration during available-model
+lookups and explicit resolution. Unfiltered and offline lists use the matching
+cached catalog when the current account can be identified without running a
+credential command.
+
 Codemode supports OpenAI Decisions classifier models, including the pinned
 GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
 and the Decisions-specific 504 retry exclusion. Native image validation and
@@ -2043,8 +2052,10 @@ execution. Tests cover rollback, interruption, memory/stack limits, output
 truncation and parallel script calls through the core execution host. The
 first-line `@options` parser accepts indented directives and zero output tokens,
 rejects unsupported or invalid fields and misplaced directives, and preserves
-script line numbers. The native JSON code argument differs from Pi's
-provider-specific raw-code input.
+script line numbers. Compatible OpenAI Responses providers use Pi's raw
+JavaScript grammar, with the same code field used internally and by providers
+that use JSON function arguments. The parser trims JavaScript whitespace and
+uses the same Pi-compatible JSON syntax diagnostics as settings and RPC.
 Non-chat model APIs and remaining execution-limit differences remain open.
 
 Classifier results include their API and invocation timestamp even if the
@@ -2845,7 +2856,10 @@ available after the shared settings. The Transport row cycles through SSE,
 WebSocket, cached WebSocket, and automatic selection in Pi's order. It updates
 the next request in a running Codex session, including sessions that
 resolve their credentials at request time, and retains the normal settings precedence. Native providers without multiple transports retain their existing
-connection behavior. The changelog and installation telemetry controls are still open. The Warnings submenu includes the default-on
+connection behavior. HTTP idle timeout edits apply to subsequent provider
+requests in the running session, including Codemode classifier and image calls,
+without interrupting an active turn. The
+changelog and installation telemetry controls are still open. The Warnings submenu includes the default-on
 Anthropic extra-usage warning. The terminal shows it once when the active model
 uses Anthropic subscription OAuth or a configured subscription token on the
 official endpoint. The warning check uses configured credentials without
