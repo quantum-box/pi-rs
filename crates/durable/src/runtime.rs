@@ -15849,7 +15849,19 @@ impl Harness {
         if expected.task.attempt_id() != Some(attempt) {
             return Err(Error::Invalid("woken attempt changed".into()));
         }
-        checks.extend(self.checkpointable_conversation_checks(&expected.task, registry)?);
+        if matches!(expected.task.owner(), crate::task::TaskOwner::Task(_)) {
+            let (conversation, ancestry_checks) =
+                self.checkpointable_nested_woken_candidate_checks(&expected.task, registry)?;
+            // The nested binding traverses the ancestor task chain and reads
+            // its conversation. Callers must fence that conversation alongside
+            // the owned descendants before this graph mark may commit.
+            if !targets.contains(&conversation) {
+                return Err(Error::TaskScheduler(crate::task_scheduler::Error::Busy));
+            }
+            checks.extend(ancestry_checks);
+        } else {
+            checks.extend(self.checkpointable_conversation_checks(&expected.task, registry)?);
+        }
         self.abort_owned_graph_impl_roots_locked(
             &gate,
             None,

@@ -9486,6 +9486,7 @@ async fn exercise_woken_owned_graph_receipt(conflict: bool, graph_aba: u8) {
                 });
             }
             if graph_aba == 27 {
+                #[cfg(feature = "experimental-graph-scope")]
                 if std::env::var("PI_TEST_WOKEN_OWNED_CUT").ok().as_deref() == Some("busy") {
                     let control = std::path::PathBuf::from(
                         std::env::var_os("PI_TEST_WOKEN_OWNED_CONTROL").unwrap(),
@@ -10473,9 +10474,10 @@ async fn nested_woken_evidence_worker() {
                 .open(self.0.join("nested-cancelled"))
                 .map_err(|e| e.to_string())?;
             writeln!(file, "called").map_err(|e| e.to_string())?;
-            if self.0.join("block-cancel").exists() {
-                std::future::pending::<()>().await;
+            while self.0.join("block-cancel").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            std::fs::write(self.0.join("cancel-returned"), b"ready").map_err(|e| e.to_string())?;
             Ok(())
         }
     }
@@ -10592,6 +10594,70 @@ async fn nested_woken_evidence_worker() {
     };
     let mut scheduler =
         Scheduler::open_with_extensions(dir.join("db"), options, extensions).unwrap();
+    #[cfg(feature = "experimental-graph-revision")]
+    if std::env::var_os("PI_TEST_NESTED_OWNED_GRAPH_PROBE").is_some() {
+        let harness = scheduler.subagent_harness();
+        let owner = harness.owner.clone();
+        let store = owner.store();
+        let child = crate::task_store::TaskStore::new(store)
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|record| {
+                matches!(record.task.owner(), crate::task::TaskOwner::Task(_))
+                    && record.task.state() == &TaskState::Running
+            })
+            .unwrap();
+        assert!(matches!(
+            harness.authenticated_scoped_woken_abort_graph(&child, &registry, &[]),
+            Err(crate::runtime::Error::TaskScheduler(
+                crate::task_scheduler::Error::Busy
+            ))
+        ));
+        if std::env::var_os("PI_TEST_NESTED_OWNED_GRAPH_MARK").is_some() {
+            let crate::task::TaskOwner::Task(parent) = child.task.owner() else {
+                unreachable!()
+            };
+            let parent = crate::task_store::TaskStore::new(store)
+                .load(*parent)
+                .unwrap()
+                .unwrap();
+            let crate::task::TaskOwner::Conversation(conversation) = parent.task.owner() else {
+                unreachable!()
+            };
+            let owned = crate::ownership_edge::EdgeStore::new(store)
+                .children(child.task.id())
+                .unwrap();
+            let mut targets = vec![*conversation];
+            targets.extend(owned.iter().map(|edge| edge.edge.child));
+            let owner = harness.owner.clone();
+            for id in &targets {
+                owner.conversation_controls().get(*id);
+            }
+            let result = owner
+                .conversation_controls()
+                .try_fence_targets(&targets, || {
+                    harness.authenticated_scoped_woken_abort_graph(&child, &registry, &targets)
+                })
+                .unwrap()
+                .unwrap();
+            assert!(!result.is_empty());
+            let marked = crate::task_store::TaskStore::new(owner.store())
+                .load(child.task.id())
+                .unwrap()
+                .unwrap();
+            assert_eq!(marked.task.state(), &TaskState::Ready);
+            assert!(marked.task.abort_requested());
+            assert!(
+                owner
+                    .store()
+                    .get(&crate::runtime::woken_owned_graph_key(child.task.id()))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        return;
+    }
     let _driver = scheduler.start_tasks(registry).unwrap();
     if std::env::var_os("PI_TEST_NESTED_WOKEN_RESUME").is_some() {
         std::future::pending::<()>().await;
@@ -11054,11 +11120,20 @@ async fn nested_woken_real_callback_records_receipt_once() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "experimental-graph-revision")))]
 #[tokio::test]
 async fn nested_woken_with_owned_conversation_remains_fail_closed() {
+    exercise_nested_woken_owned_rejection(false, false, 0).await;
+    exercise_nested_woken_owned_rejection(true, false, 0).await;
+}
+
+#[cfg(unix)]
+async fn exercise_nested_woken_owned_rejection(selected: bool, mark: bool, automatic: u8) {
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().unwrap();
+    if selected {
+        std::fs::write(dir.path().join("selected-mode"), b"yes").unwrap();
+    }
     let mut initial = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -11119,7 +11194,460 @@ async fn nested_woken_with_owned_conversation_remains_fail_closed() {
     store.commit(&prepared.checks, &prepared.mutations).unwrap();
     drop(store);
     drop(harness);
-    let mut resumed = Command::new(std::env::current_exe().unwrap())
+    #[cfg(feature = "experimental-graph-revision")]
+    {
+        let mut probe = Command::new(std::env::current_exe().unwrap());
+        probe
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::nested_woken_evidence_worker",
+            ])
+            .env("PI_TEST_NESTED_WOKEN_DIR", dir.path())
+            .env("PI_TEST_NESTED_OWNED_GRAPH_PROBE", "1");
+        if mark {
+            probe.env("PI_TEST_NESTED_OWNED_GRAPH_MARK", "1");
+        }
+        assert!(probe.status().unwrap().success());
+        if mark {
+            return;
+        }
+    }
+    if automatic == 1 || automatic == 4 {
+        std::fs::write(dir.path().join("block-cancel"), b"hold").unwrap();
+    }
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "conversation_claim_boundary_tests::nested_woken_evidence_worker",
+        ])
+        .env("PI_TEST_NESTED_WOKEN_DIR", dir.path())
+        .env("PI_TEST_NESTED_WOKEN_RESUME", "1")
+        .env("PI_TEST_WOKEN_REAL", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if automatic == 2 {
+        command.env("PI_TEST_WOKEN_HOLD_AFTER_RECEIPT", dir.path());
+    }
+    let mut resumed = command.spawn().unwrap();
+    if automatic != 0 {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !dir.path().join("nested-cancelled").exists() {
+                assert!(resumed.try_wait().unwrap().is_none());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if automatic == 4 {
+            let store = durable_store::Store::open(&path).unwrap();
+            let claim = store
+                .get(&crate::task_scheduler::woken_conversation_claim_key(
+                    edge.task,
+                ))
+                .unwrap()
+                .unwrap();
+            let claim: crate::task_scheduler::WokenConversationCancelClaim =
+                serde_json::from_slice(&claim.value).unwrap();
+            let key = format!(
+                "durable/unsafe-park-async/{}/{}/intent/receipt",
+                edge.task, claim.woken_attempt
+            )
+            .into_bytes();
+            let late = crate::async_task_tool::UnsafeDurableReceipt {
+                task_id: edge.task,
+                attempt_id: claim.woken_attempt,
+                outcome: Outcome::Succeeded("late result".into()),
+            };
+            store
+                .commit(
+                    &[durable_store::Check {
+                        key: key.clone(),
+                        expected: durable_store::Expected::Missing,
+                    }],
+                    &[durable_store::Mutation::Put {
+                        key: key.clone(),
+                        value: serde_json::to_vec(&late).unwrap(),
+                    }],
+                )
+                .unwrap();
+            drop(store);
+            std::fs::remove_file(dir.path().join("block-cancel")).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !dir.path().join("cancel-returned").exists() {
+                    assert!(resumed.try_wait().unwrap().is_none());
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            resumed.kill().unwrap();
+            resumed.wait().unwrap();
+            let mut reopened = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "conversation_claim_boundary_tests::nested_woken_evidence_worker",
+                ])
+                .env("PI_TEST_NESTED_WOKEN_DIR", dir.path())
+                .env("PI_TEST_NESTED_WOKEN_RESUME", "1")
+                .env("PI_TEST_WOKEN_REAL", "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    assert!(reopened.try_wait().unwrap().is_none());
+                    let store = durable_store::Store::open(&path).unwrap();
+                    let task = crate::task_store::TaskStore::new(&store)
+                        .load(edge.task)
+                        .unwrap()
+                        .unwrap();
+                    if task.task.is_terminal() {
+                        assert!(!matches!(task.task.state(), TaskState::Succeeded(_)));
+                        assert!(
+                            store
+                                .get(&crate::task_scheduler::woken_conversation_receipt_key(
+                                    edge.task
+                                ))
+                                .unwrap()
+                                .is_none()
+                        );
+                        assert_eq!(
+                            store.get(&key).unwrap().unwrap().value,
+                            serde_json::to_vec(&late).unwrap()
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("nested-cancelled")).unwrap(),
+                "called\n"
+            );
+            reopened.kill().unwrap();
+            reopened.wait().unwrap();
+            return;
+        }
+        if automatic == 1 {
+            let store = durable_store::Store::open(&path).unwrap();
+            let task_marker = format!("durable/task-callback-start/{}", edge.task);
+            let crate::task::TaskOwner::Task(ancestor) = edge.task_owner else {
+                unreachable!()
+            };
+            let ancestor_marker = format!("durable/task-callback-start/{ancestor}");
+            let markers = [
+                task_marker.into_bytes(),
+                ancestor_marker.into_bytes(),
+                crate::conversation_signal::callback_start_key(owned),
+            ];
+            let entries: Vec<_> = markers
+                .iter()
+                .map(|key| store.get(key).unwrap().unwrap())
+                .collect();
+            assert!(entries.iter().all(|entry| entry.value == entries[0].value));
+            let marker_commit = store
+                .commit_for_version(&markers[0], entries[0].version)
+                .unwrap()
+                .unwrap();
+            for (key, entry) in markers.iter().zip(&entries) {
+                assert_eq!(
+                    store.commit_for_version(key, entry.version).unwrap(),
+                    Some(marker_commit)
+                );
+            }
+            #[cfg(feature = "experimental-graph-revision")]
+            {
+                let manifest_key =
+                    crate::task_scheduler::woken_owned_callback_markers_key(edge.task);
+                let manifest = store.get(&manifest_key).unwrap().unwrap();
+                assert_eq!(
+                    store
+                        .commit_for_version(&manifest_key, manifest.version)
+                        .unwrap(),
+                    Some(marker_commit)
+                );
+            }
+            drop(store);
+            resumed.kill().unwrap();
+            resumed.wait().unwrap();
+            std::fs::remove_file(dir.path().join("block-cancel")).unwrap();
+            let mut reopened = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "conversation_claim_boundary_tests::nested_woken_evidence_worker",
+                ])
+                .env("PI_TEST_NESTED_WOKEN_DIR", dir.path())
+                .env("PI_TEST_NESTED_WOKEN_RESUME", "1")
+                .env("PI_TEST_WOKEN_REAL", "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    assert!(reopened.try_wait().unwrap().is_none());
+                    let store = durable_store::Store::open(&path).unwrap();
+                    let task = crate::task_store::TaskStore::new(&store)
+                        .load(edge.task)
+                        .unwrap()
+                        .unwrap();
+                    if task.task.is_terminal() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("nested-cancelled")).unwrap(),
+                "called\n"
+            );
+            let store = durable_store::Store::open(&path).unwrap();
+            for key in &markers {
+                assert!(store.get(key).unwrap().is_none());
+            }
+            assert!(
+                store
+                    .get(&crate::task_scheduler::woken_conversation_receipt_key(
+                        edge.task
+                    ))
+                    .unwrap()
+                    .is_none()
+            );
+            reopened.kill().unwrap();
+            reopened.wait().unwrap();
+            return;
+        }
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                assert!(resumed.try_wait().unwrap().is_none());
+                let store = durable_store::Store::open(&path).unwrap();
+                if store
+                    .get(&crate::task_scheduler::woken_conversation_receipt_key(
+                        edge.task,
+                    ))
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if automatic == 2 {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !dir.path().join("woken-receipt").exists() {
+                    assert!(resumed.try_wait().unwrap().is_none());
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        if automatic == 3 {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    assert!(resumed.try_wait().unwrap().is_none());
+                    let store = durable_store::Store::open(&path).unwrap();
+                    let task = crate::task_store::TaskStore::new(&store)
+                        .load(edge.task)
+                        .unwrap()
+                        .unwrap();
+                    if task.task.is_terminal() {
+                        assert!(matches!(task.task.state(), TaskState::Failed(_)));
+                        let receipt = store
+                            .get(&crate::task_scheduler::woken_conversation_receipt_key(
+                                edge.task,
+                            ))
+                            .unwrap()
+                            .unwrap();
+                        let saved: crate::task_scheduler::WokenConversationCancelReceipt =
+                            serde_json::from_slice(&receipt.value).unwrap();
+                        assert_eq!(saved.version, if selected { 2 } else { 1 });
+                        if selected {
+                            assert!(saved.after_result.is_some());
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("nested-cancelled")).unwrap(),
+                "called\n"
+            );
+            resumed.kill().unwrap();
+            resumed.wait().unwrap();
+            return;
+        }
+        resumed.kill().unwrap();
+        resumed.wait().unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        let receipt = store
+            .get(&crate::task_scheduler::woken_conversation_receipt_key(
+                edge.task,
+            ))
+            .unwrap()
+            .unwrap();
+        let saved: crate::task_scheduler::WokenConversationCancelReceipt =
+            serde_json::from_slice(&receipt.value).unwrap();
+        assert_eq!(saved.result, "callback returned");
+        assert_eq!(saved.version, if selected { 2 } else { 1 });
+        #[cfg(feature = "experimental-graph-revision")]
+        {
+            let receipt_key = crate::task_scheduler::woken_conversation_receipt_key(edge.task);
+            let retirement_key =
+                crate::task_scheduler::woken_owned_marker_retirement_key(edge.task);
+            let retirement = store.get(&retirement_key).unwrap().unwrap();
+            let receipt_commit = store
+                .commit_for_version(&receipt_key, receipt.version)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                store
+                    .commit_for_version(&retirement_key, retirement.version)
+                    .unwrap(),
+                Some(receipt_commit)
+            );
+        }
+        assert!(
+            store
+                .get(&crate::conversation_signal::callback_start_key(owned))
+                .unwrap()
+                .is_none()
+        );
+        let interrupted = saved.claim.woken_attempt;
+        let late_key = format!(
+            "durable/unsafe-park-async/{}/{interrupted}/intent/receipt",
+            edge.task
+        )
+        .into_bytes();
+        let late = crate::async_task_tool::UnsafeDurableReceipt {
+            task_id: edge.task,
+            attempt_id: interrupted,
+            outcome: Outcome::Succeeded("late result".into()),
+        };
+        store
+            .commit(
+                &[durable_store::Check {
+                    key: late_key.clone(),
+                    expected: durable_store::Expected::Missing,
+                }],
+                &[durable_store::Mutation::Put {
+                    key: late_key.clone(),
+                    value: serde_json::to_vec(&late).unwrap(),
+                }],
+            )
+            .unwrap();
+        drop(store);
+        let mut reopened = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conversation_claim_boundary_tests::nested_woken_evidence_worker",
+            ])
+            .env("PI_TEST_NESTED_WOKEN_DIR", dir.path())
+            .env("PI_TEST_NESTED_WOKEN_RESUME", "1")
+            .env("PI_TEST_WOKEN_REAL", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                assert!(reopened.try_wait().unwrap().is_none());
+                let store = durable_store::Store::open(&path).unwrap();
+                let task = crate::task_store::TaskStore::new(&store)
+                    .load(edge.task)
+                    .unwrap()
+                    .unwrap();
+                if task.task.is_terminal() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("nested-cancelled")).unwrap(),
+            "called\n"
+        );
+        reopened.kill().unwrap();
+        reopened.wait().unwrap();
+        let store = durable_store::Store::open(&path).unwrap();
+        assert_eq!(
+            store.get(&late_key).unwrap().unwrap().value,
+            serde_json::to_vec(&late).unwrap()
+        );
+        let child = crate::task_store::TaskStore::new(&store)
+            .load(edge.task)
+            .unwrap()
+            .unwrap();
+        assert!(!matches!(child.task.state(), TaskState::Succeeded(_)));
+        assert!(
+            store
+                .get(&crate::task_scheduler::woken_conversation_receipt_key(
+                    edge.task
+                ))
+                .unwrap()
+                .is_some()
+        );
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(resumed.try_wait().unwrap().is_none());
+            let store = durable_store::Store::open(&path).unwrap();
+            let task = crate::task_store::TaskStore::new(&store)
+                .load(edge.task)
+                .unwrap()
+                .unwrap();
+            if task.task.is_terminal() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!dir.path().join("nested-cancelled").exists());
+    assert!(!dir.path().join("child-after").exists());
+    resumed.kill().unwrap();
+    resumed.wait().unwrap();
+    let store = durable_store::Store::open(&path).unwrap();
+    let records = crate::task_store::TaskStore::new(&store).list().unwrap();
+    let child = records
+        .iter()
+        .find(|record| record.task.id() == edge.task)
+        .unwrap();
+    assert!(
+        store
+            .get(&crate::task_scheduler::woken_conversation_claim_key(
+                edge.task
+            ))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&crate::task_scheduler::woken_conversation_receipt_key(
+                edge.task
+            ))
+            .unwrap()
+            .is_none()
+    );
+    assert!(!matches!(child.task.state(), TaskState::Succeeded(_)));
+    drop(store);
+    let mut reopened = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "conversation_claim_boundary_tests::nested_woken_evidence_worker",
@@ -11132,10 +11660,46 @@ async fn nested_woken_with_owned_conversation_remains_fail_closed() {
         .spawn()
         .unwrap();
     tokio::time::sleep(Duration::from_millis(800)).await;
-    assert!(resumed.try_wait().unwrap().is_none());
+    assert!(reopened.try_wait().unwrap().is_none());
     assert!(!dir.path().join("nested-cancelled").exists());
-    resumed.kill().unwrap();
-    resumed.wait().unwrap();
+    assert!(!dir.path().join("child-after").exists());
+    reopened.kill().unwrap();
+    reopened.wait().unwrap();
+}
+
+#[cfg(all(unix, feature = "experimental-graph-revision"))]
+#[tokio::test]
+async fn nested_woken_owned_callback_kill_does_not_replay() {
+    exercise_nested_woken_owned_rejection(false, false, 1).await;
+    exercise_nested_woken_owned_rejection(true, false, 1).await;
+}
+
+#[cfg(all(unix, feature = "experimental-graph-revision"))]
+#[tokio::test]
+async fn nested_woken_owned_late_result_fences_callback_receipt() {
+    exercise_nested_woken_owned_rejection(false, false, 4).await;
+    exercise_nested_woken_owned_rejection(true, false, 4).await;
+}
+
+#[cfg(all(unix, feature = "experimental-graph-revision"))]
+#[tokio::test]
+async fn nested_woken_owned_graph_live_terminal_preserves_receipt() {
+    exercise_nested_woken_owned_rejection(false, false, 3).await;
+    exercise_nested_woken_owned_rejection(true, false, 3).await;
+}
+
+#[cfg(all(unix, feature = "experimental-graph-revision"))]
+#[tokio::test]
+async fn nested_woken_owned_graph_automatic_callback() {
+    exercise_nested_woken_owned_rejection(false, false, 2).await;
+    exercise_nested_woken_owned_rejection(true, false, 2).await;
+}
+
+#[cfg(all(unix, feature = "experimental-graph-revision"))]
+#[tokio::test]
+async fn nested_woken_owned_graph_mark_requires_ancestor_fence() {
+    exercise_nested_woken_owned_rejection(false, true, 0).await;
+    exercise_nested_woken_owned_rejection(true, true, 0).await;
 }
 
 #[cfg(unix)]

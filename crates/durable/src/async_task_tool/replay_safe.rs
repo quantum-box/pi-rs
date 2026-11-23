@@ -2053,11 +2053,7 @@ impl Handler for Executor {
                     )?;
                     let nested = matches!(task.owner(), crate::task::TaskOwner::Task(_));
                     #[cfg(feature = "experimental-graph-revision")]
-                    let (owned_ids, owned_leases) = if nested {
-                        (vec![], vec![])
-                    } else {
-                        admission.woken_owned_start_leases()?
-                    };
+                    let (owned_ids, owned_leases) = admission.woken_owned_start_leases()?;
                     #[cfg(not(feature = "experimental-graph-revision"))]
                     let (owned_ids, owned_leases): (
                         Vec<uuid::Uuid>,

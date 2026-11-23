@@ -101,11 +101,8 @@ pub(crate) fn changed_scope(
     current: &[(Vec<u8>, Vec<u8>)],
     changes: &[Change],
 ) -> Result<bool, ()> {
-    if root.is_nil()
-        || !current
-            .iter()
-            .any(|(key, _)| key.as_slice() == [TASK, root.as_bytes()].concat().as_slice())
-    {
+    let root_key = [TASK, root.as_bytes()].concat();
+    if root.is_nil() || !current.iter().any(|(key, _)| key == &root_key) {
         return Err(());
     }
     let mut edges = HashMap::new();
@@ -264,6 +261,33 @@ mod tests {
             Ok(false)
         );
     }
+    #[test]
+    fn full_history_distinguishes_unrelated_changes_from_owned_change() {
+        let root = Uuid::from_u128(1);
+        let root_task = task(root, Node::Conversation(Uuid::from_u128(2)));
+        let unrelated: Vec<_> = (10..4106)
+            .map(|id| {
+                task(
+                    Uuid::from_u128(id),
+                    Node::Conversation(Uuid::from_u128(id + 10000)),
+                )
+            })
+            .collect();
+        let mut current = vec![root_task];
+        current.extend(unrelated.iter().cloned());
+        let mut changes: Vec<_> = unrelated
+            .iter()
+            .map(|entry| change(entry, true, true))
+            .collect();
+        let start = std::time::Instant::now();
+        assert_eq!(changed_scope(root, &current, &changes), Ok(false));
+        let unrelated_duration = start.elapsed();
+        let owned = task(Uuid::from_u128(9000), Node::Task(root));
+        changes.push(change(&owned, false, true));
+        assert_eq!(changed_scope(root, &current, &changes), Ok(true));
+        eprintln!("4096 unrelated changes: {unrelated_duration:?}");
+    }
+
     #[test]
     fn malformed_values_fail_closed() {
         let root = Uuid::from_u128(1);
