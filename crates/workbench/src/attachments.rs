@@ -2,6 +2,7 @@
 use std::path::Path;
 
 use pi_rs::{Error, ImageContent, Result};
+use pi_rs_workbench::coding::{AttachmentContent, CodingTools};
 use pi_rs_workbench::image_profile::ImageResizeProfile;
 
 pub fn expand(
@@ -10,7 +11,7 @@ pub fn expand(
     auto_resize: bool,
     profile: Option<ImageResizeProfile>,
 ) -> Result<(String, Vec<ImageContent>)> {
-    let tools = pi_rs_workbench::coding::CodingTools::local(workspace)?
+    let tools = CodingTools::local(workspace)?
         .with_image_resize(auto_resize)
         .with_image_profile(profile);
     let mut files = String::new();
@@ -21,21 +22,23 @@ pub fn expand(
             messages.push(argument.as_str());
             continue;
         };
-        let path = tools.resolve_read_path(Path::new(path))?;
-        let metadata = path.metadata()?;
-        if metadata.is_file() && metadata.len() == 0 {
+        let Some(attachment) = tools.read_cli_attachment(workspace, path)? else {
             continue;
+        };
+        let name = attachment.name.to_string_lossy();
+        match attachment.content {
+            AttachmentContent::Text(content) => {
+                let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+                files.push_str(&format!("<file name=\"{name}\">\n{content}\n</file>\n"));
+            }
+            AttachmentContent::Image {
+                note,
+                images: attached,
+            } => {
+                files.push_str(&format!("<file name=\"{name}\">{note}</file>\n"));
+                images.extend(attached);
+            }
         }
-        let (content, attached) = tools.read_attachment_lossy(&path)?;
-        let name = path.to_string_lossy();
-        if attached.is_empty() {
-            let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-            files.push_str(&format!("<file name=\"{name}\">\n{content}\n</file>\n"));
-        } else {
-            let hints = if auto_resize { &content } else { "" };
-            files.push_str(&format!("<file name=\"{name}\">{hints}</file>\n"));
-        }
-        images.extend(attached);
         if files
             .len()
             .saturating_add(images.iter().map(|image| image.data.len()).sum::<usize>())
@@ -89,6 +92,60 @@ mod tests {
     }
 
     #[test]
+    fn attachment_tags_use_the_absolute_workspace_path() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "text").unwrap();
+        let (text, _) = expand(
+            &["@missing/../note.txt".into()],
+            directory.path(),
+            false,
+            None,
+        )
+        .unwrap();
+        let name = directory.path().join("note.txt");
+        assert_eq!(
+            text,
+            format!("<file name=\"{}\">\ntext\n</file>\n", name.display())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_tags_keep_symlink_names_for_text_and_images() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("note.txt"), "linked text").unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(source.join("target.png"))
+            .unwrap();
+        symlink("source", directory.path().join("linked")).unwrap();
+        symlink("linked/target.png", directory.path().join("image.png")).unwrap();
+
+        let (text, images) = expand(
+            &["@linked/note.txt".into(), "@image.png".into()],
+            directory.path(),
+            false,
+            None,
+        )
+        .unwrap();
+        let note = directory.path().join("linked/note.txt");
+        let image = directory.path().join("image.png");
+        assert_eq!(
+            text,
+            format!(
+                "<file name=\"{}\">\nlinked text\n</file>\n<file name=\"{}\"></file>\n",
+                note.display(),
+                image.display()
+            )
+        );
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+    }
+
+    #[test]
     fn empty_files_are_skipped_and_text_attachment_boms_are_removed() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("empty.md"), "").unwrap();
@@ -133,8 +190,14 @@ mod tests {
         .unwrap();
         let (text, images) = expand(&["@broken.png".into()], directory.path(), true, None).unwrap();
         assert!(images.is_empty());
-        assert!(text.contains("[Image omitted:"), "{text}");
-        assert!(!text.contains('\u{fffd}'));
+        let path = directory.path().join("broken.png");
+        assert_eq!(
+            text,
+            format!(
+                "<file name=\"{}\">[Image omitted: could not be resized below the inline image size limit.]</file>\n",
+                path.display()
+            )
+        );
     }
 
     #[test]
@@ -235,6 +298,26 @@ mod tests {
             )
             .unwrap();
             assert_eq!(images.len(), 1, "{format:?}: {text}");
+            let hint = if format == image::ImageFormat::Bmp {
+                "[Image converted from image/bmp to image/png.]"
+            } else {
+                ""
+            };
+            assert_eq!(
+                text,
+                format!("<file name=\"{}\">{hint}</file>\n", path.display())
+            );
+            if format == image::ImageFormat::Bmp {
+                let (original_text, original_images) = expand(
+                    &[format!("@{}", path.display())],
+                    directory.path(),
+                    false,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(original_text, text);
+                assert_eq!(original_images[0].mime_type, "image/png");
+            }
         }
     }
 
@@ -310,7 +393,9 @@ mod tests {
             .unwrap();
         assert_eq!(bytes, std::fs::read(&path).unwrap());
 
-        let (_, resized) = expand(&input, directory.path(), true, None).unwrap();
+        let (reference, resized) = expand(&input, directory.path(), true, None).unwrap();
+        assert!(reference.contains("[Image: original 2400x12, displayed at 2000x10."));
+        assert!(!reference.contains("Read image file"));
         assert_eq!(resized[0].mime_type, "image/png");
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&resized[0].data)

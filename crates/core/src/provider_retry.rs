@@ -33,8 +33,45 @@ impl ProviderRetry {
     /// Dropping the future also cancels any pending retry wait.
     pub async fn send<T, Attempt>(
         self,
-        mut attempt: impl FnMut() -> Attempt,
+        attempt: impl FnMut() -> Attempt,
         response_info: impl Fn(&T) -> (u16, &HeaderMap),
+    ) -> Result<T>
+    where
+        Attempt: Future<Output = Result<T>>,
+    {
+        self.send_with_policy(
+            attempt,
+            |value| {
+                let (status, headers) = response_info(value);
+                (status, Some(headers))
+            },
+            true,
+        )
+        .await
+    }
+
+    /// Retry only HTTP statuses for a provider whose API errors expose no headers.
+    pub async fn send_status_only<T, Attempt>(
+        self,
+        attempt: impl FnMut() -> Attempt,
+        response_status: impl Fn(&T) -> u16,
+    ) -> Result<T>
+    where
+        Attempt: Future<Output = Result<T>>,
+    {
+        Self {
+            timeout: None,
+            ..self
+        }
+        .send_with_policy(attempt, |value| (response_status(value), None), false)
+        .await
+    }
+
+    async fn send_with_policy<T, Attempt>(
+        self,
+        mut attempt: impl FnMut() -> Attempt,
+        response_info: impl Fn(&T) -> (u16, Option<&HeaderMap>),
+        retry_transport_errors: bool,
     ) -> Result<T>
     where
         Attempt: Future<Output = Result<T>>,
@@ -57,9 +94,12 @@ impl ProviderRetry {
                     if (200..300).contains(&status) || !retryable_status(status, headers) {
                         return response;
                     }
-                    self.delay(headers, index, Utc::now())?
+                    match headers {
+                        Some(headers) => self.delay(headers, index, Utc::now())?,
+                        None => fallback_delay(index),
+                    }
                 }
-                Err(Error::RetryableModel(_)) => fallback_delay(index),
+                Err(Error::RetryableModel(_)) if retry_transport_errors => fallback_delay(index),
                 Err(_) => return response,
             };
             drop(response);
@@ -82,6 +122,34 @@ impl ProviderRetry {
         let Some(delay) = delay else {
             return Ok(fallback_delay(index));
         };
+        self.validate_delay(delay)
+    }
+
+    /// Codex SSE uses whole numeric values and a one-second exponential backoff.
+    pub fn codex_sse_delay(self, headers: Option<&HeaderMap>, attempt: u32) -> Result<Duration> {
+        let delay = headers.and_then(|headers| {
+            let header = |name| {
+                let mut values = headers.get_all(name).iter();
+                let value = values.next()?.to_str().ok()?;
+                values.next().is_none().then_some(value)
+            };
+            header("retry-after-ms").and_then(whole_number).or_else(|| {
+                let value = header("retry-after").filter(|value| !value.is_empty())?;
+                whole_number(value).map_or_else(
+                    || http_date(value).map(|date| (date - Utc::now()).num_milliseconds() as f64),
+                    |seconds| Some(seconds * 1000.0),
+                )
+            })
+        });
+        match delay.filter(|delay| delay.is_finite()) {
+            Some(delay) => self.validate_delay(delay),
+            None => Ok(Duration::from_secs(
+                1u64.checked_shl(attempt).unwrap_or(u64::MAX),
+            )),
+        }
+    }
+
+    fn validate_delay(self, delay: f64) -> Result<Duration> {
         if self.max_retry_delay_ms > 0 && delay > self.max_retry_delay_ms as f64 {
             let limit = Duration::from_millis(self.max_retry_delay_ms)
                 .as_secs_f64()
@@ -96,8 +164,8 @@ impl ProviderRetry {
     }
 }
 
-fn retryable_status(status: u16, headers: &HeaderMap) -> bool {
-    match retry_header(headers, "x-should-retry") {
+fn retryable_status(status: u16, headers: Option<&HeaderMap>) -> bool {
+    match headers.and_then(|headers| retry_header(headers, "x-should-retry")) {
         Some("true") => true,
         Some("false") => false,
         _ => matches!(status, 408 | 409 | 429 | 500..),
@@ -126,6 +194,27 @@ fn number_prefix(value: &str) -> Option<f64> {
         .parse::<f64>()
         .ok()
         .filter(|value| value.is_finite())
+}
+
+fn whole_number(value: &str) -> Option<f64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(0.0);
+    }
+    for (prefix, radix) in [("0x", 16), ("0o", 8), ("0b", 2)] {
+        if let Some(digits) = value
+            .strip_prefix(prefix)
+            .or_else(|| value.strip_prefix(&prefix.to_ascii_uppercase()))
+        {
+            return u64::from_str_radix(digits, radix)
+                .ok()
+                .map(|number| number as f64);
+        }
+    }
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())
 }
 
 fn http_date(value: &str) -> Option<DateTime<Utc>> {
@@ -206,6 +295,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status.0, 429);
+    }
+
+    #[test]
+    fn codex_delays_require_a_whole_number_and_use_one_second_backoff() {
+        let policy = ProviderRetry::default();
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after-ms", HeaderValue::from_static("3ms"));
+        assert_eq!(
+            policy.codex_sse_delay(Some(&headers), 0).unwrap(),
+            Duration::from_secs(1)
+        );
+        headers.insert("retry-after", HeaderValue::from_static("0.002"));
+        assert_eq!(
+            policy.codex_sse_delay(Some(&headers), 2).unwrap(),
+            Duration::from_millis(2)
+        );
+        headers.insert("retry-after-ms", HeaderValue::from_static("0"));
+        assert_eq!(
+            policy.codex_sse_delay(Some(&headers), 3).unwrap(),
+            Duration::ZERO
+        );
+        assert_eq!(
+            policy.codex_sse_delay(None, 3).unwrap(),
+            Duration::from_secs(8)
+        );
     }
 
     #[test]
