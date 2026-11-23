@@ -2028,7 +2028,8 @@ image policy. The model still receives distinct structured content alongside
 text blocks. Embedded non-image binary resources are written to private
 temporary files for the native CLI's local read tool. Repeated projections reuse
 a file, with native process limits on file count and total bytes. The CLI cleans
-up its temporary files on normal shutdown. Formats marked as
+up its temporary files on normal shutdown. Text beyond 20 KiB keeps the beginning
+and end at UTF-8 boundaries and links to the full output file. Formats marked as
 images that the provider cannot attach stay subject to the native image policy.
 
 Programmatic shell calls return output,

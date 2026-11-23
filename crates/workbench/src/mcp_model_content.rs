@@ -16,17 +16,18 @@ use sha2::{Digest, Sha256};
 
 // MCP tools use the core tool output limit. A projected payload must fit it too.
 const MAX_MODEL_CONTENT_BYTES: usize = 1024 * 1024;
-const MAX_BINARY_FILES: usize = 64;
-const MAX_BINARY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_OUTPUT_FILES: usize = 64;
+const TEXT_PREVIEW_BYTES: usize = 20 * 1024;
+const MAX_OUTPUT_FILE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Default)]
-struct BinaryOutputs {
+struct ResourceOutputs {
     directory: Option<tempfile::TempDir>,
     files: BTreeMap<([u8; 32], String), PathBuf>,
     bytes: usize,
 }
 
-impl BinaryOutputs {
+impl ResourceOutputs {
     fn save(&mut self, data: &[u8], extension: &str) -> io::Result<PathBuf> {
         let key = (Sha256::digest(data).into(), extension.to_owned());
         if let Some(path) = self.files.get(&key).filter(|path| path.is_file()) {
@@ -34,9 +35,10 @@ impl BinaryOutputs {
         }
         let new = !self.files.contains_key(&key);
         if new
-            && (self.files.len() >= MAX_BINARY_FILES || self.bytes + data.len() > MAX_BINARY_BYTES)
+            && (self.files.len() >= MAX_OUTPUT_FILES
+                || self.bytes + data.len() > MAX_OUTPUT_FILE_BYTES)
         {
-            return Err(io::Error::other("native MCP binary output limit reached"));
+            return Err(io::Error::other("native MCP output file limit reached"));
         }
         let directory = match &self.directory {
             Some(directory) => directory,
@@ -59,20 +61,20 @@ impl BinaryOutputs {
 }
 
 // Estimation and dispatch can project the same history repeatedly.
-static BINARY_OUTPUTS: OnceLock<Mutex<BinaryOutputs>> = OnceLock::new();
+static RESOURCE_OUTPUTS: OnceLock<Mutex<ResourceOutputs>> = OnceLock::new();
 
-pub(super) fn cleanup_binary_outputs() {
-    if let Some(outputs) = BINARY_OUTPUTS.get() {
+pub(super) fn cleanup_output_files() {
+    if let Some(outputs) = RESOURCE_OUTPUTS.get() {
         let mut outputs = outputs.lock().unwrap_or_else(|error| error.into_inner());
-        *outputs = BinaryOutputs::default();
+        *outputs = ResourceOutputs::default();
     }
 }
 
-fn save_binary(data: &[u8], extension: &str) -> io::Result<PathBuf> {
-    BINARY_OUTPUTS
+fn save_output_file(data: &[u8], extension: &str) -> io::Result<PathBuf> {
+    RESOURCE_OUTPUTS
         .get_or_init(Mutex::default)
         .lock()
-        .map_err(|_| io::Error::other("MCP binary output store unavailable"))?
+        .map_err(|_| io::Error::other("MCP output file store unavailable"))?
         .save(data, extension)
 }
 
@@ -200,18 +202,46 @@ fn project_result(
     });
     if let Some(data) = distinct_data {
         projected.push(text(serde_json::to_string_pretty(data).ok()?));
-        let (output, structured) = encode_blocks(&projected);
-        if output.len() <= MAX_MODEL_CONTENT_BYTES {
-            return Some((output, structured));
-        }
-        *projected.last_mut().expect("structured content added") = text(data.to_string());
     }
+    limit_text_preview(&mut projected);
     let (output, structured) = encode_blocks(&projected);
     Some(if output.len() <= MAX_MODEL_CONTENT_BYTES {
         (output, structured)
     } else {
         encode_limited_blocks(&projected)
     })
+}
+
+fn limit_text_preview(projected: &mut Vec<Value>) {
+    let full = joined_text(projected);
+    if full.len() <= TEXT_PREVIEW_BYTES {
+        return;
+    }
+    let mut head = TEXT_PREVIEW_BYTES / 2;
+    let mut tail = full.len() - TEXT_PREVIEW_BYTES / 2;
+    while !full.is_char_boundary(head) {
+        head -= 1;
+    }
+    while !full.is_char_boundary(tail) {
+        tail += 1;
+    }
+    let tokens = full.len().div_ceil(4);
+    let total_lines = full.lines().count();
+    let removed = full[head..tail].chars().count();
+    let location = match save_output_file(full.as_bytes(), ".txt") {
+        Ok(path) => format!(
+            "[Full output: {} (read it with offset/limit)]",
+            path.display()
+        ),
+        Err(error) => format!("[Could not save the full output: {error}]"),
+    };
+    let preview = format!(
+        "Warning: truncated output (original token count: {tokens})\nTotal output lines: {total_lines}\n\n{}…{removed} chars truncated…{}\n\n{location}",
+        &full[..head],
+        &full[tail..]
+    );
+    projected.retain(|block| block["type"] != "text");
+    projected.insert(0, text(preview));
 }
 
 fn encode_limited_blocks(projected: &[Value]) -> (String, bool) {
@@ -346,7 +376,7 @@ fn binary_resource(uri: &str, mime: &str, blob: &str) -> Value {
     };
     if blob.len() > MAX_MODEL_CONTENT_BYTES {
         return text(format!(
-            "[Binary resource {uri} ({mime}) could not be saved: native MCP binary output limit reached]"
+            "[Binary resource {uri} ({mime}) could not be saved: native MCP output file limit reached]"
         ));
     }
     let Ok(data) = decode_blob(blob) else {
@@ -356,7 +386,7 @@ fn binary_resource(uri: &str, mime: &str, blob: &str) -> Value {
     };
     let size = format_size(data.len() as u64);
     let extension = resource_extension(uri);
-    match save_binary(&data, &extension) {
+    match save_output_file(&data, &extension) {
         Ok(path) => text(format!(
             "[Binary resource {uri} ({mime}, {size}) saved to {}]",
             path.display()
@@ -577,8 +607,19 @@ mod tests {
         }));
         let (output, structured) = project_result(&original, "fixture", "get", None).unwrap();
         assert!(!structured);
-        assert_eq!(output, format!("notes\n{data}"));
-        assert!(output.len() <= MAX_MODEL_CONTENT_BYTES);
+        assert!(output.contains("notes\n"));
+        assert!(output.contains("Warning: truncated output"));
+        assert!(output.len() < TEXT_PREVIEW_BYTES + 1024);
+        let path = output
+            .split_once("[Full output: ")
+            .unwrap()
+            .1
+            .strip_suffix(" (read it with offset/limit)]")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            format!("notes\n{}", serde_json::to_string_pretty(&data).unwrap())
+        );
     }
 
     #[test]
@@ -609,7 +650,7 @@ mod tests {
         assert!(structured);
         assert!(projected.len() <= MAX_MODEL_CONTENT_BYTES);
         let (text, images) = pi_rs::extract_tool_images(projected);
-        assert!(text.contains("MCP text truncated"));
+        assert!(text.contains("Warning: truncated output"));
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].data, "YQ==");
     }
@@ -624,7 +665,7 @@ mod tests {
             resource_extension("mock://example/../../a.unusual-extension"),
             ".bin"
         );
-        let mut outputs = BinaryOutputs::default();
+        let mut outputs = ResourceOutputs::default();
         let file = outputs.save(b"hello", ".pdf").unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), b"hello");
         assert_eq!(outputs.save(b"hello", ".pdf").unwrap(), file);
@@ -634,7 +675,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(file.metadata().unwrap().permissions().mode() & 0o077, 0);
         }
-        outputs.bytes = MAX_BINARY_BYTES;
+        outputs.bytes = MAX_OUTPUT_FILE_BYTES;
         assert!(outputs.save(b"new", ".pdf").is_err());
         drop(outputs);
         assert!(!file.exists());
