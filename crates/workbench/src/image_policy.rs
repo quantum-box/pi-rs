@@ -875,18 +875,36 @@ fn remove_images(messages: &mut [Message], user_placeholder: &str, tool_placehol
 
 fn remove_tool_images(content: &str, placeholder: &str) -> Option<String> {
     let mut result: Value = serde_json::from_str(content).ok()?;
-    let blocks = result.get_mut("data")?.get_mut("content")?.as_array_mut()?;
+    let data = result.get_mut("data")?;
+    let resource_read = data.get("content").is_none() && data["contents"].is_array();
+    let key = if resource_read { "contents" } else { "content" };
+    let blocks = data.get_mut(key)?.as_array_mut()?;
     let mut previous_placeholder = false;
     let mut changed = false;
     blocks.retain_mut(|block| {
-        if block["type"] == "image" {
+        let resource = if resource_read {
+            &*block
+        } else {
+            &block["resource"]
+        };
+        let embedded_image = (resource_read || block["type"] == "resource")
+            && resource["blob"].is_string()
+            && resource["mimeType"]
+                .as_str()
+                .is_some_and(|mime| mime.starts_with("image/"));
+        if block["type"] == "image" || embedded_image {
             changed = true;
             if previous_placeholder {
                 return false;
             }
-            *block = json!({"type":"text","text":placeholder});
+            *block = if resource_read {
+                json!({"uri":resource["uri"],"text":placeholder})
+            } else {
+                json!({"type":"text","text":placeholder})
+            };
         }
-        previous_placeholder = block["type"] == "text" && block["text"] == placeholder;
+        previous_placeholder =
+            (resource_read || block["type"] == "text") && block["text"] == placeholder;
         true
     });
     changed.then(|| result.to_string())
@@ -1592,6 +1610,29 @@ mod tests {
             serde_json::from_str::<Value>(content).unwrap()["data"]["content"],
             json!([{"type":"text","text":"before"},{"type":"text","text":BLOCKED_IMAGE},{"type":"text","text":"after"}]),
         );
+    }
+
+    #[test]
+    fn image_policy_redacts_fallback_mcp_resource_envelopes() {
+        let resource = json!({"uri":"mock://fixture","mimeType":"image/png","blob":"YQ=="});
+        let envelopes = [
+            json!({"data":{"content":[{"type":"resource","resource":resource}]}}),
+            json!({"data":{"contents":[resource]}}),
+        ];
+        for original in envelopes {
+            let mut messages = [Message::Tool {
+                call_id: "fixture".into(),
+                content: original.to_string(),
+                is_error: false,
+                is_structured: Some(true),
+            }];
+            remove_images(&mut messages, BLOCKED_IMAGE, BLOCKED_IMAGE);
+            let Message::Tool { content, .. } = &messages[0] else {
+                panic!("expected tool result");
+            };
+            assert!(content.contains(BLOCKED_IMAGE));
+            assert!(!content.contains("YQ=="));
+        }
     }
 
     #[test]

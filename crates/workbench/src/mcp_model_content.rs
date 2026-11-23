@@ -74,107 +74,121 @@ fn project_result(
     {
         resources
             .iter()
-            .map(|resource| {
-                project_block(
-                    &json!({"type":"resource","resource":resource}),
-                    server,
-                    read_tool,
-                )
-            })
-            .collect::<Option<Vec<_>>>()?
-    } else if let Some(blocks) = response["content"]
-        .as_array()
-        .filter(|blocks| !blocks.is_empty())
-    {
+            .map(|resource| project_resource(resource))
+            .collect::<Vec<_>>()
+    } else {
+        let blocks = response["content"].as_array()?;
         blocks
             .iter()
             .map(|block| project_block(block, server, read_tool))
-            .collect::<Option<Vec<_>>>()?
-    } else if response["content"].is_array() {
-        match response.get("structuredContent") {
-            Some(structured) => vec![text(serde_json::to_string_pretty(structured).ok()?)],
-            None => Vec::new(),
-        }
-    } else {
-        return None;
+            .collect()
     };
+    if let Some(data) = response.get("structuredContent")
+        && !projected.iter().any(|block| {
+            block["text"]
+                .as_str()
+                .and_then(|body| serde_json::from_str::<Value>(body).ok())
+                .as_ref()
+                == Some(data)
+        })
+    {
+        projected.push(text(serde_json::to_string_pretty(data).ok()?));
+    }
     let mut text_content = joined_text(&projected);
     if text_content.is_empty() && response["isError"] == true {
         text_content = format!("MCP tool {server}/{tool} returned an error");
         projected.push(text(&text_content));
     }
-    let has_images = projected.iter().any(|block| block["type"] == "image");
-    let output = if has_images {
+    let has_structured_blocks = projected.iter().any(|block| block["type"] != "text");
+    let output = if has_structured_blocks {
         // Provider adapters recognize images in the native structured tool envelope.
         json!({"data":{"content":projected},"attachments":[]}).to_string()
     } else {
         text_content
     };
-    (output.len() <= MAX_MODEL_CONTENT_BYTES).then_some((output, has_images))
+    (output.len() <= MAX_MODEL_CONTENT_BYTES).then_some((output, has_structured_blocks))
 }
 
-fn project_block(block: &Value, server: &str, read_tool: Option<&str>) -> Option<Value> {
-    match block["type"].as_str()? {
-        "text" => Some(text(block["text"].as_str()?)),
-        "image" => valid_image(block["data"].as_str()?, block["mimeType"].as_str()?),
-        "audio" => Some(text(format!(
-            "[audio {} omitted]",
-            block["mimeType"].as_str()?
-        ))),
-        "resource" => {
-            let resource = &block["resource"];
-            if let Some(content) = resource["text"].as_str() {
-                return Some(text(content));
-            }
-            let mime = resource["mimeType"].as_str().unwrap_or_default();
-            let blob = resource["blob"].as_str()?;
-            if mime.starts_with("image/") {
-                return valid_image(blob, mime);
-            }
-            let media = mime.split(';').next()?.trim().to_ascii_lowercase();
-            if media.starts_with("text/")
-                || media == "application/json"
-                || media.ends_with("+json")
-                || media.ends_with("+xml")
-            {
-                let decoded = STANDARD
-                    .decode(blob)
-                    .or_else(|_| STANDARD_NO_PAD.decode(blob))
-                    .ok()?;
-                return Some(text(String::from_utf8_lossy(&decoded)));
-            }
-            // Keep the native envelope for binary resources until a readable file
-            // can be offered. Their data remains available where it was before.
-            None
+fn project_block(block: &Value, server: &str, read_tool: Option<&str>) -> Value {
+    match block["type"].as_str() {
+        Some("text") => block.clone(),
+        Some("image") => block["data"]
+            .as_str()
+            .zip(block["mimeType"].as_str())
+            .map_or_else(
+                || text("[invalid image omitted]"),
+                |(data, mime)| valid_image(data, mime),
+            ),
+        Some("audio") => {
+            let mime = block["mimeType"].as_str().unwrap_or("unknown type");
+            text(format!("[audio {mime} omitted]"))
         }
-        "resource_link" => {
-            let uri = block["uri"].as_str()?;
-            let title = block["title"].as_str().or_else(|| block["name"].as_str())?;
-            let mut details = Vec::new();
-            if let Some(mime) = block["mimeType"].as_str().filter(|mime| !mime.is_empty()) {
-                details.push(mime.to_owned());
-            }
-            if let Some(size) = block["size"].as_u64() {
-                details.push(format_size(size));
-            }
-            let details = if details.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", details.join(", "))
-            };
-            let description = block["description"]
-                .as_str()
-                .filter(|description| !description.is_empty())
-                .map_or_else(String::new, |description| format!(": {description}"));
-            let read = read_tool.map_or_else(String::new, |tool| {
-                format!(". Read it with {tool} (server \"{server}\")")
-            });
-            Some(text(format!(
-                "[Resource {uri} \"{title}\"{details}{description}{read}]"
-            )))
+        Some("resource") => project_resource(&block["resource"]),
+        Some("resource_link") => {
+            resource_link(block, server, read_tool).unwrap_or_else(|| block.clone())
         }
-        kind => Some(text(format!("[unsupported MCP content {kind}]"))),
+        kind => text(format!(
+            "[unsupported MCP content {}]",
+            kind.unwrap_or("unknown")
+        )),
     }
+}
+
+fn project_resource(resource: &Value) -> Value {
+    if let Some(content) = resource["text"].as_str() {
+        return text(content);
+    }
+    let mime = resource["mimeType"].as_str().unwrap_or_default();
+    if let Some(blob) = resource["blob"].as_str() {
+        if mime.starts_with("image/") {
+            return valid_image(blob, mime);
+        }
+        let media = mime
+            .split_once(';')
+            .map_or(mime, |(media, _)| media)
+            .trim()
+            .to_ascii_lowercase();
+        if (media.starts_with("text/")
+            || media == "application/json"
+            || media.ends_with("+json")
+            || media.ends_with("+xml"))
+            && let Ok(decoded) = STANDARD
+                .decode(blob)
+                .or_else(|_| STANDARD_NO_PAD.decode(blob))
+        {
+            return text(String::from_utf8_lossy(&decoded));
+        }
+    }
+    // Preserve the payload for native consumers until a readable file can be offered.
+    json!({"type":"resource","resource":resource})
+}
+
+fn resource_link(block: &Value, server: &str, read_tool: Option<&str>) -> Option<Value> {
+    let uri = block["uri"].as_str()?;
+    let title = block["title"].as_str().or_else(|| block["name"].as_str())?;
+    let mut details = Vec::new();
+    if let Some(mime) = block["mimeType"].as_str().filter(|mime| !mime.is_empty()) {
+        details.push(mime.to_owned());
+    }
+    if let Some(size) = block["size"].as_u64() {
+        details.push(format_size(size));
+    }
+    let details = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", details.join(", "))
+    };
+    let description = block["description"]
+        .as_str()
+        .filter(|description| !description.is_empty())
+        .map_or_else(String::new, |description| format!(": {description}"));
+    let read = read_tool.map_or_else(
+        String::new,
+        |tool| format!(". Read it with {tool} (server "{server}")"),
+    );
+    Some(text(
+        format!("[Resource {uri} "{title}"{details}{description}{read}]"),
+    ))
 }
 
 fn text(content: impl AsRef<str>) -> Value {
@@ -189,13 +203,18 @@ fn joined_text(blocks: &[Value]) -> String {
         .join("\n")
 }
 
-fn valid_image(data: &str, mime_type: &str) -> Option<Value> {
+fn valid_image(data: &str, mime_type: &str) -> Value {
     let image = ImageContent {
         data: data.into(),
         mime_type: mime_type.into(),
     };
-    image.validate().ok()?;
-    Some(json!({"type":"image","data":image.data,"mimeType":image.mime_type}))
+    if image.validate().is_ok() {
+        json!({"type":"image","data":image.data,"mimeType":image.mime_type})
+    } else {
+        text(format!(
+            "[unsupported or invalid image {mime_type} omitted]"
+        ))
+    }
 }
 
 fn format_size(bytes: u64) -> String {
@@ -259,7 +278,7 @@ mod tests {
         assert_eq!(request.messages[2], original.messages[2]);
         assert_eq!(request.messages[1], Message::Tool {
             call_id: "mcp".into(),
-            content: "hello\n[Resource mock://notes \"Notes\" (text/plain, 2.0KB): Read me. Read it with mcp__fixture__read_resource (server \"fixture\")]\n[audio audio/wav omitted]".into(),
+            content: "hello\n[Resource mock://notes \"Notes\" (text/plain, 2.0KB): Read me. Read it with mcp__fixture__read_resource (server \"fixture\")]\n[audio audio/wav omitted]\n{\n  \"internal\": \"raw result retained\"\n}".into(),
             is_error: false,
             is_structured: Some(false),
         });
@@ -294,7 +313,10 @@ mod tests {
         let binary = tool_content(json!({"content":[{"type":"resource","resource":{
             "uri":"mock://binary","mimeType":"application/octet-stream","blob":"YQ==",
         }}]}));
-        assert_eq!(project_result(&binary, "fixture", "get", None), None);
+        assert_eq!(
+            project_result(&binary, "fixture", "get", None),
+            Some((binary.clone(), true))
+        );
         let read = tool_content(json!({"contents":[{"uri":"mock://notes","text":"contents"}]}));
         assert_eq!(
             project_result(&read, "fixture", "read_resource", None),

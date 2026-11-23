@@ -2023,8 +2023,9 @@ a tool error. Connection and transport failures reject the script's call.
 The client's tool result omits the server's top-level `_meta`. Direct calls
 send text, embedded text resources, and resource links in the model-facing view.
 Embedded images use the provider's existing image path and respect the active
-image policy. For binary resources, the native envelope remains available
-while exporting the payload as a readable file remains open.
+image policy. The model still receives distinct structured content alongside
+text blocks. Binary resources stay in the native envelope until exporting
+the payload as a readable file is supported.
 
 Programmatic shell calls return output,
 exit status, truncation and elapsed time, including nonzero exit statuses.
