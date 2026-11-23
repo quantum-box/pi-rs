@@ -6149,7 +6149,8 @@ mod estimation_tests {
         let Client::Deferred(deferred) = &client else {
             unreachable!()
         };
-        assert!(deferred.estimation_client().is_some());
+        let _ = deferred.estimation_client();
+        assert!(deferred.estimator.get().is_some());
 
         std::fs::write(&path, r#"{"transport":"sse","httpIdleTimeoutMs":200}"#).unwrap();
         client.update_codex_transport(&load());
