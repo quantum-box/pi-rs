@@ -507,6 +507,85 @@ impl Deferred {
         &self,
         auth_path: &std::path::Path,
     ) -> Result<(Client, HeaderMap)> {
+        let (client, headers) = match &self.credential {
+            Some(Credential::AnthropicFederation(federation)) => {
+                self.connect_anthropic_federation(federation).await?
+            }
+            _ => self.connect_at(auth_path).await?,
+        };
+        let mut client = client
+            .with_headers(headers.clone())
+            .with_context_probes(self.probe_context);
+        match (&self.credential, &mut client) {
+            (Some(Credential::BedrockProfile(profile)), Client::Bedrock(bedrock)) => {
+                *bedrock = bedrock.clone().with_profile(profile.clone());
+            }
+            (Some(Credential::BedrockChain), Client::Bedrock(bedrock)) => {
+                *bedrock = bedrock.clone().with_credential_chain();
+            }
+            _ => {}
+        }
+        if let Some(settings) = &self.http_settings {
+            client = client.with_http_settings_and_env(settings, self.headers.environment())?;
+        }
+        if let Some((args, reported)) = &self.options {
+            client = client.with_model_options(args, *reported)?;
+        }
+        if self.disable_message_thread_continuation {
+            client = client.without_message_thread_continuation();
+        }
+        Ok((
+            if self.observed {
+                client.observe()
+            } else {
+                client
+            },
+            headers,
+        ))
+    }
+
+    async fn connect_anthropic_federation(
+        &self,
+        federation: &Arc<super::anthropic_federation::Federation>,
+    ) -> Result<(Client, HeaderMap)> {
+        if self.provider != Provider::Anthropic
+            || self.adapter != Adapter::Anthropic
+            || self.endpoint != Provider::Anthropic.default_endpoint()
+        {
+            return Err(Error::Config(
+                "Anthropic workload identity requires the official Messages endpoint".into(),
+            ));
+        }
+        let (headers, explicit) = self.headers.resolve_anthropic_auth().await?;
+        if let Some(name) = explicit {
+            let client = Anthropic::with_authentication_header(
+                &self.endpoint,
+                name.clone(),
+                &headers[&name],
+            )?;
+            return Ok((Client::Anthropic(client), headers));
+        }
+        let fallback;
+        let settings = if let Some(settings) = &self.http_settings {
+            settings
+        } else {
+            fallback = super::config::Settings::load(&std::env::current_dir()?, false)?;
+            &fallback
+        };
+        let token = federation.access(settings).await?;
+        let headers = self
+            .headers
+            .authenticate(headers, &self.provider, Some(&token))?;
+        let federation = Arc::clone(federation);
+        let submitted = token.clone();
+        let client = Anthropic::with_federated_token(&self.endpoint, &token, move || {
+            federation.invalidate(&submitted);
+        })?;
+        Ok((Client::Anthropic(client), headers))
+    }
+
+    async fn connect_at(&self, auth_path: &std::path::Path) -> Result<(Client, HeaderMap)> {
+        let mut endpoint = self.endpoint.clone();
         let token = match &self.credential {
             Some(Credential::BedrockProfile(_) | Credential::BedrockChain) => None,
             Some(Credential::AnthropicOAuth) if self.http_settings.is_some() => Some(
@@ -533,7 +612,11 @@ impl Deferred {
                     Some(settings) => settings.clone(),
                     None => super::config::Settings::load(&std::env::current_dir()?, false)?,
                 };
-                Some(super::copilot_auth::access_for_path(auth_path, &settings, None, false).await?)
+                let credential =
+                    super::copilot_auth::credential_for_path(auth_path, &settings, None, false)
+                        .await?;
+                endpoint = super::copilot_auth::routed_endpoint(&endpoint, &credential)?;
+                Some(credential.access)
             }
             Some(Credential::Kimi) if self.http_settings.is_some() => Some(
                 super::kimi_auth::access(
@@ -582,53 +665,23 @@ impl Deferred {
                 radius_checked = true;
             }
         }
-        let endpoint = match &self.credential {
-            Some(Credential::VertexAdc(adc)) => {
-                if !headers.contains_key("x-goog-user-project")
-                    && let Some(quota) = adc.quota_project()
-                    && let Ok(value) = reqwest::header::HeaderValue::from_str(&quota)
-                {
-                    headers.insert("x-goog-user-project", value);
-                }
-                adc.endpoint.clone()
+        if let Some(Credential::VertexAdc(adc)) = &self.credential {
+            if !headers.contains_key("x-goog-user-project")
+                && let Some(quota) = adc.quota_project()
+                && let Ok(value) = reqwest::header::HeaderValue::from_str(&quota)
+            {
+                headers.insert("x-goog-user-project", value);
             }
-            Some(Credential::Copilot) => super::copilot_auth::routed_endpoint(
-                &self.endpoint,
-                token.as_deref().expect("resolved Copilot access"),
-            )?,
-            _ => self.endpoint.clone(),
-        };
-        let mut client = self
-            .provider
-            .connect_prechecked(self.adapter, &endpoint, token, auth, radius_checked)?
-            .with_headers(headers.clone())
-            .with_context_probes(self.probe_context);
-        match (&self.credential, &mut client) {
-            (Some(Credential::BedrockProfile(profile)), Client::Bedrock(bedrock)) => {
-                *bedrock = bedrock.clone().with_profile(profile.clone());
-            }
-            (Some(Credential::BedrockChain), Client::Bedrock(bedrock)) => {
-                *bedrock = bedrock.clone().with_credential_chain();
-            }
-            _ => {}
+            endpoint = adc.endpoint.clone();
         }
-        if let Some(settings) = &self.http_settings {
-            client = client.with_http_settings_and_env(settings, self.headers.environment())?;
-        }
-        if let Some((args, reported)) = &self.options {
-            client = client.with_model_options(args, *reported)?;
-        }
-        if self.disable_message_thread_continuation {
-            client = client.without_message_thread_continuation();
-        }
-        Ok((
-            if self.observed {
-                client.observe()
-            } else {
-                client
-            },
-            headers,
-        ))
+        let client = self.provider.connect_prechecked(
+            self.adapter,
+            &endpoint,
+            token,
+            auth,
+            radius_checked,
+        )?;
+        Ok((client, headers))
     }
 }
 
@@ -806,14 +859,19 @@ impl Client {
                     .with_http_options(timeout, &proxies)?
                     .with_provider_retry(retry),
             ),
-            Self::Google(client) => Self::Google(client.with_http_options(timeout, &proxies)?),
+            Self::Google(client) => Self::Google(
+                client
+                    .with_http_options(timeout, &proxies)?
+                    .with_provider_retry(retry),
+            ),
             Self::PiMessages(client) => {
                 Self::PiMessages(client.with_http_options(timeout, &proxies)?)
             }
             Self::OpenAi(client) => Self::OpenAi(
                 client
                     .with_http_options(timeout, &proxies)?
-                    .with_provider_retry(retry),
+                    .with_provider_retry(retry)
+                    .with_websocket_connect_timeout(settings.websocket_connect_timeout()),
             ),
             Self::Bedrock(_) => unreachable!("Bedrock handled above"),
             Self::Deferred(mut client) => {
@@ -821,6 +879,37 @@ impl Client {
                 Self::Deferred(client)
             }
         })
+    }
+
+    pub(super) fn uses_tool_transcript(&self, model: &str) -> bool {
+        match self {
+            Self::Ollama(client) => client.uses_tool_transcript(model),
+            Self::OpenAi(client) => client.supports_tool_transcript(model),
+            Self::Anthropic(client) => client.supports_tool_transcript(model),
+            Self::Deferred(client) => client
+                .estimation_client()
+                .is_some_and(|client| client.uses_tool_transcript(model)),
+            _ => false,
+        }
+    }
+
+    pub(super) fn with_tool_transcript(
+        self,
+        request: &ModelRequest,
+        tool_transcript: &[pi_rs::ToolTranscriptChange],
+    ) -> Self {
+        match self {
+            Self::Ollama(client) => {
+                Self::Ollama(client.with_tool_transcript(request, tool_transcript))
+            }
+            Self::OpenAi(client) => {
+                Self::OpenAi(client.with_tool_transcript(request, tool_transcript))
+            }
+            Self::Anthropic(client) => {
+                Self::Anthropic(client.with_tool_transcript(request, tool_transcript))
+            }
+            other => other,
+        }
     }
 
     /// Resolve dynamic credentials and freeze any catalog route before estimating.
@@ -1179,6 +1268,15 @@ impl Client {
         }
     }
 
+    pub(super) async fn discovered_radius_catalog(
+        &self,
+    ) -> Option<Arc<super::radius_catalog::Catalog>> {
+        match self {
+            Self::PiMessages(client) => client.discovered_catalog().await,
+            _ => None,
+        }
+    }
+
     pub fn with_headers(self, headers: reqwest::header::HeaderMap) -> Self {
         match self {
             Self::Ollama(client) => Self::Ollama(client.with_headers(headers)),
@@ -1425,6 +1523,11 @@ impl Client {
                         args.explicit_endpoint_for(&args.provider),
                         thinking,
                     ))
+                    .with_inline_tool_models(args.model_profiles.anthropic_inline_tool_models(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
+                    ))
                     .with_mid_conversation_system_models(
                         args.model_profiles
                             .anthropic_mid_conversation_system_models(
@@ -1604,7 +1707,13 @@ impl Client {
                         ),
                 )
             }
-            Self::PiMessages(client) => Self::PiMessages(client.with_thinking(thinking)),
+            Self::PiMessages(client) => {
+                let mut client = client.with_thinking(thinking);
+                if args.provider == Provider::Radius && args.settings.resize_model_images() {
+                    client = client.with_radius_request_profiles(args.model_profiles.clone());
+                }
+                Self::PiMessages(client)
+            }
             Self::OpenAi(client) => {
                 let metadata = args.model_profiles.model(&args.provider, &args.model);
                 let azure = client.is_azure();
@@ -1689,18 +1798,21 @@ impl Client {
                             model.mapped_effort("off").unwrap_or(Some("none"))
                         }
                     });
-                    client.with_codex_off_effort(off).with_codex_transport(
-                        args.settings
-                            .string("transport")
-                            .and_then(pi_rs::openai::CodexTransport::named)
-                            .unwrap_or_default(),
-                    )
+                    client
+                        .with_codex_off_effort(off)
+                        .with_codex_transport(args.settings.codex_transport())
                 } else {
                     client
                 };
                 let (system_default, system_models) = args
                     .model_profiles
                     .responses_mid_conversation_system_policy(
+                        &args.provider,
+                        &args.model,
+                        args.explicit_endpoint_for(&args.provider),
+                    );
+                let (tools_default, tools_models) =
+                    args.model_profiles.responses_tool_transcript_policy(
                         &args.provider,
                         &args.model,
                         args.explicit_endpoint_for(&args.provider),
@@ -1712,6 +1824,7 @@ impl Client {
                         &args.model,
                         args.explicit_endpoint_for(&args.provider),
                     ))
+                    .with_transcript_tools_policy(tools_default, tools_models)
                     .with_max_output_tokens_field(
                         args.model_profiles
                             .responses_max_output_tokens(&args.provider, metadata.as_ref()),
@@ -3960,6 +4073,51 @@ mod contention_tests {
                 !summary && path != 0
             );
         }
+    }
+
+    #[tokio::test]
+    async fn anthropic_federation_requires_official_messages_and_yields_to_explicit_auth() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing_file = directory.path().join("identity");
+        let federation =
+            super::super::anthropic_federation::Federation::from_env(|name| match name {
+                "ANTHROPIC_FEDERATION_RULE_ID" | "ANTHROPIC_ORGANIZATION_ID" => {
+                    Some("fixture".into())
+                }
+                "ANTHROPIC_IDENTITY_TOKEN_FILE" => {
+                    Some(missing_file.to_string_lossy().into_owned())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let client = |endpoint, headers| {
+            Client::deferred(
+                Provider::Anthropic,
+                Adapter::Anthropic,
+                endpoint,
+                Some(Credential::AnthropicFederation(Arc::clone(&federation))),
+                headers,
+            )
+        };
+        let (resolved, headers) = client(
+            Provider::Anthropic.default_endpoint(),
+            RequestHeaders::for_test("authorization", "Bearer fixture"),
+        )
+        .resolve_affinity_headers()
+        .await
+        .unwrap();
+        assert!(matches!(resolved, Client::Anthropic(_)));
+        assert_eq!(headers["authorization"], "Bearer fixture");
+
+        let result = client(
+            "https://elsewhere.example/v1/messages",
+            RequestHeaders::default(),
+        )
+        .resolve_affinity_headers()
+        .await;
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message.contains("official Messages"))
+        );
     }
 
     #[tokio::test]

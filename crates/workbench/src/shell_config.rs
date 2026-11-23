@@ -47,6 +47,7 @@ impl Default for ShellConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct ShellContext {
     pub id: uuid::Uuid,
     pub path: Option<PathBuf>,

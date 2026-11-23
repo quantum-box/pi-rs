@@ -286,6 +286,8 @@ struct ClientRegistration {
     requested_scopes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auth_server_metadata_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    challenge: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Envelope {
@@ -628,6 +630,7 @@ struct StagingState {
     credentials: Mutex<Option<(FileCredentials, StoredCredentials)>>,
     callback: Mutex<Option<crate::oauth_callback::Callback>>,
     guard: Mutex<Option<CredentialRefreshGuard>>,
+    manual_redirect: Mutex<Option<tokio::sync::oneshot::Receiver<reqwest_mcp::Url>>>,
 }
 type Staging = Arc<StagingState>;
 
@@ -788,12 +791,12 @@ pub async fn client_with_http_options(
     let identity = envelope.generation.to_string();
     let mut manager = oauth_manager(url, options).await?;
     manager.set_credential_store(store.clone());
-    if let Some(metadata_url) = envelope
-        .registration
-        .as_ref()
-        .and_then(|registration| registration.auth_server_metadata_url.as_deref())
-    {
-        manager.set_metadata(configured_metadata(metadata_url, url, options).await?);
+    if let Some(registration) = &envelope.registration {
+        if let Some(metadata_url) = registration.auth_server_metadata_url.as_deref() {
+            manager.set_metadata(configured_metadata(metadata_url, url, options).await?);
+        } else if let Some(challenge) = registration.challenge.as_deref() {
+            manager.set_metadata(discover_metadata(&manager, Some(challenge)).await?);
+        }
     }
     if !manager.initialize_from_store().await.map_err(auth_error)? {
         return Err(auth_error(AuthError::AuthorizationRequired));
@@ -1102,6 +1105,11 @@ pub enum CliLoginClient<'a> {
     },
     Metadata(&'a str),
     Configured(Option<&'a OAuthClientSettings>),
+    Interactive {
+        settings: Option<&'a OAuthClientSettings>,
+        challenge: Option<&'a str>,
+        manual_redirect: tokio::sync::oneshot::Receiver<reqwest_mcp::Url>,
+    },
 }
 
 /// Save one credential envelope after revalidating the effective MCP configuration.
@@ -1162,6 +1170,27 @@ where
                     url,
                     settings,
                     None,
+                    scopes,
+                    options,
+                    announce,
+                    Some(staged.clone()),
+                )
+                .await
+            }
+            CliLoginClient::Interactive {
+                settings,
+                challenge,
+                manual_redirect,
+            } => {
+                *staged
+                    .manual_redirect
+                    .lock()
+                    .expect("manual OAuth redirect") = Some(manual_redirect);
+                login_configured_inner(
+                    name,
+                    url,
+                    settings,
+                    challenge,
                     scopes,
                     options,
                     announce,
@@ -1511,6 +1540,20 @@ async fn configured_metadata_with_client(
     Ok(metadata)
 }
 
+async fn discover_metadata(
+    manager: &AuthorizationManager,
+    challenge: Option<&str>,
+) -> Result<AuthorizationMetadata> {
+    let resolved = manager
+        .resolve_metadata_from_challenge(challenge)
+        .await
+        .map_err(auth_error)?;
+    if challenge.is_some() && !resolved.source.is_discovered() {
+        return Err(auth_error(AuthError::NoAuthorizationSupport));
+    }
+    Ok(resolved.metadata)
+}
+
 async fn authorize(
     name: &str,
     url: &str,
@@ -1539,6 +1582,7 @@ async fn authorize(
                     callback_port: redirect.port_or_known_default(),
                     callback_url: Some(&client.redirect_uri),
                     auth_server_metadata_url: client.auth_server_metadata_url.as_deref(),
+                    challenge: client.challenge.as_deref(),
                     ..ClientOptions::default()
                 },
                 Some(upgrade),
@@ -1601,14 +1645,7 @@ async fn authorize(
     let metadata = if let Some(metadata_url) = options.auth_server_metadata_url {
         configured_metadata(metadata_url, url, http_options).await?
     } else {
-        let metadata = manager
-            .resolve_metadata_from_challenge(options.challenge)
-            .await
-            .map_err(auth_error)?;
-        if options.challenge.is_some() && !metadata.source.is_discovered() {
-            return Err(auth_error(AuthError::NoAuthorizationSupport));
-        }
-        metadata.metadata
+        discover_metadata(&manager, options.challenge).await?
     };
     if let Some(upgrade) = upgrade
         && (metadata.issuer.is_none() || metadata.issuer != upgrade.previous.credentials.issuer)
@@ -1669,6 +1706,7 @@ async fn authorize(
         redirect_uri: callback.to_string(),
         requested_scopes: scopes.clone(),
         auth_server_metadata_url: options.auth_server_metadata_url.map(str::to_owned),
+        challenge: options.challenge.map(str::to_owned),
     });
     let mut request = AuthorizationRequest::new(callback.as_str())
         .with_client_name(client_name)
@@ -1704,32 +1742,61 @@ async fn authorize(
         .map(|(_, state)| state.into_owned())
         .ok_or_else(|| Error::Config("OAuth state is missing".into()))?;
     announce(session.get_authorization_url());
-    crate::oauth_callback::open_browser(session.get_authorization_url()).await?;
+    let manual = staging.as_ref().and_then(|staged| {
+        staged
+            .manual_redirect
+            .lock()
+            .expect("manual OAuth redirect")
+            .take()
+    });
+    let browser = crate::oauth_callback::open_browser(session.get_authorization_url()).await;
+    if manual.is_none() {
+        browser?;
+    }
     let receive = async {
-        let incoming =
-            crate::oauth_callback::receive(&listener, &callback, &expected_state).await?;
-        if incoming.code().is_none() {
-            incoming.reply(false).await;
+        let from_browser = crate::oauth_callback::receive(&listener, &callback, &expected_state);
+        let (redirect, incoming) = if let Some(manual) = manual {
+            tokio::select! {
+                incoming = from_browser => {
+                    let incoming = incoming?;
+                    (incoming.url.clone(), Some(incoming))
+                }
+                redirect = manual => {
+                    let redirect = redirect.map_err(|_| Error::Cancelled)?;
+                    let redirect = crate::oauth_callback::manual_redirect(redirect.as_str(), &callback, &expected_state)
+                        .ok_or_else(|| Error::Config("Invalid MCP authorization redirect".into()))?;
+                    (redirect, None)
+                }
+            }
+        } else {
+            let incoming = from_browser.await?;
+            (incoming.url.clone(), Some(incoming))
+        };
+        if !redirect.query_pairs().any(|(key, _)| key == "code") {
+            if let Some(incoming) = incoming {
+                incoming.reply(false).await;
+            }
             return Err(Error::Config("MCP OAuth authorization was declined".into()));
         }
         if let Some(staged) = &staging {
-            let callback_url = incoming.url.to_string();
-            *staged.callback.lock().unwrap_or_else(|e| e.into_inner()) = Some(incoming);
+            *staged.callback.lock().unwrap_or_else(|e| e.into_inner()) = incoming;
             let guard = store
                 .acquire_refresh_guard()
                 .await
                 .map_err(auth_error)?
                 .ok_or_else(|| Error::Config("MCP OAuth credential lock is missing".into()))?;
             session
-                .handle_callback_url(&callback_url)
+                .handle_callback_url(redirect.as_str())
                 .await
                 .map_err(auth_error)?;
             *staged.guard.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
             Ok(())
         } else {
             let _guard = store.acquire_refresh_guard().await.map_err(auth_error)?;
-            let result = session.handle_callback_url(incoming.url.as_str()).await;
-            incoming.reply(result.is_ok()).await;
+            let result = session.handle_callback_url(redirect.as_str()).await;
+            if let Some(incoming) = incoming {
+                incoming.reply(result.is_ok()).await;
+            }
             result.map(|_| ()).map_err(auth_error)
         }
     };
@@ -3205,6 +3272,7 @@ mod tests {
             redirect_uri: "http://127.0.0.1:12345/callback".into(),
             requested_scopes: Vec::new(),
             auth_server_metadata_url: None,
+            challenge: None,
         });
         login
             .save(StoredCredentials::new("first".into(), None, vec![], None))
