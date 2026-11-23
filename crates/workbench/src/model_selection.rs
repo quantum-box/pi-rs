@@ -39,6 +39,152 @@ pub fn qualified_model<'a>(
     Some((profiles.provider(provider)?, model))
 }
 
+// The order is Pi's startup preference across authenticated providers.
+const PROVIDER_DEFAULTS: &[(&str, &str)] = &[
+    ("amazon-bedrock", "us.anthropic.claude-opus-5-5"),
+    ("ant-ling", "Ring-2.6-1T"),
+    ("anthropic", "claude-opus-5-5"),
+    ("openai", "gpt-6.2-sol"),
+    ("azure", "gpt-6.2-sol"),
+    ("openai-codex", "gpt-6.2-sol"),
+    ("radius", "balanced"),
+    ("nvidia", "nvidia/nemotron-3.5-super-vl-120b-a12b"),
+    ("deepseek", "deepseek-v4-pro"),
+    ("google", "gemini-4-argon"),
+    ("google-vertex", "gemini-4-argon"),
+    ("github-copilot", "gpt-6.1-sol"),
+    ("openrouter", "moonshotai/kimi-k2.7-code"),
+    ("vercel-ai-gateway", "zai/glm-5.3"),
+    ("xai", "grok-4.7"),
+    ("groq", "openai/gpt-oss-120b"),
+    ("cerebras", "gpt-oss-120b"),
+    ("zai", "glm-5.3"),
+    ("zai-coding-cn", "glm-5.3"),
+    ("mistral", "devstral-medium-latest"),
+    ("minimax", "MiniMax-M3"),
+    ("minimax-cn", "MiniMax-M3"),
+    ("moonshotai", "kimi-k2.7-code"),
+    ("moonshotai-cn", "kimi-k2.7-code"),
+    ("huggingface", "moonshotai/Kimi-K2.7-Code"),
+    ("fireworks", "accounts/fireworks/models/kimi-k3"),
+    ("together", "moonshotai/Kimi-K3"),
+    ("baseten", "zai-org/GLM-5.3"),
+    ("opencode", "kimi-k2.7-code"),
+    ("opencode-go", "kimi-k3.1-pro"),
+    ("kimi-coding", "kimi-for-coding"),
+    ("meta", "muse-spark-1.3"),
+    ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.7-code"),
+    (
+        "cloudflare-ai-gateway",
+        "workers-ai/@cf/moonshotai/kimi-k2.7-code",
+    ),
+    ("qwen-token-plan", "qwen3.8-max"),
+    ("qwen-token-plan-cn", "qwen3.8-max"),
+    ("qwen-token-plan-individual", "qwen3.8-max"),
+    ("qwen-token-plan-individual-cn", "qwen3.8-max"),
+    ("xiaomi", "mimo-v2.6-pro"),
+    ("xiaomi-token-plan-cn", "mimo-v2.6-pro"),
+    ("xiaomi-token-plan-ams", "mimo-v2.6-pro"),
+    ("xiaomi-token-plan-sgp", "mimo-v2.6-pro"),
+];
+
+/// Use the pinned Pi default when it is present in the effective catalog.
+pub(super) fn default_for_provider<'a>(
+    provider: &Provider,
+    models: &'a [String],
+) -> Option<&'a String> {
+    PROVIDER_DEFAULTS
+        .iter()
+        .find(|(id, _)| *id == provider.id())
+        .and_then(|(_, preferred)| models.iter().find(|model| model == preferred))
+        .or_else(|| models.first())
+}
+
+/// Choose from known catalog entries without resolving credential commands
+/// or refreshing OAuth on startup. Native Ollama remains the local fallback.
+pub(super) async fn automatic_startup_model(args: &Cli) -> Option<ScopedChoice> {
+    use super::{model_auth::Credential, providers::Client};
+
+    let profiles = &args.model_profiles;
+    let bedrock_ambient = bedrock_environment_configured(|key| {
+        std::env::var_os(key).is_some_and(|value| !value.is_empty())
+    });
+    let mut candidates = Vec::new();
+    for provider in profiles
+        .providers()
+        .filter(|provider| *provider != Provider::Ollama)
+    {
+        let radius = if provider == Provider::Radius {
+            match args.connect_provider(&provider, None) {
+                // A model fallback must not fetch catalogs or refresh OAuth.
+                // Pi Messages can read its local Radius catalog without probing.
+                Ok(Client::PiMessages(client)) => client
+                    .with_context_probe(false)
+                    .models()
+                    .await
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let base_endpoint = profiles.endpoint(&provider);
+        let mut models = profiles.model_ids(&provider);
+        for id in &radius {
+            if !models.contains(id) {
+                models.push(id.clone());
+            }
+        }
+        for model in models {
+            let endpoint = profiles
+                .model_endpoint(&provider, &model)
+                .unwrap_or(base_endpoint);
+            if args
+                .model_keys
+                .available_model_ids(&provider, endpoint)
+                .is_some_and(|available| !available.contains(&model))
+            {
+                continue;
+            }
+            let credential = args.configured_model_credential(&provider, endpoint);
+            let usable = match credential {
+                Some(Credential::Invalid) => false,
+                Some(credential) => credential
+                    .literal()
+                    .is_none_or(super::model_auth::valid_key),
+                None => {
+                    (provider == Provider::Bedrock && endpoint.is_empty() && bedrock_ambient)
+                        || (provider == Provider::Radius
+                            && endpoint == base_endpoint
+                            && radius.contains(&model))
+                }
+            };
+            if usable {
+                let priority = PROVIDER_DEFAULTS
+                    .iter()
+                    .position(|(id, preferred)| *id == provider.id() && *preferred == model)
+                    .unwrap_or(PROVIDER_DEFAULTS.len());
+                candidates.push((
+                    priority,
+                    ScopedChoice {
+                        provider: provider.clone(),
+                        model,
+                        thinking: None,
+                    },
+                ));
+            }
+        }
+    }
+    candidates.sort_by_key(|(priority, _)| *priority);
+    candidates
+        .into_iter()
+        .map(|(_, choice)| choice)
+        .find(|choice| {
+            args.connect_provider(&choice.provider, Some(&choice.model))
+                .is_ok()
+        })
+}
+
 pub struct Catalog {
     pub provider: Provider,
     pub client: super::providers::Client,
@@ -265,6 +411,142 @@ fn add_scoped_choice(
     }
 }
 
+fn add_scope_matches(
+    pattern: &str,
+    matches: Vec<(&Catalog, &str)>,
+    thinking: Option<&str>,
+    selected: &mut Vec<ScopedChoice>,
+    warnings: &mut Vec<String>,
+) {
+    if matches.len() > 1 {
+        let mut providers: Vec<_> = matches
+            .iter()
+            .map(|(catalog, _)| catalog.provider.id())
+            .collect();
+        providers.sort_unstable();
+        warnings.push(format!(
+            "Pattern \"{pattern}\" matches several providers: {}. Use provider/id to choose one.",
+            providers.join(", ")
+        ));
+    }
+    for (catalog, model) in matches {
+        add_scoped_choice(
+            selected,
+            &catalog.provider,
+            model.to_owned(),
+            thinking.map(str::to_owned),
+        );
+    }
+}
+
+fn exact_scope_alias<'a>(
+    reference: &str,
+    catalogs: &'a [Catalog],
+) -> Option<(&'a Catalog, &'a str)> {
+    catalogs.iter().find_map(|catalog| {
+        catalog
+            .aliases
+            .iter()
+            .find(|(_, name)| name.eq_ignore_ascii_case(reference))
+            .map(|(id, _)| (catalog, id.as_str()))
+    })
+}
+
+fn fuzzy_scope_matches<'a>(
+    reference: &str,
+    catalogs: &'a [Catalog],
+) -> Vec<(&'a Catalog, &'a str)> {
+    let query = reference.to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let fuzzy: Vec<_> = catalogs
+        .iter()
+        .flat_map(|catalog| {
+            catalog
+                .models
+                .iter()
+                .filter(|id| fuzzy_model_matches(id, Some(catalog.display_name(id)), &query))
+                .map(move |id| (catalog, id.as_str()))
+        })
+        .collect();
+    let locale = super::locale::select(|name| std::env::var(name).ok());
+    let collator = super::locale::collator(&locale).ok();
+    let Some((_, best)) = fuzzy
+        .iter()
+        .max_by(|(_, left), (_, right)| {
+            compare_fuzzy_ids(left, right, |left, right| {
+                collator
+                    .as_ref()
+                    .map_or_else(|| left.cmp(right), |collator| collator.compare(left, right))
+            })
+        })
+        .copied()
+    else {
+        return Vec::new();
+    };
+    fuzzy
+        .into_iter()
+        .filter(|(_, model)| *model == best)
+        .collect()
+}
+
+fn add_bare_scope(
+    pattern: &str,
+    catalogs: &[Catalog],
+    selected: &mut Vec<ScopedChoice>,
+    warnings: &mut Vec<String>,
+) {
+    let mut reference = pattern;
+    let mut thinking = None;
+    let mut invalid = None;
+    loop {
+        let mut matches = exact_scope_matches(reference, None, catalogs);
+        let parsed_level = thinking_suffix(reference);
+        if matches.is_empty()
+            && let Some((base, level)) = parsed_level
+        {
+            matches = exact_scope_matches(base, None, catalogs);
+            if !matches.is_empty() {
+                thinking.get_or_insert(level);
+            }
+        }
+        if matches.is_empty() {
+            if let Some(alias) = exact_scope_alias(reference, catalogs) {
+                matches.push(alias);
+            } else if let Some((base, level)) = parsed_level
+                && let Some(alias) = exact_scope_alias(base, catalogs)
+            {
+                matches.push(alias);
+                thinking.get_or_insert(level);
+            } else {
+                matches = fuzzy_scope_matches(reference, catalogs);
+            }
+        }
+        if !matches.is_empty() {
+            if let Some(suffix) = invalid {
+                warnings.push(format!("Invalid thinking level \"{suffix}\" in pattern \"{pattern}\". Using default instead."));
+                thinking = None;
+            }
+            add_scope_matches(pattern, matches, thinking, selected, warnings);
+            return;
+        }
+        if let Some((base, level)) = thinking_suffix(reference) {
+            thinking.get_or_insert(level);
+            reference = base;
+        } else if let Some((base, suffix)) = reference
+            .rsplit_once(':')
+            .filter(|(base, _)| !base.is_empty())
+        {
+            invalid.get_or_insert(suffix);
+            reference = base;
+        } else {
+            warnings.push(format!("No models match pattern \"{pattern}\""));
+            return;
+        }
+    }
+}
+
 pub fn scoped_choices<'a>(
     patterns: impl IntoIterator<Item = &'a str>,
     catalogs: &[Catalog],
@@ -282,6 +564,10 @@ pub fn scoped_choices<'a>(
                 .iter()
                 .find(|catalog| prefix.eq_ignore_ascii_case(catalog.provider.id()))
         });
+        if !glob && qualified.is_none() {
+            add_bare_scope(pattern, catalogs, &mut selected, &mut warnings);
+            continue;
+        }
         let suffix = thinking_suffix(pattern);
         // Pi strips the suffix before testing a glob-like pattern for a literal ID.
         let (mut exact, mut thinking) = if glob {
@@ -296,39 +582,9 @@ pub fn scoped_choices<'a>(
             thinking = Some(level);
         }
         if !exact.is_empty() {
-            if exact.len() > 1 {
-                let mut providers: Vec<_> = exact
-                    .iter()
-                    .map(|(catalog, _)| catalog.provider.id())
-                    .collect();
-                providers.sort_unstable();
-                warnings.push(format!(
-                    "Pattern \"{pattern}\" matches several providers: {}. Use provider/id to choose one.",
-                    providers.join(", ")
-                ));
-            }
-            for (catalog, model) in exact {
-                add_scoped_choice(
-                    &mut selected,
-                    &catalog.provider,
-                    model.to_owned(),
-                    thinking.map(str::to_owned),
-                );
-            }
+            add_scope_matches(pattern, exact, thinking, &mut selected, &mut warnings);
             continue;
         }
-        // Keep native display-name aliases ahead of partial matches.
-        let qualified = qualified.or_else(|| {
-            if glob {
-                return None;
-            }
-            catalogs.iter().find(|catalog| {
-                catalog.aliases.iter().any(|(_, name)| {
-                    name.eq_ignore_ascii_case(pattern)
-                        || suffix.is_some_and(|(model, _)| name.eq_ignore_ascii_case(model))
-                })
-            })
-        });
         let mut matched = false;
         for catalog in catalogs
             .iter()
@@ -397,12 +653,45 @@ fn resolve_cli_catalog_model(
     let profiles = &args.model_profiles;
     let value = value.trim();
     let suffix = thinking_suffix(value).map(|(id, level)| (id, Some(level)));
+    let catalogs: Vec<_> = profiles
+        .providers()
+        .map(|provider| {
+            let models = profiles.model_ids(&provider);
+            (provider, models)
+        })
+        .collect();
     for (reference, thinking) in std::iter::once((value, None)).chain(suffix) {
         let named = qualified_model(reference, profiles);
+        let candidate = |provider: &Provider, id: String, named: bool| {
+            let endpoint = profiles
+                .model_endpoint(provider, &id)
+                .unwrap_or_else(|| profiles.endpoint(provider));
+            let credential = args.configured_model_credential(provider, endpoint);
+            let bedrock_chain = *provider == Provider::Bedrock
+                && endpoint.is_empty()
+                && profiles.model_adapter(provider, &id) == super::providers::Adapter::Bedrock
+                && credential.is_none();
+            let authenticated = !inline
+                && match credential {
+                    Some(credential) => {
+                        !matches!(credential, super::model_auth::Credential::Invalid)
+                    }
+                    None => *provider == Provider::Ollama || (bedrock_chain && ambient_bedrock),
+                };
+            Match {
+                choice: ScopedChoice {
+                    provider: provider.clone(),
+                    model: id,
+                    thinking: thinking.map(str::to_owned),
+                },
+                named,
+                authenticated,
+                bedrock_chain,
+            }
+        };
         let mut matches = Vec::new();
-        for provider in profiles.providers() {
-            let models = profiles.model_ids(&provider);
-            let explicit = named.as_ref().filter(|(named, _)| &provider == named);
+        for (provider, models) in &catalogs {
+            let explicit = named.as_ref().filter(|(named, _)| provider == named);
             let known = models
                 .iter()
                 .find(|model| explicit.is_some_and(|(_, id)| model.eq_ignore_ascii_case(id)))
@@ -415,43 +704,60 @@ fn resolve_cli_catalog_model(
             // qualified match. A named partial match can compete with raw IDs.
             let id = known.cloned().or_else(|| {
                 let (_, id) = explicit?;
-                let names = aliases(profiles, &provider, &models);
-                let candidates = search_ids(&models, &names);
+                let names = aliases(profiles, provider, models);
+                let candidates = search_ids(models, &names);
                 exact(id, &candidates, provider.id())
                     .or_else(|| partial(id, &candidates, provider.id()))
-                    .map(|model| canonical(model.clone(), &models, &names))
+                    .map(|model| canonical(model.clone(), models, &names))
             });
-            let Some(id) = id else {
-                continue;
-            };
-            let endpoint = profiles
-                .model_endpoint(&provider, &id)
-                .unwrap_or_else(|| profiles.endpoint(&provider));
-            let credential = args.configured_model_credential(&provider, endpoint);
-            let bedrock_chain = provider == Provider::Bedrock
-                && endpoint.is_empty()
-                && profiles.model_adapter(&provider, &id) == super::providers::Adapter::Bedrock
-                && credential.is_none();
-            let authenticated = !inline
-                && match credential {
-                    Some(credential) => {
-                        !matches!(credential, super::model_auth::Credential::Invalid)
-                    }
-                    None => provider == Provider::Ollama || (bedrock_chain && ambient_bedrock),
-                };
-            matches.push(Match {
-                choice: ScopedChoice {
-                    provider,
-                    model: id,
-                    thinking: thinking.map(str::to_owned),
-                },
-                named: explicit.is_some(),
-                authenticated,
-                bedrock_chain,
-            });
+            if let Some(id) = id {
+                matches.push(candidate(provider, id, explicit.is_some()));
+            }
         }
         if matches.is_empty() {
-            continue;
+            let query = reference.to_lowercase();
+            if query.is_empty() {
+                continue;
+            }
+            // Pi treats display names as fuzzy matches, even when the whole
+            // name matches. Only literal IDs receive exact precedence here.
+            let mut fuzzy = Vec::new();
+            for (provider, models) in &catalogs {
+                fuzzy.extend(models.iter().filter_map(|id| {
+                    let metadata = profiles.model(provider, id);
+                    let name = metadata.as_ref().and_then(|model| model.name.as_deref());
+                    let matched = fuzzy_model_matches(id, name, &query);
+                    matched.then(|| candidate(provider, id.clone(), false))
+                }));
+            }
+            let Some(first) = fuzzy.first() else {
+                continue;
+            };
+            let multiple_providers = fuzzy
+                .iter()
+                .any(|candidate| candidate.choice.provider != first.choice.provider);
+            if multiple_providers && fuzzy.iter().any(|candidate| candidate.authenticated) {
+                fuzzy.retain(|candidate| candidate.authenticated);
+            }
+            let locale = super::locale::select(|name| std::env::var(name).ok());
+            let collator = super::locale::collator(&locale).map_err(|error| {
+                Error::Config(format!("Cannot initialize model collation: {error}"))
+            })?;
+            let best = fuzzy
+                .iter()
+                .max_by(|left, right| {
+                    let left = &left.choice.model;
+                    let right = &right.choice.model;
+                    compare_fuzzy_ids(left, right, |left, right| collator.compare(left, right))
+                })
+                .expect("nonempty fuzzy candidates")
+                .choice
+                .model
+                .clone();
+            matches = fuzzy
+                .into_iter()
+                .filter(|candidate| candidate.choice.model == best)
+                .collect();
         }
         let usable_count = matches.iter().filter(|model| model.authenticated).count();
         if matches.len() == 1 {
@@ -597,6 +903,21 @@ fn is_alias(model: &str) -> bool {
     !model.rsplit_once('-').is_some_and(|(_, suffix)| {
         suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit())
     })
+}
+
+fn fuzzy_model_matches(id: &str, name: Option<&str>, query: &str) -> bool {
+    id.to_lowercase().contains(query)
+        || name.is_some_and(|name| name.to_lowercase().contains(query))
+}
+
+fn compare_fuzzy_ids(
+    left: &str,
+    right: &str,
+    compare: impl FnOnce(&str, &str) -> std::cmp::Ordering,
+) -> std::cmp::Ordering {
+    is_alias(left)
+        .cmp(&is_alias(right))
+        .then_with(|| compare(left, right))
 }
 
 fn partial<'a>(value: &str, available: &'a [String], provider: &str) -> Option<&'a String> {
@@ -805,6 +1126,11 @@ mod tests {
                     "literal1",
                     "anthropic/same",
                     "alias-extra",
+                    "alias:high-next",
+                    "widget-a",
+                    "widget-z-20260101",
+                    "duplicate-model",
+                    "literal-suffix:high-next",
                 ]
                 .map(str::to_owned)
                 .to_vec(),
@@ -822,9 +1148,16 @@ mod tests {
                         false,
                     )
                     .unwrap(),
-                models: ["same", "exact", "literalm", "literal2"]
-                    .map(str::to_owned)
-                    .to_vec(),
+                models: [
+                    "same",
+                    "exact",
+                    "literalm",
+                    "literal2",
+                    "widget-z",
+                    "duplicate-model",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
                 aliases: vec![("exact".into(), "alias".into())],
                 probe_details: false,
                 complete: false,
@@ -891,6 +1224,43 @@ mod tests {
                 "anthropic/same"
             ]
         );
+
+        for (pattern, expected) in [
+            ("widget", vec!["anthropic/widget-z"]),
+            ("widget:high", vec!["anthropic/widget-z:high"]),
+            ("widget:high:low", vec!["anthropic/widget-z:low"]),
+            ("alias:high", vec!["anthropic/exact:high"]),
+            (
+                "literal-suffix:high",
+                vec!["ollama/literal-suffix:high-next"],
+            ),
+        ] {
+            let (choices, warnings) = scoped_choices([pattern], &catalogs);
+            assert!(warnings.is_empty(), "{pattern}: {warnings:?}");
+            assert_eq!(
+                choices
+                    .iter()
+                    .map(super::ScopedChoice::pattern)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{pattern}"
+            );
+        }
+        let (choices, warnings) = scoped_choices(["duplicate:high"], &catalogs);
+        assert_eq!(
+            choices
+                .iter()
+                .map(super::ScopedChoice::pattern)
+                .collect::<Vec<_>>(),
+            [
+                "ollama/duplicate-model:high",
+                "anthropic/duplicate-model:high"
+            ]
+        );
+        assert!(warnings[0].contains("matches several providers: anthropic, ollama"));
+        let (choices, warnings) = scoped_choices(["widget:bad:high"], &catalogs);
+        assert_eq!(choices[0].pattern(), "anthropic/widget-z");
+        assert!(warnings[0].contains("Invalid thinking level \"bad\""));
     }
 
     #[test]

@@ -36,7 +36,16 @@ enum Request {
         reported_reasoning: Option<bool>,
         session: PathBuf,
     },
+    SelectLiveModel {
+        id: Uuid,
+        provider: String,
+        model: String,
+        thinking: Option<String>,
+        reported_reasoning: Option<bool>,
+        reported_thinking: bool,
+    },
     CacheWarmingChanged,
+    TransportChanged,
     RenderTool {
         id: Uuid,
         operation: Uuid,
@@ -229,8 +238,30 @@ struct ReaderControls {
     shell: ShellRunner,
 }
 
+struct LiveModelRun {
+    id: Uuid,
+    args: Cli,
+    control: pi_rs::LiveModelControl,
+    latest: Option<(
+        Arc<pi_rs::LiveModelSelection>,
+        super::image_policy::WorkbenchModel,
+    )>,
+}
+
+impl LiveModelRun {
+    fn new(args: &Cli) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            args: args.clone(),
+            control: pi_rs::LiveModelControl::default(),
+            latest: None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ControlState {
+    live_model: Option<LiveModelRun>,
     token: Option<CancellationToken>,
     queued: usize,
     pending_cancel: bool,
@@ -1118,6 +1149,20 @@ async fn run_worker(
         if matches!(request, Request::CacheWarmingChanged) {
             continue;
         }
+        if matches!(request, Request::TransportChanged) {
+            match args
+                .settings
+                .reload_with_fallback(&args.workspace, args.trusted, &args.settings)
+            {
+                Ok(settings) => {
+                    args.settings
+                        .apply_worker_settings(&settings, &["transport"]);
+                    runtime.update_codex_transport(&args.settings);
+                }
+                Err(error) => output(json!({"type":"error","message":error.to_string()})),
+            }
+            continue;
+        }
         if let Request::CheckSessionTransition { id, event } = request {
             let result = tokio::select! {
                 result = async {
@@ -1320,16 +1365,20 @@ async fn run_worker(
         let mut started = prompt_response.is_none();
         let mut compact_result = serde_json::Value::Null;
         let cancel = CancellationToken::new();
-        {
+        let live_model = {
             let mut state = active.lock().expect("worker control");
             state.token = Some(cancel.clone());
+            state.live_model = (args.terminal_managed_worker
+                && matches!(&request, Request::Prompt { .. }))
+            .then(|| LiveModelRun::new(&args));
             if scheduled {
                 state.queued = state.queued.saturating_sub(1);
             }
             if std::mem::take(&mut state.pending_cancel) {
                 cancel.cancel();
             }
-        }
+            state.live_model.as_ref().map(|run| run.control.clone())
+        };
         if started {
             output(json!({"type":"agent_started"}));
         }
@@ -1343,7 +1392,9 @@ async fn run_worker(
         let mut operation = Box::pin(async {
             if matches!(
                 &request,
-                Request::Prompt { .. } | Request::TriggerCustom { .. } | Request::McpStatus { .. }
+                Request::Prompt { .. }
+                    | Request::TriggerCustom { .. }
+                    | Request::McpStatus { inspect: false }
             ) {
                 tokio::select! {
                     biased;
@@ -1357,6 +1408,9 @@ async fn run_worker(
             let session = run_session.insert(Session::open(&args.session)?);
             session.set_auto_compaction_control(runtime.auto_compaction.clone());
             session.set_retry_control(runtime.retry.clone());
+            if let Some(control) = &live_model {
+                session.set_live_model_control(control.clone());
+            }
             if session.host_binding().is_some() {
                 return Err(Error::Session(
                     "a managed session must be opened by its host".into(),
@@ -1381,8 +1435,16 @@ async fn run_worker(
             emit_refreshed_entries(refreshed);
             cache_capture.initialize(session, &runtime.registry);
             let agent = runtime.agent(&args, session);
+            let mut tool_model_context = live_model
+                .as_ref()
+                .map(|_| runtime.live_tool_model_context(&args, session));
             let mut summary_request = false;
             let mut observer = |event: pi_rs::Notification<'_>| {
+                if let Some(update) = tool_model_context.as_mut()
+                    && let pi_rs::Notification::Committed(record) = &event
+                {
+                    update(record);
+                }
                 snapshot
                     .lock()
                     .expect("session snapshot")
@@ -1697,7 +1759,7 @@ async fn run_worker(
                 }
                 Request::McpStatus { inspect } => {
                     if inspect {
-                        runtime.inspect_mcp(ui.as_ref(), &cancel).await?;
+                        runtime.manage_mcp(&args, ui.as_ref(), &cancel).await?;
                     } else {
                         runtime.mcp_status(&args)?;
                     }
@@ -1783,12 +1845,41 @@ async fn run_worker(
             }
         };
         drop(operation);
-        {
+        let live = {
             let mut state = active.lock().expect("worker control");
-            let mut snapshot = snapshot.lock().expect("session snapshot");
-            snapshot.settle_share_context();
             state.token = None;
-        }
+            state.live_model.take()
+        };
+        let adopted = if let Some(mut live) = live
+            && let Some((selection, adapter)) = live.latest.take()
+        {
+            let persist = |session: &mut Session| {
+                if session.host_binding().is_some() {
+                    return Err(Error::Session(
+                        "managed session model changes require their host".into(),
+                    ));
+                }
+                session.apply_live_model_selection(&selection, &mut |event| {
+                    observe_snapshot(event, args.trace, &snapshot)
+                })
+            };
+            match run_session.as_mut().map_or_else(
+                || Session::open(&args.session).and_then(|mut session| persist(&mut session)),
+                persist,
+            ) {
+                Ok(()) => Some((live.args, adapter)),
+                Err(error) => {
+                    output(json!({"type":"live_model_reverted","error":error.to_string()}));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        snapshot
+            .lock()
+            .expect("session snapshot")
+            .settle_share_context();
         if let (Some(input), Some(session)) = (pending_usage, run_session.as_mut()) {
             let recorded = input.apply(session, &mut |event| {
                 observe_snapshot(event, args.trace, &snapshot)
@@ -1798,8 +1889,14 @@ async fn run_worker(
         cache_capture.settle(
             run_session
                 .as_ref()
-                .filter(|_| result.is_ok() && completed_shells.is_empty()),
+                .filter(|_| result.is_ok() && completed_shells.is_empty() && adopted.is_none()),
         );
+        drop(cache_capture);
+        if let Some((selected, adapter)) = adopted {
+            args = selected;
+            runtime.refresh_read_image_policy(&args);
+            runtime.provider = adapter;
+        }
         for execution in completed_shells {
             let recorded = match run_session.as_mut() {
                 Some(session) => record_shell(session, &execution, &args, &snapshot),
@@ -2371,6 +2468,26 @@ fn read_requests(
                     auto_compaction.set_enabled(enabled);
                     control_response("set_auto_compaction", id, Ok(serde_json::Value::Null));
                 }
+                Request::SelectLiveModel {
+                    id,
+                    provider,
+                    model,
+                    thinking,
+                    reported_reasoning,
+                    reported_thinking,
+                } => {
+                    if let Err(error) = select_live_model(
+                        &active,
+                        id,
+                        &provider,
+                        model,
+                        thinking,
+                        reported_reasoning,
+                        reported_thinking,
+                    ) {
+                        control_response("select_live_model", Some(json!(id)), Err(error));
+                    }
+                }
                 Request::ExtensionUiResponse { id, value } => ui.resolve(id, value),
                 request @ (Request::Steer { .. }
                 | Request::Followup { .. }
@@ -2408,6 +2525,7 @@ fn read_requests(
                         request,
                         Request::Configure { .. }
                             | Request::CacheWarmingChanged
+                            | Request::TransportChanged
                             | Request::CheckSessionTransition { .. }
                             | Request::SessionInfoChanged { .. }
                             | Request::SelectionChanged { .. }
@@ -2436,6 +2554,63 @@ fn read_requests(
         stopping.store(true, Ordering::SeqCst);
         cancel_active(&active);
     });
+}
+
+fn select_live_model(
+    active: &Mutex<ControlState>,
+    request_id: Uuid,
+    provider: &str,
+    model: String,
+    thinking: Option<String>,
+    reported_reasoning: Option<bool>,
+    reported_thinking: bool,
+) -> Result<()> {
+    let unavailable = || Error::Config("No active prompt can change models".into());
+    let (id, mut args) = {
+        let state = active.lock().expect("worker control");
+        let live = state.live_model.as_ref().ok_or_else(unavailable)?;
+        (live.id, live.args.clone())
+    };
+    let provider = args
+        .model_profiles
+        .provider(provider)
+        .ok_or_else(|| Error::Config("Unknown model provider".into()))?;
+    args.activate_provider(provider, Some(&model))?;
+    args.model = model;
+    args.thinking_profile = (reported_thinking || reported_reasoning.is_some())
+        .then(|| (args.model.clone(), Vec::new(), reported_reasoning));
+    args.thinking = thinking;
+    let adapter = runtime::model_client(&args, reported_thinking, true)?;
+    let selection = Arc::new(pi_rs::LiveModelSelection {
+        adapter: Arc::new(adapter.clone()),
+        provider: args.recorded_provider().map(str::to_owned),
+        request_provider: args.provider.id().into(),
+        model: args.model.clone(),
+        thinking: args.thinking.clone(),
+        limits: pi_rs::Limits {
+            compaction_tokens: Some(
+                args.settings
+                    .compaction_tokens(args.provider.id(), &args.model),
+            ),
+            ..runtime::effective_limits(&args)
+        },
+    });
+    let mut state = active.lock().expect("worker control");
+    let live = state
+        .live_model
+        .as_mut()
+        .filter(|live| live.id == id)
+        .ok_or_else(unavailable)?;
+    live.control.select(selection.clone());
+    live.latest = Some((selection, adapter));
+    live.args = args;
+    // Keep the acknowledgement ordered before the run's settlement event.
+    control_response(
+        "select_live_model",
+        Some(json!(request_id)),
+        Ok(serde_json::Value::Null),
+    );
+    Ok(())
 }
 
 fn control_response(

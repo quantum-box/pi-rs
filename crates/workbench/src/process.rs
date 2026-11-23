@@ -494,8 +494,17 @@ impl Worker {
             Ok(())
         }
     }
-    pub(super) fn control(slot: &mut Option<Self>, args: &Cli, mut request: Value) -> Result<()> {
-        prepare_images(args, &mut request)?;
+    pub(super) fn control(slot: &mut Option<Self>, args: &Cli, request: Value) -> Result<()> {
+        Self::control_with_image_model(slot, args, args, request)
+    }
+
+    pub(super) fn control_with_image_model(
+        slot: &mut Option<Self>,
+        args: &Cli,
+        image_model: &Cli,
+        mut request: Value,
+    ) -> Result<()> {
+        prepare_images(image_model, &mut request)?;
         if slot
             .as_ref()
             .is_none_or(|worker| !worker.matches(args) || worker.session != args.session)
@@ -541,6 +550,13 @@ impl Worker {
         slot.as_mut().expect("shell worker").bashing = true;
         Ok(())
     }
+    pub(super) fn adopt_live_model(&mut self, args: &Cli) {
+        let route = configuration(args);
+        for key in ["provider", "endpoint", "token_fingerprint", "image_profile"] {
+            self.configuration[key] = route[key].clone();
+        }
+    }
+
     pub(super) fn matches(&self, args: &Cli) -> bool {
         self.persistent && self.configuration == configuration(args)
     }
