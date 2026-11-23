@@ -8,8 +8,8 @@ use std::time::Duration;
 use rmcp::{
     RoleClient,
     model::{
-        ClientJsonRpcMessage, ClientRequest, GetMeta, ProgressNotificationParam, ProgressToken,
-        ServerJsonRpcMessage, ServerNotification,
+        ClientJsonRpcMessage, ClientRequest, GetMeta, NumberOrString, ProgressNotificationParam,
+        ProgressToken, ServerJsonRpcMessage, ServerNotification,
     },
     transport::Transport,
 };
@@ -129,7 +129,11 @@ impl<T: Transport<RoleClient>> Transport<RoleClient> for ProgressTransport<T> {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .values()
-                .find(|call| call.token.as_ref() == Some(&progress.params.progress_token))
+                .find(|call| {
+                    call.token
+                        .as_ref()
+                        .is_some_and(|token| token_matches(token, &progress.params.progress_token))
+                })
         {
             active.updates.send_if_modified(|update| {
                 let now = Instant::now();
@@ -147,6 +151,15 @@ impl<T: Transport<RoleClient>> Transport<RoleClient> for ProgressTransport<T> {
     async fn close(&mut self) -> Result<(), Self::Error> {
         self.inner.close().await
     }
+}
+
+fn token_matches(assigned: &ProgressToken, echoed: &ProgressToken) -> bool {
+    assigned == echoed
+        || matches!(
+            (&assigned.0, &echoed.0),
+            (NumberOrString::Number(number), NumberOrString::String(text))
+                if *number >= 0 && text.as_ref() == number.to_string()
+        )
 }
 
 pub(super) async fn wait_for_idle(mut updates: Updates) {
