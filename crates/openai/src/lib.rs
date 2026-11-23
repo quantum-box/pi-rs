@@ -4,6 +4,7 @@
 mod codex_ws;
 mod grammar;
 pub mod oauth;
+mod transcript_tools;
 
 use base64::Engine;
 use eventsource_stream::{EventStreamError, Eventsource};
@@ -24,6 +25,24 @@ pub const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/response
 pub const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const MAX_STREAM: usize = 32 * 1024 * 1024;
 const NAMESPACE: &str = "pi";
+
+fn openai_http_client(
+    timeout: Option<std::time::Duration>,
+    proxies: &[reqwest::Proxy],
+) -> Result<Client> {
+    let mut builder = Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(timeout) = timeout {
+        builder = builder.read_timeout(timeout);
+    }
+    for proxy in proxies {
+        builder = builder.proxy(proxy.clone());
+    }
+    builder
+        .build()
+        .map_err(|_| Error::Config("could not initialize OpenAI client".into()))
+}
 
 type ResponseEvents = BoxStream<'static, Result<Value>>;
 
@@ -116,6 +135,8 @@ pub struct OpenAiResponses {
     deployments: Arc<BTreeMap<String, String>>,
     codex_account: Option<String>,
     codex_transport: CodexTransport,
+    websocket_client: Option<Client>,
+    websocket_connect_timeout: Option<std::time::Duration>,
     idle_timeout: Option<std::time::Duration>,
     codex_off_effort: Option<String>,
     thinking: Option<String>,
@@ -136,6 +157,9 @@ pub struct OpenAiResponses {
     use_developer_role: bool,
     mid_conversation_system_models: BTreeMap<String, bool>,
     mid_conversation_system_default: bool,
+    transcript_tools_default: (bool, bool),
+    transcript_tools_models: BTreeMap<String, (bool, bool)>,
+    tool_transcript: Option<pi_rs_core::BoundToolTranscript>,
 }
 
 /// A Responses request whose wire tools and effective sampling are fixed.
@@ -149,6 +173,7 @@ pub struct PreparedResponsesRequest {
 
 #[derive(Default)]
 struct ResponsesTools {
+    source: Vec<pi_rs_core::ToolDeclaration>,
     declarations: Vec<Value>,
     grammar_inputs: BTreeMap<String, String>,
 }
@@ -291,22 +316,24 @@ impl OpenAiResponses {
         timeout: Option<std::time::Duration>,
         proxies: &[reqwest::Proxy],
     ) -> Result<Self> {
-        let mut builder = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none());
-        if let Some(timeout) = timeout {
-            builder = builder.read_timeout(timeout);
-        }
-        for proxy in proxies {
-            builder = builder.proxy(proxy.clone());
-        }
+        // Keep the WebSocket opening deadline separate from the HTTP
+        // header timeout and the idle timeout after the upgrade.
+        self.websocket_client = if self.codex_account.is_some() && timeout.is_some() {
+            Some(openai_http_client(None, proxies)?)
+        } else {
+            None
+        };
         self.idle_timeout = timeout;
         self.identity_safe_transport = proxies.is_empty();
-        self.client = builder
-            .build()
-            .map_err(|_| Error::Config("could not initialize OpenAI client".into()))?;
+        self.client = openai_http_client(timeout, proxies)?;
         Ok(self)
     }
+    /// Configure the Codex WebSocket opening deadline. `None` disables it.
+    pub fn with_websocket_connect_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.websocket_connect_timeout = timeout.filter(|timeout| !timeout.is_zero());
+        self
+    }
+
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
         Self::create(endpoint, token, true)
     }
@@ -391,11 +418,7 @@ impl OpenAiResponses {
         if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
             return Err(Error::Config("invalid OpenAI bearer token".into()));
         }
-        let client = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| Error::Config("could not initialize OpenAI client".into()))?;
+        let client = openai_http_client(None, &[])?;
         Ok(Self {
             client,
             endpoint,
@@ -406,6 +429,8 @@ impl OpenAiResponses {
             deployments: Arc::default(),
             codex_account: None,
             codex_transport: CodexTransport::default(),
+            websocket_client: None,
+            websocket_connect_timeout: Some(codex_ws::DEFAULT_CONNECT_TIMEOUT),
             idle_timeout: None,
             codex_off_effort: None,
             thinking: None,
@@ -427,7 +452,144 @@ impl OpenAiResponses {
             use_developer_role: false,
             mid_conversation_system_models: BTreeMap::new(),
             mid_conversation_system_default: false,
+            transcript_tools_default: (false, false),
+            transcript_tools_models: BTreeMap::new(),
+            tool_transcript: None,
         })
+    }
+
+    /// Resolve additional-tools and tool-search support on the active route.
+    pub fn with_transcript_tools_policy(
+        mut self,
+        default: (bool, bool),
+        models: BTreeMap<String, (bool, bool)>,
+    ) -> Self {
+        self.transcript_tools_default = default;
+        self.transcript_tools_models = models;
+        self
+    }
+
+    pub fn supports_tool_transcript(&self, model: &str) -> bool {
+        self.transcript_tool_mode(model) != transcript_tools::Mode::TopLevel
+    }
+
+    /// Bind tool changes to an adapter prepared for a single conversation request.
+    pub fn with_tool_transcript(
+        mut self,
+        request: &ModelRequest,
+        changes: &[pi_rs_core::ToolTranscriptChange],
+    ) -> Self {
+        self.tool_transcript =
+            if changes.is_empty() || !self.supports_tool_transcript(&request.model) {
+                None
+            } else {
+                pi_rs_core::BoundToolTranscript::bind(request, changes)
+            };
+        self
+    }
+
+    fn transcript_tool_mode(&self, model: &str) -> transcript_tools::Mode {
+        // A ChatGPT plan namespace uses a different declaration shape.
+        if self.provider == "openai-chatgpt" || !self.supports_mid_conversation_system(model) {
+            return transcript_tools::Mode::TopLevel;
+        }
+        let (additional, search) = self
+            .transcript_tools_models
+            .get(model)
+            .copied()
+            .unwrap_or(self.transcript_tools_default);
+        transcript_tools::Mode::from_capabilities(true, additional, search)
+    }
+
+    fn tool_projection(
+        &self,
+        request: &ModelRequest,
+        traits: &ResponsesTools,
+        instruction_role: &str,
+    ) -> Option<transcript_tools::WireProjection> {
+        let mode = self.transcript_tool_mode(&request.model);
+        let changes = self.tool_transcript.as_ref()?.changes_for(request)?;
+        if mode == transcript_tools::Mode::TopLevel {
+            return None;
+        }
+        let encode = |declaration: &pi_rs_core::ToolDeclaration| {
+            let spec = &declaration.spec;
+            let prepared = traits.source.iter().position(|tool| tool == declaration);
+            let (mut wire, property) = if let Some(index) = prepared {
+                (
+                    traits.declarations[index].clone(),
+                    traits.grammar_inputs.get(&spec.name).cloned(),
+                )
+            } else {
+                let compiled = resolve_responses_wire_tool(
+                    declaration,
+                    self.strict_tool_support,
+                    self.has_implicit_strict_tools(),
+                    self.supports_grammar_tools(),
+                );
+                // A historical tool is context only. Required constraints that
+                // cannot run on the selected route still have a plain declaration.
+                compiled.map_or_else(
+                    |_| (unconstrained_wire_tool(spec), None),
+                    |(wire, sampling)| match sampling {
+                        pi_rs_core::EffectiveToolSampling::OpenAiGrammar {
+                            input_property, ..
+                        } => (wire, Some(input_property)),
+                        _ => (wire, None),
+                    },
+                )
+            };
+            if self.codex_account.is_some()
+                && !self.strict_tool_support
+                && !self.has_implicit_strict_tools()
+                && let Some(object) = wire.as_object_mut()
+            {
+                object.remove("strict");
+            }
+            (wire, property)
+        };
+        Some(transcript_tools::wire_projection(
+            transcript_tools::plan(mode, changes, &traits.source),
+            mode,
+            instruction_role,
+            matches!(request.messages.first(), Some(Message::System { .. })),
+            encode,
+        ))
+    }
+
+    fn transcript_payload(
+        &self,
+        request: &ModelRequest,
+        tools: &ResponsesTools,
+        instruction_role: &str,
+    ) -> Result<Option<Value>> {
+        let Some(projection) = self.tool_projection(request, tools, instruction_role) else {
+            return Ok(None);
+        };
+        let grammar = projection.grammar_calls(&request.messages);
+        let replay_provider = self.replay_provider(&request.model);
+        let edited_scope =
+            pi_rs_core::endpoint_replay_scope(&replay_provider, self.endpoint.as_str());
+        let mut body = responses_payload(
+            request,
+            &replay_provider,
+            &edited_scope,
+            instruction_role,
+            self.api(),
+            ResponsesProjection {
+                supports_mid_conversation_system: true,
+                active_effort: self.configuration_update_effort(&request.model),
+                tools: Some(projection),
+            },
+        );
+        grammar::project_input(
+            request,
+            &mut body["input"],
+            &tools.grammar_inputs,
+            None,
+            Some(&grammar),
+        )?;
+        Ok(Some(body))
     }
 
     /// Set the API version and model-to-deployment map for Azure Responses.
@@ -899,7 +1061,7 @@ pub fn codex_account_id(token: &str) -> Option<String> {
 fn responses_transcript(
     messages: &[Message],
     supports_mid_conversation_system: bool,
-) -> impl Iterator<Item = Cow<'_, Message>> {
+) -> impl Iterator<Item = (Option<usize>, Cow<'_, Message>)> {
     let leading = (!supports_mid_conversation_system)
         .then(|| {
             messages
@@ -912,15 +1074,99 @@ fn responses_transcript(
                 .join("\n\n")
         })
         .filter(|content| !content.is_empty())
-        .map(|content| Cow::Owned(Message::System { content }));
+        .map(|content| (None, Cow::Owned(Message::System { content })));
     leading.into_iter().chain(
         messages
             .iter()
-            .filter(move |message| {
+            .enumerate()
+            .filter(move |(_, message)| {
                 supports_mid_conversation_system || !matches!(message, Message::System { .. })
             })
-            .map(Cow::Borrowed),
+            .map(|(index, message)| (Some(index), Cow::Borrowed(message))),
     )
+}
+
+fn codex_sse_error_details(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    complete: bool,
+    secrets: &[String],
+) -> Result<(Value, pi_rs_core::ProviderLimitInfo)> {
+    let info = pi_rs_core::provider_limit_info_from_bytes(body, complete, secrets);
+    if info.permanent {
+        return Err(responses_limit_error(status, info));
+    }
+    let error = serde_json::from_slice(body).unwrap_or_else(|_| {
+        let text = String::from_utf8_lossy(body);
+        if !complete || text.trim_start().starts_with(['{', '[']) {
+            Value::Null
+        } else {
+            Value::String(text.into_owned())
+        }
+    });
+    if status.is_client_error()
+        && status.as_u16() != 429
+        && pi_rs_core::provider_context_overflow(&error, secrets)
+    {
+        return Err(Error::Model("context window exceeded".into()));
+    }
+    Ok((error, info))
+}
+
+fn responses_limit_error(
+    status: reqwest::StatusCode,
+    info: pi_rs_core::ProviderLimitInfo,
+) -> Error {
+    if info.permanent {
+        match info.recognized_code {
+            Some(code @ "subscription_sharing_usage_limit_exceeded") => {
+                response_error(Some(code), Some(status))
+            }
+            _ => Error::Model("OpenAI account quota or billing limit reached".into()),
+        }
+    } else if info.recognized_code.is_some() {
+        response_error(info.recognized_code, Some(status))
+    } else {
+        Error::RetryableModel(format!("OpenAI request failed ({status})"))
+    }
+}
+
+fn codex_sse_transient_message(error: &Value, secrets: &[String]) -> bool {
+    static PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            "(?i)rate.?limit|overloaded|service.?unavailable|upstream.?connect|connection.?refused",
+        )
+        .expect("valid Codex retry pattern")
+    });
+    let sanitized = pi_rs_core::sanitized_provider_error(error, secrets);
+    let error = sanitized.get("error").unwrap_or(&sanitized);
+    if let Some(message) = error.as_str() {
+        return PATTERN.is_match(message);
+    }
+    ["message", "code", "type", "errorMessage"]
+        .into_iter()
+        .filter_map(|key| error[key].as_str())
+        .any(|message| PATTERN.is_match(message))
+}
+
+async fn read_codex_retry_error(mut response: reqwest::Response) -> (Vec<u8>, bool) {
+    const LIMIT: usize = 64 * 1024;
+    let mut body = Vec::new();
+    let complete = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while body.len() < LIMIT {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    body.extend_from_slice(&chunk[..chunk.len().min(LIMIT - body.len())]);
+                }
+                Ok(None) => return true,
+                Err(_) => break,
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    (body, complete)
 }
 
 fn configuration_update(effort: &str) -> Value {
@@ -940,27 +1186,54 @@ fn payload(
         edited_scope,
         instruction_role,
         pi_rs_core::ModelApi::OpenaiResponses,
-        false,
-        None,
+        ResponsesProjection::default(),
     )
 }
 
+#[derive(Default)]
+struct ResponsesProjection<'a> {
+    supports_mid_conversation_system: bool,
+    active_effort: Option<&'a str>,
+    tools: Option<transcript_tools::WireProjection>,
+}
 fn responses_payload(
     request: &ModelRequest,
     provider: &str,
     edited_scope: &str,
     instruction_role: &str,
     api: pi_rs_core::ModelApi,
-    supports_mid_conversation_system: bool,
-    active_effort: Option<&str>,
+    projection: ResponsesProjection<'_>,
 ) -> Value {
+    let ResponsesProjection {
+        supports_mid_conversation_system,
+        active_effort,
+        tools: mut tool_projection,
+    } = projection;
     let codex = api == pi_rs_core::ModelApi::OpenaiCodexResponses;
     let mut input = Vec::new();
-    for message in responses_transcript(&request.messages, supports_mid_conversation_system) {
+    for (index, message) in
+        responses_transcript(&request.messages, supports_mid_conversation_system)
+    {
+        let anchored = index
+            .and_then(|index| tool_projection.as_mut()?.by_message.remove(&index))
+            .unwrap_or_default();
+        input.extend(anchored.before);
+        if !matches!(message.as_ref(), Message::System { .. })
+            && !anchored.removal_notices.is_empty()
+        {
+            input.push(
+                json!({"role":instruction_role,"content":anchored.removal_notices.join("\n\n")}),
+            );
+        }
         match message.as_ref() {
-            Message::System { content } if content.is_empty() => {}
             Message::System { content } => {
-                input.push(json!({"role":instruction_role, "content": content}))
+                let sections: Vec<&str> = std::iter::once(content.as_str())
+                    .chain(anchored.removal_notices.iter().map(String::as_str))
+                    .filter(|section| !section.is_empty())
+                    .collect();
+                if !sections.is_empty() {
+                    input.push(json!({"role":instruction_role, "content":sections.join("\n\n")}));
+                }
             }
             Message::User { content } => input.push(json!({"role":"user", "content": content})),
             Message::UserWithImages { content, images } => {
@@ -1049,6 +1322,17 @@ fn responses_payload(
             }
         }
     }
+    if let Some(anchored) = tool_projection
+        .as_mut()
+        .and_then(|projection| projection.by_message.remove(&request.messages.len()))
+    {
+        input.extend(anchored.before);
+        if !anchored.removal_notices.is_empty() {
+            input.push(
+                json!({"role":instruction_role,"content":anchored.removal_notices.join("\n\n")}),
+            );
+        }
+    }
     if let Some(effort) = active_effort {
         input.push(configuration_update(effort));
     }
@@ -1062,8 +1346,11 @@ fn responses_payload(
     if codex && request.max_output_tokens != 0 {
         body["max_output_tokens"] = json!(request.max_output_tokens);
     }
-    if !request.tools.is_empty() {
-        let tools: Vec<_> = request.tools.iter().map(|tool| json!({"type":"function", "name":tool.name, "description":tool.description, "parameters":tool.parameters, "strict":false})).collect();
+    let tools = tool_projection.map_or_else(
+        || request.tools.iter().map(unconstrained_wire_tool).collect(),
+        |projection| projection.top_level,
+    );
+    if !tools.is_empty() {
         body["tools"] = if provider == "openai-chatgpt" {
             json!([{"type":"namespace", "name":NAMESPACE, "description":"Local tools", "tools":tools}])
         } else {
@@ -1071,6 +1358,13 @@ fn responses_payload(
         };
     }
     body
+}
+
+fn unconstrained_wire_tool(tool: &pi_rs_core::ToolSpec) -> Value {
+    json!({
+        "type":"function", "name":tool.name, "description":tool.description,
+        "parameters":tool.parameters, "strict":false
+    })
 }
 
 fn resolved_constrained_tools(
@@ -1092,66 +1386,85 @@ fn resolved_constrained_tools(
         ));
     }
     let mut wire = ResponsesTools {
+        source: declarations.to_vec(),
         declarations: Vec::with_capacity(declarations.len()),
         ..Default::default()
     };
     let mut effective = Vec::with_capacity(declarations.len());
     for declaration in declarations {
-        let spec = &declaration.spec;
-        if supports_grammar
-            && let Some((syntax, definition, property)) =
-                pi_rs_core::resolve_openai_tool_grammar(declaration)
-                    .map_err(|error| Error::Config(error.to_string()))?
-        {
-            wire.declarations.push(json!({
-                "type":"custom","name":spec.name,"description":spec.description,
-                "format":{"type":"grammar","syntax":syntax,"definition":definition}
-            }));
+        let (tool, sampling) = resolve_responses_wire_tool(
+            declaration,
+            supports_strict,
+            implicit_strict_tools,
+            supports_grammar,
+        )?;
+        if let pi_rs_core::EffectiveToolSampling::OpenAiGrammar { input_property, .. } = &sampling {
             wire.grammar_inputs
-                .insert(spec.name.clone(), property.to_owned());
-            effective.push(pi_rs_core::EffectiveToolDeclaration {
-                spec: spec.clone(),
-                sampling: pi_rs_core::EffectiveToolSampling::OpenAiGrammar {
-                    syntax,
-                    input_property: property.to_owned(),
-                },
-            });
-            continue;
+                .insert(declaration.spec.name.clone(), input_property.clone());
         }
-        let strict_schema = match &declaration.constrained_sampling {
-            Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => {
-                pi_rs_core::resolve_strict_tool_schema(
-                    &spec.name,
-                    &spec.parameters,
-                    *strict,
-                    supports_strict,
-                    |_, _| false,
-                )
-                .map_err(|error| Error::Config(error.to_string()))?
-            }
-            _ => None,
-        };
-        let mut tool = json!({"type":"function","name":spec.name,"description":spec.description,"parameters":strict_schema.as_ref().unwrap_or(&spec.parameters)});
-        if supports_strict || implicit_strict_tools {
-            tool["strict"] = json!(strict_schema.is_some());
-        }
-        let sampling = if strict_schema.is_some() {
-            pi_rs_core::EffectiveToolSampling::StrictJsonSchema {
-                original_schema: spec.parameters.clone(),
-                normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
-            }
-        } else {
-            pi_rs_core::EffectiveToolSampling::Unconstrained
-        };
         wire.declarations.push(tool);
         effective.push(pi_rs_core::EffectiveToolDeclaration {
-            spec: spec.clone(),
+            spec: declaration.spec.clone(),
             sampling,
         });
     }
     pi_rs_core::validate_effective_tool_declarations(request, declarations, &effective)
         .map_err(|error| Error::Config(error.to_string()))?;
     Ok((wire, effective))
+}
+
+fn resolve_responses_wire_tool(
+    declaration: &pi_rs_core::ToolDeclaration,
+    supports_strict: bool,
+    implicit_strict_tools: bool,
+    supports_grammar: bool,
+) -> Result<(Value, pi_rs_core::EffectiveToolSampling)> {
+    use pi_rs_core::{EffectiveToolSampling, ToolConstraint};
+    let spec = &declaration.spec;
+    if supports_grammar
+        && let Some((syntax, definition, property)) =
+            pi_rs_core::resolve_openai_tool_grammar(declaration)
+                .map_err(|error| Error::Config(error.to_string()))?
+    {
+        let tool = json!({
+            "type":"custom","name":spec.name,"description":spec.description,
+            "format":{"type":"grammar","syntax":syntax,"definition":definition}
+        });
+        return Ok((
+            tool,
+            EffectiveToolSampling::OpenAiGrammar {
+                syntax,
+                input_property: property.to_owned(),
+            },
+        ));
+    }
+    let schema = match &declaration.constrained_sampling {
+        Some(ToolConstraint::JsonSchema { strict }) => pi_rs_core::resolve_strict_tool_schema(
+            &spec.name,
+            &spec.parameters,
+            *strict,
+            supports_strict,
+            |_, _| false,
+        )
+        .map_err(|error| Error::Config(error.to_string()))?,
+        _ => None,
+    };
+    let mut tool = json!({
+        "type":"function","name":spec.name,"description":spec.description,
+        "parameters":schema.as_ref().unwrap_or(&spec.parameters)
+    });
+    if supports_strict || implicit_strict_tools {
+        tool["strict"] = json!(schema.is_some());
+    }
+    let sampling = if schema.is_some() {
+        EffectiveToolSampling::StrictJsonSchema {
+            original_schema: spec.parameters.clone(),
+            normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
+        }
+    } else {
+        EffectiveToolSampling::Unconstrained
+    };
+    Ok((tool, sampling))
 }
 
 #[cfg(test)]
@@ -1197,6 +1510,20 @@ fn response_error(code: Option<&str>, status: Option<reqwest::StatusCode>) -> Er
 
 #[async_trait::async_trait]
 impl Model for OpenAiResponses {
+    fn uses_tool_transcript(&self, model: &str) -> bool {
+        self.supports_tool_transcript(model)
+    }
+
+    async fn prepare_context_with_tool_transcript<'a>(
+        &'a self,
+        request: &ModelRequest,
+        tool_transcript: &[pi_rs_core::ToolTranscriptChange],
+    ) -> Result<Option<Arc<dyn Model + 'a>>> {
+        Ok(self.supports_tool_transcript(&request.model).then(|| {
+            Arc::new(self.clone().with_tool_transcript(request, tool_transcript)) as Arc<dyn Model>
+        }))
+    }
+
     fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
         self.supports_mid_conversation_system(model)
     }
@@ -1222,7 +1549,7 @@ impl Model for OpenAiResponses {
         )?))
     }
     fn context_identity(&self) -> Option<String> {
-        if !self.identity_safe_transport {
+        if !self.identity_safe_transport || self.tool_transcript.is_some() {
             return None;
         }
         let mut headers: Vec<_> = self
@@ -1371,6 +1698,20 @@ impl Model for OpenAiResponses {
     }
 
     fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        let role = if self.use_developer_role {
+            "developer"
+        } else {
+            "system"
+        };
+        if let Ok(Some(body)) = self.transcript_payload(request, &ResponsesTools::default(), role) {
+            let input = body["input"]
+                .as_array()
+                .map_or(0, |input| pi_rs_core::estimate_replay_tokens(input));
+            let tools = body["tools"]
+                .as_array()
+                .map_or(0, |tools| pi_rs_core::estimate_replay_tokens(tools));
+            return 8_u64.saturating_add(input).saturating_add(tools);
+        }
         let overhead = pi_rs_core::estimate_request_tokens(&ModelRequest {
             model: request.model.clone(),
             max_output_tokens: request.max_output_tokens,
@@ -1381,6 +1722,7 @@ impl Model for OpenAiResponses {
             &request.messages,
             self.supports_mid_conversation_system(&request.model),
         )
+        .map(|(_, message)| message)
         .filter(|message| {
             !matches!(message.as_ref(), Message::System { content } if content.is_empty())
         }).fold(overhead, |tokens, message| {
@@ -1653,6 +1995,60 @@ impl OpenAiResponses {
         self.stream_enriched_with_tools(request, None).await
     }
 
+    async fn send_codex_sse<Attempt>(
+        &self,
+        mut attempt: impl FnMut() -> Attempt,
+        error_secrets: &[String],
+    ) -> Result<reqwest::Response>
+    where
+        Attempt: Future<Output = Result<reqwest::Response>>,
+    {
+        let retry = self.provider_retry;
+        for index in 0..=retry.max_retries {
+            let result = match retry.timeout.filter(|timeout| !timeout.is_zero()) {
+                Some(timeout) => tokio::time::timeout(timeout, attempt())
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Error::RetryableModel(format!(
+                            "Codex SSE response headers timed out after {}ms",
+                            timeout.as_millis()
+                        )))
+                    }),
+                None => attempt().await,
+            };
+            if index == retry.max_retries {
+                return result;
+            }
+            let delay = match result {
+                Ok(response) if response.status().is_success() => return Ok(response),
+                Ok(response) => {
+                    let status = response.status();
+                    let headers = response.headers().clone();
+                    pi_rs_core::observe_provider_response(
+                        status,
+                        &headers,
+                        error_secrets,
+                        &self.headers,
+                    )
+                    .await;
+                    if status.as_u16() == 413 {
+                        return Err(Error::Model("413 request too large".into()));
+                    }
+                    let (body, complete) = read_codex_retry_error(response).await;
+                    let (error, _) =
+                        codex_sse_error_details(status, &body, complete, error_secrets)?;
+                    let use_server_delay = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+                        || codex_sse_transient_message(&error, error_secrets);
+                    retry.codex_sse_delay(use_server_delay.then_some(&headers), index)?
+                }
+                Err(Error::RetryableModel(_)) => retry.codex_sse_delay(None, index)?,
+                Err(error) => return Err(error),
+            };
+            tokio::time::sleep(delay).await;
+        }
+        unreachable!("the last request returns its result")
+    }
+
     async fn open_sse(
         &self,
         body: &Value,
@@ -1700,27 +2096,31 @@ impl OpenAiResponses {
             None => request.json(body),
         };
         let request = request.header(reqwest::header::ACCEPT, "text/event-stream");
-        let retry = if self.codex_account.is_some() || self.provider == "openai-chatgpt" {
-            pi_rs_core::ProviderRetry::default()
-        } else {
-            self.provider_retry
+        let attempt = || {
+            let request = request
+                .try_clone()
+                .ok_or_else(|| Error::Config("OpenAI request cannot be replayed".into()));
+            async {
+                request?
+                    .send()
+                    .await
+                    .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))
+            }
         };
-        let mut response = retry
-            .send(
-                || {
-                    let request = request
-                        .try_clone()
-                        .ok_or_else(|| Error::Config("OpenAI request cannot be replayed".into()));
-                    async {
-                        request?
-                            .send()
-                            .await
-                            .map_err(|_| Error::RetryableModel("OpenAI request failed".into()))
-                    }
-                },
-                |response| (response.status().as_u16(), response.headers()),
-            )
-            .await?;
+        let mut response = if self.codex_account.is_some() {
+            self.send_codex_sse(attempt, error_secrets).await?
+        } else {
+            let retry = if self.provider == "openai-chatgpt" {
+                pi_rs_core::ProviderRetry::default()
+            } else {
+                self.provider_retry
+            };
+            retry
+                .send(attempt, |response| {
+                    (response.status().as_u16(), response.headers())
+                })
+                .await?
+        };
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
@@ -1733,20 +2133,23 @@ impl OpenAiResponses {
             if status.as_u16() == 413 {
                 return Err(Error::Model("413 request too large".into()));
             }
+            if self.codex_account.is_some() {
+                let (body, complete) = read_codex_retry_error(response).await;
+                let (error, info) =
+                    codex_sse_error_details(status, &body, complete, error_secrets)?;
+                if status.as_u16() == 429 || status.is_server_error() {
+                    return Err(responses_limit_error(status, info));
+                }
+                let error = pi_rs_core::sanitized_provider_error(&error, error_secrets);
+                return Err(response_error(
+                    error["error"]["code"].as_str(),
+                    Some(status),
+                ));
+            }
             if status.as_u16() == 429 || status.is_server_error() {
                 let info =
                     pi_rs_core::provider_limit_info(response.bytes_stream(), error_secrets).await;
-                return Err(if info.permanent {
-                    if info.recognized_code == Some("subscription_sharing_usage_limit_exceeded") {
-                        response_error(info.recognized_code, Some(status))
-                    } else {
-                        Error::Model("OpenAI account quota or billing limit reached".into())
-                    }
-                } else if info.recognized_code.is_some() {
-                    response_error(info.recognized_code, Some(status))
-                } else {
-                    Error::RetryableModel(format!("OpenAI request failed ({status})"))
-                });
+                return Err(responses_limit_error(status, info));
             }
             let mut bytes = Vec::new();
             while let Ok(Some(chunk)) = response.chunk().await {
@@ -1839,19 +2242,45 @@ impl OpenAiResponses {
             return Err(Error::Budget);
         }
         let active_effort = self.configuration_update_effort(&model).map(str::to_owned);
-        let mut body = responses_payload(
-            &request,
-            &replay_provider,
-            &edited_scope,
-            if self.use_developer_role {
-                "developer"
-            } else {
-                "system"
-            },
-            api,
-            self.supports_mid_conversation_system(&model),
-            active_effort.as_deref(),
-        );
+        let instruction_role = if self.use_developer_role {
+            "developer"
+        } else {
+            "system"
+        };
+        let tools = tools.unwrap_or_default();
+        let mut body = if let Some(body) =
+            self.transcript_payload(&request, &tools, instruction_role)?
+        {
+            body
+        } else {
+            let mut body = responses_payload(
+                &request,
+                &replay_provider,
+                &edited_scope,
+                instruction_role,
+                api,
+                ResponsesProjection {
+                    supports_mid_conversation_system: self.supports_mid_conversation_system(&model),
+                    active_effort: active_effort.as_deref(),
+                    ..Default::default()
+                },
+            );
+            grammar::project_input(
+                &request,
+                &mut body["input"],
+                &tools.grammar_inputs,
+                (self.provider == "openai-chatgpt").then_some(NAMESPACE),
+                None,
+            )?;
+            if !tools.declarations.is_empty() {
+                body["tools"] = if self.provider == "openai-chatgpt" {
+                    json!([{"type":"namespace","name":NAMESPACE,"description":"Local tools","tools":tools.declarations}])
+                } else {
+                    json!(tools.declarations)
+                };
+            }
+            body
+        };
         if self.azure_api_version.is_some() {
             if let Some(deployment) = self.deployments.get(&model) {
                 body["model"] = json!(deployment);
@@ -1861,20 +2290,6 @@ impl OpenAiResponses {
                     .expect("Responses request object")
                     .remove("max_output_tokens");
             }
-        }
-        let tools = tools.unwrap_or_default();
-        grammar::project_input(
-            &request,
-            &mut body["input"],
-            &tools.grammar_inputs,
-            (self.provider == "openai-chatgpt").then_some(NAMESPACE),
-        )?;
-        if !tools.declarations.is_empty() {
-            body["tools"] = if self.provider == "openai-chatgpt" {
-                json!([{"type":"namespace","name":NAMESPACE,"description":"Local tools","tools":tools.declarations}])
-            } else {
-                json!(tools.declarations)
-            };
         }
         let provider = self.provider.clone();
         if let Some(effort) = active_effort
@@ -1936,7 +2351,7 @@ impl OpenAiResponses {
             let affinity_session = session.filter(|_| self.cache_retention != CacheRetention::None);
             codex_ws::open(
                 codex_ws::Request {
-                    client: &self.client,
+                    client: self.websocket_client.as_ref().unwrap_or(&self.client),
                     endpoint: &self.endpoint,
                     headers: &self.headers,
                     token: &self.token,
@@ -1944,6 +2359,7 @@ impl OpenAiResponses {
                     error_secrets: &error_secrets,
                     session,
                     affinity_session,
+                    connect_timeout: self.websocket_connect_timeout,
                     timeout: self.idle_timeout,
                     reuse_connection: self.identity_safe_transport && affinity_session.is_some(),
                     cache_context: matches!(
@@ -2173,6 +2589,200 @@ impl OpenAiResponses {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn codex_sse_retries_transient_errors_and_preserves_terminal_limits() {
+        for (max_retries, status, retry_headers, body, attempts) in [
+            (
+                0,
+                503,
+                "Retry-After-Ms: 0\r\n",
+                r#"{"error":{"code":"server_error"}}"#,
+                1,
+            ),
+            (
+                1,
+                503,
+                "Retry-After-Ms: 0\r\nX-Should-Retry: false\r\n",
+                r#"{"error":{"code":"server_error"}}"#,
+                2,
+            ),
+            (
+                1,
+                503,
+                "Retry-After: 61\r\n",
+                r#"{"error":{"code":"server_error"}}"#,
+                1,
+            ),
+            (
+                1,
+                429,
+                "Retry-After-Ms: 0\r\n",
+                r#"{"error":{"code":"insufficient_quota"}}"#,
+                1,
+            ),
+            (
+                1,
+                401,
+                "Retry-After: 61\r\n",
+                r#"{"error":{"code":"server_error"}}"#,
+                2,
+            ),
+        ] {
+            assert_codex_sse_retry(max_retries, status, retry_headers, body, attempts).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_sse_limits_preserve_bounded_quota_and_error_message_hints() {
+        let oversized = format!(
+            r#"{{"error":{{"code":"insufficient_quota"}},"metadata":"{}"}}"#,
+            "X".repeat(64 * 1024),
+        );
+        assert_codex_sse_retry(1, 429, "Retry-After-Ms: 0\r\n", &oversized, 1).await;
+        assert_codex_sse_retry(
+            1,
+            400,
+            "Retry-After: 61\r\n",
+            r#"{"error":{"errorMessage":"service unavailable"}}"#,
+            1,
+        )
+        .await;
+        assert_codex_sse_retry(
+            1, 429, "Retry-After-Ms: 0\r\n",
+            r#"{"error":{"code":"subscription_sharing_usage_unavailable","message":"billing limit reached"}}"#,
+            1,
+        ).await;
+        assert_codex_sse_retry(
+            1,
+            400,
+            "Retry-After-Ms: 0\r\n",
+            r#"{"error":{"code":"context_length_exceeded"}}"#,
+            1,
+        )
+        .await;
+        assert_codex_sse_retry(
+            0, 400, "",
+            r#"{"error":{"code":"subscription_sharing_usage_unavailable","message":"billing limit reached"}}"#,
+            1,
+        ).await;
+        assert_codex_sse_retry(0, 400, "", "prompt is too long", 1).await;
+    }
+
+    #[tokio::test]
+    async fn codex_sse_attempt_timeout_does_not_require_retries() {
+        let account = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}"#);
+        let client = OpenAiResponses::new_codex(
+            "http://127.0.0.1:1/backend-api/codex/responses",
+            format!("e30.{account}.fixture"),
+            "openai-codex",
+        )
+        .unwrap()
+        .with_provider_retry(pi_rs_core::ProviderRetry {
+            timeout: Some(std::time::Duration::from_millis(1)),
+            ..Default::default()
+        });
+        let error = client
+            .send_codex_sse(std::future::pending, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableModel(message) if message.contains("response headers timed out"))
+        );
+    }
+
+    async fn assert_codex_sse_retry(
+        max_retries: u32,
+        status: u16,
+        retry_headers: &str,
+        error_body: &str,
+        expected_requests: usize,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/backend-api/codex/responses",
+            listener.local_addr().unwrap()
+        );
+        let first_reply = format!(
+            "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\n{retry_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{error_body}",
+            error_body.len(),
+        );
+        let server = tokio::spawn(async move {
+            let answer = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+            let second_reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+            for index in 0..expected_requests {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let reply = if index == 0 {
+                    &first_reply
+                } else {
+                    &second_reply
+                };
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+            // Keep the listener open long enough to catch an unexpected request.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let account = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}"#);
+        let client =
+            OpenAiResponses::new_codex(&endpoint, format!("e30.{account}.fixture"), "openai-codex")
+                .unwrap()
+                .with_codex_transport(CodexTransport::Sse)
+                .with_provider_retry(pi_rs_core::ProviderRetry {
+                    max_retries,
+                    ..Default::default()
+                });
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::User {
+                content: "hello".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 32,
+        };
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(4), client.stream(request))
+                .await
+                .unwrap();
+        if expected_requests == 2 {
+            let events = result.unwrap().collect::<Vec<_>>().await;
+            assert!(
+                events
+                    .into_iter()
+                    .any(|event| matches!(event, Ok(ModelEvent::Complete { .. })))
+            );
+        } else {
+            let Err(error) = result else {
+                panic!("expected to fail before streaming");
+            };
+            if retry_headers.contains("61") {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Server requested 61s retry delay")
+                );
+            } else if status == 429 || error_body.contains("billing limit reached") {
+                assert!(
+                    matches!(error, Error::Model(message) if message.contains("quota or billing"))
+                );
+            } else if error_body.contains("context_length_exceeded")
+                || error_body == "prompt is too long"
+            {
+                assert!(error.to_string().contains("context window exceeded"));
+            }
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn codex_sse_uses_subscription_headers_payload_and_completion_alias() {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2314,7 +2924,17 @@ mod tests {
             max_output_tokens: 64,
         };
         let make = |api, support| {
-            responses_payload(&request, "openai", "", "developer", api, support, None)
+            responses_payload(
+                &request,
+                "openai",
+                "",
+                "developer",
+                api,
+                ResponsesProjection {
+                    supports_mid_conversation_system: support,
+                    ..Default::default()
+                },
+            )
         };
         let folded = make(pi_rs_core::ModelApi::OpenaiResponses, false);
         assert_eq!(
@@ -2358,15 +2978,34 @@ mod tests {
             max_output_tokens: 64,
         };
         for support in [false, true] {
-            let body =
-                responses_payload(&request, "openai-codex", "", "system", api, support, None);
+            let body = responses_payload(
+                &request,
+                "openai-codex",
+                "",
+                "system",
+                api,
+                ResponsesProjection {
+                    supports_mid_conversation_system: support,
+                    ..Default::default()
+                },
+            );
             assert!(body.get("instructions").is_none());
             assert_eq!(body["input"], json!([{"role":"user","content":"ask"}]));
         }
         request.messages[0] = Message::System {
             content: "rules".into(),
         };
-        let body = responses_payload(&request, "openai-codex", "", "system", api, true, None);
+        let body = responses_payload(
+            &request,
+            "openai-codex",
+            "",
+            "system",
+            api,
+            ResponsesProjection {
+                supports_mid_conversation_system: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(body["input"][0], json!({"role":"system","content":"rules"}));
     }
 
@@ -3946,6 +4585,7 @@ mod tests {
             &mut body["input"],
             &BTreeMap::from([("read".into(), "path".into())]),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(body["input"][2], item);
@@ -3955,7 +4595,7 @@ mod tests {
         );
 
         let mut body = payload(&req, "openai", "openai", "system");
-        grammar::project_input(&req, &mut body["input"], &BTreeMap::new(), None).unwrap();
+        grammar::project_input(&req, &mut body["input"], &BTreeMap::new(), None, None).unwrap();
         assert_eq!(
             body["input"][2],
             json!({"type":"function_call","call_id":"c1","name":"read","arguments":fragments})
@@ -4053,6 +4693,7 @@ mod tests {
             &req,
             &mut body["input"],
             &BTreeMap::from([("read".into(), "path".into())]),
+            None,
             None,
         )
         .unwrap();
@@ -4821,8 +5462,10 @@ mod tests {
                 "fixture",
                 "system",
                 pi_rs_core::ModelApi::OpenaiResponses,
-                false,
-                Some("low"),
+                ResponsesProjection {
+                    active_effort: Some("low"),
+                    ..Default::default()
+                },
             );
             assert_eq!(
                 body["input"],
@@ -5140,8 +5783,11 @@ mod tests {
                 "route",
                 role,
                 pi_rs_core::ModelApi::OpenaiCodexResponses,
-                true,
-                Some("high"),
+                ResponsesProjection {
+                    supports_mid_conversation_system: true,
+                    active_effort: Some("high"),
+                    ..ResponsesProjection::default()
+                },
             );
             assert!(body.get("instructions").is_none());
             assert_eq!(
@@ -5181,8 +5827,10 @@ mod tests {
             "route",
             "developer",
             pi_rs_core::ModelApi::OpenaiResponses,
-            false,
-            Some("high"),
+            ResponsesProjection {
+                active_effort: Some("high"),
+                ..Default::default()
+            },
         );
         assert_eq!(
             body["input"],
