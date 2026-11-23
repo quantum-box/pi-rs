@@ -43,3 +43,9 @@ chat does not provide filesystem or shell tools.
 The UI uses React, Vite, Tailwind and installed AI Elements components. To
 rebuild the UI after editing it, run `npm ci && npm run build` in this directory.
 `build.sh` builds both the UI and the browser SDK from the repository root.
+It builds the preview SDK in release mode and checks every output file against
+the Cloudflare Pages 25 MiB per-file limit. CI also exercises the generated
+SDK in Chrome. Set `PI_PREVIEW_USE_EXISTING_TOOLCHAIN=1` to use an already
+installed Rust 1.89.0, WASM target, and wasm-bindgen-cli 0.2.130.
+CI also opens the built preview in Chrome and exercises its browser-model
+worker with stubbed model runtimes, without downloading a model or using a GPU.
