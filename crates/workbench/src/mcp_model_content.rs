@@ -57,6 +57,12 @@ fn mcp_tool_name<'a>(name: &'a str, readable: &BTreeMap<&str, &str>) -> Option<(
             return Some((prefix, &suffix[2..]));
         }
     }
+    if let Some((separator, _)) = name
+        .rmatch_indices("__")
+        .find(|(index, _)| is_resource_read(&name[index + 2..]))
+    {
+        return Some((&name[..separator], &name[separator + 2..]));
+    }
     let (server, tool) = name.strip_prefix("mcp__")?.split_once("__")?;
     Some((&name[..5 + server.len()], tool))
 }
@@ -93,17 +99,6 @@ fn project_result(
             .map(|block| project_block(block, server, read_tool))
             .collect()
     };
-    if let Some(data) = response.get("structuredContent")
-        && !projected.iter().any(|block| {
-            block["text"]
-                .as_str()
-                .and_then(|body| serde_json::from_str::<Value>(body).ok())
-                .as_ref()
-                == Some(data)
-        })
-    {
-        projected.push(text(serde_json::to_string_pretty(data).ok()?));
-    }
     if response["isError"] == true {
         // Some provider tool-result formats have no separate error field.
         projected.insert(
@@ -111,14 +106,37 @@ fn project_result(
             text(format!("MCP tool {server}/{tool} returned an error")),
         );
     }
-    let has_structured_blocks = projected.iter().any(|block| block["type"] != "text");
-    let output = if has_structured_blocks {
+    let distinct_data = response.get("structuredContent").filter(|data| {
+        !projected.iter().any(|block| {
+            block["text"]
+                .as_str()
+                .and_then(|body| serde_json::from_str::<Value>(body).ok())
+                .as_ref()
+                == Some(*data)
+        })
+    });
+    if let Some(data) = distinct_data {
+        projected.push(text(serde_json::to_string_pretty(data).ok()?));
+        let (output, structured) = encode_blocks(&projected);
+        if output.len() <= MAX_MODEL_CONTENT_BYTES {
+            return Some((output, structured));
+        }
+        *projected.last_mut().expect("structured content added") = text(data.to_string());
+    }
+    let (output, structured) = encode_blocks(&projected);
+    (output.len() <= MAX_MODEL_CONTENT_BYTES).then_some((output, structured))
+}
+
+fn encode_blocks(projected: &[Value]) -> (String, bool) {
+    if projected.iter().any(|block| block["type"] != "text") {
         // Provider adapters recognize images in the native structured tool envelope.
-        json!({"data":{"content":projected},"attachments":[]}).to_string()
+        (
+            json!({"data":{"content":projected},"attachments":[]}).to_string(),
+            true,
+        )
     } else {
-        joined_text(&projected)
-    };
-    (output.len() <= MAX_MODEL_CONTENT_BYTES).then_some((output, has_structured_blocks))
+        (joined_text(projected), false)
+    }
 }
 
 fn project_block(block: &Value, server: &str, read_tool: Option<&str>) -> Value {
@@ -319,6 +337,24 @@ mod tests {
         assert!(caption.contains("caption"));
         assert!(!caption.contains("YQ=="));
         assert!(caption.contains("dGVzdA=="));
+    }
+
+    #[test]
+    fn mcp_model_content_compacts_large_structured_data_and_recognizes_historical_reads() {
+        assert_eq!(
+            mcp_tool_name("mcp__foo__bar__read_resource_resource", &BTreeMap::new()),
+            Some(("mcp__foo__bar", "read_resource_resource"))
+        );
+        let data =
+            json!({"large":("a".repeat(MAX_MODEL_CONTENT_BYTES - 4096)), "array": vec![0; 1000]});
+        let original = tool_content(json!({
+            "content":[{"type":"resource","resource":{"uri":"mock://notes","text":"notes"}}],
+            "structuredContent":data
+        }));
+        let (output, structured) = project_result(&original, "fixture", "get", None).unwrap();
+        assert!(!structured);
+        assert_eq!(output, format!("notes\n{data}"));
+        assert!(output.len() <= MAX_MODEL_CONTENT_BYTES);
     }
 
     #[test]
