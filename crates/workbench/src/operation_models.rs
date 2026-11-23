@@ -1024,7 +1024,13 @@ impl Entry {
 #[derive(Clone)]
 pub(super) struct Operations {
     args: Cli,
-    client: Arc<RwLock<reqwest::Client>>,
+    http: Arc<RwLock<HttpOptions>>,
+}
+
+#[derive(Clone)]
+struct HttpOptions {
+    client: reqwest::Client,
+    settings: super::config::Settings,
 }
 
 impl Operations {
@@ -1033,22 +1039,25 @@ impl Operations {
     }
 
     fn with_client(args: Cli, client: reqwest::Client) -> Self {
+        let settings = args.settings.clone();
         Self {
             args,
-            client: Arc::new(RwLock::new(client)),
+            http: Arc::new(RwLock::new(HttpOptions { client, settings })),
         }
     }
 
     pub(super) fn update_http_client(&self, args: &Cli) -> Result<()> {
         let client = Self::http_client(args)?;
-        *self.client.write().expect("model operation HTTP client") = client;
+        let settings = args.settings.clone();
+        *self.http.write().expect("model operation HTTP options") =
+            HttpOptions { client, settings };
         Ok(())
     }
 
-    fn current_client(&self) -> reqwest::Client {
-        self.client
+    fn current_http(&self) -> HttpOptions {
+        self.http
             .read()
-            .expect("model operation HTTP client")
+            .expect("model operation HTTP options")
             .clone()
     }
 
@@ -1087,7 +1096,7 @@ impl Operations {
             None => None,
         };
         let cache = super::config::agent_dir().join("llama-classifier-models.json");
-        let client = (!self.args.offline).then(|| self.current_client());
+        let client = (!self.args.offline).then(|| self.current_http().client);
         let discovered =
             llama_discovery::catalogue(client.as_ref(), &root, key.as_deref(), cache).await;
         let configured = &mut self.args.model_profiles.operations_mut().0;
@@ -1374,11 +1383,11 @@ impl Operations {
         let resolved = entry.resolved_cloudflare(keys)?;
         let entry = &resolved;
         initialize_result(entry, data);
-        let client = self.current_client();
+        let HttpOptions { client, settings } = self.current_http();
         let (payload, image_opt_in) = match entry.api {
             Api::LlamaCppClassifier => {
                 let questions = llama_cpp::prepare(context)?;
-                let (_, headers) = self.request_target(entry, keys).await?;
+                let (_, headers) = self.request_target(entry, keys, &settings).await?;
                 data["answers"] = llama_cpp::classify(&client, entry, &headers, questions).await?;
                 return Ok(());
             }
@@ -1386,7 +1395,7 @@ impl Operations {
             Api::OpenAiDecisions => (decisions::payload(entry, context)?, false),
             Api::OpenRouterImages => (image_payload(entry, context)?, false),
         };
-        let (endpoint, mut headers) = self.request_target(entry, keys).await?;
+        let (endpoint, mut headers) = self.request_target(entry, keys, &settings).await?;
         // Pi adds the automatic classifier image opt-in as request options,
         // after provider and model headers have been combined.
         if image_opt_in {
@@ -1428,7 +1437,12 @@ impl Operations {
         Ok(())
     }
 
-    async fn request_target(&self, entry: &Entry, keys: &Keys) -> Result<(Url, HeaderMap)> {
+    async fn request_target(
+        &self,
+        entry: &Entry,
+        keys: &Keys,
+        settings: &super::config::Settings,
+    ) -> Result<(Url, HeaderMap)> {
         let credential_env = keys.operation_environment(
             &entry.provider,
             entry.endpoint.as_str(),
@@ -1438,8 +1452,7 @@ impl Operations {
         let mut headers = HeaderMap::new();
         if let Some(credential) = entry.credential(keys) {
             let key = if matches!(credential, Credential::Copilot) {
-                let credential =
-                    super::copilot_auth::credential(&self.args.settings, None, false).await?;
+                let credential = super::copilot_auth::credential(settings, None, false).await?;
                 endpoint = super::copilot_auth::routed_classifier_endpoint(&endpoint, &credential)?;
                 credential.access
             } else {
@@ -1509,9 +1522,15 @@ mod tests {
         args.settings = load(0);
         let operations = Operations::new(&args).unwrap();
         let registered = operations.clone();
-        let previous_client = registered.current_client();
+        let previous_http = registered.current_http();
         args.settings = load(100);
         operations.update_http_client(&args).unwrap();
+        let updated_http = registered.current_http();
+        assert_eq!(previous_http.settings.http_idle_timeout(), None);
+        assert_eq!(
+            updated_http.settings.http_idle_timeout(),
+            Some(Duration::from_millis(100))
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -1531,8 +1550,8 @@ mod tests {
         });
 
         assert!(
-            registered
-                .current_client()
+            updated_http
+                .client
                 .get(&endpoint)
                 .send()
                 .await
@@ -1540,7 +1559,8 @@ mod tests {
                 .is_timeout()
         );
         assert_eq!(
-            previous_client
+            previous_http
+                .client
                 .get(&endpoint)
                 .send()
                 .await
@@ -1625,7 +1645,9 @@ mod tests {
             .iter()
             .filter(|entry| entry.provider == "llama.cpp")
         {
-            let target = operations.request_target(entry, &keys).await;
+            let target = operations
+                .request_target(entry, &keys, &operations.args.settings)
+                .await;
             if entry.model.id == "decision" {
                 let (endpoint, headers) = target.unwrap();
                 assert_eq!(endpoint, entry.endpoint);
