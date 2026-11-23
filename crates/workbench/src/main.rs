@@ -14,9 +14,11 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 mod anthropic_auth;
+mod anthropic_federation;
 mod attachments;
 mod auth_cli;
 mod auth_lock;
+mod auth_login;
 mod backend;
 mod builtin_chat;
 mod cache_stats;
@@ -549,7 +551,11 @@ impl Cli {
                     return None;
                 }
                 if provider == &Provider::Anthropic {
-                    return model_auth::anthropic_env_credential(|name| std::env::var(name).ok());
+                    let env = |name: &str| std::env::var(name).ok();
+                    return model_auth::anthropic_env_credential(env).or_else(|| {
+                        anthropic_federation::Federation::from_env(env)
+                            .map(model_auth::Credential::AnthropicFederation)
+                    });
                 }
                 let variable = match provider {
                     Provider::Google => "GEMINI_API_KEY",
@@ -693,6 +699,19 @@ impl Cli {
         thinking: Option<String>,
         source: pi_rs::ModelSelectSource,
     ) -> Result<()> {
+        let selected = self.prepare_model_change(provider, model, thinking, source)?;
+        selected.record_model_selection(&mut Session::open(&selected.session)?)?;
+        *self = selected;
+        Ok(())
+    }
+
+    fn prepare_model_change(
+        &self,
+        provider: Provider,
+        model: String,
+        thinking: Option<String>,
+        source: pi_rs::ModelSelectSource,
+    ) -> Result<Self> {
         let previous_model = rpc::model_value(self, &self.provider, &self.model);
         let previous_level = self.thinking.as_deref().unwrap_or("off").to_owned();
         let mut selected = self.clone();
@@ -702,10 +721,16 @@ impl Cli {
         if thinking.is_some() {
             selected.thinking = thinking;
         } else {
+            if matches!(source, pi_rs::ModelSelectSource::Cycle) {
+                selected.thinking = selected
+                    .settings
+                    .string("defaultThinkingLevel")
+                    .map(str::to_owned)
+                    .or_else(|| self.thinking.clone());
+            }
             selected.apply_model_thinking_defaults();
         }
         thinking::adjust(&mut selected);
-        selected.record_model_selection(&mut Session::open(&selected.session)?)?;
         let level = selected.thinking.as_deref().unwrap_or("off");
         if previous_level != level {
             selected
@@ -724,8 +749,7 @@ impl Cli {
                     source,
                 });
         }
-        *self = selected;
-        Ok(())
+        Ok(selected)
     }
     fn configured_model_name(&self, model: &str) -> String {
         match &self.provider {
@@ -1158,7 +1182,9 @@ impl Cli {
                 catalogs
                     .iter()
                     .find(|catalog| catalog.provider == provider)
-                    .and_then(|catalog| catalog.models.first())
+                    .and_then(|catalog| {
+                        model_selection::default_for_provider(&provider, &catalog.models)
+                    })
                     .cloned()
             });
         let (provider, model) = model.map_or_else(
@@ -1237,6 +1263,9 @@ enum Command {
         /// Use Anthropic's headless copy-code authorization.
         #[arg(long, conflicts_with = "device_code")]
         copy_code: bool,
+        /// GitHub Enterprise domain or HTTPS URL for Copilot.
+        #[arg(long)]
+        enterprise_url: Option<String>,
         /// Register a different ChatGPT account or workspace.
         #[arg(long, conflicts_with_all = ["account", "list_accounts"])]
         new_account: bool,
@@ -1867,17 +1896,17 @@ async fn execute(
     if let Some(search) = &args.list_models {
         return model_listing::list(&args, search).await;
     }
-    let needs_default_model = args.model.is_empty()
-        && matches!(
-            args.command,
-            None | Some(
-                Command::Run { .. }
-                    | Command::Resume
-                    | Command::Interactive
-                    | Command::Compact { .. }
-                    | Command::Review { .. }
-            )
-        );
+    let starts_model_session = matches!(
+        args.command,
+        None | Some(
+            Command::Run { .. }
+                | Command::Resume
+                | Command::Interactive
+                | Command::Compact { .. }
+                | Command::Review { .. }
+        )
+    );
+    let needs_default_model = args.model.is_empty() && starts_model_session;
     let has_patterns = patterns.iter().any(|pattern| !pattern.trim().is_empty());
     let catalogs = if has_patterns {
         if matches!(&args.command, Some(Command::Mcp { command }) if matches!(command.as_ref(), mcp_config::McpCommand::Login { .. }))
@@ -1953,10 +1982,23 @@ async fn execute(
                     .find(|choice| !args.connection_explicit || choice.provider == args.provider)
             })
             .cloned();
+        let selected = if selected.is_none()
+            && starts_model_session
+            && !args.connection_explicit
+            && args.settings.string("defaultProvider").is_none()
+            && args.settings.string("defaultModel").is_none()
+            && args.api_key.is_none()
+            && std::env::var_os("PI_RS_MODEL_TOKEN").is_none()
+        {
+            model_selection::automatic_startup_model(&args).await
+        } else {
+            selected
+        };
         if let Some(choice) = selected {
             let previous_thinking = args.thinking.clone();
             args.activate_provider(choice.provider, Some(&choice.model))?;
             args.model = choice.model;
+            args.model_is_literal = true;
             if args.thinking_explicit {
                 args.thinking = previous_thinking;
             } else if choice.thinking.is_some() {
@@ -1965,9 +2007,13 @@ async fn execute(
         }
     }
     if needs_default_model && args.model.is_empty() {
-        args.model = available.first().cloned().ok_or_else(|| {
-            Error::Config("no model is available for the selected provider; pass --model".into())
-        })?;
+        args.model = model_selection::default_for_provider(&args.provider, available)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Config(
+                    "no model is available for the selected provider; pass --model".into(),
+                )
+            })?;
     }
 
     args.bind_initial_model_endpoint();
@@ -1997,6 +2043,7 @@ async fn execute(
             provider,
             device_code,
             copy_code,
+            enterprise_url,
             new_account,
             account,
             list_accounts,
@@ -2022,99 +2069,22 @@ async fn execute(
             if *copy_code && provider != "anthropic" {
                 return Err(Error::Config("--copy-code requires anthropic".into()));
             }
-            let login = async {
-                if provider == "anthropic" {
-                    if *device_code {
-                        return Err(Error::Config(
-                            "Anthropic uses browser or copy-code authorization".into(),
-                        ));
-                    }
-                    let method = if *copy_code {
-                        anthropic_auth::LoginMethod::CopyCode
-                    } else {
-                        anthropic_auth::LoginMethod::Browser
-                    };
-                    anthropic_auth::login(&args.settings, method, meta_auth::LoginControl::default(), |url, sender| {
-                        eprintln!("Continue in your browser: {url}");
-                        eprintln!("Paste the authorization code or redirect URL if the callback does not complete:");
-                        std::thread::spawn(move || {
-                            let mut line = String::new();
-                            if std::io::stdin().read_line(&mut line).is_ok_and(|count| count > 0) { let _ = sender.send(line); }
-                        });
-                    }).await
-                } else if provider == "openai-chatgpt" {
-                    if *device_code {
-                        return Err(Error::Config("ChatGPT uses browser authorization".into()));
-                    }
-                    chatgpt_auth::login(&args.settings, *new_account, account.as_deref(), |url| {
-                        eprintln!("Continue with ChatGPT in your browser: {url}")
-                    })
-                    .await
-                } else if provider == "openai-codex" {
-                    let method = if *device_code {
-                        codex_auth::Method::Device
-                    } else {
-                        codex_auth::Method::Browser
-                    };
-                    codex_auth::login(
-                        &args.settings, meta_auth::LoginControl::default(), method,
-                        |notice| match notice {
-                            codex_auth::Notice::Device {url, code} => eprintln!("Enter code {code} at {url}"),
-                            codex_auth::Notice::Browser(url, sender) => {
-                                eprintln!("Continue in your browser: {url}");
-                                eprintln!("Paste the authorization code or redirect URL if the callback does not complete:");
-                                std::thread::spawn(move || {
-                                    let mut line = String::new();
-                                    if std::io::stdin().read_line(&mut line).is_ok_and(|count| count > 0) {
-                                        let _ = sender.send(line);
-                                    }
-                                });
-                            }
-                        },
-                    ).await
-                } else if provider == "github-copilot" {
-                    copilot_auth::login(
-                        &args.settings,
-                        meta_auth::LoginControl::default(),
-                        |url, code| eprintln!("Enter code {code} at {url}"),
-                    )
-                    .await
-                } else if provider == "xai" {
-                    xai_auth::login(
-                        &args.settings,
-                        meta_auth::LoginControl::default(),
-                        |url, code| eprintln!("Enter code {code} at {url}"),
-                    )
-                    .await
-                } else if provider == "kimi-coding" {
-                    kimi_auth::login(&args.settings, |url, code| {
-                        eprintln!("Enter code {code} at {url}")
-                    })
-                    .await
-                } else if provider == "openrouter" {
-                    if *device_code {
-                        return Err(Error::Config(
-                            "OpenRouter uses browser authorization".into(),
-                        ));
-                    }
-                    let mut manual_input = None;
-                    let result = openrouter_auth::login(&args.settings, |url, sender| {
-                        eprintln!("Continue in your browser: {url}");
-                        manual_input = Some(sender);
-                    })
-                    .await;
-                    drop(manual_input);
-                    result
-                } else {
-                    let gateway = radius_auth::Gateway::configured_with_settings(&args.settings)?;
-                    let method = if *device_code {
-                        radius_auth::Method::Device
-                    } else {
-                        radius_auth::Method::Browser
-                    };
-                    gateway.login(method, |notice| eprintln!("{notice}")).await
-                }
-            };
+            if enterprise_url.is_some() && provider != "github-copilot" {
+                return Err(Error::Config(
+                    "--enterprise-url requires github-copilot".into(),
+                ));
+            }
+            let login = auth_login::oauth(
+                &args.settings,
+                provider,
+                auth_login::OAuthOptions::legacy(
+                    *device_code,
+                    *copy_code,
+                    *new_account,
+                    account.as_deref(),
+                    enterprise_url.as_deref(),
+                ),
+            );
             tokio::select! {
                 biased;
                 _ = tokio::signal::ctrl_c() => return Err(Error::Cancelled),
@@ -2513,7 +2483,7 @@ async fn execute(
             if !trigger { return Ok(()); }
             if args.model.is_empty() {
                 let catalog = model_selection::catalog(&args, args.provider.clone(), args.allow_model_probes()).await?;
-                args.model = catalog.models.first().cloned().ok_or_else(|| Error::Config("no model is available for the selected provider; pass --model".into()))?;
+                args.model = model_selection::default_for_provider(&args.provider, &catalog.models).cloned().ok_or_else(|| Error::Config("no model is available for the selected provider; pass --model".into()))?;
                 args.bind_initial_model_endpoint();
                 if !args.thinking_explicit { args.apply_model_thinking_defaults(); }
                 thinking::adjust(&mut args);

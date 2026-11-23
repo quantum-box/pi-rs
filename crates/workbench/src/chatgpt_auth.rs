@@ -354,6 +354,51 @@ pub(super) async fn login(
     account: Option<&str>,
     announce: impl FnOnce(&Url),
 ) -> Result<()> {
+    login_with_browser(settings, new_account, account, true, |url| {
+        announce(url);
+        None
+    })
+    .await
+}
+
+async fn receive_redirect(
+    listener: &tokio::net::TcpListener,
+    callback: &Url,
+    auth: &pi_rs::openai::oauth::Authorization,
+    pasted: Option<tokio::sync::oneshot::Receiver<String>>,
+) -> Result<(Url, Option<pi_rs_workbench::oauth_callback::Callback>)> {
+    let manual = async {
+        if let Some(pasted) = pasted
+            && let Ok(input) = pasted.await
+        {
+            return input;
+        }
+        std::future::pending().await
+    };
+    tokio::select! {
+        incoming = pi_rs_workbench::oauth_callback::receive(listener, callback, auth.state()) => {
+            let incoming = incoming?;
+            Ok((incoming.url.clone(), Some(incoming)))
+        }
+        input = manual => {
+            let redirect = Url::parse(input.trim())
+                .map_err(|_| Error::Config("invalid ChatGPT redirect URL".into()))?;
+            if !redirect.username().is_empty() || redirect.password().is_some() {
+                return Err(Error::Config("invalid ChatGPT redirect URL".into()));
+            }
+            auth.callback(&redirect)?;
+            Ok((redirect, None))
+        }
+    }
+}
+
+pub(super) async fn login_with_browser(
+    settings: &super::config::Settings,
+    new_account: bool,
+    account: Option<&str>,
+    open_browser: bool,
+    announce: impl FnOnce(&Url) -> Option<tokio::sync::oneshot::Receiver<String>>,
+) -> Result<()> {
     let mut chat_lock = Some(lock().await?);
     let store = registrations()?;
     let registered = if new_account {
@@ -431,17 +476,19 @@ pub(super) async fn login(
         auth
     };
     let url = auth.url();
-    announce(&url);
-    let _ = pi_rs_workbench::oauth_callback::open_browser(url.as_str()).await;
-    let redirect = tokio::time::timeout(
+    let pasted = announce(&url);
+    if open_browser {
+        let _ = pi_rs_workbench::oauth_callback::open_browser(url.as_str()).await;
+    }
+    let (redirect, incoming) = tokio::time::timeout(
         Duration::from_secs(300),
-        pi_rs_workbench::oauth_callback::receive(&listener, &callback, auth.state()),
+        receive_redirect(&listener, &callback, &auth, pasted),
     )
     .await
     .map_err(|_| Error::Config("ChatGPT sign-in timed out".into()))??;
     let result = async {
         let client = client(settings)?;
-        let credential = auth.exchange(&client, &redirect.url).await?;
+        let credential = auth.exchange(&client, &redirect).await?;
         if registered
             .as_ref()
             .is_some_and(|previous| previous.subject != credential.subject)
@@ -455,7 +502,9 @@ pub(super) async fn login(
         Ok(allowed)
     }
     .await;
-    redirect.reply(result.is_ok()).await;
+    if let Some(incoming) = incoming {
+        incoming.reply(result.is_ok()).await;
+    }
     if result? {
         Ok(())
     } else {
@@ -712,6 +761,47 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn pasted_login_requires_the_issued_client_id_and_callback_state() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let callback = reqwest::Url::parse(&format!(
+            "http://127.0.0.1:{}/auth/callback",
+            listener.local_addr().unwrap().port()
+        ))
+        .unwrap();
+        let auth = pi_rs::openai::oauth::Authorization::new(
+            callback.clone(),
+            format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+        for (state, client_id, valid) in [
+            (auth.state(), Some("issued-client"), true),
+            ("wrong-state", Some("issued-client"), false),
+            (auth.state(), None, false),
+        ] {
+            let mut url = callback.clone();
+            url.query_pairs_mut()
+                .append_pair("state", state)
+                .append_pair("code", "fixture-code");
+            if let Some(client_id) = client_id {
+                url.query_pairs_mut().append_pair("client_id", client_id);
+            }
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            sender.send(url.to_string()).unwrap();
+            let result = super::receive_redirect(&listener, &callback, &auth, Some(receiver)).await;
+            if valid {
+                let (redirect, incoming) = result.unwrap();
+                assert_eq!(redirect, url);
+                assert!(incoming.is_none());
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
     use super::*;
     #[tokio::test]
     async fn access_options_preserve_rotation_and_honor_no_refresh() {
