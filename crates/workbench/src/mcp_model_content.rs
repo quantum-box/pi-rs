@@ -78,7 +78,28 @@ fn save_output_file(data: &[u8], extension: &str) -> io::Result<PathBuf> {
         .save(data, extension)
 }
 
+#[derive(Clone, Copy)]
+struct FileReaders {
+    read: bool,
+    shell: bool,
+}
+
+impl FileReaders {
+    fn from_request(request: &ModelRequest) -> Self {
+        Self {
+            read: request.tools.iter().any(|tool| {
+                tool.name == "read" && tool.parameters["properties"]["offset"]["type"] == "number"
+            }),
+            shell: request.tools.iter().any(|tool| {
+                matches!(tool.name.as_str(), "bash" | "powershell")
+                    && tool.parameters["properties"]["timeout"] == json!({"type":"number"})
+            }),
+        }
+    }
+}
+
 pub(super) fn project_tool_results(request: &mut ModelRequest) {
+    let files = FileReaders::from_request(request);
     let readable = request
         .tools
         .iter()
@@ -112,7 +133,9 @@ pub(super) fn project_tool_results(request: &mut ModelRequest) {
                     continue;
                 };
                 let read_tool = readable.get(prefix).copied();
-                if let Some((text, structured)) = project_result(content, server, tool, read_tool) {
+                if let Some((text, structured)) =
+                    project_result_with_files(content, server, tool, read_tool, files)
+                {
                     *content = text;
                     *is_structured = Some(structured);
                 } else if is_structured.is_none()
@@ -156,11 +179,31 @@ fn is_resource_read(name: &str) -> bool {
     suffix.is_empty()
 }
 
+#[cfg(test)]
 fn project_result(
     content: &str,
     server: &str,
     tool: &str,
     read_tool: Option<&str>,
+) -> Option<(String, bool)> {
+    project_result_with_files(
+        content,
+        server,
+        tool,
+        read_tool,
+        FileReaders {
+            read: true,
+            shell: true,
+        },
+    )
+}
+
+fn project_result_with_files(
+    content: &str,
+    server: &str,
+    tool: &str,
+    read_tool: Option<&str>,
+    files: FileReaders,
 ) -> Option<(String, bool)> {
     let value: Value = serde_json::from_str(content).ok()?;
     let response = value.get("data")?;
@@ -169,7 +212,7 @@ fn project_result(
     {
         resources
             .iter()
-            .map(|resource| project_resource(resource, resources.len() > 1))
+            .map(|resource| project_resource(resource, resources.len() > 1, files.shell))
             .collect::<Vec<_>>()
     } else {
         let blocks = response["content"].as_array()?;
@@ -181,7 +224,7 @@ fn project_result(
             > 1;
         blocks
             .iter()
-            .map(|block| project_block(block, server, read_tool, multiple_resources))
+            .map(|block| project_block(block, server, read_tool, multiple_resources, files.shell))
             .collect()
     };
     if response["isError"] == true {
@@ -203,7 +246,7 @@ fn project_result(
     if let Some(data) = distinct_data {
         projected.push(text(serde_json::to_string_pretty(data).ok()?));
     }
-    limit_text_preview(&mut projected);
+    limit_text_preview(&mut projected, files);
     let (output, structured) = encode_blocks(&projected);
     Some(if output.len() <= MAX_MODEL_CONTENT_BYTES {
         (output, structured)
@@ -212,11 +255,26 @@ fn project_result(
     })
 }
 
-fn limit_text_preview(projected: &mut Vec<Value>) {
+fn limit_text_preview(projected: &mut Vec<Value>, files: FileReaders) {
     let full = joined_text(projected);
     if full.len() <= TEXT_PREVIEW_BYTES {
         return;
     }
+    let page_by_line = files.read
+        && full
+            .lines()
+            .all(|line| line.len() <= pi_rs_workbench::coding::READ_PAGE_BYTES);
+    let hint = if page_by_line {
+        "read it with offset/limit"
+    } else if files.shell {
+        "read byte ranges with the local shell"
+    } else {
+        return;
+    };
+    // Keep the inline form if there is no usable copy on disk.
+    let Ok(path) = save_output_file(full.as_bytes(), ".txt") else {
+        return;
+    };
     let mut head = TEXT_PREVIEW_BYTES / 2;
     let mut tail = full.len() - TEXT_PREVIEW_BYTES / 2;
     while !full.is_char_boundary(head) {
@@ -228,13 +286,7 @@ fn limit_text_preview(projected: &mut Vec<Value>) {
     let tokens = full.len().div_ceil(4);
     let total_lines = full.lines().count();
     let removed = full[head..tail].chars().count();
-    let location = match save_output_file(full.as_bytes(), ".txt") {
-        Ok(path) => format!(
-            "[Full output: {} (read it with offset/limit)]",
-            path.display()
-        ),
-        Err(error) => format!("[Could not save the full output: {error}]"),
-    };
+    let location = format!("[Full output: {} ({hint})]", path.display());
     let preview = format!(
         "Warning: truncated output (original token count: {tokens})\nTotal output lines: {total_lines}\n\n{}…{removed} chars truncated…{}\n\n{location}",
         &full[..head],
@@ -300,6 +352,7 @@ fn project_block(
     server: &str,
     read_tool: Option<&str>,
     multiple_resources: bool,
+    binary_file: bool,
 ) -> Value {
     match block["type"].as_str() {
         Some("text") => block.clone(),
@@ -312,7 +365,7 @@ fn project_block(
             let mime = block["mimeType"].as_str().unwrap_or("unknown type");
             text(format!("[audio {mime} omitted]"))
         }
-        Some("resource") => project_resource(&block["resource"], multiple_resources),
+        Some("resource") => project_resource(&block["resource"], multiple_resources, binary_file),
         Some("resource_link") => {
             resource_link(block, server, read_tool).unwrap_or_else(|| block.clone())
         }
@@ -323,7 +376,7 @@ fn project_block(
     }
 }
 
-fn project_resource(resource: &Value, identify: bool) -> Value {
+fn project_resource(resource: &Value, identify: bool, binary_file: bool) -> Value {
     let content_text = |content: &str| {
         if identify && let Some(uri) = resource["uri"].as_str() {
             text(format!("[Resource {uri}]\n{content}"))
@@ -354,9 +407,11 @@ fn project_resource(resource: &Value, identify: bool) -> Value {
             return content_text(&String::from_utf8_lossy(&decoded));
         }
         // Keep unsupported image formats subject to the native image policy.
-        if !media.starts_with("image/") {
+        if binary_file && !media.starts_with("image/") {
             let uri = resource["uri"].as_str().unwrap_or("unknown URI");
-            return binary_resource(uri, mime, blob);
+            if let Some(output) = binary_resource(uri, mime, blob) {
+                return output;
+            }
         }
     }
     json!({"type":"resource","resource":resource})
@@ -368,33 +423,23 @@ fn decode_blob(blob: &str) -> std::result::Result<Vec<u8>, base64::DecodeError> 
         .or_else(|_| STANDARD_NO_PAD.decode(blob))
 }
 
-fn binary_resource(uri: &str, mime: &str, blob: &str) -> Value {
+fn binary_resource(uri: &str, mime: &str, blob: &str) -> Option<Value> {
+    if blob.len() > MAX_MODEL_CONTENT_BYTES {
+        return None;
+    }
     let mime = if mime.is_empty() {
         "unknown type"
     } else {
         mime
     };
-    if blob.len() > MAX_MODEL_CONTENT_BYTES {
-        return text(format!(
-            "[Binary resource {uri} ({mime}) could not be saved: native MCP output file limit reached]"
-        ));
-    }
-    let Ok(data) = decode_blob(blob) else {
-        return text(format!(
-            "[Binary resource {uri} ({mime}) could not be saved: invalid base64]"
-        ));
-    };
+    let data = decode_blob(blob).ok()?;
     let size = format_size(data.len() as u64);
     let extension = resource_extension(uri);
-    match save_output_file(&data, &extension) {
-        Ok(path) => text(format!(
-            "[Binary resource {uri} ({mime}, {size}) saved to {}]",
-            path.display()
-        )),
-        Err(error) => text(format!(
-            "[Binary resource {uri} ({mime}, {size}) could not be saved: {error}]"
-        )),
-    }
+    let path = save_output_file(&data, &extension).ok()?;
+    Some(text(format!(
+        "[Binary resource {uri} ({mime}, {size}) saved to {}]",
+        path.display()
+    )))
 }
 
 fn resource_extension(uri: &str) -> String {
@@ -614,7 +659,7 @@ mod tests {
             .split_once("[Full output: ")
             .unwrap()
             .1
-            .strip_suffix(" (read it with offset/limit)]")
+            .strip_suffix(" (read byte ranges with the local shell)]")
             .unwrap();
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),
@@ -653,6 +698,36 @@ mod tests {
         assert!(text.contains("Warning: truncated output"));
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].data, "YQ==");
+    }
+
+    #[test]
+    fn mcp_model_content_keeps_inline_output_without_usable_file_tools() {
+        let long = "x".repeat(TEXT_PREVIEW_BYTES * 3);
+        let original = tool_content(json!({"content":[{"type":"text","text":long}]}));
+        for read in [false, true] {
+            let output = project_result_with_files(
+                &original,
+                "fixture",
+                "get",
+                None,
+                FileReaders { read, shell: false },
+            );
+            assert_eq!(output, Some((long.clone(), false)));
+        }
+        let short_lines = "line\n".repeat(TEXT_PREVIEW_BYTES);
+        let original = tool_content(json!({"content":[{"type":"text","text":short_lines}]}));
+        let (output, _) = project_result_with_files(
+            &original,
+            "fixture",
+            "get",
+            None,
+            FileReaders {
+                read: true,
+                shell: false,
+            },
+        )
+        .unwrap();
+        assert!(output.ends_with(" (read it with offset/limit)]"));
     }
 
     #[test]
