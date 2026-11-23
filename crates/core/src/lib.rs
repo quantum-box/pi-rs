@@ -13,6 +13,7 @@ mod journal;
 mod lifecycle;
 mod live_model;
 mod mcp_registration;
+mod message_hooks;
 mod model_catalog;
 mod model_price;
 mod persistent_map;
@@ -57,6 +58,7 @@ pub use lifecycle::{
 };
 pub use live_model::{LiveModelControl, LiveModelSelection};
 pub use mcp_registration::{McpRegistryHost, McpServerDeclaration, RegisteredMcpServer};
+pub use message_hooks::{AssistantMessageUpdate, MessageLifecycleEvent, MessageStatus};
 pub use model_catalog::*;
 pub use model_price::ChatPrice;
 pub use pi_rs_tool_arguments::{
