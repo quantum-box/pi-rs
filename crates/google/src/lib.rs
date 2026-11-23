@@ -1393,7 +1393,7 @@ impl Model for Google {
                     .map_err(|_| Error::Model("invalid Google Gemini stream chunk".into()))?;
                 if let Some(headers) = &observation_headers {
                     pi_rs_core::observe_provider_stream(
-                        &provider, ModelApi::GoogleGenerativeAi, &requested_model, &value, &error_secrets, headers,
+                        &provider, api, &requested_model, &value, &error_secrets, headers,
                     ).await;
                 }
                 if let Some(error) = value.get("error") {
