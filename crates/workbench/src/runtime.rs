@@ -579,7 +579,7 @@ impl Runtime {
         };
         let old = servers.remove(index);
         let mut registry = self.registry.clone();
-        registry.unregister(old.id())?;
+        registry.try_unregister(old.id())?;
         let prompt = catalog.select_mcp_tools(&mut registry, &servers);
         self.registry = registry;
         catalog.state.lock().expect("MCP catalog").servers = servers;
@@ -1345,7 +1345,7 @@ impl LiveMcpCatalog {
             .iter()
             .filter(|id| !retained_ids.contains(id.as_str()))
         {
-            registry.unregister(removed)?;
+            registry.try_unregister(removed)?;
         }
         for server in &servers {
             if !registry.replace(server.clone())? {

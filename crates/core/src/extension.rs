@@ -3113,7 +3113,7 @@ impl Registry {
 
     /// Remove an extension and its tools after checking dependent extensions.
     /// The caller owns shutdown of the removed extension's resources.
-    pub fn unregister(&mut self, id: &str) -> Result<bool> {
+    pub fn try_unregister(&mut self, id: &str) -> Result<bool> {
         let Some(index) = self
             .extensions
             .iter()
