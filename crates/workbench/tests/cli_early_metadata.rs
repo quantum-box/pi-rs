@@ -132,6 +132,39 @@ fn model_listing_reports_unknown_options_before_showing_results() {
 }
 
 #[test]
+fn json_model_listing_exposes_radius_cost_and_image_limits_offline() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(home.path())
+        .env("PI_RS_HOME", home.path())
+        .env("RADIUS_API_KEY", "fixture")
+        .env_remove("PI_RADIUS_GATEWAY")
+        .args([
+            "--offline",
+            "--no-approve",
+            "--no-extensions",
+            "--no-mcp",
+            "--provider",
+            "radius",
+            "--mode",
+            "json",
+            "--list-models",
+            "balanced",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let row = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|row| row["model"] == "balanced" && row["provider"] == "radius")
+        .expect("Radius balanced catalog entry");
+    assert_eq!(row["cost"]["cacheRead"], 0.3);
+    assert_eq!(row["inputLimits"]["images"]["resize"]["maxWidth"], 2000);
+}
+
+#[test]
 fn deferred_builtin_errors_precede_model_selection() {
     let output = run(&[
         "--offline",
