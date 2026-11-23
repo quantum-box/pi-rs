@@ -1,5 +1,10 @@
 //! Project MCP call results into the provider request without changing the journal.
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    io::{self, Write},
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+};
 
 use base64::{
     Engine,
@@ -7,9 +12,61 @@ use base64::{
 };
 use pi_rs::{ImageContent, Message, ModelRequest};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 // MCP tools use the core tool output limit. A projected payload must fit it too.
 const MAX_MODEL_CONTENT_BYTES: usize = 1024 * 1024;
+const MAX_BINARY_FILES: usize = 64;
+const MAX_BINARY_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Default)]
+struct BinaryOutputs {
+    directory: Option<tempfile::TempDir>,
+    files: BTreeMap<([u8; 32], String), PathBuf>,
+    bytes: usize,
+}
+
+impl BinaryOutputs {
+    fn save(&mut self, data: &[u8], extension: &str) -> io::Result<PathBuf> {
+        let key = (Sha256::digest(data).into(), extension.to_owned());
+        if let Some(path) = self.files.get(&key).filter(|path| path.is_file()) {
+            return Ok(path.clone());
+        }
+        let new = !self.files.contains_key(&key);
+        if new
+            && (self.files.len() >= MAX_BINARY_FILES || self.bytes + data.len() > MAX_BINARY_BYTES)
+        {
+            return Err(io::Error::other("native MCP binary output limit reached"));
+        }
+        let directory = match &self.directory {
+            Some(directory) => directory,
+            None => self
+                .directory
+                .insert(tempfile::Builder::new().prefix("pi-mcp-").tempdir()?),
+        };
+        let mut file = tempfile::Builder::new()
+            .prefix("resource-")
+            .suffix(extension)
+            .tempfile_in(directory.path())?;
+        file.write_all(data)?;
+        let (_, path) = file.keep().map_err(|error| error.error)?;
+        self.files.insert(key, path.clone());
+        if new {
+            self.bytes += data.len();
+        }
+        Ok(path)
+    }
+}
+
+fn save_binary(data: &[u8], extension: &str) -> io::Result<PathBuf> {
+    // Estimation and dispatch can project the same history repeatedly.
+    static OUTPUTS: OnceLock<Mutex<BinaryOutputs>> = OnceLock::new();
+    OUTPUTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .map_err(|_| io::Error::other("MCP binary output store unavailable"))?
+        .save(data, extension)
+}
 
 pub(super) fn project_tool_results(request: &mut ModelRequest) {
     let readable = request
@@ -251,19 +308,67 @@ fn project_resource(resource: &Value, identify: bool) -> Value {
             .map_or(mime, |(media, _)| media)
             .trim()
             .to_ascii_lowercase();
-        if (media.starts_with("text/")
+        let textual = media.starts_with("text/")
             || media == "application/json"
             || media.ends_with("+json")
-            || media.ends_with("+xml"))
-            && let Ok(decoded) = STANDARD
-                .decode(blob)
-                .or_else(|_| STANDARD_NO_PAD.decode(blob))
-        {
+            || media.ends_with("+xml");
+        if textual && let Ok(decoded) = decode_blob(blob) {
             return content_text(&String::from_utf8_lossy(&decoded));
         }
+        // Keep unsupported image formats subject to the native image policy.
+        if !media.starts_with("image/") {
+            let uri = resource["uri"].as_str().unwrap_or("unknown URI");
+            return binary_resource(uri, mime, blob);
+        }
     }
-    // Preserve the payload for native consumers until a readable file can be offered.
     json!({"type":"resource","resource":resource})
+}
+
+fn decode_blob(blob: &str) -> std::result::Result<Vec<u8>, base64::DecodeError> {
+    STANDARD
+        .decode(blob)
+        .or_else(|_| STANDARD_NO_PAD.decode(blob))
+}
+
+fn binary_resource(uri: &str, mime: &str, blob: &str) -> Value {
+    let mime = if mime.is_empty() {
+        "unknown type"
+    } else {
+        mime
+    };
+    if blob.len() > MAX_MODEL_CONTENT_BYTES {
+        return text(format!(
+            "[Binary resource {uri} ({mime}) could not be saved: native MCP binary output limit reached]"
+        ));
+    }
+    let Ok(data) = decode_blob(blob) else {
+        return text(format!(
+            "[Binary resource {uri} ({mime}) could not be saved: invalid base64]"
+        ));
+    };
+    let size = format_size(data.len() as u64);
+    let extension = resource_extension(uri);
+    match save_binary(&data, &extension) {
+        Ok(path) => text(format!(
+            "[Binary resource {uri} ({mime}, {size}) saved to {}]",
+            path.display()
+        )),
+        Err(error) => text(format!(
+            "[Binary resource {uri} ({mime}, {size}) could not be saved: {error}]"
+        )),
+    }
+}
+
+fn resource_extension(uri: &str) -> String {
+    let url = reqwest::Url::parse(uri).ok();
+    let path = url.as_ref().map_or(uri, |url| url.path());
+    path.rsplit_once('.')
+        .map(|(_, extension)| extension)
+        .filter(|extension| {
+            (1..=8).contains(&extension.len())
+                && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .map_or_else(|| ".bin".into(), |extension| format!(".{extension}"))
 }
 
 fn resource_link(block: &Value, server: &str, read_tool: Option<&str>) -> Option<Value> {
@@ -404,7 +509,12 @@ mod tests {
         );
         assert!(caption.contains("caption"));
         assert!(!caption.contains("YQ=="));
-        assert!(caption.contains("dGVzdA=="));
+        assert!(
+            caption.contains(
+                "[Binary resource mock://binary (application/octet-stream, 4B) saved to "
+            )
+        );
+        assert!(!caption.contains("dGVzdA=="));
     }
 
     #[test]
@@ -497,13 +607,44 @@ mod tests {
     }
 
     #[test]
+    fn mcp_model_content_uses_bounded_private_binary_paths() {
+        assert_eq!(
+            resource_extension("mock://example/a.pdf?param=value"),
+            ".pdf"
+        );
+        assert_eq!(
+            resource_extension("mock://example/../../a.unusual-extension"),
+            ".bin"
+        );
+        let mut outputs = BinaryOutputs::default();
+        let file = outputs.save(b"hello", ".pdf").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"hello");
+        assert_eq!(outputs.save(b"hello", ".pdf").unwrap(), file);
+        assert_eq!(outputs.bytes, 5);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o077, 0);
+        }
+        outputs.bytes = MAX_BINARY_BYTES;
+        assert!(outputs.save(b"new", ".pdf").is_err());
+    }
+
+    #[test]
     fn mcp_model_content_preserves_binary_and_projects_structured_fallback_and_errors() {
         let binary = tool_content(json!({"content":[{"type":"resource","resource":{
             "uri":"mock://binary","mimeType":"application/octet-stream","blob":"YQ==",
         }}]}));
+        let (output, structured) = project_result(&binary, "fixture", "get", None).unwrap();
+        let path = output
+            .strip_prefix("[Binary resource mock://binary (application/octet-stream, 1B) saved to ")
+            .and_then(|output| output.strip_suffix(']'))
+            .unwrap();
+        assert!(!structured);
+        assert_eq!(std::fs::read(path).unwrap(), b"a");
         assert_eq!(
             project_result(&binary, "fixture", "get", None),
-            Some((binary.clone(), true))
+            Some((output, false))
         );
         let read = tool_content(json!({"contents":[{"uri":"mock://notes","text":"contents"}]}));
         assert_eq!(
