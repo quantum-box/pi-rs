@@ -1323,6 +1323,7 @@ impl Model for Google {
             &mut last_progress,
             Progress::WaitingForModel,
         );
+        let requested_model = request.model;
         let request = self.authenticate(self.client.post(url)).json(&body);
         let response = self
             .provider_retry
@@ -1362,7 +1363,6 @@ impl Model for Google {
         let replay_scope = self.replay_scope.clone();
         let observation_headers =
             pi_rs_core::observes_provider_stream().then(|| self.headers.clone());
-        let requested_model = request.model;
         Ok(Box::pin(async_stream::try_stream! {
             let mut stream = response.bytes_stream().eventsource();
             let mut metadata = ModelMetadata {
