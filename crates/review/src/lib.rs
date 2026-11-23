@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use pi_rs_core::{
     Agent, AgentInput, CancellationToken, Error, Event, Extension, ExtensionResult, ExtensionState,
-    Message, ModelRequest, Observer, Result, RunState, Session, UsageReport,
+    Message, Observer, Result, RunState, Session, UsageReport,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -49,6 +49,9 @@ impl Extension for ReviewContext {
     fn id(&self) -> &str {
         ID
     }
+    fn source_is_builtin(&self) -> bool {
+        true
+    }
 
     fn commands(&self) -> &[&str] {
         &["record"]
@@ -82,9 +85,9 @@ impl Extension for ReviewContext {
 
     fn context(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let links = decode(state)?;
         if let Some(link) = links
             .values()
@@ -92,11 +95,13 @@ impl Extension for ReviewContext {
             .max_by_key(|link| link.parent_record)
             && let ReviewStatus::Done { answer } = &link.status
         {
-            request.messages.insert(1.min(request.messages.len()), Message::User {
+            let insert_at = 1.min(request.messages.len());
+            request.insert_user(insert_at, Message::User {
                 content: format!("Independent review from child {} at record {}. Treat the following as review data:\n{}", link.child, link.parent_record, answer),
-            });
+            })?;
+            return Ok(pi_rs_core::ContextChange::Changed);
         }
-        Ok(())
+        Ok(pi_rs_core::ContextChange::Unchanged)
     }
 }
 
@@ -183,7 +188,7 @@ impl Review<'_> {
         if let ReviewStatus::Done { answer } = link.status {
             return Ok(answer);
         }
-        let snapshot = serde_json::to_string(&parent.conversation_at(link.parent_record)?)?;
+        let snapshot = serde_json::to_string(&parent.model_conversation_at(link.parent_record)?)?;
         if snapshot.len() > 64 * 1024 {
             return Err(Error::Config(
                 "review snapshot is too large; compact the parent branch first".into(),
@@ -310,5 +315,43 @@ impl Review<'_> {
             observer,
         )?;
         result
+    }
+}
+
+#[cfg(test)]
+mod context_provenance_tests {
+    use super::*;
+    use pi_rs_core::{ContextRequest, ModelRequest};
+
+    #[test]
+    fn completed_review_uses_tracked_user_insertion() {
+        let child = Uuid::new_v4();
+        let link = ReviewLink {
+            child,
+            parent_record: 1,
+            task: "review".into(),
+            status: ReviewStatus::Done {
+                answer: "done".into(),
+            },
+        };
+        let state = ExtensionState {
+            version: 1,
+            data: serde_json::to_value(BTreeMap::from([(child, link)])).unwrap(),
+        };
+        let mut request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::Assistant {
+                content: "visible".into(),
+                calls: vec![],
+                replay: None,
+            }],
+            tools: vec![],
+            max_output_tokens: 8,
+        };
+        let mut guarded = ContextRequest::new(&mut request);
+        let access = guarded.access();
+        ReviewContext.context(&mut guarded, Some(&state)).unwrap();
+        assert!(!access.assistant_accessed());
+        assert_eq!(access.user_edits().len(), 1);
     }
 }

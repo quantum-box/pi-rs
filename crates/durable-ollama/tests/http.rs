@@ -452,6 +452,8 @@ fn ordered_tool_request() -> pi_rs_durable::model::DurableToolRequest {
             replay: None,
         },
         Message::Tool {
+            is_error: false,
+            is_structured: None,
             call_id: "c1".into(),
             content: String::new(),
         },
@@ -657,6 +659,8 @@ async fn consecutive_tool_images_follow_the_entire_result_batch() {
         });
     }
     req.request.request.messages.push(Message::Tool {
+        is_error: false,
+        is_structured: None,
         call_id: "c2".into(),
         content: String::new(),
     });

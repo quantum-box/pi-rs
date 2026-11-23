@@ -12,12 +12,39 @@ pub(super) struct Builtin {
     compatibility: fn() -> Value,
 }
 
+const QWEN_TOKEN_PLAN: &str =
+    "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1/chat/completions";
+const QWEN_TOKEN_PLAN_CN: &str =
+    "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1/chat/completions";
+const LEGACY_QWEN_TOKEN_PLAN: &str =
+    "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions";
+const LEGACY_QWEN_TOKEN_PLAN_CN: &str =
+    "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions";
+
 pub(super) const PROVIDERS: &[Builtin] = &[
+    Builtin {
+        id: "google-vertex",
+        endpoint: "https://aiplatform.googleapis.com/v1",
+        env: "GOOGLE_CLOUD_API_KEY",
+        compatibility: || json!({}),
+    },
     Builtin {
         id: "openai",
         endpoint: "https://api.openai.com/v1/responses",
         env: "OPENAI_API_KEY",
         compatibility: || json!({}),
+    },
+    Builtin {
+        id: "ant-ling",
+        endpoint: "https://api.ant-ling.com/v1/chat/completions",
+        env: "ANT_LING_API_KEY",
+        compatibility: || json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","thinkingFormat":"ant-ling","supportsStrictMode":true}),
+    },
+    Builtin {
+        id: "azure",
+        endpoint: "",
+        env: "AZURE_OPENAI_API_KEY",
+        compatibility: standard,
     },
     Builtin {
         id: "baseten",
@@ -30,6 +57,18 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         endpoint: "https://api.cerebras.ai/v1/chat/completions",
         env: "CEREBRAS_API_KEY",
         compatibility: || json!({"maxTokensField":"max_completion_tokens"}),
+    },
+    Builtin {
+        id: "cloudflare-ai-gateway",
+        endpoint: "",
+        env: "CLOUDFLARE_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
+        id: "cloudflare-workers-ai",
+        endpoint: "",
+        env: "CLOUDFLARE_API_KEY",
+        compatibility: || json!({}),
     },
     Builtin {
         id: "deepseek",
@@ -45,7 +84,13 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         id: "fireworks",
         endpoint: "https://api.fireworks.ai/inference/v1/chat/completions",
         env: "FIREWORKS_API_KEY",
-        compatibility: standard,
+        compatibility: || json!({"supportsStore":true,"maxTokensField":"max_completion_tokens"}),
+    },
+    Builtin {
+        id: "github-copilot",
+        endpoint: "https://api.individual.githubcopilot.com/chat/completions",
+        env: "COPILOT_GITHUB_TOKEN",
+        compatibility: || json!({}),
     },
     Builtin {
         id: "groq",
@@ -57,7 +102,7 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         id: "huggingface",
         endpoint: "https://router.huggingface.co/v1/chat/completions",
         env: "HF_TOKEN",
-        compatibility: standard,
+        compatibility: || json!({"supportsStore":true,"maxTokensField":"max_completion_tokens"}),
     },
     Builtin {
         id: "kimi-coding",
@@ -73,6 +118,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         },
     },
     Builtin {
+        id: "meta",
+        endpoint: "https://api.meta.ai/v1/responses",
+        env: "META_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "minimax",
         endpoint: "https://api.minimax.io/anthropic/v1/messages",
         env: "MINIMAX_API_KEY",
@@ -83,6 +134,12 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         endpoint: "https://api.minimaxi.com/anthropic/v1/messages",
         env: "MINIMAX_CN_API_KEY",
         compatibility: || json!({}),
+    },
+    Builtin {
+        id: "mistral",
+        endpoint: "https://api.mistral.ai/v1/chat/completions",
+        env: "MISTRAL_API_KEY",
+        compatibility: || json!({"supportsStrictMode":true}),
     },
     Builtin {
         id: "moonshotai",
@@ -103,6 +160,24 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         compatibility: || json!({}),
     },
     Builtin {
+        id: "openai-codex",
+        endpoint: pi_rs::openai::CODEX_ENDPOINT,
+        env: "",
+        compatibility: || json!({}),
+    },
+    Builtin {
+        id: "opencode",
+        endpoint: "https://opencode.ai/inference/openai/v1/chat/completions",
+        env: "OPENCODE_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
+        id: "opencode-go",
+        endpoint: "https://opencode.ai/inference/go/openai/v1/chat/completions",
+        env: "OPENCODE_API_KEY",
+        compatibility: || json!({}),
+    },
+    Builtin {
         id: "openrouter",
         endpoint: "https://openrouter.ai/api/v1/chat/completions",
         env: "OPENROUTER_API_KEY",
@@ -113,10 +188,40 @@ pub(super) const PROVIDERS: &[Builtin] = &[
         },
     },
     Builtin {
+        id: "qwen-token-plan",
+        endpoint: QWEN_TOKEN_PLAN,
+        env: "QWEN_TOKEN_PLAN_TEAM_API_KEY",
+        compatibility: qwen_token_plan,
+    },
+    Builtin {
+        id: "qwen-token-plan-cn",
+        endpoint: QWEN_TOKEN_PLAN_CN,
+        env: "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY",
+        compatibility: qwen_token_plan,
+    },
+    Builtin {
+        id: "qwen-token-plan-individual",
+        endpoint: QWEN_TOKEN_PLAN,
+        env: "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+        compatibility: qwen_token_plan,
+    },
+    Builtin {
+        id: "qwen-token-plan-individual-cn",
+        endpoint: QWEN_TOKEN_PLAN_CN,
+        env: "QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY",
+        compatibility: qwen_token_plan,
+    },
+    Builtin {
         id: "together",
         endpoint: "https://api.together.ai/v1/chat/completions",
         env: "TOGETHER_API_KEY",
         compatibility: || json!({"thinkingFormat":"together", "supportsReasoningEffort":false}),
+    },
+    Builtin {
+        id: "vercel-ai-gateway",
+        endpoint: "https://ai-gateway.vercel.sh/v1/messages",
+        env: "AI_GATEWAY_API_KEY",
+        compatibility: || json!({}),
     },
     Builtin {
         id: "xai",
@@ -170,6 +275,10 @@ fn moonshot() -> Value {
     json!({"supportsReasoningEffort":false})
 }
 
+fn qwen_token_plan() -> Value {
+    json!({"thinkingFormat":"qwen", "supportsDeveloperRole":false, "supportsStore":false})
+}
+
 fn xiaomi() -> Value {
     json!({"thinkingFormat":"deepseek", "supportsReasoningEffort":false,
         "supportsStore":true,"supportsDeveloperRole":true,"maxTokensField":"max_completion_tokens",
@@ -191,8 +300,12 @@ impl Builtin {
         Provider::Custom {
             id: Arc::from(self.id),
             adapter: match self.id {
-                "openai" | "xai" => Adapter::OpenAiResponses,
-                "minimax" | "minimax-cn" => Adapter::Anthropic,
+                "openai" | "xai" | "meta" => Adapter::OpenAiResponses,
+                "google-vertex" => Adapter::GoogleVertex,
+                "mistral" => Adapter::MistralConversations,
+                "azure" => Adapter::AzureResponses,
+                "openai-codex" => Adapter::CodexResponses,
+                "minimax" | "minimax-cn" | "vercel-ai-gateway" => Adapter::Anthropic,
                 _ => Adapter::ChatCompletions,
             },
         }
@@ -204,27 +317,107 @@ impl Builtin {
 
     pub fn endpoint_for(&self, adapter: Adapter) -> Option<&'static str> {
         match (adapter, self.id) {
-            (Adapter::OpenAiResponses, "openai" | "xai") => Some(self.endpoint),
+            (_, "azure") => None,
+            (
+                Adapter::ChatCompletions | Adapter::Anthropic | Adapter::OpenAiResponses,
+                "cloudflare-ai-gateway",
+            ) => Some(""),
+            (Adapter::CodexResponses, "openai-codex") => Some(self.endpoint),
+            (Adapter::GoogleVertex, "google-vertex") => Some(self.endpoint),
+            (Adapter::OpenAiResponses, "openai" | "xai" | "meta") => Some(self.endpoint),
+            (Adapter::MistralConversations, "mistral") => Some(self.endpoint),
             (Adapter::ChatCompletions, id)
-                if !matches!(id, "openai" | "xai" | "minimax" | "minimax-cn") =>
+                if !matches!(
+                    id,
+                    "openai"
+                        | "xai"
+                        | "meta"
+                        | "google-vertex"
+                        | "openai-codex"
+                        | "minimax"
+                        | "minimax-cn"
+                        | "vercel-ai-gateway"
+                        | "mistral"
+                ) =>
             {
                 Some(self.endpoint)
             }
-            (Adapter::Anthropic, "minimax" | "minimax-cn") => Some(self.endpoint),
+            (Adapter::Anthropic, "minimax" | "minimax-cn" | "vercel-ai-gateway") => {
+                Some(self.endpoint)
+            }
             (Adapter::Anthropic, "fireworks") => {
                 Some("https://api.fireworks.ai/inference/v1/messages")
+            }
+            (Adapter::Anthropic, "github-copilot") => {
+                Some("https://api.individual.githubcopilot.com/v1/messages")
+            }
+            (Adapter::OpenAiResponses, "github-copilot") => {
+                Some("https://api.individual.githubcopilot.com/responses")
+            }
+            (Adapter::OpenAiResponses, "opencode") => {
+                Some("https://opencode.ai/inference/openai/v1/responses")
+            }
+            (Adapter::OpenAiResponses, "opencode-go") => {
+                Some("https://opencode.ai/inference/go/openai/v1/responses")
+            }
+            (Adapter::Anthropic, "opencode") => {
+                Some("https://opencode.ai/inference/anthropic/v1/messages")
+            }
+            (Adapter::Anthropic, "opencode-go") => {
+                Some("https://opencode.ai/inference/go/anthropic/v1/messages")
+            }
+            (Adapter::Google, "opencode") => Some("https://opencode.ai/inference/google/v1beta"),
+            (Adapter::Google, "opencode-go") => {
+                Some("https://opencode.ai/inference/go/google/v1beta")
             }
             (Adapter::Anthropic, "openrouter") => Some("https://openrouter.ai/api/v1/messages"),
             _ => None,
         }
     }
 
+    pub fn is_default_endpoint(&self, endpoint: &str) -> bool {
+        if endpoint.is_empty() {
+            return false;
+        }
+        self.endpoint == endpoint
+            || match self.id {
+                "qwen-token-plan" | "qwen-token-plan-individual" => {
+                    endpoint == LEGACY_QWEN_TOKEN_PLAN
+                }
+                "qwen-token-plan-cn" | "qwen-token-plan-individual-cn" => {
+                    endpoint == LEGACY_QWEN_TOKEN_PLAN_CN
+                }
+                _ => false,
+            }
+    }
+
     pub fn is_official_endpoint(&self, endpoint: &str) -> bool {
-        self.endpoint == endpoint || self.endpoint_for(Adapter::Anthropic) == Some(endpoint)
+        !endpoint.is_empty()
+            && (self.is_default_endpoint(endpoint)
+                || [
+                    Adapter::Anthropic,
+                    Adapter::Google,
+                    Adapter::OpenAiResponses,
+                ]
+                .into_iter()
+                .any(|adapter| self.endpoint_for(adapter) == Some(endpoint)))
     }
 
     pub fn env(&self) -> &'static str {
         self.env
+    }
+
+    pub fn env_names(&self) -> impl Iterator<Item = &'static str> {
+        let fallback = match self.id {
+            "qwen-token-plan" | "qwen-token-plan-individual" => Some("QWEN_TOKEN_PLAN_API_KEY"),
+            "qwen-token-plan-cn" | "qwen-token-plan-individual-cn" => {
+                Some("QWEN_TOKEN_PLAN_CN_API_KEY")
+            }
+            _ => None,
+        };
+        std::iter::once(self.env)
+            .chain(fallback)
+            .filter(|name| !name.is_empty())
     }
 
     pub fn compatibility(&self) -> Value {

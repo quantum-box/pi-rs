@@ -84,6 +84,10 @@ pub enum AgentInput {
         message: QueuedMessage,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
+    EnqueueCustom {
+        message: crate::QueuedCustomMessage,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
     ClearQueue {
         reply: tokio::sync::oneshot::Sender<Result<Vec<QueuedMessage>>>,
     },
@@ -95,6 +99,12 @@ pub enum AgentInput {
     /// Persist a display name through the session owner during an active run.
     SetSessionName {
         name: String,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    /// Persist a bookmark through the session owner during an active run.
+    SetSessionLabel {
+        target: u64,
+        label: Option<String>,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
 }
@@ -168,6 +178,16 @@ impl ImageContent {
     }
 }
 
+/// Resolve provenance for tool messages written before the structured flag existed.
+/// Unknown legacy messages retain the historical structured-envelope detection.
+pub fn tool_content_is_structured(content: &str, is_structured: Option<bool>) -> bool {
+    is_structured.unwrap_or_else(|| {
+        serde_json::from_str::<Value>(content)
+            .ok()
+            .is_some_and(|value| value["data"]["content"].is_array())
+    })
+}
+
 /// Separate supported images from native structured tool output for provider encoding.
 pub fn extract_tool_images(mut content: String) -> (String, Vec<ImageContent>) {
     let mut images = Vec::new();
@@ -218,6 +238,12 @@ pub enum ContextContent {
 pub enum ContentBlock {
     Text {
         text: String,
+        #[serde(
+            default,
+            rename = "textSignature",
+            skip_serializing_if = "Option::is_none"
+        )]
+        text_signature: Option<String>,
     },
     Image {
         data: String,
@@ -226,11 +252,25 @@ pub enum ContentBlock {
     },
     Thinking {
         thinking: String,
+        #[serde(
+            default,
+            rename = "thinkingSignature",
+            skip_serializing_if = "Option::is_none"
+        )]
+        thinking_signature: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        redacted: bool,
     },
     ToolCall {
         id: String,
         name: String,
         arguments: Value,
+        #[serde(
+            default,
+            rename = "thoughtSignature",
+            skip_serializing_if = "Option::is_none"
+        )]
+        thought_signature: Option<String>,
     },
 }
 
@@ -256,7 +296,44 @@ pub enum Message {
     Tool {
         call_id: String,
         content: String,
+        /// Whether the tool result represents an error; absent in older messages.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
+        /// None denotes an older message whose provenance was not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_structured: Option<bool>,
     },
+}
+
+/// Headers required by Copilot for the initiator and capabilities of a turn.
+pub fn copilot_request_headers(
+    messages: &[Message],
+) -> impl Iterator<Item = (&'static str, &'static str)> {
+    let initiator = match messages.last() {
+        None | Some(Message::User { .. } | Message::UserWithImages { .. }) => "user",
+        Some(_) => "agent",
+    };
+    let images = messages.iter().any(|message| match message {
+        Message::UserWithImages { images, .. } => !images.is_empty(),
+        Message::Tool {
+            content,
+            is_structured,
+            ..
+        } if *is_structured != Some(false) => serde_json::from_str::<Value>(content)
+            .ok()
+            .is_some_and(|body| {
+                body.pointer("/data/content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| parts.iter().any(|part| part["type"] == "image"))
+            }),
+        _ => false,
+    });
+    [
+        ("x-initiator", initiator),
+        ("openai-intent", "conversation-edits"),
+    ]
+    .into_iter()
+    .chain(images.then_some(("copilot-vision-request", "true")))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -399,9 +476,13 @@ impl CacheRetention {
 #[serde(rename_all = "kebab-case")]
 pub enum ModelApi {
     OpenaiCompletions,
+    MistralConversations,
     OpenaiResponses,
+    OpenaiCodexResponses,
     AnthropicMessages,
     GoogleGenerativeAi,
+    GoogleVertex,
+    BedrockConverseStream,
     PiMessages,
 }
 
@@ -409,9 +490,13 @@ impl ModelApi {
     pub fn named(name: &str) -> Option<Self> {
         match name {
             "openai-completions" => Some(Self::OpenaiCompletions),
+            "mistral-conversations" => Some(Self::MistralConversations),
             "openai-responses" => Some(Self::OpenaiResponses),
+            "openai-codex-responses" => Some(Self::OpenaiCodexResponses),
             "anthropic-messages" => Some(Self::AnthropicMessages),
             "google-generative-ai" => Some(Self::GoogleGenerativeAi),
+            "google-vertex" => Some(Self::GoogleVertex),
+            "bedrock-converse-stream" => Some(Self::BedrockConverseStream),
             "pi-messages" => Some(Self::PiMessages),
             _ => None,
         }
@@ -420,9 +505,13 @@ impl ModelApi {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenaiCompletions => "openai-completions",
+            Self::MistralConversations => "mistral-conversations",
             Self::OpenaiResponses => "openai-responses",
+            Self::OpenaiCodexResponses => "openai-codex-responses",
             Self::AnthropicMessages => "anthropic-messages",
             Self::GoogleGenerativeAi => "google-generative-ai",
+            Self::GoogleVertex => "google-vertex",
+            Self::BedrockConverseStream => "bedrock-converse-stream",
             Self::PiMessages => "pi-messages",
         }
     }
@@ -430,6 +519,10 @@ impl ModelApi {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelMetadata {
+    /// Whether an extension replaced finalized assistant text after streaming.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub assistant_text_edited: bool,
+
     /// Provider, importer, or catalog estimate in USD, absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<serde_json::Number>,
@@ -437,6 +530,9 @@ pub struct ModelMetadata {
     pub cost_breakdown: Option<UsageCostBreakdown>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_from_provider: Option<bool>,
+    /// Service tier multiplier applied to catalog estimates for this reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_cost_multiplier: Option<serde_json::Number>,
     pub provider_request_id: Option<String>,
     pub cached_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -449,6 +545,9 @@ pub struct ModelMetadata {
     pub provider_prompt_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_model: Option<ResolvedModelIdentity>,
+    /// Provider adapter scope used to replay edited context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_identity: Option<ResolvedModelIdentity>,
     /// API actually used for this request, independent of the provider's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_api: Option<ModelApi>,
@@ -456,6 +555,9 @@ pub struct ModelMetadata {
     /// Provider-supplied visible reasoning, retained for session presentation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Provider-reported reasoning tokens already included in total output tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<AssistantDiagnostic>,
     /// Complete ordered assistant content required for provider-specific continuations.
@@ -470,6 +572,15 @@ pub enum AssistantDiagnostic {
         timestamp: i64,
         details: AnthropicInputTransformations,
     },
+    AnthropicThreadFallback {
+        timestamp: i64,
+        details: AnthropicThreadFallbackDetails,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnthropicThreadFallbackDetails {
+    pub reason: String,
 }
 
 impl AssistantDiagnostic {
@@ -480,15 +591,35 @@ impl AssistantDiagnostic {
             .flatten()
             .take(16)
             .filter_map(|diagnostic| {
-                if diagnostic["type"] != "anthropic_input_transformations" {
-                    return None;
+                let timestamp = diagnostic["timestamp"].as_i64()?;
+                match diagnostic["type"].as_str()? {
+                    "anthropic_input_transformations" => {
+                        Some(Self::AnthropicInputTransformations {
+                            timestamp,
+                            details: AnthropicInputTransformations::from_value(
+                                &diagnostic["details"]["transformations"],
+                            )?,
+                        })
+                    }
+                    "anthropic_thread_fallback" => {
+                        let reason = diagnostic["details"]["reason"].as_str()?;
+                        if reason.len() > 64
+                            || reason.is_empty()
+                            || !reason
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                        {
+                            return None;
+                        }
+                        Some(Self::AnthropicThreadFallback {
+                            timestamp,
+                            details: AnthropicThreadFallbackDetails {
+                                reason: reason.into(),
+                            },
+                        })
+                    }
+                    _ => None,
                 }
-                Some(Self::AnthropicInputTransformations {
-                    timestamp: diagnostic["timestamp"].as_i64()?,
-                    details: AnthropicInputTransformations::from_value(
-                        &diagnostic["details"]["transformations"],
-                    )?,
-                })
             })
             .collect()
     }
@@ -500,6 +631,7 @@ impl AssistantDiagnostic {
                 .iter()
                 .filter(|transformation| transformation.kind == "thinking_dropped")
                 .count(),
+            Self::AnthropicThreadFallback { .. } => 0,
         }
     }
 }
@@ -556,6 +688,143 @@ pub struct ProviderReplay {
     pub blocks: Vec<Value>,
 }
 
+impl ProviderReplay {
+    /// Keep the request effort as private metadata beside the response blocks.
+    pub fn record_openai_effort(&mut self, effort: &str) {
+        if !effort.is_empty() {
+            self.blocks
+                .retain(|block| block.get("_pi_openai_effort").is_none());
+            self.blocks
+                .push(serde_json::json!({"_pi_openai_effort":effort}));
+        }
+    }
+
+    pub fn openai_effort(&self) -> Option<&str> {
+        self.blocks.iter().find_map(|block| {
+            block
+                .get("_pi_openai_effort")?
+                .as_str()
+                .filter(|effort| !effort.is_empty())
+        })
+    }
+
+    /// Preserve the recorded Anthropic effort without placing private data on the wire.
+    pub fn record_anthropic_effort(&mut self, effort: &str) {
+        if let Some(effort) = Self::valid_anthropic_effort(effort) {
+            self.blocks
+                .retain(|block| block.get("_pi_anthropic_effort").is_none());
+            self.blocks
+                .push(serde_json::json!({"_pi_anthropic_effort":effort}));
+        }
+    }
+
+    pub fn anthropic_effort(&self) -> Option<&'static str> {
+        self.blocks.iter().find_map(|block| {
+            Self::valid_anthropic_effort(block.get("_pi_anthropic_effort")?.as_str()?)
+        })
+    }
+
+    pub fn valid_anthropic_effort(effort: &str) -> Option<&'static str> {
+        match effort {
+            "low" => Some("low"),
+            "medium" => Some("medium"),
+            "high" => Some("high"),
+            "xhigh" => Some("xhigh"),
+            "max" => Some("max"),
+            _ => None,
+        }
+    }
+
+    pub fn is_context_edit(&self) -> bool {
+        self.blocks
+            .iter()
+            .any(|b| b.get("_pi_context_edit_api").is_some())
+    }
+
+    /// Replay with a known wire format must use the originating API family.
+    pub fn supports_api(&self, api: ModelApi) -> bool {
+        if let Some(name) = self
+            .blocks
+            .iter()
+            .find_map(|block| block.get("_pi_context_edit_api").and_then(Value::as_str))
+        {
+            return name == api.as_str();
+        }
+        // Pi Messages uses Anthropic-shaped content with its own marker.
+        if self
+            .blocks
+            .first()
+            .is_some_and(|block| block["type"] == "pi-rs:pi-messages-origin")
+        {
+            return api == ModelApi::PiMessages;
+        }
+        // Mistral may record a compatibility reasoning block alongside its
+        // native content envelope. The envelope defines the route for both.
+        if self
+            .blocks
+            .iter()
+            .any(|block| block.get("mistral_content").is_some())
+        {
+            return api == ModelApi::MistralConversations;
+        }
+        self.blocks.iter().all(|block| {
+            if block.get("_pi_anthropic_effort").is_some() {
+                return api == ModelApi::AnthropicMessages;
+            }
+            if block.get("_pi_openai_effort").is_some() {
+                return matches!(
+                    api,
+                    ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses
+                );
+            }
+            match block["type"].as_str() {
+                Some("thinking" | "redacted_thinking") => api == ModelApi::AnthropicMessages,
+                // Older Bedrock and Anthropic journals share these block types.
+                Some("text" | "tool_use") => {
+                    matches!(
+                        api,
+                        ModelApi::AnthropicMessages | ModelApi::BedrockConverseStream
+                    )
+                }
+                Some("reasoning")
+                    if block.get("text").is_some()
+                        || block.get("redacted").is_some()
+                        || block.get("signature").is_some() =>
+                {
+                    api == ModelApi::BedrockConverseStream
+                }
+                Some("message" | "reasoning" | "function_call" | "custom_tool_call") => {
+                    matches!(
+                        api,
+                        ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses
+                    )
+                }
+                Some(kind) if kind == "reasoning_content" || kind.starts_with("reasoning.") => {
+                    api == ModelApi::OpenaiCompletions
+                }
+                None if [
+                    "text",
+                    "thought",
+                    "thoughtSignature",
+                    "functionCall",
+                    "functionResponse",
+                    "inlineData",
+                    "fileData",
+                    "executableCode",
+                    "codeExecutionResult",
+                ]
+                .iter()
+                .any(|key| block.get(key).is_some()) =>
+                {
+                    matches!(api, ModelApi::GoogleGenerativeAi | ModelApi::GoogleVertex)
+                }
+                // An older or host-defined block may have no recognizable API marker.
+                _ => true,
+            }
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UsageReport {
@@ -593,12 +862,176 @@ pub struct ToolCallDelta {
 
 pub type ModelStream = futures_util::stream::BoxStream<'static, Result<ModelEvent>>;
 
+/// Model events with optional provider reasoning item boundaries and identity.
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum EnrichedModelEvent {
+    Legacy(ModelEvent),
+    TextStart { index: u64 },
+    TextDelta { index: u64, delta: String },
+    TextEnd { index: u64, content: String },
+    ReasoningStart { index: u64 },
+    ReasoningDelta { index: u64, delta: String },
+    ReasoningEnd { index: u64, content: String },
+}
+
+pub type EnrichedModelStream = futures_util::stream::BoxStream<'static, Result<EnrichedModelEvent>>;
+
+/// An enriched event with an optional redacted-thinking start marker.
+#[derive(Clone)]
+pub struct DetailedModelEvent {
+    pub event: EnrichedModelEvent,
+    redacted: bool,
+}
+impl DetailedModelEvent {
+    pub fn redacted_start(index: u64) -> Self {
+        Self {
+            event: EnrichedModelEvent::ReasoningStart { index },
+            redacted: true,
+        }
+    }
+    pub fn is_redacted_start(&self) -> bool {
+        self.redacted
+    }
+}
+impl From<EnrichedModelEvent> for DetailedModelEvent {
+    fn from(event: EnrichedModelEvent) -> Self {
+        Self {
+            event,
+            redacted: false,
+        }
+    }
+}
+pub type DetailedModelStream = futures_util::stream::BoxStream<'static, Result<DetailedModelEvent>>;
+
+/// Native tool declarations that became effective before a message in a request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolTranscriptChange {
+    /// A value equal to the message count denotes the end of the request.
+    pub message_index: usize,
+    pub added: Vec<crate::ToolDeclaration>,
+    pub removed: Vec<String>,
+}
+
+/// Identity and cache purpose fixed when preparing a model dispatch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolDispatchContext {
+    pub request_id: Uuid,
+    pub session_id: Uuid,
+    pub external_id: String,
+    pub summary: bool,
+}
+
+/// An immutable prepared model dispatch and its actual tool-sampling decisions.
+#[async_trait::async_trait]
+pub trait PreparedToolDispatch: Send {
+    fn effective_tools(&self) -> &[crate::EffectiveToolDeclaration];
+    /// Snapshot bound to the final request, decisions and dispatch context.
+    fn decision_snapshot(&self) -> &crate::ToolDecisionSnapshot;
+    /// Request after host filtering and before tool-schema transformation.
+    fn dispatch_request(&self) -> &ModelRequest;
+    /// Request with the tool schemas actually sent, for budget estimation.
+    fn reservation_request(&self) -> &ModelRequest;
+    async fn dispatch(self: Box<Self>) -> Result<DetailedModelStream>;
+}
+
+/// Verify a prepared adapter's snapshot and exposed decisions against the
+/// caller's final declarations before recording or dispatching it.
+pub fn validate_prepared_tool_dispatch<'a>(
+    prepared: &'a dyn PreparedToolDispatch,
+    context: &ToolDispatchContext,
+    request: &ModelRequest,
+    declarations: &[crate::ToolDeclaration],
+) -> Result<crate::ValidatedToolDecisionSnapshot<'a>> {
+    let validated = prepared
+        .decision_snapshot()
+        .validate(context, request, prepared.dispatch_request(), declarations)
+        .map_err(|error| Error::Config(error.to_string()))?;
+    if validated.effective_tools() != prepared.effective_tools() {
+        return Err(Error::Config(
+            "prepared tool decisions do not match snapshot".into(),
+        ));
+    }
+    Ok(validated)
+}
+
 #[async_trait::async_trait]
 pub trait Model: Send + Sync {
+    /// Whether the effective route can represent system instructions in conversation order.
+    fn supports_mid_conversation_system_messages(&self, _model: &str) -> bool {
+        false
+    }
+
+    /// Resolve a request-specific adapter once for estimation and dispatch.
+    async fn prepare_context<'a>(
+        &'a self,
+        _request: &ModelRequest,
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        Ok(None)
+    }
+
+    /// Whether this adapter consumes ordered tool changes from native sessions.
+    fn uses_tool_transcript(&self, _model: &str) -> bool {
+        false
+    }
+
+    /// Resolve the adapter together with a branch-local transcript of tool changes.
+    async fn prepare_context_with_tool_transcript<'a>(
+        &'a self,
+        request: &ModelRequest,
+        _tool_transcript: &[ToolTranscriptChange],
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        self.prepare_context(request).await
+    }
+
+    /// Prepare the actual tool decisions and dispatch together. A legacy
+    /// adapter may return `None` only after rejecting required constraints;
+    /// in that case every tool is treated as unconstrained.
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[crate::ToolDeclaration],
+        _context: &ToolDispatchContext,
+    ) -> Result<Option<Box<dyn PreparedToolDispatch + 'a>>> {
+        validate_legacy_tool_declarations(request, declarations)?;
+        Ok(None)
+    }
+
+    /// Stable identity of all configuration affecting the effective request.
+    /// Return None when the adapter cannot prove that identity across requests.
+    /// Implementations must not return credentials or other secrets in plaintext.
+    fn context_identity(&self) -> Option<String> {
+        None
+    }
+
+    /// Estimate a message in the form this adapter sends to its provider.
+    fn estimate_message_tokens(&self, _request: &ModelRequest, message: &Message) -> u64 {
+        crate::estimate_message_tokens(message)
+    }
+
+    /// Estimate the complete request, including provider-specific message serialization.
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        let mut base = request.clone();
+        base.messages.clear();
+        let messages = request
+            .messages
+            .iter()
+            .map(|message| self.estimate_message_tokens(request, message))
+            .fold(0_u64, u64::saturating_add);
+        crate::estimate_request_tokens(&base).saturating_add(messages)
+    }
+
     /// Effective context capacity, when the provider can discover it.
     async fn context_window(&self, _model: &str) -> Option<u32> {
         None
     }
+
+    /// Smallest positive output budget accepted by this adapter.
+    fn minimum_output_tokens(&self) -> u32 {
+        1
+    }
+
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream>;
 
     /// Host adapters can reserve budget using this ID before calling a provider.
@@ -620,6 +1053,18 @@ pub trait Model: Send + Sync {
         self.stream_with_id(request_id, request).await
     }
 
+    /// Provide a Pi-compatible external identity without breaking existing models.
+    async fn stream_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        _external_id: &str,
+        request: ModelRequest,
+    ) -> Result<ModelStream> {
+        self.stream_in_session(request_id, session_id, request)
+            .await
+    }
+
     /// Summaries use their own prompt and should bypass reusable conversation caches.
     async fn stream_for_summary(
         &self,
@@ -628,6 +1073,96 @@ pub trait Model: Send + Sync {
         request: ModelRequest,
     ) -> Result<ModelStream> {
         self.stream_in_session(request_id, session_id, request)
+            .await
+    }
+
+    /// Stream with item-level reasoning events, defaulting to the legacy session stream.
+    async fn stream_enriched_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<EnrichedModelStream> {
+        use futures_util::StreamExt;
+        Ok(self
+            .stream_in_session_with_identity(request_id, session_id, external_id, request)
+            .await?
+            .map(|event| event.map(EnrichedModelEvent::Legacy))
+            .boxed())
+    }
+
+    /// Stream a summary with item-level reasoning events, defaulting to the legacy summary stream.
+    async fn stream_enriched_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<EnrichedModelStream> {
+        use futures_util::StreamExt;
+        Ok(self
+            .stream_for_summary(request_id, session_id, request)
+            .await?
+            .map(|event| event.map(EnrichedModelEvent::Legacy))
+            .boxed())
+    }
+
+    /// Enriched stream with optional redacted-thinking start marker.
+    async fn stream_detailed_in_session_with_identity(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<DetailedModelStream> {
+        use futures_util::StreamExt;
+        Ok(self
+            .stream_enriched_in_session_with_identity(request_id, session_id, external_id, request)
+            .await?
+            .map(|event| event.map(Into::into))
+            .boxed())
+    }
+
+    /// Summary counterpart of the detailed stream.
+    async fn stream_detailed_for_summary(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+    ) -> Result<DetailedModelStream> {
+        use futures_util::StreamExt;
+        Ok(self
+            .stream_enriched_for_summary(request_id, session_id, request)
+            .await?
+            .map(|event| event.map(Into::into))
+            .boxed())
+    }
+
+    /// Stream with a snapshot of per-tool constraints. Legacy models may fall
+    /// back for preferred constraints, but must fail closed for required ones.
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[crate::ToolDeclaration],
+    ) -> Result<DetailedModelStream> {
+        validate_legacy_tool_declarations(&request, declarations)?;
+        self.stream_detailed_in_session_with_identity(request_id, session_id, external_id, request)
+            .await
+    }
+
+    /// Summary counterpart of the constrained detailed stream.
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        request_id: Uuid,
+        session_id: Uuid,
+        request: ModelRequest,
+        declarations: &[crate::ToolDeclaration],
+    ) -> Result<DetailedModelStream> {
+        validate_legacy_tool_declarations(&request, declarations)?;
+        self.stream_detailed_for_summary(request_id, session_id, request)
             .await
     }
 
@@ -648,6 +1183,230 @@ pub trait Model: Send + Sync {
     }
 }
 
+/// Check declarations before falling back to a legacy model adapter.
+pub fn validate_legacy_tool_declarations(
+    request: &ModelRequest,
+    declarations: &[crate::ToolDeclaration],
+) -> Result<()> {
+    let mut names = std::collections::BTreeSet::new();
+    if request.tools.len() != declarations.len()
+        || request
+            .tools
+            .iter()
+            .zip(declarations)
+            .any(|(spec, declaration)| spec != &declaration.spec || !names.insert(&spec.name))
+    {
+        return Err(Error::Config(
+            "tool declarations do not match the effective request".into(),
+        ));
+    }
+    if let Some(declaration) = declarations.iter().find(|declaration| {
+        matches!(
+            declaration.constrained_sampling,
+            Some(crate::ToolConstraint::JsonSchema {
+                strict: crate::StrictToolPolicy::Require
+            })
+        )
+    }) {
+        return Err(Error::Config(format!(
+            "Tool \"{}\" requires JSON-schema constrained sampling, but strict tools are unsupported.",
+            declaration.spec.name
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod declaration_dispatch_tests {
+    use super::*;
+
+    struct LegacyModel;
+    struct InconsistentDispatch {
+        snapshot: crate::ToolDecisionSnapshot,
+        request: ModelRequest,
+        effective: Vec<crate::EffectiveToolDeclaration>,
+    }
+    #[async_trait::async_trait]
+    impl PreparedToolDispatch for InconsistentDispatch {
+        fn effective_tools(&self) -> &[crate::EffectiveToolDeclaration] {
+            &self.effective
+        }
+        fn decision_snapshot(&self) -> &crate::ToolDecisionSnapshot {
+            &self.snapshot
+        }
+        fn dispatch_request(&self) -> &ModelRequest {
+            &self.request
+        }
+        fn reservation_request(&self) -> &ModelRequest {
+            &self.request
+        }
+        async fn dispatch(self: Box<Self>) -> Result<DetailedModelStream> {
+            panic!("must not dispatch")
+        }
+    }
+    #[async_trait::async_trait]
+    impl Model for LegacyModel {
+        async fn stream(&self, _request: ModelRequest) -> Result<ModelStream> {
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+    }
+
+    #[test]
+    fn prepared_dispatch_rejects_decisions_that_disagree_with_snapshot() {
+        let spec = ToolSpec {
+            name: "read".into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type":"object"}),
+        };
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 1,
+        };
+        let declaration = crate::ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(crate::ToolConstraint::JsonSchema {
+                strict: crate::StrictToolPolicy::Prefer,
+            }),
+        };
+        let strict = crate::EffectiveToolDeclaration {
+            spec: spec.clone(),
+            sampling: crate::EffectiveToolSampling::StrictJsonSchema {
+                original_schema: spec.parameters.clone(),
+                normalization_version: crate::STRICT_TOOL_NORMALIZATION_VERSION,
+            },
+        };
+        let context = ToolDispatchContext {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        let snapshot = crate::ToolDecisionSnapshot::capture(
+            &context,
+            &request,
+            std::slice::from_ref(&declaration),
+            &[strict],
+        )
+        .unwrap();
+        let dispatch = InconsistentDispatch {
+            snapshot,
+            request: request.clone(),
+            effective: vec![crate::EffectiveToolDeclaration {
+                spec,
+                sampling: crate::EffectiveToolSampling::Unconstrained,
+            }],
+        };
+        assert!(
+            validate_prepared_tool_dispatch(&dispatch, &context, &request, &[declaration]).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_models_fail_closed_for_required_tool_constraints() {
+        let spec = ToolSpec {
+            name: "read".into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type":"object"}),
+        };
+        let request = ModelRequest {
+            model: "test".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 1,
+        };
+        let mut declaration = crate::ToolDeclaration {
+            spec,
+            constrained_sampling: Some(crate::ToolConstraint::JsonSchema {
+                strict: crate::StrictToolPolicy::Prefer,
+            }),
+        };
+        let model = LegacyModel;
+        let context = ToolDispatchContext {
+            request_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            external_id: "id".into(),
+            summary: false,
+        };
+        assert!(
+            model
+                .prepare_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let duplicate = ModelRequest {
+            tools: vec![request.tools[0].clone(), request.tools[0].clone()],
+            ..request.clone()
+        };
+        assert!(
+            validate_legacy_tool_declarations(
+                &duplicate,
+                &[declaration.clone(), declaration.clone()]
+            )
+            .is_err()
+        );
+        assert!(
+            model
+                .stream_detailed_with_tool_declarations(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    "id",
+                    request.clone(),
+                    std::slice::from_ref(&declaration)
+                )
+                .await
+                .is_ok()
+        );
+        declaration.constrained_sampling = Some(crate::ToolConstraint::JsonSchema {
+            strict: crate::StrictToolPolicy::Require,
+        });
+        assert!(
+            model
+                .prepare_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+                .await
+                .is_err()
+        );
+        assert!(
+            model
+                .stream_detailed_with_tool_declarations(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    "id",
+                    request.clone(),
+                    std::slice::from_ref(&declaration)
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            model
+                .stream_detailed_summary_with_tool_declarations(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    request.clone(),
+                    std::slice::from_ref(&declaration)
+                )
+                .await
+                .is_err()
+        );
+        declaration.spec.name = "changed".into();
+        assert!(
+            model
+                .stream_detailed_with_tool_declarations(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    "id",
+                    request,
+                    &[declaration]
+                )
+                .await
+                .is_err()
+        );
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", content = "detail", rename_all = "snake_case")]
 pub enum Outcome {
@@ -658,6 +1417,21 @@ pub enum Outcome {
         details: Value,
     },
     Failed(String),
+    /// A patched text result with independent model content, metadata and error status.
+    TextResult {
+        output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+        is_error: bool,
+    },
+    /// Text sent to the model with a separate structured result for event consumers.
+    TextResultWithStructuredContent {
+        output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+        structured_content: Value,
+        is_error: bool,
+    },
     Skipped(String),
     /// An effect may have occurred. Only an authoritative reconciliation can clear this state.
     Unknown(String),
@@ -672,6 +1446,12 @@ pub enum Outcome {
         data: Value,
         attachments: Vec<AttachmentRef>,
     },
+    /// Structured output with metadata retained outside model-facing content.
+    StructuredWithDetails {
+        data: Value,
+        attachments: Vec<AttachmentRef>,
+        details: Value,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -682,19 +1462,93 @@ pub struct AttachmentRef {
 }
 
 impl Outcome {
+    pub fn is_error(&self) -> bool {
+        match self {
+            Self::Failed(_) | Self::Skipped(_) | Self::Unknown(_) => true,
+            Self::TextResult { is_error, .. }
+            | Self::TextResultWithStructuredContent { is_error, .. } => *is_error,
+            Self::Structured { data, .. } | Self::StructuredWithDetails { data, .. } => {
+                data["isError"] == true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether this outcome contains structured tool data.
+    pub fn is_structured(&self) -> bool {
+        matches!(
+            self,
+            Self::Structured { .. } | Self::StructuredWithDetails { .. }
+        )
+    }
+
+    /// Lossy projection for older native executable protocols.
+    pub fn legacy_text_result(&self) -> Self {
+        match self {
+            Self::TextResult {
+                output,
+                details,
+                is_error: false,
+            } => match details {
+                Some(details) => Self::SucceededWithDetails {
+                    output: output.clone(),
+                    details: details.clone(),
+                },
+                None => Self::Succeeded(output.clone()),
+            },
+            Self::TextResult {
+                output,
+                is_error: true,
+                ..
+            } => Self::Failed(output.clone()),
+            Self::TextResultWithStructuredContent {
+                output,
+                details,
+                is_error,
+                ..
+            } => Self::TextResult {
+                output: output.clone(),
+                details: details.clone(),
+                is_error: *is_error,
+            }
+            .legacy_text_result(),
+            _ => self.clone(),
+        }
+    }
+
+    /// Project the structured-result extension to the existing text-result protocol.
+    pub fn protocol_text_result(&self) -> Self {
+        match self {
+            Self::TextResultWithStructuredContent {
+                output,
+                details,
+                is_error,
+                ..
+            } => Self::TextResult {
+                output: output.clone(),
+                details: details.clone(),
+                is_error: *is_error,
+            },
+            _ => self.clone(),
+        }
+    }
+
     pub fn tool_content(&self) -> String {
         match self {
             Self::Succeeded(output) | Self::SucceededWithDetails { output, .. } => output.clone(),
             Self::Failed(reason) => format!("Tool failed: {reason}"),
+            Self::TextResult { output, .. }
+            | Self::TextResultWithStructuredContent { output, .. } => output.clone(),
             Self::Skipped(reason) => format!("Tool did not start: {reason}"),
             Self::Unknown(reason) => format!("Tool outcome unknown: {reason}"),
             Self::Pending { .. } => "Tool operation is still pending".into(),
             Self::Truncated { original_bytes } => format!(
                 "Tool succeeded. Output omitted ({original_bytes} bytes exceeded the limit)."
             ),
-            Self::Structured { data, attachments } => {
-                serde_json::json!({ "data": data, "attachments": attachments }).to_string()
-            }
+            Self::Structured { data, attachments }
+            | Self::StructuredWithDetails {
+                data, attachments, ..
+            } => serde_json::json!({ "data": data, "attachments": attachments }).to_string(),
         }
     }
 }

@@ -1,4 +1,5 @@
 //! Native Anthropic Messages and Models API integration.
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -6,19 +7,24 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use pi_rs_core::{
-    AnthropicInputTransformations, AssistantDiagnostic, Error, Message, Model, ModelApi,
-    ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay, ReportedUsageCost,
-    ResolvedModelIdentity, Result, ToolCall, Usage,
+    AnthropicInputTransformations, AnthropicThreadFallbackDetails, AssistantDiagnostic,
+    BoundToolTranscript, ChatPrice, Error, ImageContent, Message, Model, ModelApi, ModelEvent,
+    ModelMetadata, ModelRequest, ModelStream, ProviderReplay, ReportedUsageCost,
+    ResolvedModelIdentity, Result, ToolCall, ToolDeclaration, ToolSpec, ToolTranscriptChange,
+    Usage,
 };
 use reqwest::{
     Client, Response, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+mod thread;
 
 pub const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
+pub const OAUTH_API_BETA: &str = "oauth-2025-04-20";
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
@@ -34,11 +40,44 @@ pub struct CatalogEntry {
     effort_levels: bool,
 }
 
+impl CatalogEntry {
+    /// Whether discovery explicitly identified a usable mode or disabled thinking.
+    pub fn has_known_thinking(&self) -> bool {
+        self.reasoning == Some(false) || self.thinking.is_some()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ThinkingMode {
     Adaptive,
     Budgeted,
 }
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum ThinkingDisplay {
+    #[default]
+    Summarized,
+    Omitted,
+}
+
+impl ThinkingDisplay {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Summarized => "summarized",
+            Self::Omitted => "omitted",
+        }
+    }
+}
+
+const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+const MESSAGE_THREADS_BETA: &str = "message-threads-2026-08-12";
+const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+const EFFORT_BETA: &str = "mid-conversation-output-config-2026-07-01";
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+const INLINE_TOOLS_BETA: &str = "inline-tools-2026-09-15";
+const DEFERRED_TOOL_PLACEHOLDER: &str = "__pi_deferred_placeholder__";
+const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
+const OAUTH_BETAS: &str = "claude-code-20250219,oauth-2025-04-20";
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,22 +92,71 @@ pub use pi_rs_core::CacheRetention;
 
 type ReasoningObserver = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// A server-side fallback target with the catalog price used if it answers.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct AnthropicFallbackModel {
+    pub provider: String,
+    pub model: String,
+    pub cost: ChatPrice,
+}
+
+impl AnthropicFallbackModel {
+    pub fn valid_list(models: &[Self]) -> bool {
+        models.len() <= 3
+            && models.iter().all(|target| {
+                !target.provider.trim().is_empty()
+                    && !target.model.trim().is_empty()
+                    && target.cost.valid()
+            })
+    }
+}
+
+#[derive(Default)]
+struct RequestFeatures {
+    interleaved: bool,
+    legacy_tool_streaming: bool,
+    inline_tools: bool,
+    managed_effort: bool,
+    fallbacks: bool,
+    session_threads: bool,
+}
+
 #[derive(Clone)]
 pub struct Anthropic {
     client: Client,
+    provider_retry: pi_rs_core::ProviderRetry,
     http_proxies: Vec<reqwest::Proxy>,
     endpoint: Url,
     auth: (HeaderName, HeaderValue),
+    oauth: bool,
+    federation_rejected: Option<Arc<dyn Fn() + Send + Sync>>,
     provider: Arc<str>,
     replay_scope: Arc<str>,
     headers: HeaderMap,
     catalog: Arc<RwLock<BTreeMap<String, CatalogEntry>>>,
     probe_context: bool,
     thinking_level: Option<String>,
+    thinking_budgets: Option<Value>,
+    temperatures: Arc<BTreeMap<String, f64>>,
+    thinking_display: ThinkingDisplay,
+    interleaved_thinking: bool,
+    managed_effort_models: Arc<BTreeMap<String, bool>>,
+    fallback_models: Arc<BTreeMap<String, Vec<AnthropicFallbackModel>>>,
+    disable_message_thread_continuation: bool,
+    message_thread_default: Option<bool>,
+    message_thread_support: Arc<BTreeMap<String, bool>>,
+    eager_tool_input_streaming: bool,
+    eager_tool_input_models: Arc<BTreeMap<String, bool>>,
     configured_thinking: Option<CatalogEntry>,
+    configured_thinking_is_fallback: bool,
     allow_empty_signature: bool,
     cache_retention: CacheRetention,
     cache_tools: bool,
+    strict_tool_support: bool,
+    strict_tool_models: Option<Arc<BTreeMap<String, bool>>>,
+    mid_conversation_system_models: Arc<BTreeSet<String>>,
+    inline_tool_models: Arc<BTreeSet<String>>,
+    tool_transcript: Option<BoundToolTranscript>,
     progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
     reasoning: Option<ReasoningObserver>,
 }
@@ -86,6 +174,65 @@ impl Anthropic {
             ));
         }
         Self::connect(endpoint, AUTHORIZATION, &format!("Bearer {token}"))
+    }
+
+    /// Authenticate using a short-lived Anthropic workload identity access token.
+    pub fn with_federated_token(
+        endpoint: &str,
+        token: &str,
+        on_rejection: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self> {
+        let mut client = Self::with_bearer_token(endpoint, token)?;
+        if client.endpoint.as_str() != DEFAULT_ENDPOINT {
+            return Err(Error::Config(
+                "Anthropic workload identity requires the official endpoint".into(),
+            ));
+        }
+        client.federation_rejected = Some(Arc::new(on_rejection));
+        Ok(client)
+    }
+
+    /// Use an explicitly configured authentication header as the request credential.
+    pub fn with_authentication_header(
+        endpoint: &str,
+        name: HeaderName,
+        value: &HeaderValue,
+    ) -> Result<Self> {
+        let credential = value
+            .to_str()
+            .map_err(|_| Error::Config("invalid Anthropic authentication header".into()))?;
+        Self::connect(endpoint, name, credential)
+    }
+
+    /// Authenticate to Cloudflare AI Gateway without an origin API key.
+    pub fn with_cloudflare_gateway_token(endpoint: &str, token: &str) -> Result<Self> {
+        if token.trim().is_empty() {
+            return Err(Error::Config("missing Cloudflare AI Gateway token".into()));
+        }
+        Self::connect(
+            endpoint,
+            HeaderName::from_static("cf-aig-authorization"),
+            &format!("Bearer {token}"),
+        )
+    }
+
+    /// Connect using Anthropic subscription OAuth credentials.
+    pub fn with_oauth_token(endpoint: &str, token: &str) -> Result<Self> {
+        let mut client = Self::with_bearer_token(endpoint, token)?;
+        let official = client.endpoint.as_str() == DEFAULT_ENDPOINT;
+        let test_loopback = cfg!(test)
+            && client.endpoint.scheme() == "http"
+            && matches!(
+                client.endpoint.host_str(),
+                Some("127.0.0.1" | "localhost" | "[::1]")
+            );
+        if !official && !test_loopback {
+            return Err(Error::Config(
+                "Anthropic OAuth requires the official endpoint".into(),
+            ));
+        }
+        client.oauth = true;
+        Ok(client)
     }
 
     fn connect(endpoint: &str, name: HeaderName, credential: &str) -> Result<Self> {
@@ -118,24 +265,189 @@ impl Anthropic {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|_| Error::Config("could not build Anthropic HTTP client".into()))?;
+        let replay_scope: Arc<str> = if endpoint.as_str() == DEFAULT_ENDPOINT {
+            Arc::from("anthropic")
+        } else {
+            pi_rs_core::endpoint_replay_scope("anthropic", endpoint.as_str()).into()
+        };
         Ok(Self {
             client,
             http_proxies: Vec::new(),
+            provider_retry: pi_rs_core::ProviderRetry::default(),
             endpoint,
             auth: (name, value),
+            oauth: false,
+            federation_rejected: None,
             provider: Arc::from("anthropic"),
-            replay_scope: Arc::from("anthropic"),
+            replay_scope,
             headers: HeaderMap::new(),
             catalog: Default::default(),
             probe_context: true,
             thinking_level: None,
+            thinking_budgets: None,
+            temperatures: Arc::default(),
+            thinking_display: ThinkingDisplay::default(),
+            interleaved_thinking: true,
+            managed_effort_models: Arc::default(),
+            fallback_models: Arc::default(),
+            disable_message_thread_continuation: false,
+            message_thread_default: None,
+            message_thread_support: Arc::default(),
+            eager_tool_input_streaming: true,
+            eager_tool_input_models: Arc::default(),
             configured_thinking: None,
+            configured_thinking_is_fallback: false,
             allow_empty_signature: false,
             cache_retention: CacheRetention::None,
             cache_tools: true,
+            strict_tool_support: false,
+            strict_tool_models: None,
+            mid_conversation_system_models: Arc::default(),
+            inline_tool_models: Arc::default(),
+            tool_transcript: None,
             progress: None,
             reasoning: None,
         })
+    }
+
+    /// Enable native system updates for the listed models on this client route.
+    pub fn with_mid_conversation_system_models(mut self, models: BTreeSet<String>) -> Self {
+        self.mid_conversation_system_models = Arc::new(models);
+        self
+    }
+
+    /// Enable native tool checkpoints on the specified models of this route.
+    pub fn with_inline_tool_models(mut self, models: BTreeSet<String>) -> Self {
+        self.inline_tool_models = Arc::new(models);
+        self
+    }
+
+    pub fn supports_tool_transcript(&self, model: &str) -> bool {
+        self.mid_conversation_system_models.contains(model)
+            && self.inline_tool_models.contains(model)
+    }
+
+    pub fn with_tool_transcript(
+        mut self,
+        request: &ModelRequest,
+        changes: &[ToolTranscriptChange],
+    ) -> Self {
+        self.tool_transcript = None;
+        if self.supports_tool_transcript(&request.model) && !changes.is_empty() {
+            self.tool_transcript = BoundToolTranscript::bind(request, changes);
+        }
+        self
+    }
+
+    fn inline_tools(
+        &self,
+        request: &ModelRequest,
+        prepared: Option<&AnthropicWireTools>,
+        check_final_tools: bool,
+    ) -> Option<InlineTools> {
+        let changes = self.tool_transcript.as_ref()?.changes_for(request)?;
+        let strict = self
+            .strict_tool_models
+            .as_ref()
+            .map_or(self.strict_tool_support, |models| {
+                models.get(&request.model).copied().unwrap_or(false)
+            });
+        let encode = |declaration: &ToolDeclaration| {
+            prepared
+                .and_then(|tools| {
+                    let index = tools
+                        .source
+                        .iter()
+                        .position(|active| active == declaration)?;
+                    tools.declarations.get(index).cloned()
+                })
+                .or_else(|| {
+                    resolve_anthropic_wire_tool(declaration, strict)
+                        .ok()
+                        .map(|(wire, _)| wire)
+                })
+        };
+        InlineTools::project(
+            changes,
+            request,
+            prepared,
+            encode,
+            self.tool_input_is_eager(&request.model),
+            check_final_tools,
+            self.oauth,
+        )
+    }
+
+    /// Use per-tool eager input streaming, or the legacy beta when disabled.
+    pub fn with_eager_tool_input_streaming(
+        mut self,
+        enabled: bool,
+        models: BTreeMap<String, bool>,
+    ) -> Self {
+        self.eager_tool_input_streaming = enabled;
+        self.eager_tool_input_models = Arc::new(models);
+        self
+    }
+
+    /// Set the selected model's JSON Schema strict-tool capability.
+    /// Unknown and compatible endpoints default to unsupported.
+    pub fn with_strict_tool_support(mut self, supported: bool) -> Self {
+        self.strict_tool_support = supported;
+        self
+    }
+
+    /// Freeze strict-tool capabilities for models on this route.
+    /// A constrained request for an absent model fails closed.
+    pub fn with_strict_tool_models(mut self, models: BTreeMap<String, bool>) -> Self {
+        self.strict_tool_models = Some(Arc::new(models));
+        self
+    }
+
+    /// Bind the configured strict capability to a single selected model.
+    pub fn with_strict_tool_model(self, model: &str) -> Self {
+        let supported = self.strict_tool_support;
+        self.with_strict_tool_models([(model.to_owned(), supported)].into_iter().collect())
+    }
+
+    /// Resolve and bind the exact tools to be sent for this dispatch.
+    pub fn prepare_bound_tool_dispatch(
+        &self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Box<dyn pi_rs_core::PreparedToolDispatch>> {
+        let constrained = declarations.iter().any(|declaration| {
+            matches!(
+                declaration.constrained_sampling,
+                Some(pi_rs_core::ToolConstraint::JsonSchema { .. })
+            )
+        });
+        let supported = match (&self.strict_tool_models, constrained) {
+            (Some(models), true) => *models.get(&request.model).ok_or_else(|| {
+                Error::Config("Anthropic strict-tool capability cannot be resolved for the final request model and route".into())
+            })?,
+            _ => self.strict_tool_support,
+        };
+        let (wire_tools, effective) = resolve_tools(request, declarations, supported)?;
+        let snapshot =
+            pi_rs_core::ToolDecisionSnapshot::capture(context, request, declarations, &effective)
+                .map_err(|error| Error::Config(error.to_string()))?;
+        let mut reservation = request.clone();
+        for (tool, wire) in reservation.tools.iter_mut().zip(&wire_tools) {
+            tool.parameters = wire["input_schema"].clone();
+        }
+        Ok(Box::new(PreparedAnthropicDispatch {
+            client: self.clone(),
+            request: request.clone(),
+            reservation,
+            wire_tools: AnthropicWireTools {
+                source: declarations.to_vec(),
+                declarations: wire_tools,
+            },
+            effective,
+            snapshot,
+            context: context.clone(),
+        }))
     }
 
     /// Set the per-read HTTP idle timeout; `None` disables it.
@@ -145,6 +457,12 @@ impl Anthropic {
     }
 
     /// Configure the per-read deadline and explicit HTTP proxies.
+    /// Configure provider-level retries before a response stream starts.
+    pub fn with_provider_retry(mut self, policy: pi_rs_core::ProviderRetry) -> Self {
+        self.provider_retry = policy;
+        self
+    }
+
     pub fn with_http_options(
         mut self,
         timeout: Option<Duration>,
@@ -184,6 +502,11 @@ impl Anthropic {
         self
     }
 
+    /// Return the configured request headers for protected context identity.
+    pub fn context_headers(&self) -> reqwest::header::HeaderMap {
+        self.headers.clone()
+    }
+
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -199,9 +522,105 @@ impl Anthropic {
         self
     }
 
+    /// Supply temperatures for models on the active Messages route.
+    pub fn with_model_temperatures(mut self, temperatures: BTreeMap<String, f64>) -> Self {
+        self.temperatures = Arc::new(temperatures);
+        self
+    }
+
+    pub fn with_thinking_budget_settings(mut self, budgets: Option<Value>) -> Self {
+        self.thinking_budgets = budgets;
+        self
+    }
+
+    /// Choose whether the model returns readable thinking or only its replay signature.
+    pub fn with_thinking_display(mut self, display: ThinkingDisplay) -> Self {
+        self.thinking_display = display;
+        self
+    }
+
+    /// Enable the interleaved beta for budgeted thinking when no beta header is specified.
+    pub fn with_interleaved_thinking(mut self, enabled: bool) -> Self {
+        self.interleaved_thinking = enabled;
+        self
+    }
+
+    /// Enable per-reply effort for the listed models, with their ability to disable thinking.
+    pub fn with_managed_effort_models(mut self, models: BTreeMap<String, bool>) -> Self {
+        self.managed_effort_models = Arc::new(models);
+        self
+    }
+
+    /// Configure the ordered server-side fallback targets for each requested model.
+    pub fn with_fallback_models(
+        mut self,
+        mut models: BTreeMap<String, Vec<AnthropicFallbackModel>>,
+    ) -> Result<Self> {
+        if models
+            .values()
+            .any(|targets| !AnthropicFallbackModel::valid_list(targets))
+        {
+            return Err(Error::Config("invalid Anthropic fallback targets".into()));
+        }
+        models.retain(|_, targets| !targets.is_empty());
+        self.fallback_models = Arc::new(models);
+        Ok(self)
+    }
+
+    /// Set the route default and final-model overrides for Messages threads.
+    pub fn with_message_thread_support(
+        mut self,
+        default: Option<bool>,
+        models: BTreeMap<String, bool>,
+    ) -> Self {
+        self.message_thread_default = default;
+        self.message_thread_support = Arc::new(models);
+        self
+    }
+
+    /// Keep the route's beta and cache options without reading or updating a thread.
+    pub fn without_message_thread_continuation(mut self) -> Self {
+        self.disable_message_thread_continuation = true;
+        self
+    }
+
+    fn thread_key(&self, model: &str, session: Option<(uuid::Uuid, &str)>) -> Option<String> {
+        let (session_id, external_id) = session?;
+        if self.cache_retention == CacheRetention::None
+            || external_id.is_empty()
+            || !self
+                .message_thread_support
+                .get(model)
+                .copied()
+                .or(self.message_thread_default)
+                .unwrap_or(self.endpoint.host_str() == Some("api.anthropic.com"))
+        {
+            return None;
+        }
+        let mut headers: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort_unstable();
+        pi_rs_core::protected_model_fingerprint(&(
+            "anthropic-message-thread-v1",
+            session_id,
+            external_id,
+            self.endpoint.as_str(),
+            self.provider.as_ref(),
+            self.replay_scope.as_ref(),
+            self.auth.0.as_str(),
+            self.auth.1.as_bytes(),
+            self.oauth,
+            headers,
+        ))
+    }
+
     /// Use known thinking capabilities for a gateway that lacks a Models API.
     pub fn with_configured_thinking(mut self, level: &str, adaptive: bool, disable: bool) -> Self {
         self.thinking_level = Some(level.into());
+        self.configured_thinking_is_fallback = false;
         self.configured_thinking = Some(CatalogEntry {
             thinking_levels: vec![level.into()],
             thinking: Some(if adaptive {
@@ -213,6 +632,13 @@ impl Anthropic {
             effort_levels: adaptive,
             ..CatalogEntry::default()
         });
+        self
+    }
+
+    /// Use declared capabilities only when model discovery is unavailable.
+    pub fn with_fallback_thinking(mut self, level: &str, adaptive: bool, disable: bool) -> Self {
+        self = self.with_configured_thinking(level, adaptive, disable);
+        self.configured_thinking_is_fallback = true;
         self
     }
 
@@ -250,7 +676,7 @@ impl Anthropic {
         let mut url = self.models_url();
         url.path_segments_mut().ok()?.push(model);
         let details = tokio::time::timeout(Duration::from_secs(2), async {
-            let response = send(self.authenticate(self.client.get(url))).await.ok()?;
+            let response = self.send_catalog_request(url).await.ok()?;
             decode_model(&read_json(response).await.ok()?)
         })
         .await
@@ -287,11 +713,141 @@ impl Anthropic {
         url
     }
 
-    fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        request
+    fn error_secrets(&self) -> Vec<String> {
+        let mut secrets = Vec::new();
+        for value in std::iter::once(&self.auth.1).chain(self.headers.values()) {
+            if let Ok(value) = value.to_str() {
+                if !value.is_empty() {
+                    secrets.push(value.to_owned());
+                }
+                if let Some((scheme, token)) = value.split_once(' ')
+                    && scheme.eq_ignore_ascii_case("bearer")
+                    && !token.trim().is_empty()
+                {
+                    secrets.push(token.trim().to_owned());
+                }
+            }
+        }
+        secrets
+    }
+
+    fn authenticate(
+        &self,
+        mut request: reqwest::RequestBuilder,
+        features: RequestFeatures,
+    ) -> reqwest::RequestBuilder {
+        request = request
             .header("anthropic-version", API_VERSION)
-            .header(self.auth.0.clone(), self.auth.1.clone())
-            .headers(self.headers.clone())
+            .header(self.auth.0.clone(), self.auth.1.clone());
+        if self.oauth {
+            request = request
+                .header("accept", "application/json")
+                .header("anthropic-dangerous-direct-browser-access", "true")
+                .header("user-agent", "claude-cli/2.1.280")
+                .header("x-app", "cli");
+        }
+        let mut headers = self.headers.clone();
+        let beta = HeaderName::from_static("anthropic-beta");
+        if !headers.contains_key(&beta) {
+            let betas = [
+                self.oauth.then_some(OAUTH_BETAS),
+                features
+                    .legacy_tool_streaming
+                    .then_some(FINE_GRAINED_TOOL_STREAMING_BETA),
+                features.interleaved.then_some(INTERLEAVED_THINKING_BETA),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            if !betas.is_empty() {
+                headers.insert(
+                    &beta,
+                    HeaderValue::from_str(&betas.join(",")).expect("static betas"),
+                );
+            }
+        }
+        if features.fallbacks
+            || features.managed_effort
+            || features.inline_tools
+            || features.session_threads
+            || self.federation_rejected.is_some()
+        {
+            let mut value = headers
+                .get(&beta)
+                .map_or_else(Vec::new, |value| value.as_bytes().to_vec());
+            for feature in [
+                features.fallbacks.then_some(FALLBACK_BETA),
+                self.federation_rejected.is_some().then_some(OAUTH_API_BETA),
+                features.managed_effort.then_some(EFFORT_BETA),
+                features.managed_effort.then_some(THINKING_BINDING_BETA),
+                features.session_threads.then_some(MESSAGE_THREADS_BETA),
+                features.inline_tools.then_some(INLINE_TOOLS_BETA),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !value
+                    .split(|byte| *byte == b',')
+                    .any(|entry| entry.trim_ascii() == feature.as_bytes())
+                {
+                    if !value.is_empty() {
+                        value.push(b',');
+                    }
+                    value.extend_from_slice(feature.as_bytes());
+                }
+            }
+            headers.insert(
+                &beta,
+                HeaderValue::from_bytes(&value).expect("validated beta header"),
+            );
+        }
+        request.headers(headers)
+    }
+
+    fn tool_input_is_eager(&self, model: &str) -> bool {
+        self.eager_tool_input_models
+            .get(model)
+            .copied()
+            .unwrap_or(self.eager_tool_input_streaming)
+    }
+
+    fn configure_tool_input_streaming(&self, model: &str, body: &mut Value) -> bool {
+        let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+            return false;
+        };
+        if self.tool_input_is_eager(model) {
+            for tool in tools {
+                tool["eager_input_streaming"] = json!(true);
+            }
+            false
+        } else {
+            !tools.is_empty()
+        }
+    }
+
+    fn configure_request_thinking(
+        &self,
+        body: &mut Value,
+        details: Option<&CatalogEntry>,
+        max_output_tokens: u32,
+    ) -> Result<bool> {
+        if let Some(level) = self.thinking_level.as_deref() {
+            configure_thinking(
+                body,
+                details,
+                level,
+                max_output_tokens,
+                self.thinking_budgets.as_ref(),
+            )?;
+        }
+        let mode = body["thinking"]["type"].as_str();
+        let interleaved = mode == Some("enabled") && self.interleaved_thinking;
+        if matches!(mode, Some("enabled" | "adaptive"))
+            && self.thinking_display != ThinkingDisplay::Summarized
+        {
+            body["thinking"]["display"] = json!(self.thinking_display.as_str());
+        }
+        Ok(interleaved)
     }
 
     /// Return paginated models in server order and retain their metadata for this client.
@@ -312,7 +868,7 @@ impl Anthropic {
             if let Some(cursor) = &cursor {
                 url.query_pairs_mut().append_pair("after_id", cursor);
             }
-            let response = send(self.authenticate(self.client.get(url))).await?;
+            let response = self.send_catalog_request(url).await?;
             let page = read_json(response).await?;
             let models = page["data"]
                 .as_array()
@@ -344,6 +900,21 @@ impl Anthropic {
             "Anthropic model listing exceeds page limit".into(),
         ))
     }
+
+    async fn send_catalog_request(&self, url: Url) -> Result<Response> {
+        let request = self.authenticate(self.client.get(url), RequestFeatures::default());
+        let response = send_http(request).await?;
+        self.invalidate_rejected_federation_token(response.status());
+        check_status(response, &self.error_secrets()).await
+    }
+
+    fn invalidate_rejected_federation_token(&self, status: reqwest::StatusCode) {
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(rejected) = &self.federation_rejected
+        {
+            rejected();
+        }
+    }
 }
 
 fn decode_model(model: &Value) -> Option<CatalogEntry> {
@@ -355,7 +926,9 @@ fn decode_model(model: &Value) -> Option<CatalogEntry> {
     };
     let capabilities = &model["capabilities"];
     let types = &capabilities["thinking"]["types"];
-    let thinking = if types["adaptive"]["supported"] == true {
+    let thinking = if capabilities["thinking"]["supported"] == false {
+        None
+    } else if types["adaptive"]["supported"] == true {
         Some(ThinkingMode::Adaptive)
     } else if types["enabled"]["supported"] == true {
         Some(ThinkingMode::Budgeted)
@@ -401,8 +974,226 @@ fn decode_model(model: &Value) -> Option<CatalogEntry> {
     })
 }
 
-async fn send(request: reqwest::RequestBuilder) -> Result<Response> {
-    let response = request.send().await.map_err(|error| {
+// Pi excludes account and billing limits from agent retries even if a
+// provider wraps them in HTTP 429. Inspect only a bounded prefix and never
+// include provider response bodies in errors or logs.
+fn permanent_quota_text(body: &[u8], complete: bool, secrets: &[String]) -> bool {
+    let mut text = String::from_utf8_lossy(body).into_owned();
+    for secret in secrets {
+        if !secret.is_empty() {
+            text = text.replace(secret, "[REDACTED]");
+        }
+    }
+    let text = text.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "gousagelimiterror",
+        "freeusagelimiterror",
+        "monthly usage limit reached",
+        "available balance",
+        "insufficient_quota",
+        "out of budget",
+        "quota exceeded",
+        "billing",
+        "subscription_sharing_usage_limit_exceeded",
+        "subscription_sharing_workplace_individual_usage_limit_exceeded",
+    ];
+    if MARKERS.iter().any(|marker| text.contains(marker)) {
+        return true;
+    }
+    text.match_indices("\"code\"").any(|(index, _)| {
+        let rest = text[index + 6..].trim_start();
+        let Some(rest) = rest.strip_prefix(':') else {
+            return false;
+        };
+        let rest = rest
+            .trim_start()
+            .strip_prefix('\"')
+            .unwrap_or(rest.trim_start());
+        rest.strip_prefix("1308").is_some_and(|tail| {
+            (complete || !tail.is_empty()) && !tail.starts_with(|c: char| c.is_ascii_digit())
+        })
+    })
+}
+
+fn permanent_quota_value(value: &Value, secrets: &[String]) -> bool {
+    let error = value.get("error").unwrap_or(value);
+    if let Some(text) = error.as_str() {
+        return permanent_quota_text(text.as_bytes(), true, secrets);
+    }
+    let Some(object) = error.as_object() else {
+        return false;
+    };
+    ["message", "code", "type", "errorMessage"]
+        .iter()
+        .any(|key| {
+            let Some(value) = object.get(*key) else {
+                return false;
+            };
+            if *key == "code" && value.as_u64() == Some(1308) {
+                return true;
+            }
+            if *key == "code"
+                && value.as_str() == Some("1308")
+                && !secrets
+                    .iter()
+                    .any(|secret| !secret.is_empty() && "1308".contains(secret))
+            {
+                return true;
+            }
+            value
+                .as_str()
+                .is_some_and(|text| permanent_quota_text(text.as_bytes(), true, secrets))
+        })
+}
+
+// Keep only complete, directly nested error fields observed before an EOF at
+// the bounded prefix. Unrelated metadata and incomplete values are ignored.
+fn quota_prefix_value(body: &[u8]) -> Option<Value> {
+    use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+    use std::fmt;
+    struct Root<'a>(&'a mut serde_json::Map<String, Value>);
+    struct Fields<'a>(&'a mut serde_json::Map<String, Value>);
+    impl<'de> DeserializeSeed<'de> for Root<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            d: D,
+        ) -> std::result::Result<(), D::Error> {
+            struct RootVisitor<'a>(&'a mut serde_json::Map<String, Value>);
+            impl<'de> Visitor<'de> for RootVisitor<'_> {
+                type Value = ();
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("error envelope")
+                }
+                fn visit_map<M: MapAccess<'de>>(
+                    self,
+                    mut map: M,
+                ) -> std::result::Result<(), M::Error> {
+                    while let Some(key) = map.next_key::<String>()? {
+                        if key == "error" {
+                            self.0.clear();
+                            map.next_value_seed(Fields(self.0))?;
+                        } else {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            d.deserialize_map(RootVisitor(self.0))
+        }
+    }
+    impl<'de> DeserializeSeed<'de> for Fields<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            d: D,
+        ) -> std::result::Result<(), D::Error> {
+            struct FieldsVisitor<'a>(&'a mut serde_json::Map<String, Value>);
+            impl<'de> Visitor<'de> for FieldsVisitor<'_> {
+                type Value = ();
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("error fields")
+                }
+                fn visit_map<M: MapAccess<'de>>(
+                    self,
+                    mut map: M,
+                ) -> std::result::Result<(), M::Error> {
+                    while let Some(key) = map.next_key::<String>()? {
+                        if matches!(key.as_str(), "message" | "code" | "type" | "errorMessage") {
+                            self.0.remove(&key);
+                            let value = map.next_value::<Value>()?;
+                            self.0.insert(key, value);
+                        } else {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            d.deserialize_map(FieldsVisitor(self.0))
+        }
+    }
+    let mut fields = serde_json::Map::new();
+    let mut de = serde_json::Deserializer::from_slice(body);
+    match Root(&mut fields).deserialize(&mut de) {
+        Err(error) if error.is_eof() && !fields.is_empty() => Some(Value::Object(fields)),
+        _ => None,
+    }
+}
+
+fn permanent_quota_error(body: &[u8], complete: bool, secrets: &[String]) -> bool {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(value) => permanent_quota_value(&value, secrets),
+        Err(_) if !complete && String::from_utf8_lossy(body).trim_start().starts_with('{') => {
+            // A JSON parser can accept an unfinished number at EOF. Probe a
+            // trailing digit with another digit; otherwise preserve an already
+            // observed delimiter, including whitespace.
+            let Some(value) = quota_prefix_value(body) else {
+                return false;
+            };
+            let mut probe = Vec::with_capacity(body.len() + 1);
+            probe.extend_from_slice(body);
+            probe.push(if body.last().is_some_and(u8::is_ascii_digit) {
+                b'0'
+            } else {
+                b' '
+            });
+            quota_prefix_value(&probe).is_some_and(|next| next == value)
+                && permanent_quota_value(&value, secrets)
+        }
+        Err(_)
+            if String::from_utf8_lossy(body)
+                .trim_start()
+                .starts_with(['{', '[']) =>
+        {
+            false
+        }
+        Err(_) => permanent_quota_text(body, complete, secrets),
+    }
+}
+
+async fn is_permanent_quota(mut response: Response, secrets: &[String]) -> bool {
+    const MAX_ERROR_BODY: usize = 64 * 1024;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut body = Vec::new();
+        let mut complete = false;
+        while body.len() < MAX_ERROR_BODY {
+            let Some(chunk) = response.chunk().await.ok()? else {
+                complete = true;
+                break;
+            };
+            let remaining = MAX_ERROR_BODY - body.len();
+            body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        }
+        Some(permanent_quota_error(&body, complete, secrets))
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+#[cfg(test)]
+async fn send(request: reqwest::RequestBuilder, secrets: &[String]) -> Result<Response> {
+    check_status(send_http(request).await?, secrets).await
+}
+
+fn thread_fallback_diagnostic(reason: &str) -> AssistantDiagnostic {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    AssistantDiagnostic::AnthropicThreadFallback {
+        timestamp: i64::try_from(millis).unwrap_or(i64::MAX),
+        details: AnthropicThreadFallbackDetails {
+            reason: reason.into(),
+        },
+    }
+}
+
+async fn send_http(request: reqwest::RequestBuilder) -> Result<Response> {
+    request.send().await.map_err(|error| {
         Error::RetryableModel(
             if error.is_timeout() && !error.is_connect() {
                 "HTTP idle timeout"
@@ -411,13 +1202,35 @@ async fn send(request: reqwest::RequestBuilder) -> Result<Response> {
             }
             .into(),
         )
-    })?;
+    })
+}
+
+async fn check_status(response: Response, secrets: &[String]) -> Result<Response> {
     let status = response.status();
     if status.is_success() {
         Ok(response)
     } else {
         let message = format!("Anthropic returned HTTP {status}");
-        if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
+        if status.as_u16() == 413 {
+            return Err(Error::Model("413 request too large".into()));
+        }
+        if matches!(status.as_u16(), 400 | 422) {
+            let overflow =
+                pi_rs_core::provider_context_overflow_stream(response.bytes_stream(), secrets)
+                    .await;
+            return Err(Error::Model(if overflow {
+                "context window exceeded".into()
+            } else {
+                message
+            }));
+        }
+        if (matches!(status.as_u16(), 408 | 429) || status.is_server_error())
+            && is_permanent_quota(response, secrets).await
+        {
+            Err(Error::Model(
+                "Anthropic account quota or billing limit reached".into(),
+            ))
+        } else if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
             Err(Error::RetryableModel(message))
         } else {
             Err(Error::Model(message))
@@ -440,13 +1253,186 @@ async fn read_json(mut response: Response) -> Result<Value> {
     serde_json::from_slice(&bytes).map_err(|_| Error::Model("invalid Anthropic response".into()))
 }
 
-fn encode_request(request: ModelRequest, replay_scope: &str) -> Result<Value> {
+struct InlineTools {
+    initial: Vec<Value>,
+    updates: BTreeMap<usize, Vec<Value>>,
+}
+
+fn deferred_tool_placeholder() -> Value {
+    json!({
+        "name": DEFERRED_TOOL_PLACEHOLDER,
+        "description": "Reserved placeholder. Never available. Never call this.",
+        "input_schema": {"type":"object","properties":{},"required":[]},
+        "defer_loading": true,
+    })
+}
+
+fn tool_definition(tool: &ToolSpec) -> Value {
+    json!({
+        "name": tool.name,
+        "description": tool.description,
+        "input_schema": anthropic_input_schema(&tool.parameters, false),
+    })
+}
+
+impl InlineTools {
+    fn project(
+        changes: &[ToolTranscriptChange],
+        request: &ModelRequest,
+        prepared_tools: Option<&AnthropicWireTools>,
+        encode: impl Fn(&ToolDeclaration) -> Option<Value>,
+        eager: bool,
+        check_final_tools: bool,
+        oauth: bool,
+    ) -> Option<Self> {
+        let (initial, later) = changes.split_first()?;
+        if initial.message_index != 0 || initial.added.is_empty() {
+            // Anthropic requires at least one non-deferred top-level declaration.
+            return None;
+        }
+        if changes.iter().any(|change| {
+            change.message_index > request.messages.len()
+                || change
+                    .added
+                    .iter()
+                    .any(|tool| tool.spec.name == DEFERRED_TOOL_PLACEHOLDER)
+        }) {
+            return None;
+        }
+        let mut active: BTreeMap<_, _> = initial
+            .added
+            .iter()
+            .map(|tool| (&tool.spec.name, tool))
+            .collect();
+        if active.len() != initial.added.len()
+            || (oauth && !unique_oauth_tools(active.keys().copied()))
+        {
+            return None;
+        }
+        let mut updates = BTreeMap::<usize, Vec<Value>>::new();
+        for change in later {
+            let update = updates.entry(change.message_index).or_default();
+            for name in &change.removed {
+                if active.remove(name).is_some()
+                    && !change.added.iter().any(|tool| tool.spec.name == *name)
+                {
+                    update.push(json!({
+                        "type":"tool_removal", "tool":{"type":"tool_reference","name":name}
+                    }));
+                }
+            }
+            for tool in &change.added {
+                active.insert(&tool.spec.name, tool);
+                let mut definition = encode(tool)?;
+                if eager {
+                    definition["eager_input_streaming"] = json!(true);
+                }
+                update.push(json!({
+                    "type":"tool_addition", "tool":{"type":"tool_definition","definition":definition}
+                }));
+            }
+            if oauth && !unique_oauth_tools(active.keys().copied()) {
+                return None;
+            }
+        }
+        // Keep native constraints authoritative if an extension rewrites the
+        // final tool definitions after history was prepared.
+        if check_final_tools
+            && (active.len() != request.tools.len()
+                || request
+                    .tools
+                    .iter()
+                    .any(|tool| active.get(&tool.name).map(|active| &active.spec) != Some(tool))
+                || prepared_tools.is_some_and(|prepared| {
+                    prepared
+                        .source
+                        .iter()
+                        .any(|decl| active.get(&decl.spec.name).copied() != Some(decl))
+                }))
+        {
+            return None;
+        }
+        Some(Self {
+            initial: initial.added.iter().map(encode).collect::<Option<_>>()?,
+            updates,
+        })
+    }
+}
+
+fn tool_result_content(
+    content: &str,
+    is_structured: Option<bool>,
+) -> (Cow<'_, str>, Vec<ImageContent>) {
+    if pi_rs_core::tool_content_is_structured(content, is_structured) {
+        let (text, images) = pi_rs_core::extract_tool_images(content.to_owned());
+        if !images.is_empty() && images.iter().all(|image| image.validate().is_ok()) {
+            return (Cow::Owned(text), images);
+        }
+    }
+    (Cow::Borrowed(content), Vec::new())
+}
+
+fn image_block(image: ImageContent) -> Value {
+    json!({"type":"image","source":{
+        "type":"base64","media_type":image.mime_type,"data":image.data
+    }})
+}
+
+fn error_image_caption(call_id: &str, tool_name: Option<&str>) -> String {
+    match tool_name {
+        Some(name) => format!("Images from the error result of tool call {call_id} ({name}):"),
+        None => format!("Images from the error result of tool call {call_id}:"),
+    }
+}
+
+fn effort_message(effort: &str) -> Value {
+    json!({"role":"system","content":[],"output_config":{"effort":effort}})
+}
+
+fn encode_request(
+    request: ModelRequest,
+    replay_scope: &str,
+    edited_scope: &str,
+    allow_empty_signature: bool,
+    supports_mid_conversation_system: bool,
+    replay_effort: bool,
+    inline_tools: Option<InlineTools>,
+) -> Result<Value> {
+    let (tools, mut updates) = match inline_tools {
+        Some(inline) => (inline.initial, inline.updates),
+        None => (
+            request.tools.iter().map(|tool| {
+                json!({"name":tool.name,"description":tool.description,"input_schema":tool.parameters})
+            }).collect(),
+            BTreeMap::new(),
+        ),
+    };
     let mut system = Vec::new();
-    let mut turns: Vec<(&str, Vec<Value>)> = Vec::new();
-    for message in request.messages {
+    let mut pending_system = Vec::new();
+    let mut pending_error_images = Vec::new();
+    let mut tool_names = BTreeMap::new();
+    let mut turns: Vec<(&str, Vec<Value>, Option<&'static str>)> = Vec::new();
+    let end = request.messages.len();
+    for (index, message) in request.messages.into_iter().enumerate() {
+        let mut prior_effort = None;
+        let is_tool_result = matches!(&message, Message::Tool { .. });
+        let mut tool_update = updates.remove(&index).unwrap_or_default();
+        if !matches!(message, Message::System { .. }) && !tool_update.is_empty() {
+            pending_system.push(("system", std::mem::take(&mut tool_update), None));
+        }
         let (role, blocks) = match message {
             Message::System { content } => {
-                system.push(content);
+                if index == 0 || !supports_mid_conversation_system {
+                    if !content.is_empty() {
+                        system.push(content);
+                    }
+                } else {
+                    let mut blocks: Vec<_> = text_block(content).into_iter().collect();
+                    blocks.append(&mut tool_update);
+                    if !blocks.is_empty() {
+                        pending_system.push(("system", blocks, None));
+                    }
+                }
                 continue;
             }
             Message::User { content } => ("user", text_block(content).into_iter().collect()),
@@ -454,9 +1440,7 @@ fn encode_request(request: ModelRequest, replay_scope: &str) -> Result<Value> {
                 let mut blocks: Vec<_> = text_block(content).into_iter().collect();
                 for image in images {
                     image.validate()?;
-                    blocks.push(json!({"type":"image","source":{
-                        "type":"base64","media_type":image.mime_type,"data":image.data
-                    }}));
+                    blocks.push(image_block(image));
                 }
                 ("user", blocks)
             }
@@ -465,17 +1449,42 @@ fn encode_request(request: ModelRequest, replay_scope: &str) -> Result<Value> {
                 calls,
                 replay,
             } => {
+                tool_names.extend(
+                    calls
+                        .iter()
+                        .map(|call| (call.id.clone(), call.name.clone())),
+                );
                 let blocks = match replay {
                     Some(replay)
                         if replay_matches(
                             &replay,
-                            replay_scope,
+                            if replay.is_context_edit() {
+                                edited_scope
+                            } else {
+                                replay_scope
+                            },
                             &request.model,
                             &content,
                             &calls,
                         ) =>
                     {
-                        replay.blocks
+                        if replay_effort && !replay.is_context_edit() {
+                            prior_effort = replay.anthropic_effort();
+                        }
+                        replay
+                            .blocks
+                            .into_iter()
+                            .filter(|block| block.get("_pi_context_edit_api").is_none() && block.get("_pi_anthropic_effort").is_none() && block["_pi_omitted_text"] != true)
+                            .map(|mut block| {
+                                if block["_pi_thinking"] == true && allow_empty_signature {
+                                    return json!({"type":"thinking","thinking":block["text"],"signature":""});
+                                }
+                                if let Some(object) = block.as_object_mut() {
+                                    object.remove("_pi_thinking");
+                                }
+                                block
+                            })
+                            .collect()
                     }
                     _ => {
                         let mut blocks: Vec<_> = text_block(content).into_iter().collect();
@@ -485,22 +1494,53 @@ fn encode_request(request: ModelRequest, replay_scope: &str) -> Result<Value> {
                 };
                 ("assistant", blocks)
             }
-            Message::Tool { call_id, content } => (
-                "user",
-                vec![json!({
-                    "type":"tool_result","tool_use_id":call_id,"content":content
-                })],
-            ),
+            Message::Tool {
+                call_id,
+                content,
+                is_error,
+                is_structured,
+            } => {
+                let (text, images) = tool_result_content(&content, is_structured);
+                let content = if images.is_empty() {
+                    Value::String(text.into_owned())
+                } else if is_error {
+                    let name = tool_names.get(&call_id).map(String::as_str);
+                    pending_error_images.extend(text_block(error_image_caption(&call_id, name)));
+                    pending_error_images.extend(images.into_iter().map(image_block));
+                    Value::String(text.into_owned())
+                } else {
+                    let mut blocks: Vec<_> = text_block(text.into_owned()).into_iter().collect();
+                    blocks.extend(images.into_iter().map(image_block));
+                    Value::Array(blocks)
+                };
+                let mut block =
+                    json!({"type":"tool_result","tool_use_id":call_id,"content":content});
+                if is_error {
+                    block["is_error"] = json!(true);
+                }
+                ("user", vec![block])
+            }
         };
         if blocks.is_empty() {
             continue;
         }
-        if let Some((previous, content)) = turns.last_mut()
+        // Anthropic requires all tool results to precede error images in the user turn.
+        if !is_tool_result && let Some(("user", content, _)) = turns.last_mut() {
+            content.append(&mut pending_error_images);
+        }
+        // Pi holds updates until the next assistant message or the end of the transcript.
+        // This leaves every assistant tool call adjacent to its results.
+        if role == "assistant" {
+            turns.append(&mut pending_system);
+        }
+        if let Some((previous, content, previous_effort)) = turns.last_mut()
             && *previous == role
+            && previous_effort.is_none()
+            && prior_effort.is_none()
         {
             content.extend(blocks);
         } else {
-            turns.push((role, blocks));
+            turns.push((role, blocks, prior_effort));
         }
     }
     if turns.is_empty() {
@@ -508,18 +1548,28 @@ fn encode_request(request: ModelRequest, replay_scope: &str) -> Result<Value> {
             "Anthropic requires at least one conversation message".into(),
         ));
     }
+    if let Some(("user", content, _)) = turns.last_mut() {
+        content.append(&mut pending_error_images);
+    }
+    if let Some(blocks) = updates.remove(&end) {
+        pending_system.push(("system", blocks, None));
+    }
+    turns.append(&mut pending_system);
     let messages: Vec<_> = turns
         .into_iter()
-        .map(|(role, content)| json!({"role":role,"content":content}))
+        .flat_map(|(role, content, effort)| {
+            effort
+                .map(effort_message)
+                .into_iter()
+                .chain(std::iter::once(json!({"role":role,"content":content})))
+        })
         .collect();
     let mut body = json!({"model":request.model,"messages":messages,"max_tokens":request.max_output_tokens,"stream":true});
     if !system.is_empty() {
         body["system"] = json!(system.join("\n\n"));
     }
-    if !request.tools.is_empty() {
-        body["tools"] = json!(request.tools.into_iter().map(|tool| {
-            json!({"name":tool.name,"description":tool.description,"input_schema":tool.parameters})
-        }).collect::<Vec<_>>());
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
     }
     Ok(body)
 }
@@ -543,17 +1593,95 @@ fn apply_cache_control(body: &mut Value, retention: CacheRetention, cache_tools:
         .get_mut("messages")
         .and_then(Value::as_array_mut)
         .and_then(|messages| messages.last_mut())
-        && message["role"] == "user"
+        && matches!(message["role"].as_str(), Some("user" | "system"))
         && let Some(block) = message
             .get_mut("content")
             .and_then(Value::as_array_mut)
             .and_then(|blocks| blocks.last_mut())
         && matches!(
             block["type"].as_str(),
-            Some("text" | "image" | "tool_result")
+            Some("text" | "image" | "tool_result" | "tool_addition" | "tool_removal")
         )
     {
         block["cache_control"] = control;
+    }
+}
+
+const CLAUDE_CODE_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+];
+
+fn oauth_tool_name(name: &str) -> &str {
+    CLAUDE_CODE_TOOLS
+        .iter()
+        .copied()
+        .find(|candidate| candidate.eq_ignore_ascii_case(name))
+        .unwrap_or(name)
+}
+
+fn normalize_oauth_tool_names(blocks: &mut [Value]) {
+    for block in blocks {
+        let tool = match block["type"].as_str() {
+            Some("tool_use") => block,
+            Some("tool_addition") => &mut block["tool"]["definition"],
+            Some("tool_removal") => &mut block["tool"],
+            _ => continue,
+        };
+        if let Some(name) = tool["name"].as_str() {
+            tool["name"] = json!(oauth_tool_name(name));
+        }
+    }
+}
+
+fn unique_oauth_tools<'a>(names: impl IntoIterator<Item = &'a String>) -> bool {
+    let mut canonical = BTreeSet::new();
+    names
+        .into_iter()
+        .all(|name| canonical.insert(oauth_tool_name(name).to_ascii_lowercase()))
+}
+
+fn prepare_oauth_request(body: &mut Value, retention: CacheRetention) {
+    let mut identity =
+        json!({"type":"text", "text":"You are Claude Code, Anthropic's official CLI for Claude."});
+    if let Some(control) = retention.anthropic_control() {
+        identity["cache_control"] = control;
+    }
+    let mut system = vec![identity];
+    match body.get_mut("system").map(Value::take) {
+        Some(Value::String(text)) => system.push(json!({"type":"text","text":text})),
+        Some(Value::Array(blocks)) => system.extend(blocks),
+        _ => {}
+    }
+    body["system"] = Value::Array(system);
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            if let Some(name) = tool["name"].as_str() {
+                tool["name"] = json!(oauth_tool_name(name));
+            }
+        }
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(blocks) = message["content"].as_array_mut() {
+                normalize_oauth_tool_names(blocks);
+            }
+        }
     }
 }
 
@@ -566,6 +1694,7 @@ fn configure_thinking(
     details: Option<&CatalogEntry>,
     level: &str,
     max_output: u32,
+    budgets: Option<&Value>,
 ) -> Result<()> {
     if level == "off" {
         if let Some(model) = details.filter(|model| model.thinking.is_some()) {
@@ -585,19 +1714,43 @@ fn configure_thinking(
         })?;
     match details.thinking {
         Some(ThinkingMode::Adaptive) => {
-            body["thinking"] = json!({"type":"adaptive"});
+            body["thinking"] = json!({"type":"adaptive","display":"summarized"});
             // A model can advertise adaptive thinking without effort controls.
             if details.effort_levels {
                 body["output_config"] = json!({"effort":level});
             }
         }
         Some(ThinkingMode::Budgeted) => {
-            let preferred = match level {
-                "minimal" | "low" => 1024,
-                "medium" => 4096,
-                "high" => 8192,
-                "xhigh" => 16_384,
-                _ => 32_768,
+            let key = match level {
+                "minimal" => "minimal",
+                "low" => "low",
+                "medium" => "medium",
+                _ => "high",
+            };
+            let default = match level {
+                "minimal" => 1024,
+                "low" => 2048,
+                "medium" => 8192,
+                _ => 16_384,
+            };
+            let preferred = if let Some(budgets) = budgets {
+                let object = budgets
+                    .as_object()
+                    .ok_or_else(|| Error::Config("thinkingBudgets must be an object".into()))?;
+                match object.get(key) {
+                    None => default,
+                    Some(value) => value
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .filter(|n| *n >= 1024)
+                        .ok_or_else(|| {
+                            Error::Config(format!(
+                                "thinkingBudgets.{key} must be an integer of at least 1024"
+                            ))
+                        })?,
+                }
+            } else {
+                default
             };
             let budget = preferred.min(max_output.saturating_sub(1024).max(1024));
             if budget >= max_output {
@@ -605,7 +1758,8 @@ fn configure_thinking(
                     "Anthropic budgeted thinking needs at least 1025 output tokens".into(),
                 ));
             }
-            body["thinking"] = json!({"type":"enabled","budget_tokens":budget});
+            body["thinking"] =
+                json!({"type":"enabled","budget_tokens":budget,"display":"summarized"});
         }
         None => {}
     }
@@ -627,13 +1781,16 @@ fn replay_matches(
     text: &str,
     calls: &[ToolCall],
 ) -> bool {
-    if replay.identity.provider != scope || replay.identity.model != model {
+    if !replay.supports_api(ModelApi::AnthropicMessages)
+        || replay.identity.provider != scope
+        || replay.identity.model != model
+    {
         return false;
     }
     let rendered = replay
         .blocks
         .iter()
-        .filter(|block| block["type"] == "text")
+        .filter(|block| block["type"] == "text" && block["_pi_thinking"] != true)
         .filter_map(|block| block["text"].as_str())
         .collect::<String>();
     if rendered != text {
@@ -774,6 +1931,9 @@ impl StreamUsage {
         metadata.cached_input_tokens = self.cached;
         metadata.cache_creation_input_tokens = self.cache_written;
         metadata.provider_prompt_tokens = self.total_input();
+        metadata.reasoning_output_tokens = value["output_tokens_details"]["thinking_tokens"]
+            .as_u64()
+            .or(metadata.reasoning_output_tokens);
     }
     fn total_input(&self) -> Option<u64> {
         Some(
@@ -790,19 +1950,635 @@ impl StreamUsage {
     }
 }
 
+struct AnthropicWireTools {
+    source: Vec<ToolDeclaration>,
+    declarations: Vec<Value>,
+}
+
+struct PreparedAnthropicDispatch {
+    client: Anthropic,
+    request: ModelRequest,
+    reservation: ModelRequest,
+    wire_tools: AnthropicWireTools,
+    effective: Vec<pi_rs_core::EffectiveToolDeclaration>,
+    snapshot: pi_rs_core::ToolDecisionSnapshot,
+    context: pi_rs_core::ToolDispatchContext,
+}
+
+#[async_trait::async_trait]
+impl pi_rs_core::PreparedToolDispatch for PreparedAnthropicDispatch {
+    fn effective_tools(&self) -> &[pi_rs_core::EffectiveToolDeclaration] {
+        &self.effective
+    }
+    fn decision_snapshot(&self) -> &pi_rs_core::ToolDecisionSnapshot {
+        &self.snapshot
+    }
+    fn dispatch_request(&self) -> &ModelRequest {
+        &self.request
+    }
+    fn reservation_request(&self) -> &ModelRequest {
+        &self.reservation
+    }
+    async fn dispatch(self: Box<Self>) -> Result<pi_rs_core::DetailedModelStream> {
+        self.client
+            .stream_detailed_with_tools(
+                self.request,
+                Some(self.wire_tools),
+                (!self.context.summary)
+                    .then_some((self.context.session_id, self.context.external_id.as_str())),
+            )
+            .await
+    }
+}
+
+fn anthropic_unsupported_keyword(key: &str, value: &Value) -> bool {
+    match key {
+        "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum" | "multipleOf"
+        | "maxItems" | "uniqueItems" | "minContains" | "maxContains" | "minProperties"
+        | "maxProperties" => true,
+        "minItems" => !matches!(value.as_f64(), Some(n) if n == 0.0 || n == 1.0),
+        "format" => !matches!(
+            value.as_str(),
+            Some(
+                "date-time"
+                    | "time"
+                    | "date"
+                    | "duration"
+                    | "email"
+                    | "hostname"
+                    | "uri"
+                    | "ipv4"
+                    | "ipv6"
+                    | "uuid"
+            )
+        ),
+        _ => false,
+    }
+}
+
+// Pi keeps strict root annotations, while ordinary tools use only the
+// Anthropic-supported root fields. Root combinators cannot be sent.
+fn anthropic_input_schema(parameters: &Value, strict: bool) -> Value {
+    let mut root = if strict {
+        parameters.as_object().cloned().unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+    for key in ["anyOf", "oneOf", "allOf"] {
+        root.remove(key);
+    }
+    root.insert("type".into(), json!("object"));
+    for (key, default) in [("properties", json!({})), ("required", json!([]))] {
+        let value = parameters
+            .get(key)
+            .filter(|v| !v.is_null())
+            .cloned()
+            .unwrap_or(default);
+        root.insert(key.into(), value);
+    }
+    for key in ["additionalProperties", "$defs", "definitions"] {
+        if let Some(value) = parameters.get(key) {
+            root.insert(key.into(), value.clone());
+        }
+    }
+    Value::Object(root)
+}
+
+fn resolve_tools(
+    request: &ModelRequest,
+    declarations: &[pi_rs_core::ToolDeclaration],
+    supported: bool,
+) -> Result<(Vec<Value>, Vec<pi_rs_core::EffectiveToolDeclaration>)> {
+    if request.tools.len() != declarations.len()
+        || request
+            .tools
+            .iter()
+            .zip(declarations)
+            .any(|(a, b)| a != &b.spec)
+    {
+        return Err(Error::Config(
+            "tool declarations do not match the effective request".into(),
+        ));
+    }
+    let mut wire = Vec::new();
+    let mut effective = Vec::new();
+    for declaration in declarations {
+        let (tool, sampling) = resolve_anthropic_wire_tool(declaration, supported)?;
+        wire.push(tool);
+        effective.push(pi_rs_core::EffectiveToolDeclaration {
+            spec: declaration.spec.clone(),
+            sampling,
+        });
+    }
+    pi_rs_core::validate_effective_tool_declarations(request, declarations, &effective)
+        .map_err(|error| Error::Config(error.to_string()))?;
+    Ok((wire, effective))
+}
+
+fn resolve_anthropic_wire_tool(
+    declaration: &ToolDeclaration,
+    supported: bool,
+) -> Result<(Value, pi_rs_core::EffectiveToolSampling)> {
+    let spec = &declaration.spec;
+    // Removing a root constraint would change what strict sampling promises.
+    // Fall back or fail before advertising such a decision.
+    let root_combinator = ["anyOf", "oneOf", "allOf"]
+        .iter()
+        .any(|key| spec.parameters.get(key).is_some());
+    let strict = match &declaration.constrained_sampling {
+        Some(pi_rs_core::ToolConstraint::JsonSchema { strict }) => {
+            pi_rs_core::resolve_strict_tool_schema(
+                &spec.name,
+                &spec.parameters,
+                *strict,
+                supported && !root_combinator,
+                anthropic_unsupported_keyword,
+            )
+            .map_err(|error| Error::Config(error.to_string()))?
+        }
+        _ => None,
+    };
+    let sampling = if strict.is_some() {
+        pi_rs_core::EffectiveToolSampling::StrictJsonSchema {
+            original_schema: spec.parameters.clone(),
+            normalization_version: pi_rs_core::STRICT_TOOL_NORMALIZATION_VERSION,
+        }
+    } else {
+        pi_rs_core::EffectiveToolSampling::Unconstrained
+    };
+    let schema = anthropic_input_schema(
+        strict.as_ref().unwrap_or(&spec.parameters),
+        strict.is_some(),
+    );
+    let mut tool = json!({"name":spec.name,"description":spec.description,"input_schema":schema});
+    if strict.is_some() {
+        tool["strict"] = json!(true);
+    }
+    Ok((tool, sampling))
+}
+
 #[async_trait::async_trait]
 impl Model for Anthropic {
+    fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
+        self.mid_conversation_system_models.contains(model)
+    }
+
+    fn uses_tool_transcript(&self, model: &str) -> bool {
+        self.supports_tool_transcript(model)
+    }
+
+    async fn prepare_context_with_tool_transcript<'a>(
+        &'a self,
+        request: &ModelRequest,
+        changes: &[ToolTranscriptChange],
+    ) -> Result<Option<Arc<dyn Model + 'a>>> {
+        Ok(self.supports_tool_transcript(&request.model).then(|| {
+            Arc::new(self.clone().with_tool_transcript(request, changes)) as Arc<dyn Model>
+        }))
+    }
+
+    async fn prepare_tool_dispatch<'a>(
+        &'a self,
+        request: &ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: &pi_rs_core::ToolDispatchContext,
+    ) -> Result<Option<Box<dyn pi_rs_core::PreparedToolDispatch + 'a>>> {
+        Ok(Some(self.prepare_bound_tool_dispatch(
+            request,
+            declarations,
+            context,
+        )?))
+    }
+
+    async fn stream_detailed_with_tool_declarations(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id,
+            session_id,
+            external_id: external_id.into(),
+            summary: false,
+        };
+        self.stream_without_retained_decision(request, declarations, context)
+            .await
+    }
+
+    async fn stream_detailed_summary_with_tool_declarations(
+        &self,
+        request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id,
+            session_id,
+            external_id: session_id.to_string(),
+            summary: true,
+        };
+        self.clone()
+            .without_cache()
+            .stream_without_retained_decision(request, declarations, context)
+            .await
+    }
+
+    fn context_identity(&self) -> Option<String> {
+        // Thinking and discovered output limits can depend on a changing catalog.
+        if !self.http_proxies.is_empty()
+            || (self.thinking_level.is_some()
+                && (self.configured_thinking.is_none() || self.probe_context))
+        {
+            return None;
+        }
+        let mut headers: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort();
+        let identity = (
+            headers,
+            "anthropic-v2",
+            self.endpoint.as_str(),
+            self.provider.as_ref(),
+            self.replay_scope.as_ref(),
+            self.auth.0.as_str(),
+            self.auth.1.as_bytes(),
+            &self.thinking_level,
+            &self.thinking_budgets,
+            format!("{:?}", self.configured_thinking),
+            self.configured_thinking_is_fallback,
+            self.allow_empty_signature,
+            self.cache_retention.anthropic_control(),
+            self.cache_tools,
+        );
+        let base = if self.strict_tool_support {
+            pi_rs_core::protected_model_fingerprint(&(identity, "strict-tools-v1"))
+        } else {
+            pi_rs_core::protected_model_fingerprint(&identity)
+        }?;
+        if self.tool_transcript.is_some() {
+            return None;
+        }
+        let base = if self.mid_conversation_system_models.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "mid-conversation-system-v1",
+                self.mid_conversation_system_models.as_ref(),
+            ))?
+        };
+        let base = if self.inline_tool_models.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "inline-tools-v1",
+                self.inline_tool_models.as_ref(),
+            ))?
+        };
+        let base = if self.eager_tool_input_streaming && self.eager_tool_input_models.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "tool-input-streaming",
+                self.eager_tool_input_streaming,
+                self.eager_tool_input_models.as_ref(),
+            ))?
+        };
+        let active_thinking = self
+            .thinking_level
+            .as_deref()
+            .is_some_and(|level| level != "off");
+        let interleaved = active_thinking
+            && self.interleaved_thinking
+            && !self.headers.contains_key("anthropic-beta")
+            && self
+                .configured_thinking
+                .as_ref()
+                .is_some_and(|details| matches!(details.thinking, Some(ThinkingMode::Budgeted)));
+        let omitted = active_thinking && self.thinking_display == ThinkingDisplay::Omitted;
+        let base = if interleaved || omitted {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "thinking-request-options-v1",
+                interleaved,
+                omitted,
+            ))?
+        } else {
+            base
+        };
+        let base = if self.temperatures.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "messages-temperature-v1",
+                self.temperatures.as_ref(),
+            ))?
+        };
+        let base = if self.managed_effort_models.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "managed-effort-v1",
+                self.managed_effort_models.as_ref(),
+            ))?
+        };
+        let base = if self.mid_conversation_system_models.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "mid-conversation-system-v1",
+                self.mid_conversation_system_models.as_ref(),
+            ))?
+        };
+        let base = if self.fallback_models.is_empty() {
+            base
+        } else {
+            pi_rs_core::protected_model_fingerprint(&(
+                base,
+                "anthropic-fallback-v1",
+                self.fallback_models.as_ref(),
+            ))?
+        };
+        let base =
+            if self.message_thread_default.is_none() && self.message_thread_support.is_empty() {
+                base
+            } else {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    "message-threads-v1",
+                    self.message_thread_default,
+                    self.message_thread_support.as_ref(),
+                ))?
+            };
+        let base = if self.disable_message_thread_continuation {
+            pi_rs_core::protected_model_fingerprint(&(base, "disable-thread-continuation"))?
+        } else {
+            base
+        };
+        match &self.strict_tool_models {
+            // A map containing only unsupported models cannot change any
+            // successful request's sampling compared with the default.
+            Some(models) if models.values().any(|supported| *supported) => {
+                pi_rs_core::protected_model_fingerprint(&(
+                    base,
+                    "strict-models-v1",
+                    models.as_ref(),
+                ))
+            }
+            _ => Some(base),
+        }
+    }
+
+    fn estimate_request_tokens(&self, request: &ModelRequest) -> u64 {
+        let mut base = request.clone();
+        base.messages.clear();
+        let messages = request
+            .messages
+            .iter()
+            .map(|message| self.estimate_message_tokens(request, message))
+            .fold(0, u64::saturating_add);
+        let mut tools = pi_rs_core::estimate_request_tokens(&base);
+        if let Some(mut inline) = self.inline_tools(request, None, false) {
+            inline.initial.push(deferred_tool_placeholder());
+            let checkpoints = inline
+                .updates
+                .values()
+                .map(|blocks| pi_rs_core::estimate_replay_tokens(blocks))
+                .fold(0, u64::saturating_add);
+            tools = tools.max(
+                pi_rs_core::estimate_replay_tokens(&inline.initial).saturating_add(checkpoints),
+            );
+        }
+        tools.saturating_add(messages)
+    }
+
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        let edited_scope =
+            pi_rs_core::endpoint_replay_scope(&self.replay_scope, self.endpoint.as_str());
+        match message {
+            Message::Tool {
+                call_id,
+                content,
+                is_error,
+                is_structured,
+            } => {
+                let (mut content, images) = tool_result_content(content, *is_structured);
+                if *is_error && !images.is_empty() {
+                    let tool_name =
+                        request
+                            .messages
+                            .iter()
+                            .rev()
+                            .find_map(|message| match message {
+                                Message::Assistant { calls, .. } => calls
+                                    .iter()
+                                    .find(|call| call.id == *call_id)
+                                    .map(|call| call.name.as_str()),
+                                _ => None,
+                            });
+                    content
+                        .to_mut()
+                        .push_str(&error_image_caption(call_id, tool_name));
+                }
+                pi_rs_core::estimate_message_tokens(&Message::UserWithImages {
+                    content: content.into_owned(),
+                    images,
+                })
+            }
+            Message::Assistant {
+                content,
+                calls,
+                replay: Some(replay),
+            } if replay_matches(
+                replay,
+                if replay.is_context_edit() {
+                    &edited_scope
+                } else {
+                    &self.replay_scope
+                },
+                &request.model,
+                content,
+                calls,
+            ) =>
+            {
+                pi_rs_core::estimate_replay_tokens(&replay.blocks)
+                    .max(pi_rs_core::estimate_message_tokens(message))
+            }
+            _ => pi_rs_core::estimate_message_tokens(message),
+        }
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
         self.model(model).await?.context_window
     }
 
-    async fn stream(&self, mut request: ModelRequest) -> Result<ModelStream> {
-        let details = if self.configured_thinking.is_some() {
-            self.configured_thinking.clone()
-        } else if self.thinking_level.is_some() {
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+        let stream = self.stream_enriched(request).await?;
+        Ok(Box::pin(stream.filter_map(|event| async move {
+            match event {
+                Ok(pi_rs_core::EnrichedModelEvent::Legacy(event)) => Some(Ok(event)),
+                Ok(pi_rs_core::EnrichedModelEvent::TextDelta { delta, .. }) => {
+                    Some(Ok(ModelEvent::Text(delta)))
+                }
+                Ok(pi_rs_core::EnrichedModelEvent::ReasoningDelta { delta, .. }) => {
+                    Some(Ok(ModelEvent::Reasoning(delta)))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })))
+    }
+    async fn stream_enriched_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::EnrichedModelStream> {
+        let stream = self
+            .stream_detailed_with_tools(request, None, Some((session_id, external_id)))
+            .await?;
+        Ok(Box::pin(stream.map(|event| event.map(|event| event.event))))
+    }
+    async fn stream_enriched_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::EnrichedModelStream> {
+        self.stream_enriched(request).await
+    }
+    async fn stream_detailed_in_session_with_identity(
+        &self,
+        _request_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        external_id: &str,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        self.stream_detailed_with_tools(request, None, Some((session_id, external_id)))
+            .await
+    }
+    async fn stream_detailed_for_summary(
+        &self,
+        _request_id: uuid::Uuid,
+        _session_id: uuid::Uuid,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        self.stream_detailed(request).await
+    }
+}
+
+impl Anthropic {
+    async fn stream_without_retained_decision(
+        &self,
+        request: ModelRequest,
+        declarations: &[pi_rs_core::ToolDeclaration],
+        context: pi_rs_core::ToolDispatchContext,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let prepared = self.prepare_bound_tool_dispatch(&request, declarations, &context)?;
+        pi_rs_core::validate_prepared_tool_dispatch(
+            prepared.as_ref(),
+            &context,
+            &request,
+            declarations,
+        )?;
+        if prepared.effective_tools().iter().any(|tool| {
+            matches!(
+                tool.sampling,
+                pi_rs_core::EffectiveToolSampling::StrictJsonSchema { .. }
+            )
+        }) {
+            return Err(Error::Config("strict tool sampling requires prepared dispatch so its effective decisions can be retained".into()));
+        }
+        prepared.dispatch().await
+    }
+
+    async fn stream_enriched(
+        &self,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::EnrichedModelStream> {
+        Ok(Box::pin(
+            self.stream_detailed(request)
+                .await?
+                .map(|event| event.map(|event| event.event)),
+        ))
+    }
+
+    async fn stream_detailed(
+        &self,
+        request: ModelRequest,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        self.stream_detailed_with_tools(request, None, None).await
+    }
+
+    async fn send_observed(
+        &self,
+        request: reqwest::RequestBuilder,
+        error_secrets: &[String],
+    ) -> Result<Response> {
+        let response = self
+            .provider_retry
+            .send(
+                || {
+                    let request = request.try_clone().ok_or_else(|| {
+                        Error::Config("Anthropic request cannot be replayed".into())
+                    });
+                    async { send_http(request?).await }
+                },
+                |response| (response.status().as_u16(), response.headers()),
+            )
+            .await?;
+        self.invalidate_rejected_federation_token(response.status());
+        pi_rs_core::observe_provider_response(
+            response.status(),
+            response.headers(),
+            error_secrets,
+            &self.headers,
+        )
+        .await;
+        Ok(response)
+    }
+
+    async fn stream_detailed_with_tools(
+        &self,
+        mut request: ModelRequest,
+        wire_tools: Option<AnthropicWireTools>,
+        session: Option<(uuid::Uuid, &str)>,
+    ) -> Result<pi_rs_core::DetailedModelStream> {
+        let discovered = if self.thinking_level.is_some() {
             self.model(&request.model).await
         } else {
             self.cached_model(&request.model)
+        };
+        let details = if self.configured_thinking_is_fallback
+            && discovered
+                .as_ref()
+                .is_some_and(CatalogEntry::has_known_thinking)
+        {
+            discovered
+        } else if let Some(mut configured) = self.configured_thinking.clone() {
+            if let Some(discovered) = discovered {
+                configured.id = discovered.id;
+                configured.context_window = discovered.context_window;
+                configured.max_output_tokens = discovered.max_output_tokens;
+                configured.reasoning = discovered.reasoning;
+                configured.images = discovered.images;
+            }
+            Some(configured)
+        } else {
+            discovered
         };
         if let Some(limit) = details.as_ref().and_then(|model| model.max_output_tokens) {
             request.max_output_tokens = request.max_output_tokens.min(limit);
@@ -813,27 +2589,250 @@ impl Model for Anthropic {
         let openrouter =
             provider.as_ref() == "openrouter" || self.endpoint.host_str() == Some("openrouter.ai");
         let replay_scope = self.replay_scope.clone();
-        let mut body = encode_request(request, &replay_scope)?;
+        let edited_scope = pi_rs_core::endpoint_replay_scope(&replay_scope, self.endpoint.as_str());
+        let oauth_tool_names: Vec<String> = if self.oauth {
+            let names: Vec<String> = request.tools.iter().map(|tool| tool.name.clone()).collect();
+            if !unique_oauth_tools(&names) {
+                return Err(Error::Config(
+                    "Anthropic OAuth tool names must be unique ignoring case".into(),
+                ));
+            }
+            names
+        } else {
+            Vec::new()
+        };
+        let copilot = (self.provider.as_ref() == "github-copilot")
+            .then(|| pi_rs_core::copilot_request_headers(&request.messages).collect::<Vec<_>>());
+        let has_active_tools = !request.tools.is_empty();
+        let wire_tools = wire_tools.or_else(|| {
+            self.supports_tool_transcript(&request.model)
+                .then(|| AnthropicWireTools {
+                    source: Vec::new(),
+                    declarations: request.tools.iter().map(tool_definition).collect(),
+                })
+        });
+        let inline_tools = self.inline_tools(&request, wire_tools.as_ref(), true);
+        let native_tool_changes = inline_tools.is_some();
+        let mut thinking = json!({});
+        let managed_effort_model = self.managed_effort_models.get(&requested_model).copied();
+        let supports_managed_effort = managed_effort_model.is_some();
+        let active_effort = match (managed_effort_model, self.thinking_level.as_deref()) {
+            (Some(false), None | Some("off")) => Some("high"),
+            (Some(_), Some(level)) if level != "off" => Some(
+                ProviderReplay::valid_anthropic_effort(level).ok_or_else(|| {
+                    Error::Config(
+                        "selected Anthropic model does not advertise that effort level".into(),
+                    )
+                })?,
+            ),
+            _ => None,
+        };
+        let interleaved = if active_effort.is_some() {
+            thinking["thinking"] = json!({
+                "type":"adaptive", "display":self.thinking_display.as_str(),
+                "block_binding":{"prefix_mismatch_behavior":"drop_block"}
+            });
+            thinking["output_config"] = json!({"effort":"low"});
+            false
+        } else {
+            let interleaved = self.configure_request_thinking(
+                &mut thinking,
+                details.as_ref(),
+                max_output_tokens,
+            )?;
+            if supports_managed_effort && self.thinking_level.as_deref() == Some("off") {
+                thinking["thinking"] = json!({"type":"disabled"});
+            }
+            interleaved
+        };
+        let mut body = encode_request(
+            request,
+            &replay_scope,
+            &edited_scope,
+            self.allow_empty_signature,
+            self.mid_conversation_system_models
+                .contains(&requested_model),
+            active_effort.is_some(),
+            inline_tools,
+        )?;
+        if !native_tool_changes
+            && let Some(tools) = wire_tools
+            && !tools.declarations.is_empty()
+        {
+            body["tools"] = json!(tools.declarations);
+        }
+        let fallbacks = self
+            .fallback_models
+            .get(&requested_model)
+            .cloned()
+            .unwrap_or_default();
+        if !fallbacks.is_empty() {
+            body["fallbacks"] = Value::Array(
+                fallbacks
+                    .iter()
+                    .map(|target| json!({"model": target.model}))
+                    .collect(),
+            );
+        }
+        let legacy_tool_streaming =
+            self.configure_tool_input_streaming(&requested_model, &mut body);
         apply_cache_control(&mut body, self.cache_retention, self.cache_tools);
-        if let Some(level) = self.thinking_level.as_deref() {
-            configure_thinking(&mut body, details.as_ref(), level, max_output_tokens)?;
+        if native_tool_changes {
+            body["tools"]
+                .as_array_mut()
+                .expect("initial tools")
+                .push(deferred_tool_placeholder());
+        }
+        if self.oauth {
+            prepare_oauth_request(&mut body, self.cache_retention);
+        }
+        if let Some(effort) = active_effort {
+            body["messages"]
+                .as_array_mut()
+                .expect("encoded messages")
+                .push(effort_message(effort));
+        }
+        body.as_object_mut()
+            .expect("encoded request")
+            .append(thinking.as_object_mut().expect("thinking options object"));
+        if !supports_managed_effort
+            && matches!(body["thinking"]["type"].as_str(), None | Some("disabled"))
+            && let Some(temperature) = self.temperatures.get(&requested_model)
+        {
+            body["temperature"] = json!(temperature);
         }
         if let Some(progress) = &self.progress {
             progress(Progress::WaitingForModel);
         }
-        let response =
-            send(self.authenticate(self.client.post(self.endpoint.clone()).json(&body))).await?;
-        if !response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("text/event-stream"))
+        let error_secrets = self.error_secrets();
+        let thread_key = self.thread_key(&requested_model, session);
+        let thread_beta = thread_key.as_deref().is_some_and(thread::allows_beta);
+        let mut thread = thread_key
+            .filter(|_| !self.disable_message_thread_continuation)
+            .and_then(|key| thread::Attempt::begin(key, &body));
+        let mut request = self.client.post(self.endpoint.clone());
+        if self.auth.0 == "cf-aig-authorization"
+            || copilot.is_some()
+            || matches!(self.provider.as_ref(), "opencode" | "opencode-go")
         {
-            return Err(Error::Model("expected an Anthropic SSE response".into()));
+            request = request.query(&[("beta", "true")]);
         }
+        if let Some(headers) = copilot {
+            for (name, value) in headers {
+                if !self.headers.contains_key(name) {
+                    request = request.header(name, value);
+                }
+            }
+        }
+        let send = |request: reqwest::RequestBuilder, session_threads| {
+            self.send_observed(
+                self.authenticate(
+                    request,
+                    RequestFeatures {
+                        interleaved,
+                        legacy_tool_streaming: legacy_tool_streaming && has_active_tools,
+                        inline_tools: native_tool_changes,
+                        managed_effort: supports_managed_effort,
+                        fallbacks: !fallbacks.is_empty(),
+                        session_threads,
+                    },
+                ),
+                &error_secrets,
+            )
+        };
+        let first = request
+            .try_clone()
+            .ok_or_else(|| Error::Model("cannot prepare Anthropic request".into()))?;
+        let response = send(
+            first.json(thread.as_ref().map_or(&body, |attempt| &attempt.body)),
+            thread_beta,
+        )
+        .await?;
+        let mut thread_fallback = None;
+        let response =
+            if thread.is_some() && matches!(response.status().as_u16(), 400 | 404 | 409 | 422) {
+                let status = response.status();
+                let (error, complete) = thread::read_error(response).await;
+                match complete
+                    .then(|| thread::rejection(status, &error))
+                    .flatten()
+                {
+                    Some(thread::Rejection::Restart(reason)) => {
+                        thread_fallback = Some(thread_fallback_diagnostic(reason));
+                        send(request.json(&thread::create(&body)), true).await
+                    }
+                    Some(thread::Rejection::Unsupported { reason, keep_beta }) => {
+                        thread_fallback = Some(thread_fallback_diagnostic(reason));
+                        let response = send(request.json(&body), keep_beta).await;
+                        if response
+                            .as_ref()
+                            .is_ok_and(|response| response.status().is_success())
+                            && let Some(attempt) = thread.take()
+                        {
+                            attempt.disable(keep_beta);
+                        }
+                        response
+                    }
+                    None => {
+                        let overflow = matches!(status.as_u16(), 400 | 422)
+                            && pi_rs_core::provider_context_overflow_from_bytes(
+                                &error,
+                                complete,
+                                &error_secrets,
+                            );
+                        return Err(Error::Model(if overflow {
+                            "context window exceeded".into()
+                        } else {
+                            format!("Anthropic returned HTTP {status}")
+                        }));
+                    }
+                }
+            } else {
+                Ok(response)
+            };
+        let response = match response {
+            Ok(response) => check_status(response, &error_secrets).await,
+            Err(error) => Err(error),
+        }
+        .and_then(|response| {
+            if response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+            {
+                Ok(response)
+            } else {
+                Err(Error::Model("expected an Anthropic SSE response".into()))
+            }
+        });
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let Some(diagnostic) = thread_fallback else {
+                    return Err(error);
+                };
+                return Ok(Box::pin(futures_util::stream::iter([
+                    Ok(pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(
+                        ModelMetadata {
+                            provider_api: Some(ModelApi::AnthropicMessages),
+                            diagnostics: vec![diagnostic],
+                            ..ModelMetadata::default()
+                        },
+                    ))
+                    .into()),
+                    Err(error),
+                ])));
+            }
+        };
+        let thread_request = thread.as_mut().map(|attempt| {
+            attempt.body = Value::Null;
+            body
+        });
         let progress = self.progress.clone();
         let allow_empty_signature = self.allow_empty_signature;
         let reasoning = self.reasoning.clone();
+        let oauth = self.oauth;
         Ok(Box::pin(async_stream::try_stream! {
             let mut size = 0_usize;
             let mut events = response.bytes_stream().map(move |chunk| {
@@ -854,13 +2853,21 @@ impl Model for Anthropic {
             let mut calls = BTreeMap::<u64, Call>::new();
             let mut blocks = BTreeMap::<u64, ResponseBlock>::new();
             let mut usage = StreamUsage::default();
+            let mut fallback_price = None;
             let mut metadata = ModelMetadata {
                 provider_api: Some(ModelApi::AnthropicMessages),
+                replay_identity: Some(ResolvedModelIdentity { provider: edited_scope, model: requested_model.clone() }),
                 ..ModelMetadata::default()
             };
-            let mut reasoning_text = String::new();
             let mut input_transformations = None;
+            if let Some(diagnostic) = thread_fallback {
+                metadata.diagnostics.push(diagnostic);
+                yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::Legacy(
+                    ModelEvent::Metadata(metadata.clone()),
+                ));
+            }
             let mut started = false;
+            let mut fallback_observed = false;
             while let Some(event) = events.next().await {
                 let event = event.map_err(|error| match error {
                     eventsource_stream::EventStreamError::Transport(error) => error,
@@ -869,7 +2876,8 @@ impl Model for Anthropic {
                 let value: Value = serde_json::from_str(&event.data)
                     .map_err(|_| Error::Model("malformed Anthropic SSE event".into()))?;
                 let previous = metadata.clone();
-                match value["type"].as_str() {
+                let event_type = value["type"].as_str();
+                match event_type {
                     Some("message_start") if !started => {
                         started = true;
                         let message = &value["message"];
@@ -880,12 +2888,26 @@ impl Model for Anthropic {
                             provider: provider.to_string(),
                             model: message["model"].as_str().unwrap_or(&requested_model).into(),
                         });
+                        if let Some(response_model) = message["model"].as_str().filter(|id| *id != requested_model) {
+                            fallback_price = fallbacks.iter()
+                                .find(|target| target.provider == provider.as_ref() && target.model == response_model)
+                                .map(|target| &target.cost);
+                        }
                         usage.update(&message["usage"], &mut metadata);
                         input_transformations = AnthropicInputTransformations::from_value(&message["input_transformations"]);
                     }
                     Some("content_block_start") if started => {
-                        let index = block_index(&value)?;
                         let block = &value["content_block"];
+                        if block["type"] == "fallback" {
+                            fallback_observed = true;
+                            if !calls.is_empty() || blocks.values().any(|block| matches!(block.raw["type"].as_str(), Some("text" | "thinking" | "redacted_thinking"))) {
+                                Err(Error::Model("Anthropic performed an unsupported mid-output model fallback".into()))?;
+                            }
+                            // Pi ignores unknown blocks; they must not cross the fallback boundary in replay.
+                            blocks.clear();
+                            continue;
+                        }
+                        let index = block_index(&value)?;
                         if blocks.contains_key(&index) || calls.contains_key(&index)
                             || blocks.len().saturating_add(calls.len()) >= 256
                         {
@@ -893,35 +2915,48 @@ impl Model for Anthropic {
                         }
                         if block["type"] == "tool_use" {
                             let id = required(&block["id"], "tool ID")?;
-                            let name = required(&block["name"], "tool name")?;
+                            let wire_name = required(&block["name"], "tool name")?;
+                            let name = oauth_tool_names.iter().find(|name| name.eq_ignore_ascii_case(wire_name)).map_or(wire_name, String::as_str);
                             if calls.len() >= 64 {
                                 Err(Error::Model("too many Anthropic tool calls".into()))?;
                             }
+                            let mut raw = block.clone();
+                            raw["name"] = json!(name);
                             calls.insert(index, Call {
-                                id: id.into(), name: name.into(), raw: block.clone(),
+                                id: id.into(), name: name.into(), raw,
                                 fragments: String::new(), complete: false,
                             });
                             report(Progress::PreparingTool);
-                            yield ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
+                            yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
                                 index,
                                 id: id.into(),
                                 name: name.into(),
                                 arguments: block["input"].as_object().filter(|input| !input.is_empty())
                                     .map_or_else(String::new, |input| Value::Object(input.clone()).to_string()),
-                            });
+                            })));
                         } else {
                             let captured = ResponseBlock::new(block);
                             match block["type"].as_str() {
-                                Some("text") if !captured.text.is_empty() => {
+                                Some("text") => {
                                     report(Progress::Generating);
-                                    yield ModelEvent::Text(captured.text.clone());
+                                    yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::TextStart { index });
+                                    if !captured.text.is_empty() { yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::TextDelta { index, delta: captured.text.clone() }); }
                                 }
                                 Some("thinking" | "redacted_thinking") => {
                                     report(Progress::Thinking);
+                                    yield if block["type"] == "redacted_thinking" {
+                                        pi_rs_core::DetailedModelEvent::redacted_start(index)
+                                    } else {
+                                        pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::ReasoningStart { index })
+                                    };
+                                    if block["type"] == "redacted_thinking" {
+                                        let text = "[Reasoning redacted]";
+                                        if let Some(observer) = &reasoning { observer(text); }
+                                        yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::ReasoningDelta { index, delta: text.into() });
+                                    }
                                     if !captured.text.is_empty() && block["type"] == "thinking" {
-                                        reasoning_text.push_str(&captured.text);
                                         if let Some(observer) = &reasoning { observer(&captured.text); }
-                                        yield ModelEvent::Reasoning(captured.text.clone());
+                                        yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::ReasoningDelta { index, delta: captured.text.clone() });
                                     }
                                 }
                                 _ => {}
@@ -940,7 +2975,7 @@ impl Model for Anthropic {
                                 if let Some(text) = delta["text"].as_str().filter(|text| !text.is_empty()) {
                                     captured.text.push_str(text);
                                     report(Progress::Generating);
-                                    yield ModelEvent::Text(text.into());
+                                    yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::TextDelta { index, delta: text.into() });
                                 }
                             }
                             Some("thinking_delta") => {
@@ -949,9 +2984,8 @@ impl Model for Anthropic {
                                 if let Some(text) = delta["thinking"].as_str().filter(|text| !text.is_empty()) {
                                     captured.text.push_str(text);
                                     report(Progress::Thinking);
-                                    reasoning_text.push_str(text);
                                     if let Some(observer) = &reasoning { observer(text); }
-                                    yield ModelEvent::Reasoning(text.into());
+                                    yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::ReasoningDelta { index, delta: text.into() });
                                 }
                             }
                             Some("signature_delta") => {
@@ -973,9 +3007,9 @@ impl Model for Anthropic {
                                     .ok_or_else(|| Error::Model("Anthropic tool input has no open block".into()))?;
                                 if let Some(arguments) = delta["partial_json"].as_str().filter(|text| !text.is_empty()) {
                                     call.fragments.push_str(arguments);
-                                    yield ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
+                                    yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(pi_rs_core::ToolCallDelta {
                                         index, id: String::new(), name: String::new(), arguments: arguments.into(),
-                                    });
+                                    })));
                                 }
                             }
                             _ => {}
@@ -987,6 +3021,14 @@ impl Model for Anthropic {
                             call.complete = true;
                         }
                         if let Some(block) = blocks.get_mut(&index) {
+                            if !block.complete {
+                                match block.raw["type"].as_str() {
+                                    Some("text") => yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::TextEnd { index, content: block.text.clone() }),
+                                    Some("thinking") => yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::ReasoningEnd { index, content: block.text.clone() }),
+                                    Some("redacted_thinking") => yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::ReasoningEnd { index, content: "[Reasoning redacted]".into() }),
+                                    _ => {}
+                                }
+                            }
                             block.complete = true;
                         }
                     }
@@ -1018,17 +3060,24 @@ impl Model for Anthropic {
                             Some("tool_calls") if !calls.is_empty() => {}
                             _ => Err(Error::Model("Anthropic response did not finish successfully".into()))?,
                         }
-                        let signed = blocks.values().any(ResponseBlock::signed);
+                        let reasoning_text: String = blocks.values().filter_map(|block| match block.raw["type"].as_str() {
+                            Some("thinking") => Some(block.text.as_str()),
+                            Some("redacted_thinking") => Some("[Reasoning redacted]"),
+                            _ => None,
+                        }).collect();
+                        let retain_replay = thread.is_some() || active_effort.is_some() || blocks.values().any(ResponseBlock::signed);
                         let mut replay = BTreeMap::new();
-                        if signed {
+                        if retain_replay {
                             for (index, block) in blocks {
-                                replay.insert(index, block.finish(allow_empty_signature)?);
+                                if matches!(block.raw["type"].as_str(), Some("text" | "thinking" | "redacted_thinking")) {
+                                    replay.insert(index, block.finish(allow_empty_signature)?);
+                                }
                             }
                         }
                         let mut completed_calls = Vec::new();
                         for (index, call) in calls {
                             let (call, raw) = call.finish()?;
-                            if signed {
+                            if retain_replay {
                                 replay.insert(index, raw);
                             }
                             completed_calls.push(call);
@@ -1041,30 +3090,67 @@ impl Model for Anthropic {
                             let timestamp = i64::try_from(millis).unwrap_or(i64::MAX);
                             metadata.diagnostics.push(AssistantDiagnostic::AnthropicInputTransformations { timestamp, details });
                         }
-                        if signed {
-                            metadata.replay = Some(Box::new(ProviderReplay {
+                        if retain_replay {
+                            if let Some(attempt) = thread.take()
+                                && !fallback_observed
+                                && fallback_price.is_none()
+                                && metadata.resolved_model.as_ref().is_some_and(|identity|
+                                    thread::reply_matches_model(&requested_model, &identity.model))
+                                && let Some(id) = metadata.provider_request_id.as_ref().filter(|id| !id.is_empty())
+                                && let Some(thread_request) = thread_request.as_ref()
+                            {
+                                let mut thread_blocks: Vec<_> = replay.values().cloned().collect();
+                                if oauth {
+                                    normalize_oauth_tool_names(&mut thread_blocks);
+                                }
+                                attempt.record(thread_request, id.clone(), thread_blocks);
+                            }
+                            let mut replay = ProviderReplay {
                                 identity: ResolvedModelIdentity { provider: replay_scope.to_string(), model: requested_model },
                                 blocks: replay.into_values().collect(),
-                            }));
+                            };
+                            if let Some(effort) = active_effort {
+                                replay.record_anthropic_effort(effort);
+                            }
+                            metadata.replay = Some(Box::new(replay));
                         }
                         if metadata != previous {
-                            yield ModelEvent::Metadata(metadata);
+                            yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata)));
                         }
-                        yield ModelEvent::Complete { calls: completed_calls, usage: usage.finish() };
+                        yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete { calls: completed_calls, usage: usage.finish() }));
                         return;
                     }
                     Some("error") => {
                         let kind = value["error"]["type"].as_str().unwrap_or_default();
-                        Err(if matches!(kind, "overloaded_error" | "api_error" | "rate_limit_error") {
+                        Err(if permanent_quota_value(&value["error"], &error_secrets) {
+                            Error::Model("Anthropic account quota or billing limit reached".into())
+                        } else if matches!(kind, "overloaded_error" | "api_error" | "rate_limit_error") {
                             Error::RetryableModel("Anthropic returned a transient stream error".into())
+                        } else if pi_rs_core::provider_context_overflow(&value["error"], &error_secrets) {
+                            Error::Model("context window exceeded".into())
                         } else {
                             Error::Model("Anthropic returned a stream error".into())
                         })?;
                     }
                     _ => {}
                 }
+                if matches!(event_type, Some("message_start" | "message_delta"))
+                    && let Some(price) = fallback_price
+                    && let Some(input_tokens) = usage.total_input()
+                    && let Some(cost) = price.estimate(
+                        Usage { input_tokens, output_tokens: usage.output.unwrap_or_default() },
+                        &metadata,
+                    )
+                    && let Some(total) = cost.total()
+                {
+                    metadata.cost_breakdown = Some(cost);
+                    if metadata.cost_from_provider != Some(true) {
+                        metadata.cost_usd = Some(total);
+                        metadata.cost_from_provider = Some(false);
+                    }
+                }
                 if metadata != previous {
-                    yield ModelEvent::Metadata(metadata.clone());
+                    yield pi_rs_core::DetailedModelEvent::from(pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata.clone())));
                 }
             }
             Err(Error::RetryableModel("Anthropic stream ended before message_stop".into()))?;
@@ -1087,7 +3173,2928 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    fn constrained_fixture(
+        policy: pi_rs_core::StrictToolPolicy,
+        schema: Value,
+    ) -> (ModelRequest, pi_rs_core::ToolDeclaration) {
+        let spec = pi_rs_core::ToolSpec {
+            name: "lookup".into(),
+            description: "lookup".into(),
+            parameters: schema,
+        };
+        (
+            ModelRequest {
+                model: "claude".into(),
+                messages: vec![Message::User {
+                    content: "hello".into(),
+                }],
+                tools: vec![spec.clone()],
+                max_output_tokens: 32,
+            },
+            pi_rs_core::ToolDeclaration {
+                spec,
+                constrained_sampling: Some(pi_rs_core::ToolConstraint::JsonSchema {
+                    strict: policy,
+                }),
+            },
+        )
+    }
+
+    #[test]
+    fn constrained_anthropic_policy_and_schema_decisions() {
+        use pi_rs_core::{EffectiveToolSampling as S, StrictToolPolicy as P};
+        let schema =
+            json!({"type":"object","properties":{"query":{"type":"string"}},"required":[]});
+        for policy in [P::Prefer, P::Require] {
+            let (req, decl) = constrained_fixture(policy, schema.clone());
+            let (wire, effective) =
+                super::resolve_tools(&req, std::slice::from_ref(&decl), true).unwrap();
+            assert_eq!(wire[0]["strict"], true);
+            assert_eq!(wire[0]["input_schema"]["required"], json!(["query"]));
+            assert!(matches!(effective[0].sampling, S::StrictJsonSchema { .. }));
+            let no_support = super::resolve_tools(&req, &[decl], false);
+            if policy == P::Require {
+                assert!(no_support.is_err());
+            } else {
+                let (wire, effective) = no_support.unwrap();
+                assert!(wire[0].get("strict").is_none());
+                assert_eq!(wire[0]["input_schema"], schema);
+                assert!(matches!(effective[0].sampling, S::Unconstrained));
+            }
+        }
+        for unsupported in [
+            json!({"type":"integer","minimum":1}),
+            json!({"type":"string","format":"regex"}),
+            json!({"type":"array","items":{"type":"string"},"minItems":2}),
+        ] {
+            let schema = json!({"type":"object","properties":{"x":unsupported}});
+            for policy in [P::Prefer, P::Require] {
+                let (req, decl) = constrained_fixture(policy, schema.clone());
+                let result = super::resolve_tools(&req, &[decl], true);
+                if policy == P::Require {
+                    assert!(result.is_err());
+                } else {
+                    assert!(result.unwrap().0[0].get("strict").is_none());
+                }
+            }
+        }
+        let (req, mut decl) = constrained_fixture(P::Require, schema);
+        decl.spec.name = "different".into();
+        assert!(super::resolve_tools(&req, &[decl], true).is_err());
+    }
+
+    #[test]
+    fn constrained_root_projection_and_reservation_match() {
+        use pi_rs_core::{StrictToolPolicy as P, ToolDispatchContext};
+        let model = Anthropic::new(DEFAULT_ENDPOINT, "key")
+            .unwrap()
+            .with_strict_tool_support(true);
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        let schema = json!({"type":"object", "anyOf":[{"type":"object"}], "oneOf":[], "allOf":[], "description":"omit", "additionalProperties":false, "$defs":{"x":{"type":"string"}}, "definitions":{}});
+        let (request, decl) = constrained_fixture(P::Prefer, schema);
+        let (wire, effective) =
+            super::resolve_tools(&request, std::slice::from_ref(&decl), true).unwrap();
+        assert!(matches!(
+            effective[0].sampling,
+            pi_rs_core::EffectiveToolSampling::Unconstrained
+        ));
+        assert_eq!(
+            wire[0]["input_schema"],
+            json!({"type":"object","properties":{},"required":[],"additionalProperties":false,"$defs":{"x":{"type":"string"}},"definitions":{}})
+        );
+        let prepared = model
+            .prepare_bound_tool_dispatch(&request, &[decl], &context)
+            .unwrap();
+        assert_eq!(
+            prepared.reservation_request().tools[0].parameters,
+            wire[0]["input_schema"]
+        );
+        let (required, declaration) = constrained_fixture(
+            P::Require,
+            json!({"type":"object","anyOf":[{"type":"string"}]}),
+        );
+        assert!(
+            model
+                .prepare_bound_tool_dispatch(&required, &[declaration], &context)
+                .is_err()
+        );
+
+        let (request, decl) =
+            constrained_fixture(P::Require, json!({"type":"object","title":"strict title"}));
+        let (wire, _) = super::resolve_tools(&request, std::slice::from_ref(&decl), true).unwrap();
+        assert_eq!(wire[0]["strict"], true);
+        assert_eq!(wire[0]["input_schema"]["properties"], json!({}));
+        assert_eq!(wire[0]["input_schema"]["required"], json!([]));
+        assert_eq!(wire[0]["input_schema"]["title"], "strict title");
+        let prepared = model
+            .prepare_bound_tool_dispatch(&request, &[decl], &context)
+            .unwrap();
+        assert_eq!(
+            prepared.reservation_request().tools[0].parameters,
+            wire[0]["input_schema"]
+        );
+        let defaults =
+            super::anthropic_input_schema(&json!({"properties":null,"required":null}), false);
+        assert_eq!(
+            defaults,
+            json!({"type":"object","properties":{},"required":[]})
+        );
+    }
+
+    #[test]
+    fn constrained_min_items_accepts_javascript_numeric_equivalents() {
+        for number in [json!(0), json!(0.0), json!(1), json!(1.0), json!(-0.0)] {
+            assert!(
+                !super::anthropic_unsupported_keyword("minItems", &number),
+                "{number}"
+            );
+        }
+        for value in [json!(2), json!(0.5), json!("1"), Value::Null] {
+            assert!(
+                super::anthropic_unsupported_keyword("minItems", &value),
+                "{value}"
+            );
+        }
+        for number in [json!(0.0), json!(1.0)] {
+            let (request, decl) = constrained_fixture(
+                pi_rs_core::StrictToolPolicy::Require,
+                json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"string"},"minItems":number}}}),
+            );
+            assert!(super::resolve_tools(&request, &[decl], true).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn constrained_declaration_streams_reject_strict_and_dispatch_fallback() {
+        use pi_rs_core::StrictToolPolicy as P;
+        use std::io::{Read, Write};
+        for summary in [false, true] {
+            for policy in [P::Prefer, P::Require] {
+                let (request, declaration) = constrained_fixture(policy, json!({"type":"object"}));
+                let client = Anthropic::new("http://127.0.0.1:9/v1/messages", "key")
+                    .unwrap()
+                    .with_strict_tool_support(true)
+                    .with_context_probe(false);
+                let result = if summary {
+                    client
+                        .stream_detailed_summary_with_tool_declarations(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            request,
+                            &[declaration],
+                        )
+                        .await
+                } else {
+                    client
+                        .stream_detailed_with_tool_declarations(
+                            uuid::Uuid::nil(),
+                            uuid::Uuid::nil(),
+                            "session",
+                            request,
+                            &[declaration],
+                        )
+                        .await
+                };
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("effective decisions can be retained")
+                );
+            }
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut data = Vec::new();
+                let mut buf = [0; 4096];
+                loop {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    data.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..pos]);
+                        let len: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(|s| s.parse().unwrap())
+                            })
+                            .unwrap();
+                        if data.len() >= pos + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let pos = data.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                let body: Value = serde_json::from_slice(&data[pos + 4..]).unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                body
+            });
+            let client = Anthropic::new(&format!("http://{address}/v1/messages"), "key")
+                .unwrap()
+                .with_context_probe(false)
+                .with_cache_retention(CacheRetention::Short, true);
+            let (request, declaration) = constrained_fixture(
+                P::Prefer,
+                json!({"type":"object","anyOf":[{"type":"object"}]}),
+            );
+            let result = if summary {
+                client
+                    .stream_detailed_summary_with_tool_declarations(
+                        uuid::Uuid::nil(),
+                        uuid::Uuid::nil(),
+                        request,
+                        &[declaration],
+                    )
+                    .await
+            } else {
+                client
+                    .stream_detailed_with_tool_declarations(
+                        uuid::Uuid::nil(),
+                        uuid::Uuid::nil(),
+                        "session",
+                        request,
+                        &[declaration],
+                    )
+                    .await
+            };
+            assert!(result.is_ok());
+            let body = server.join().unwrap();
+            assert!(body["tools"][0].get("strict").is_none());
+            assert_eq!(
+                body["tools"][0]["input_schema"],
+                json!({"type":"object","properties":{},"required":[]})
+            );
+            assert_eq!(body["tools"][0].get("cache_control").is_some(), !summary);
+        }
+    }
+
+    #[test]
+    fn constrained_bound_model_rejects_rewritten_request() {
+        use pi_rs_core::{StrictToolPolicy as P, ToolDispatchContext};
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        for supported in [false, true] {
+            let client = Anthropic::new(DEFAULT_ENDPOINT, "key")
+                .unwrap()
+                .with_strict_tool_support(supported)
+                .with_strict_tool_model("selected");
+            for policy in [P::Prefer, P::Require] {
+                let (mut request, decl) = constrained_fixture(policy, json!({"type":"object"}));
+                request.model = "rewritten".into();
+                let error = client
+                    .prepare_bound_tool_dispatch(&request, &[decl], &context)
+                    .err()
+                    .unwrap();
+                assert!(error.to_string().contains("cannot be resolved"));
+            }
+            let (mut request, mut decl) = constrained_fixture(P::Prefer, json!({"type":"object"}));
+            request.model = "rewritten".into();
+            decl.constrained_sampling = None;
+            assert!(
+                client
+                    .prepare_bound_tool_dispatch(&request, &[decl], &context)
+                    .is_ok()
+            );
+            if supported {
+                assert_ne!(
+                    client.context_identity(),
+                    client
+                        .clone()
+                        .with_strict_tool_model("other")
+                        .context_identity()
+                );
+            } else {
+                assert_eq!(
+                    client.context_identity(),
+                    client
+                        .clone()
+                        .with_strict_tool_model("other")
+                        .context_identity()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn constrained_final_model_uses_frozen_capability_map() {
+        use pi_rs_core::{EffectiveToolSampling as S, StrictToolPolicy as P, ToolDispatchContext};
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "s".into(),
+            summary: false,
+        };
+        let client = Anthropic::new(DEFAULT_ENDPOINT, "key")
+            .unwrap()
+            .with_strict_tool_models(
+                [("strict".into(), true), ("loose".into(), false)]
+                    .into_iter()
+                    .collect(),
+            );
+        let other = Anthropic::new(DEFAULT_ENDPOINT, "key")
+            .unwrap()
+            .with_strict_tool_models(
+                [("strict".into(), false), ("loose".into(), false)]
+                    .into_iter()
+                    .collect(),
+            );
+        assert_ne!(client.context_identity(), other.context_identity());
+        for (model, supported) in [("strict", true), ("loose", false)] {
+            for policy in [P::Prefer, P::Require] {
+                let (mut request, declaration) =
+                    constrained_fixture(policy, json!({"type":"object"}));
+                request.model = model.into();
+                let result = client.prepare_bound_tool_dispatch(
+                    &request,
+                    std::slice::from_ref(&declaration),
+                    &context,
+                );
+                if !supported && policy == P::Require {
+                    assert!(result.is_err());
+                } else {
+                    let prepared = result.unwrap();
+                    pi_rs_core::validate_prepared_tool_dispatch(
+                        prepared.as_ref(),
+                        &context,
+                        &request,
+                        &[declaration],
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        matches!(
+                            prepared.effective_tools()[0].sampling,
+                            S::StrictJsonSchema { .. }
+                        ),
+                        supported
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn constrained_disabled_capability_map_preserves_legacy_fingerprint() {
+        let legacy = Anthropic::new(DEFAULT_ENDPOINT, "key").unwrap();
+        let disabled = legacy.clone().with_strict_tool_models(
+            [("selected".into(), false), ("other".into(), false)]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(legacy.context_identity(), disabled.context_identity());
+        let enabled = legacy.clone().with_strict_tool_models(
+            [("selected".into(), false), ("other".into(), true)]
+                .into_iter()
+                .collect(),
+        );
+        assert_ne!(legacy.context_identity(), enabled.context_identity());
+        // Prepared fallback can still alter the wire even with strict disabled.
+        let (request, declaration) = constrained_fixture(
+            pi_rs_core::StrictToolPolicy::Prefer,
+            json!({"type":"object","title":"dropped"}),
+        );
+        let old = encode_request(
+            request.clone(),
+            &legacy.replay_scope,
+            "",
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        let (wire, _) = super::resolve_tools(&request, &[declaration], false).unwrap();
+        assert_ne!(old["tools"][0]["input_schema"], wire[0]["input_schema"]);
+        assert_eq!(
+            wire[0]["input_schema"],
+            json!({"type":"object","properties":{},"required":[]})
+        );
+    }
+
+    #[test]
+    fn image_projection_updates_context_identity_while_preserving_strict_variants() {
+        let model = Anthropic::new(DEFAULT_ENDPOINT, "key").unwrap();
+        let mut headers: Vec<_> = model
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort();
+        let legacy = pi_rs_core::protected_model_fingerprint(&(
+            headers,
+            "anthropic-v1",
+            model.endpoint.as_str(),
+            model.provider.as_ref(),
+            model.replay_scope.as_ref(),
+            model.auth.0.as_str(),
+            model.auth.1.as_bytes(),
+            &model.thinking_level,
+            &model.thinking_budgets,
+            format!("{:?}", model.configured_thinking),
+            model.configured_thinking_is_fallback,
+            model.allow_empty_signature,
+            model.cache_retention.anthropic_control(),
+            model.cache_tools,
+        ));
+        assert!(legacy.is_some());
+        let current = model.context_identity();
+        assert!(current.is_some());
+        assert_ne!(current, legacy);
+        assert_eq!(
+            model
+                .clone()
+                .with_strict_tool_support(false)
+                .context_identity(),
+            current
+        );
+        assert_ne!(
+            model.with_strict_tool_support(true).context_identity(),
+            current
+        );
+    }
+
+    #[tokio::test]
+    async fn constrained_prepared_dispatch_sends_schema_and_observes_model_tool_output() {
+        use pi_rs_core::{EnrichedModelEvent, StrictToolPolicy as P, ToolDispatchContext};
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut data = Vec::new();
+            let mut buf = [0; 4096];
+            loop {
+                let n = socket.read(&mut buf).unwrap();
+                assert!(n > 0);
+                data.extend_from_slice(&buf[..n]);
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&data[..pos]);
+                    let len: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(|s| s.parse().unwrap())
+                        })
+                        .unwrap();
+                    if data.len() >= pos + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let pos = data.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let body: Value = serde_json::from_slice(&data[pos + 4..]).unwrap();
+            assert_eq!(body["tools"][0]["strict"], true);
+            assert_eq!(
+                body["tools"][0]["input_schema"]["required"],
+                json!(["query"])
+            );
+            let events = [
+                json!({"type":"message_start","message":{"id":"msg","model":"claude","usage":{}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call","name":"lookup","input":{}}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":null}"}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{}}),
+                json!({"type":"message_stop"}),
+            ];
+            let body: String = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let client = Anthropic::new(&format!("http://{addr}/v1/messages"), "key")
+            .unwrap()
+            .with_context_probe(false)
+            .with_strict_tool_support(true);
+        let (request, decl) = constrained_fixture(
+            P::Require,
+            json!({"type":"object","properties":{"query":{"type":"string"}},"required":[]}),
+        );
+        let context = ToolDispatchContext {
+            request_id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            external_id: "session".into(),
+            summary: false,
+        };
+        let prepared = client
+            .prepare_bound_tool_dispatch(&request, std::slice::from_ref(&decl), &context)
+            .unwrap();
+        pi_rs_core::validate_prepared_tool_dispatch(prepared.as_ref(), &context, &request, &[decl])
+            .unwrap();
+        assert_eq!(
+            prepared.reservation_request().tools[0].parameters["required"],
+            json!(["query"])
+        );
+        let mut stream = prepared.dispatch().await.unwrap();
+        let mut found = false;
+        while let Some(event) = stream.next().await {
+            if let EnrichedModelEvent::Legacy(ModelEvent::Complete { calls, .. }) =
+                event.unwrap().event
+            {
+                assert_eq!(calls[0].name, "lookup");
+                let raw: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+                assert_eq!(raw, json!({"query":null}));
+                assert_eq!(
+                    pi_rs_core::normalize_strict_tool_arguments(&request.tools[0].parameters, &raw)
+                        .unwrap(),
+                    json!({})
+                );
+                found = true;
+            }
+        }
+        assert!(found);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn oauth_and_api_key_replay_share_only_the_official_endpoint() {
+        let oauth = Anthropic::with_oauth_token(DEFAULT_ENDPOINT, "sk-ant-oat-secret").unwrap();
+        let api_key = Anthropic::new(DEFAULT_ENDPOINT, "key").unwrap();
+        let custom = Anthropic::new("https://other.example/v1/messages", "key").unwrap();
+        assert_eq!(oauth.replay_scope, api_key.replay_scope);
+        assert_ne!(oauth.replay_scope, custom.replay_scope);
+        let request = ModelRequest {
+            model: "claude".into(),
+            tools: vec![],
+            max_output_tokens: 16,
+            messages: vec![Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: Some(Box::new(ProviderReplay {
+                    identity: ResolvedModelIdentity {
+                        provider: oauth.replay_scope.to_string(),
+                        model: "claude".into(),
+                    },
+                    blocks: vec![
+                        json!({"type":"thinking","thinking":"secret","signature":"signed"}),
+                        json!({"type":"text","text":"answer"}),
+                    ],
+                })),
+            }],
+        };
+        let same = encode_request(
+            request.clone(),
+            &api_key.replay_scope,
+            "",
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        let other =
+            encode_request(request, &custom.replay_scope, "", false, false, false, None).unwrap();
+        assert!(same.to_string().contains("secret"));
+        assert!(!other.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn oauth_credentials_are_rejected_for_untrusted_endpoints() {
+        assert!(
+            Anthropic::with_oauth_token("https://example.com/v1/messages", "sk-ant-oat-secret")
+                .is_err()
+        );
+        assert!(Anthropic::with_oauth_token(DEFAULT_ENDPOINT, "sk-ant-oat-secret").is_ok());
+    }
+
+    #[tokio::test]
+    async fn oauth_rejects_ambiguous_tool_names_before_network() {
+        let model = Anthropic::with_oauth_token(DEFAULT_ENDPOINT, "sk-ant-oat-secret")
+            .unwrap()
+            .with_context_probe(false);
+        let spec = |name: &str| pi_rs_core::ToolSpec {
+            name: name.into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        };
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::User {
+                content: "hello".into(),
+            }],
+            tools: vec![spec("read"), spec("Read")],
+            max_output_tokens: 16,
+        };
+        assert!(model.stream(request).await.is_err());
+    }
+
+    fn read_fixture_request(socket: &mut std::net::TcpStream) -> (String, Value) {
+        use std::io::Read;
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let n = socket.read(&mut buffer).unwrap();
+            assert!(n > 0);
+            request.extend_from_slice(&buffer[..n]);
+            if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..pos]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(|n| n.parse().unwrap())
+                    })
+                    .unwrap();
+                if request.len() >= pos + 4 + length {
+                    break;
+                }
+            }
+        }
+        let pos = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        (
+            String::from_utf8_lossy(&request[..pos]).to_ascii_lowercase(),
+            serde_json::from_slice(&request[pos + 4..]).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn temperature_is_sent_only_when_thinking_and_managed_effort_are_inactive() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for expected in [Some(0.35), None, None, None] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (_, body) = read_fixture_request(&mut socket);
+                assert_eq!(body["temperature"].as_f64(), expected);
+                socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+            }
+        });
+        let client = Anthropic::new(&format!("http://{address}/v1/messages"), "fixture")
+            .unwrap()
+            .with_context_probe(false)
+            .with_model_temperatures(BTreeMap::from([("m".into(), 0.35)]));
+        for (client, model) in [
+            (client.clone(), "m"),
+            (client.clone(), "another-model"),
+            (
+                client.clone().with_configured_thinking("low", true, true),
+                "m",
+            ),
+            (
+                client
+                    .clone()
+                    .with_managed_effort_models(BTreeMap::from([("m".into(), true)])),
+                "m",
+            ),
+        ] {
+            let result = client
+                .stream(ModelRequest {
+                    model: model.into(),
+                    messages: vec![Message::User {
+                        content: "hello".into(),
+                    }],
+                    tools: vec![],
+                    max_output_tokens: 2048,
+                })
+                .await;
+            assert!(result.is_err());
+        }
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_round_trip_uses_canonical_wire_names_and_restores_local_tool() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let (headers, body) = read_fixture_request(&mut socket);
+            assert!(headers.contains("authorization: bearer fixture-oauth"));
+            assert!(headers.lines().any(|line| {
+                line == "anthropic-beta: claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"
+            }));
+            assert_eq!(body["tools"][0]["name"], "Read");
+            assert_eq!(
+                body["thinking"],
+                json!({"type":"enabled","budget_tokens":2048,"display":"omitted"})
+            );
+            assert_eq!(
+                body["system"][0]["text"],
+                "You are Claude Code, Anthropic's official CLI for Claude."
+            );
+            let events = [
+                json!({"type":"message_start","message":{"id":"msg","model":"m","usage":{}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call","name":"Read","input":{}}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{}}),
+                json!({"type":"message_stop"}),
+            ];
+            let body: String = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let model =
+            Anthropic::with_oauth_token(&format!("http://{address}/v1/messages"), "fixture-oauth")
+                .unwrap()
+                .with_context_probe(false)
+                .with_configured_thinking("low", false, true)
+                .with_thinking_display(ThinkingDisplay::Omitted);
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::User {
+                content: "hello".into(),
+            }],
+            tools: vec![pi_rs_core::ToolSpec {
+                name: "read".into(),
+                description: "read".into(),
+                parameters: json!({"type":"object"}),
+            }],
+            max_output_tokens: 4096,
+        };
+        let mut stream = model.stream(request).await.unwrap();
+        let mut observed = false;
+        while let Some(event) = stream.next().await {
+            if let ModelEvent::Complete { calls, .. } = event.unwrap() {
+                assert_eq!(calls[0].name, "read");
+                observed = true;
+            }
+        }
+        assert!(observed);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn oauth_request_adds_identity_and_maps_tool_names() {
+        let mut body = json!({"system":"project instructions", "tools":[{"name":"read"},{"name":"custom"}], "messages":[{"role":"assistant","content":[{"type":"tool_use","id":"one","name":"read","input":{}}]}]});
+        super::prepare_oauth_request(&mut body, pi_rs_core::CacheRetention::None);
+        assert_eq!(
+            body["system"][0]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
+        assert_eq!(body["system"][1]["text"], "project instructions");
+        assert_eq!(body["tools"][0]["name"], "Read");
+        assert_eq!(body["tools"][1]["name"], "custom");
+        assert_eq!(body["messages"][0]["content"][0]["name"], "Read");
+    }
+
+    #[tokio::test]
+    async fn enriched_stream_preserves_anthropic_block_boundaries_and_redaction() {
+        use pi_rs_core::EnrichedModelEvent as E;
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let events = [
+                    json!({"type":"message_start","message":{"id":"msg","model":"m","usage":{}}}),
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a"}}),
+                    json!({"type":"content_block_stop","index":0}),
+                    json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":"b"}}),
+                    json!({"type":"content_block_stop","index":1}),
+                    json!({"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+                    json!({"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"thought"}}),
+                    json!({"type":"content_block_start","index":3,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+                    json!({"type":"content_block_delta","index":3,"delta":{"type":"thinking_delta","thinking":"next"}}),
+                    json!({"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"-end"}}),
+                    json!({"type":"content_block_delta","index":2,"delta":{"type":"signature_delta","signature":"sig"}}),
+                    json!({"type":"content_block_stop","index":2}),
+                    json!({"type":"content_block_delta","index":3,"delta":{"type":"signature_delta","signature":"sig2"}}),
+                    json!({"type":"content_block_stop","index":3}),
+                    json!({"type":"content_block_start","index":4,"content_block":{"type":"redacted_thinking","data":"opaque"}}),
+                    json!({"type":"content_block_stop","index":4}),
+                    json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}),
+                    json!({"type":"message_stop"}),
+                ];
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let model = Anthropic::new(&format!("http://{address}/v1/messages"), "key")
+            .unwrap()
+            .with_context_probe(false);
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::User {
+                content: "hello".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let events = model
+            .stream_enriched(request.clone())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let items: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                E::TextStart { index } => Some(("text_start", *index)),
+                E::TextEnd { index, .. } => Some(("text_end", *index)),
+                E::ReasoningStart { index } => Some(("thinking_start", *index)),
+                E::ReasoningEnd { index, .. } => Some(("thinking_end", *index)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            items,
+            [
+                ("text_start", 0),
+                ("text_end", 0),
+                ("text_start", 1),
+                ("text_end", 1),
+                ("thinking_start", 2),
+                ("thinking_start", 3),
+                ("thinking_end", 2),
+                ("thinking_end", 3),
+                ("thinking_start", 4),
+                ("thinking_end", 4)
+            ]
+        );
+        assert!(events.iter().any(|event| matches!(event, E::ReasoningDelta { index: 4, delta } if delta == "[Reasoning redacted]")));
+        let metadata = events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                E::Legacy(ModelEvent::Metadata(metadata)) if metadata.replay.is_some() => {
+                    Some(metadata)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            metadata.reasoning.as_deref(),
+            Some("thought-endnext[Reasoning redacted]")
+        );
+        let replay = metadata.replay.as_ref().unwrap();
+        assert_eq!(replay.blocks[2]["signature"], "sig");
+        assert_eq!(replay.blocks[3]["signature"], "sig2");
+        assert_eq!(replay.blocks[4]["data"], "opaque");
+        for summary in [false, true] {
+            let detailed = if summary {
+                model
+                    .stream_detailed_for_summary(
+                        uuid::Uuid::nil(),
+                        uuid::Uuid::nil(),
+                        request.clone(),
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                model
+                    .stream_detailed_in_session_with_identity(
+                        uuid::Uuid::nil(),
+                        uuid::Uuid::nil(),
+                        "session",
+                        request.clone(),
+                    )
+                    .await
+                    .unwrap()
+            }
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+            assert!(detailed.iter().any(|event| matches!(
+                event.event,
+                E::ReasoningStart { index: 4 }
+            ) && event.is_redacted_start()));
+            assert!(detailed.iter().any(|event| matches!(&event.event, E::ReasoningDelta { index: 4, delta } if delta == "[Reasoning redacted]")));
+        }
+        let legacy = model
+            .stream(request)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(legacy.iter().any(
+            |event| matches!(event, ModelEvent::Reasoning(text) if text == "[Reasoning redacted]")
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn thread_route_default_is_used_when_the_final_model_has_no_override() {
+        let session = Some((uuid::Uuid::new_v4(), "fixture"));
+        for (endpoint, explicit, inferred) in [
+            (DEFAULT_ENDPOINT, false, true),
+            ("http://127.0.0.1:1/v1/messages", true, false),
+        ] {
+            let native = Anthropic::new(endpoint, "fixture")
+                .unwrap()
+                .with_cache_retention(CacheRetention::Short, true);
+            assert_eq!(native.thread_key("unlisted", session).is_some(), inferred);
+            let client = native.with_message_thread_support(
+                Some(explicit),
+                BTreeMap::from([("model-override".into(), !explicit)]),
+            );
+            assert_eq!(client.thread_key("unlisted", session).is_some(), explicit);
+            assert_eq!(
+                client.thread_key("model-override", session).is_some(),
+                !explicit
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_thread_beta_resend_keeps_the_fallback_diagnostic() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for (threaded, error) in [
+                (
+                    true,
+                    r#"{"message":"unknown beta message-threads-2026-08-12"}"#,
+                ),
+                (
+                    false,
+                    r#"{"error":{"message":"fixture rejected the resend"}}"#,
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (headers, body) = read_fixture_request(&mut socket);
+                assert_eq!(headers.contains(MESSAGE_THREADS_BETA), threaded);
+                assert_eq!(body.get("thread").is_some(), threaded);
+                write!(
+                    socket,
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}",
+                    error.len(),
+                ).unwrap();
+            }
+        });
+        let (request, mut declaration) = constrained_fixture(
+            pi_rs_core::StrictToolPolicy::Prefer,
+            json!({"type":"object","properties":{}}),
+        );
+        declaration.constrained_sampling = None;
+        let client = Anthropic::new(&format!("http://{address}/v1/messages"), "fixture")
+            .unwrap()
+            .with_message_thread_support(None, BTreeMap::from([("claude".into(), true)]))
+            .with_cache_retention(CacheRetention::Short, true);
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "session".into(),
+            summary: false,
+        };
+        let stream = client
+            .prepare_bound_tool_dispatch(&request, &[declaration], &context)
+            .unwrap()
+            .dispatch()
+            .await
+            .unwrap();
+        let events = stream.collect::<Vec<_>>().await;
+        assert!(matches!(events.as_slice(), [
+            Ok(pi_rs_core::DetailedModelEvent {
+                event: pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(ModelMetadata { diagnostics, .. })),
+                ..
+            }),
+            Err(Error::Model(_)),
+        ] if matches!(diagnostics.as_slice(), [
+            AssistantDiagnostic::AnthropicThreadFallback { details, .. },
+        ] if details.reason == "thread_beta_unsupported")));
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_federation_token_is_invalidated_by_catalog_requests() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let exchanges = [
+            ("/v1/models?limit=100", "401 Unauthorized"),
+            ("/v1/models/claude", "401 Unauthorized"),
+            ("/v1/models?limit=100", "403 Forbidden"),
+        ];
+        let worker = std::thread::spawn(move || {
+            for (path, status) in exchanges {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                assert_eq!(first.trim_end(), format!("GET {path} HTTP/1.1"));
+                let headers: Vec<_> = reader
+                    .lines()
+                    .map(|line| line.unwrap())
+                    .take_while(|line| !line.is_empty())
+                    .collect();
+                assert!(headers.iter().any(|line| {
+                    line.eq_ignore_ascii_case("authorization: Bearer fixture-token")
+                }));
+                let status_line = format!("HTTP/1.1 {status}\r\n");
+                socket.write_all(status_line.as_bytes()).unwrap();
+                socket
+                    .write_all(b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            }
+        });
+        let rejected = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&rejected);
+        let mut client =
+            Anthropic::with_bearer_token(&format!("http://{address}/v1/messages"), "fixture-token")
+                .unwrap();
+        client.federation_rejected = Some(Arc::new(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        }));
+        assert!(client.models().await.is_err());
+        assert_eq!(rejected.load(Ordering::Relaxed), 1);
+        assert!(client.model("claude").await.is_none());
+        assert_eq!(rejected.load(Ordering::Relaxed), 2);
+        assert!(client.models().await.is_err());
+        assert_eq!(rejected.load(Ordering::Relaxed), 2);
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn federation_and_inline_tools_survive_thread_fallback() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for (status, error) in [
+                (
+                    "404 Not Found",
+                    json!({"error":{"details":{"error_code":"thread_not_found"},"message":"fixture"}}),
+                ),
+                (
+                    "401 Unauthorized",
+                    json!({"error":{"type":"authentication_error","message":"expired"}}),
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (headers, body) = read_fixture_request(&mut socket);
+                assert!(headers.contains(MESSAGE_THREADS_BETA));
+                assert!(headers.contains(OAUTH_API_BETA));
+                assert!(headers.contains(INLINE_TOOLS_BETA));
+                assert_eq!(body["thread"], json!({"type":"create"}));
+                assert_eq!(body["tools"][0]["name"], "read");
+                let error = error.to_string();
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}", error.len()).unwrap();
+            }
+        });
+        let rejections = Arc::new(AtomicUsize::new(0));
+        let rejected = Arc::clone(&rejections);
+        let mut client =
+            Anthropic::with_bearer_token(&format!("http://{address}/v1/messages"), "fixture-token")
+                .unwrap()
+                .with_message_thread_support(Some(true), BTreeMap::new())
+                .with_mid_conversation_system_models(BTreeSet::from(["claude".into()]))
+                .with_inline_tool_models(BTreeSet::from(["claude".into()]))
+                .with_cache_retention(CacheRetention::Short, true);
+        client.federation_rejected = Some(Arc::new(move || {
+            rejected.fetch_add(1, Ordering::Relaxed);
+        }));
+        let tool = ToolSpec {
+            name: "read".into(),
+            description: "Read fixture".into(),
+            parameters: json!({"type":"object","properties":{}}),
+        };
+        let request = ModelRequest {
+            model: "claude".into(),
+            messages: vec![Message::User {
+                content: "test".into(),
+            }],
+            tools: vec![tool.clone()],
+            max_output_tokens: 8,
+        };
+        let client = client.with_tool_transcript(
+            &request,
+            &[ToolTranscriptChange {
+                message_index: 0,
+                added: vec![ToolDeclaration {
+                    spec: tool,
+                    constrained_sampling: None,
+                }],
+                removed: vec![],
+            }],
+        );
+        assert!(client.inline_tools(&request, None, true).is_some());
+        let mut stream = client
+            .stream_detailed_with_tools(request, None, Some((uuid::Uuid::new_v4(), "fixture")))
+            .await
+            .unwrap();
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert!(matches!(stream.next().await, Some(Err(_))));
+        assert_eq!(rejections.load(Ordering::Relaxed), 1);
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_message_threads_send_suffixes_and_recover_from_rejections() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for (attempt, expected, count, reply) in [
+                (0, json!({"type":"create"}), 1, "msg_a"),
+                (1, Value::Null, 1, "msg_warm"),
+                (
+                    2,
+                    json!({"type":"continue","previous_message_id":"msg_a"}),
+                    1,
+                    "",
+                ),
+                (3, json!({"type":"create"}), 3, "msg_b"),
+                (
+                    4,
+                    json!({"type":"continue","previous_message_id":"msg_b"}),
+                    1,
+                    "",
+                ),
+                (5, Value::Null, 5, "msg_c"),
+                (6, Value::Null, 7, "msg_d"),
+                (7, Value::Null, 9, "msg_summary"),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (headers, body) = read_fixture_request(&mut socket);
+                assert_eq!(
+                    headers.contains(MESSAGE_THREADS_BETA),
+                    reply != "msg_summary",
+                    "attempt {attempt}"
+                );
+                assert_eq!(body["thread"], expected, "attempt {attempt}");
+                assert_eq!(
+                    body["messages"].as_array().unwrap().len(),
+                    count,
+                    "attempt {attempt}"
+                );
+                let continuation = expected["type"] == "continue";
+                assert_eq!(body.get("system").is_none(), continuation);
+                assert_eq!(body.get("tools").is_none(), continuation);
+                if reply == "msg_warm" {
+                    assert_eq!(body["max_tokens"], 1);
+                }
+                if reply.is_empty() {
+                    let (status, error_code) = if attempt == 2 {
+                        ("404 Not Found", "thread_not_found")
+                    } else {
+                        ("400 Bad Request", "thread_unsupported_request")
+                    };
+                    let error =
+                        json!({"error":{"details":{"error_code":error_code},"message":"fixture"}})
+                            .to_string();
+                    write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}", error.len()).unwrap();
+                } else {
+                    let events = [
+                        json!({"type":"message_start","message":{"id":reply,"model":"claude-20261001","usage":{"input_tokens":1}}}),
+                        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":reply}}),
+                        json!({"type":"content_block_stop","index":0}),
+                        json!({"type":"content_block_start","index":1,"content_block":{"type":"future_response_block","data":"not replayable"}}),
+                        json!({"type":"content_block_stop","index":1}),
+                        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+                        json!({"type":"message_stop"}),
+                    ];
+                    let body: String = events
+                        .iter()
+                        .map(|event| format!("data: {event}\n\n"))
+                        .collect();
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            }
+        });
+        let session_id = uuid::Uuid::new_v4();
+        let (mut request, mut declaration) = constrained_fixture(
+            pi_rs_core::StrictToolPolicy::Prefer,
+            json!({"type":"object","properties":{}}),
+        );
+        declaration.constrained_sampling = None;
+        request.messages.insert(
+            0,
+            Message::System {
+                content: "system".into(),
+            },
+        );
+        for (expected, fallback, summary) in [
+            ("msg_a", None, false),
+            ("msg_b", Some("thread_not_found"), false),
+            ("msg_c", Some("thread_unsupported_request"), false),
+            ("msg_d", None, false),
+            ("msg_summary", None, true),
+        ] {
+            // Workbench may rebuild the client from the same route between requests.
+            let client = Anthropic::new(&format!("http://{address}/v1/messages"), "fixture")
+                .unwrap()
+                .with_message_thread_support(None, BTreeMap::from([("claude".into(), true)]))
+                .with_cache_retention(CacheRetention::Short, true);
+            let context = pi_rs_core::ToolDispatchContext {
+                request_id: uuid::Uuid::new_v4(),
+                session_id,
+                external_id: "session".into(),
+                summary,
+            };
+            let prepared = client
+                .prepare_bound_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+                .unwrap();
+            let mut stream = prepared.dispatch().await.unwrap();
+            let mut last = None;
+            while let Some(event) = stream.next().await {
+                if let pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata)) =
+                    event.unwrap().event
+                {
+                    last = Some(metadata);
+                }
+            }
+            let metadata = last.unwrap();
+            assert_eq!(metadata.provider_request_id.as_deref(), Some(expected));
+            if expected == "msg_a" {
+                let replay = metadata.replay.as_ref().unwrap();
+                assert_eq!(replay.blocks.len(), 1);
+                assert_eq!(replay.blocks[0]["type"], "text");
+            }
+            assert_eq!(
+                metadata
+                    .diagnostics
+                    .iter()
+                    .find_map(|diagnostic| match diagnostic {
+                        AssistantDiagnostic::AnthropicThreadFallback { details, .. } =>
+                            Some(details.reason.as_str()),
+                        _ => None,
+                    }),
+                fallback
+            );
+            if expected == "msg_a" {
+                let mut warming = request.clone();
+                warming.max_output_tokens = 1;
+                let replay = client
+                    .clone()
+                    .without_message_thread_continuation()
+                    .prepare_bound_tool_dispatch(
+                        &warming,
+                        std::slice::from_ref(&declaration),
+                        &context,
+                    )
+                    .unwrap();
+                let mut events = replay.dispatch().await.unwrap();
+                while let Some(event) = events.next().await {
+                    event.unwrap();
+                }
+            }
+            request.messages.push(Message::Assistant {
+                content: expected.into(),
+                calls: vec![],
+                replay: metadata.replay,
+            });
+            request.messages.push(Message::User {
+                content: "next".into(),
+            });
+        }
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_message_thread_continues_after_lowercase_local_tool() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for continuation in [false, true] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (_, body) = read_fixture_request(&mut socket);
+                if continuation {
+                    assert_eq!(
+                        body["thread"],
+                        json!({"type":"continue","previous_message_id":"msg_a"})
+                    );
+                    assert!(body.get("tools").is_none());
+                    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+                    assert_eq!(body["messages"][0]["content"][0]["tool_use_id"], "call_a");
+                } else {
+                    assert_eq!(body["thread"], json!({"type":"create"}));
+                    assert_eq!(body["tools"][0]["name"], "Read");
+                }
+
+                let (id, content, reason) = if continuation {
+                    ("msg_b", json!({"type":"text","text":"done"}), "end_turn")
+                } else {
+                    (
+                        "msg_a",
+                        json!({"type":"tool_use","id":"call_a","name":"Read","input":{}}),
+                        "tool_use",
+                    )
+                };
+                let events = [
+                    json!({"type":"message_start","message":{"id":id,"model":"claude","usage":{}}}),
+                    json!({"type":"content_block_start","index":0,"content_block":content}),
+                    json!({"type":"content_block_stop","index":0}),
+                    json!({"type":"message_delta","delta":{"stop_reason":reason},"usage":{}}),
+                    json!({"type":"message_stop"}),
+                ];
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+
+        let (mut request, mut declaration) = constrained_fixture(
+            pi_rs_core::StrictToolPolicy::Prefer,
+            json!({"type":"object","properties":{}}),
+        );
+        request.tools[0].name = "read".into();
+        declaration.spec = request.tools[0].clone();
+        declaration.constrained_sampling = None;
+        let client =
+            Anthropic::with_oauth_token(&format!("http://{address}/v1/messages"), "fixture-oauth")
+                .unwrap()
+                .with_message_thread_support(None, BTreeMap::from([("claude".into(), true)]))
+                .with_cache_retention(CacheRetention::Short, true);
+        let mut context = pi_rs_core::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "oauth-thread".into(),
+            summary: false,
+        };
+        let prepared = client
+            .prepare_bound_tool_dispatch(&request, std::slice::from_ref(&declaration), &context)
+            .unwrap();
+        let mut stream = prepared.dispatch().await.unwrap();
+        let mut replay = None;
+        let mut calls = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap().event {
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Metadata(metadata)) => {
+                    replay = metadata.replay;
+                }
+                pi_rs_core::EnrichedModelEvent::Legacy(ModelEvent::Complete {
+                    calls: call_list,
+                    ..
+                }) => {
+                    calls = Some(call_list);
+                }
+                _ => {}
+            }
+        }
+        let replay = replay.unwrap();
+        let calls = calls.unwrap();
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(replay.blocks[0]["name"], "read");
+        request.messages.push(Message::Assistant {
+            content: String::new(),
+            calls,
+            replay: Some(replay),
+        });
+        request.messages.push(Message::Tool {
+            call_id: "call_a".into(),
+            content: "found".into(),
+            is_error: false,
+            is_structured: Some(false),
+        });
+
+        context.request_id = uuid::Uuid::new_v4();
+        let prepared = client
+            .prepare_bound_tool_dispatch(&request, &[declaration], &context)
+            .unwrap();
+        let mut stream = prepared.dispatch().await.unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fallback_targets_and_resolved_model_pricing_are_bound_to_the_request() {
+        use std::io::Write;
+        for (response_model, expect_price, enable_fallback, custom_beta) in [
+            ("backup", true, true, None),
+            ("backup", true, true, Some("custom-feature")),
+            ("backup", true, true, Some(FALLBACK_BETA)),
+            ("different-provider", false, true, None),
+            ("unlisted", false, true, None),
+            ("primary", false, true, None),
+            ("backup", false, false, None),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let (headers, request) = read_fixture_request(&mut socket);
+                assert_eq!(request["model"], "primary");
+                assert_eq!(request["messages"][0]["role"], "user");
+                assert_eq!(request["messages"][1]["role"], "system");
+                assert_eq!(request["messages"][1]["content"][0]["text"], "checkpoint");
+                assert_eq!(
+                    headers.matches(FALLBACK_BETA).count(),
+                    usize::from(enable_fallback)
+                );
+                if let Some(custom_beta) = custom_beta {
+                    assert!(headers.contains(custom_beta));
+                }
+                if enable_fallback {
+                    assert_eq!(
+                        request["fallbacks"],
+                        json!([{"model":"backup"}, {"model":"different-provider"}])
+                    );
+                } else {
+                    assert!(request.get("fallbacks").is_none());
+                }
+                let events = [
+                    json!({"type":"message_start","message":{
+                        "model":response_model, "usage":{
+                            "input_tokens":1_000_000,"cache_read_input_tokens":1_000_000,
+                            "cache_creation_input_tokens":2_000_000,
+                            "cache_creation":{"ephemeral_1h_input_tokens":1_000_000}
+                        }
+                    }}),
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"ok"}}),
+                    json!({"type":"content_block_stop","index":0}),
+                    json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2_000_000}}),
+                    json!({"type":"message_stop"}),
+                ];
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = Anthropic::new(&format!("http://{address}/v1/messages"), "key")
+                .unwrap()
+                .with_context_probe(false);
+            let model = if let Some(custom_beta) = custom_beta {
+                let mut headers = HeaderMap::new();
+                headers.insert("anthropic-beta", HeaderValue::from_static(custom_beta));
+                model.with_headers(headers)
+            } else {
+                model
+            };
+            let original_identity = model.context_identity().unwrap();
+            let model =
+                model.with_mid_conversation_system_models(BTreeSet::from(["primary".into()]));
+            let base_identity = model.context_identity().unwrap();
+            assert_ne!(base_identity, original_identity);
+            let price = json!({"input":5,"output":25,"cacheRead":0.5,"cacheWrite":6.25});
+            let targets: Vec<AnthropicFallbackModel> = serde_json::from_value(json!([
+                {"provider":"anthropic","model":"backup","cost":price},
+                {"provider":"proxy","model":"different-provider","cost":price}
+            ]))
+            .unwrap();
+            let model = model
+                .with_fallback_models(BTreeMap::from([(
+                    "primary".into(),
+                    if enable_fallback { targets } else { vec![] },
+                )]))
+                .unwrap();
+            assert_eq!(
+                model.context_identity().unwrap() != base_identity,
+                enable_fallback
+            );
+            let mut stream = model
+                .stream(ModelRequest {
+                    model: "primary".into(),
+                    messages: vec![
+                        Message::User {
+                            content: "hello".into(),
+                        },
+                        Message::System {
+                            content: "checkpoint".into(),
+                        },
+                    ],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                })
+                .await
+                .unwrap();
+            let mut final_metadata = None;
+            while let Some(event) = stream.next().await {
+                if let ModelEvent::Metadata(metadata) = event.unwrap() {
+                    final_metadata = Some(metadata);
+                }
+            }
+            worker.join().unwrap();
+            let metadata = final_metadata.unwrap();
+            assert_eq!(metadata.resolved_model.unwrap().model, response_model);
+            if expect_price {
+                assert_eq!(
+                    metadata.cost_breakdown,
+                    pi_rs_core::UsageCostBreakdown::new(5.0, 50.0, 0.5, 16.25)
+                );
+                assert_eq!(metadata.cost_usd.unwrap().as_f64(), Some(71.75));
+                assert_eq!(metadata.cost_from_provider, Some(false));
+            } else {
+                assert!(metadata.cost_breakdown.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_is_only_allowed_before_output_blocks() {
+        use std::io::{Read, Write};
+        for block in [
+            None,
+            Some(json!({"type":"future_block"})),
+            Some(json!({"type":"text","text":""})),
+            Some(json!({"type":"thinking","thinking":""})),
+            Some(json!({"type":"redacted_thinking","data":"opaque"})),
+            Some(json!({"type":"tool_use","id":"call","name":"read","input":{}})),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let unknown = block
+                .as_ref()
+                .is_some_and(|block| block["type"] == "future_block");
+            let expect_error = block.is_some() && !unknown;
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let mut events = vec![
+                    json!({"type":"message_start","message":{"id":"msg","model":"m","usage":{}}}),
+                ];
+                if let Some(block) = block {
+                    events.push(
+                        json!({"type":"content_block_start","index":0,"content_block":block}),
+                    );
+                }
+                events.push(json!({"type":"content_block_start","index":1,"content_block":{"type":"fallback"}}));
+                if unknown {
+                    events.push(json!({"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"thought","signature":"sig"}}));
+                    events.push(json!({"type":"content_block_stop","index":2}));
+                }
+                events.push(
+                    json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}),
+                );
+                events.push(json!({"type":"message_stop"}));
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = Anthropic::new(&format!("http://{address}/v1/messages"), "key")
+                .unwrap()
+                .with_context_probe(false);
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![Message::User {
+                    content: "hello".into(),
+                }],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream = model.stream(request).await.unwrap();
+            let mut completed = false;
+            let mut fallback_error = false;
+            let mut replay = None;
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(ModelEvent::Complete { .. }) => completed = true,
+                    Ok(ModelEvent::Metadata(metadata)) if metadata.replay.is_some() => {
+                        replay = metadata.replay
+                    }
+                    Err(Error::Model(message))
+                        if message.contains("unsupported mid-output model fallback") =>
+                    {
+                        fallback_error = true
+                    }
+                    Err(error) => panic!("unexpected error: {error}"),
+                    _ => {}
+                }
+            }
+            worker.join().unwrap();
+            assert_eq!(fallback_error, expect_error);
+            assert_eq!(completed, !expect_error);
+            if unknown {
+                let replay = replay.expect("signed thinking replay");
+                assert_eq!(replay.blocks.len(), 1);
+                assert_eq!(replay.blocks[0]["type"], "thinking");
+            }
+        }
+    }
+
+    #[test]
+    fn overflow_http_classification_is_bounded_and_hides_credentials() {
+        use std::io::{Read, Write};
+        for (status, body, overflow) in [
+            (400, r#"{"error":{"message":"prompt is too long"}}"#, true),
+            (
+                400,
+                r#"{"error":{"message":"other"},"request_id":"context_length_exceeded"}"#,
+                false,
+            ),
+            (
+                400,
+                r#"{"error":{"message":"prompt is too long secret-token"}}"#,
+                true,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit: too many tokens"}}"#,
+                false,
+            ),
+            (413, r#"{"error":{"message":"other"}}"#, true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.ends_with(b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0 && request.len() + count <= 16 * 1024);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let error = runtime
+                .block_on(super::send(
+                    reqwest::Client::new().get(format!("http://{address}/")),
+                    &["secret-token".into()],
+                ))
+                .unwrap_err();
+            let message = error.to_string();
+            assert_eq!(
+                message.contains("context window exceeded")
+                    || message.contains("413 request too large"),
+                overflow,
+                "{message}"
+            );
+            assert!(!message.contains("secret-token"));
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn tool_arguments_use_correctly_rounded_decimal_on_wire() {
+        use pi_rs_core::{Message, Model, ModelRequest, ToolCall};
+        use std::io::{BufRead, Read, Write};
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "request did not connect"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut socket = std::io::BufReader::new(socket);
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                socket.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut body = vec![0; length.expect("request content length")];
+            socket.read_exact(&mut body).unwrap();
+            socket.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            String::from_utf8(body).unwrap()
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let model =
+                super::Anthropic::new(&format!("http://{address}/messages"), "key").unwrap();
+            let request = ModelRequest {
+                model: "fixture".into(),
+                messages: vec![Message::Assistant {
+                    content: String::new(),
+                    calls: vec![ToolCall {
+                        id: "id".into(),
+                        name: "c".into(),
+                        arguments: r#"{"x":34450847700860466777e-23}"#.into(),
+                    }],
+                    replay: None,
+                }],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let _stream = model.stream(request).await.unwrap();
+        });
+        let wire = worker.join().unwrap();
+        assert!(
+            wire.contains(r#""input":{"x":0.00034450847700860464}"#),
+            "{wire}"
+        );
+    }
+
+    #[test]
+    fn streamed_tool_argument_decimals_are_rounded_before_replay_and_execution() {
+        let call = super::Call {
+            id: "id".into(),
+            name: "capture".into(),
+            raw: serde_json::json!({"type":"tool_use", "id":"id", "name":"capture", "input":{}}),
+            fragments: r#"{"x":34450847700860466777e-23}"#.into(),
+            complete: true,
+        };
+        let (call, replay) = call.finish().unwrap();
+        let execution = pi_rs_core::parse_tool_arguments(&call.arguments).unwrap();
+        let expected = 0.00034450847700860464_f64.to_bits();
+        assert_eq!(execution["x"].as_f64().unwrap().to_bits(), expected);
+        assert_eq!(replay["input"]["x"].as_f64().unwrap().to_bits(), expected);
+    }
+
+    #[test]
+    fn rate_limit_response_classification_and_redaction() {
+        use std::io::{Read, Write};
+        for (status, body, permanent) in [
+            (
+                429,
+                r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (503, r#"{"error":{"message":"quota exceeded"}}"#, true),
+            (408, r#"{"error":{"message":"quota exceeded"}}"#, true),
+            (
+                429,
+                r#"{"error":{"message":"rate limit exceeded"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"temporarily unavailable","request_id":"billing-sentinel-secret"}}"#,
+                false,
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 2048];
+                let _ = stream.read(&mut request).unwrap();
+                write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let error = runtime
+                .block_on(super::send(
+                    reqwest::Client::new().get(format!("http://{address}/")),
+                    &[],
+                ))
+                .unwrap_err();
+            assert_eq!(matches!(error, pi_rs_core::Error::Model(_)), permanent);
+            assert_eq!(
+                matches!(error, pi_rs_core::Error::RetryableModel(_)),
+                !permanent
+            );
+            if permanent {
+                assert!(
+                    matches!(&error, pi_rs_core::Error::Model(message) if message == "Anthropic account quota or billing limit reached")
+                );
+            } else {
+                assert!(
+                    matches!(&error, pi_rs_core::Error::RetryableModel(message) if message.starts_with(&format!("Anthropic returned HTTP {status} ")))
+                );
+            }
+            assert!(!error.to_string().contains("sentinel-secret"));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn permanent_quota_markers_do_not_retry() {
+        for body in [
+            r#"{"error":{"code":"insufficient_quota"}}"#,
+            r#"{"code" : "1308"}"#,
+            "FREEUSAGELIMITERROR",
+            "Monthly usage limit reached",
+            "BILLING",
+        ] {
+            assert!(
+                super::permanent_quota_error(body.as_bytes(), true, &[]),
+                "{body}"
+            );
+        }
+        assert!(!super::permanent_quota_error(
+            br#"{"code":1308"#,
+            false,
+            &[]
+        ));
+        assert!(!super::permanent_quota_error(
+            br#"{"error":{"message":"rate limit"},"request_id":"billing"}"#,
+            true,
+            &[]
+        ));
+        for body in [r#"{"code":13080}"#, "rate limit exceeded", "server busy"] {
+            assert!(
+                !super::permanent_quota_error(body.as_bytes(), true, &[]),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_quota_error_precedes_transient_type_without_metadata_leaks() {
+        use futures_util::StreamExt;
+        use pi_rs_core::Model;
+        use std::io::{Read, Write};
+        for case in [0, 1, 2] {
+            let permanent = case == 1;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let event = serde_json::json!({"type":"error","error":{"type":"overloaded_error", "code": if case == 2 {13080} else {0}, "message": if permanent {"quota exceeded"} else {"temporarily overloaded sk-ant-billing-secret"}, "request_id":"billing-sentinel-secret"}});
+                let body = format!("event: error\ndata: {event}\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let error = runtime.block_on(async {
+                let model = super::Anthropic::new(
+                    &format!("http://{address}/messages"),
+                    "sk-ant-billing-secret",
+                )
+                .unwrap();
+                let request = pi_rs_core::ModelRequest {
+                    model: "m".into(),
+                    messages: vec![pi_rs_core::Message::User {
+                        content: "hello".into(),
+                    }],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                };
+                let mut stream = match model.stream(request).await {
+                    Ok(stream) => stream,
+                    Err(error) => panic!("{error}"),
+                };
+                loop {
+                    match stream.next().await {
+                        Some(Err(error)) => break error,
+                        Some(Ok(_)) => {}
+                        None => panic!("missing error"),
+                    }
+                }
+            });
+            assert_eq!(matches!(error, pi_rs_core::Error::Model(_)), permanent);
+            assert_eq!(
+                matches!(error, pi_rs_core::Error::RetryableModel(_)),
+                !permanent
+            );
+            assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(!error.to_string().contains("sk-ant-billing-secret"));
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn bounded_http_error_keeps_complete_quota_field() {
+        use std::io::{Read, Write};
+        for case in [0, 1, 2] {
+            let permanent = case == 1;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 2048];
+                let _ = socket.read(&mut request).unwrap();
+                let body = if case == 2 {
+                    let head = r#"{"error":{"padding":""#;
+                    let tail = r#"","code":1308"#;
+                    format!(
+                        "{head}{}{tail}0}}}}",
+                        "x".repeat(64 * 1024 - head.len() - tail.len())
+                    )
+                } else {
+                    let kind = if permanent {
+                        "insufficient_quota"
+                    } else {
+                        "overloaded_error"
+                    };
+                    format!(
+                        "{{\"error\":{{\"type\":\"{kind}\",\"request_id\":\"billing-{}\"}}}}",
+                        "x".repeat(70_000)
+                    )
+                };
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 503 Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let error = runtime
+                .block_on(super::send(
+                    reqwest::Client::builder()
+                        .no_proxy()
+                        .build()
+                        .unwrap()
+                        .get(format!("http://{address}/")),
+                    &[],
+                ))
+                .unwrap_err();
+            assert_eq!(matches!(error, pi_rs_core::Error::Model(_)), permanent);
+            assert_eq!(
+                matches!(error, pi_rs_core::Error::RetryableModel(_)),
+                !permanent
+            );
+            assert!(!error.to_string().contains("billing-"));
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn numeric_prefix_requires_a_delimiter_and_credentials_are_masked() {
+        let head = r#"{"error":{"padding":""#;
+        let tail = r#"","code":1308"#;
+        let mut bytes = format!(
+            "{head}{}{tail}",
+            "x".repeat(64 * 1024 - head.len() - tail.len())
+        )
+        .into_bytes();
+        assert_eq!(bytes.len(), 64 * 1024);
+        assert!(!super::permanent_quota_error(&bytes, false, &[]));
+        bytes.push(b' ');
+        assert!(super::permanent_quota_error(&bytes, false, &[]));
+        bytes.pop();
+        let delimited = format!(
+            "{{\"error\":{{\"code\":1308,\"padding\":\"{}\"}}}}",
+            "x".repeat(70_000)
+        );
+        assert!(super::permanent_quota_error(
+            &delimited.as_bytes()[..64 * 1024],
+            false,
+            &[]
+        ));
+        let string_tail = r#"","type":"insufficient_quota""#;
+        let string_boundary = format!(
+            "{head}{}{string_tail}",
+            "x".repeat(64 * 1024 - head.len() - string_tail.len())
+        );
+        assert_eq!(string_boundary.len(), 64 * 1024);
+        assert!(super::permanent_quota_error(
+            string_boundary.as_bytes(),
+            false,
+            &[]
+        ));
+        bytes.extend_from_slice(b"0}} ");
+        assert!(!super::permanent_quota_error(&bytes, true, &[]));
+        let secret = "sk-ant-billing-secret".to_string();
+        let body = br#"{"error":{"type":"overloaded_error","message":"rate limited sk-ant-billing-secret"}}"#;
+        assert!(!super::permanent_quota_error(body, true, &[secret]));
+    }
+
+    #[test]
+    fn http_error_masks_the_actual_request_credential() {
+        use pi_rs_core::Model;
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 8192];
+            let _ = socket.read(&mut request).unwrap();
+            let body = r#"{"error":{"type":"overloaded_error","message":"rate limited sk-ant-billing-secret"}}"#;
+            write!(
+                socket,
+                "HTTP/1.1 503 Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime.block_on(async {
+            let model = super::Anthropic::new(
+                &format!("http://{address}/messages"),
+                "sk-ant-billing-secret",
+            )
+            .unwrap();
+            let request = pi_rs_core::ModelRequest {
+                model: "m".into(),
+                messages: vec![pi_rs_core::Message::User {
+                    content: "hello".into(),
+                }],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            match model.stream(request).await {
+                Err(error) => error,
+                Ok(_) => panic!("expected error"),
+            }
+        });
+        assert!(matches!(error, pi_rs_core::Error::RetryableModel(_)));
+        assert!(!error.to_string().contains("sk-ant-billing-secret"));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn bounded_json_retains_only_complete_error_fields() {
+        let long = "x".repeat(70_000);
+        for prefix in [
+            r#"{"error":{"type":"insufficient_quota","detail":""#,
+            r#"{"request_id":"other","error":{"message":"quota exceeded","extra":""#,
+        ] {
+            let body = format!("{prefix}{long}\"}}}}");
+            assert!(super::permanent_quota_error(
+                &body.as_bytes()[..64 * 1024],
+                false,
+                &[]
+            ));
+        }
+        for prefix in [
+            r#"{"request_id":"billing","error":{"message":"temporary","extra":""#,
+            r#"{"error":{"metadata":{"type":"insufficient_quota"},"message":"temporary","extra":""#,
+            r#"{"error":{"message":"billing"#,
+            r#"{"error":{"type":"insufficient_quota","type":""#,
+        ] {
+            let body = format!("{prefix}{long}");
+            assert!(!super::permanent_quota_error(
+                &body.as_bytes()[..64 * 1024],
+                false,
+                &[]
+            ));
+        }
+        assert!(!super::permanent_quota_error(
+            br#"{"error":{"type":"insufficient_quota",!"#,
+            false,
+            &[]
+        ));
+    }
+
     use super::*;
+
+    #[test]
+    fn anthropic_reasoning_usage_survives_later_partial_usage_updates() {
+        let mut usage = StreamUsage::default();
+        let mut metadata = ModelMetadata::default();
+        usage.update(
+            &json!({"input_tokens":10,"output_tokens":7,
+            "output_tokens_details":{"thinking_tokens":5}}),
+            &mut metadata,
+        );
+        usage.update(&json!({"output_tokens":9}), &mut metadata);
+        assert_eq!(usage.finish().unwrap().output_tokens, 9);
+        assert_eq!(metadata.reasoning_output_tokens, Some(5));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn context_identity_tracks_static_route_and_configuration() {
+        let make = |endpoint: &str, key: &str| Anthropic::new(endpoint, key).unwrap();
+        let first = make(DEFAULT_ENDPOINT, "key-a");
+        assert!(first.context_identity().is_some());
+        assert_eq!(first.context_identity(), first.clone().context_identity());
+        assert_ne!(
+            first.context_identity(),
+            make(DEFAULT_ENDPOINT, "key-b").context_identity()
+        );
+        assert_ne!(
+            first.context_identity(),
+            make("https://example.com/v1/messages", "key-a").context_identity()
+        );
+        assert_ne!(
+            first.context_identity(),
+            first
+                .clone()
+                .with_configured_thinking("high", true, true)
+                .context_identity()
+        );
+        let configured = first.clone().with_configured_thinking("high", true, true);
+        assert!(configured.context_identity().is_none());
+        assert!(
+            configured
+                .with_context_probe(false)
+                .context_identity()
+                .is_some()
+        );
+        assert!(
+            first
+                .with_thinking(Some("high"))
+                .context_identity()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn capacity_estimate_matches_image_and_replay_serialization() {
+        let model = Anthropic::new(DEFAULT_ENDPOINT, "key").unwrap();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let tool = |n| {
+            Message::Tool { call_id: "c".into(), content: json!({"data":{"content":[{"type":"image","mimeType":"image/png","data":"A".repeat(n)}]}}).to_string(), is_error: false, is_structured: Some(true) }
+        };
+        let small = model.estimate_message_tokens(&request, &tool(4));
+        let large = model.estimate_message_tokens(&request, &tool(20000));
+        assert_eq!(large, small);
+        let replay = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "anthropic".into(),
+                model: "fixture".into(),
+            },
+            blocks: vec![
+                json!({"type":"text","text":"answer"}),
+                json!({"type":"thinking","thinking":"x".repeat(5000),"signature":"sig"}),
+            ],
+        };
+        let assistant = Message::Assistant {
+            content: "answer".into(),
+            calls: vec![],
+            replay: Some(Box::new(replay)),
+        };
+        assert!(model.estimate_message_tokens(&request, &assistant) > 1000);
+        let mismatch = if let Message::Assistant {
+            replay: Some(mut replay),
+            ..
+        } = assistant.clone()
+        {
+            replay.identity.model = "different".into();
+            Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: Some(replay),
+            }
+        } else {
+            unreachable!()
+        };
+        assert_eq!(
+            model.estimate_message_tokens(&request, &mismatch),
+            pi_rs_core::estimate_message_tokens(&mismatch)
+        );
+    }
+
+    #[test]
+    fn edited_replay_preserves_whitespace_and_thinking() {
+        let scope = pi_rs_core::endpoint_replay_scope("anthropic", "https://one.example/messages");
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::Assistant {
+                content: "first \nsecond".into(),
+                calls: vec![],
+                replay: Some(Box::new(ProviderReplay {
+                    identity: ResolvedModelIdentity {
+                        provider: scope.clone(),
+                        model: "m".into(),
+                    },
+                    blocks: vec![
+                        json!({"type":"text","text":"first \n"}),
+                        json!({"type":"text","text":"second"}),
+                        json!({"type":"thinking","thinking":"secret","signature":"sig"}),
+                        json!({"_pi_context_edit_api":"anthropic-messages"}),
+                    ],
+                })),
+            }],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let body = encode_request(request, "anthropic", &scope, false, false, false, None).unwrap();
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([{"type":"text","text":"first \n"},{"type":"text","text":"second"},{"type":"thinking","thinking":"secret","signature":"sig"}])
+        );
+    }
+
+    #[test]
+    fn edited_thinking_is_bound_to_the_original_endpoint() {
+        let scope_a = pi_rs_core::endpoint_replay_scope("anthropic", "https://a.example/messages");
+        let scope_b = pi_rs_core::endpoint_replay_scope("anthropic", "https://b.example/messages");
+        let request = ModelRequest {
+            model: "claude".into(),
+            messages: vec![
+                Message::User {
+                    content: "question".into(),
+                },
+                Message::Assistant {
+                    content: String::new(),
+                    calls: vec![],
+                    replay: Some(Box::new(ProviderReplay {
+                        identity: ResolvedModelIdentity {
+                            provider: scope_a.clone(),
+                            model: "claude".into(),
+                        },
+                        blocks: vec![
+                            json!({"type":"thinking","thinking":"secret","signature":"sig"}),
+                            json!({"_pi_context_edit_api":"anthropic-messages"}),
+                        ],
+                    })),
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let same = encode_request(
+            request.clone(),
+            "anthropic",
+            &scope_a,
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(same["messages"][1]["content"][0]["thinking"], "secret");
+        let other =
+            encode_request(request, "anthropic", &scope_b, false, false, false, None).unwrap();
+        assert_eq!(other["messages"].as_array().unwrap().len(), 1);
+        assert!(!other.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn edited_replay_is_scoped_and_private_marker_is_not_sent() {
+        let make = |model: &str| ModelRequest {
+            model: model.into(),
+            tools: vec![],
+            max_output_tokens: 16,
+            messages: vec![Message::Assistant {
+                content: "answer".into(),
+                calls: vec![],
+                replay: Some(Box::new(ProviderReplay {
+                    identity: ResolvedModelIdentity {
+                        provider: "anthropic".into(),
+                        model: "claude".into(),
+                    },
+                    blocks: vec![
+                        json!({"type":"thinking","thinking":"secret","signature":"signed"}),
+                        json!({"type":"text","text":"answer"}),
+                        json!({"_pi_context_edit_api":"anthropic-messages"}),
+                    ],
+                })),
+            }],
+        };
+        let same = encode_request(
+            make("claude"),
+            "anthropic",
+            "anthropic",
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            same["messages"][0]["content"],
+            json!([{"type":"thinking","thinking":"secret","signature":"signed"},{"type":"text","text":"answer"}])
+        );
+        let other = encode_request(
+            make("other"),
+            "anthropic",
+            "anthropic",
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            other["messages"][0]["content"],
+            json!([{"type":"text","text":"answer"}])
+        );
+    }
+
+    #[test]
+    fn system_updates_are_delayed_until_an_emitted_assistant_turn_or_the_end() {
+        let system = |content: &str| Message::System {
+            content: content.into(),
+        };
+        let user = |content: &str| Message::User {
+            content: content.into(),
+        };
+        let assistant = |content: &str, calls| Message::Assistant {
+            content: content.into(),
+            calls,
+            replay: None,
+        };
+        let request = ModelRequest {
+            model: "fixture".into(),
+            max_output_tokens: 128,
+            tools: vec![],
+            messages: vec![
+                system("base"),
+                user("question"),
+                assistant(
+                    "",
+                    vec![ToolCall {
+                        id: "call".into(),
+                        name: "Read".into(),
+                        arguments: "{}".into(),
+                    }],
+                ),
+                system("while the tool runs"),
+                Message::Tool {
+                    call_id: "call".into(),
+                    content: "result".into(),
+                    is_error: false,
+                    is_structured: None,
+                },
+                assistant("", vec![]),
+                system(""),
+                user("follow-up"),
+                system("next instruction"),
+                assistant("answer", vec![]),
+                system("last instruction"),
+            ],
+        };
+        let mut native = encode_request(request.clone(), "", "", false, true, false, None).unwrap();
+        assert_eq!(native["system"], "base");
+        assert_eq!(
+            native["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "user",
+                "assistant",
+                "user",
+                "system",
+                "system",
+                "assistant",
+                "system"
+            ]
+        );
+        assert_eq!(native["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(native["messages"][2]["content"][1]["text"], "follow-up");
+        assert_eq!(
+            native["messages"][3]["content"][0]["text"],
+            "while the tool runs"
+        );
+        assert_eq!(
+            native["messages"][4]["content"][0]["text"],
+            "next instruction"
+        );
+        assert_eq!(
+            native["messages"][6]["content"][0]["text"],
+            "last instruction"
+        );
+        apply_cache_control(&mut native, CacheRetention::Short, true);
+        assert_eq!(
+            native["messages"][6]["content"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+
+        let folded = encode_request(request, "", "", false, false, false, None).unwrap();
+        assert_eq!(
+            folded["system"],
+            "base\n\nwhile the tool runs\n\nnext instruction\n\nlast instruction"
+        );
+        assert_eq!(folded["messages"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn inline_tool_history_falls_back_when_required_schema_or_oauth_names_are_unsafe() {
+        let request = ModelRequest {
+            model: "claude".into(),
+            messages: vec![Message::User {
+                content: "next".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 32,
+        };
+        let models = BTreeSet::from([request.model.clone()]);
+        let route = |client: Anthropic| {
+            client
+                .with_mid_conversation_system_models(models.clone())
+                .with_inline_tool_models(models.clone())
+        };
+        let named = |name: &str| ToolDeclaration {
+            spec: ToolSpec {
+                name: name.into(),
+                description: name.into(),
+                parameters: json!({"type":"object","properties":{}}),
+            },
+            constrained_sampling: None,
+        };
+        let mut strict = named("read");
+        strict.constrained_sampling = Some(pi_rs_core::ToolConstraint::JsonSchema {
+            strict: pi_rs_core::StrictToolPolicy::Require,
+        });
+        let history = [
+            ToolTranscriptChange {
+                message_index: 0,
+                added: vec![strict],
+                removed: vec![],
+            },
+            ToolTranscriptChange {
+                message_index: 1,
+                added: vec![],
+                removed: vec!["read".into(), "stale".into()],
+            },
+        ];
+        let api_key = route(Anthropic::new("http://localhost/v1/messages", "fixture").unwrap());
+        assert!(
+            api_key
+                .clone()
+                .with_tool_transcript(&request, &history)
+                .inline_tools(&request, None, true)
+                .is_none()
+        );
+        let supported = api_key
+            .with_strict_tool_support(true)
+            .with_tool_transcript(&request, &history);
+        let inline = supported.inline_tools(&request, None, true).unwrap();
+        assert_eq!(inline.initial[0]["strict"], true);
+        assert_eq!(inline.updates[&1].len(), 1);
+        assert_eq!(inline.updates[&1][0]["tool"]["name"], "read");
+
+        let history = [
+            ToolTranscriptChange {
+                message_index: 0,
+                added: vec![named("read"), named("Read")],
+                removed: vec![],
+            },
+            ToolTranscriptChange {
+                message_index: 1,
+                added: vec![],
+                removed: vec!["read".into(), "Read".into()],
+            },
+        ];
+        let oauth =
+            route(Anthropic::with_oauth_token("http://localhost/v1/messages", "fixture").unwrap())
+                .with_tool_transcript(&request, &history);
+        assert!(oauth.inline_tools(&request, None, true).is_none());
+    }
+
+    #[tokio::test]
+    async fn inline_tool_changes_are_sent_with_the_stable_initial_catalog() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            (0..5).map(|_| {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = BufReader::new(&mut socket);
+                let mut headers = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(request.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    headers.push(line.to_ascii_lowercase());
+                }
+                let length = headers.iter().find_map(|line| {
+                    line.strip_prefix("content-length: ")?.trim().parse().ok()
+                }).unwrap();
+                let mut bytes = vec![0; length];
+                request.read_exact(&mut bytes).unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                (headers, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }).collect::<Vec<_>>()
+        });
+        let model = "claude";
+        let models = BTreeSet::from([model.into()]);
+        let client = Anthropic::new(&endpoint, "fixture")
+            .unwrap()
+            .with_context_probe(false)
+            .with_mid_conversation_system_models(models.clone())
+            .with_inline_tool_models(models)
+            .with_strict_tool_support(true)
+            .with_cache_retention(CacheRetention::Short, true);
+        let make_tool = |name: &str, description: &str| ToolDeclaration {
+            spec: ToolSpec {
+                name: name.into(),
+                description: description.into(),
+                parameters: json!({"type":"object","properties":{}}),
+            },
+            constrained_sampling: None,
+        };
+        let read = make_tool("read", "old");
+        let mut write = make_tool("write", "initial only");
+        write.constrained_sampling = Some(pi_rs_core::ToolConstraint::JsonSchema {
+            strict: pi_rs_core::StrictToolPolicy::Require,
+        });
+        let redefined = make_tool("read", "new");
+        let added = make_tool("search", "new name");
+        let start = ToolTranscriptChange {
+            message_index: 0,
+            added: vec![read, write],
+            removed: vec![],
+        };
+        let mut initial = ModelRequest {
+            model: model.into(),
+            messages: vec![
+                Message::System {
+                    content: "base prompt".into(),
+                },
+                Message::User {
+                    content: "prompt".into(),
+                },
+            ],
+            tools: start.added.iter().map(|tool| tool.spec.clone()).collect(),
+            max_output_tokens: 32,
+        };
+        let context = pi_rs_core::ToolDispatchContext {
+            request_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            external_id: "fixture".into(),
+            summary: false,
+        };
+        let prepared = client
+            .clone()
+            .with_tool_transcript(&initial, std::slice::from_ref(&start))
+            .prepare_bound_tool_dispatch(&initial, &start.added, &context)
+            .unwrap();
+        drop(prepared.dispatch().await.unwrap());
+
+        initial.messages.extend([
+            Message::Assistant {
+                content: String::new(),
+                calls: vec![ToolCall {
+                    id: "call".into(),
+                    name: "write".into(),
+                    arguments: "{}".into(),
+                }],
+                replay: None,
+            },
+            Message::System {
+                content: "updated instructions".into(),
+            },
+            Message::Tool {
+                call_id: "call".into(),
+                content: json!({"data":{"content":[
+                    {"type":"text","text":"failed"},
+                    {"type":"image","mimeType":"image/png","data":"Zml4dHVyZQ=="}
+                ]}})
+                .to_string(),
+                is_error: true,
+                is_structured: Some(true),
+            },
+        ]);
+        initial.tools = vec![redefined.spec.clone(), added.spec.clone()];
+        let change = ToolTranscriptChange {
+            message_index: 3,
+            added: vec![redefined, added],
+            removed: vec!["read".into(), "write".into()],
+        };
+        let bound = client
+            .clone()
+            .with_tool_transcript(&initial, &[start.clone(), change.clone()]);
+        assert!(bound.estimate_request_tokens(&initial) > client.estimate_request_tokens(&initial));
+        let mut reservation = initial.clone();
+        reservation.tools[0].parameters["additionalProperties"] = json!(false);
+        assert!(bound.inline_tools(&reservation, None, true).is_none());
+        assert!(
+            bound.estimate_request_tokens(&reservation)
+                > client.estimate_request_tokens(&reservation)
+        );
+        drop(bound.stream(initial.clone()).await.unwrap());
+        drop(
+            bound
+                .clone()
+                .with_headers(HeaderMap::from_iter([(
+                    HeaderName::from_static("anthropic-beta"),
+                    HeaderValue::from_static("custom-feature"),
+                )]))
+                .with_managed_effort_models(BTreeMap::from([(model.into(), true)]))
+                .with_thinking(Some("high"))
+                .stream(initial.clone())
+                .await
+                .unwrap(),
+        );
+        // A bound history for a different request falls back to current tools.
+        initial.messages.push(Message::User {
+            content: "new request".into(),
+        });
+        drop(bound.stream(initial.clone()).await.unwrap());
+        assert!(
+            InlineTools::project(
+                std::slice::from_ref(&change),
+                &initial,
+                None,
+                |tool| Some(tool_definition(&tool.spec)),
+                true,
+                true,
+                false
+            )
+            .is_none()
+        );
+        let remove_all = ToolTranscriptChange {
+            message_index: initial.messages.len() - 1,
+            added: vec![],
+            removed: initial.tools.drain(..).map(|tool| tool.name).collect(),
+        };
+        drop(
+            client
+                .with_eager_tool_input_streaming(false, BTreeMap::new())
+                .with_tool_transcript(&initial, &[start, change, remove_all])
+                .stream(initial)
+                .await
+                .unwrap(),
+        );
+
+        let mut requests = server.join().unwrap().into_iter();
+        let (first_headers, first) = requests.next().unwrap();
+        let (headers, body) = requests.next().unwrap();
+        let (managed_headers, managed) = requests.next().unwrap();
+        assert!(managed_headers.iter().any(|header| {
+            header.trim_end()
+                == format!(
+                    "anthropic-beta: custom-feature,{EFFORT_BETA},{THINKING_BINDING_BETA},{INLINE_TOOLS_BETA}"
+                )
+        }));
+        assert_eq!(managed["output_config"]["effort"], "low");
+        assert_eq!(managed["messages"][3], body["messages"][3]);
+        assert_eq!(managed["messages"][4], effort_message("high"));
+        let (fallback_headers, fallback) = requests.next().unwrap();
+        let (removed_headers, removed) = requests.next().unwrap();
+        assert!(
+            !removed_headers
+                .iter()
+                .any(|line| line.contains(FINE_GRAINED_TOOL_STREAMING_BETA))
+        );
+        assert_eq!(
+            removed["messages"].as_array().unwrap().last().unwrap()["content"][1]["type"],
+            "tool_removal"
+        );
+        let has_beta = |headers: Vec<String>| {
+            headers.iter().any(|line| {
+                line.starts_with("anthropic-beta: ") && line.contains(INLINE_TOOLS_BETA)
+            })
+        };
+        assert!(has_beta(first_headers));
+        assert!(has_beta(headers));
+        assert!(!has_beta(fallback_headers));
+        assert!(has_beta(removed_headers));
+        assert_eq!(first["tools"], body["tools"]);
+        assert_eq!(body["tools"][1]["name"], "write");
+        assert_eq!(body["tools"][1]["strict"], true);
+        assert_eq!(
+            body["tools"][1]["input_schema"]["additionalProperties"],
+            false
+        );
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["tools"][2]["name"], DEFERRED_TOOL_PLACEHOLDER);
+        assert_eq!(body["tools"][2]["defer_loading"], true);
+        assert!(body["tools"][2].get("eager_input_streaming").is_none());
+        assert!(body["tools"][2].get("cache_control").is_none());
+        assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            body["messages"][2]["content"][1]["text"],
+            "Images from the error result of tool call call (write):"
+        );
+        assert_eq!(body["messages"][2]["content"][2]["type"], "image");
+        let update = body["messages"][3]["content"].as_array().unwrap();
+        assert_eq!(update.len(), 4);
+        assert_eq!(update[0]["text"], "updated instructions");
+        assert_eq!(
+            update[1],
+            json!({"type":"tool_removal","tool":{"type":"tool_reference","name":"write"}})
+        );
+        assert_eq!(update[2]["tool"]["definition"]["description"], "new");
+        assert_eq!(
+            update[3]["tool"]["definition"]["eager_input_streaming"],
+            true
+        );
+        assert_eq!(update[3]["cache_control"]["type"], "ephemeral");
+        assert!(
+            update[3]["tool"]["definition"]
+                .get("cache_control")
+                .is_none()
+        );
+        assert_eq!(fallback["tools"][0]["description"], "new");
+        assert_eq!(fallback["tools"][0]["input_schema"]["required"], json!([]));
+        assert_eq!(fallback["tools"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn malformed_structured_tool_images_preserve_the_original_tool_result() {
+        for data in ["", "bad?base64"] {
+            let content = json!({"data":{"content":[
+                {"type":"text","text":"tool output"},
+                {"type":"image","mimeType":"image/png","data":data}
+            ]}})
+            .to_string();
+            let (text, images) = tool_result_content(&content, Some(true));
+            assert_eq!(text, content);
+            assert!(images.is_empty());
+        }
+    }
+
+    #[test]
+    fn structured_tool_images_use_native_blocks_without_breaking_result_order() {
+        let envelope = |data: &str| {
+            json!({"data":{"content":[
+                {"type":"text","text":"result"},
+                {"type":"image","mimeType":"image/png","data":data}
+            ]},"extra":"preserve"})
+            .to_string()
+        };
+        let tool = |id: &str, is_error, is_structured, data: &str| Message::Tool {
+            call_id: id.into(),
+            content: envelope(data),
+            is_error,
+            is_structured,
+        };
+        let mut reply = ProviderReplay {
+            identity: ResolvedModelIdentity {
+                provider: "anthropic".into(),
+                model: "fixture".into(),
+            },
+            blocks: vec![text_block("finished".into()).unwrap()],
+        };
+        reply.record_anthropic_effort("low");
+        let request = ModelRequest {
+            model: "fixture".into(),
+            tools: Vec::new(),
+            max_output_tokens: 128,
+            messages: vec![
+                Message::User {
+                    content: "inspect".into(),
+                },
+                Message::Assistant {
+                    content: String::new(),
+                    calls: ["failed", "success", "plain"]
+                        .into_iter()
+                        .map(|id| ToolCall {
+                            id: id.into(),
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        })
+                        .collect(),
+                    replay: None,
+                },
+                tool("failed", true, Some(true), "ZmFpbGVk"),
+                Message::System {
+                    content: "update".into(),
+                },
+                tool("success", false, None, "c3VjY2Vzcw=="),
+                tool("plain", false, Some(false), "cGxhaW4="),
+                Message::Assistant {
+                    content: "finished".into(),
+                    calls: vec![],
+                    replay: Some(Box::new(reply)),
+                },
+            ],
+        };
+        let body =
+            encode_request(request.clone(), "anthropic", "", false, true, true, None).unwrap();
+        let result = &body["messages"][2]["content"];
+        assert_eq!(result[0]["tool_use_id"], "failed");
+        assert_eq!(result[0]["is_error"], true);
+        let error_text = result[0]["content"].as_str().unwrap();
+        assert!(error_text.contains("[image attached]"));
+        assert!(!error_text.contains("ZmFpbGVk"));
+        assert_eq!(result[1]["tool_use_id"], "success");
+        assert!(
+            result[1]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("preserve")
+        );
+        assert_eq!(result[1]["content"][1]["source"]["data"], "c3VjY2Vzcw==");
+        assert_eq!(result[2]["content"], envelope("cGxhaW4="));
+        assert_eq!(
+            result[3]["text"],
+            "Images from the error result of tool call failed (read):"
+        );
+        assert_eq!(result[4]["source"]["data"], "ZmFpbGVk");
+        assert_eq!(body["messages"][3]["role"], "system");
+        assert_eq!(body["messages"][3]["content"][0]["text"], "update");
+        assert_eq!(body["messages"][4], effort_message("low"));
+        assert_eq!(body["messages"][5]["role"], "assistant");
+
+        let mut trailing = request;
+        trailing.messages.pop();
+        trailing.messages.remove(3);
+        let mut trailing =
+            encode_request(trailing, "anthropic", "", false, true, true, None).unwrap();
+        assert_eq!(result, &trailing["messages"][2]["content"]);
+        apply_cache_control(&mut trailing, CacheRetention::Short, true);
+        assert_eq!(
+            trailing["messages"][2]["content"][4]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+    }
+
+    #[test]
+    fn tool_result_error_status_is_encoded_independently_of_text() {
+        let body = encode_request(
+            ModelRequest {
+                model: "fixture".into(),
+                messages: vec![
+                    Message::User {
+                        content: "go".into(),
+                    },
+                    Message::Tool {
+                        call_id: "failed".into(),
+                        content: "normal text".into(),
+                        is_error: true,
+                        is_structured: Some(false),
+                    },
+                    Message::Tool {
+                        call_id: "ok".into(),
+                        content: "Tool failed: but succeeded".into(),
+                        is_error: false,
+                        is_structured: Some(false),
+                    },
+                ],
+                tools: vec![],
+                max_output_tokens: 128,
+            },
+            "fixture",
+            "fixture",
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        let blocks = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["content"].as_array().unwrap())
+            .filter(|block| block["type"] == "tool_result")
+            .collect::<Vec<_>>();
+        assert_eq!(blocks[0]["is_error"], true);
+        assert_eq!(blocks[0]["content"], "normal text");
+        assert!(blocks[1].get("is_error").is_none());
+        assert_eq!(blocks[1]["content"], "Tool failed: but succeeded");
+    }
 
     #[test]
     fn input_transformations_keep_only_diagnostic_fields() {
@@ -1116,6 +6123,282 @@ mod tests {
         assert!(AnthropicInputTransformations::from_value(&json!([])).is_none());
     }
 
+    #[tokio::test]
+    async fn managed_effort_round_trip_records_and_replays_the_reply_setting() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for (sent, previous) in [
+                (Some("low"), None),
+                (Some("xhigh"), Some("low")),
+                (Some("off"), None),
+                (None, None),
+                (Some("high"), None),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (headers, body) = read_fixture_request(&mut socket);
+                assert!(headers.lines().any(|line| line
+                    == format!(
+                        "anthropic-beta: custom-feature,{EFFORT_BETA},{THINKING_BINDING_BETA}"
+                    )));
+                assert!(!headers.contains(INTERLEAVED_THINKING_BETA));
+                let messages = body["messages"].as_array().unwrap();
+                assert!(!body.to_string().contains("_pi_anthropic_effort"));
+                let active = sent.and_then(ProviderReplay::valid_anthropic_effort);
+                if let Some(active) = active {
+                    assert_eq!(body["output_config"], json!({"effort":"low"}));
+                    assert_eq!(
+                        body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+                        "drop_block"
+                    );
+                    assert_eq!(messages.last().unwrap(), &effort_message(active));
+                } else {
+                    if sent == Some("off") {
+                        assert_eq!(body["thinking"], json!({"type":"disabled"}));
+                    } else {
+                        assert!(body.get("thinking").is_none());
+                    }
+                    assert!(body.get("output_config").is_none());
+                }
+                if let Some(previous) = previous {
+                    assert_eq!(messages[1], effort_message(previous));
+                    assert_eq!(messages[2]["content"][0]["text"], "reply");
+                } else {
+                    assert_eq!(
+                        messages.iter().filter(|m| m["role"] == "system").count(),
+                        usize::from(active.is_some())
+                    );
+                }
+                let events = [
+                    json!({"type":"message_start","message":{"id":"msg","model":"m","usage":{}}}),
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"reply"}}),
+                    json!({"type":"content_block_stop","index":0}),
+                    json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}),
+                    json!({"type":"message_stop"}),
+                ];
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let client = Anthropic::new(&format!("http://{address}/v1/messages"), "fixture")
+            .unwrap()
+            .with_context_probe(false)
+            .with_headers(
+                [(
+                    HeaderName::from_static("anthropic-beta"),
+                    HeaderValue::from_str(&format!("custom-feature,{EFFORT_BETA}")).unwrap(),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .with_managed_effort_models(BTreeMap::from([
+                ("m".into(), true),
+                ("always".into(), false),
+            ]));
+        let mut request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::User {
+                content: "prompt".into(),
+            }],
+            tools: Vec::new(),
+            max_output_tokens: 64,
+        };
+        for (model, level) in [
+            ("m", Some("low")),
+            ("m", Some("xhigh")),
+            ("m", Some("off")),
+            ("m", None),
+            ("always", None),
+        ] {
+            request.model = model.into();
+            let mut stream = client
+                .clone()
+                .with_thinking(level)
+                .stream(request.clone())
+                .await
+                .unwrap();
+            let mut replay = None;
+            while let Some(event) = stream.next().await {
+                if let ModelEvent::Metadata(metadata) = event.unwrap() {
+                    replay = metadata.replay.or(replay);
+                }
+            }
+            assert_eq!(
+                replay.as_deref().and_then(ProviderReplay::anthropic_effort),
+                level
+                    .and_then(ProviderReplay::valid_anthropic_effort)
+                    .or_else(|| (model == "always").then_some("high")),
+            );
+            if level == Some("low") {
+                request.messages.push(Message::Assistant {
+                    content: "reply".into(),
+                    calls: Vec::new(),
+                    replay,
+                });
+                request.messages.push(Message::User {
+                    content: "next".into(),
+                });
+            }
+        }
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn tool_input_streaming_uses_eager_flags_or_the_legacy_beta() {
+        let base = Anthropic::new(DEFAULT_ENDPOINT, "fixture").unwrap();
+        let legacy = base
+            .clone()
+            .with_eager_tool_input_streaming(false, BTreeMap::new());
+        assert_ne!(base.context_identity(), legacy.context_identity());
+        let routed = base
+            .clone()
+            .with_eager_tool_input_streaming(true, BTreeMap::from([("rewritten".into(), false)]));
+        let mut body = json!({"tools":[{"name":"read"}]});
+        assert!(routed.configure_tool_input_streaming("rewritten", &mut body));
+        assert!(body["tools"][0].get("eager_input_streaming").is_none());
+
+        let explicit = legacy.clone().with_headers(
+            [(
+                HeaderName::from_static("anthropic-beta"),
+                HeaderValue::from_static("custom-beta"),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        for (client, tools, eager, beta) in [
+            (base, json!([{"name":"read"}]), Some(true), None),
+            (
+                legacy.clone(),
+                json!([{"name":"read"}]),
+                None,
+                Some(FINE_GRAINED_TOOL_STREAMING_BETA),
+            ),
+            (legacy, json!([]), None, None),
+            (
+                explicit,
+                json!([{"name":"read"}]),
+                None,
+                Some("custom-beta"),
+            ),
+        ] {
+            let mut body = json!({"tools":tools});
+            let legacy_streaming = client.configure_tool_input_streaming("fixture", &mut body);
+            let request = client
+                .authenticate(
+                    client.client.post(DEFAULT_ENDPOINT),
+                    RequestFeatures {
+                        legacy_tool_streaming: legacy_streaming,
+                        ..Default::default()
+                    },
+                )
+                .build()
+                .unwrap();
+            assert_eq!(body["tools"][0]["eager_input_streaming"].as_bool(), eager);
+            assert_eq!(
+                request
+                    .headers()
+                    .get("anthropic-beta")
+                    .and_then(|value| value.to_str().ok()),
+                beta
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_request_uses_interleaved_beta_for_budgeted_thinking_only() {
+        let base = Anthropic::new(DEFAULT_ENDPOINT, "fixture")
+            .unwrap()
+            .with_context_probe(false);
+        let budgeted = base.clone().with_configured_thinking("low", false, true);
+        let adaptive = base.clone().with_configured_thinking("low", true, true);
+        let disabled = budgeted.clone().with_thinking(Some("off"));
+        let explicit = budgeted.clone().with_headers(
+            [(
+                HeaderName::from_static("anthropic-beta"),
+                HeaderValue::from_static("custom-feature"),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        for (client, thinking, beta) in [
+            (base, Value::Null, None),
+            (disabled, json!({"type":"disabled"}), None),
+            (
+                budgeted.clone(),
+                json!({"type":"enabled","budget_tokens":2048,"display":"summarized"}),
+                Some(INTERLEAVED_THINKING_BETA),
+            ),
+            (
+                budgeted.clone().with_interleaved_thinking(false),
+                json!({"type":"enabled","budget_tokens":2048,"display":"summarized"}),
+                None,
+            ),
+            (
+                adaptive
+                    .clone()
+                    .with_thinking_display(ThinkingDisplay::Omitted),
+                json!({"type":"adaptive","display":"omitted"}),
+                None,
+            ),
+            (
+                explicit,
+                json!({"type":"enabled","budget_tokens":2048,"display":"summarized"}),
+                Some("custom-feature"),
+            ),
+        ] {
+            let mut body = json!({});
+            let interleaved = client
+                .configure_request_thinking(&mut body, client.configured_thinking.as_ref(), 4096)
+                .unwrap();
+            assert_eq!(body["thinking"], thinking);
+            let request = client
+                .authenticate(
+                    client.client.post(DEFAULT_ENDPOINT),
+                    RequestFeatures {
+                        interleaved,
+                        ..Default::default()
+                    },
+                )
+                .build()
+                .unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get("anthropic-beta")
+                    .and_then(|value| value.to_str().ok()),
+                beta,
+            );
+        }
+        assert_ne!(
+            budgeted.context_identity(),
+            budgeted
+                .clone()
+                .with_interleaved_thinking(false)
+                .context_identity(),
+        );
+        assert_eq!(
+            adaptive.context_identity(),
+            adaptive
+                .clone()
+                .with_interleaved_thinking(false)
+                .context_identity(),
+        );
+        assert_ne!(
+            adaptive.context_identity(),
+            adaptive
+                .clone()
+                .with_thinking_display(ThinkingDisplay::Omitted)
+                .context_identity(),
+        );
+    }
+
     #[test]
     fn thinking_controls_respect_advertised_effort_and_output_budget() {
         let adaptive = decode_model(&json!({
@@ -1128,9 +6411,12 @@ mod tests {
         .unwrap();
         assert_eq!(adaptive.thinking_levels, ["low", "high"]);
         let mut body = json!({});
-        assert!(configure_thinking(&mut body, Some(&adaptive), "off", 2048).is_err());
-        configure_thinking(&mut body, Some(&adaptive), "high", 2048).unwrap();
-        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert!(configure_thinking(&mut body, Some(&adaptive), "off", 2048, None).is_err());
+        configure_thinking(&mut body, Some(&adaptive), "high", 2048, None).unwrap();
+        assert_eq!(
+            body["thinking"],
+            json!({"type":"adaptive","display":"summarized"})
+        );
         assert_eq!(body["output_config"]["effort"], "high");
 
         let legacy = decode_model(&json!({
@@ -1138,12 +6424,30 @@ mod tests {
         }))
         .unwrap();
         let mut body = json!({});
-        assert!(configure_thinking(&mut body, Some(&legacy), "high", 1024).is_err());
-        configure_thinking(&mut body, Some(&legacy), "high", 2048).unwrap();
+        assert!(configure_thinking(&mut body, Some(&legacy), "high", 1024, None).is_err());
+        configure_thinking(&mut body, Some(&legacy), "high", 2048, None).unwrap();
         assert_eq!(
             body["thinking"],
-            json!({"type":"enabled","budget_tokens":1024})
+            json!({"type":"enabled","budget_tokens":1024,"display":"summarized"})
         );
+        let budgets = json!({"high": 3456, "low": "invalid"});
+        configure_thinking(&mut body, Some(&legacy), "xhigh", 10000, Some(&budgets)).unwrap();
+        assert_eq!(body["thinking"]["budget_tokens"], 3456);
+        assert!(
+            configure_thinking(&mut body, Some(&legacy), "low", 10000, Some(&budgets)).is_err()
+        );
+        configure_thinking(&mut body, Some(&legacy), "high", 2048, Some(&budgets)).unwrap();
+        assert_eq!(body["thinking"]["budget_tokens"], 1024);
+        for (level, expected) in [
+            ("minimal", 1024),
+            ("low", 2048),
+            ("medium", 8192),
+            ("high", 16384),
+            ("xhigh", 16384),
+        ] {
+            configure_thinking(&mut body, Some(&legacy), level, 20000, None).unwrap();
+            assert_eq!(body["thinking"]["budget_tokens"], expected);
+        }
     }
 
     #[test]

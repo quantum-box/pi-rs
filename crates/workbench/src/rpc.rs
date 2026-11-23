@@ -3,15 +3,23 @@ use std::io::{BufRead, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use pi_rs::{Error, Result, Session};
+#[cfg(test)]
+use pi_rs::JSON_DIAGNOSTIC_RETRY_LIMIT;
+use pi_rs::{Error, Result, Session, json_syntax_diagnostic};
 use serde_json::{Value, json};
 
 use super::{Cli, interactive, process::Worker, sessions};
 
-pub(super) fn run(mut args: Cli) -> Result<()> {
-    if args.command.is_some() || !args.prompt.is_empty() {
+pub(super) fn run(
+    mut args: Cli,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    if args.command.is_some() {
         return Err(Error::Config("RPC accepts prompts through stdin".into()));
     }
+    // Pi prepares positional messages at startup but does not submit them in
+    // RPC mode. Keep stdin exclusively for RPC commands.
+    args.prompt.clear();
     if let Some(parent) = args
         .session
         .parent()
@@ -29,17 +37,39 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     if session.working_directory().is_none() {
         session.set_working_directory(&args.workspace)?;
     }
-    super::backend::initialize_queue_modes(&mut session, &args)?;
+    let previous_warnings = args.settings.diagnostics().to_vec();
+    for warning in super::backend::initialize_queue_modes(&mut session, &mut args)? {
+        if !previous_warnings.contains(&warning) {
+            eprintln!("{warning}");
+        }
+    }
     if let Some(name) = &args.name {
         session.set_name(name)?;
     }
     drop(session);
-    interactive::restore_workspace(&mut args)?;
+    let reported_settings = args.settings.diagnostics().to_vec();
+    interactive::restore_workspace_cancellable(&mut args, &cancelled)?;
+    for warning in args.settings.diagnostics() {
+        if !reported_settings.contains(warning) {
+            eprintln!("{warning}");
+        }
+    }
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        for line in std::io::stdin().lock().lines() {
-            if sender.send(line).is_err() {
-                break;
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        loop {
+            match read_rpc_line(&mut input) {
+                Ok(Some(line)) => {
+                    if sender.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    break;
+                }
             }
         }
     });
@@ -49,9 +79,80 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     let mut pending_compact: Option<Value> = None;
     let mut pending_queries: Vec<Value> = Vec::new();
     let mut pending_inputs: Vec<Value> = Vec::new();
+    let mut pending_modes: Vec<PendingMode> = Vec::new();
+    let mut shutdown_waiting = false;
+    let mut mode_worker_pid = None;
     let mut model_queries: Vec<(Value, mpsc::Receiver<Result<Value>>)> = Vec::new();
+    let mut transition: Option<(Value, mpsc::Receiver<Result<Cli>>)> = None;
+    let mut deferred = std::collections::VecDeque::<Value>::new();
     let mut stream = super::rpc_events::Stream::default();
-    loop {
+    'run: loop {
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(active) = &mut worker {
+                active.interrupt_shutdown();
+            }
+            return Err(Error::Cancelled);
+        }
+        // Drain accepted input before committing a completed transition. This
+        // gives abort/shutdown priority over prompts queued while it was pending.
+        if transition.is_some() {
+            while let Ok(line) = receiver.try_recv() {
+                let request = match parse_request(&line?) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        response(&json!({"type":"parse"}), Err(error))?;
+                        continue;
+                    }
+                };
+                if matches!(request["type"].as_str(), Some("abort" | "shutdown")) {
+                    let (pending, _) = transition.take().expect("pending transition");
+                    cancel_transition(&pending, &mut deferred, &mut shutdown_waiting, response)?;
+                    if request["type"] == "shutdown" {
+                        drop(worker.take());
+                        response(&request, Ok(None))?;
+                        break 'run;
+                    }
+                    response(&request, Ok(None))?;
+                    continue 'run;
+                }
+                if deferred.len() >= 256 {
+                    response(
+                        &request,
+                        Err(Error::Config(
+                            "too many commands waiting for session transition".into(),
+                        )),
+                    )?;
+                } else {
+                    deferred.push_back(request);
+                }
+            }
+        }
+        if let Some((_, receiver)) = &transition {
+            let result = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(Error::Config(
+                    "session transition worker stopped".into(),
+                ))),
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = result {
+                let (request, _) = transition.take().expect("pending transition");
+                let result = result.and_then(|mut next| {
+                    let previous_thinking = args.thinking.clone();
+                    let reason = if request["type"] == "new_session" { pi_rs::SessionStartReason::New } else { pi_rs::SessionStartReason::Resume };
+                    if request["type"] == "new_session" {
+                        finish_new_session(&mut next, request["parentSession"].as_str().filter(|path| !path.is_empty()))?;
+                    }
+                    Worker::transition(&mut worker, &next, reason)?;
+                    args = next;
+                    if previous_thinking.as_deref().unwrap_or("off") != args.thinking.as_deref().unwrap_or("off") {
+                        emit(json!({"type":"thinking_level_changed","level":args.thinking.as_deref().unwrap_or("off")}))?;
+                    }
+                    Ok(Some(json!({"cancelled":false})))
+                });
+                response(&request, result)?;
+            }
+        }
         let mut index = 0;
         while index < model_queries.len() {
             match model_queries[index].1.try_recv() {
@@ -70,12 +171,27 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             }
         }
         if let Some(active) = &mut worker {
-            for event in active.drain_events() {
+            if mode_worker_pid != Some(active.child.id()) {
+                if let Ok(session) = Session::snapshot(&args.session) {
+                    reconcile_worker_queue_modes(
+                        &session,
+                        &mut active.steering_mode,
+                        &mut active.follow_up_mode,
+                    );
+                }
+                mode_worker_pid = Some(active.child.id());
+            }
+            for mut event in active.drain_events() {
+                if mode_event(&mut pending_modes, active, &mut event) {
+                    continue;
+                }
                 acknowledge(&mut pending_queries, &event);
                 acknowledge(&mut pending_inputs, &event);
                 match event["type"].as_str() {
                     Some("auto_retry_start") => active.retrying = true,
                     Some("auto_retry_end" | "agent_settled" | "request") => active.retrying = false,
+                    Some("compaction_start") => active.compacting = true,
+                    Some("compaction_end") => active.compacting = false,
                     Some("bash_execution_end") => active.bashing = false,
                     _ => {}
                 }
@@ -94,7 +210,10 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                 for reader in finished.readers.drain(..) {
                     let _ = reader.join();
                 }
-                for event in finished.drain_events() {
+                for mut event in finished.drain_events() {
+                    if mode_event(&mut pending_modes, &mut finished, &mut event) {
+                        continue;
+                    }
                     acknowledge(&mut pending_queries, &event);
                     acknowledge(&mut pending_inputs, &event);
                     forward_event(
@@ -105,6 +224,14 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         &mut pending_compact,
                         &mut stream,
                         &args,
+                    )?;
+                }
+                for pending in pending_modes.drain(..) {
+                    response(
+                        &pending.request,
+                        Err(Error::Config(
+                            "mode worker exited before acknowledging the request".into(),
+                        )),
                     )?;
                 }
                 for request in pending_queries.drain(..) {
@@ -123,26 +250,26 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                         )),
                     )?;
                 }
+                if let Some(request) = pending_compact.take() {
+                    finished.busy = false;
+                    let event = response_value(
+                        &request,
+                        Err(Error::Config(
+                            "compaction worker exited before returning a result".into(),
+                        )),
+                    );
+                    emit(manual_compaction_end(&event, false))?;
+                    emit(event)?;
+                }
                 if finished.busy {
-                    for event in stream.settle(false) {
+                    for event in stream.settle(false, status.success()) {
                         emit(event)?;
                     }
-                    emit(
-                        json!({"type":"agent_end","success":status.success(),"messages":stream.messages,"willRetry":false}),
-                    )?;
                     emit(json!({"type":"agent_settled","aborted":stream.aborted()}))?;
                     stream.reset();
                 }
                 if let Some(request) = pending_abort.take() {
                     response(&request, Ok(None))?;
-                }
-                if let Some(request) = pending_compact.take() {
-                    response(
-                        &request,
-                        Err(Error::Config(
-                            "compaction worker exited before returning a result".into(),
-                        )),
-                    )?;
                 }
                 if let Some(request) = pending_bash.take() {
                     response(
@@ -159,24 +286,103 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
-        let line = match receiver.recv_timeout(Duration::from_millis(20)) {
-            Ok(line) => line?,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) if model_queries.is_empty() => break,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // Do not drop accepted model-list requests when a batch client
-                // closes stdin before discovery finishes.
-                std::thread::sleep(Duration::from_millis(20));
-                continue;
+        let from_deferred = transition.is_none()
+            && !pending_modes.iter().any(|pending| !pending.applied)
+            && (pending_modes.is_empty()
+                || !deferred
+                    .front()
+                    .is_some_and(|request| mode_waits_for_settings(request, &worker)))
+            && !deferred.is_empty();
+        let request = if from_deferred {
+            deferred.pop_front().expect("deferred request")
+        } else {
+            let line = match receiver.recv_timeout(Duration::from_millis(20)) {
+                Ok(line) => line?,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected)
+                    if model_queries.is_empty()
+                        && transition.is_none()
+                        && deferred.is_empty()
+                        && pending_modes.is_empty() =>
+                {
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Do not drop accepted model-list requests when a batch client
+                    // closes stdin before discovery finishes.
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+            };
+            match parse_request(&line) {
+                Ok(request) => request,
+                Err(error) => {
+                    response(&json!({"type":"parse"}), Err(error))?;
+                    continue;
+                }
             }
         };
-        let request = match parse_request(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                response(&json!({"type":"parse"}), Err(error))?;
-                continue;
+        if shutdown_waiting
+            && !from_deferred
+            && !matches!(
+                request["type"].as_str(),
+                Some("abort" | "abort_bash" | "abort_retry" | "extension_ui_response")
+            )
+        {
+            response(
+                &request,
+                Err(Error::Config("worker is shutting down".into())),
+            )?;
+            continue;
+        }
+        if transition.is_none()
+            && (pending_modes.iter().any(|pending| !pending.applied)
+                || (mode_waits_for_settings(&request, &worker) && !pending_modes.is_empty())
+                || (!from_deferred && !deferred.is_empty()))
+            && !matches!(
+                request["type"].as_str(),
+                Some("abort" | "abort_bash" | "abort_retry" | "extension_ui_response")
+            )
+        {
+            if deferred.len() >= 256 {
+                response(
+                    &request,
+                    Err(Error::Config(
+                        "too many commands waiting for mode application".into(),
+                    )),
+                )?;
+            } else {
+                if request["type"] == "shutdown" {
+                    shutdown_waiting = true;
+                }
+                deferred.push_back(request);
             }
-        };
+            continue;
+        }
+        if transition.is_some() && matches!(request["type"].as_str(), Some("abort" | "shutdown")) {
+            let (pending, _) = transition.take().expect("pending transition");
+            cancel_transition(&pending, &mut deferred, &mut shutdown_waiting, response)?;
+            if request["type"] == "shutdown" {
+                drop(worker.take());
+                response(&request, Ok(None))?;
+                break;
+            }
+            response(&request, Ok(None))?;
+            continue;
+        }
+        if transition.is_some() {
+            if deferred.len() >= 256 {
+                response(
+                    &request,
+                    Err(Error::Config(
+                        "too many commands waiting for session transition".into(),
+                    )),
+                )?;
+            } else {
+                deferred.push_back(request);
+            }
+            continue;
+        }
         if request["type"] == "get_available_models" {
             if model_queries.len() >= 16 {
                 response(
@@ -184,14 +390,77 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     Err(Error::Config("too many pending model queries".into())),
                 )?;
             } else {
+                let generation = next_model_generation(&args);
                 let args = args.clone();
                 let (sender, receiver) = mpsc::channel();
                 std::thread::spawn(move || {
-                    let result =
-                        available_models(&args, true).map(|(_, models)| json!({"models":models}));
+                    let result = available_models_at(&args, true, generation)
+                        .map(|(_, models)| json!({"models":models}));
                     let _ = sender.send(result);
                 });
                 model_queries.push((request, receiver));
+            }
+            continue;
+        }
+        if request["type"] == "switch_session" || request["type"] == "new_session" {
+            let prepared = (|| {
+                if !pending_inputs.is_empty() || !pending_modes.is_empty() || busy(&worker) {
+                    return Err(Error::Config(
+                        "wait for the current operation before switching sessions".into(),
+                    ));
+                }
+                let is_new = request["type"] == "new_session";
+                let path = if is_new {
+                    None
+                } else {
+                    Some(
+                        args.workspace.join(
+                            request["sessionPath"]
+                                .as_str()
+                                .ok_or_else(|| Error::Config("sessionPath is required".into()))?,
+                        ),
+                    )
+                };
+                match request.get("parentSession") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(path)) => Some(path.clone()).filter(|path| !path.is_empty()),
+                    Some(_) if is_new => {
+                        return Err(Error::Config("parentSession must be a string".into()));
+                    }
+                    Some(_) => None,
+                };
+                if Worker::check_session_transition_cancellable(
+                    Some(&cancelled),
+                    Some(&mut worker),
+                    &args,
+                    pi_rs::BeforeSessionTransition::Switch {
+                        reason: if is_new {
+                            pi_rs::SessionSwitchReason::New
+                        } else {
+                            pi_rs::SessionSwitchReason::Resume
+                        },
+                        target_session_file: path.clone(),
+                    },
+                )? {
+                    return Ok(None);
+                }
+                let mut next = args.clone();
+                let (sender, receiver) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = if let Some(path) = path {
+                        switch_session(&mut next, &path)
+                    } else {
+                        prepare_new_session_draft(&mut next)
+                    }
+                    .map(|()| next);
+                    let _ = sender.send(result);
+                });
+                Ok(Some(receiver))
+            })();
+            match prepared {
+                Ok(Some(receiver)) => transition = Some((request, receiver)),
+                Ok(None) => response(&request, Ok(Some(json!({"cancelled":true}))))?,
+                Err(error) => response(&request, Err(error))?,
             }
             continue;
         }
@@ -221,7 +490,8 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             }
             continue;
         }
-        if !pending_inputs.is_empty() && requires_idle(request["type"].as_str().unwrap_or_default())
+        if (!pending_inputs.is_empty() || !pending_modes.is_empty())
+            && requires_idle(request["type"].as_str().unwrap_or_default())
         {
             response(
                 &request,
@@ -262,18 +532,17 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
                     } else {
                         pi_rs::InputKind::FollowUp
                     };
-                    json!({"type":"set_queue_mode","kind":kind,"mode":mode,"id":request.get("id")})
+                    let token = uuid::Uuid::new_v4().to_string();
+                    let control = json!({"type":"set_queue_mode","kind":kind,"mode":mode,"id":{"_rpc_mode_token":token}});
+                    Worker::control(&mut worker, &args, control)?;
+                    pending_modes.push(PendingMode {
+                        token,
+                        request: request.clone(),
+                        applied: false,
+                    });
+                    return Ok::<_, Error>(());
                 };
                 Worker::control(&mut worker, &args, control)?;
-                if command != "clear_queue" {
-                    let mode: pi_rs::QueueMode = serde_json::from_value(request["mode"].clone())?;
-                    let active = worker.as_mut().expect("control worker");
-                    if command == "set_steering_mode" {
-                        active.steering_mode = mode;
-                    } else {
-                        active.follow_up_mode = mode;
-                    }
-                }
                 Ok::<_, Error>(())
             })();
             if let Err(error) = result {
@@ -421,24 +690,25 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
         } else {
             None
         };
-        let result = command(&request, &mut args, &mut worker).and_then(|data| {
-            if data.as_ref().is_some_and(|data| data["cancelled"] == true) {
-                return Ok(data);
-            }
-            let reason = match request["type"].as_str() {
-                Some("new_session") => pi_rs::SessionStartReason::New,
-                Some("switch_session") => pi_rs::SessionStartReason::Resume,
-                Some("fork" | "clone") => pi_rs::SessionStartReason::Fork,
-                _ => return Ok(data),
-            };
-            Worker::transition(&mut worker, &args, reason)?;
-            Ok(data)
-        });
+        let result = command_cancellable(&request, &mut args, &mut worker, Some(&cancelled))
+            .and_then(|data| {
+                if data.as_ref().is_some_and(|data| data["cancelled"] == true) {
+                    return Ok(data);
+                }
+                let reason = match request["type"].as_str() {
+                    Some("new_session") => pi_rs::SessionStartReason::New,
+                    Some("switch_session") => pi_rs::SessionStartReason::Resume,
+                    Some("fork" | "clone") => pi_rs::SessionStartReason::Fork,
+                    _ => return Ok(data),
+                };
+                Worker::transition(&mut worker, &args, reason)?;
+                Ok(data)
+            });
         if result.is_ok()
             && let Some(previous) = previous_records
             && let Ok(session) = Session::snapshot(&args.session)
         {
-            for entry in super::rpc_entries::changes(&session, previous) {
+            for entry in super::rpc_entries::changes(&session, previous)? {
                 emit(json!({"type":"entry_appended","entry":entry}))?;
             }
         }
@@ -451,7 +721,9 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
             )?;
         }
         for event in std::mem::take(&mut args.selection_events) {
-            if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
+            if let Err(error) =
+                Worker::notify_selection_cancellable(Some(&cancelled), &mut worker, &args, &event)
+            {
                 eprintln!("Extension selection notification: {error}");
             }
         }
@@ -459,6 +731,94 @@ pub(super) fn run(mut args: Cli) -> Result<()> {
     }
     drop(worker);
     Ok(())
+}
+
+struct PendingMode {
+    token: String,
+    request: Value,
+    applied: bool,
+}
+
+fn cancel_transition(
+    pending: &Value,
+    deferred: &mut std::collections::VecDeque<Value>,
+    shutdown_waiting: &mut bool,
+    mut respond: impl FnMut(&Value, Result<Option<Value>>) -> Result<()>,
+) -> Result<()> {
+    respond(pending, Ok(Some(json!({"cancelled":true}))))?;
+    for queued in deferred.drain(..) {
+        respond(
+            &queued,
+            Err(Error::Config("session transition cancelled".into())),
+        )?;
+    }
+    *shutdown_waiting = false;
+    Ok(())
+}
+
+// A fresh or legacy session may have no mode record for one or both kinds.
+// In that case Worker::start already resolved the configured fallback.
+fn reconcile_worker_queue_modes(
+    session: &Session,
+    steering: &mut pi_rs::QueueMode,
+    follow_up: &mut pi_rs::QueueMode,
+) {
+    for record in session.branch() {
+        if let pi_rs::Event::QueueModeSelected { kind, mode } = &record.event {
+            match kind {
+                pi_rs::InputKind::Steer => *steering = *mode,
+                pi_rs::InputKind::FollowUp => *follow_up = *mode,
+            }
+        }
+    }
+}
+
+fn mode_waits_for_settings(request: &Value, worker: &Option<Worker>) -> bool {
+    let command = request["type"].as_str().unwrap_or_default();
+    (requires_idle(command) && !(command == "set_session_name" && busy(worker)))
+        || matches!(
+            command,
+            "shutdown" | "set_auto_retry" | "set_auto_compaction"
+        )
+}
+
+// Worker identifiers are private and unique even when RPC ids are missing or repeated.
+fn mode_event(pending: &mut Vec<PendingMode>, worker: &mut Worker, event: &mut Value) -> bool {
+    let Some(token) = event
+        .get("id")
+        .and_then(|id| id.get("_rpc_mode_token"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(index) = pending.iter().position(|item| item.token == token) else {
+        return event["type"] == "internal_queue_mode_applied";
+    };
+    if event["type"] == "internal_queue_mode_applied" {
+        if let Ok(mode) = serde_json::from_value::<pi_rs::QueueMode>(event["mode"].clone()) {
+            if event["kind"] == "steer" {
+                worker.steering_mode = mode;
+            } else {
+                worker.follow_up_mode = mode;
+            }
+            pending[index].applied = true;
+        }
+        return true;
+    }
+    if event["type"] == "response"
+        && matches!(
+            event["command"].as_str(),
+            Some("set_steering_mode" | "set_follow_up_mode")
+        )
+    {
+        let request = pending.remove(index).request;
+        if let Some(id) = request.get("id") {
+            event["id"] = id.clone();
+        } else if let Some(object) = event.as_object_mut() {
+            object.remove("id");
+        }
+    }
+    false
 }
 
 fn acknowledge(pending: &mut Vec<Value>, event: &Value) {
@@ -483,7 +843,7 @@ fn submit_prompt(request: &Value, args: &Cli, worker: &mut Option<Worker>) -> Re
         image.validate()?;
     }
     let message = request["message"].as_str().unwrap_or_default();
-    if message.trim().is_empty() && images.is_empty() {
+    if request["message"].as_str().is_none() && images.is_empty() {
         return Err(Error::Config("message or images are required".into()));
     }
     let queue_kind = match name {
@@ -527,13 +887,630 @@ fn submit_prompt(request: &Value, args: &Cli, worker: &mut Option<Worker>) -> Re
     }
 }
 
+// Pi's JSONL reader decodes malformed UTF-8 with replacement and splits only
+// on LF. A trailing CR is removed even on the final unterminated record.
+fn read_rpc_line(input: &mut impl BufRead) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    if input.read_until(b'\n', &mut bytes)? == 0 {
+        return Ok(None);
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+#[cfg(test)]
+mod jsonl_framing_tests {
+    use super::{parse_request, read_rpc_line};
+    use std::io::BufReader;
+
+    #[test]
+    fn unescaped_control_characters_use_v8_error_positions() {
+        for (input, expected) in [
+            (
+                "{\"x\":\"a\tb\"}",
+                "Bad control character in string literal in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "{\"x\":\"\u{1}\"}",
+                "Bad control character in string literal in JSON at position 6 (line 1 column 7)",
+            ),
+            (
+                "{\"x\":\"😀\rb\"}",
+                "Bad control character in string literal in JSON at position 8 (line 1 column 9)",
+            ),
+            (
+                "{\"x\":\"\\q\t\"}",
+                "Bad escaped character in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "\"\\ud800\t\"",
+                "Bad control character in string literal in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "\"\\udc00\t\"",
+                "Bad control character in string literal in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "\"x\n\\q\"",
+                "Bad control character in string literal in JSON at position 2 (line 1 column 3)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        let error = parse_request("\"\\ud800\\q\t\"").unwrap_err().to_string();
+        assert!(!error.contains("Bad control character"), "{error}");
+    }
+
+    #[test]
+    fn reads_lossy_utf8_with_lf_framing_and_final_cr() {
+        let bytes =
+            b"{\"id\":\"\xe3\x81\x82\xff\"}\r\n\n{\"id\":\"\xe2\x80\xa8\"}\n{\"id\":\"last\"}\r";
+        let mut input = BufReader::with_capacity(1, &bytes[..]);
+        assert_eq!(
+            read_rpc_line(&mut input).unwrap().unwrap(),
+            "{\"id\":\"あ�\"}"
+        );
+        assert_eq!(read_rpc_line(&mut input).unwrap().unwrap(), "");
+        assert_eq!(
+            read_rpc_line(&mut input).unwrap().unwrap(),
+            "{\"id\":\"\u{2028}\"}"
+        );
+        assert_eq!(
+            read_rpc_line(&mut input).unwrap().unwrap(),
+            "{\"id\":\"last\"}"
+        );
+        assert!(read_rpc_line(&mut input).unwrap().is_none());
+    }
+    #[test]
+    fn minus_at_eof_uses_v8_positions_without_masking_errors() {
+        for (input, expected) in [
+            ("{\"n\":-", "position 6 (line 1 column 7)"),
+            ("[ -", "position 3 (line 1 column 4)"),
+            ("{\"😀\":-", "position 7 (line 1 column 8)"),
+            ("[\r\n -", "position 5 (line 2 column 3)"),
+            ("-", "position 1 (line 1 column 2)"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains("No number after minus sign in JSON"),
+                "{input:?}: {error}"
+            );
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        for (input, expected) in [
+            ("[1e-", "Exponent part is missing a number in JSON"),
+            ("{\"n\":1.", "Unterminated fractional number in JSON"),
+            ("[1,] -", "Unexpected token ']'"),
+            ("{\"bad\":,\"n\":-", "Unexpected token ','"),
+            ("[01,-", "Unexpected number in JSON"),
+            ("[1e400,-", "number out of range"),
+            (r#"["\ud800",-"#, "unexpected end of hex escape"),
+            ("{\"n\":\"-", "Unterminated string in JSON"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        for (input, expected) in [
+            (r#"{"n":-2}"#, serde_json::json!({"n":-2})),
+            (r#"{"n":-2.5e-3}"#, serde_json::json!({"n":-0.0025})),
+            (r#"{"n":"-"}"#, serde_json::json!({"n":"-"})),
+        ] {
+            assert_eq!(parse_request(input).unwrap(), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn unfinished_fractions_at_eof_use_v8_positions_without_masking_errors() {
+        for (input, expected) in [
+            ("{\"n\":1.", "position 7 (line 1 column 8)"),
+            ("{\"😀\":-2.", "position 9 (line 1 column 10)"),
+            ("[0.", "position 3 (line 1 column 4)"),
+            ("[\r\n -12.", "position 8 (line 2 column 6)"),
+            ("1.", "position 2 (line 1 column 3)"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains("Unterminated fractional number in JSON"),
+                "{input:?}: {error}"
+            );
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        for (input, expected) in [
+            ("[1,] 1.", "Unexpected token ']'"),
+            ("{\"bad\":,\"n\":1.", "Unexpected token ','"),
+            ("[01.", "Unexpected number in JSON"),
+            ("[1e400,1.", "number out of range"),
+            (r#"["\ud800",1."#, "unexpected end of hex escape"),
+            ("{\"n\":\"1.", "Unterminated string in JSON"),
+            (
+                "{\"n\":1.0",
+                "Expected ',' or '}' after property value in JSON",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        for (input, expected) in [
+            (r#"{"n":1.0}"#, serde_json::json!({"n":1.0})),
+            (r#"{"n":-2.5e-3}"#, serde_json::json!({"n":-0.0025})),
+            (r#"{"n":"1."}"#, serde_json::json!({"n":"1."})),
+        ] {
+            assert_eq!(parse_request(input).unwrap(), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn unfinished_exponents_at_eof_use_v8_positions_without_masking_errors() {
+        for (input, expected) in [
+            ("{\"n\":1e", "position 7 (line 1 column 8)"),
+            ("{\"n\":1e+", "position 8 (line 1 column 9)"),
+            ("{\"n\":1e-", "position 8 (line 1 column 9)"),
+            ("{\"😀\":-2E-", "position 10 (line 1 column 11)"),
+            ("[\r\n 1e+", "position 7 (line 2 column 5)"),
+            ("[\r1E", "position 4 (line 2 column 3)"),
+            ("1e", "position 2 (line 1 column 3)"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains("Exponent part is missing a number in JSON"),
+                "{input:?}: {error}"
+            );
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        for input in [
+            "[1,] 1e",
+            r#"["\ud800",1e"#,
+            "[1e400,1e",
+            "{\"bad\":,\"n\":1e",
+            "{\"n\":\"1e",
+            "{\"n\":01e",
+            "{\"n\":1e2",
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                !error.contains("Exponent part is missing a number"),
+                "{input:?}: {error}"
+            );
+        }
+        for input in [r#"{"n":1e2}"#, r#"{"n":-2E-3}"#, r#"{"n":"1e+"}"#] {
+            assert!(parse_request(input).is_ok(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn truncated_json_objects_and_nested_commas_report_pi_diagnostics() {
+        for (input, expected) in [
+            (
+                r#"{"x""#,
+                "Expected ':' after property name in JSON at position 4 (line 1 column 5)",
+            ),
+            (
+                r#"{"x": "y""#,
+                "Expected ',' or '}' after property value in JSON at position 9 (line 1 column 10)",
+            ),
+            (
+                r#"{"x": 1,"#,
+                "Expected double-quoted property name in JSON at position 8 (line 1 column 9)",
+            ),
+            (r#"{"x":[1,"#, "Unexpected end of JSON input"),
+            (r#"[{"x":0},"#, "Unexpected end of JSON input"),
+            (
+                r#"{"x":[{"nested""#,
+                "Expected ':' after property name in JSON at position 15 (line 1 column 16)",
+            ),
+            (
+                r#"{"a": { "b": 2 }"#,
+                "Expected ',' or '}' after property value in JSON at position 16 (line 1 column 17)",
+            ),
+            (
+                "{\"😀\":1,\r\n ",
+                "Expected double-quoted property name in JSON at position 11 (line 2 column 2)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.ends_with(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+
+        let too_long = format!(r#"{{"{}""#, "x".repeat(super::JSON_DIAGNOSTIC_RETRY_LIMIT));
+        let error = parse_request(&too_long).unwrap_err().to_string();
+        assert!(error.contains("EOF while parsing an object"), "{error}");
+    }
+
+    #[test]
+    fn malformed_json_structure_reports_pi_diagnostics() {
+        for (input, expected) in [
+            (
+                "{x:1}",
+                "Expected property name or '}' in JSON at position 1 (line 1 column 2)",
+            ),
+            (
+                r#"{"é":0, bad:1}"#,
+                "Expected double-quoted property name in JSON at position 8 (line 1 column 9)",
+            ),
+            (
+                "{\r\n \"😀\":1,\r  }",
+                "Expected double-quoted property name in JSON at position 14 (line 3 column 3)",
+            ),
+            (
+                r#"{"😀":1,}"#,
+                "Expected double-quoted property name in JSON at position 8 (line 1 column 9)",
+            ),
+            (
+                r#"{"a" 1}"#,
+                "Expected ':' after property name in JSON at position 5 (line 1 column 6)",
+            ),
+            (
+                r#"{"a":1 "b":2}"#,
+                "Expected ',' or '}' after property value in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "[\r\n 1 2]",
+                "Expected ',' or ']' after array element in JSON at position 6 (line 2 column 4)",
+            ),
+            (
+                "true false",
+                "Unexpected non-whitespace character after JSON at position 5 (line 1 column 6)",
+            ),
+            (
+                r#""😀"🚧"#,
+                "Unexpected non-whitespace character after JSON at position 4 (line 1 column 5)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.ends_with(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_json_numbers_report_pi_diagnostics_at_the_first_invalid_character() {
+        for (input, expected) in [
+            (
+                "-x",
+                "No number after minus sign in JSON at position 1 (line 1 column 2)",
+            ),
+            (
+                "[-\n1]",
+                "No number after minus sign in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                r#"{"😀": -}"#,
+                "No number after minus sign in JSON at position 8 (line 1 column 9)",
+            ),
+            (
+                "1. ",
+                "Unterminated fractional number in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                r#"{"😀":1.💥}"#,
+                "Unterminated fractional number in JSON at position 8 (line 1 column 9)",
+            ),
+            (
+                "1e--1",
+                "Exponent part is missing a number in JSON at position 3 (line 1 column 4)",
+            ),
+            (
+                "[\r\n1e+]",
+                "Exponent part is missing a number in JSON at position 6 (line 2 column 4)",
+            ),
+            (
+                "-01",
+                "Unexpected number in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                r#"{"n":01}"#,
+                "Unexpected number in JSON at position 6 (line 1 column 7)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.ends_with(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_json_reports_pi_eof_diagnostics() {
+        for (input, expected) in [
+            ("[", "Unexpected end of JSON input"),
+            ("[1,", "Unexpected end of JSON input"),
+            (
+                "[1",
+                "Expected ',' or ']' after array element in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                "{",
+                "Expected property name or '}' in JSON at position 1 (line 1 column 2)",
+            ),
+            (
+                "\"😺",
+                "Unterminated string in JSON at position 3 (line 1 column 4)",
+            ),
+            (
+                "[\n1",
+                "Expected ',' or ']' after array element in JSON at position 3 (line 2 column 2)",
+            ),
+            (
+                "\"😺\\ntext",
+                "Unterminated string in JSON at position 9 (line 1 column 10)",
+            ),
+            (
+                "\"a\\\\",
+                "Unterminated string in JSON at position 4 (line 1 column 5)",
+            ),
+            (
+                "\"\\uDC00",
+                "Unterminated string in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "\"\\uDC00\\uDC00",
+                "Unterminated string in JSON at position 13 (line 1 column 14)",
+            ),
+            (
+                "{\"a\":\"\\uD800hello",
+                "Unterminated string in JSON at position 17 (line 1 column 18)",
+            ),
+            (
+                "[\r\n1",
+                "Expected ',' or ']' after array element in JSON at position 4 (line 2 column 2)",
+            ),
+            (
+                "[\r1",
+                "Expected ',' or ']' after array element in JSON at position 3 (line 2 column 2)",
+            ),
+            (
+                "[1\r",
+                "Expected ',' or ']' after array element in JSON at position 3 (line 2 column 1)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unfinished_escapes_report_v8_diagnostic() {
+        for (input, expected) in [
+            ("\"a\\", "Unexpected end of JSON input"),
+            (
+                "\"a\\u",
+                "Bad Unicode escape in JSON at position 4 (line 1 column 5)",
+            ),
+            (
+                "\"a\\u1",
+                "Bad Unicode escape in JSON at position 5 (line 1 column 6)",
+            ),
+            (
+                "\"a\\u12",
+                "Bad Unicode escape in JSON at position 6 (line 1 column 7)",
+            ),
+            (
+                "\"a\\u123",
+                "Bad Unicode escape in JSON at position 7 (line 1 column 8)",
+            ),
+            (
+                "{\"x\":\"😺\\u1",
+                "Bad Unicode escape in JSON at position 11 (line 1 column 12)",
+            ),
+            (
+                "[\r\n\"x\\u12",
+                "Bad Unicode escape in JSON at position 9 (line 2 column 7)",
+            ),
+            ("[\"a\\\\u12\\", "Unexpected end of JSON input"),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_escape_does_not_hide_earlier_syntax_errors() {
+        let input = "[false,] \"x\\u1";
+        let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+        assert_eq!(
+            super::json_syntax_diagnostic(input, &error),
+            format!("Unexpected token ']', \"{input}\" is not valid JSON")
+        );
+    }
+
+    #[test]
+    fn invalid_escapes_report_v8_diagnostics() {
+        for (input, expected) in [
+            (
+                "\"\\x\"",
+                "Bad escaped character in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                "\"\\q\"",
+                "Bad escaped character in JSON at position 2 (line 1 column 3)",
+            ),
+            (
+                "\"\\u12x4\"",
+                "Bad Unicode escape in JSON at position 5 (line 1 column 6)",
+            ),
+            (
+                "\"\\u1\"",
+                "Bad Unicode escape in JSON at position 4 (line 1 column 5)",
+            ),
+            (
+                "{\"x\":\"😺\\x\"}",
+                "Bad escaped character in JSON at position 9 (line 1 column 10)",
+            ),
+            (
+                "[\r\n\"\\u12z4\"]",
+                "Bad Unicode escape in JSON at position 8 (line 2 column 6)",
+            ),
+            (
+                "\"x\\q\\u1",
+                "Bad escaped character in JSON at position 3 (line 1 column 4)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("Failed to parse command: {expected}")),
+                "{input:?}: {error}"
+            );
+        }
+        let input = "[false,] \"x\\q\"";
+        let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+        assert_eq!(
+            super::json_syntax_diagnostic(input, &error),
+            format!("Unexpected token ']', \"{input}\" is not valid JSON")
+        );
+
+        let input = r#""\uDC00\x""#;
+        let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+        assert_eq!(
+            super::json_syntax_diagnostic(input, &error),
+            error.to_string()
+        );
+    }
+
+    #[test]
+    fn controls_after_surrogates_in_other_strings_match_v8() {
+        for (input, expected) in [
+            ("[\"\\ud800\",\"a\t\"]", "position 12 (line 1 column 13)"),
+            (
+                "{\"あ\":\"\\udc00\",\"x\":\"😺\r\"}",
+                "position 21 (line 1 column 22)",
+            ),
+            (
+                "[\"\\ud800\",\"\\ud83d\\ude00\",\"\t\"]",
+                "position 26 (line 1 column 27)",
+            ),
+            (
+                "[\"\\ud800\",\"\\\\ud800\t\"]",
+                "position 18 (line 1 column 19)",
+            ),
+            (
+                "[\"\\\\ud800\",\"\\udc00\",\"x\\\"y\t\"]",
+                "position 25 (line 1 column 26)",
+            ),
+            (
+                "{\r\n\"😀\":\"\\ud800\",\r\n\"other\":\"x\u{1}\"}",
+                "position 29 (line 3 column 11)",
+            ),
+            (
+                "[\"\\ud800\",\"\\udbff\\udfff\",\"\\udc00\",\"\t\"]",
+                "position 35 (line 1 column 36)",
+            ),
+        ] {
+            let error = parse_request(input).unwrap_err().to_string();
+            assert!(
+                error.contains("Bad control character"),
+                "{input:?}: {error}"
+            );
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+        // A successful sanitized parse is diagnostic-only; the actual RPC
+        // request still rejects a lone surrogate and does not change values.
+        let input = r#"{"type":"\ud800"}"#;
+        let original = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+        assert_eq!(
+            super::json_syntax_diagnostic(input, &original),
+            original.to_string()
+        );
+        assert!(parse_request(input).is_err());
+        let valid = parse_request(r#"{"type":"\ud83d\ude00"}"#).unwrap();
+        assert_eq!(valid["type"], "😀");
+    }
+
+    #[test]
+    fn surrogate_retry_respects_first_error_and_resource_boundaries() {
+        for input in [
+            "[\"\\ud800\" false,\"\t\"]",
+            "[\"\\ud800\",\"\\q\",\"\t\"]",
+            "[\"\\ud800\",\"\\u12xz\",\"\t\"]",
+            "[\"\\ud800\",1e400,\"\t\"]",
+            "[\"\\ud800\",]",
+        ] {
+            let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+            assert_eq!(
+                super::json_syntax_diagnostic(input, &error),
+                error.to_string(),
+                "{input:?}"
+            );
+        }
+        let deep = format!(
+            "[\"\\ud800\",{}0{},\"\t\"]",
+            "[".repeat(130),
+            "]".repeat(130)
+        );
+        let error = serde_json::from_str::<serde_json::Value>(&deep).unwrap_err();
+        assert_eq!(
+            super::json_syntax_diagnostic(&deep, &error),
+            error.to_string()
+        );
+        let prefix = "[\"\\ud800\",\"";
+        let suffix = "\t\"]";
+        for (size, mapped) in [
+            (super::JSON_DIAGNOSTIC_RETRY_LIMIT, true),
+            (super::JSON_DIAGNOSTIC_RETRY_LIMIT + 1, false),
+        ] {
+            let input = format!(
+                "{prefix}{}{suffix}",
+                "a".repeat(size - prefix.len() - suffix.len())
+            );
+            let error = serde_json::from_str::<serde_json::Value>(&input).unwrap_err();
+            let actual = super::json_syntax_diagnostic(&input, &error);
+            assert_eq!(
+                actual.contains("Bad control character"),
+                mapped,
+                "size={size}: {actual}"
+            );
+            if !mapped {
+                assert_eq!(actual, error.to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn surrogate_errors_do_not_hide_other_syntax_errors() {
+        for input in [
+            "\"\\uDC00\"",
+            "\"\\uDC00\" trailing \"unfinished",
+            "\"\\uDC00\\x",
+            "\"\\uDC00\\u12",
+            "[\"\\ud800\" false,\"\t\"]",
+        ] {
+            let error = serde_json::from_str::<serde_json::Value>(input).unwrap_err();
+            assert_eq!(
+                super::json_syntax_diagnostic(input, &error),
+                error.to_string(),
+                "{input:?}"
+            );
+        }
+    }
+}
+
 fn parse_request(line: &str) -> Result<Value> {
     match serde_json::from_str(line) {
-        Ok(Value::Object(request)) => Ok(Value::Object(request)),
-        Ok(_) => Err(Error::Config(
+        Ok(Value::Null) => Err(Error::Config(
             "Failed to parse command: expected a JSON object".into(),
         )),
-        Err(error) => Err(Error::Config(format!("Failed to parse command: {error}"))),
+        Ok(request) => Ok(request),
+        Err(error) => Err(Error::Config(format!(
+            "Failed to parse command: {}",
+            json_syntax_diagnostic(line, &error)
+        ))),
     }
 }
 
@@ -553,7 +1530,16 @@ fn requires_idle(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Result<Option<Value>> {
+    command_cancellable(request, args, worker, None)
+}
+fn command_cancellable(
+    request: &Value,
+    args: &mut Cli,
+    worker: &mut Option<Worker>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Option<Value>> {
     let name = request["type"].as_str().unwrap_or_default();
     if requires_idle(name) && busy(worker) {
         return Err(Error::Config(format!(
@@ -611,7 +1597,8 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 .as_str()
                 .ok_or_else(|| Error::Config("sessionPath is required".into()))?;
             let path = args.workspace.join(path);
-            if Worker::check_session_transition(
+            if Worker::check_session_transition_cancellable(
+                cancelled,
                 Some(worker),
                 args,
                 pi_rs::BeforeSessionTransition::Switch {
@@ -626,13 +1613,15 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
         }
         "fork" | "clone" => {
             let session = Session::open(&args.session)?;
+            let entries = super::rpc_entries::Entries::new(&session);
+            entries.ensure_valid()?;
             let (entry_id, position, target, text) = if name == "fork" {
                 let invalid = || Error::Config("Invalid entry ID for forking".into());
                 let entry = record_id(&request["entryId"]).map_err(|_| invalid())?;
-                if !super::rpc_entries::Entries::new(&session).is_user_message(entry) {
+                if !entries.is_user_message(entry) {
                     return Err(invalid());
                 }
-                let id = super::rpc_entries::editable_record(&session, entry);
+                let id = super::rpc_entries::editable_record(&session, entry)?;
                 let record = session
                     .records()
                     .iter()
@@ -652,7 +1641,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                     _ => return Err(invalid()),
                 }
             } else {
-                if !super::rpc_entries::Entries::new(&session).has_leaf() {
+                if !entries.has_leaf() {
                     return Err(Error::Config(
                         "Cannot clone session: no current entry selected".into(),
                     ));
@@ -664,7 +1653,8 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                     None,
                 )
             };
-            if Worker::check_session_transition(
+            if Worker::check_session_transition_cancellable(
+                cancelled,
                 Some(worker),
                 args,
                 pi_rs::BeforeSessionTransition::Fork { entry_id, position },
@@ -685,7 +1675,11 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 &args.workspace,
             )?;
             drop(session);
-            switch_session(args, &destination)?;
+            let retry_discovery = args.selection_discovery_pending;
+            args.selection_discovery_pending = false;
+            let switched = switch_session(args, &destination);
+            args.selection_discovery_pending = retry_discovery;
+            switched?;
             let mut data = json!({"cancelled":false});
             if let Some(text) = text {
                 data["text"] = json!(text);
@@ -702,7 +1696,8 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                 Some(Value::String(path)) => Some(path.as_str()).filter(|path| !path.is_empty()),
                 Some(_) => return Err(Error::Config("parentSession must be a string".into())),
             };
-            if Worker::check_session_transition(
+            if Worker::check_session_transition_cancellable(
+                cancelled,
                 Some(worker),
                 args,
                 pi_rs::BeforeSessionTransition::Switch {
@@ -712,40 +1707,36 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             )? {
                 return Ok(Some(json!({"cancelled":true})));
             }
-            let destination = if args.no_session {
-                args.session
-                    .with_file_name(format!("{}.jsonl", uuid::Uuid::new_v4()))
-            } else {
-                interactive::session_path(&args.workspace, args.session_dir.as_deref())
-            };
-            if let Some(directory) = destination.parent() {
-                std::fs::create_dir_all(directory)?;
-            }
-            let mut session = Session::open(&destination)?;
-            session.set_working_directory(&args.workspace)?;
-            super::backend::initialize_queue_modes(&mut session, args)?;
-            if let Some(parent) = parent {
-                session.set_parent_session(parent)?;
-            }
-            drop(session);
-            args.session = destination;
+            prepare_new_session(args, parent)?;
             Ok(Some(json!({"cancelled":false})))
         }
         "set_model" => {
-            let provider_id = request.get("provider").map_or(args.provider.id(), |value| {
-                value.as_str().unwrap_or("undefined")
-            });
-            let model = request["modelId"].as_str().unwrap_or("undefined");
+            let provider_value = request.get("provider");
+            let model_field = request.get("modelId");
+            let (Some(provider_id), Some(model)) = (
+                provider_value.map_or(Some(args.provider.id()), Value::as_str),
+                model_field.and_then(Value::as_str),
+            ) else {
+                let display = |value: Option<&Value>| match value {
+                    Some(value) => js_command_string(value),
+                    None => Ok("undefined".into()),
+                };
+                return Err(Error::Config(format!(
+                    "Model not found: {}/{}",
+                    match provider_value {
+                        Some(value) => display(Some(value))?,
+                        None => args.provider.id().to_owned(),
+                    },
+                    display(model_field)?
+                )));
+            };
             let not_found = || Error::Config(format!("Model not found: {provider_id}/{model}"));
             let provider = args
                 .model_profiles
                 .provider(provider_id)
                 .filter(|provider| provider.id() == provider_id)
                 .ok_or_else(not_found)?;
-            if request["modelId"]
-                .as_str()
-                .is_none_or(|model| model.is_empty())
-            {
+            if model.is_empty() {
                 return Err(not_found());
             }
             let value = if args
@@ -756,6 +1747,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             {
                 model_value(args, &provider, model)
             } else {
+                let generation = next_model_generation(args);
                 let current = args.clone();
                 let selected = provider.clone();
                 let candidate = model.to_owned();
@@ -771,8 +1763,29 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
                     let details = catalog
                         .details(std::slice::from_ref(&candidate), &current.model_profiles)
                         .await;
-                    Ok(Some(super::model_listing::with_details(
-                        model_value(&current, &catalog.provider, &candidate),
+                    let radius = catalog.client.discovered_radius_catalog().await;
+                    let metadata = radius
+                        .as_ref()
+                        .and_then(|radius| radius.metadata(&candidate));
+                    remember_model_metadata(
+                        &current,
+                        &catalog.provider,
+                        &candidate,
+                        details.get(&candidate),
+                        metadata,
+                        generation,
+                    );
+                    let mut model =
+                        model_value_without_cache(&current, &catalog.provider, &candidate);
+                    apply_radius_metadata(
+                        &current,
+                        &catalog.provider,
+                        &candidate,
+                        metadata,
+                        &mut model,
+                    );
+                    Ok(Some(model_with_input_details(
+                        model,
                         details.get(&candidate),
                     )))
                 })?
@@ -791,7 +1804,7 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
             let target = super::rpc_entries::editable_record(
                 session,
                 record_id(request.get("targetId").unwrap_or(&request["target"]))?,
-            );
+            )?;
             let replacement = request
                 .get("replacement")
                 .ok_or_else(|| Error::Config("replacement is required".into()))?;
@@ -845,12 +1858,39 @@ fn command(request: &Value, args: &mut Cli, worker: &mut Option<Worker>) -> Resu
 
         _ => {
             let command = match request.get("type") {
-                Some(Value::String(name)) => name.clone(),
-                Some(value) => value.to_string(),
+                Some(value) => js_command_string(value)?,
                 None => "undefined".into(),
             };
             Err(Error::Config(format!("Unknown command: {command}")))
         }
+    }
+}
+
+// The upstream diagnostic interpolates the unvalidated JSON value in a JS
+// template literal. Array joining treats null elements as empty strings.
+fn js_command_string(value: &Value) -> Result<String> {
+    match value {
+        Value::Null => Ok("null".into()),
+        Value::Bool(value) => Ok(value.to_string()),
+        Value::Number(value) => Ok(ryu_js::Buffer::new()
+            .format(value.as_f64().expect("JSON number"))
+            .to_owned()),
+        Value::String(value) => Ok(value.clone()),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                if value.is_null() {
+                    Ok(String::new())
+                } else {
+                    js_command_string(value)
+                }
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|values| values.join(",")),
+        Value::Object(value) if value.contains_key("toString") => Err(Error::Config(
+            "Cannot convert object to primitive value".into(),
+        )),
+        Value::Object(_) => Ok("[object Object]".into()),
     }
 }
 
@@ -903,9 +1943,16 @@ pub(super) fn snapshot_response(
     match request["type"].as_str().unwrap_or_default() {
         "get_state" => {
             let pending = pending_request();
-            state["steeringMode"] = json!(session.queue_mode(pi_rs::InputKind::Steer));
-            state["followUpMode"] = json!(session.queue_mode(pi_rs::InputKind::FollowUp));
-            state["sessionId"] = json!(session.session_id());
+            for record in session.branch() {
+                if let pi_rs::Event::QueueModeSelected { kind, mode } = &record.event {
+                    let key = match kind {
+                        pi_rs::InputKind::Steer => "steeringMode",
+                        pi_rs::InputKind::FollowUp => "followUpMode",
+                    };
+                    state[key] = json!(mode);
+                }
+            }
+            state["sessionId"] = json!(session.external_session_id());
             if let Some(name) = session.name() {
                 state["sessionName"] = json!(name);
             }
@@ -920,6 +1967,14 @@ pub(super) fn snapshot_response(
             Ok(state)
         }
         "get_entries" => {
+            if let Some(since) = request.get("since")
+                && !since.is_string()
+            {
+                return Err(Error::Config(format!(
+                    "Entry not found: {}",
+                    js_command_string(since)?
+                )));
+            }
             let mut result =
                 super::rpc_entries::Entries::new(session).after(request.get("since"))?;
             if request["includeNative"] == true {
@@ -929,14 +1984,20 @@ pub(super) fn snapshot_response(
             Ok(result)
         }
         "get_tree" => {
-            let mut result = super::rpc_entries::Entries::new(session).tree();
+            let entries = super::rpc_entries::Entries::new(session);
+            entries.ensure_valid()?;
+            let mut result = entries.tree();
             if request["includeNative"] == true {
                 result["nativeTree"] = json!(session_tree(session));
                 result["nativeLeafId"] = json!(session.head().to_string());
             }
             Ok(result)
         }
-        "get_fork_messages" => Ok(super::rpc_entries::Entries::new(session).fork_messages()),
+        "get_fork_messages" => {
+            let entries = super::rpc_entries::Entries::new(session);
+            entries.ensure_valid()?;
+            Ok(entries.fork_messages())
+        }
         "get_last_assistant_text" => Ok(super::rpc_messages::last_assistant_text(session)
             .map_or_else(|| json!({}), |text| json!({"text":text}))),
         "get_messages" => {
@@ -952,7 +2013,9 @@ pub(super) fn snapshot_response(
         }
         "get_session_stats" => {
             let mut native = session.statistics();
-            super::rpc_entries::Entries::new(session).apply_message_counts(&mut native);
+            let entries = super::rpc_entries::Entries::new(session);
+            entries.ensure_valid()?;
+            entries.apply_message_counts(&mut native);
             let operations = super::sessions::model_operation_usage(session.records());
             native.tokens.input = native.tokens.input.saturating_add(operations.input);
             native.tokens.output = native.tokens.output.saturating_add(operations.output);
@@ -967,6 +2030,7 @@ pub(super) fn snapshot_response(
             native.tokens.total = native.tokens.total.saturating_add(operations.total_tokens);
             native.cost = native.cost.map(|cost| cost + operations.cost.total);
             let mut stats = serde_json::to_value(native)?;
+            stats["sessionId"] = json!(session.external_session_id());
             if operations.measured() {
                 stats["operationUsage"] = serde_json::to_value(operations)?;
             }
@@ -983,6 +2047,50 @@ pub(super) fn snapshot_response(
 }
 
 pub(super) fn model_value(args: &Cli, provider: &super::Provider, model: &str) -> Value {
+    let mut value = model_value_without_cache(args, provider, model);
+    let Some(key) = model_cache_key(args, provider, model) else {
+        return value;
+    };
+    let entry = args
+        .rpc_model_images
+        .lock()
+        .unwrap()
+        .entries
+        .get(&key)
+        .cloned();
+    let Some(entry) = entry else {
+        return value;
+    };
+    apply_radius_metadata(args, provider, model, entry.radius.as_ref(), &mut value);
+    if value.get("input").is_some() {
+        return value;
+    }
+    model_with_input_details(
+        value,
+        entry
+            .images
+            .map(|images| pi_rs::ollama::ModelDetails {
+                images: Some(images),
+                ..Default::default()
+            })
+            .as_ref(),
+    )
+}
+
+fn apply_radius_metadata(
+    args: &Cli,
+    provider: &super::Provider,
+    model: &str,
+    metadata: Option<&super::radius_catalog::Metadata>,
+    value: &mut Value,
+) {
+    if let Some(metadata) = metadata {
+        let configured = args.model_profiles.model(provider, model);
+        metadata.apply(configured.as_ref(), value);
+    }
+}
+
+fn model_value_without_cache(args: &Cli, provider: &super::Provider, model: &str) -> Value {
     let configured = args.model_profiles.model(provider, model);
     let name = configured
         .as_ref()
@@ -992,6 +2100,9 @@ pub(super) fn model_value(args: &Cli, provider: &super::Provider, model: &str) -
     let mut value = json!({"id":model,"name":name,"provider":provider.id(),"api":adapter.api()});
     if let Some(configured) = configured {
         configured.apply_catalog_metadata(&mut value);
+        if let Some(input) = configured.input_modalities() {
+            value["input"] = json!(input);
+        }
         let mut details = pi_rs::ollama::ModelDetails::default();
         configured.apply(adapter, &mut details);
         super::model_listing::with_details(value, Some(&details))
@@ -1000,9 +2111,233 @@ pub(super) fn model_value(args: &Cli, provider: &super::Provider, model: &str) -
     }
 }
 
+#[derive(Default)]
+pub(super) struct ModelImageCache {
+    generation: u64,
+    eviction_floor: u64,
+    entries: std::collections::BTreeMap<ModelCacheKey, ModelImageEntry>,
+    completed: std::collections::BTreeMap<ModelCacheScope, u64>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ModelCacheKey {
+    scope: ModelCacheScope,
+    model: String,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ModelCacheScope {
+    provider: String,
+    endpoint: String,
+    discovery_endpoint: String,
+    adapter: String,
+    profiles_revision: String,
+    auth_revision: String,
+    credential_hash: Option<String>,
+    discovery_credential_hash: Option<String>,
+}
+
+#[derive(Clone)]
+struct ModelImageEntry {
+    generation: u64,
+    images: Option<bool>,
+    radius: Option<super::radius_catalog::Metadata>,
+}
+
+const MAX_MODEL_IMAGE_ENTRIES: usize = 1024;
+const MAX_MODEL_IMAGE_SCOPES: usize = 128;
+
+impl ModelImageCache {
+    fn evict(&mut self) {
+        while self.entries.len() > MAX_MODEL_IMAGE_ENTRIES {
+            let (key, generation) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.generation)
+                .map(|(key, entry)| (key.clone(), entry.generation))
+                .expect("nonempty cache");
+            self.entries.remove(&key);
+            self.eviction_floor = self.eviction_floor.max(generation);
+        }
+        while self.completed.len() > MAX_MODEL_IMAGE_SCOPES {
+            let (scope, generation) = self
+                .completed
+                .iter()
+                .min_by_key(|(_, generation)| *generation)
+                .map(|(scope, generation)| (scope.clone(), *generation))
+                .expect("nonempty cache");
+            self.completed.remove(&scope);
+            self.eviction_floor = self.eviction_floor.max(generation);
+        }
+    }
+}
+
+fn next_model_generation(args: &Cli) -> u64 {
+    let mut cache = args.rpc_model_images.lock().unwrap();
+    cache.generation = cache
+        .generation
+        .checked_add(1)
+        .expect("model discovery generation overflow");
+    cache.generation
+}
+
+fn model_cache_key(args: &Cli, provider: &super::Provider, model: &str) -> Option<ModelCacheKey> {
+    use sha2::{Digest, Sha256};
+    let endpoint = args.model_endpoint_for(provider, Some(model));
+    let discovery_endpoint = args.model_endpoint_for(provider, None);
+    let credential = args.model_credential_for(provider, endpoint);
+    let discovery_credential = args.model_credential_for(provider, discovery_endpoint);
+    // Resolving a command, OAuth credential, or dynamic header merely to make a
+    // cache key can run external code and may yield a different account than
+    // the request. Do not reuse capabilities when identity is unknowable.
+    if credential
+        .as_ref()
+        .is_some_and(super::model_auth::Credential::requires_resolution)
+        || discovery_credential
+            .as_ref()
+            .is_some_and(super::model_auth::Credential::requires_resolution)
+        || args
+            .model_profiles
+            .header_settings(provider, endpoint, Some(model))
+            .has_dynamic_values()
+        || args
+            .model_profiles
+            .header_settings(provider, discovery_endpoint, None)
+            .has_dynamic_values()
+    {
+        return None;
+    }
+    let digest = |credential: super::model_auth::Credential| {
+        credential
+            .literal()
+            .map(|value| format!("{:x}", Sha256::digest(value.as_bytes())))
+    };
+    let credential_hash = credential.and_then(digest);
+    let discovery_credential_hash = discovery_credential.and_then(digest);
+    Some(ModelCacheKey {
+        model: model.to_owned(),
+        scope: ModelCacheScope {
+            provider: provider.id().to_owned(),
+            endpoint: endpoint.to_owned(),
+            discovery_endpoint: discovery_endpoint.to_owned(),
+            adapter: args
+                .model_profiles
+                .model_adapter(provider, model)
+                .api()
+                .to_owned(),
+            profiles_revision: args.model_profiles.revision().to_owned(),
+            auth_revision: args.model_keys.revision().to_owned(),
+            credential_hash,
+            discovery_credential_hash,
+        },
+    })
+}
+
+#[cfg(test)]
+fn remember_model_images(
+    args: &Cli,
+    provider: &super::Provider,
+    model: &str,
+    details: Option<&pi_rs::ollama::ModelDetails>,
+    generation: u64,
+) {
+    remember_model_metadata(args, provider, model, details, None, generation);
+}
+
+fn remember_model_metadata(
+    args: &Cli,
+    provider: &super::Provider,
+    model: &str,
+    details: Option<&pi_rs::ollama::ModelDetails>,
+    radius: Option<&super::radius_catalog::Metadata>,
+    generation: u64,
+) {
+    let Some(key) = model_cache_key(args, provider, model) else {
+        return;
+    };
+    let mut cache = args.rpc_model_images.lock().unwrap();
+    if generation < cache.eviction_floor {
+        return;
+    }
+    if cache
+        .completed
+        .get(&key.scope)
+        .is_some_and(|completed| *completed > generation)
+    {
+        return;
+    }
+    if cache
+        .entries
+        .get(&key)
+        .is_none_or(|entry| entry.generation <= generation)
+    {
+        // Keep unknown as a tombstone so an older discovery cannot revive it.
+        // Radius OAuth is resolved outside model_credential_for. Only reuse
+        // account metadata when the discovery credential is identified here.
+        let radius = radius
+            .filter(|_| key.scope.discovery_credential_hash.is_some())
+            .cloned();
+        cache.entries.insert(
+            key,
+            ModelImageEntry {
+                generation,
+                images: details.and_then(|details| details.images),
+                radius,
+            },
+        );
+        cache.evict();
+    }
+}
+
+// A complete newer catalog also invalidates models it no longer lists. The
+// scope watermark prevents an older in-flight catalog from reintroducing them.
+fn complete_model_catalog(
+    args: &Cli,
+    provider: &super::Provider,
+    models: &[String],
+    generation: u64,
+) {
+    let Some(key) = model_cache_key(args, provider, "") else {
+        return;
+    };
+    let scope = key.scope;
+    let models: std::collections::HashSet<&str> = models.iter().map(String::as_str).collect();
+    let mut cache = args.rpc_model_images.lock().unwrap();
+    if generation < cache.eviction_floor {
+        return;
+    }
+    if cache
+        .completed
+        .get(&scope)
+        .is_some_and(|completed| *completed > generation)
+    {
+        return;
+    }
+    for (key, entry) in &mut cache.entries {
+        if key.scope == scope
+            && entry.generation <= generation
+            && !models.contains(key.model.as_str())
+        {
+            entry.generation = generation;
+            entry.images = None;
+            entry.radius = None;
+        }
+    }
+    cache.completed.insert(scope, generation);
+    cache.evict();
+}
+
 fn available_models(
     args: &Cli,
     include_details: bool,
+) -> Result<(Vec<super::model_selection::ScopedChoice>, Vec<Value>)> {
+    available_models_at(args, include_details, next_model_generation(args))
+}
+
+fn available_models_at(
+    args: &Cli,
+    include_details: bool,
+    generation: u64,
 ) -> Result<(Vec<super::model_selection::ScopedChoice>, Vec<Value>)> {
     use super::model_selection::ScopedChoice;
     if !include_details && !args.model_scope.is_empty() {
@@ -1027,12 +2362,28 @@ fn available_models(
             } else {
                 Default::default()
             };
+            let radius = if include_details {
+                catalog.client.discovered_radius_catalog().await
+            } else {
+                None
+            };
+            if include_details && catalog.complete {
+                complete_model_catalog(&args, &catalog.provider, &catalog.models, generation);
+            }
             for model in catalog.models {
                 if include_details {
-                    rows.push(super::model_listing::with_details(
-                        model_value(&args, &catalog.provider, &model),
+                    let metadata = radius.as_ref().and_then(|radius| radius.metadata(&model));
+                    remember_model_metadata(
+                        &args,
+                        &catalog.provider,
+                        &model,
                         details.get(&model),
-                    ));
+                        metadata,
+                        generation,
+                    );
+                    let mut row = model_value_without_cache(&args, &catalog.provider, &model);
+                    apply_radius_metadata(&args, &catalog.provider, &model, metadata, &mut row);
+                    rows.push(model_with_input_details(row, details.get(&model)));
                 }
                 choices.push(ScopedChoice {
                     provider: catalog.provider.clone(),
@@ -1043,6 +2394,23 @@ fn available_models(
         }
         Ok((choices, rows))
     })
+}
+
+// Dynamic native catalogs can report image support without a Pi-style input
+// list. Preserve configured lists verbatim, and derive one only when the
+// discovered capability is known; an unknown capability remains unknown.
+fn model_with_input_details(model: Value, details: Option<&pi_rs::ollama::ModelDetails>) -> Value {
+    let mut model = super::model_listing::with_details(model, details);
+    if model.get("input").is_none()
+        && let Some(images) = details.and_then(|details| details.images)
+    {
+        model["input"] = if images {
+            json!(["text", "image"])
+        } else {
+            json!(["text"])
+        };
+    }
+    model
 }
 
 fn discover_models<T: Send + 'static, F: std::future::Future<Output = Result<T>>>(
@@ -1059,9 +2427,20 @@ fn discover_models<T: Send + 'static, F: std::future::Future<Output = Result<T>>
 }
 
 fn session_name(request: &Value) -> Result<String> {
-    let name = request["name"]
-        .as_str()
-        .ok_or_else(|| Error::Config("name is required".into()))?;
+    let name = match request.get("name") {
+        None => {
+            return Err(Error::Config(
+                "Cannot read properties of undefined (reading 'trim')".into(),
+            ));
+        }
+        Some(Value::Null) => {
+            return Err(Error::Config(
+                "Cannot read properties of null (reading 'trim')".into(),
+            ));
+        }
+        Some(Value::String(name)) => name,
+        Some(_) => return Err(Error::Config("command.name.trim is not a function".into())),
+    };
     sessions::validate_name(name).map_err(Error::Config)
 }
 
@@ -1071,6 +2450,47 @@ fn record_id(value: &Value) -> Result<u64> {
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
         .filter(|id| *id > 0)
         .ok_or_else(|| Error::Config("entry ID must be a positive integer".into()))
+}
+
+fn prepare_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
+    let mut next = args.clone();
+    prepare_new_session_draft(&mut next)?;
+    finish_new_session(&mut next, parent)?;
+    *args = next;
+    Ok(())
+}
+
+fn prepare_new_session_draft(args: &mut Cli) -> Result<()> {
+    args.settings.fork_worker_history();
+    args.refresh_workspace_selection();
+    args.session = if args.no_session {
+        args.session
+            .with_file_name(format!("{}.jsonl", uuid::Uuid::new_v4()))
+    } else {
+        interactive::session_path(&args.workspace, args.session_dir.as_deref())
+    };
+    Ok(())
+}
+
+fn finish_new_session(args: &mut Cli, parent: Option<&str>) -> Result<()> {
+    if let Some(directory) = args.session.parent() {
+        std::fs::create_dir_all(directory)?;
+    }
+    let mut session = Session::open(&args.session)?;
+    session.set_working_directory(&args.workspace)?;
+    let previous_warnings = args.settings.diagnostics().to_vec();
+    for warning in super::backend::initialize_queue_modes(&mut session, args)? {
+        if !previous_warnings.contains(&warning) {
+            eprintln!("{warning}");
+        }
+    }
+    if let Some(parent) = parent {
+        session.set_parent_session(parent)?;
+    }
+    args.restore_session_model(&session)?;
+    super::thinking::adjust(args);
+    args.record_automatic_model_selection(&mut session)?;
+    Ok(())
 }
 
 fn switch_session(args: &mut Cli, path: &std::path::Path) -> Result<()> {
@@ -1085,8 +2505,12 @@ fn switch_session(args: &mut Cli, path: &std::path::Path) -> Result<()> {
     }
     drop(session);
     let mut next = args.clone();
+    next.settings.fork_worker_history();
     next.session = path.to_path_buf();
     interactive::restore_workspace(&mut next)?;
+    for warning in next.settings.diagnostics() {
+        eprintln!("{warning}");
+    }
     *args = next;
     Ok(())
 }
@@ -1119,6 +2543,34 @@ fn busy(worker: &Option<Worker>) -> bool {
         .is_some_and(|worker| worker.busy || worker.bashing)
 }
 
+// Native extensions identify themselves by ID, whereas Pi identifies a
+// JavaScript extension by path. Keep the native fields for existing clients.
+fn extension_error_for_rpc(mut event: Value) -> Value {
+    if event["type"] == "extension_error" {
+        if event.get("extensionPath").is_none()
+            && let Some(extension) = event.get("extension").cloned()
+        {
+            event["extensionPath"] = extension;
+        }
+        if let Some(message) = event.get("message").cloned() {
+            event["error"] = message;
+        }
+    }
+    event
+}
+
+fn manual_compaction_end(response: &Value, aborted: bool) -> Value {
+    let mut event = json!({
+        "type":"compaction_end","reason":"manual","aborted":aborted,"willRetry":false,
+    });
+    if response["success"] == true {
+        event["result"] = response["data"].clone();
+    } else if !aborted && let Some(error) = response["error"].as_str() {
+        event["errorMessage"] = json!(format!("Compaction failed: {error}"));
+    }
+    event
+}
+
 fn forward_event(
     event: Value,
     busy: &mut bool,
@@ -1128,7 +2580,13 @@ fn forward_event(
     stream: &mut super::rpc_events::Stream,
     args: &Cli,
 ) -> Result<()> {
+    let event = extension_error_for_rpc(event);
     match event["type"].as_str() {
+        Some("warning") => {
+            eprintln!("{}", event["message"].as_str().unwrap_or_default());
+            Ok(())
+        }
+        Some("response") if event["command"] == "get_commands" => emit_command_catalog(event),
         Some("response")
             if matches!(
                 event["command"].as_str(),
@@ -1153,16 +2611,7 @@ fn forward_event(
         Some("response") if event["command"] == "compact" => {
             pending_compact.take();
             *busy = false;
-            let mut completed = json!({
-                "type":"compaction_end","reason":"manual",
-                "aborted":stream.aborted(),"willRetry":false,
-            });
-            if event["success"] == true {
-                completed["result"] = event["data"].clone();
-            } else {
-                completed["errorMessage"] = event["error"].clone();
-            }
-            emit(completed)?;
+            emit(manual_compaction_end(&event, stream.aborted()))?;
             emit(event)?;
             if let Some(request) = pending_abort.take() {
                 response(&request, Ok(None))?;
@@ -1208,19 +2657,22 @@ fn forward_event(
             *busy = true;
             stream.reset();
             if pending_compact.is_some() {
-                emit(json!({"type":"compaction_start","reason":"manual"}))?;
+                return emit(json!({"type":"compaction_start","reason":"manual"}));
             }
             emit(json!({"type":"agent_start"}))
         }
+        Some("agent_settled") if pending_compact.is_some() => {
+            // The compact response ends this operation and releases any
+            // abort response waiting for it.
+            stream.mark_aborted(event["aborted"] == true);
+            Ok(())
+        }
         Some("agent_settled") => {
-            *busy = pending_compact.is_some();
+            *busy = false;
             if event["started"] != false {
-                for mapped in stream.settle(event["aborted"] == true) {
+                for mapped in stream.settle(event["aborted"] == true, event["success"] == true) {
                     emit(mapped)?;
                 }
-                emit(
-                    json!({"type":"agent_end","success":event["success"],"messages":stream.messages,"willRetry":false}),
-                )?;
             }
             emit(
                 json!({"type":"agent_settled","aborted":event["aborted"] == true || (event["started"] != false && stream.aborted())}),
@@ -1231,12 +2683,31 @@ fn forward_event(
             Ok(())
         }
         _ => {
+            let suppress_summary_record = stream.suppress_summary_record(&event);
             for mapped in stream.observe(&event, args) {
                 emit(mapped)?;
             }
+            if suppress_summary_record {
+                return Ok(());
+            }
             if matches!(
                 event["type"].as_str(),
-                Some("text_delta" | "tool_call_delta" | "summary_request_start")
+                Some(
+                    "text_delta"
+                        | "reasoning_delta"
+                        | "text_item_start"
+                        | "text_item_delta"
+                        | "text_item_end"
+                        | "reasoning_item_start"
+                        | "reasoning_item_delta"
+                        | "reasoning_item_end"
+                        | "tool_call_delta"
+                        | "summary_request_start"
+                        | "auto_retry_start"
+                        | "auto_retry_end"
+                        | "internal_tool_result_metadata"
+                        | "internal_tool_attempt"
+                )
             ) {
                 return Ok(());
             }
@@ -1246,6 +2717,10 @@ fn forward_event(
 }
 
 fn response(request: &Value, result: Result<Option<Value>>) -> Result<()> {
+    emit(response_value(request, result))
+}
+
+fn response_value(request: &Value, result: Result<Option<Value>>) -> Value {
     let mut value = json!({"type":"response","success":result.is_ok()});
     if let Some(command) = request.get("type") {
         value["command"] = command.clone();
@@ -1259,7 +2734,100 @@ fn response(request: &Value, result: Result<Option<Value>>) -> Result<()> {
         Err(error) => value["error"] = json!(error.to_string()),
         _ => {}
     }
-    emit(value)
+    value
+}
+
+// The worker sends split UTF-16 units separately because JSON Value and Rust
+// String cannot carry an unpaired surrogate. Only this RPC response uses that
+// trusted sidecar; normal text and literal U+FFFD never act as sentinels.
+fn command_catalog_json(mut event: Value) -> Result<Vec<u8>> {
+    let Some(data) = event.get_mut("data").and_then(Value::as_object_mut) else {
+        return Ok(serde_json::to_vec(&event)?);
+    };
+    let sidecar = data.remove("_pi_rs_prompt_surrogates");
+    let Some(entries) = sidecar.as_ref().and_then(Value::as_array) else {
+        return Ok(serde_json::to_vec(&event)?);
+    };
+    let mut units = std::collections::BTreeMap::new();
+    for entry in entries {
+        if let (Some(index), Some(unit)) = (entry[0].as_u64(), entry[1].as_u64())
+            && (0xd800..=0xdbff).contains(&unit)
+            && let Ok(index) = usize::try_from(index)
+        {
+            units.insert(index, unit as u16);
+        }
+    }
+    fn object<W: Write>(
+        out: &mut W,
+        map: &serde_json::Map<String, Value>,
+        mut special: impl FnMut(&mut W, &str, &Value) -> Result<bool>,
+    ) -> Result<()> {
+        write!(out, "{{")?;
+        for (index, (key, value)) in map.iter().enumerate() {
+            if index > 0 {
+                write!(out, ",")?;
+            }
+            serde_json::to_writer(&mut *out, key)?;
+            write!(out, ":")?;
+            if !special(out, key, value)? {
+                serde_json::to_writer(&mut *out, value)?;
+            }
+        }
+        write!(out, "}}")?;
+        Ok(())
+    }
+    let mut output = Vec::new();
+    if let Some(root) = event.as_object() {
+        object(&mut output, root, |out, key, value| {
+            let Some(data) = (key == "data").then(|| value.as_object()).flatten() else {
+                return Ok(false);
+            };
+            object(out, data, |out, key, value| {
+                let Some(commands) = (key == "commands").then(|| value.as_array()).flatten() else {
+                    return Ok(false);
+                };
+                write!(out, "[")?;
+                for (index, command) in commands.iter().enumerate() {
+                    if index > 0 {
+                        write!(out, ",")?;
+                    }
+                    let unit = units.get(&index).filter(|_| command["source"] == "prompt");
+                    if let (Some(unit), Some(map)) = (unit, command.as_object()) {
+                        object(out, map, |out, key, value| {
+                            let Some(prefix) = (key == "description")
+                                .then(|| value.as_str())
+                                .flatten()
+                                .and_then(|s| s.strip_suffix("�..."))
+                            else {
+                                return Ok(false);
+                            };
+                            let mut quoted = serde_json::to_string(prefix)?;
+                            quoted.pop();
+                            write!(out, "{quoted}\\u{unit:04x}...\"")?;
+                            Ok(true)
+                        })?;
+                    } else {
+                        serde_json::to_writer(&mut *out, command)?;
+                    }
+                }
+                write!(out, "]")?;
+                Ok(true)
+            })?;
+            Ok(true)
+        })?;
+    } else {
+        output = serde_json::to_vec(&event)?;
+    }
+    Ok(output)
+}
+
+fn emit_command_catalog(event: Value) -> Result<()> {
+    let encoded = command_catalog_json(event)?;
+    let mut output = std::io::stdout().lock();
+    output.write_all(&encoded)?;
+    writeln!(output)?;
+    output.flush()?;
+    Ok(())
 }
 
 fn emit(value: Value) -> Result<()> {
@@ -1273,6 +2841,951 @@ fn emit(value: Value) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn snapshot_state_uses_selected_modes_and_preserves_other_fallbacks() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let state = json!({"steeringMode":"all", "followUpMode":"one-at-a-time"});
+        let request = json!({"type":"get_state"});
+        let path = std::path::Path::new("session.jsonl");
+        let result = snapshot_response(&request, &session, path, None, state.clone()).unwrap();
+        assert_eq!(result["steeringMode"], "all");
+        assert_eq!(result["followUpMode"], "one-at-a-time");
+        session
+            .set_queue_mode(pi_rs::InputKind::Steer, pi_rs::QueueMode::OneAtATime)
+            .unwrap();
+        let result = snapshot_response(&request, &session, path, None, state).unwrap();
+        assert_eq!(result["steeringMode"], "one-at-a-time");
+        assert_eq!(result["followUpMode"], "one-at-a-time");
+    }
+
+    #[test]
+    fn cancelling_transition_responds_in_order_and_clears_deferred_shutdown() {
+        let pending = json!({"type":"new_session", "id":"new"});
+        let mut deferred = std::collections::VecDeque::from([
+            json!({"type":"get_state", "id":"state"}),
+            json!({"type":"shutdown", "id":"stop"}),
+            json!({"type":"prompt", "id":"prompt"}),
+        ]);
+        let mut shutdown_waiting = true;
+        let mut responses = Vec::new();
+        cancel_transition(
+            &pending,
+            &mut deferred,
+            &mut shutdown_waiting,
+            |request, result| {
+                responses.push(response_value(request, result));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            responses,
+            vec![
+                json!({"type":"response", "command":"new_session", "id":"new", "success":true, "data":{"cancelled":true}}),
+                json!({"type":"response", "command":"get_state", "id":"state", "success":false, "error":"session transition cancelled"}),
+                json!({"type":"response", "command":"shutdown", "id":"stop", "success":false, "error":"session transition cancelled"}),
+                json!({"type":"response", "command":"prompt", "id":"prompt", "success":false, "error":"session transition cancelled"}),
+            ]
+        );
+        assert!(deferred.is_empty());
+        assert!(!shutdown_waiting);
+    }
+
+    #[test]
+    fn worker_queue_mode_reconciliation_preserves_unselected_fallbacks() {
+        use pi_rs::{InputKind, QueueMode};
+
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let mut steering = QueueMode::OneAtATime;
+        let mut follow_up = QueueMode::OneAtATime;
+        reconcile_worker_queue_modes(&session, &mut steering, &mut follow_up);
+        assert_eq!(
+            (steering, follow_up),
+            (QueueMode::OneAtATime, QueueMode::OneAtATime)
+        );
+
+        session
+            .set_queue_mode(InputKind::Steer, QueueMode::All)
+            .unwrap();
+        reconcile_worker_queue_modes(&session, &mut steering, &mut follow_up);
+        assert_eq!(
+            (steering, follow_up),
+            (QueueMode::All, QueueMode::OneAtATime)
+        );
+
+        session
+            .set_queue_mode(InputKind::Steer, QueueMode::OneAtATime)
+            .unwrap();
+        session
+            .set_queue_mode(InputKind::FollowUp, QueueMode::All)
+            .unwrap();
+        reconcile_worker_queue_modes(&session, &mut steering, &mut follow_up);
+        assert_eq!(
+            (steering, follow_up),
+            (QueueMode::OneAtATime, QueueMode::All)
+        );
+    }
+
+    #[test]
+    fn session_name_type_errors_match_pi() {
+        for (request, expected) in [
+            (
+                json!({}),
+                "Cannot read properties of undefined (reading 'trim')",
+            ),
+            (
+                json!({"name":null}),
+                "Cannot read properties of null (reading 'trim')",
+            ),
+            (json!({"name":42}), "command.name.trim is not a function"),
+            (json!({"name":false}), "command.name.trim is not a function"),
+            (json!({"name":[]}), "command.name.trim is not a function"),
+            (json!({"name":{}}), "command.name.trim is not a function"),
+            (
+                json!({"name":"  \u{feff}  "}),
+                "Session name cannot be empty",
+            ),
+        ] {
+            assert!(
+                matches!(session_name(&request), Err(Error::Config(message)) if message == expected)
+            );
+        }
+        assert_eq!(
+            session_name(&json!({"name":"  example  "})).unwrap(),
+            "example"
+        );
+    }
+
+    #[test]
+    fn get_entries_since_uses_strict_type_and_js_diagnostics() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("hello".into(), Vec::new(), None)
+            .unwrap();
+        let path = std::path::Path::new("session.jsonl");
+        let snapshot =
+            |request: Value| snapshot_response(&request, &session, path, None, json!({}));
+        let entries = snapshot(json!({"type":"get_entries"})).unwrap();
+        let id = entries["entries"][0]["id"].as_str().unwrap();
+        let numeric: u64 = id.parse().expect("native entry id is numeric");
+        assert!(snapshot(json!({"type":"get_entries","since":id})).is_ok());
+        for (value, expected) in [
+            (json!(numeric), format!("Entry not found: {numeric}")),
+            (Value::Null, "Entry not found: null".into()),
+            (
+                json!([1, null, [true, 2], {}]),
+                "Entry not found: 1,,true,2,[object Object]".into(),
+            ),
+            (json!({"x":1}), "Entry not found: [object Object]".into()),
+            (
+                json!({"toString":0}),
+                "Cannot convert object to primitive value".into(),
+            ),
+        ] {
+            assert!(
+                matches!(snapshot(json!({"type":"get_entries","since":value})), Err(Error::Config(message)) if message == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn command_catalog_encodes_only_recorded_surrogates() {
+        let event = json!({"type":"response", "command":"get_commands", "id":"�\\ud83d", "data":{
+            "commands":[
+                {"source":"prompt", "description":"literal �..."},
+                {"source":"prompt", "description":"quote\"\\�prefix�..."},
+                {"source":"prompt", "description":"second �..."},
+                {"source":"extension", "description":"extension �..."}
+            ],
+            "_pi_rs_prompt_surrogates":[[1, 0xd83d], [2, 0xd840], [3, 0xd83d]]
+        }});
+        let output = String::from_utf8(command_catalog_json(event).unwrap()).unwrap();
+        assert!(output.contains(r#""description":"literal �...""#));
+        assert!(output.contains(r#""description":"quote\"\\�prefix\ud83d...""#));
+        assert!(output.contains(r#""description":"second \ud840...""#));
+        assert!(output.contains(r#""description":"extension �...""#));
+        assert!(output.contains(r#""id":"�\\ud83d""#));
+        assert!(!output.contains("_pi_rs_prompt_surrogates"));
+    }
+
+    #[test]
+    fn rpc_session_identity_survives_import_export_and_fork() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("import.jsonl");
+        for identity in ["legacy-id", "ID / 日本語", "bad\r\nid"] {
+            std::fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    json!({"type":"session", "version":3, "id":identity})
+                ),
+            )
+            .unwrap();
+            let imported = super::super::session_import::read(&path).unwrap();
+            let check = |session: &Session, expected: &str| {
+                for command in ["get_state", "get_session_stats"] {
+                    for native in [false, true] {
+                        let result = snapshot_response(
+                            &json!({"type":command,"includeNative":native}),
+                            session,
+                            &path,
+                            None,
+                            json!({}),
+                        )
+                        .unwrap();
+                        assert_eq!(result["sessionId"], expected, "{command}");
+                    }
+                }
+            };
+            check(&imported, identity);
+            assert_eq!(imported.statistics().session_id, imported.session_id());
+            let export = directory.path().join("export.jsonl");
+            imported.export_jsonl(&export).unwrap();
+            let reopened = super::super::session_import::read(&export).unwrap();
+            check(&reopened, identity);
+            let fork =
+                Session::from_records(reopened.fork_records(reopened.head()).unwrap()).unwrap();
+            assert_ne!(fork.session_id(), reopened.session_id());
+            check(&fork, &fork.session_id().to_string());
+            std::fs::remove_file(export).unwrap();
+        }
+        let native = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        for command in ["get_state", "get_session_stats"] {
+            let result =
+                snapshot_response(&json!({"type":command}), &native, &path, None, json!({}))
+                    .unwrap();
+            assert_eq!(result["sessionId"], native.session_id().to_string());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotating_command_credentials_never_reuse_dynamic_capabilities() {
+        let directory = tempfile::tempdir().unwrap();
+        let key_file = directory.path().join("token");
+        std::fs::write(&key_file, "first-key").unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{
+                "api":"openai-completions", "baseUrl":"https://example.invalid/v1",
+                "apiKey":format!("!cat {}", shell_words::quote(key_file.to_str().unwrap()))
+            }}}))
+            .unwrap();
+        let provider = args.model_profiles.provider("relay").unwrap();
+        let endpoint = args.model_endpoint_for(&provider, Some("dynamic"));
+        let credential = args.model_credential_for(&provider, endpoint).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(runtime.block_on(credential.resolve()).unwrap(), "first-key");
+        let known = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&known),
+            next_model_generation(&args),
+        );
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        std::fs::write(&key_file, "second-key").unwrap();
+        assert_eq!(
+            runtime.block_on(credential.resolve()).unwrap(),
+            "second-key"
+        );
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        assert!(args.rpc_model_images.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn current_radius_model_reuses_metadata_only_for_the_same_credential() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        let provider = super::super::Provider::Radius;
+        let key = |value: &str| {
+            super::super::model_auth::Keys::parse(&json!({"radius":{"type":"api_key","key":value}}))
+        };
+        args.model_keys = key("first-fixture-key");
+        let metadata = serde_json::from_value(json!({
+            "cost":{"input":3}, "inputLimits":{"images":{"resize":{"maxWidth":512}}}
+        }))
+        .unwrap();
+        remember_model_metadata(
+            &args,
+            &provider,
+            "balanced",
+            None,
+            Some(&metadata),
+            next_model_generation(&args),
+        );
+        let model = model_value(&args, &provider, "balanced");
+        assert_eq!(model["cost"]["input"], 3.0);
+        assert_eq!(model["inputLimits"]["images"]["resize"]["maxWidth"], 512);
+        args.model_keys = key("second-fixture-key");
+        assert!(
+            model_value(&args, &provider, "balanced")
+                .get("cost")
+                .is_none()
+        );
+        args.model_keys = key("first-fixture-key");
+        complete_model_catalog(&args, &provider, &[], next_model_generation(&args));
+        assert!(
+            model_value(&args, &provider, "balanced")
+                .get("cost")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dynamic_header_and_oauth_credentials_disable_capability_reuse() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{
+            "api":"openai-completions", "baseUrl":"https://example.invalid/v1", "headers":{"X-Account":"!echo account"}
+        }}})).unwrap();
+        let provider = args.model_profiles.provider("relay").unwrap();
+        assert!(model_cache_key(&args, &provider, "dynamic").is_none());
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{
+            "api":"openai-completions", "baseUrl":"https://example.invalid/v1", "headers":{"X-Account":"${ACCOUNT}"}
+        }}})).unwrap();
+        let provider = args.model_profiles.provider("relay").unwrap();
+        assert!(model_cache_key(&args, &provider, "dynamic").is_none());
+        args.model_keys = super::super::model_auth::Keys::parse(&json!({"xai":{
+            "type":"oauth", "access":"access", "refresh":"refresh", "expires":123
+        }}));
+        let xai = args.model_profiles.provider("xai").unwrap();
+        assert!(model_cache_key(&args, &xai, "dynamic").is_none());
+    }
+
+    #[test]
+    fn discovery_dynamic_header_cannot_be_hidden_by_model_override() {
+        for provider_value in ["!echo account", "${ACCOUNT}"] {
+            let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+            args.model_profiles =
+                super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{
+                    "api":"openai-completions", "baseUrl":"https://example.invalid/v1",
+                    "headers":{"X-Account":provider_value},
+                    "modelOverrides":{"dynamic":{"headers":{"X-Account":"fixed"}}}
+                }}}))
+                .unwrap();
+            let provider = args.model_profiles.provider("relay").unwrap();
+            let endpoint = args.model_endpoint_for(&provider, Some("dynamic"));
+            assert!(
+                !args
+                    .model_profiles
+                    .header_settings(&provider, endpoint, Some("dynamic"))
+                    .has_dynamic_values()
+            );
+            assert!(
+                args.model_profiles
+                    .header_settings(&provider, args.model_endpoint_for(&provider, None), None)
+                    .has_dynamic_values()
+            );
+            assert!(model_cache_key(&args, &provider, "dynamic").is_none());
+            let known = pi_rs::ollama::ModelDetails {
+                images: Some(true),
+                ..Default::default()
+            };
+            remember_model_images(
+                &args,
+                &provider,
+                "dynamic",
+                Some(&known),
+                next_model_generation(&args),
+            );
+            assert!(
+                model_value(&args, &provider, "dynamic")
+                    .get("input")
+                    .is_none()
+            );
+            assert!(args.rpc_model_images.lock().unwrap().entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn model_capability_cache_eviction_is_bounded_and_blocks_stale_completions() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        let known = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        let old = next_model_generation(&args);
+        remember_model_images(&args, &provider, "evicted", Some(&known), old);
+        for index in 0..=MAX_MODEL_IMAGE_ENTRIES {
+            let generation = next_model_generation(&args);
+            remember_model_images(
+                &args,
+                &provider,
+                &format!("model-{index}"),
+                None,
+                generation,
+            );
+        }
+        assert!(args.rpc_model_images.lock().unwrap().entries.len() <= MAX_MODEL_IMAGE_ENTRIES);
+        remember_model_images(&args, &provider, "evicted", Some(&known), old);
+        assert!(
+            model_value(&args, &provider, "evicted")
+                .get("input")
+                .is_none()
+        );
+        let first = args.clone();
+        for index in 0..=MAX_MODEL_IMAGE_SCOPES {
+            args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"ollama":{"baseUrl":format!("https://example.invalid/{index}")}}})).unwrap();
+            let generation = next_model_generation(&args);
+            complete_model_catalog(&args, &provider, &[], generation);
+        }
+        let cache = args.rpc_model_images.lock().unwrap();
+        assert!(cache.completed.len() <= MAX_MODEL_IMAGE_SCOPES);
+        assert!(cache.entries.len() <= MAX_MODEL_IMAGE_ENTRIES);
+        let floor = cache.eviction_floor;
+        drop(cache);
+        assert!(old < floor);
+        remember_model_images(&first, &provider, "late", Some(&known), old);
+        assert!(
+            model_value(&first, &provider, "late")
+                .get("input")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn discovery_results_use_own_capabilities_and_ignore_older_writes() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        let old = next_model_generation(&args);
+        let new = next_model_generation(&args);
+        let vision = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        let text = pi_rs::ollama::ModelDetails {
+            images: Some(false),
+            ..Default::default()
+        };
+        // Force the older request to publish, then let the newer request
+        // overwrite the shared cache before the older response is constructed.
+        let (published, first_published) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let older_args = args.clone();
+        let older_provider = provider.clone();
+        let older_vision = vision.clone();
+        let older = std::thread::spawn(move || {
+            remember_model_images(
+                &older_args,
+                &older_provider,
+                "dynamic",
+                Some(&older_vision),
+                old,
+            );
+            published.send(()).unwrap();
+            released.recv().unwrap();
+            let response = model_with_input_details(
+                model_value_without_cache(&older_args, &older_provider, "dynamic"),
+                Some(&older_vision),
+            );
+            remember_model_images(
+                &older_args,
+                &older_provider,
+                "dynamic",
+                Some(&older_vision),
+                old,
+            );
+            response
+        });
+        first_published.recv().unwrap();
+        remember_model_images(&args, &provider, "dynamic", Some(&text), new);
+        release.send(()).unwrap();
+        let old_response = older.join().unwrap();
+        assert_eq!(old_response["input"], json!(["text", "image"]));
+        assert_eq!(old_response["images"], true);
+        let current = model_value(&args, &provider, "dynamic");
+        assert_eq!(current["input"], json!(["text"]));
+        assert_eq!(current["images"], false);
+        let unknown = next_model_generation(&args);
+        remember_model_images(&args, &provider, "dynamic", None, unknown);
+        remember_model_images(&args, &provider, "dynamic", Some(&vision), old);
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        let old_catalog = next_model_generation(&args);
+        let new_catalog = next_model_generation(&args);
+        remember_model_images(
+            &args,
+            &provider,
+            "previously-listed",
+            Some(&vision),
+            old_catalog,
+        );
+        complete_model_catalog(&args, &provider, &[], new_catalog);
+        assert!(
+            model_value(&args, &provider, "previously-listed")
+                .get("input")
+                .is_none()
+        );
+        remember_model_images(&args, &provider, "removed", Some(&vision), old_catalog);
+        assert!(
+            model_value(&args, &provider, "removed")
+                .get("input")
+                .is_none()
+        );
+        // Adapter changes must isolate the cache even when the provider name,
+        // endpoint, profile and credentials are otherwise identical.
+        let first = super::super::Provider::Custom {
+            id: std::sync::Arc::from("relay"),
+            adapter: super::super::providers::Adapter::ChatCompletions,
+        };
+        let second = super::super::Provider::Custom {
+            id: std::sync::Arc::from("relay"),
+            adapter: super::super::providers::Adapter::OpenAiResponses,
+        };
+        args.provider = first.clone();
+        args.endpoint = "https://example.invalid/shared".into();
+        remember_model_images(
+            &args,
+            &first,
+            "dynamic",
+            Some(&vision),
+            next_model_generation(&args),
+        );
+        assert_eq!(
+            model_value(&args, &first, "dynamic")["input"],
+            json!(["text", "image"])
+        );
+        args.provider = second.clone();
+        assert!(
+            model_value(&args, &second, "dynamic")
+                .get("input")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dynamic_capabilities_are_isolated_by_connection_configuration() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        let profile = |api: &str, key: &str| {
+            super::super::model_profiles::Profiles::parse(&json!({"providers":{"relay":{"api":api,"baseUrl":"https://example.invalid/v1","apiKey":key}}})).unwrap()
+        };
+        args.model_profiles = profile("openai-completions", "first-secret");
+        let provider = args.model_profiles.provider("relay").unwrap();
+        let vision = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&vision),
+            next_model_generation(&args),
+        );
+        assert_eq!(
+            model_value(&args, &provider, "dynamic")["input"],
+            json!(["text", "image"])
+        );
+        args.model_profiles = profile("openai-completions", "second-secret");
+        let provider = args.model_profiles.provider("relay").unwrap();
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&vision),
+            next_model_generation(&args),
+        );
+        args.model_keys = super::super::model_auth::Keys::parse(
+            &json!({"relay":{"type":"api_key","key":"saved-secret"}}),
+        );
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+        args.model_profiles = profile("openai-responses", "second-secret");
+        let provider = args.model_profiles.provider("relay").unwrap();
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rpc_model_input_preserves_configured_modalities() {
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers": {"ollama": {"models": [
+                {"id":"vision", "input":["text", "image"]},
+                {"id":"text", "input":["text"]},
+                {"id":"image-only", "input":["image"]}
+            ]}}
+        }))
+        .unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        for (id, input) in [
+            ("vision", json!(["text", "image"])),
+            ("text", json!(["text"])),
+            ("image-only", json!(["image"])),
+        ] {
+            let value = model_value(&args, &provider, id);
+            assert_eq!(value["input"], input, "{id}");
+            assert_eq!(
+                value["images"],
+                input.as_array().unwrap().contains(&json!("image"))
+            );
+        }
+        assert!(
+            model_value(&args, &provider, "unknown")
+                .get("input")
+                .is_none()
+        );
+        let meta = args.model_profiles.provider("meta").unwrap();
+        assert_eq!(
+            model_value(&args, &meta, "muse-spark-1.3")["input"],
+            json!(["text", "image"])
+        );
+    }
+
+    #[test]
+    fn rpc_dynamic_model_input_reflects_known_capabilities_without_guessing() {
+        let model = json!({"id":"dynamic"});
+        for (images, expected) in [
+            (Some(true), Some(json!(["text", "image"]))),
+            (Some(false), Some(json!(["text"]))),
+            (None, None),
+        ] {
+            let details = pi_rs::ollama::ModelDetails {
+                images,
+                ..Default::default()
+            };
+            let result = model_with_input_details(model.clone(), Some(&details));
+            assert_eq!(result.get("input"), expected.as_ref());
+        }
+        let configured = json!({"input":["image"]});
+        let details = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            model_with_input_details(configured, Some(&details))["input"],
+            json!(["image"])
+        );
+    }
+
+    #[test]
+    fn rpc_rediscovery_clears_previously_known_dynamic_image_support() {
+        let args = Cli::try_parse_from(["pi", "--offline", "--no-session"]).unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        let known = pi_rs::ollama::ModelDetails {
+            images: Some(true),
+            ..Default::default()
+        };
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&known),
+            next_model_generation(&args),
+        );
+        assert_eq!(
+            model_value(&args, &provider, "dynamic")["input"],
+            json!(["text", "image"])
+        );
+
+        let unknown = pi_rs::ollama::ModelDetails::default();
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&unknown),
+            next_model_generation(&args),
+        );
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            Some(&known),
+            next_model_generation(&args),
+        );
+        remember_model_images(
+            &args,
+            &provider,
+            "dynamic",
+            None,
+            next_model_generation(&args),
+        );
+        assert!(
+            model_value(&args, &provider, "dynamic")
+                .get("input")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rpc_selection_and_state_expose_model_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.session = directory.path().join("session.jsonl");
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers": {"ollama": {"models": [
+                {"id":"vision", "input":["text", "image"]},
+                {"id":"text", "input":["text"]}
+            ]}}
+        }))
+        .unwrap();
+        args.provider = args.model_profiles.provider("ollama").unwrap();
+        args.model = "vision".into();
+        for (request, expected) in [
+            (
+                json!({"type":"set_model", "provider":"ollama"}),
+                "Model not found: ollama/undefined",
+            ),
+            (
+                json!({"type":"set_model", "provider":null, "modelId":"text"}),
+                "Model not found: null/text",
+            ),
+            (
+                json!({"type":"set_model", "provider":{}, "modelId":"text"}),
+                "Model not found: [object Object]/text",
+            ),
+            (
+                json!({"type":"set_model", "provider":"ollama", "modelId":[1,null,2]}),
+                "Model not found: ollama/1,,2",
+            ),
+        ] {
+            let error = command(&request, &mut args, &mut None).unwrap_err();
+            assert!(matches!(error, Error::Config(message) if message == expected));
+            assert_eq!(args.model, "vision");
+        }
+        let selected = command(
+            &json!({"type":"set_model", "provider":"ollama", "modelId":"text"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected["input"], json!(["text"]));
+        let state = command(&json!({"type":"get_state"}), &mut args, &mut None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state["model"]["id"], "text");
+        assert_eq!(state["model"]["input"], json!(["text"]));
+        let selected = command(
+            &json!({"type":"set_model", "modelId":"vision"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected["id"], "vision");
+    }
+
+    #[test]
+    fn rpc_configured_default_input_and_partial_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline", "--no-session"]).unwrap();
+        args.session = directory.path().join("session.jsonl");
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({
+            "providers": {"ollama": {
+                "models": [{"id":"default"}, {"id":"vision", "input":["text", "image"]}],
+                "modelOverrides": {"vision":{"name":"renamed"}}
+            }}
+        }))
+        .unwrap();
+        let provider = args.model_profiles.provider("ollama").unwrap();
+        assert_eq!(
+            model_value(&args, &provider, "default")["input"],
+            json!(["text"])
+        );
+        assert_eq!(
+            model_value(&args, &provider, "vision")["input"],
+            json!(["text", "image"])
+        );
+        let models = available_models(&args, true).unwrap().1;
+        assert!(
+            models
+                .iter()
+                .any(|m| m["id"] == "default" && m["input"] == json!(["text"]))
+        );
+        args.provider = provider;
+        let result = command(
+            &json!({"type":"set_model", "provider":"ollama", "modelId":"default"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["input"], json!(["text"]));
+        let state = command(&json!({"type":"get_state"}), &mut args, &mut None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state["model"]["input"], json!(["text"]));
+    }
+
+    #[test]
+    fn rpc_dynamic_discovery_selection_state_and_cycle_keep_capabilities() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let server = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let path = line.clone();
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut request_body = vec![0; length];
+                reader.read_exact(&mut request_body).unwrap();
+                let body = if path.starts_with("GET /v1/models ") {
+                    r#"{"data":[{"id":"dynamic"},{"id":"other"}]}"#
+                } else if path.starts_with("GET /api/ps ") {
+                    r#"{"models":[]}"#
+                } else if path.starts_with("POST /api/show ") {
+                    if String::from_utf8_lossy(&request_body).contains("dynamic") {
+                        r#"{"capabilities":["vision"]}"#
+                    } else {
+                        r#"{}"#
+                    }
+                } else {
+                    panic!("unexpected request: {path}")
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut args =
+            Cli::try_parse_from(["pi", "--offline", "--no-session", "--endpoint", &endpoint])
+                .unwrap();
+        args.workspace = directory.path().to_path_buf();
+        args.session = directory.path().join("session.jsonl");
+        args.model = "other".into();
+        let models = command(
+            &json!({"type":"get_available_models"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            models["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "dynamic" && m["input"] == json!(["text", "image"]))
+        );
+        assert!(
+            models["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "other" && m.get("input").is_none())
+        );
+        args.rpc_model_images.lock().unwrap().entries.clear();
+        let selected = command(
+            &json!({"type":"set_model", "provider":"ollama", "modelId":"dynamic"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected["input"], json!(["text", "image"]));
+        let state = command(&json!({"type":"get_state"}), &mut args, &mut None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state["model"]["input"], json!(["text", "image"]));
+        args.model = "other".into();
+        args.model_scope = ["other", "dynamic"]
+            .into_iter()
+            .map(|model| super::super::model_selection::ScopedChoice {
+                provider: args.provider.clone(),
+                model: model.into(),
+                thinking: None,
+            })
+            .collect();
+        let cycled = command(&json!({"type":"cycle_model"}), &mut args, &mut None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cycled["model"]["input"], json!(["text", "image"]));
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cache_warming_extension_errors_use_rpc_field_names() {
+        let event = json!({"type":"extension_error", "extension":"cache-hook",
+            "event":"cache_warming_decision", "message":"failed"});
+        let projected = extension_error_for_rpc(event);
+        assert_eq!(projected["extensionPath"], "cache-hook");
+        assert_eq!(projected["error"], "failed");
+        assert_eq!(projected["event"], "cache_warming_decision");
+        let with_source = json!({"type":"extension_error", "extension":"cache-hook",
+            "extensionPath":"/extensions/cache", "message":"failed"});
+        assert_eq!(
+            extension_error_for_rpc(with_source)["extensionPath"],
+            "/extensions/cache"
+        );
+        let other = json!({"type":"error", "message":"failed"});
+        assert_eq!(extension_error_for_rpc(other.clone()), other);
+    }
 
     #[test]
     fn rpc_html_export_uses_the_requested_format_and_protects_the_session() {
@@ -1323,18 +3836,23 @@ mod tests {
             "role":"assistant","stopReason":"aborted",
             "content":[{"type":"thinking","thinking":"partial reasoning"}]
         }});
+        let empty_reply = json!({"type":"message","id":"d","parentId":"c","message":{
+            "role":"assistant","stopReason":"stop","content":[]
+        }});
         let entries = [
             json!({"type":"session","version":3}),
             answer,
             aborted,
             thinking_only,
+            empty_reply,
         ];
         let mut args = Cli::try_parse_from(["pi"]).unwrap();
         for (length, expected) in [
             (1, json!({})),
             (2, json!({"text":"Hello world"})),
             (3, json!({"text":"Hello world"})),
-            (4, json!({})),
+            (4, json!({"text":"Hello world"})),
+            (5, json!({})),
         ] {
             let body = entries[..length]
                 .iter()
@@ -1357,9 +3875,33 @@ mod tests {
     }
 
     #[test]
+    fn manual_compaction_end_has_result_or_diagnostic_unless_aborted() {
+        let failed = json!({"success":false,"error":"Nothing to compact (session too small)"});
+        assert_eq!(
+            manual_compaction_end(&failed, false),
+            json!({"type":"compaction_end","reason":"manual","aborted":false,"willRetry":false,
+                "errorMessage":"Compaction failed: Nothing to compact (session too small)"})
+        );
+        assert_eq!(
+            manual_compaction_end(
+                &json!({"success":false,"error":"Compaction cancelled"}),
+                true
+            ),
+            json!({"type":"compaction_end","reason":"manual","aborted":true,"willRetry":false})
+        );
+        let result = json!({"summary":"summary","firstKeptEntryId":"12","tokensBefore":1000,
+            "estimatedTokensAfter":100});
+        assert_eq!(
+            manual_compaction_end(&json!({"success":true,"data":result}), false),
+            json!({"type":"compaction_end","reason":"manual","aborted":false,"willRetry":false,
+                "result":result})
+        );
+    }
+
+    #[test]
     fn compaction_stays_busy_until_its_completion_response() {
         let mut busy = true;
-        let mut abort = None;
+        let mut abort = Some(json!({"type":"abort","id":"during-compaction"}));
         let mut bash = None;
         let mut compact = Some(json!({"type":"compact","id":"focus"}));
         let mut stream = super::super::rpc_events::Stream::default();
@@ -1376,7 +3918,7 @@ mod tests {
         .unwrap();
         assert!(busy);
         assert!(compact.is_some());
-        abort = Some(json!({"type":"abort","id":"late-abort"}));
+        assert_eq!(abort.as_ref().unwrap()["id"], "during-compaction");
         let response = json!({
             "type": "response", "command": "compact", "id": "focus",
             "success": true, "data": {"summary": "done"},
@@ -1608,6 +4150,9 @@ mod tests {
         let mut session = Session::open(&path).unwrap();
         session.set_working_directory(&workspace).unwrap();
         session.select_model("other-model", None).unwrap();
+        session
+            .append_user_with_images("existing conversation".into(), Vec::new(), None)
+            .unwrap();
         drop(session);
         let mut args = Cli::try_parse_from(["pi", "--no-trust"]).unwrap();
         switch_session(&mut args, &path).unwrap();
@@ -1627,6 +4172,441 @@ mod tests {
         assert_eq!(args.workspace, workspace.canonicalize().unwrap());
         assert_eq!(args.session, previous);
         assert_eq!(args.model, "other-model");
+    }
+
+    #[test]
+    fn switching_to_empty_saved_session_uses_initial_model() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("empty.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session.set_working_directory(root.path()).unwrap();
+        session.select_model("old-model", Some("low")).unwrap();
+        drop(session);
+        let mut args = Cli::try_parse_from(["pi", "--no-trust"]).unwrap();
+        args.workspace = root.path().into();
+        args.model = "initial-model".into();
+        args.remember_initial_selection();
+        args.model = "current-model".into();
+        switch_session(&mut args, &path).unwrap();
+        assert_eq!(args.model, "initial-model");
+    }
+
+    #[test]
+    fn new_session_restores_original_explicit_cli_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = root.path().into();
+        args.session = root.path().join("current.jsonl");
+        args.session_dir = Some(root.path().into());
+        args.endpoint = "https://example.invalid/v1/chat/completions".into();
+        args.endpoint_explicit = true;
+        args.initial_connection = Some((super::super::Provider::Ollama, args.endpoint.clone()));
+        args.model = "alpha".into();
+        args.thinking = Some("low".into());
+        args.model_explicit = true;
+        args.thinking_explicit = true;
+        args.remember_initial_selection();
+        args.change_model(
+            super::super::Provider::Ollama,
+            "beta".into(),
+            Some("high".into()),
+            pi_rs::ModelSelectSource::Set,
+        )
+        .unwrap();
+        command(&json!({"type":"new_session"}), &mut args, &mut None).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("alpha", Some("low"))
+        );
+        assert_eq!(
+            Session::open(&args.session).unwrap().model_selection(),
+            Some(("alpha".into(), Some("low".into())))
+        );
+    }
+
+    #[test]
+    fn workspace_switch_discovers_dynamic_scope_models() {
+        use std::io::Read;
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(launch.join(".pi")).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            json!({"enabledModels":["ollama/dynamic:high"]}).to_string(),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let n = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).starts_with("GET /v1/models "));
+            let body = r#"{"data":[{"id":"dynamic"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let target_session = root.path().join("target.jsonl");
+        Session::open(&target_session)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch;
+        args.session = root.path().join("launch.jsonl");
+        args.session_dir = Some(root.path().into());
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(
+            &json!({"providers":{"ollama":{"baseUrl":endpoint, "models":[{"id":"alpha"}]}}}),
+        )
+        .unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        switch_session(&mut args, &target_session).unwrap();
+        server.join().unwrap();
+        assert_eq!(args.model, "dynamic");
+        assert_eq!(
+            args.model_scope
+                .iter()
+                .map(|c| c.model.as_str())
+                .collect::<Vec<_>>(),
+            ["dynamic"]
+        );
+        command(&json!({"type":"new_session"}), &mut args, &mut None).unwrap();
+        assert_eq!(args.model, "dynamic");
+    }
+
+    #[test]
+    fn workspace_discovery_retains_success_and_retries_a_timed_out_provider() {
+        use std::io::Read;
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            json!({"enabledModels":["ollama/fast", "slow/late"]}).to_string(),
+        )
+        .unwrap();
+        let fast = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let slow = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fast_url = format!("http://{}/v1", fast.local_addr().unwrap());
+        let slow_url = format!("http://{}/v1", slow.local_addr().unwrap());
+        let serve = |listener: std::net::TcpListener, id: &'static str, delayed: bool| {
+            std::thread::spawn(move || {
+                for i in 0..2 {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    let mut buf = [0; 2048];
+                    let _ = socket.read(&mut buf);
+                    if delayed && i == 0 {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    let body = json!({"data":[{"id":id}]}).to_string();
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                }
+            })
+        };
+        let fast_thread = serve(fast, "fast", false);
+        let slow_thread = serve(slow, "late", true);
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{
+            "ollama":{"baseUrl":fast_url, "models":[{"id":"alpha"}]},
+            "slow":{"baseUrl":slow_url, "api":"openai-completions", "apiKey":"test", "models":[]}
+        }}))
+        .unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        args.workspace = target.clone();
+        args.settings = super::super::config::Settings::load(&target, true).unwrap();
+        args.refresh_workspace_selection_with_timeout(Duration::from_millis(100));
+        assert_eq!(args.model, "fast");
+        assert_eq!(
+            args.model_scope
+                .iter()
+                .map(|choice| choice.model.as_str())
+                .collect::<Vec<_>>(),
+            ["fast"]
+        );
+        assert!(args.selection_discovery_pending);
+        std::thread::sleep(Duration::from_millis(200));
+        args.refresh_workspace_selection_with_timeout(Duration::from_secs(2));
+        assert!(
+            args.model_scope.iter().any(|choice| choice.model == "late"),
+            "catalog={:?} pending={}",
+            args.discovered_models,
+            args.selection_discovery_pending
+        );
+        assert!(!args.selection_discovery_pending);
+        fast_thread.join().unwrap();
+        slow_thread.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_endpoint_keeps_original_provider_on_workspace_switch_and_new_session() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(target.join(".pi/settings.json"), json!({"defaultProvider":"relay","defaultModel":"beta","enabledModels":["relay/beta","ollama/alpha"]}).to_string()).unwrap();
+        let path = root.path().join("target.jsonl");
+        Session::open(&path)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch;
+        args.session = root.path().join("current.jsonl");
+        args.session_dir = Some(root.path().to_path_buf());
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{
+            "ollama":{"baseUrl":"https://example.invalid/v1","models":[{"id":"alpha"}]},
+            "relay":{"baseUrl":"https://example.invalid/v1","api":"openai-completions","models":[{"id":"beta"}]}
+        }})).unwrap();
+        args.provider = super::super::Provider::Ollama;
+        args.model = "alpha".into();
+        args.endpoint = "https://explicit.example/v1/chat/completions".into();
+        args.endpoint_explicit = true;
+        args.connection_explicit = true;
+        args.initial_connection = Some((args.provider.clone(), args.endpoint.clone()));
+        args.remember_initial_selection();
+        switch_session(&mut args, &path).unwrap();
+        assert_eq!(
+            (
+                args.provider.id(),
+                args.model.as_str(),
+                args.endpoint.as_str()
+            ),
+            (
+                "ollama",
+                "alpha",
+                "https://explicit.example/v1/chat/completions"
+            )
+        );
+        command(&json!({"type":"new_session"}), &mut args, &mut None).unwrap();
+        assert_eq!(
+            (
+                args.provider.id(),
+                args.model.as_str(),
+                args.endpoint.as_str()
+            ),
+            (
+                "ollama",
+                "alpha",
+                "https://explicit.example/v1/chat/completions"
+            )
+        );
+    }
+
+    #[test]
+    fn workspace_provider_only_default_never_uses_previous_provider_model() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            json!({"defaultProvider":"target"}).to_string(),
+        )
+        .unwrap();
+        let target_session = root.path().join("target.jsonl");
+        Session::open(&target_session)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch;
+        args.session = root.path().join("launch.jsonl");
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{
+            "ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha"}]},
+            "target":{"baseUrl":"https://example.invalid/v1", "api":"openai-completions", "models":[{"id":"beta"}]}
+        }})).unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        let mut unavailable = args.clone();
+        unavailable.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{
+            "ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha"}]},
+            "target":{"baseUrl":"https://example.invalid/v1", "api":"openai-completions", "models":[]}
+        }})).unwrap();
+        switch_session(&mut unavailable, &target_session).unwrap();
+        assert_eq!(
+            (unavailable.provider.id(), unavailable.model.as_str()),
+            ("ollama", "alpha")
+        );
+        switch_session(&mut args, &target_session).unwrap();
+        assert_eq!(
+            (args.provider.id(), args.model.as_str()),
+            ("target", "beta")
+        );
+    }
+
+    #[test]
+    fn switching_workspace_rebuilds_defaults_and_scope_for_new_session() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        for (workspace, model, thinking) in [(&launch, "alpha", "low"), (&target, "beta", "high")] {
+            std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+            std::fs::write(workspace.join(".pi/settings.json"), json!({"defaultProvider":"ollama", "defaultModel":model, "defaultThinkingLevel":thinking, "enabledModels":[format!("ollama/{model}:{thinking}")]}).to_string()).unwrap();
+        }
+        let target_session = root.path().join("target.jsonl");
+        let mut session = Session::open(&target_session).unwrap();
+        session.set_working_directory(&target).unwrap();
+        drop(session);
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.workspace = launch.clone();
+        args.session = root.path().join("current.jsonl");
+        args.session_dir = Some(root.path().into());
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&json!({"providers":{"ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha","reasoning":true},{"id":"beta","reasoning":true}]}}})).unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.settings = super::super::config::Settings::load(&launch, true).unwrap();
+        args.model = "alpha".into();
+        args.refresh_workspace_selection();
+        args.thinking = Some("low".into());
+        args.remember_initial_selection();
+        let mut thinking_override = args.clone();
+        thinking_override.thinking_explicit = true;
+        thinking_override.remember_initial_selection();
+        switch_session(&mut thinking_override, &target_session).unwrap();
+        assert_eq!(
+            (
+                thinking_override.model.as_str(),
+                thinking_override.thinking.as_deref()
+            ),
+            ("beta", Some("low"))
+        );
+        thinking_override.thinking = Some("high".into());
+        command(
+            &json!({"type":"new_session"}),
+            &mut thinking_override,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                thinking_override.model.as_str(),
+                thinking_override.thinking.as_deref()
+            ),
+            ("beta", Some("low"))
+        );
+        switch_session(&mut args, &target_session).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("beta", Some("high"))
+        );
+        assert_eq!(
+            args.model_scope
+                .iter()
+                .map(|choice| choice.model.as_str())
+                .collect::<Vec<_>>(),
+            ["beta"]
+        );
+        args.change_model(
+            super::super::Provider::Ollama,
+            "alpha".into(),
+            Some("low".into()),
+            pi_rs::ModelSelectSource::Set,
+        )
+        .unwrap();
+        command(&json!({"type":"new_session"}), &mut args, &mut None).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("beta", Some("high"))
+        );
+        assert_eq!(
+            Session::open(&args.session).unwrap().model_selection(),
+            Some(("beta".into(), Some("high".into())))
+        );
+    }
+
+    #[test]
+    fn thinking_rpc_does_not_emit_model_change_after_virtual_response() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("pi.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"change","parentId":null,"provider":"router","modelId":"virtual"}),
+            json!({"type":"message","id":"assistant","parentId":"change","message":{"role":"assistant","provider":"ollama","model":"physical","content":[]}}),
+        ];
+        std::fs::write(
+            &source,
+            entries
+                .iter()
+                .map(|entry| format!("{entry}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let native = root.path().join("native.jsonl");
+        super::super::session_import::read(&source)
+            .unwrap()
+            .export_jsonl(&native)
+            .unwrap();
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        args.session = native.clone();
+        args.model = "physical".into();
+        args.thinking = Some("low".into());
+        command(
+            &json!({"type":"set_thinking_level","level":"high"}),
+            &mut args,
+            &mut None,
+        )
+        .unwrap();
+        let session = Session::open(&native).unwrap();
+        let bytes = super::super::rpc_entries::Entries::new(&session)
+            .write_share_branch(&session, root.path())
+            .unwrap();
+        let entries: Vec<Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["type"] == "model_change")
+                .count(),
+            1
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .rev()
+                .find(|entry| entry["type"] == "thinking_level_change")
+                .unwrap()["thinkingLevel"],
+            "high"
+        );
     }
 
     #[test]

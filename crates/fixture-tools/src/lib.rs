@@ -73,7 +73,15 @@ impl Extension for Fixtures {
         previous: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<ExtensionState>> {
         if matches!(name, "patch_fixture" | "submit_mock_order")
-            && matches!(outcome, Outcome::Succeeded(_))
+            && matches!(
+                outcome,
+                Outcome::Succeeded(_)
+                    | Outcome::SucceededWithDetails { .. }
+                    | Outcome::TextResult {
+                        is_error: false,
+                        ..
+                    }
+            )
         {
             let count = previous
                 .and_then(|state| state.data.as_u64())
@@ -142,6 +150,26 @@ impl Tool for FixtureTool {
         match String::from_utf8(bytes) {
             Ok(result) => Outcome::Succeeded(result),
             Err(_) => Outcome::Unknown("fixture response could not be decoded".into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    #[test]
+    fn fixture_counts_recovered_results_only() {
+        let fixture = Fixtures::new("http://127.0.0.1/fixture/").unwrap();
+        for (is_error, count) in [(false, Some(1)), (true, None)] {
+            let outcome = Outcome::TextResult {
+                output: "result".into(),
+                details: Some(json!({"info":true})),
+                is_error,
+            };
+            let next = fixture
+                .after_tool("patch_fixture", &outcome, Some(&counter(0)))
+                .unwrap();
+            assert_eq!(next.map(|state| state.data.as_u64().unwrap()), count);
         }
     }
 }

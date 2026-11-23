@@ -14,7 +14,7 @@ use super::Cli;
 
 #[derive(Default)]
 pub(super) struct Stream {
-    pub messages: Vec<Value>,
+    messages: Vec<Value>,
     assistant: Value,
     request_id: Option<Uuid>,
     started: bool,
@@ -24,14 +24,39 @@ pub(super) struct Stream {
     metadata: ModelMetadata,
     tool_results: Vec<Value>,
     calls: HashMap<Uuid, (Invocation, Option<String>)>,
+    started_tools: HashSet<Uuid>,
+    result_metadata: HashMap<Uuid, ToolResultMetadata>,
     pending_tools: HashMap<u64, PendingTool>,
+    reasoning_items: HashMap<u64, (usize, bool)>,
+    text_items: HashMap<u64, (usize, bool)>,
     aborted: bool,
     summary: bool,
+    retryable_failure: bool,
+    retry_attempt: RetryAttempt,
+    retry_end: Option<Value>,
+}
+
+#[derive(Default, PartialEq)]
+enum RetryAttempt {
+    #[default]
+    Initial,
+    Waiting,
+    Resumed,
+}
+
+#[derive(Default)]
+struct ToolResultMetadata {
+    structured_content: Option<Value>,
+    duration_ms: Option<u64>,
+}
+
+pub(super) fn tool_duration_ms(metadata: Option<&Value>) -> Option<u64> {
+    metadata.and_then(|metadata| metadata["durationMs"].as_u64())
 }
 
 struct PendingTool {
     content_index: usize,
-    arguments: super::streaming_json::StreamingJson,
+    arguments: super::StreamingJson,
 }
 
 impl Stream {
@@ -43,6 +68,16 @@ impl Stream {
         self.aborted
     }
 
+    pub fn mark_aborted(&mut self, aborted: bool) {
+        self.aborted |= aborted;
+    }
+
+    pub fn suppress_summary_record(&self, event: &Value) -> bool {
+        self.summary
+            && event["type"] == "record"
+            && event["record"]["event"]["type"] == "model_finished"
+    }
+
     pub fn partial(&self, request_id: &Value) -> Option<&Value> {
         let id = request_id.as_str()?.parse::<Uuid>().ok()?;
         (self.request_id == Some(id) && self.started && !self.ended).then_some(&self.assistant)
@@ -51,9 +86,29 @@ impl Stream {
     pub fn observe(&mut self, event: &Value, args: &Cli) -> Vec<Value> {
         let mut events = Vec::new();
         match event["type"].as_str() {
+            Some("internal_tool_result_metadata") => {
+                if let Some(id) = event["operationId"].as_str().and_then(|id| id.parse().ok()) {
+                    self.result_metadata.insert(
+                        id,
+                        ToolResultMetadata {
+                            structured_content: event.get("structuredContent").cloned(),
+                            duration_ms: event["durationMs"].as_u64(),
+                        },
+                    );
+                }
+            }
+            Some("internal_tool_attempt") => {
+                if let Some(id) = event["operationId"].as_str().and_then(|id| id.parse().ok()) {
+                    events.extend(self.start_tool(id));
+                }
+            }
             Some("summary_request_start") => {
                 self.finish_turn(&mut events);
                 self.summary = true;
+                self.retryable_failure = false;
+            }
+            Some("auto_retry_start" | "auto_retry_end") => {
+                self.retry(event.clone(), &mut events);
             }
             Some("record") => {
                 if let Ok(record) = Record::deserialize(&event["record"]) {
@@ -64,12 +119,58 @@ impl Stream {
                 if let Some(delta) = event["delta"].as_str()
                     && !self.assistant.is_null()
                 {
-                    let kind = if event["type"] == "text_delta" {
-                        "text"
+                    if event["type"] == "reasoning_delta" {
+                        if let Some(index) = event["reasoningIndex"].as_u64() {
+                            if !self.ended {
+                                self.reasoning_item_delta(index, delta, &mut events);
+                            }
+                        } else {
+                            self.delta("thinking", delta, &mut events);
+                        }
+                    } else if let Some(index) = event["textIndex"].as_u64() {
+                        if !self.ended {
+                            self.text_item_delta(index, delta, &mut events);
+                        }
                     } else {
-                        "thinking"
-                    };
-                    self.delta(kind, delta, &mut events);
+                        self.delta("text", delta, &mut events);
+                    }
+                }
+            }
+            Some("reasoning_item_start" | "reasoning_item_delta" | "reasoning_item_end")
+                if !self.assistant.is_null() && !self.ended =>
+            {
+                if let Some(index) = event["index"].as_u64() {
+                    if event["type"] == "reasoning_item_start" {
+                        self.reasoning_item_start(index, event["redacted"] == true, &mut events);
+                    } else if event["type"] == "reasoning_item_delta" {
+                        if let Some(delta) = event["delta"].as_str() {
+                            self.reasoning_item_delta(index, delta, &mut events);
+                        }
+                    } else if let Some(content) = event["content"].as_str() {
+                        self.reasoning_item_end(index, content, &mut events);
+                    }
+                }
+            }
+            Some("text_item_start" | "text_item_delta" | "text_item_end")
+                if !self.assistant.is_null() && !self.ended =>
+            {
+                if let Some(index) = event["index"].as_u64() {
+                    match event["type"].as_str() {
+                        Some("text_item_start") => {
+                            self.text_item_index(index, &mut events);
+                        }
+                        Some("text_item_delta") => {
+                            if let Some(delta) = event["delta"].as_str() {
+                                self.text_item_delta(index, delta, &mut events);
+                            }
+                        }
+                        Some("text_item_end") => {
+                            if let Some(content) = event["content"].as_str() {
+                                self.text_item_end(index, content, &mut events);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             Some("tool_call_delta") if !self.assistant.is_null() && !self.ended => {
@@ -88,13 +189,56 @@ impl Stream {
             Notification::SummaryRequest => {
                 self.finish_turn(&mut events);
                 self.summary = true;
+                self.retryable_failure = false;
             }
-            Notification::Committed(record) => self.record(record.event.clone(), args, &mut events),
+            Notification::Retry(event) => {
+                self.retry(
+                    serde_json::to_value(event).expect("retry event"),
+                    &mut events,
+                );
+            }
+            Notification::Committed(record) => {
+                if let Event::ToolFinished { operation_id, .. } = &record.event {
+                    let structured_content = pi_rs::tool_result_event_metadata(*operation_id);
+                    let duration_ms =
+                        tool_duration_ms(pi_rs::record_event_metadata(record.id).as_ref());
+                    if structured_content.is_some() || duration_ms.is_some() {
+                        self.result_metadata.insert(
+                            *operation_id,
+                            ToolResultMetadata {
+                                structured_content,
+                                duration_ms,
+                            },
+                        );
+                    }
+                }
+                self.record(record.event.clone(), args, &mut events)
+            }
             Notification::Text(delta) if !self.assistant.is_null() => {
                 self.delta("text", delta, &mut events);
             }
             Notification::Reasoning(delta) if !self.assistant.is_null() => {
-                self.delta("thinking", delta, &mut events);
+                if !self.ended {
+                    match pi_rs::reasoning_event_metadata() {
+                        Some(pi_rs::ReasoningEventMetadata::Start { index }) => {
+                            self.reasoning_item_index(index, &mut events);
+                        }
+                        Some(pi_rs::ReasoningEventMetadata::Delta { index }) => {
+                            self.reasoning_item_delta(index, delta, &mut events)
+                        }
+                        Some(pi_rs::ReasoningEventMetadata::End { index, content }) => {
+                            self.reasoning_item_end(index, &content, &mut events)
+                        }
+                        None => self.delta("thinking", delta, &mut events),
+                    }
+                }
+            }
+            Notification::ToolProgress(event) => {
+                if let Some(id) = pi_rs::tool_attempt_operation_id() {
+                    events.extend(self.start_tool(id));
+                } else {
+                    events.push(serde_json::to_value(event).expect("tool progress"));
+                }
             }
             Notification::ToolCallDelta(delta) if !self.assistant.is_null() && !self.ended => {
                 self.tool_delta((*delta).clone(), &mut events);
@@ -104,33 +248,69 @@ impl Stream {
         events
     }
 
-    pub fn settle(&mut self, aborted: bool) -> Vec<Value> {
+    fn start_tool(&mut self, operation_id: Uuid) -> Option<Value> {
+        let (invocation, parent) = self.calls.get(&operation_id)?;
+        if !self.started_tools.insert(operation_id) {
+            return None;
+        }
+        let mut event = json!({
+            "type":"tool_execution_start", "toolCallId":invocation.call.id,
+            "toolName":invocation.call.name, "args":tool_call_value(&invocation.call)["arguments"],
+        });
+        if let Some(parent) = parent {
+            event["parentToolCallId"] = json!(parent);
+        }
+        Some(event)
+    }
+
+    fn retry(&mut self, event: Value, events: &mut Vec<Value>) {
+        if event["type"] == "auto_retry_start" && std::mem::take(&mut self.retryable_failure) {
+            events.push(self.agent_end(false, true));
+            self.retry_attempt = RetryAttempt::Waiting;
+        } else if event["type"] == "auto_retry_end" && self.retry_attempt == RetryAttempt::Resumed {
+            // A resumed attempt reports recovery after message_end and reports
+            // exhaustion after its terminal agent_end.
+            self.retry_end = Some(event);
+            return;
+        }
+        events.push(event);
+    }
+
+    fn agent_end(&mut self, success: bool, will_retry: bool) -> Value {
+        let messages = std::mem::take(&mut self.messages);
+        json!({"type":"agent_end","success":success,"messages":messages,"willRetry":will_retry})
+    }
+
+    pub fn settle(&mut self, aborted: bool, success: bool) -> Vec<Value> {
         self.aborted |= aborted;
         let mut events = Vec::new();
         if !self.assistant.is_null() && !self.ended {
             self.assistant["stopReason"] = json!(if self.aborted { "aborted" } else { "error" });
+            self.assistant["errorMessage"] = json!(if self.aborted {
+                "Model request cancelled"
+            } else {
+                "Model request failed"
+            });
             self.finish_message(None, &mut events);
         }
         self.finish_turn(&mut events);
+        // A retry cancelled during the wait has already ended its last attempt.
+        if self.retry_attempt != RetryAttempt::Waiting {
+            events.push(self.agent_end(success, false));
+        }
+        events.extend(self.retry_end.take());
         events
     }
 
     fn record(&mut self, event: Event, args: &Cli, events: &mut Vec<Value>) {
         match event {
             Event::User { content, .. } => {
-                self.user(json!(content), events);
+                self.user(user_content(&content, &[]), events);
             }
             Event::UserWithImages {
                 content, images, ..
             } => {
-                let mut blocks = Vec::new();
-                if !content.is_empty() {
-                    blocks.push(json!({"type":"text","text":content}));
-                }
-                blocks.extend(images.into_iter().map(
-                    |image| json!({"type":"image","data":image.data,"mimeType":image.mime_type}),
-                ));
-                self.user(json!(blocks), events);
+                self.user(user_content(&content, &images), events);
             }
             Event::ModelRequested { .. } if self.summary => {}
             Event::ModelRequested {
@@ -140,6 +320,7 @@ impl Stream {
                 // Pi emits a turn for every assistant response and tool batch.
                 self.finish_turn(events);
                 self.begin_turn(events);
+                self.retryable_failure = false;
                 self.started = false;
                 self.ended = false;
                 self.request_id = request_id;
@@ -164,9 +345,15 @@ impl Stream {
                 if let Some(failure) = failure
                     && !self.assistant.is_null()
                 {
+                    self.retryable_failure = failure == ModelFailure::Retryable;
                     self.aborted |= failure == ModelFailure::Cancelled;
                     self.assistant["stopReason"] =
                         json!(if self.aborted { "aborted" } else { "error" });
+                    self.assistant["errorMessage"] = json!(match failure {
+                        ModelFailure::Cancelled => "Model request cancelled",
+                        ModelFailure::Retryable => "Model request failed temporarily",
+                        ModelFailure::Failed => "Model request failed",
+                    });
                     self.finish_message(None, events);
                     self.finish_turn(events);
                 } else if let UsageReport::Measured { usage } = usage
@@ -204,6 +391,8 @@ impl Stream {
                     "toolUse"
                 });
                 self.close_block(events);
+                self.finish_reasoning_items(events);
+                self.finish_text_items(events);
                 let blocks = self.assistant["content"]
                     .as_array_mut()
                     .expect("assistant blocks");
@@ -268,6 +457,14 @@ impl Stream {
                         });
                 }
                 self.finish_message(Some(content), events);
+                if self
+                    .retry_end
+                    .as_ref()
+                    .is_some_and(|event| event["success"] == true)
+                {
+                    events.extend(self.retry_end.take());
+                    self.retry_attempt = RetryAttempt::Initial;
+                }
             }
             Event::ToolPlanned {
                 invocation,
@@ -283,17 +480,8 @@ impl Stream {
                 self.calls
                     .insert(invocation.operation_id, (invocation, parent));
             }
-            Event::ToolStarted { operation_id } => {
-                if let Some((invocation, parent)) = self.calls.get(&operation_id) {
-                    let mut event = json!({
-                        "type":"tool_execution_start", "toolCallId":invocation.call.id,
-                        "toolName":invocation.call.name, "args":tool_call_value(&invocation.call)["arguments"],
-                    });
-                    if let Some(parent) = &parent {
-                        event["parentToolCallId"] = json!(parent);
-                    }
-                    events.push(event);
-                }
+            Event::ToolStarted { operation_id, .. } => {
+                events.extend(self.start_tool(operation_id));
             }
             Event::ToolFinished {
                 operation_id,
@@ -304,23 +492,49 @@ impl Stream {
                 operation_id,
                 outcome,
             } => {
+                self.started_tools.remove(&operation_id);
+                let metadata = self
+                    .result_metadata
+                    .remove(&operation_id)
+                    .unwrap_or_default();
                 if let Some((invocation, parent)) = self.calls.remove(&operation_id) {
                     let is_error = tool_failed(&outcome);
-                    let result = tool_result_value(&outcome.tool_content(), Some(&outcome));
+                    let mut result = tool_event_result_value(
+                        &outcome.tool_content(),
+                        Some(&outcome),
+                        Some(outcome.is_structured()),
+                    );
+                    if let Some(content) = &metadata.structured_content {
+                        result["structuredContent"] = content.clone();
+                    }
                     let mut event = json!({
                         "type":"tool_execution_end","toolCallId":invocation.call.id,
                         "toolName":invocation.call.name,"result":result,"isError":is_error,
                     });
+                    if let Some(duration_ms) = metadata.duration_ms {
+                        event["durationMs"] = json!(duration_ms);
+                    }
                     if let Some(parent) = &parent {
                         event["parentToolCallId"] = json!(parent);
                     }
                     events.push(event);
                     if parent.is_none() {
                         let mut message = result;
+                        if metadata.structured_content.is_some()
+                            || matches!(outcome, Outcome::TextResultWithStructuredContent { .. })
+                        {
+                            message
+                                .as_object_mut()
+                                .expect("result object")
+                                .remove("structuredContent");
+                        }
                         message["role"] = json!("toolResult");
                         message["toolCallId"] = json!(invocation.call.id);
                         message["toolName"] = json!(invocation.call.name);
                         message["isError"] = json!(is_error);
+                        if let Some(duration_ms) = metadata.duration_ms {
+                            message["durationMs"] = json!(duration_ms);
+                        }
                         message["timestamp"] = json!(timestamp());
                         self.message(message.clone(), events);
                         self.tool_results.push(message);
@@ -333,6 +547,10 @@ impl Stream {
     }
 
     fn begin_turn(&mut self, events: &mut Vec<Value>) {
+        if self.retry_attempt == RetryAttempt::Waiting {
+            self.retry_attempt = RetryAttempt::Resumed;
+            events.push(json!({"type":"agent_start"}));
+        }
         if !self.turn {
             self.turn = true;
             events.push(json!({"type":"turn_start"}));
@@ -347,6 +565,8 @@ impl Stream {
             );
             self.tool_results.clear();
             self.pending_tools.clear();
+            self.reasoning_items.clear();
+            self.text_items.clear();
             self.assistant = Value::Null;
             self.request_id = None;
         }
@@ -379,15 +599,26 @@ impl Stream {
     fn finish_message(&mut self, content: Option<String>, events: &mut Vec<Value>) {
         self.start_message(events);
         self.close_block(events);
+        self.finish_reasoning_items(events);
+        self.finish_text_items(events);
         if let Some(content) = content {
             let blocks = self.assistant["content"]
                 .as_array_mut()
                 .expect("assistant blocks");
-            let mut text = blocks.iter_mut().filter(|block| block["type"] == "text");
-            if let Some(first) = text.next()
-                && text.next().is_none()
-            {
-                first["text"] = json!(content);
+            if self.metadata.assistant_text_edited {
+                let first_text = blocks.iter().position(|block| block["type"] == "text");
+                blocks.retain(|block| block["type"] != "text");
+                if !content.is_empty() {
+                    let index = first_text.unwrap_or(0).min(blocks.len());
+                    blocks.insert(index, json!({"type": "text", "text": content}));
+                }
+            } else {
+                let mut text = blocks.iter_mut().filter(|block| block["type"] == "text");
+                if let Some(first) = text.next()
+                    && text.next().is_none()
+                {
+                    first["text"] = json!(content);
+                }
             }
         }
         events.push(json!({"type":"message_end","message":self.assistant}));
@@ -396,8 +627,20 @@ impl Stream {
     }
 
     fn update(&self, mut update: Value, events: &mut Vec<Value>) {
+        if update["type"] == "toolcall_start"
+            && let Some(index) = update["contentIndex"].as_u64()
+            && let Some(call) = self.assistant["content"].get(index as usize)
+        {
+            update["id"] = call["id"].clone();
+            update["toolName"] = call["name"].clone();
+        }
         update["partial"] = self.assistant.clone();
-        events.push(json!({"type":"message_update","message":self.assistant,"assistantMessageEvent":update}));
+        events.push(json!({
+            "type":"message_update",
+            "usage":self.assistant["usage"],
+            "message":self.assistant,
+            "assistantMessageEvent":update,
+        }));
     }
 
     fn delta(&mut self, kind: &'static str, delta: &str, events: &mut Vec<Value>) {
@@ -428,6 +671,153 @@ impl Stream {
         );
     }
 
+    fn reasoning_item_index(&mut self, output_index: u64, events: &mut Vec<Value>) -> usize {
+        self.reasoning_item_start(output_index, false, events)
+    }
+
+    fn reasoning_item_start(
+        &mut self,
+        output_index: u64,
+        redacted: bool,
+        events: &mut Vec<Value>,
+    ) -> usize {
+        if let Some(&(index, _)) = self.reasoning_items.get(&output_index) {
+            return index;
+        }
+        self.start_message(events);
+        self.close_block(events);
+        let blocks = self.assistant["content"]
+            .as_array_mut()
+            .expect("assistant blocks");
+        let index = blocks.len();
+        blocks.push(if redacted {
+            json!({"type":"thinking", "thinking":"[Reasoning redacted]", "redacted":true})
+        } else {
+            json!({"type":"thinking","thinking":""})
+        });
+        self.reasoning_items.insert(output_index, (index, false));
+        self.update(
+            json!({"type":"thinking_start","contentIndex":index}),
+            events,
+        );
+        index
+    }
+
+    fn reasoning_item_delta(&mut self, output_index: u64, delta: &str, events: &mut Vec<Value>) {
+        let index = self.reasoning_item_index(output_index, events);
+        if self.reasoning_items[&output_index].1
+            || self.assistant["content"][index]["redacted"] == true
+        {
+            return;
+        }
+        if let Value::String(content) = &mut self.assistant["content"][index]["thinking"] {
+            content.push_str(delta);
+        }
+        self.update(
+            json!({"type":"thinking_delta","contentIndex":index,"delta":delta}),
+            events,
+        );
+    }
+
+    fn reasoning_item_end(&mut self, output_index: u64, content: &str, events: &mut Vec<Value>) {
+        let index = self.reasoning_item_index(output_index, events);
+        let ended = &mut self
+            .reasoning_items
+            .get_mut(&output_index)
+            .expect("reasoning item")
+            .1;
+        if *ended {
+            return;
+        }
+        *ended = true;
+        let content = if self.assistant["content"][index]["redacted"] == true {
+            "[Reasoning redacted]"
+        } else {
+            content
+        };
+        self.assistant["content"][index]["thinking"] = json!(content);
+        self.update(
+            json!({"type":"thinking_end","contentIndex":index,"content":content}),
+            events,
+        );
+    }
+
+    fn finish_reasoning_items(&mut self, events: &mut Vec<Value>) {
+        let mut pending: Vec<_> = self
+            .reasoning_items
+            .iter()
+            .filter_map(|(&output, &(index, ended))| (!ended).then_some((index, output)))
+            .collect();
+        pending.sort_unstable();
+        for (index, output) in pending {
+            let content = self.assistant["content"][index]["thinking"]
+                .as_str()
+                .expect("thinking block")
+                .to_owned();
+            self.reasoning_item_end(output, &content, events);
+        }
+    }
+
+    fn text_item_index(&mut self, output_index: u64, events: &mut Vec<Value>) -> usize {
+        if let Some(&(index, _)) = self.text_items.get(&output_index) {
+            return index;
+        }
+        self.start_message(events);
+        self.close_block(events);
+        let blocks = self.assistant["content"]
+            .as_array_mut()
+            .expect("assistant blocks");
+        let index = blocks.len();
+        blocks.push(json!({"type":"text","text":""}));
+        self.text_items.insert(output_index, (index, false));
+        self.update(json!({"type":"text_start","contentIndex":index}), events);
+        index
+    }
+
+    fn text_item_delta(&mut self, output_index: u64, delta: &str, events: &mut Vec<Value>) {
+        let index = self.text_item_index(output_index, events);
+        if self.text_items[&output_index].1 {
+            return;
+        }
+        if let Value::String(content) = &mut self.assistant["content"][index]["text"] {
+            content.push_str(delta);
+        }
+        self.update(
+            json!({"type":"text_delta","contentIndex":index,"delta":delta}),
+            events,
+        );
+    }
+
+    fn text_item_end(&mut self, output_index: u64, content: &str, events: &mut Vec<Value>) {
+        let index = self.text_item_index(output_index, events);
+        let ended = &mut self.text_items.get_mut(&output_index).expect("text item").1;
+        if *ended {
+            return;
+        }
+        *ended = true;
+        self.assistant["content"][index]["text"] = json!(content);
+        self.update(
+            json!({"type":"text_end","contentIndex":index,"content":content}),
+            events,
+        );
+    }
+
+    fn finish_text_items(&mut self, events: &mut Vec<Value>) {
+        let mut pending: Vec<_> = self
+            .text_items
+            .iter()
+            .filter_map(|(&output, &(index, ended))| (!ended).then_some((index, output)))
+            .collect();
+        pending.sort_unstable();
+        for (index, output) in pending {
+            let content = self.assistant["content"][index]["text"]
+                .as_str()
+                .expect("text block")
+                .to_owned();
+            self.text_item_end(output, &content, events);
+        }
+    }
+
     fn tool_delta(&mut self, delta: ToolCallDelta, events: &mut Vec<Value>) {
         self.start_message(events);
         self.close_block(events);
@@ -439,7 +829,7 @@ impl Stream {
             blocks.push(json!({"type":"toolCall","id":"","name":"","arguments":{}}));
             PendingTool {
                 content_index: next,
-                arguments: super::streaming_json::StreamingJson::default(),
+                arguments: super::StreamingJson::default(),
             }
         });
         let index = pending.content_index;
@@ -494,15 +884,30 @@ pub(super) fn tool_call_value(call: &ToolCall) -> Value {
     value
 }
 
-pub(super) fn tool_failed(outcome: &Outcome) -> bool {
-    matches!(
-        outcome,
-        Outcome::Failed(_) | Outcome::Skipped(_) | Outcome::Unknown(_)
-    ) || matches!(outcome, Outcome::Structured { data, .. } if data["isError"] == true)
+pub(super) fn user_content(content: &str, images: &[pi_rs::ImageContent]) -> Value {
+    let mut blocks = vec![json!({"type":"text", "text":content})];
+    blocks.extend(
+        images
+            .iter()
+            .map(|image| json!({"type":"image", "data":image.data, "mimeType":image.mime_type})),
+    );
+    json!(blocks)
 }
 
-pub(super) fn tool_result_value(text: &str, outcome: Option<&Outcome>) -> Value {
-    let (text, images) = pi_rs::extract_tool_images(text.to_owned());
+pub(super) fn tool_failed(outcome: &Outcome) -> bool {
+    outcome.is_error()
+}
+
+pub(super) fn tool_result_value(
+    text: &str,
+    outcome: Option<&Outcome>,
+    is_structured: Option<bool>,
+) -> Value {
+    let (text, images) = if pi_rs::tool_content_is_structured(text, is_structured) {
+        pi_rs::extract_tool_images(text.to_owned())
+    } else {
+        (text.to_owned(), Vec::new())
+    };
     let mut content = vec![json!({"type":"text","text":text})];
     content.extend(
         images
@@ -510,10 +915,161 @@ pub(super) fn tool_result_value(text: &str, outcome: Option<&Outcome>) -> Value 
             .map(|image| json!({"type":"image","data":image.data,"mimeType":image.mime_type})),
     );
     let mut result = json!({"content":content});
-    if let Some(Outcome::SucceededWithDetails { details, .. }) = outcome {
+    if matches!(outcome, Some(Outcome::Failed(_) | Outcome::Skipped(_))) {
+        result["details"] = json!({});
+    }
+    if let Some(
+        Outcome::SucceededWithDetails { details, .. }
+        | Outcome::StructuredWithDetails { details, .. },
+    ) = outcome
+    {
         result["details"] = details.clone();
     }
+    if let Some(
+        Outcome::TextResult {
+            details: Some(details),
+            ..
+        }
+        | Outcome::TextResultWithStructuredContent {
+            details: Some(details),
+            ..
+        },
+    ) = outcome
+    {
+        result["details"] = details.clone();
+    }
+    if let Some(Outcome::TextResultWithStructuredContent {
+        structured_content, ..
+    }) = outcome
+    {
+        result["structuredContent"] = structured_content.clone();
+    }
     result
+}
+
+/// Project native content-block results as Pi events without changing the
+/// separate model-facing native tool envelope.
+pub(super) fn tool_event_result_value(
+    text: &str,
+    outcome: Option<&Outcome>,
+    is_structured: Option<bool>,
+) -> Value {
+    let mut result = tool_result_value(text, outcome, is_structured);
+    if !pi_rs::tool_content_is_structured(text, is_structured) {
+        return result;
+    }
+    let Ok(envelope) = serde_json::from_str::<Value>(text) else {
+        return result;
+    };
+    let Some(data) = envelope.get("data").and_then(Value::as_object) else {
+        return result;
+    };
+    let mut content = Vec::new();
+    let mut rejected = Vec::new();
+    let blocks = data.get("content").and_then(Value::as_array);
+    for (index, block) in blocks.into_iter().flatten().enumerate() {
+        let valid = match block["type"].as_str() {
+            Some("text") => block["text"].is_string(),
+            Some("image") => {
+                block["data"]
+                    .as_str()
+                    .is_some_and(|data| data.len() <= 8 * 1024 * 1024)
+                    && block["mimeType"].is_string()
+            }
+            _ => false,
+        };
+        if valid {
+            content.push(block.clone());
+        } else {
+            rejected.push(json!({"index":index,"block":block}));
+        }
+    }
+    if let Some(blocks) = blocks
+        && (!content.is_empty() || blocks.is_empty())
+    {
+        result["content"] = json!(content);
+    }
+    if let Some(structured_content) = data.get("structuredContent") {
+        result["structuredContent"] = structured_content.clone();
+    }
+    if !rejected.is_empty() {
+        result["nativeRejectedBlocks"] = json!(rejected);
+    }
+    // Preserve native fields that used to be present in the text envelope.
+    let mut native = data.clone();
+    native.remove("content");
+    if let Some(attachments) = envelope
+        .get("attachments")
+        .filter(|value| value.as_array().is_some_and(|values| !values.is_empty()))
+    {
+        result["nativeAttachments"] = attachments.clone();
+    }
+    if !native.is_empty() {
+        result["nativeData"] = Value::Object(native);
+    }
+    if let Some(fields) = envelope.as_object() {
+        let mut extra = fields.clone();
+        extra.remove("data");
+        extra.remove("attachments");
+        if !extra.is_empty() {
+            result["nativeEnvelope"] = Value::Object(extra);
+        }
+    }
+    result
+}
+
+pub(super) fn auto_compaction_value(
+    reason: pi_rs::CompactionTrigger,
+    update: &pi_rs::AutoCompactionUpdate,
+) -> Value {
+    use pi_rs::AutoCompactionUpdate;
+
+    match update {
+        AutoCompactionUpdate::Started => json!({"type":"compaction_start","reason":reason}),
+        AutoCompactionUpdate::Completed {
+            compaction_entry,
+            details,
+            estimated_tokens_after,
+            will_retry,
+        } => {
+            let Event::Compacted {
+                summary,
+                retain_from,
+                tokens_before,
+                usage,
+                usage_metadata,
+                ..
+            } = &compaction_entry.event
+            else {
+                unreachable!("completed automatic compaction must have a compaction record");
+            };
+            let mut result = json!({
+                "summary":summary,
+                "firstKeptEntryId":retain_from.unwrap_or(compaction_entry.id).to_string(),
+                "tokensBefore":tokens_before.unwrap_or_default(),
+                "estimatedTokensAfter":estimated_tokens_after,
+            });
+            if let Some(usage) = usage {
+                let metadata = usage_metadata.as_ref().map(|usage| &usage.metadata);
+                result["usage"] =
+                    usage_value(*usage, metadata.unwrap_or(&ModelMetadata::default()));
+            }
+            if let Some(details) = details {
+                result["details"] = details.clone();
+            }
+            json!({"type":"compaction_end","reason":reason,"aborted":false,"willRetry":will_retry,"result":result})
+        }
+        AutoCompactionUpdate::Failed {
+            aborted,
+            error_message,
+        } => {
+            let mut event = json!({"type":"compaction_end","reason":reason,"aborted":aborted,"willRetry":false});
+            if let Some(error_message) = error_message {
+                event["errorMessage"] = json!(error_message);
+            }
+            event
+        }
+    }
 }
 
 pub(super) fn usage_value(usage: Usage, metadata: &ModelMetadata) -> Value {
@@ -530,6 +1086,9 @@ pub(super) fn usage_value(usage: Usage, metadata: &ModelMetadata) -> Value {
             "total":metadata.cost_usd.as_ref().and_then(serde_json::Number::as_f64).unwrap_or_default()
         },
     });
+    if let Some(reasoning) = metadata.reasoning_output_tokens {
+        value["reasoning"] = json!(reasoning);
+    }
     if let Some(long) = metadata.cache_write_1h_tokens {
         value["cacheWrite1h"] = json!(long);
     }
@@ -549,6 +1108,1084 @@ fn timestamp() -> u64 {
 #[cfg(test)]
 mod streaming_tool_tests {
     use super::*;
+
+    #[test]
+    fn portable_usage_reports_reasoning_without_counting_it_twice() {
+        let usage = Usage {
+            input_tokens: 12,
+            output_tokens: 9,
+        };
+        let metadata = ModelMetadata {
+            reasoning_output_tokens: Some(4),
+            ..Default::default()
+        };
+        let value = usage_value(usage, &metadata);
+        assert_eq!(value["reasoning"], 4);
+        assert_eq!(value["output"], 9);
+        assert_eq!(value["totalTokens"], 21);
+        assert!(
+            usage_value(usage, &ModelMetadata::default())
+                .get("reasoning")
+                .is_none()
+        );
+    }
+
+    use clap::Parser;
+
+    #[test]
+    fn native_message_edit_replaces_every_streamed_text_block_in_final_rpc_message() {
+        let mut stream = Stream {
+            assistant: json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "reasoning"},
+                {"type": "text", "text": "first"},
+                {"type": "toolCall", "id": "call-1", "name": "read", "arguments": {}},
+                {"type": "text", "text": "second"}
+            ]}),
+            started: true,
+            metadata: ModelMetadata {
+                assistant_text_edited: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut events = Vec::new();
+        stream.finish_message(Some("replace both".into()), &mut events);
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert_eq!(
+            end["message"]["content"],
+            json!([
+                {"type": "thinking", "thinking": "reasoning"},
+                {"type": "text", "text": "replace both"},
+                {"type": "toolCall", "id": "call-1", "name": "read", "arguments": {}}
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_attempt_start_is_deduplicated_by_operation_identity() {
+        let args = Cli::parse_from(["pi"]);
+        let mut stream = Stream::default();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let fallback = Uuid::new_v4();
+        for (operation_id, arguments) in [
+            (first, r#"{"path":42}"#),
+            (second, "[42]"),
+            (fallback, "{}"),
+        ] {
+            stream.calls.insert(
+                operation_id,
+                (
+                    Invocation {
+                        operation_id,
+                        call: ToolCall {
+                            id: "repeated-id".into(),
+                            name: "read".into(),
+                            arguments: arguments.into(),
+                        },
+                    },
+                    None,
+                ),
+            );
+        }
+        for (operation_id, arguments) in [(first, json!({"path":42})), (second, json!({}))] {
+            let event = json!({"type":"internal_tool_attempt","operationId":operation_id});
+            assert_eq!(
+                stream.observe(&event, &args),
+                vec![
+                    json!({"type":"tool_execution_start","toolCallId":"repeated-id","toolName":"read","args":arguments})
+                ]
+            );
+            let mut events = Vec::new();
+            stream.record(
+                Event::ToolStarted {
+                    operation_id,
+                    tool_execution: None,
+                },
+                &args,
+                &mut events,
+            );
+            assert!(events.is_empty());
+        }
+
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id: first,
+                outcome: Outcome::Skipped("rejected before dispatch".into()),
+                states: Default::default(),
+            },
+            &args,
+            &mut events,
+        );
+        assert_eq!(events[0]["type"], "tool_execution_end");
+        assert!(!stream.started_tools.contains(&first));
+        assert!(stream.started_tools.contains(&second));
+        assert!(
+            stream
+                .observe(
+                    &json!({"type":"internal_tool_attempt","operationId":first}),
+                    &args
+                )
+                .is_empty()
+        );
+
+        events.clear();
+        stream.record(
+            Event::ToolStarted {
+                operation_id: fallback,
+                tool_execution: None,
+            },
+            &args,
+            &mut events,
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "tool_execution_start");
+    }
+
+    #[test]
+    fn automatic_compaction_uses_pi_16_event_names() {
+        use pi_rs::{AutoCompactionUpdate, CompactionTrigger};
+
+        assert_eq!(
+            auto_compaction_value(CompactionTrigger::Threshold, &AutoCompactionUpdate::Started),
+            json!({"type":"compaction_start","reason":"threshold"})
+        );
+        assert_eq!(
+            auto_compaction_value(
+                CompactionTrigger::Overflow,
+                &AutoCompactionUpdate::Failed {
+                    aborted: true,
+                    error_message: None
+                },
+            ),
+            json!({"type":"compaction_end","reason":"overflow","aborted":true,"willRetry":false})
+        );
+    }
+
+    #[test]
+    fn failed_model_attempts_expose_classification_without_provider_text() {
+        let args = Cli::parse_from(["pi"]);
+        for (failure, reason, message) in [
+            (ModelFailure::Failed, "error", "Model request failed"),
+            (
+                ModelFailure::Retryable,
+                "error",
+                "Model request failed temporarily",
+            ),
+            (
+                ModelFailure::Cancelled,
+                "aborted",
+                "Model request cancelled",
+            ),
+        ] {
+            let mut stream = Stream {
+                assistant: json!({"role":"assistant","content":[]}),
+                ..Stream::default()
+            };
+            let mut events = Vec::new();
+            stream.begin_turn(&mut events);
+            stream.record(
+                Event::ModelFinished {
+                    request_id: Uuid::new_v4(),
+                    metadata: ModelMetadata::default(),
+                    usage: UsageReport::Unconfirmed,
+                    failure: Some(failure),
+                    partial: String::new(),
+                    reply: None,
+                },
+                &args,
+                &mut events,
+            );
+            let end = events
+                .iter()
+                .find(|event| event["type"] == "message_end")
+                .unwrap();
+            assert_eq!(end["message"]["stopReason"], reason);
+            assert_eq!(end["message"]["errorMessage"], message);
+            assert_eq!(stream.messages[0], end["message"]);
+            let turn = events
+                .iter()
+                .find(|event| event["type"] == "turn_end")
+                .unwrap();
+            assert_eq!(turn["message"], end["message"]);
+        }
+    }
+
+    #[test]
+    fn redacted_reasoning_starts_with_complete_block_without_delta() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        let mut events = stream.observe(
+            &json!({"type":"reasoning_item_start", "index":4, "redacted":true}),
+            &args,
+        );
+        events.extend(stream.observe(
+            &json!({"type":"reasoning_item_end", "index":4, "content":"[Reasoning redacted]"}),
+            &args,
+        ));
+        let updates: Vec<_> = events
+            .iter()
+            .filter_map(|e| e.get("assistantMessageEvent"))
+            .collect();
+        assert_eq!(
+            updates
+                .iter()
+                .map(|e| e["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["thinking_start", "thinking_end"]
+        );
+        for update in updates {
+            assert_eq!(
+                update["partial"]["content"][0],
+                json!({"type":"thinking", "thinking":"[Reasoning redacted]", "redacted":true})
+            );
+        }
+    }
+
+    #[test]
+    fn user_events_preserve_text_block_for_text_and_image_only_inputs() {
+        let image = pi_rs::ImageContent {
+            data: "aW1hZ2U=".into(),
+            mime_type: "image/png".into(),
+        };
+        let cases = [
+            (
+                Event::User {
+                    content: "hello".into(),
+                    input_id: None,
+                },
+                json!([{ "type":"text", "text":"hello" }]),
+            ),
+            (
+                Event::UserWithImages {
+                    content: "".into(),
+                    images: vec![image],
+                    input_id: None,
+                },
+                json!([{ "type":"text", "text":"" }, { "type":"image", "data":"aW1hZ2U=", "mimeType":"image/png" }]),
+            ),
+        ];
+        for (event, expected) in cases {
+            let mut stream = Stream::default();
+            let mut events = Vec::new();
+            stream.record(event, &Cli::parse_from(["pi"]), &mut events);
+            for kind in ["message_start", "message_end"] {
+                let message = events.iter().find(|event| event["type"] == kind).unwrap();
+                assert_eq!(message["message"]["content"], expected);
+            }
+            assert_eq!(stream.messages[0]["content"], expected);
+        }
+    }
+
+    #[test]
+    fn redacted_end_keeps_placeholder_after_reasoning_budget_is_exhausted() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        let large = "x".repeat(1024 * 1024);
+        stream.observe(&json!({"type":"reasoning_item_start", "index":0}), &args);
+        stream.observe(
+            &json!({"type":"reasoning_item_delta", "index":0, "delta":large}),
+            &args,
+        );
+        stream.observe(
+            &json!({"type":"reasoning_item_end", "index":0, "content":large}),
+            &args,
+        );
+        stream.observe(
+            &json!({"type":"reasoning_item_start", "index":1, "redacted":true}),
+            &args,
+        );
+        // Core's bounded fallback is empty after its delta budget is exhausted.
+        let events = stream.observe(
+            &json!({"type":"reasoning_item_end", "index":1, "content":""}),
+            &args,
+        );
+        let end = events
+            .iter()
+            .find_map(|event| event.get("assistantMessageEvent"))
+            .unwrap();
+        assert_eq!(end["type"], "thinking_end");
+        assert_eq!(end["content"], "[Reasoning redacted]");
+        assert_eq!(
+            end["partial"]["content"][1],
+            json!({"type":"thinking","thinking":"[Reasoning redacted]","redacted":true})
+        );
+        assert_eq!(stream.assistant["content"][1], end["partial"]["content"][1]);
+    }
+
+    #[test]
+    fn cancelled_redacted_block_closes_with_placeholder() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        stream.observe(
+            &json!({"type":"reasoning_item_start", "index":4, "redacted":true}),
+            &args,
+        );
+        let events = stream.settle(true, false);
+        let end = events
+            .iter()
+            .filter_map(|event| event.get("assistantMessageEvent"))
+            .find(|event| event["type"] == "thinking_end")
+            .unwrap();
+        assert_eq!(end["content"], "[Reasoning redacted]");
+        let message = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert_eq!(message["message"]["stopReason"], "aborted");
+        assert_eq!(
+            message["message"]["content"][0],
+            json!({"type":"thinking","thinking":"[Reasoning redacted]","redacted":true})
+        );
+    }
+
+    #[test]
+    fn summary_model_finished_record_is_not_forwarded() {
+        let mut stream = Stream::default();
+        let args = Cli::parse_from(["pi"]);
+        let record = json!({"type":"record","record":Record {
+            timestamp: None, run_id: None, version: 1, id: 1, parent: None,
+            event: Event::ModelFinished { request_id: Uuid::new_v4(), metadata: ModelMetadata::default(), usage: UsageReport::Unconfirmed, failure: None, partial: "private summary".into(), reply: None },
+        }});
+        assert!(!stream.suppress_summary_record(&record));
+        stream.observe(&json!({"type":"summary_request_start"}), &args);
+        assert!(stream.suppress_summary_record(&record));
+        assert!(!stream.suppress_summary_record(
+            &json!({"type":"record","record":{"event":{"type":"model_requested"}}})
+        ));
+        assert!(stream.observe(&record, &args).is_empty());
+        assert!(!stream.suppress_summary_record(&record));
+    }
+
+    #[test]
+    fn indexed_text_and_reasoning_preserve_interleaved_items() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        let mut updates = Vec::new();
+        for event in [
+            json!({"type":"text_item_start","index":0}),
+            json!({"type":"text_item_delta","index":0,"delta":"a"}),
+            json!({"type":"reasoning_item_start","index":1}),
+            json!({"type":"reasoning_item_delta","index":1,"delta":"think"}),
+            json!({"type":"text_item_start","index":2}),
+            json!({"type":"text_item_delta","index":2,"delta":"b"}),
+            json!({"type":"text_item_delta","index":0,"delta":"c"}),
+            json!({"type":"text_item_end","index":2,"content":"B"}),
+            json!({"type":"reasoning_item_end","index":1,"content":"thought"}),
+            json!({"type":"text_item_end","index":0,"content":"AC"}),
+            json!({"type":"text_item_end","index":0,"content":"ignored"}),
+        ] {
+            updates.extend(stream.observe(&event, &args));
+        }
+        assert_eq!(
+            stream.assistant["content"],
+            json!([
+                {"type":"text","text":"AC"}, {"type":"thinking","thinking":"thought"}, {"type":"text","text":"B"}
+            ])
+        );
+        let events: Vec<_> = updates
+            .iter()
+            .filter_map(|v| v.get("assistantMessageEvent"))
+            .map(|v| {
+                (
+                    v["type"].as_str().unwrap(),
+                    v["contentIndex"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                ("text_start", 0),
+                ("text_delta", 0),
+                ("thinking_start", 1),
+                ("thinking_delta", 1),
+                ("text_start", 2),
+                ("text_delta", 2),
+                ("text_delta", 0),
+                ("text_end", 2),
+                ("thinking_end", 1),
+                ("text_end", 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn indexed_reasoning_start_precedes_interleaved_tool_and_delta() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        let mut events = Vec::new();
+        for event in [
+            json!({"type":"reasoning_item_start","index":4}),
+            json!({"type":"reasoning_item_start","index":4}),
+            json!({"type":"tool_call_delta","toolCallDelta":{"index":8,"id":"call","name":"read"}}),
+            json!({"type":"reasoning_delta","reasoningIndex":4,"delta":"thought"}),
+            json!({"type":"reasoning_item_end","index":4,"content":"final thought"}),
+        ] {
+            events.extend(stream.observe(&event, &args));
+        }
+        assert_eq!(
+            stream.assistant["content"][0],
+            json!({"type":"thinking","thinking":"final thought"})
+        );
+        assert_eq!(stream.assistant["content"][1]["type"], "toolCall");
+        let updates: Vec<_> = events
+            .iter()
+            .filter_map(|e| e.get("assistantMessageEvent"))
+            .collect();
+        let types: Vec<_> = updates
+            .iter()
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap(),
+                    e["contentIndex"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            types,
+            [
+                ("thinking_start", 0),
+                ("toolcall_start", 1),
+                ("thinking_delta", 0),
+                ("thinking_end", 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn unindexed_reasoning_delta_keeps_legacy_behavior() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        stream.observe(&json!({"type":"reasoning_delta","delta":"legacy"}), &args);
+        stream.finish_message(None, &mut Vec::new());
+        assert_eq!(
+            stream.assistant["content"],
+            json!([{"type":"thinking","thinking":"legacy"}])
+        );
+    }
+
+    #[test]
+    fn indexed_reasoning_observe_interleaves_and_uses_final_content() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        let mut events = Vec::new();
+        for event in [
+            json!({"type":"reasoning_item_delta","index":4,"delta":"a"}),
+            json!({"type":"reasoning_item_delta","index":9,"delta":"b"}),
+            json!({"type":"reasoning_item_delta","index":4,"delta":"c"}),
+            json!({"type":"reasoning_item_end","index":9,"content":"final b"}),
+            json!({"type":"reasoning_item_end","index":4,"content":"final a"}),
+            json!({"type":"reasoning_item_end","index":4,"content":"duplicate"}),
+        ] {
+            events.extend(stream.observe(&event, &args));
+        }
+        assert_eq!(
+            stream.assistant["content"],
+            json!([
+                {"type":"thinking","thinking":"final a"},
+                {"type":"thinking","thinking":"final b"}
+            ])
+        );
+        let updates: Vec<_> = events
+            .iter()
+            .filter_map(|e| e.get("assistantMessageEvent"))
+            .collect();
+        let types: Vec<_> = updates
+            .iter()
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap(),
+                    e["contentIndex"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            types,
+            [
+                ("thinking_start", 0),
+                ("thinking_delta", 0),
+                ("thinking_start", 1),
+                ("thinking_delta", 1),
+                ("thinking_delta", 0),
+                ("thinking_end", 1),
+                ("thinking_end", 0)
+            ]
+        );
+        assert_eq!(updates[5]["content"], "final b");
+    }
+
+    #[test]
+    fn indexed_reasoning_without_delta_and_unfinished_items_close_once() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let args = Cli::parse_from(["pi"]);
+        let mut events = stream.observe(
+            &json!({"type":"reasoning_item_end","index":2,"content":"only final"}),
+            &args,
+        );
+        events.extend(stream.observe(
+            &json!({"type":"reasoning_item_delta","index":5,"delta":"partial"}),
+            &args,
+        ));
+        stream.finish_message(None, &mut events);
+        assert_eq!(stream.assistant["content"][0]["thinking"], "only final");
+        assert_eq!(stream.assistant["content"][1]["thinking"], "partial");
+        let ends: Vec<_> = events
+            .iter()
+            .filter_map(|e| e.get("assistantMessageEvent"))
+            .filter(|e| e["type"] == "thinking_end")
+            .collect();
+        assert_eq!(ends.len(), 2);
+        assert_eq!(ends[1]["content"], "partial");
+    }
+
+    #[test]
+    fn structured_read_metadata_is_correlated_and_not_added_to_messages() {
+        let operation_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let mut stream = Stream::default();
+        let args = Cli::parse_from(["pi"]);
+        stream.calls.insert(
+            operation_id,
+            (
+                Invocation {
+                    operation_id,
+                    call: ToolCall {
+                        id: "read-call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                None,
+            ),
+        );
+        let metadata = json!("page\n\n[1 more line]");
+        stream.result_metadata.insert(
+            other_id,
+            ToolResultMetadata {
+                structured_content: Some(json!("other")),
+                duration_ms: Some(500),
+            },
+        );
+        assert!(stream.observe(&json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":metadata, "durationMs":0}), &args).is_empty());
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome: Outcome::Succeeded(metadata.as_str().unwrap().into()),
+                states: Default::default(),
+            },
+            &args,
+            &mut events,
+        );
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "tool_execution_end")
+            .unwrap();
+        assert_eq!(end["result"]["structuredContent"], metadata);
+        assert_eq!(end["durationMs"], 0);
+        assert!(end["result"].get("durationMs").is_none());
+        let message = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert!(message["message"].get("structuredContent").is_none());
+        assert_eq!(
+            stream.result_metadata[&other_id].structured_content,
+            Some(json!("other"))
+        );
+        assert_eq!(stream.result_metadata[&other_id].duration_ms, Some(500));
+        assert_eq!(message["message"]["durationMs"], 0);
+        assert_eq!(stream.tool_results[0]["durationMs"], 0);
+        assert!(!stream.result_metadata.contains_key(&operation_id));
+    }
+
+    #[test]
+    fn image_read_sidecar_appears_only_in_execution_event() {
+        let operation_id = Uuid::new_v4();
+        let mut stream = Stream::default();
+        let args = Cli::parse_from(["pi"]);
+        stream.calls.insert(
+            operation_id,
+            (
+                Invocation {
+                    operation_id,
+                    call: ToolCall {
+                        id: "image-read".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                None,
+            ),
+        );
+        let blocks = json!([{ "type":"text", "text":"image note" }, { "type":"image", "mimeType":"image/png", "data":"aW1hZ2U=" }]);
+        let structured =
+            json!({"type":"image", "mimeType":"image/png", "data":"aW1hZ2U=", "note":"image note"});
+        stream.observe(&json!({"type":"internal_tool_result_metadata", "operationId":operation_id, "structuredContent":structured}), &args);
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome: Outcome::Structured {
+                    data: json!({"content":blocks}),
+                    attachments: vec![],
+                },
+                states: Default::default(),
+            },
+            &args,
+            &mut events,
+        );
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "tool_execution_end")
+            .unwrap();
+        assert_eq!(end["result"]["content"], blocks);
+        assert_eq!(end["result"]["structuredContent"], structured);
+        assert!(end.get("durationMs").is_none());
+        let message = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert_eq!(message["message"]["content"], blocks);
+        assert!(message["message"].get("durationMs").is_none());
+        assert!(message["message"].get("structuredContent").is_none());
+    }
+
+    #[test]
+    fn multimodal_tool_events_preserve_order_and_native_metadata() {
+        let blocks = json!([
+            {"type":"text","text":"before"},
+            {"type":"image","mimeType":"image/png","data":"aW1hZ2U="},
+            {"type":"text","text":"after"},
+            {"type":"image","mimeType":"image/jpeg","data":"cGhvdG8="}
+        ]);
+        let outcome = Outcome::StructuredWithDetails {
+            data: json!({"content":blocks,"structuredContent":{"answer":42},"wall_time_seconds":1.25}),
+            attachments: vec![pi_rs::AttachmentRef {
+                id: "asset".into(),
+                media_type: "image/png".into(),
+            }],
+            details: json!({"code":42}),
+        };
+        let operation_id = Uuid::new_v4();
+        let invocation = Invocation {
+            operation_id,
+            call: ToolCall {
+                id: "call".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut stream = Stream::default();
+        stream.calls.insert(operation_id, (invocation, None));
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome: outcome.clone(),
+                states: Default::default(),
+            },
+            &Cli::parse_from(["pi"]),
+            &mut events,
+        );
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "tool_execution_end")
+            .unwrap();
+        let message = events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap();
+        assert_eq!(end["result"]["content"], blocks);
+        assert_eq!(message["message"]["content"], blocks);
+        assert_eq!(end["result"]["details"], json!({"code":42}));
+        assert_eq!(end["result"]["structuredContent"], json!({"answer":42}));
+        assert_eq!(end["result"]["nativeData"]["wall_time_seconds"], 1.25);
+        assert_eq!(end["result"]["nativeAttachments"][0]["id"], "asset");
+        assert_eq!(
+            tool_event_result_value(&outcome.tool_content(), None, Some(true))["content"],
+            blocks
+        );
+        assert_eq!(
+            tool_event_result_value(&outcome.tool_content(), None, None)["content"],
+            blocks
+        );
+        // Provider-facing native content remains the original envelope.
+        assert!(tool_result_value(&outcome.tool_content(), Some(&outcome), Some(true))["content"][0]["text"].as_str().unwrap().contains("[image attached]"));
+    }
+
+    #[test]
+    fn multimodal_projection_keeps_plain_and_unknown_structured_data() {
+        let plain = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}] } }"#;
+        assert_eq!(
+            tool_event_result_value(plain, None, Some(false)),
+            json!({"content":[{"type":"text","text":plain}]})
+        );
+        let outcome = Outcome::Structured {
+            data: json!({"content":[{"type":"custom","value":1}]}),
+            attachments: vec![],
+        };
+        let result = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
+        assert_eq!(
+            result["content"],
+            tool_result_value(&outcome.tool_content(), Some(&outcome), Some(true))["content"]
+        );
+        assert_eq!(result["nativeRejectedBlocks"][0]["block"]["type"], "custom");
+    }
+
+    #[test]
+    fn multimodal_projection_keeps_valid_blocks_around_rejected_images() {
+        let oversized = "A".repeat(8 * 1024 * 1024 + 1);
+        let rejected_mime = json!({"type":"image","mimeType":"image/tiff","data":"dGlmZg=="});
+        let rejected_size = json!({"type":"image","mimeType":"image/png","data":oversized});
+        let supported = json!({"type":"image","mimeType":"image/png","data":"aW1hZ2U="});
+        let outcome = Outcome::StructuredWithDetails {
+            data: json!({"content":[{"type":"text","text":"before"}, rejected_mime, supported, rejected_size, {"type":"text","text":"after"}], "nativeInfo":"kept"}),
+            attachments: vec![],
+            details: json!({"code":42}),
+        };
+        let result = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
+        assert_eq!(
+            result["content"],
+            json!([{"type":"text","text":"before"}, rejected_mime, supported, {"type":"text","text":"after"}])
+        );
+        assert_eq!(result["nativeRejectedBlocks"][0]["index"], 3);
+        assert_eq!(result["nativeRejectedBlocks"][0]["block"], rejected_size);
+        assert_eq!(result["nativeData"]["nativeInfo"], "kept");
+        assert_eq!(result["details"]["code"], 42);
+        let operation_id = Uuid::new_v4();
+        let mut stream = Stream::default();
+        stream.calls.insert(
+            operation_id,
+            (
+                Invocation {
+                    operation_id,
+                    call: ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                None,
+            ),
+        );
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome,
+                states: Default::default(),
+            },
+            &Cli::parse_from(["pi"]),
+            &mut events,
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event["type"] == "tool_execution_end")
+                .unwrap()["result"],
+            result
+        );
+        let message = &events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap()["message"];
+        assert_eq!(message["content"], result["content"]);
+        assert_eq!(
+            message["nativeRejectedBlocks"],
+            result["nativeRejectedBlocks"]
+        );
+    }
+
+    #[test]
+    fn multimodal_legacy_envelope_preserves_structured_content_and_extra_fields() {
+        let envelope = json!({
+            "data": {
+                "content": [
+                    {"type":"text","text":"before"},
+                    {"type":"image","mimeType":"image/tiff","data":"dGlmZg=="},
+                    {"type":"image","mimeType":"image/png","data":"aW1hZ2U="},
+                    {"type":"text","text":"after"}
+                ],
+                "structuredContent": {"answer":42},
+                "otherData": true
+            },
+            "attachments": [],
+            "extra": {"origin":"legacy"}
+        });
+        let result = tool_event_result_value(&envelope.to_string(), None, None);
+        assert_eq!(result["structuredContent"], json!({"answer":42}));
+        assert_eq!(
+            result["nativeData"]["structuredContent"],
+            json!({"answer":42})
+        );
+        assert_eq!(result["nativeData"]["otherData"], true);
+        assert_eq!(
+            result["nativeEnvelope"],
+            json!({"extra":{"origin":"legacy"}})
+        );
+        assert_eq!(
+            result["content"],
+            json!([
+                {"type":"text","text":"before"},
+                {"type":"image","mimeType":"image/tiff","data":"dGlmZg=="},
+                {"type":"image","mimeType":"image/png","data":"aW1hZ2U="},
+                {"type":"text","text":"after"}
+            ])
+        );
+        assert!(result.get("nativeRejectedBlocks").is_none());
+    }
+
+    #[test]
+    fn structured_content_survives_missing_or_unprojectable_content() {
+        for content in [None, Some(json!([{"type":"custom","value":1}]))] {
+            let mut data = json!({"structuredContent":{"answer":42}});
+            if let Some(content) = content {
+                data["content"] = content;
+            }
+            let outcome = Outcome::Structured {
+                data,
+                attachments: vec![],
+            };
+            let result =
+                tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
+            assert_eq!(result["structuredContent"], json!({"answer":42}));
+        }
+        let image = json!({"type":"image","mimeType":"image/tiff","data":"dGlmZg=="});
+        let outcome = Outcome::Structured {
+            data: json!({"content":[image],"structuredContent":{"answer":42}}),
+            attachments: vec![],
+        };
+        let result = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(true));
+        assert_eq!(result["content"], json!([image]));
+        assert_eq!(result["structuredContent"], json!({"answer":42}));
+    }
+
+    #[test]
+    fn generated_tool_failures_have_pi_error_details() {
+        for outcome in [
+            Outcome::Failed("execution failed".into()),
+            Outcome::Skipped("validation failed".into()),
+        ] {
+            let mut stream = Stream::default();
+            let args = Cli::parse_from(["pi"]);
+            let operation_id = Uuid::new_v4();
+            stream.calls.insert(
+                operation_id,
+                (
+                    Invocation {
+                        operation_id,
+                        call: ToolCall {
+                            id: "call".into(),
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                    None,
+                ),
+            );
+
+            let mut events = Vec::new();
+            stream.record(
+                Event::ToolFinished {
+                    operation_id,
+                    outcome,
+                    states: Default::default(),
+                },
+                &args,
+                &mut events,
+            );
+            let end = events
+                .iter()
+                .find(|event| event["type"] == "tool_execution_end")
+                .unwrap();
+            let message = events
+                .iter()
+                .find(|event| event["type"] == "message_end")
+                .unwrap();
+            assert_eq!(end["isError"], true);
+            assert_eq!(end["result"]["details"], json!({}));
+            assert_eq!(message["message"]["isError"], true);
+            assert_eq!(message["message"]["details"], json!({}));
+        }
+
+        let returned_error = Outcome::TextResult {
+            output: "explicit result".into(),
+            details: None,
+            is_error: true,
+        };
+        let result = tool_event_result_value(
+            &returned_error.tool_content(),
+            Some(&returned_error),
+            Some(false),
+        );
+        assert!(result.get("details").is_none());
+    }
+
+    #[test]
+    fn patched_result_projects_verbatim_content_details_and_error() {
+        let result = Outcome::TextResult {
+            output: "exact".into(),
+            details: Some(json!({"code": 42})),
+            is_error: true,
+        };
+        assert!(tool_failed(&result));
+        assert_eq!(
+            tool_result_value(
+                &result.tool_content(),
+                Some(&result),
+                Some(result.is_structured())
+            ),
+            json!({"content":[{"type":"text","text":"exact"}], "details":{"code":42}})
+        );
+        let success = Outcome::TextResult {
+            output: "recovered".into(),
+            details: None,
+            is_error: false,
+        };
+        assert!(!tool_failed(&success));
+    }
+
+    #[test]
+    fn structured_text_result_projects_event_fields_without_changing_model_text() {
+        let outcome = Outcome::TextResultWithStructuredContent {
+            output: "bad\n\nCommand exited with code 7".into(),
+            details: Some(json!({"source":"shell"})),
+            structured_content: json!({"output":"bad","exit_code":7,"truncated":false,"wall_time_seconds":0.1}),
+            is_error: true,
+        };
+        let result = tool_event_result_value(&outcome.tool_content(), Some(&outcome), Some(false));
+        assert_eq!(result["content"][0]["text"], outcome.tool_content());
+        assert_eq!(result["structuredContent"]["exit_code"], 7);
+        assert_eq!(result["details"]["source"], "shell");
+        assert!(tool_failed(&outcome));
+        let operation_id = Uuid::new_v4();
+        let mut stream = Stream::default();
+        stream.calls.insert(
+            operation_id,
+            (
+                Invocation {
+                    operation_id,
+                    call: ToolCall {
+                        id: "call".into(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                None,
+            ),
+        );
+        let mut events = Vec::new();
+        stream.record(
+            Event::ToolFinished {
+                operation_id,
+                outcome,
+                states: Default::default(),
+            },
+            &Cli::parse_from(["pi"]),
+            &mut events,
+        );
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "tool_execution_end")
+            .unwrap();
+        assert_eq!(end["result"]["structuredContent"]["exit_code"], 7);
+        assert_eq!(end["isError"], true);
+        let message = &events
+            .iter()
+            .find(|event| event["type"] == "message_end")
+            .unwrap()["message"];
+        assert!(message.get("structuredContent").is_none());
+        assert_eq!(
+            message["content"][0]["text"],
+            "bad\n\nCommand exited with code 7"
+        );
+    }
+
+    #[test]
+    fn plain_json_result_is_verbatim_in_rpc() {
+        let text = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}] } }"#;
+        let outcome = Outcome::TextResult {
+            output: text.into(),
+            details: None,
+            is_error: true,
+        };
+        assert_eq!(
+            tool_result_value(text, Some(&outcome), Some(outcome.is_structured())),
+            json!({"content":[{"type":"text","text":text}]})
+        );
+    }
+
+    #[test]
+    fn tool_progress_is_forwarded_as_pi_event_in_json_mode() {
+        let event = pi_rs::LifecycleEvent::ToolExecutionUpdate {
+            tool_call_id: "child".into(),
+            tool_name: "bash".into(),
+            args: json!({"command":"echo hi"}),
+            partial_result: json!({"content":[{"type":"text","text":"hi"}]}),
+            parent_tool_call_id: Some("parent".into()),
+        };
+        let mut stream = Stream::default();
+        let args = Cli::parse_from(["pi-rs"]);
+        let events = stream.notify(&Notification::ToolProgress(&event), &args);
+        assert_eq!(
+            events,
+            vec![
+                json!({"type":"tool_execution_update", "toolCallId":"child", "toolName":"bash", "args":{"command":"echo hi"}, "partialResult":{"content":[{"type":"text","text":"hi"}]}, "parentToolCallId":"parent"})
+            ]
+        );
+    }
+
+    #[test]
+    fn json_trace_emits_progress_once_and_worker_trace_still_forwards() {
+        let event = pi_rs::LifecycleEvent::ToolExecutionUpdate {
+            tool_call_id: "call".into(),
+            tool_name: "bash".into(),
+            args: json!({}),
+            partial_result: json!({"content":[]}),
+            parent_tool_call_id: None,
+        };
+        let args = Cli::parse_from(["pi"]);
+        for trace in [false, true] {
+            let mut stream = Stream::default();
+            let mut output = stream.notify(&Notification::ToolProgress(&event), &args);
+            output.extend(super::super::trace_tool_progress(&event, trace, true));
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0]["type"], "tool_execution_update");
+        }
+        let worker_event = super::super::trace_tool_progress(&event, true, false).unwrap();
+        assert_eq!(worker_event["type"], "tool_execution_update");
+        assert!(super::super::trace_tool_progress(&event, false, false).is_none());
+    }
 
     #[test]
     fn completed_tool_call_reports_repaired_and_invalid_arguments() {
@@ -583,6 +2220,12 @@ mod streaming_tool_tests {
             arguments: arguments.into(),
         };
         stream.tool_delta(delta(0, "call-a", "read", "{\"path\":\"fo"), &mut events);
+        let start = events
+            .iter()
+            .find(|event| event["assistantMessageEvent"]["type"] == "toolcall_start")
+            .unwrap();
+        assert_eq!(start["assistantMessageEvent"]["id"], "call-a");
+        assert_eq!(start["assistantMessageEvent"]["toolName"], "read");
         assert_eq!(
             stream.assistant["content"][0]["arguments"],
             json!({"path":"fo"})
@@ -595,6 +2238,12 @@ mod streaming_tool_tests {
             delta(1, "call-b", "write", "{\"content\":\"xy"),
             &mut events,
         );
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event["assistantMessageEvent"]["type"] == "toolcall_start")
+            .collect();
+        assert_eq!(starts[1]["assistantMessageEvent"]["id"], "call-b");
+        assert_eq!(starts[1]["assistantMessageEvent"]["toolName"], "write");
         stream.tool_delta(delta(0, "", "", "o.txt\"}"), &mut events);
         assert_eq!(
             stream.assistant["content"][0]["arguments"],
@@ -611,5 +2260,69 @@ mod streaming_tool_tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn toolcall_start_reports_identity_available_at_that_event() {
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let mut events = Vec::new();
+        stream.tool_delta(
+            ToolCallDelta {
+                index: 0,
+                id: "call-".into(),
+                name: "re".into(),
+                arguments: String::new(),
+            },
+            &mut events,
+        );
+        stream.tool_delta(
+            ToolCallDelta {
+                index: 0,
+                id: "a".into(),
+                name: "ad".into(),
+                arguments: "{}".into(),
+            },
+            &mut events,
+        );
+        let start = events
+            .iter()
+            .find(|event| event["assistantMessageEvent"]["type"] == "toolcall_start")
+            .unwrap();
+        assert_eq!(start["assistantMessageEvent"]["id"], "call-");
+        assert_eq!(start["assistantMessageEvent"]["toolName"], "re");
+        assert_eq!(stream.assistant["content"][0]["id"], "call-a");
+        assert_eq!(stream.assistant["content"][0]["name"], "read");
+
+        let mut stream = Stream {
+            assistant: json!({"role":"assistant","content":[]}),
+            ..Stream::default()
+        };
+        let mut events = Vec::new();
+        stream.record(
+            Event::Assistant {
+                content: String::new(),
+                invocations: vec![Invocation {
+                    operation_id: Uuid::new_v4(),
+                    call: ToolCall {
+                        id: "call-final".into(),
+                        name: "write".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: None,
+                request_id: None,
+            },
+            &Cli::parse_from(["pi"]),
+            &mut events,
+        );
+        let start = events
+            .iter()
+            .find(|event| event["assistantMessageEvent"]["type"] == "toolcall_start")
+            .unwrap();
+        assert_eq!(start["assistantMessageEvent"]["id"], "call-final");
+        assert_eq!(start["assistantMessageEvent"]["toolName"], "write");
     }
 }

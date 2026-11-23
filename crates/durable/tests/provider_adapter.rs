@@ -539,6 +539,8 @@ async fn tool_block_adapter_contract_fails_closed_for_legacy_providers() {
     let request = ModelRequest {
         model: "fake".into(),
         messages: vec![Message::Tool {
+            is_error: false,
+            is_structured: None,
             call_id: "call".into(),
             content: String::new(),
         }],
@@ -570,11 +572,15 @@ async fn tool_block_adapter_contract_fails_closed_for_legacy_providers() {
             .is_err()
     );
     durable.request.request.messages[0] = Message::Tool {
+        is_error: false,
+        is_structured: None,
         call_id: "call".into(),
         content: "hidden".into(),
     };
     assert!(durable.validate_bindings().is_err());
     durable.request.request.messages[0] = Message::Tool {
+        is_error: false,
+        is_structured: None,
         call_id: "call".into(),
         content: String::new(),
     };

@@ -336,6 +336,8 @@ mod tests {
             replay: None,
         });
         s.messages.push(Message::Tool {
+            is_error: false,
+            is_structured: None,
             call_id: "a".into(),
             content: "done".into(),
         });
@@ -344,6 +346,8 @@ mod tests {
             Err(Error::InvalidTranscript)
         ));
         s.messages.push(Message::Tool {
+            is_error: false,
+            is_structured: None,
             call_id: "b".into(),
             content: "done".into(),
         });
@@ -365,6 +369,8 @@ mod tests {
                 replay: None,
             },
             Message::Tool {
+                is_error: false,
+                is_structured: None,
                 call_id: "a".into(),
                 content: "ok".into(),
             },
@@ -374,6 +380,8 @@ mod tests {
             Err(Error::InvalidTranscript)
         ));
         s.messages.push(Message::Tool {
+            is_error: false,
+            is_structured: None,
             call_id: "b".into(),
             content: "ok".into(),
         });
@@ -388,6 +396,8 @@ mod tests {
         });
         assert!(extract(id, &record(&s)).is_ok());
         s.messages.push(Message::Tool {
+            is_error: false,
+            is_structured: None,
             call_id: "b".into(),
             content: "duplicate".into(),
         });

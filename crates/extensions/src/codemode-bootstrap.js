@@ -1,7 +1,7 @@
 (() => {
     const stringify = value => typeof value === "string" ? value : JSON.stringify(value) ?? String(value);
-    const emit = (kind, value) => {
-        const error = __emit(kind, value);
+    const emit = (kind, value, mimeType = "") => {
+        const error = __emit(kind, value, mimeType);
         if (error) throw new Error(error);
     };
     globalThis.text = value => emit("text", stringify(value));
@@ -13,26 +13,40 @@
             value = { type: "image", mimeType: match[1], data: match[2].replace(/\s/g, "") };
         }
         if (!value || value.type !== "image" || typeof value.data !== "string") throw new Error("invalid image block");
-        emit("image", JSON.stringify(value));
+        emit("image", value.data, typeof value.mimeType === "string" ? value.mimeType : "");
     };
     globalThis.console = Object.freeze(Object.fromEntries(["log", "info", "warn", "error", "debug"].map(name => [name, (...args) => emit("console", args.map(stringify).join(" "))])));
     const values = Object.create(null);
     for (const [key, value] of Object.entries(__initial_store)) values[key] = JSON.stringify(value);
+    let storedChars = Object.entries(values).reduce((size, [key, value]) => size + key.length + value.length, 0);
     let changed = false;
-    globalThis.load = key => Object.hasOwn(values, String(key)) ? JSON.parse(values[String(key)]) : undefined;
+    const checkKey = (name, key) => {
+        if (typeof key !== "string") throw new TypeError(name + "() key must be a string");
+    };
+    globalThis.load = key => {
+        checkKey("load", key);
+        return Object.hasOwn(values, key) ? JSON.parse(values[key]) : undefined;
+    };
     globalThis.store = (key, value) => {
-        key = String(key);
-        if (key.length > 1024) throw new Error("store key exceeds size limit");
-        const encoded = value === undefined ? undefined : JSON.stringify(value);
-        if (value !== undefined && encoded === undefined) throw new Error("stored value is not JSON serializable");
-        if (encoded !== undefined && encoded.length > 262144) throw new Error("stored value exceeds size limit");
-        const next = { ...values };
-        if (encoded === undefined) delete next[key];
-        else next[key] = encoded;
-        const size = Object.entries(next).reduce((sum, [name, entry]) => sum + name.length + entry.length, 0);
-        if (size > 1048576) throw new Error("store exceeds size limit");
-        if (encoded === undefined) delete values[key];
-        else values[key] = encoded;
+        checkKey("store", key);
+        if (value === undefined) {
+            const previous = Object.hasOwn(values, key) ? key.length + values[key].length : 0;
+            delete values[key];
+            storedChars -= previous;
+            changed = true;
+            return;
+        }
+        let encoded;
+        try { encoded = JSON.stringify(value); }
+        catch (_) { throw new TypeError("stored value is not JSON serializable"); }
+        if (encoded === undefined) throw new TypeError("stored value is not JSON serializable");
+        if (encoded.length > 262144) throw new RangeError("stored value exceeds size limit");
+        // JSON.stringify can invoke toJSON, which may mutate this same key.
+        const previous = Object.hasOwn(values, key) ? key.length + values[key].length : 0;
+        const size = storedChars - previous + key.length + encoded.length;
+        if (size > 1048576) throw new RangeError("store exceeds size limit");
+        values[key] = encoded;
+        storedChars = size;
         changed = true;
     };
     const tools = Object.create(null);
@@ -53,28 +67,105 @@
     }
     globalThis.tools = Object.freeze(tools);
     globalThis.ALL_TOOLS = Object.freeze(__catalog.map(({ name, description }) => Object.freeze({ name, description })));
-    globalThis.searchTools = async (query, options = {}) => JSON.parse(__search_tools(String(query), JSON.stringify(options)));
-    globalThis.describeTool = async name => JSON.parse(__describe_tool(String(name))) ?? undefined;
-    globalThis.describeNamespace = async name => JSON.parse(__describe_namespace(String(name))) ?? undefined;
+    globalThis.searchTools = async (...args) => {
+        // Normalize public arguments through the same JSON boundary as Pi.
+        const [query, options] = JSON.parse(JSON.stringify(args));
+        if (typeof query !== "string") throw new Error("searchTools() expects a query string");
+        const limit = options?.limit ?? 8;
+        if (!Number.isInteger(limit) || limit <= 0) throw new Error("searchTools() limit must be a positive integer");
+        const namespace = options?.namespace;
+        if (namespace != null && typeof namespace !== "string")
+            throw new Error("searchTools() namespace must be a string");
+        return JSON.parse(__search_tools(query, limit, namespace || undefined));
+    };
+    globalThis.describeTool = async (...args) => {
+        const [name] = JSON.parse(JSON.stringify(args));
+        if (typeof name !== "string") throw new Error("describeTool() expects a tool name");
+        return JSON.parse(__describe_tool(name)) ?? undefined;
+    };
+    globalThis.describeNamespace = async (...args) => {
+        const [name] = JSON.parse(JSON.stringify(args));
+        if (typeof name !== "string") throw new Error("describeNamespace() expects a namespace name");
+        return JSON.parse(__describe_namespace(name)) ?? undefined;
+    };
     const callModel = __call_model_operation;
     const modelType = type => {
-        if (!["chat", "classifier", "image"].includes(type)) throw new Error("Unknown model type");
+        if (!["chat", "classifier", "image"].includes(type))
+            throw new Error(`Unknown model type ${JSON.stringify(type)}. Use "chat", "image", or "classifier".`);
         return type;
     };
-    const listModels = async (type, provider, available, id) => {
-        const reply = JSON.parse(await callModel(JSON.stringify({ action: "list", type: modelType(type), provider, available, id })));
+    const modelProvider = provider => {
+        if (provider == null) return undefined;
+        if (typeof provider !== "string") throw new Error("provider must be a string");
+        return provider;
+    };
+    const describeModelArg = value => {
+        if (value == null) return String(value);
+        if (Array.isArray(value)) return value.length ? "an array" : "an empty array";
+        if (typeof value === "object") {
+            const keys = Object.keys(value);
+            return keys.length ? `{ ${keys.slice(0, 6).join(", ")}${keys.length > 6 ? ", ..." : ""} }` : "{}";
+        }
+        return typeof value === "string" ? "a string" : `a ${typeof value}`;
+    };
+    const listModels = async (available, lookup, ...args) => {
+        // Pi passes spread arguments through a JSON boundary before checking them.
+        const [kind, owner, modelId] = JSON.parse(JSON.stringify(args));
+        const reply = JSON.parse(await callModel(JSON.stringify({ action: "list", type: modelType(kind), provider: modelProvider(owner), available, id: lookup ? modelId : undefined })));
         if (!reply.ok) throw new Error(reply.error);
         return reply.value;
     };
+    const record = value => typeof value === "object" && value !== null && !Array.isArray(value);
+    const imageBlock = value => record(value) && value.type === "image" && typeof value.data === "string" && typeof value.mimeType === "string";
+    const validateContext = (action, context) => {
+        const name = action === "classify" ? "models.classify()" : "models.generateImages()";
+        if (!record(context)) throw new Error(`${name} expects a context object`);
+        if (action === "classify") {
+            if (!record(context.state)) throw new Error(`${name} context.state must be an object`);
+            if (context.images !== undefined && (!Array.isArray(context.images) || !context.images.every(imageBlock)))
+                throw new Error(`${name} context.images must be an array of image blocks`);
+            if (!record(context.questions) || !Object.keys(context.questions).length)
+                throw new Error(`${name} context.questions must map question IDs to questions`);
+            for (const [id, question] of Object.entries(context.questions)) {
+                if (!record(question) || typeof question.instructions !== "string")
+                    throw new Error(`${name} context.questions.${id} must have string instructions`);
+                const criteria = question.criteria;
+                const strings = values => values.length > 0 && values.every(value => typeof value === "string");
+                const valid = question.type === "choice" ? record(criteria) && strings(Object.values(criteria))
+                    : question.type === "score" ? Array.isArray(criteria) && strings(criteria)
+                    : question.type === "bool" ? record(criteria) && typeof criteria.true === "string" && typeof criteria.false === "string"
+                    : false;
+                if (!valid) throw new Error(`${name} context.questions.${id} has invalid type or criteria`);
+            }
+        } else if (!Array.isArray(context.input) || !context.input.length || !context.input.every(value =>
+            record(value) && ((value.type === "text" && typeof value.text === "string") || imageBlock(value)))) {
+            throw new Error(`${name} context.input must be a non-empty array of text or image blocks`);
+        }
+    };
     const modelOperation = async (action, model, context) => {
-        const { provider = "", id = "" } = model ?? {};
-        const reply = JSON.parse(await callModel(JSON.stringify({ action, provider, id, context })));
-        return reply.ok ? reply.value : { provider, model: id, stopReason: "error", errorMessage: reply.error, ...(action === "classify" ? { answers: {} } : { output: [] }) };
+        if (!record(model) || typeof model.provider !== "string" || typeof model.id !== "string")
+            throw new Error(`models.${action}() expects a model with provider and id strings`);
+        const { provider, id } = model;
+        const resolved = JSON.parse(await callModel(JSON.stringify({ action: "resolve", type: action === "classify" ? "classifier" : "image", provider, id })));
+        if (!resolved.ok) throw new Error(resolved.error);
+        // Match the sandbox JSON boundary: holes, undefined and toJSON values
+        // must be validated exactly as the host will receive them.
+        const argumentsJson = JSON.stringify({ action, provider, id, context });
+        validateContext(action, JSON.parse(argumentsJson).context);
+        const reply = JSON.parse(await callModel(argumentsJson));
+        if (!reply.ok) throw new Error(reply.error);
+        return reply.value;
     };
     globalThis.models = Object.freeze({
-        getModelsOfType: (type, provider) => listModels(type, provider, false),
-        getAvailableOfType: (type, provider) => listModels(type, provider, true),
-        getModelOfType: async (type, provider, id) => (await listModels(type, provider, false, id))[0],
+        getModelsOfType: (...args) => listModels(false, false, ...args),
+        getAvailableOfType: (...args) => listModels(true, false, ...args),
+        getModelOfType: async (...args) => {
+            const values = JSON.parse(JSON.stringify(args));
+            const [kind, owner, modelId] = values;
+            if (typeof owner !== "string" || typeof modelId !== "string")
+                throw new Error(`models.getModelOfType(type, provider, id) expects three strings, got (${values.map(describeModelArg).join(", ")}). The provider and the id are separate arguments, for example models.getModelOfType("classifier", "typesafe", "jev-latest").`);
+            return (await listModels(false, true, kind, owner, modelId))[0];
+        },
         classify: (model, context) => modelOperation("classify", model, context),
         generateImages: (model, context) => modelOperation("generateImages", model, context),
     });

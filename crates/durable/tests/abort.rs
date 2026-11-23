@@ -338,7 +338,7 @@ async fn abort_dispatched_tool_blocks_replay_across_restart_even_when_safe() {
     h.resume(&CancellationToken::new()).await.unwrap();
     assert_eq!(tool.count.load(Ordering::SeqCst), 1);
     let state = h.conversation(id).unwrap();
-    assert!(state.messages.iter().any(|m| matches!(m, Message::Tool { call_id, content } if call_id == "two" && content.contains("did not start"))));
+    assert!(state.messages.iter().any(|m| matches!(m, Message::Tool { call_id, content, .. } if call_id == "two" && content.contains("did not start"))));
 }
 
 struct Parent {

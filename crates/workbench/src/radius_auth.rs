@@ -1,9 +1,11 @@
 //! OAuth and endpoint-bound credential storage for the Radius gateway.
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use pi_rs::{Error, Result};
+use pi_rs::{CancellationToken, Error, Result};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -18,6 +20,31 @@ const CLIENT_ID: &str = "pi-gateway";
 const SCOPE: &str = "gateway offline_access";
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const REFRESH_PENDING: &str = "_piRsRefreshPending";
+
+fn ambiguous_refresh_error() -> Error {
+    Error::Config("Radius refresh has an unknown outcome; sign in to Radius again".into())
+}
+
+fn pending_entry(gateway: &Url, attempt: &str) -> Value {
+    serde_json::json!({"type":"api_key", (REFRESH_PENDING): {"attempt":attempt, "gateway":gateway.as_str()}})
+}
+
+#[cfg(test)]
+fn pause_crash_fixture(stage: &str) {
+    if std::env::var("PI_RS_RADIUS_CRASH_FIXTURE_STAGE")
+        .ok()
+        .as_deref()
+        != Some(stage)
+    {
+        return;
+    }
+    let dir = std::env::var_os("PI_RS_RADIUS_CRASH_FIXTURE_DIR").expect("fixture directory");
+    std::fs::write(std::path::PathBuf::from(dir).join("stage-ready"), stage).unwrap();
+    loop {
+        std::thread::park();
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum Method {
@@ -156,6 +183,13 @@ impl Gateway {
 
     fn credential(&self) -> Result<Option<Credential>> {
         let value = super::config::read_object(&auth_path())?;
+        self.credential_from_value(&value)
+    }
+
+    fn credential_from_value(&self, value: &Value) -> Result<Option<Credential>> {
+        if self.pending_for_gateway(&value["radius"])? {
+            return Err(ambiguous_refresh_error());
+        }
         let Some(entry) = value.get("radius").filter(|entry| entry["type"] == "oauth") else {
             return Ok(None);
         };
@@ -170,12 +204,47 @@ impl Gateway {
         Ok(Some(credential))
     }
 
+    fn pending_for_gateway(&self, entry: &Value) -> Result<bool> {
+        match entry.get(REFRESH_PENDING) {
+            None | Some(Value::Bool(false)) => Ok(false),
+            Some(Value::Bool(true)) => Ok(entry["gateway"] == self.origin.as_str()),
+            Some(Value::Object(marker)) => {
+                let gateway = marker
+                    .get("gateway")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::Config("Invalid pending Radius refresh".into()))?;
+                Ok(gateway == self.origin.as_str())
+            }
+            Some(_) => Err(Error::Config("Invalid pending Radius refresh".into())),
+        }
+    }
+
     pub(super) fn has_credential(&self) -> Result<bool> {
         Ok(self.credential()?.is_some())
     }
 
-    pub(super) fn cached_access(&self) -> Result<Option<String>> {
-        Ok(self.credential()?.map(|credential| credential.access))
+    /// A pending entry is unusable but remains selectable for logout.
+    pub(super) fn has_stored_credential(&self) -> Result<bool> {
+        let value = super::config::read_object(&auth_path())?;
+        self.has_stored_credential_in(&value)
+    }
+
+    fn has_stored_credential_in(&self, value: &Value) -> Result<bool> {
+        if self.pending_for_gateway(&value["radius"])? {
+            return Ok(true);
+        }
+        Ok(self.credential_from_value(value)?.is_some())
+    }
+
+    pub(super) async fn cached_access(&self) -> Result<Option<String>> {
+        self.cached_access_at(&auth_path()).await
+    }
+
+    pub(super) async fn cached_access_at(&self, path: &std::path::Path) -> Result<Option<String>> {
+        let value = super::config::read_auth_object(path).await?;
+        Ok(self
+            .credential_from_value(&value)?
+            .map(|credential| credential.access))
     }
 
     pub(super) fn cached_login_id(&self) -> Result<Option<String>> {
@@ -189,19 +258,28 @@ impl Gateway {
         };
         let credential = self.credential_from_token(token, None)?;
         let _guard = auth_lock().await?;
-        save(&credential)
+        save_at(&auth_path(), &credential).await
     }
 
     pub(super) async fn logout(&self) -> Result<bool> {
-        let _guard = auth_lock().await?;
-        if !self.has_credential()? {
-            return Ok(false);
-        }
-        super::config::update_object(&auth_path(), |data| {
-            data.remove("radius");
+        self.logout_at(&auth_path()).await
+    }
+
+    async fn logout_at(&self, path: &std::path::Path) -> Result<bool> {
+        let _guard = auth_lock_at(path.parent().expect("auth parent")).await?;
+        let mut removed = false;
+        super::config::update_auth_object(path, |data| {
+            let entry = data.get("radius").unwrap_or(&Value::Null);
+            if self.pending_for_gateway(entry)?
+                || (entry["type"] == "oauth" && entry["gateway"] == self.origin.as_str())
+            {
+                data.remove("radius");
+                removed = true;
+            }
             Ok(())
-        })?;
-        Ok(true)
+        })
+        .await?;
+        Ok(removed)
     }
 
     pub(super) async fn access(&self, min_validity: Duration) -> Result<Option<String>> {
@@ -211,39 +289,173 @@ impl Gateway {
             .map(|(token, _)| token))
     }
 
+    pub(super) async fn access_with_minimum(
+        &self,
+        min_validity: Duration,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .access_with_login_at_before_barrier(
+                auth_path(),
+                min_validity.max(Duration::from_secs(300)),
+                true,
+                || {},
+            )
+            .await?
+            .map(|(token, _)| token))
+    }
+
     pub(super) async fn access_with_login(
         &self,
         min_validity: Duration,
     ) -> Result<Option<(String, String)>> {
-        let Some(credential) = self.credential()? else {
+        self.access_with_login_at(auth_path(), min_validity).await
+    }
+
+    async fn access_with_login_at(
+        &self,
+        path: PathBuf,
+        min_validity: Duration,
+    ) -> Result<Option<(String, String)>> {
+        self.access_with_login_at_before_barrier(path, min_validity, false, || {})
+            .await
+    }
+
+    async fn access_with_login_at_before_barrier(
+        &self,
+        path: PathBuf,
+        min_validity: Duration,
+        require_minimum: bool,
+        before_barrier: impl FnOnce() + Send + 'static,
+    ) -> Result<Option<(String, String)>> {
+        let admission = RefreshCancellation::default();
+        self.access_with_admission_at(
+            path,
+            min_validity,
+            require_minimum,
+            before_barrier,
+            admission.0.clone(),
+        )
+        .await
+    }
+
+    pub(super) async fn access_with_admission(
+        &self,
+        min_validity: Duration,
+        admission: Arc<RefreshAdmission>,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .access_with_admission_at(auth_path(), min_validity, false, || {}, admission)
+            .await?
+            .map(|(token, _)| token))
+    }
+
+    async fn access_with_admission_at(
+        &self,
+        path: PathBuf,
+        min_validity: Duration,
+        require_minimum: bool,
+        before_barrier: impl FnOnce() + Send + 'static,
+        admission: Arc<RefreshAdmission>,
+    ) -> Result<Option<(String, String)>> {
+        let value = admission
+            .until_cancelled(super::config::read_auth_object(&path))
+            .await?;
+        let Some(credential) = self.credential_from_value(&value)? else {
             return Ok(None);
         };
-        let min_validity = u64::try_from(min_validity.as_millis()).unwrap_or(u64::MAX);
+        // Pi refreshes OAuth credentials within five minutes of expiry even
+        // when the caller does not request a longer minimum.
+        let min_validity = u64::try_from(min_validity.max(Duration::from_secs(300)).as_millis())
+            .unwrap_or(u64::MAX);
         if credential.expires > now().saturating_add(min_validity) {
             return Ok(Some(credential.access()));
         }
-        let _guard = auth_lock().await?;
-        let Some(credential) = self.credential()? else {
+        let radius_guard = admission
+            .until_cancelled(auth_lock_at(path.parent().expect("auth parent")))
+            .await?;
+        let guard = admission
+            .until_cancelled(super::auth_lock::acquire_async(&path))
+            .await?;
+        let value = super::config::read_auth_object_locked(&guard)?;
+        let Some(credential) = self.credential_from_value(&value)? else {
             return Ok(None);
         };
+        guard.check()?;
         if credential.expires > now().saturating_add(min_validity) {
             return Ok(Some(credential.access()));
         }
-        let result = self
-            .token(&[
+        let gateway = self.clone();
+        let previous = value["radius"].clone();
+        tokio::task::spawn_blocking(move || {
+            let _radius_guard = radius_guard;
+            before_barrier();
+            let barrier = admission.enter()?;
+            let guard = super::process::guard_refresh_auth(barrier, guard);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| Error::Config("Could not start Radius refresh runtime".into()))?;
+            let fenced = pending_entry(&gateway.origin, &Uuid::new_v4().to_string());
+            // Write and sync the marker before sending: a process crash or a
+            // lost response can make it unclear whether the token rotated.
+            super::config::update_object_locked(&path, Some(&guard), |data| {
+                if data.get("radius") != Some(&previous) {
+                    return Err(Error::Config("Radius credentials changed during refresh".into()));
+                }
+                data.insert("radius".into(), fenced.clone());
+                Ok(())
+            }).map_err(|_| Error::Config("Could not prepare Radius refresh; no request was sent. If a pending entry remains, sign in to Radius again".into()))?;
+            guard.check().map_err(|_| ambiguous_refresh_error())?;
+            #[cfg(test)]
+            pause_crash_fixture("before-send");
+            let token_form = [
                 ("grant_type", "refresh_token"),
                 ("client_id", CLIENT_ID),
                 ("refresh_token", &credential.refresh),
-            ])
-            .await?;
-        let TokenResult::Granted(token) = result else {
-            return Err(Error::Config(
-                "Radius OAuth refresh did not return a token".into(),
-            ));
-        };
-        let refreshed = self.credential_from_token(token, Some(credential))?;
-        save(&refreshed)?;
-        Ok(Some(refreshed.access()))
+            ];
+            let result = runtime
+                .block_on(super::model_auth::with_oauth_refresh_deadline(
+                    "radius",
+                    gateway.token(&token_form),
+                ))
+                .map_err(|_| ambiguous_refresh_error())?;
+            let TokenResult::Granted(token) = result else {
+                return Err(ambiguous_refresh_error());
+            };
+            if token.refresh_token.as_deref().is_none_or(|token| !valid_secret(token)) {
+                return Err(ambiguous_refresh_error());
+            }
+            let refreshed = gateway.credential_from_token(token, Some(credential)).map_err(|_| ambiguous_refresh_error())?;
+            #[cfg(test)]
+            pause_crash_fixture("before-persist");
+            super::config::update_object_locked(&path, Some(&guard), |data| {
+                if data.get("radius") != Some(&fenced) {
+                    return Err(Error::Config(
+                        "Radius credentials changed during refresh".into(),
+                    ));
+                }
+                let mut restored = previous.clone();
+                let current = restored.as_object_mut().ok_or_else(|| Error::Config("Invalid saved Radius credentials".into()))?;
+                let updated = serde_json::to_value(&refreshed)?;
+                for key in ["type", "gateway", "access", "refresh", "expires", "scope", "login_id"] {
+                    if let Some(value) = updated.get(key) { current.insert(key.into(), value.clone()); }
+                    else { current.remove(key); }
+                }
+                current.remove(REFRESH_PENDING);
+                data.insert("radius".into(), restored);
+                Ok(())
+            }).map_err(|_| Error::Config("Radius refreshed credentials could not be durably saved; inspect the saved state and sign in again if needed".into()))?;
+            #[cfg(test)]
+            pause_crash_fixture("after-persist");
+            if require_minimum && refreshed.expires <= now().saturating_add(min_validity) {
+                return Err(Error::Config(
+                    "Refreshed Radius credential expires too soon".into(),
+                ));
+            }
+            Ok(Some(refreshed.access()))
+        })
+        .await
+        .map_err(|_| Error::Config("Radius refresh task failed".into()))?
     }
 
     async fn login_browser(&self, announce: impl Fn(Notice)) -> Result<()> {
@@ -302,7 +514,7 @@ impl Gateway {
             };
             let credential = self.credential_from_token(token, None)?;
             let _guard = auth_lock().await?;
-            save(&credential)
+            save_at(&auth_path(), &credential).await
         }
         .await;
         incoming.reply(result.is_ok()).await;
@@ -425,6 +637,71 @@ impl Gateway {
     }
 }
 
+// Cancellation and admission race on this state. Once admitted, the refresh
+// owns its locks through persistence even when its caller has been cancelled.
+#[derive(Default)]
+pub(super) struct RefreshAdmission {
+    state: AtomicU8,
+    cancelled: CancellationToken,
+}
+
+impl RefreshAdmission {
+    const QUEUED: u8 = 0;
+    const ADMITTED: u8 = 1;
+    const CANCELLED: u8 = 2;
+
+    pub(super) fn cancel(&self) {
+        if self
+            .state
+            .compare_exchange(
+                Self::QUEUED,
+                Self::CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.cancelled.cancel();
+        }
+    }
+
+    async fn until_cancelled<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::select! {
+            biased;
+            _ = self.cancelled.cancelled() => Err(Error::Cancelled),
+            result = operation => result,
+        }
+    }
+
+    fn enter(&self) -> Result<super::process::RefreshBarrier> {
+        let barrier = super::process::refresh_barrier_cancellable(|| {
+            self.state.load(Ordering::SeqCst) == Self::CANCELLED
+        })?
+        .ok_or(Error::Cancelled)?;
+        self.state
+            .compare_exchange(
+                Self::QUEUED,
+                Self::ADMITTED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map_err(|_| Error::Cancelled)?;
+        Ok(barrier)
+    }
+}
+
+#[derive(Default)]
+struct RefreshCancellation(Arc<RefreshAdmission>);
+
+impl Drop for RefreshCancellation {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 pub(super) fn model_endpoint(origin: &Url) -> Url {
     let path = if origin.as_str() == DEFAULT_GATEWAY {
         "/v1/messages"
@@ -474,8 +751,11 @@ fn auth_path() -> PathBuf {
 }
 
 async fn auth_lock() -> Result<std::fs::File> {
-    let directory = super::config::agent_dir();
-    std::fs::create_dir_all(&directory)?;
+    auth_lock_at(&super::config::agent_dir()).await
+}
+
+async fn auth_lock_at(directory: &std::path::Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(directory)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -498,11 +778,12 @@ async fn auth_lock() -> Result<std::fs::File> {
         .map_err(|_| Error::Config("Radius credential storage is busy".into()))?
 }
 
-fn save(credential: &Credential) -> Result<()> {
-    super::config::update_object(&auth_path(), |data| {
+async fn save_at(path: &std::path::Path, credential: &Credential) -> Result<()> {
+    super::config::update_auth_object(path, |data| {
         data.insert("radius".into(), serde_json::to_value(credential)?);
         Ok(())
     })
+    .await
 }
 
 fn valid_secret(value: &str) -> bool {
@@ -530,6 +811,293 @@ fn request_error() -> Error {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pending_entry_matches_upstream_interop_fixture() {
+        let origin = Url::parse("https://radius.pi.dev/").unwrap();
+        assert_eq!(
+            pending_entry(&origin, "fixture"),
+            serde_json::json!({"type":"api_key", "_piRsRefreshPending":{"attempt":"fixture","gateway":"https://radius.pi.dev/"}})
+        );
+    }
+
+    struct FixtureChild(std::process::Child);
+    impl Drop for FixtureChild {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    async fn read_refresh_form(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&buffer[..count]);
+            if let Some(pos) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..pos]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(|value| value.parse().unwrap())
+                    })
+                    .unwrap();
+                if request.len() >= pos + 4 + length {
+                    return String::from_utf8(request[pos + 4..pos + 4 + length].to_vec()).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn killed_refresh_at_persistence_boundaries_does_not_reuse_old_token() {
+        use tokio::io::AsyncWriteExt;
+        for stage in ["before-send", "before-persist", "after-persist"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("auth.json");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin =
+                Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+            std::fs::write(&path, serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0},"other":{"key":"keep"}}).to_string()).unwrap();
+            let mut child = FixtureChild(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "radius_auth::tests::refresh_crash_worker",
+                        "--nocapture",
+                    ])
+                    .env("PI_RS_RADIUS_CRASH_FIXTURE_DIR", dir.path())
+                    .env("PI_RS_RADIUS_CRASH_FIXTURE_ORIGIN", origin.as_str())
+                    .env("PI_RS_RADIUS_CRASH_FIXTURE_STAGE", stage)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            if stage != "before-send" {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let body =
+                    tokio::time::timeout(Duration::from_secs(5), read_refresh_form(&mut socket))
+                        .await
+                        .unwrap();
+                assert!(body.contains("refresh_token=old-refresh"));
+                let response =
+                    r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
+            }
+            let ready = dir.path().join("stage-ready");
+            let result = tokio::time::timeout(Duration::from_secs(10), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            if result.is_err() {
+                panic!("worker did not reach {stage}");
+            }
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+            std::fs::remove_dir_all(dir.path().join("auth.json.lock")).unwrap();
+            let stored = super::super::config::read_auth_object(&path).await.unwrap();
+            let gateway = Gateway::build(origin, &[], None).unwrap();
+            if stage == "after-persist" {
+                assert_eq!(stored["radius"]["refresh"], "rotated");
+                assert_eq!(
+                    gateway
+                        .access_with_login_at(path, Duration::ZERO)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .0,
+                    "new"
+                );
+            } else {
+                assert!(stored["radius"][REFRESH_PENDING].is_object());
+                assert!(!stored.to_string().contains("old-refresh"));
+                assert!(
+                    gateway
+                        .access_with_login_at(path, Duration::ZERO)
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(stored["other"]["key"], "keep");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_crash_worker() {
+        let Some(directory) = std::env::var_os("PI_RS_RADIUS_CRASH_FIXTURE_DIR") else {
+            return;
+        };
+        let origin =
+            Url::parse(&std::env::var("PI_RS_RADIUS_CRASH_FIXTURE_ORIGIN").unwrap()).unwrap();
+        let path = std::path::PathBuf::from(directory).join("auth.json");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = runtime.block_on(
+            Gateway::build(origin, &[], None)
+                .unwrap()
+                .access_with_login_at(path, Duration::ZERO),
+        );
+    }
+
+    #[tokio::test]
+    async fn killed_refresh_process_leaves_durable_ambiguous_marker() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        std::fs::write(&path, serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0},"other":{"key":"keep"}}).to_string()).unwrap();
+        let mut child = FixtureChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "radius_auth::tests::refresh_crash_worker",
+                    "--nocapture",
+                ])
+                .env("PI_RS_RADIUS_CRASH_FIXTURE_DIR", dir.path())
+                .env("PI_RS_RADIUS_CRASH_FIXTURE_ORIGIN", origin.as_str())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
+        if accepted.is_err() {
+            panic!("refresh worker never reached server");
+        }
+        let (mut socket, _) = accepted.unwrap().unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut data = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                data.extend_from_slice(&buffer[..count]);
+                if let Some(pos) = data.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&data[..pos]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(|value| value.parse().unwrap())
+                        })
+                        .unwrap();
+                    if data.len() >= pos + 4 + length {
+                        break data[pos + 4..pos + 4 + length].to_vec();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(String::from_utf8_lossy(&request).contains("refresh_token=old-refresh"));
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let error = super::super::auth_lock::acquire(&path)
+            .err()
+            .expect("killed worker leaves a stale lock");
+        assert!(
+            error
+                .to_string()
+                .contains("stop all Pi and pi-rs processes")
+        );
+        // The killed fixture alone owned this lock. Real stores require all Pi
+        // processes to stop before recovering a stale lock.
+        std::fs::remove_dir_all(dir.path().join("auth.json.lock")).unwrap();
+        let stored = super::super::config::read_auth_object(&path).await.unwrap();
+        assert_eq!(stored["radius"]["type"], "api_key");
+        assert!(stored["radius"][REFRESH_PENDING].is_object());
+        assert_eq!(stored["other"]["key"], "keep");
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        assert!(
+            gateway
+                .access_with_login_at(path.clone(), Duration::ZERO)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown outcome")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        );
+        assert!(gateway.logout_at(&path).await.unwrap());
+        let after = super::super::config::read_auth_object(&path).await.unwrap();
+        assert!(after.get("radius").is_none());
+        assert_eq!(after["other"]["key"], "keep");
+    }
+
+    #[tokio::test]
+    async fn cached_access_waits_cancellably_without_refreshing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let origin = Url::parse("http://127.0.0.1:1/").unwrap();
+        std::fs::write(&path, serde_json::json!({"radius":{
+            "type":"oauth", "gateway":origin.as_str(), "access":"old", "refresh":"old-refresh", "expires":0
+        }}).to_string()).unwrap();
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        let held = super::super::auth_lock::acquire_async(&path).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(120), gateway.cached_access_at(&path))
+                .await
+                .is_err()
+        );
+        drop(held);
+        assert_eq!(
+            gateway.cached_access_at(&path).await.unwrap().as_deref(),
+            Some("old")
+        );
+    }
+
+    #[tokio::test]
+    async fn login_save_waits_for_shared_auth_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"other":{"type":"api_key","key":"keep"}}"#).unwrap();
+        let held = super::super::auth_lock::acquire_async(&path).await.unwrap();
+        let mut save = tokio::spawn({
+            let path = path.clone();
+            async move {
+                let credential: Credential = serde_json::from_value(serde_json::json!({
+                "type":"oauth", "gateway":"https://radius.example/", "access":"new", "refresh":"new-refresh", "expires":123
+            })).unwrap();
+                save_at(&path, &credential).await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut save)
+                .await
+                .is_err()
+        );
+        drop(held);
+        save.await.unwrap().unwrap();
+        let value = super::super::config::read_auth_object(&path).await.unwrap();
+        assert_eq!(value["radius"]["refresh"], "new-refresh");
+        assert_eq!(value["other"]["key"], "keep");
+    }
+
     #[tokio::test]
     async fn refresh_token_request_uses_configured_proxy() {
         let (proxy, server) = super::super::http_proxy::test_proxy(
@@ -555,5 +1123,581 @@ mod tests {
                 .unwrap()
                 .contains("refresh_token=fixture-refresh")
         );
+    }
+    // The barrier is deliberately held while the asynchronous caller is cancelled;
+    // only the blocking worker waits for this synchronous guard.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn cancelled_queued_refresh_never_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let original = serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0}}).to_string();
+        std::fs::write(&path, &original).unwrap();
+        let barrier = super::super::process::stop_new_refreshes();
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let refresh = tokio::spawn({
+            let path = path.clone();
+            async move {
+                gateway
+                    .access_with_login_at_before_barrier(path, Duration::ZERO, false, || {
+                        let _ = started.send(());
+                    })
+                    .await
+            }
+        });
+        // The blocking worker has started and owns auth.json, but the barrier
+        // prevents admission until after cancellation.
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        refresh.abort();
+        assert!(refresh.await.unwrap_err().is_cancelled());
+        drop(barrier);
+        let guard = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::super::auth_lock::acquire_async(&path),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn refresh_persists_rotated_token_and_checks_explicit_validity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for require_minimum in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("auth.json");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin =
+                Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+            std::fs::write(&path, serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0}}).to_string()).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":120}"#;
+                stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            });
+            let gateway = Gateway::build(origin, &[], None).unwrap();
+            let result = gateway
+                .access_with_login_at_before_barrier(
+                    path.clone(),
+                    Duration::from_secs(300),
+                    require_minimum,
+                    || {},
+                )
+                .await;
+            if require_minimum {
+                assert!(result.unwrap_err().to_string().contains("expires too soon"));
+            } else {
+                assert_eq!(result.unwrap().unwrap().0, "new");
+            }
+            server.await.unwrap();
+            let stored = super::super::config::read_auth_object(&path).await.unwrap();
+            assert_eq!(stored["radius"]["refresh"], "rotated");
+            assert_eq!(stored["radius"]["access"], "new");
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_access_refreshes_within_five_minutes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        std::fs::write(&path, serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":now() + 120_000}}).to_string()).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":120}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            gateway.access_with_login_at(path.clone(), Duration::ZERO),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.0, "new");
+        server.await.unwrap();
+        let stored = super::super::config::read_auth_object(&path).await.unwrap();
+        assert_eq!(stored["radius"]["refresh"], "rotated");
+    }
+
+    #[tokio::test]
+    async fn pending_refresh_can_be_recovered_by_logout_or_fresh_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let origin = Url::parse("https://radius.example/").unwrap();
+        let marker = serde_json::json!({"type":"api_key",(REFRESH_PENDING):{"attempt":"fixture","gateway":origin.as_str()}});
+        std::fs::write(
+            &path,
+            serde_json::json!({"radius":marker,"other":{"key":"keep"}}).to_string(),
+        )
+        .unwrap();
+        let wrong =
+            Gateway::build(Url::parse("https://other.example/").unwrap(), &[], None).unwrap();
+        assert!(!wrong.logout_at(&path).await.unwrap());
+        let gateway = Gateway::build(origin.clone(), &[], None).unwrap();
+        let pending = super::super::config::read_auth_object(&path).await.unwrap();
+        assert!(gateway.has_stored_credential_in(&pending).unwrap());
+        assert!(!wrong.has_stored_credential_in(&pending).unwrap());
+        let keys = super::super::model_auth::Keys::parse(&pending);
+        assert!(
+            !keys.has(&super::super::Provider::Radius),
+            "the generic API-key picker must not duplicate the pending OAuth entry"
+        );
+        assert!(gateway.logout_at(&path).await.unwrap());
+        let stored = super::super::config::read_auth_object(&path).await.unwrap();
+        assert!(stored.get("radius").is_none());
+        assert_eq!(stored["other"]["key"], "keep");
+        std::fs::write(
+            &path,
+            serde_json::json!({"radius":marker,"other":{"key":"keep"}}).to_string(),
+        )
+        .unwrap();
+        let fresh = Credential {
+            kind: "oauth".into(),
+            gateway: origin.to_string(),
+            access: "new".into(),
+            refresh: "new-refresh".into(),
+            expires: now() + 3_600_000,
+            scope: None,
+            login_id: None,
+        };
+        save_at(&path, &fresh).await.unwrap();
+        assert_eq!(
+            gateway
+                .access_with_login_at(path.clone(), Duration::ZERO)
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            "new"
+        );
+        let stored = super::super::config::read_auth_object(&path).await.unwrap();
+        assert!(stored["radius"].get(REFRESH_PENDING).is_none());
+        assert_eq!(stored["other"]["key"], "keep");
+    }
+
+    #[tokio::test]
+    async fn storage_failures_at_commit_boundaries_do_not_replay_a_sent_token() {
+        use tokio::io::AsyncWriteExt;
+        for pending_write in [true, false] {
+            let stages: &[&str] = if cfg!(unix) {
+                &["file-sync", "rename", "directory-sync"]
+            } else {
+                &["file-sync", "rename"]
+            };
+            for &stage in stages {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("auth.json");
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let origin =
+                    Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+                std::fs::write(&path, serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0},"other":{"key":"keep"}}).to_string()).unwrap();
+                super::super::config::fail_json_write_for_test(&path, pending_write, stage);
+                let gateway = Gateway::build(origin, &[], None).unwrap();
+                let refresh = tokio::spawn({
+                    let path = path.clone();
+                    let gateway = gateway.clone();
+                    async move { gateway.access_with_login_at(path, Duration::ZERO).await }
+                });
+                if !pending_write {
+                    let (mut socket, _) =
+                        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    let request = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        read_refresh_form(&mut socket),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(request.contains("refresh_token=old-refresh"));
+                    let body =
+                        r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+                let error = refresh.await.unwrap().unwrap_err();
+                assert!(error.to_string().contains(if pending_write {
+                    "no request was sent"
+                } else {
+                    "could not be durably saved"
+                }));
+                let stored = super::super::config::read_auth_object(&path).await.unwrap();
+                assert_eq!(stored["other"]["key"], "keep");
+                if !pending_write || stage == "directory-sync" {
+                    assert!(!stored.to_string().contains("old-refresh"));
+                    if stored["radius"][REFRESH_PENDING].is_object() {
+                        assert!(
+                            gateway
+                                .access_with_login_at(path.clone(), Duration::ZERO)
+                                .await
+                                .is_err()
+                        );
+                    } else {
+                        assert_eq!(stored["radius"]["refresh"], "rotated");
+                        assert_eq!(
+                            gateway
+                                .access_with_login_at(path.clone(), Duration::ZERO)
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .0,
+                            "new"
+                        );
+                    }
+                } else {
+                    assert_eq!(stored["radius"]["refresh"], "old-refresh");
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_response_without_replacement_token_remains_pending() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        std::fs::write(&path, serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0}}).to_string()).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            let body = r#"{"access_token":"new","expires_in":3600}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        let error = gateway
+            .access_with_login_at(path.clone(), Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("sign in to Radius again"));
+        server.await.unwrap();
+        let stored = super::super::config::read_auth_object(&path).await.unwrap();
+        assert!(stored["radius"][REFRESH_PENDING].is_object());
+        assert!(!stored.to_string().contains("old-refresh"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn unwritable_store_prevents_refresh_request() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let original = serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0}}).to_string();
+        std::fs::write(&path, &original).unwrap();
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        let directory = dir.path().to_owned();
+        let result = gateway
+            .access_with_login_at_before_barrier(path.clone(), Duration::ZERO, false, move || {
+                std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+                    .unwrap();
+            })
+            .await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn replacement_write_failure_keeps_pending_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        std::fs::write(&path, serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0},"other":{"key":"keep"}}).to_string()).unwrap();
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        let refresh = tokio::spawn({
+            let gateway = gateway.clone();
+            let path = path.clone();
+            async move { gateway.access_with_login_at(path, Duration::ZERO).await }
+        });
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        let body_start = loop {
+            let n = socket.read(&mut buffer).await.unwrap();
+            assert!(n > 0);
+            request.extend_from_slice(&buffer[..n]);
+            if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..pos]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(|n| n.parse().unwrap())
+                    })
+                    .unwrap();
+                if request.len() >= pos + 4 + length {
+                    break pos + 4;
+                }
+            }
+        };
+        assert!(
+            String::from_utf8_lossy(&request[body_start..]).contains("refresh_token=old-refresh")
+        );
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let result = refresh.await.unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        let lock = dir.path().join("auth.json.lock");
+        if lock.exists() {
+            std::fs::remove_dir_all(lock).unwrap();
+        }
+        let stored = super::super::config::read_auth_object(&path).await.unwrap();
+        assert_eq!(stored["radius"]["type"], "api_key");
+        assert!(stored["radius"][REFRESH_PENDING].is_object());
+        assert!(!stored.to_string().contains("old-refresh"));
+        assert_eq!(stored["other"]["key"], "keep");
+        assert!(
+            gateway
+                .access_with_login_at(path, Duration::ZERO)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_refresh_is_not_retried_and_cached_access_fails_closed() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        std::fs::write(&path, serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0,"extra":"keep"},"other":{"key":"keep"}}).to_string()).unwrap();
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        let refresh = tokio::spawn({
+            let gateway = gateway.clone();
+            let path = path.clone();
+            async move { gateway.access_with_login_at(path, Duration::ZERO).await }
+        });
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = [0; 4096];
+        assert!(stream.read(&mut data).await.unwrap() > 0);
+        let stored = super::super::config::read_object_unlocked(&path).unwrap();
+        assert_eq!(stored["radius"]["type"], "api_key");
+        assert!(stored["radius"][REFRESH_PENDING].is_object());
+        drop(stream);
+        assert!(
+            refresh
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("sign in to Radius again")
+        );
+        let retry = gateway
+            .access_with_login_at(path.clone(), Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(retry.to_string().contains("unknown outcome"));
+        assert!(gateway.cached_access_at(&path).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        );
+        let stored = super::super::config::read_auth_object(&path).await.unwrap();
+        assert!(!stored.to_string().contains("old-refresh"));
+        assert!(!stored.to_string().contains("old\""));
+        assert_eq!(stored["other"]["key"], "keep");
+    }
+
+    #[tokio::test]
+    async fn concurrent_refreshers_share_one_rotated_credential() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        std::fs::write(&path, serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0}}).to_string()).unwrap();
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        let first = tokio::spawn({
+            let gateway = gateway.clone();
+            let path = path.clone();
+            async move { gateway.access_with_login_at(path, Duration::ZERO).await }
+        });
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let body = read_refresh_form(&mut socket).await;
+        assert!(body.contains("refresh_token=old-refresh"));
+        let second = tokio::spawn({
+            let gateway = gateway.clone();
+            let path = path.clone();
+            async move { gateway.access_with_login_at(path, Duration::ZERO).await }
+        });
+        let response = r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.await.unwrap().unwrap().unwrap().0, "new");
+        assert_eq!(second.await.unwrap().unwrap().unwrap().0, "new");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn rotating_refresh_holds_shared_store_lock_until_persisted() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        std::fs::write(&path, serde_json::json!({"radius":{"type":"oauth","gateway":origin.as_str(),"access":"old","refresh":"old-refresh","expires":0,"extra":"keep"},"other":{"type":"api_key","key":"keep"}}).to_string()).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut data = [0; 4096];
+            assert!(stream.read(&mut data).await.unwrap() > 0);
+            started_tx.send(()).unwrap();
+            reply_rx.await.unwrap();
+            let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let gateway = Gateway::build(origin, &[], None).unwrap();
+        let refresh = tokio::spawn({
+            let path = path.clone();
+            async move { gateway.access_with_login_at(path, Duration::ZERO).await }
+        });
+        started_rx.await.unwrap();
+        let mut contender = tokio::spawn({
+            let path = path.clone();
+            async move { super::super::auth_lock::acquire_async(&path).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut contender)
+                .await
+                .is_err()
+        );
+        // Cancellation must not drop the rotating exchange or the shared lock.
+        refresh.abort();
+        reply_tx.send(()).unwrap();
+        server.await.unwrap();
+        let guard = tokio::time::timeout(Duration::from_secs(3), contender)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let stored = super::super::config::read_object_unlocked(&path).unwrap();
+        assert_eq!(stored["radius"]["refresh"], "rotated");
+        assert!(stored["radius"].get(REFRESH_PENDING).is_none());
+        assert_eq!(stored["radius"]["extra"], "keep");
+        assert_eq!(stored["other"]["key"], "keep");
+        drop(guard);
     }
 }

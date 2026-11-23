@@ -458,7 +458,9 @@ fn wire_request_with_blocks(
                 }
                 push_content(&mut contents, "model", parts, false);
             }
-            Message::Tool { call_id, content } => {
+            Message::Tool {
+                call_id, content, ..
+            } => {
                 let Some((name, id)) = calls.get(call_id.as_str()) else {
                     return Err(Error::Model(
                         "Google tool result has no preceding call".into(),

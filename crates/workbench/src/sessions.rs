@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use pi_rs::{Error, Event, Result, Session};
+use pi_rs::{Error, Event, Record, Result, Session};
 use serde::Serialize;
 
 pub fn validate_name(value: &str) -> std::result::Result<String, String> {
@@ -34,15 +34,20 @@ pub fn resolve_reference(input: &Path, directory: &Path) -> Result<PathBuf> {
     if input.is_file() || input.components().count() != 1 {
         return Ok(input.to_path_buf());
     }
+    let explicit_filename = input
+        .extension()
+        .is_some_and(|extension| extension == "jsonl");
     let Some(query) = input.to_str().filter(|query| !query.is_empty()) else {
         return Ok(input.to_path_buf());
     };
-    if !directory.is_dir() {
-        return Ok(input.to_path_buf());
-    }
     let mut matches = Vec::new();
     let mut exact_ids = Vec::new();
-    for entry in std::fs::read_dir(directory)? {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries.into_iter().flatten() {
         let path = entry?.path();
         if path
             .extension()
@@ -58,11 +63,14 @@ pub fn resolve_reference(input: &Path, directory: &Path) -> Result<PathBuf> {
         if stem == query {
             return Ok(path);
         }
-        let id = stored_id(&path).unwrap_or_default();
-        if id == query {
+        let (external_id, native_id) = stored_ids(&path).unwrap_or_default();
+        let ids = [Some(external_id.as_str()), native_id.as_deref()];
+        if ids.iter().flatten().any(|id| *id == query) {
             exact_ids.push(path.clone());
         }
-        if stem.starts_with(query) || id.starts_with(query) {
+        if !explicit_filename
+            && (stem.starts_with(query) || ids.iter().flatten().any(|id| id.starts_with(query)))
+        {
             matches.push(path);
         }
     }
@@ -70,7 +78,10 @@ pub fn resolve_reference(input: &Path, directory: &Path) -> Result<PathBuf> {
         matches = exact_ids;
     }
     match matches.len() {
-        0 => Ok(input.to_path_buf()),
+        0 if explicit_filename => Ok(input.to_path_buf()),
+        0 => Err(Error::Config(format!(
+            "No session found matching '{query}'"
+        ))),
         1 => Ok(matches.remove(0)),
         _ => Err(Error::Config(format!(
             "ambiguous session ID {query:?}; use a longer ID or a file path"
@@ -123,16 +134,52 @@ fn sort_by_activity(paths: &mut [PathBuf]) {
     });
 }
 
-fn stored_id(path: &Path) -> Option<String> {
+fn stored_ids(path: &Path) -> Option<(String, Option<String>)> {
     use std::io::{BufRead, Read};
     let mut line = String::new();
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?).take(1024 * 1024);
-    reader.read_line(&mut line).ok()?;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    reader
+        .by_ref()
+        .take(1024 * 1024)
+        .read_line(&mut line)
+        .ok()?;
     let record: serde_json::Value = serde_json::from_str(&line).ok()?;
-    record["event"]["session_id"]
-        .as_str()
-        .or_else(|| record["id"].as_str())
-        .map(str::to_owned)
+    let Some(native_id) = record["event"]["session_id"].as_str() else {
+        return record["id"].as_str().map(|id| (id.to_owned(), None));
+    };
+    let fallback = || Some((native_id.to_owned(), None));
+    if record["event"]["type"] != "created" || record["id"] != 1 {
+        return fallback();
+    }
+    line.clear();
+    // The external ID is the first imported record. Bound the read to the
+    // journal's maximum record size and verify ownership, including on forks.
+    if reader
+        .by_ref()
+        .take(16 * 1024 * 1024 + 1)
+        .read_line(&mut line)
+        .is_err()
+        || line.len() > 16 * 1024 * 1024
+    {
+        return fallback();
+    }
+    let Ok(next) = serde_json::from_str::<serde_json::Value>(&line) else {
+        return fallback();
+    };
+    let event = &next["event"];
+    if next["id"] == 2
+        && next["parent"] == 1
+        && event["type"] == "source_entry"
+        && event["format"] == "pi-rs:external-session-id"
+        && event["entry"]["native_id"].as_str() == Some(native_id)
+        && let Some(id) = event["entry"]["id"].as_str()
+    {
+        return Some((
+            id.to_owned(),
+            (id != native_id).then(|| native_id.to_owned()),
+        ));
+    }
+    fallback()
 }
 
 #[derive(Serialize)]
@@ -222,12 +269,26 @@ pub fn fork(
     destination: &Path,
     workspace: &Path,
 ) -> Result<()> {
-    let mut copy = Session::from_records(session.fork_records(target)?)?;
+    let mut copy = session.fork_session(target)?;
     copy.set_parent_session(&source.to_string_lossy())?;
     copy.set_working_directory(workspace)?;
     if let Some(name) = session.name() {
         copy.set_name(name)?;
     }
+    copy.export_jsonl(destination)
+}
+
+pub fn fork_full_history_when_inert(
+    session: &Session,
+    source: &Path,
+    destination: &Path,
+    workspace: &Path,
+) -> Result<()> {
+    let Some(mut copy) = session.fork_inert_full_history()? else {
+        return fork(session, source, session.head(), destination, workspace);
+    };
+    copy.set_parent_session(&source.to_string_lossy())?;
+    copy.set_working_directory(workspace)?;
     copy.export_jsonl(destination)
 }
 
@@ -341,14 +402,53 @@ pub fn html(session: &Session) -> String {
                 content, images, ..
             } => render_user_html(&mut html, content, images),
             Event::UserImages { images } => html.push_str(&images_html(images)),
-            Event::CustomMessage { message } if message.display => {
+            Event::CustomMessage { message } | Event::CustomMessageDelivered { message, .. } => {
+                // Older unmarked journals are ambiguous when a native message
+                // exactly matches the legacy source. Prefer hiding that content.
+                let legacy = {
+                    record
+                        .parent
+                        .and_then(|id| id.checked_sub(1))
+                        .and_then(|index| usize::try_from(index).ok())
+                        .and_then(|index| session.records().get(index))
+                        .is_some_and(|parent| match &parent.event {
+                            Event::SourceEntry { format, entry }
+                                if format == "pi"
+                                    && entry["type"] == "message"
+                                    && matches!(
+                                        entry["message"]["role"].as_str(),
+                                        Some("custom" | "hookMessage")
+                                    ) =>
+                            {
+                                super::session_import::imported_custom_message(
+                                    &entry["message"],
+                                    true,
+                                )
+                                .ok()
+                                .is_some_and(|original| {
+                                    serde_json::to_value(original)
+                                        .ok()
+                                        .zip(serde_json::to_value(message).ok())
+                                        .is_some_and(|(original, message)| original == message)
+                                })
+                            }
+                            _ => false,
+                        })
+                };
+                let show = message.display || !legacy;
+                if !show {
+                    continue;
+                }
                 html.push_str(&format!("<article><b>{}</b>", escape(&message.custom_type)));
+                if !message.display {
+                    html.push_str(" <span>Hidden in terminal</span>");
+                }
                 match &message.content {
                     pi_rs::ContextContent::Text(text) => render_export_markdown(&mut html, text),
                     pi_rs::ContextContent::Blocks(blocks) => {
                         for block in blocks {
                             match block {
-                                pi_rs::ContentBlock::Text { text } => {
+                                pi_rs::ContentBlock::Text { text, .. } => {
                                     render_export_markdown(&mut html, text)
                                 }
                                 pi_rs::ContentBlock::Image { data, mime_type } => {
@@ -414,6 +514,24 @@ pub fn html(session: &Session) -> String {
                         _ => {}
                     }
                 }
+            }
+            Event::ImportedUnattributedToolResult {
+                call_id,
+                tool_name,
+                content,
+                is_error,
+                details,
+                ..
+            } => {
+                html.push_str(&format!(
+                    "<p>Unattributed tool result: {} (call {}, {})</p>",
+                    escape(tool_name),
+                    escape(call_id),
+                    if *is_error { "error" } else { "success" }
+                ));
+                html.push_str(&tool_html(&unattributed_outcome(
+                    content, *is_error, details,
+                )));
             }
             Event::ToolFinished { outcome, .. } | Event::ToolReconciled { outcome, .. } => {
                 html.push_str(&tool_html(outcome))
@@ -681,6 +799,43 @@ fn images_html(images: &[pi_rs::ImageContent]) -> String {
         "<img alt=\"Attached image\" style=\"max-width:100%;height:auto\" src=\"data:{};base64,{}\">", image.mime_type, image.data
     )).collect()
 }
+pub(super) fn unattributed_outcome(
+    content: &pi_rs::ContextContent,
+    is_error: bool,
+    details: &Option<serde_json::Value>,
+) -> pi_rs::Outcome {
+    match content {
+        pi_rs::ContextContent::Text(text) => pi_rs::Outcome::TextResult {
+            output: text.clone(),
+            is_error,
+            details: details.clone(),
+        },
+        pi_rs::ContextContent::Blocks(blocks)
+            if blocks
+                .iter()
+                .all(|block| matches!(block, pi_rs::ContentBlock::Text { .. })) =>
+        {
+            pi_rs::Outcome::TextResult {
+                output: blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        pi_rs::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+                is_error,
+                details: details.clone(),
+            }
+        }
+        pi_rs::ContextContent::Blocks(blocks) => pi_rs::Outcome::StructuredWithDetails {
+            data: serde_json::json!({"content":blocks,"isError":is_error}),
+            attachments: Vec::new(),
+            details: details.clone().unwrap_or(serde_json::Value::Null),
+        },
+    }
+}
+
 fn tool_html(outcome: &pi_rs::Outcome) -> String {
     let mut value = serde_json::to_value(outcome).expect("serializable outcome");
     let mut images = Vec::new();
@@ -714,6 +869,71 @@ pub fn copy_last(session: &Session) -> Result<()> {
     copy_text(&text)
 }
 
+pub(super) fn tree_context_text(content: &pi_rs::ContextContent) -> std::borrow::Cow<'_, str> {
+    match content {
+        pi_rs::ContextContent::Text(text) => std::borrow::Cow::Borrowed(text),
+        pi_rs::ContextContent::Blocks(blocks) => std::borrow::Cow::Owned(
+            blocks
+                .iter()
+                .filter_map(|block| match block {
+                    pi_rs::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+        ),
+    }
+}
+
+pub(super) fn tree_imported_system_text<'a>(
+    session: &Session,
+    record: &'a Record,
+) -> Option<&'a str> {
+    let Event::SystemCheckpoint { content, .. } = &record.event else {
+        return None;
+    };
+    let source = tree_parent(session, record)?;
+    matches!(&source.event, Event::SourceEntry { format, entry }
+        if format == "pi" && entry["type"] == "message" && entry["message"]["role"] == "system")
+    .then_some(content.as_str())
+}
+
+pub(super) fn tree_assistant_completion<'a>(
+    session: &'a Session,
+    assistant: &Record,
+) -> Option<&'a Record> {
+    let Event::Assistant {
+        request_id: Some(request_id),
+        ..
+    } = &assistant.event
+    else {
+        return None;
+    };
+    let parent = tree_parent(session, assistant)?;
+    matches!(parent.event, Event::ModelFinished { request_id: id, .. } if id == *request_id)
+        .then_some(parent)
+}
+
+pub(super) fn tree_completion_error<'a>(
+    session: &'a Session,
+    completion: &Record,
+) -> Option<&'a str> {
+    let source = tree_parent(session, completion)?;
+    let Event::SourceEntry { format, entry } = &source.event else {
+        return None;
+    };
+    if format == "pi" && entry["message"]["role"] == "assistant" {
+        entry["message"]["errorMessage"].as_str()
+    } else {
+        None
+    }
+}
+
+fn tree_parent<'a>(session: &'a Session, record: &Record) -> Option<&'a Record> {
+    session
+        .records()
+        .get(record.parent?.checked_sub(1)? as usize)
+}
+
 pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
     use std::borrow::Cow;
 
@@ -722,16 +942,29 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
         .get(id.saturating_sub(1) as usize)
         .filter(|record| record.id == id)
         .and_then(|record| match &record.event {
-            Event::User { content, .. }
-            | Event::UserWithImages { content, .. }
-            | Event::Assistant { content, .. } => Some(Cow::Borrowed(content.as_str())),
+            Event::User { content, .. } | Event::UserWithImages { content, .. } => {
+                Some(Cow::Borrowed(content.as_str()))
+            }
+            Event::Assistant { content, .. } => {
+                if content.is_empty() {
+                    tree_assistant_completion(session, record)
+                        .and_then(|completion| tree_completion_error(session, completion))
+                        .map(Cow::Borrowed)
+                } else {
+                    Some(Cow::Borrowed(content.as_str()))
+                }
+            }
             Event::BashExecution { execution } => Some(Cow::Borrowed(execution.command.as_str())),
             Event::ToolFinished {
-                outcome: pi_rs::Outcome::Structured { data, .. },
+                outcome:
+                    pi_rs::Outcome::Structured { data, .. }
+                    | pi_rs::Outcome::StructuredWithDetails { data, .. },
                 ..
             }
             | Event::ToolReconciled {
-                outcome: pi_rs::Outcome::Structured { data, .. },
+                outcome:
+                    pi_rs::Outcome::Structured { data, .. }
+                    | pi_rs::Outcome::StructuredWithDetails { data, .. },
                 ..
             } => data["content"]
                 .as_array()
@@ -742,20 +975,35 @@ pub fn tree_record_text(session: &Session, id: u64) -> Result<String> {
                             .filter(|block| block["type"] == "text")
                             .filter_map(|block| block["text"].as_str())
                             .collect::<Vec<_>>()
-                            .join("\n"),
+                            .concat(),
                     )
                 })
                 .or_else(|| data["output"].as_str().map(Cow::Borrowed)),
             Event::ToolFinished { outcome, .. } | Event::ToolReconciled { outcome, .. } => {
                 Some(Cow::Owned(outcome.tool_content()))
             }
+            Event::ImportedUnattributedToolResult { content, .. } => {
+                Some(tree_context_text(content))
+            }
+            Event::CustomMessage { message } | Event::CustomMessageDelivered { message, .. } => {
+                Some(tree_context_text(&message.content))
+            }
             Event::ModelFinished {
                 failure: Some(_),
                 partial,
                 ..
-            } => Some(Cow::Borrowed(partial.as_str())),
-            Event::Compacted { summary, .. } | Event::BranchSummary { summary, .. } => {
-                Some(Cow::Borrowed(summary.as_str()))
+            } => {
+                if partial.is_empty() {
+                    tree_completion_error(session, record).map(Cow::Borrowed)
+                } else {
+                    Some(Cow::Borrowed(partial.as_str()))
+                }
+            }
+            Event::Compacted { summary, .. }
+            | Event::CompactionSummaryMessage { summary, .. }
+            | Event::BranchSummary { summary, .. } => Some(Cow::Borrowed(summary.as_str())),
+            Event::SystemCheckpoint { .. } => {
+                tree_imported_system_text(session, record).map(Cow::Borrowed)
             }
             _ => None,
         })
@@ -800,6 +1048,61 @@ pub fn copy_text(text: &str) -> Result<()> {
         }
     }
     Err(Error::Config("no working clipboard command found".into()))
+}
+
+// Async variant for cancellable device-code actions. Dropping the future
+// terminates an in-progress clipboard process rather than leaving a late write.
+pub(super) async fn copy_text_async(text: &str) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else if cfg!(windows) {
+        &[("clip", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+    for (program, arguments) in candidates {
+        let mut command = tokio::process::Command::new(program);
+        command
+            .args(*arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let mut stdin = child.stdin.take().expect("piped clipboard");
+        let result = stdin.write_all(text.as_bytes()).await;
+        drop(stdin);
+        let status = child.wait().await?;
+        result?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    Err(Error::Config("no working clipboard command found".into()))
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ShareContext {
+    pub system_prompt: String,
+    pub tools: Vec<pi_rs::ToolSpec>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ShareSnapshot {
+    pub session_id: uuid::Uuid,
+    pub head: u64,
+    pub context: ShareContext,
 }
 
 pub(super) enum ShareDestination {
@@ -864,6 +1167,10 @@ impl ShareDestination {
         })
     }
 
+    pub(super) fn is_radius(&self) -> bool {
+        matches!(self, Self::Radius { .. })
+    }
+
     pub(super) fn status(&self) -> &'static str {
         match self {
             Self::Radius { .. } => "Uploading to Radius",
@@ -871,7 +1178,23 @@ impl ShareDestination {
         }
     }
 
-    pub(super) async fn share(self, session: Session, workspace: &Path) -> Result<SharedSession> {
+    pub(super) async fn share(
+        self,
+        session: Session,
+        workspace: &Path,
+        snapshot: Option<ShareSnapshot>,
+    ) -> Result<SharedSession> {
+        self.share_with_broker(session, workspace, snapshot, None)
+            .await
+    }
+
+    pub(super) async fn share_with_broker(
+        self,
+        session: Session,
+        workspace: &Path,
+        snapshot: Option<ShareSnapshot>,
+        refresh: Option<&super::share_refresh::Broker>,
+    ) -> Result<SharedSession> {
         match self {
             Self::Radius {
                 mut endpoint,
@@ -879,17 +1202,33 @@ impl ShareDestination {
                 proxies,
                 idle_timeout,
             } => {
+                if snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.session_id != session.session_id() || snapshot.head != session.head()
+                }) {
+                    return Err(Error::Config(
+                        "Session changed while preparing the share; try again".into(),
+                    ));
+                }
+                let context = snapshot;
                 let body = super::rpc_entries::Entries::new(&session)
-                    .write_share_branch(&session, workspace)?;
+                    .write_share_branch_with_context(
+                        &session,
+                        workspace,
+                        context.as_ref().map(|snapshot| &snapshot.context),
+                    )?;
                 drop(session);
                 let token = match *credential {
                     RadiusCredential::ApiKey(key) => key,
-                    RadiusCredential::OAuth(gateway) => gateway
-                        .access(std::time::Duration::from_secs(300))
-                        .await?
+                    RadiusCredential::OAuth(gateway) => {
+                        let min_validity = std::time::Duration::from_secs(300);
+                        match refresh {
+                            Some(refresh) => refresh.access(gateway, min_validity).await,
+                            None => gateway.access(min_validity).await,
+                        }?
                         .ok_or_else(|| {
                             Error::Config("Radius credentials were removed. Sign in again.".into())
-                        })?,
+                        })?
+                    }
                 };
                 endpoint
                     .query_pairs_mut()
@@ -1012,6 +1351,159 @@ async fn share_gist(file: &Path, name: &str) -> Result<SharedSession> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_fork_preserves_imported_compaction_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("imported.jsonl");
+        std::fs::write(&source, concat!(
+            "{\"type\":\"session\",\"version\":3}\n",
+            "{\"type\":\"message\",\"id\":\"u\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"question\"}}\n",
+            "{\"type\":\"message\",\"id\":\"s\",\"parentId\":\"u\",\"message\":{\"role\":\"user\",\"content\":\"sibling\"}}\n",
+            "{\"type\":\"label\",\"id\":\"l\",\"parentId\":\"u\",\"targetId\":\"u\",\"label\":\"old\",\"timestamp\":\"2024-01-01T00:00:00Z\"}\n",
+            "{\"type\":\"compaction\",\"id\":\"c\",\"parentId\":\"l\",\"firstKeptEntryId\":\"u\",\"summary\":\"summary\",\"tokensBefore\":42,\"fromHook\":true,\"details\":{\"source\":\"extension\"}}\n",
+            "{\"type\":\"label\",\"id\":\"new\",\"parentId\":\"s\",\"targetId\":\"u\",\"label\":\"current\",\"timestamp\":\"2024-01-02T00:00:00Z\"}\n",
+        )).unwrap();
+        let session = super::super::session_import::read(&source).unwrap();
+        let target = session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap()
+            .id;
+        let destination = directory.path().join("fork.jsonl");
+        fork(&session, &source, target, &destination, directory.path()).unwrap();
+        let forked = Session::open(&destination).unwrap();
+        let compacted = forked
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap();
+        assert_eq!(
+            forked.record_metadata(compacted.id),
+            Some(&serde_json::json!({"fromExtension":true,"details":{"source":"extension"}}))
+        );
+        forked.validated_pi_conversion_counts().unwrap();
+        let entries = super::super::rpc_entries::Entries::new(&forked)
+            .after(None)
+            .unwrap();
+        let entries = entries["entries"].as_array().unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry["message"]["content"] == "sibling")
+        );
+        let label = entries
+            .iter()
+            .find(|entry| entry["type"] == "label")
+            .unwrap();
+        assert_eq!(label["label"], "current");
+        assert_eq!(label["timestamp"], "2024-01-02T00:00:00Z");
+    }
+
+    #[test]
+    fn startup_fork_keeps_legacy_pending_tree_trigger_fallback() {
+        for sibling in [false, true] {
+            let initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+            let mut records = initial.records().to_vec();
+            records.push(pi_rs::Record {
+                timestamp: None,
+                run_id: None,
+                version: records[0].version,
+                id: 2,
+                parent: Some(1),
+                event: Event::TreeMessageQueued {
+                    input: pi_rs::QueuedCustomMessage {
+                        id: uuid::Uuid::new_v4(),
+                        delivery: pi_rs::CustomMessageDelivery::TriggerTurn,
+                        message: pi_rs::CustomMessage {
+                            custom_type: "trigger".into(),
+                            content: pi_rs::ContextContent::Text("queued".into()),
+                            display: false,
+                            details: None,
+                        },
+                    },
+                },
+            });
+            if sibling {
+                records.push(pi_rs::Record {
+                    timestamp: None,
+                    run_id: None,
+                    version: records[0].version,
+                    id: 3,
+                    parent: Some(2),
+                    event: Event::Checkout { target: 1 },
+                });
+                records.push(pi_rs::Record {
+                    timestamp: None,
+                    run_id: None,
+                    version: records[0].version,
+                    id: 4,
+                    parent: Some(1),
+                    event: Event::User {
+                        content: "other".into(),
+                        input_id: None,
+                    },
+                });
+            }
+            let session = Session::from_records(records).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("fork.jsonl");
+            fork_full_history_when_inert(
+                &session,
+                Path::new("source"),
+                &destination,
+                directory.path(),
+            )
+            .unwrap();
+            let forked = Session::open(&destination).unwrap();
+            assert_eq!(forked.queued_custom_messages().len(), 1);
+            assert_eq!(session.queued_custom_messages().len(), 1);
+        }
+    }
+
+    #[test]
+    fn resume_resolves_external_and_native_ids_without_following_fork_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let input = source.path().join("pi.jsonl");
+        std::fs::write(
+            &input,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"legacy-resume-id\"}\n",
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&input).unwrap();
+        let native_id = imported.session_id().to_string();
+        let output = root.path().join("native.jsonl");
+        imported.export_jsonl(&output).unwrap();
+        let before = std::fs::read(&output).unwrap();
+        assert_eq!(
+            resolve_reference(Path::new("legacy-resume-id"), root.path()).unwrap(),
+            output
+        );
+        assert_eq!(
+            resolve_reference(Path::new("legacy-resume"), root.path()).unwrap(),
+            output
+        );
+        assert_eq!(
+            resolve_reference(Path::new(&native_id), root.path()).unwrap(),
+            output
+        );
+        let fork = Session::from_records(imported.fork_records(imported.head()).unwrap()).unwrap();
+        let fork_path = root.path().join("fork.jsonl");
+        fork.export_jsonl(&fork_path).unwrap();
+        assert_eq!(
+            resolve_reference(Path::new("legacy-resume-id"), root.path()).unwrap(),
+            output
+        );
+        assert_eq!(
+            resolve_reference(Path::new(&fork.session_id().to_string()), root.path()).unwrap(),
+            fork_path
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), before);
+        std::fs::copy(&output, root.path().join("duplicate.jsonl")).unwrap();
+        assert!(resolve_reference(Path::new("legacy-resume-id"), root.path()).is_err());
+    }
     #[tokio::test]
     async fn radius_share_uses_configured_proxy() {
         let root = tempfile::tempdir().unwrap();
@@ -1026,7 +1518,7 @@ mod tests {
             proxies: vec![proxy],
             idle_timeout: None,
         };
-        let shared = destination.share(session, root.path()).await.unwrap();
+        let shared = destination.share(session, root.path(), None).await.unwrap();
         assert_eq!(shared.url, "https://example.com/shared");
         let (request, headers, _) = server.await.unwrap();
         assert!(request.starts_with("POST http://127.0.0.1:1/v1/artifacts?"));
@@ -1036,6 +1528,119 @@ mod tests {
                 .contains("authorization: bearer fixture-token")
         );
     }
+    #[tokio::test]
+    async fn radius_share_uploads_context_for_matching_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::open(root.path().join("session.jsonl")).unwrap();
+        let snapshot = ShareSnapshot {
+            session_id: session.session_id(),
+            head: session.head(),
+            context: ShareContext {
+                system_prompt: "live instructions".into(),
+                tools: vec![pi_rs::ToolSpec {
+                    name: "read".into(),
+                    description: "Read a file".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }],
+            },
+        };
+        let (proxy, server) = super::super::http_proxy::test_proxy(
+            r#"{"artifact":{"canonical_url":"https://example.com/shared"}}"#,
+        )
+        .await;
+        let destination = ShareDestination::Radius {
+            endpoint: reqwest::Url::parse("http://127.0.0.1:1/v1/artifacts").unwrap(),
+            credential: Box::new(RadiusCredential::ApiKey("fixture".into())),
+            proxies: vec![proxy],
+            idle_timeout: None,
+        };
+        destination
+            .share(session, root.path(), Some(snapshot))
+            .await
+            .unwrap();
+        let (_, _, body) = server.await.unwrap();
+        let entries: Vec<serde_json::Value> = body
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1]["type"], "custom");
+        assert_eq!(entries[1]["customType"], "pi.share");
+        assert!(entries[1]["parentId"].is_null());
+        assert_eq!(entries[1]["data"]["systemPrompt"], "live instructions");
+        assert_eq!(
+            entries[1]["data"]["tools"][0],
+            serde_json::json!({"name":"read","description":"Read a file","parameters":{"type":"object"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn radius_share_uses_external_id_with_native_snapshot_guard() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pi.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"share-legacy-id\"}\n",
+        )
+        .unwrap();
+        let session = super::super::session_import::read(&path).unwrap();
+        let snapshot = ShareSnapshot {
+            session_id: session.session_id(),
+            head: session.head(),
+            context: ShareContext {
+                system_prompt: "snapshot".into(),
+                tools: vec![],
+            },
+        };
+        let (proxy, server) = super::super::http_proxy::test_proxy(
+            r#"{"artifact":{"canonical_url":"https://example.com/shared"}}"#,
+        )
+        .await;
+        let destination = ShareDestination::Radius {
+            endpoint: reqwest::Url::parse("http://127.0.0.1:1/v1/artifacts").unwrap(),
+            credential: Box::new(RadiusCredential::ApiKey("fixture".into())),
+            proxies: vec![proxy],
+            idle_timeout: None,
+        };
+        destination
+            .share(session, root.path(), Some(snapshot))
+            .await
+            .unwrap();
+        let (_, _, body) = server.await.unwrap();
+        let header: serde_json::Value =
+            serde_json::from_slice(body.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+        assert_eq!(header["id"], "share-legacy-id");
+    }
+
+    #[tokio::test]
+    async fn radius_share_rejects_stale_snapshot_before_upload() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::open(root.path().join("session.jsonl")).unwrap();
+        let snapshot = ShareSnapshot {
+            session_id: session.session_id(),
+            head: session.head() + 1,
+            context: ShareContext {
+                system_prompt: "stale".into(),
+                tools: vec![],
+            },
+        };
+        let destination = ShareDestination::Radius {
+            endpoint: reqwest::Url::parse("http://127.0.0.1:1/v1/artifacts").unwrap(),
+            credential: Box::new(RadiusCredential::ApiKey("fixture".into())),
+            proxies: vec![],
+            idle_timeout: None,
+        };
+        let error = match destination
+            .share(session, root.path(), Some(snapshot))
+            .await
+        {
+            Ok(_) => panic!("stale context accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("Session changed"));
+    }
+
     #[test]
     fn session_ids_and_prefixes_resolve_without_changing_journals() {
         let root = tempfile::tempdir().unwrap();
@@ -1069,6 +1674,51 @@ mod tests {
         for valid in ["one", "Run_2.3", "a-b"] {
             assert!(validate_id(valid).is_ok());
         }
+    }
+
+    #[test]
+    fn missing_session_id_is_not_treated_as_a_new_file() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in [root.path().to_path_buf(), root.path().join("missing")] {
+            let error = resolve_reference(Path::new("unknown-id"), &directory).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("No session found matching 'unknown-id'")
+            );
+            assert_eq!(
+                resolve_reference(Path::new("new.jsonl"), &directory).unwrap(),
+                Path::new("new.jsonl")
+            );
+        }
+    }
+
+    #[test]
+    fn jsonl_reference_prefers_exact_stored_stem_before_filename_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("work.jsonl.jsonl");
+        drop(Session::open(&path).unwrap());
+        assert_eq!(
+            resolve_reference(Path::new("work.jsonl"), root.path()).unwrap(),
+            path
+        );
+        assert_eq!(
+            resolve_reference(Path::new("other.jsonl"), root.path()).unwrap(),
+            Path::new("other.jsonl")
+        );
+        let other = tempfile::tempdir().unwrap();
+        drop(Session::open(other.path().join("work.jsonl-extra.jsonl")).unwrap());
+        // An explicit filename must not select a longer, merely prefix-matching stem.
+        assert_eq!(
+            resolve_reference(Path::new("work.jsonl"), other.path()).unwrap(),
+            Path::new("work.jsonl")
+        );
+        let header_path = other.path().join("header.jsonl");
+        std::fs::write(&header_path, "{\"id\":\"journal.jsonl\"}\n").unwrap();
+        assert_eq!(
+            resolve_reference(Path::new("journal.jsonl"), other.path()).unwrap(),
+            header_path
+        );
     }
 
     #[test]
@@ -1213,13 +1863,182 @@ mod tests {
             serde_json::json!({"type":"session","version":3}),
             serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"custom","customType":"private","content":"secret context","display":false}}),
             serde_json::json!({"type":"message","id":"b","parentId":"a","message":{"role":"custom","customType":"note","content":"visible **note**","display":true}}),
+            serde_json::json!({"type":"message","id":"c","parentId":"b","message":{"role":"hookMessage","content":"hidden hook explicit","display":false}}),
+            serde_json::json!({"type":"message","id":"d","parentId":"c","message":{"role":"hookMessage","content":"hidden hook default"}}),
+            serde_json::json!({"type":"message","id":"e","parentId":"d","message":{"role":"hookMessage","content":"visible hook","display":true}}),
         ] {
             writeln!(fixture, "{entry}").unwrap();
         }
         let session = super::super::session_import::read(fixture.path()).unwrap();
         let document = html(&session);
         assert!(!document.contains("secret context"));
+        assert!(!document.contains("hidden hook explicit"));
+        assert!(!document.contains("hidden hook default"));
+        assert!(document.contains("visible hook"));
         assert!(document.contains("visible <strong>note</strong>"));
+    }
+
+    #[test]
+    fn html_exports_hidden_custom_entries_with_terminal_visibility_label() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"custom_message","id":"a","parentId":null,"customType":"<note>","content":"hidden **context**", "display":false}),
+            serde_json::json!({"type":"custom_message","id":"b","parentId":"a","customType":"visible","content":"shown", "display":true}),
+            serde_json::json!({"type":"message","id":"c","parentId":"b","message":{"role":"custom","customType":"private","content":"private role", "display":false}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let session = super::super::session_import::read(fixture.path()).unwrap();
+        let document = html(&session);
+        assert!(document.contains("<b>&lt;note&gt;</b> <span>Hidden in terminal</span>"));
+        assert!(document.contains("hidden <strong>context</strong>"));
+        assert!(document.contains("<b>visible</b>"));
+        assert_eq!(document.matches("Hidden in terminal").count(), 1);
+        assert!(!document.contains("private role"));
+    }
+
+    #[test]
+    fn html_exports_native_hidden_custom_messages() {
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        for (custom_type, content, display) in [
+            ("<native>", "hidden **native**", false),
+            ("visible", "visible native", true),
+        ] {
+            session
+                .append_custom_message(pi_rs::CustomMessage {
+                    custom_type: custom_type.into(),
+                    content: pi_rs::ContextContent::Text(content.into()),
+                    display,
+                    details: None,
+                })
+                .unwrap();
+        }
+        let document = html(&session);
+        assert!(document.contains("<b>&lt;native&gt;</b> <span>Hidden in terminal</span>"));
+        assert!(document.contains("hidden <strong>native</strong>"));
+        assert!(document.contains("visible native"));
+        assert_eq!(document.matches("Hidden in terminal").count(), 1);
+    }
+
+    #[test]
+    fn html_exports_native_hidden_message_after_checkout_to_legacy_source() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"hookMessage","content":"legacy hidden","display":false}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let mut session = super::super::session_import::read(fixture.path()).unwrap();
+        let source = session
+            .records()
+            .iter()
+            .find(|record| {
+                matches!(
+                    &record.event,
+                    Event::SourceEntry { entry, .. } if entry["id"] == "a"
+                )
+            })
+            .unwrap()
+            .id;
+        session.checkout(source).unwrap();
+        session
+            .append_custom_message(pi_rs::CustomMessage {
+                custom_type: "native".into(),
+                content: pi_rs::ContextContent::Text("native after checkout".into()),
+                display: false,
+                details: None,
+            })
+            .unwrap();
+        let document = html(&session);
+        assert!(document.contains("<b>native</b> <span>Hidden in terminal</span>"));
+        assert!(document.contains("native after checkout"));
+        assert!(!document.contains("legacy hidden"));
+    }
+
+    #[test]
+    fn html_exports_native_message_after_fork_at_legacy_source_even_if_content_matches() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"hookMessage","content":"same content","display":false}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let imported = super::super::session_import::read(fixture.path()).unwrap();
+        let source = imported
+            .records()
+            .iter()
+            .find(|record| {
+                matches!(
+                    &record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a"
+                )
+            })
+            .unwrap()
+            .id;
+        let mut fork = Session::from_records(imported.fork_records(source).unwrap()).unwrap();
+        fork.append_custom_message(pi_rs::CustomMessage {
+            custom_type: String::new(),
+            content: pi_rs::ContextContent::Text("same content".into()),
+            display: false,
+            details: None,
+        })
+        .unwrap();
+        let records = serde_json::to_string(fork.records()).unwrap();
+        let reopened = Session::from_records(serde_json::from_str(&records).unwrap()).unwrap();
+        let document = html(&reopened);
+        assert!(document.contains("Hidden in terminal"));
+        assert!(document.contains("same content"));
+    }
+
+    #[test]
+    fn html_hides_ambiguous_unmarked_native_message_matching_legacy_source() {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            serde_json::json!({"type":"session","version":3}),
+            serde_json::json!({"type":"message","id":"a","parentId":null,"message":{"role":"hookMessage","content":"ambiguous private content","display":false}}),
+        ] {
+            writeln!(fixture, "{entry}").unwrap();
+        }
+        let imported = super::super::session_import::read(fixture.path()).unwrap();
+        let source = imported
+            .records()
+            .iter()
+            .find(|record| {
+                matches!(
+                    &record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a"
+                )
+            })
+            .unwrap()
+            .id;
+        // Model a historical record-only snapshot ending at the source. The
+        // current fork now completes a verified imported conversion.
+        let mut records = imported.records()[..source as usize].to_vec();
+        let parent = records.last().unwrap().id;
+        // Simulate an old native append without the new associated source marker.
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: 2,
+            id: parent + 1,
+            parent: Some(parent),
+            event: Event::CustomMessage {
+                message: pi_rs::CustomMessage {
+                    custom_type: String::new(),
+                    content: pi_rs::ContextContent::Text("ambiguous private content".into()),
+                    display: false,
+                    details: None,
+                },
+            },
+        });
+        let mut wire = serde_json::to_value(&records).unwrap();
+        // Journals produced by the interim optional-field format remain readable.
+        wire.as_array_mut().unwrap().last_mut().unwrap()["event"]["legacy_source"] =
+            serde_json::json!(false);
+        let decoded: Vec<pi_rs::Record> = serde_json::from_value(wire).unwrap();
+        let old = Session::from_records(decoded).unwrap();
+        assert!(!html(&old).contains("ambiguous private content"));
     }
 
     #[test]

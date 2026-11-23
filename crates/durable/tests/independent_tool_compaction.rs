@@ -270,7 +270,7 @@ async fn summary_during_running_tool_keeps_result_and_inbox_order() {
         assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
         {
             let requests = model.requests.lock().unwrap();
-            assert!(requests[3].messages.iter().any(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content } if call_id == "tool-call" && content == "tool result")));
+            assert!(requests[3].messages.iter().any(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content, .. } if call_id == "tool-call" && content == "tool result")));
             assert!(requests[3].messages.iter().any(|m| matches!(m, pi_rs_core::Message::User { content } if content.contains("tool checkpoint"))));
             assert_eq!(
                 requests[3].messages.iter().any(
@@ -334,7 +334,7 @@ async fn abort_with_running_tool_keeps_summary_until_explicit_reconciliation() {
         IndependentCompactionStatus::Applied
     );
     let c = s.conversation(id).unwrap();
-    assert_eq!(c.messages.iter().filter(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content } if call_id == "tool-call" && content == "verified result")).count(), 1);
+    assert_eq!(c.messages.iter().filter(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content, .. } if call_id == "tool-call" && content == "verified result")).count(), 1);
     assert!(
         !c.messages.iter().any(
             |m| matches!(m, pi_rs_core::Message::User { content } if content == "withdraw me")
@@ -522,7 +522,7 @@ async fn multi_call_round_places_after_both_results_and_queued_input() {
             assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
             let c = s.conversation(id).unwrap();
             let pos = |id: &str| {
-                c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content } if call_id == id && content == "tool result")).unwrap()
+                c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content, .. } if call_id == id && content == "tool result")).unwrap()
             };
             let queued = c
                 .messages
@@ -635,8 +635,8 @@ async fn multi_call_abort_reconciles_dispatched_call_and_skips_rest() {
     );
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     let c = s.conversation(id).unwrap();
-    assert_eq!(c.messages.iter().filter(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content } if call_id == "tool-call" && content == "confirmed")).count(), 1);
-    assert_eq!(c.messages.iter().filter(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content } if call_id == "second-call" && content.contains("aborted"))).count(), 1);
+    assert_eq!(c.messages.iter().filter(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content, .. } if call_id == "tool-call" && content == "confirmed")).count(), 1);
+    assert_eq!(c.messages.iter().filter(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content, .. } if call_id == "second-call" && content.contains("aborted"))).count(), 1);
     assert!(
         !c.messages.iter().any(
             |m| matches!(m, pi_rs_core::Message::User { content } if content == "withdraw me")
@@ -693,7 +693,7 @@ async fn multi_call_reopen_reconciles_second_without_repeating_effects() {
             .count(),
         1
     );
-    assert_eq!(c.messages.iter().filter(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content } if call_id == "second-call" && content == "confirmed second")).count(), 1);
+    assert_eq!(c.messages.iter().filter(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content, .. } if call_id == "second-call" && content == "confirmed second")).count(), 1);
     s.shutdown().await.unwrap();
 }
 
@@ -831,7 +831,7 @@ async fn task_backed_second_call_waits_across_reopen_before_summary_placement() 
     assert_eq!(effects.load(Ordering::SeqCst), 2);
     let c = s.conversation(id).unwrap();
     let pos = |id: &str| {
-        c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content } if call_id == id && content.contains("task result"))).unwrap()
+        c.messages.iter().position(|m| matches!(m, pi_rs_core::Message::Tool { call_id, content, .. } if call_id == id && content.contains("task result"))).unwrap()
     };
     let queued = c
         .messages

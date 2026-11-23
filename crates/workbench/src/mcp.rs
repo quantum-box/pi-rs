@@ -1,5 +1,6 @@
 //! Native MCP client connections exposed through the shared tool contract.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, RwLock,
@@ -10,13 +11,19 @@ use std::time::{Duration, Instant};
 use pi_rs::{Error, Extension, Outcome, Result, Tool, ToolContext, ToolSpec};
 use rmcp::{
     RoleClient,
-    model::{CallToolResponse, ProtocolVersion, SubscriptionFilter},
+    model::{
+        CallToolResponse, ErrorData, PaginatedRequestParams, ProtocolVersion, SubscriptionFilter,
+    },
     service::{
-        ClientLifecycleMode, ClientServiceExt, NotificationContext, RunningService, ServiceError,
+        ClientInitializeError, ClientLifecycleMode, ClientServiceExt, NotificationContext,
+        RunningService, ServiceError,
     },
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
-        streamable_http_client::{InsufficientScopeError, StreamableHttpClientTransportConfig},
+        streamable_http_client::{
+            InsufficientScopeError, StreamableHttpClient, StreamableHttpClientTransportConfig,
+            StreamableHttpError,
+        },
     },
 };
 use serde::{Deserialize, Serialize};
@@ -24,8 +31,29 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::mcp_progress::{self, ProgressTransport, ToolProgress};
 use crate::mcp_provider_auth::ProviderClient;
 pub use crate::mcp_provider_auth::TokenResolver;
+use crate::mcp_resource_compat::ResourceCompatibility;
+use crate::process_cleanup::Children;
+
+/// Validate the URL before storing or connecting to a streamable HTTP server.
+pub fn validate_server_url(url: &str) -> Result<()> {
+    let parsed = reqwest_mcp::Url::parse(url)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .ok_or_else(|| Error::Config("MCP URL must be an HTTP or HTTPS URL".into()))?;
+    let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if (parsed.scheme() == "http" && !loopback)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(Error::Config(
+            "MCP URL requires HTTPS or loopback HTTP and no embedded credentials".into(),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -41,7 +69,9 @@ pub struct ServerConfig {
     pub url: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    pub timeout: Option<u64>,
+    /// Per-request timeout. JSON configuration expresses it in seconds.
+    #[serde(default, deserialize_with = "deserialize_server_timeout")]
+    pub timeout: Option<Duration>,
     pub protocol_version: Option<String>,
     pub description: Option<String>,
     pub enabled: Option<bool>,
@@ -49,8 +79,35 @@ pub struct ServerConfig {
     pub oauth: Option<crate::mcp_auth::OAuthSetting>,
     pub auth: Option<ProviderAuth>,
     #[serde(default)]
-    pub tool_exposure: BTreeMap<String, String>,
+    pub tool_exposure: ToolExposure,
 }
+
+/// Tool exposure overrides in configuration order.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(transparent)]
+pub struct ToolExposure(indexmap::IndexMap<String, String>);
+
+impl std::ops::Deref for ToolExposure {
+    type Target = indexmap::IndexMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ToolExposure {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl PartialEq for ToolExposure {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.iter().eq(other.0.iter())
+    }
+}
+
+impl Eq for ToolExposure {}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct ProviderAuth {
@@ -83,8 +140,63 @@ impl ServerConfig {
 
 #[derive(Clone, Default)]
 struct NativeClient {
+    server_name: Option<Arc<str>>,
+    workspace_root: Option<WorkspaceRoot>,
     interaction: Arc<std::sync::Mutex<Option<Interaction>>>,
     catalog: Arc<CatalogSignal>,
+    progress: Arc<ToolProgress>,
+    dispatch_closed: Arc<std::sync::Mutex<crate::mcp_oauth_client::DispatchState>>,
+}
+
+#[derive(Clone)]
+struct WorkspaceRoot {
+    uri: String,
+    name: String,
+}
+
+impl NativeClient {
+    fn progress_transport<T>(&self, transport: T) -> ProgressTransport<T> {
+        ProgressTransport::new(transport, self.progress.clone())
+    }
+
+    async fn for_server(name: &str, workspace: &Path) -> Self {
+        let workspace_root = tokio::fs::canonicalize(workspace)
+            .await
+            .ok()
+            .and_then(|path| {
+                let uri = reqwest_mcp::Url::from_file_path(&path).ok()?.to_string();
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                Some(WorkspaceRoot { uri, name })
+            });
+        Self {
+            server_name: Some(Arc::from(name)),
+            workspace_root,
+            ..Self::default()
+        }
+    }
+}
+
+struct AbandonedCall {
+    closed: Arc<std::sync::Mutex<crate::mcp_oauth_client::DispatchState>>,
+    service: Option<rmcp::service::RunningServiceCancellationToken>,
+}
+impl Drop for AbandonedCall {
+    fn drop(&mut self) {
+        if let Some(service) = self.service.take() {
+            // Close the gate before stopping rmcp: its best-effort cancellation
+            // notification can be lost when the peer queue is full. A POST
+            // already started remains ambiguous and is reported as such.
+            self.closed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .closed = true;
+            service.cancel();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -103,6 +215,10 @@ struct CatalogSnapshot {
     signal: Arc<CatalogSignal>,
     revision: u64,
     checked_at: Instant,
+    definitions: Vec<rmcp::model::Tool>,
+    has_resources: bool,
+    has_prompts: bool,
+    instructions: Option<String>,
 }
 
 const CATALOG_FALLBACK: Duration = Duration::from_secs(30);
@@ -120,7 +236,9 @@ impl Drop for InteractionGuard {
 }
 impl rmcp::ClientHandler for NativeClient {
     fn get_info(&self) -> rmcp::model::ClientConfig {
-        let mut info = rmcp::model::ClientConfig::default();
+        let mut info = rmcp::model::ClientConfig::default()
+            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE);
+        info.capabilities.roots = self.workspace_root.as_ref().map(|_| Default::default());
         info.capabilities.elicitation = Some(
             rmcp::model::ElicitationCapability::new()
                 .with_form(rmcp::model::FormElicitationCapability::default())
@@ -134,6 +252,19 @@ impl rmcp::ClientHandler for NativeClient {
             .into(),
         );
         info
+    }
+
+    #[allow(deprecated)]
+    async fn list_roots(
+        &self,
+        _context: rmcp::service::RequestContext<RoleClient>,
+    ) -> std::result::Result<rmcp::model::ListRootsResult, rmcp::model::ErrorData> {
+        let roots = self
+            .workspace_root
+            .iter()
+            .map(|root| rmcp::model::Root::new(&root.uri).with_name(&root.name))
+            .collect();
+        Ok(rmcp::model::ListRootsResult::new(roots))
     }
 
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
@@ -290,8 +421,9 @@ struct Connection {
     config: ServerConfig,
     workspace: PathBuf,
     provider_token: Option<TokenResolver>,
-    http_options: Option<HttpOptions>,
+    http_options: Option<HttpOptionsWithProxyHosts>,
     closed: AtomicBool,
+    page_outputs: PageOutputs,
 }
 impl Connection {
     fn identity(&self) -> ConnectionIdentity {
@@ -312,7 +444,7 @@ impl Connection {
             return Err(Error::Config("MCP connection is closed".into()));
         }
         if service.is_closed() || service.peer().is_transport_closed() {
-            let replacement = McpExtension::connect_with_http_options(
+            let replacement = McpExtension::connect_with_proxy_hosts(
                 &self.name,
                 &self.config,
                 &self.workspace,
@@ -344,7 +476,7 @@ impl Connection {
                 "MCP connection changed during reauthorization".into(),
             ));
         }
-        let replacement = McpExtension::connect_with_http_options(
+        let replacement = McpExtension::connect_with_proxy_hosts(
             &self.name,
             &self.config,
             &self.workspace,
@@ -414,13 +546,15 @@ async fn listen_for_tool_changes(service: &RunningService<RoleClient, NativeClie
 pub struct McpExtension {
     id: String,
     tools: Vec<Arc<dyn Tool>>,
+    server_tool_names: Vec<String>,
     deferred: BTreeSet<String>,
     has_codemode: bool,
     has_deferred: bool,
     pub server_name: String,
     pub description: String,
     connection: Arc<Connection>,
-    catalog: CatalogSnapshot,
+    catalog: Arc<CatalogSnapshot>,
+    exposure: Option<String>,
 }
 
 /// HTTP transport settings supplied by an embedding host.
@@ -428,6 +562,20 @@ pub struct McpExtension {
 pub struct HttpOptions {
     pub proxies: Vec<reqwest_mcp::Proxy>,
     pub idle_timeout: Option<Duration>,
+}
+
+/// HTTP settings with proxy host names for OAuth DNS validation.
+#[derive(Clone)]
+pub struct HttpOptionsWithProxyHosts {
+    pub http: HttpOptions,
+    pub proxy_hosts: Vec<String>,
+}
+
+impl std::ops::Deref for HttpOptionsWithProxyHosts {
+    type Target = HttpOptions;
+    fn deref(&self) -> &HttpOptions {
+        &self.http
+    }
 }
 
 impl McpExtension {
@@ -450,6 +598,39 @@ impl McpExtension {
         workspace: &Path,
         provider_token: Option<TokenResolver>,
         http_options: Option<HttpOptions>,
+    ) -> Result<Self> {
+        Self::connect_with_proxy_hosts(
+            name,
+            config,
+            workspace,
+            provider_token,
+            http_options.map(|http| HttpOptionsWithProxyHosts {
+                http,
+                proxy_hosts: Vec::new(),
+            }),
+        )
+        .await
+    }
+
+    pub async fn connect_with_proxy_hosts(
+        name: &str,
+        config: &ServerConfig,
+        workspace: &Path,
+        provider_token: Option<TokenResolver>,
+        http_options: Option<HttpOptionsWithProxyHosts>,
+    ) -> Result<Self> {
+        Self::connect_with_owned_stdio(name, config, workspace, provider_token, http_options, None)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn connect_with_owned_stdio(
+        name: &str,
+        config: &ServerConfig,
+        workspace: &Path,
+        provider_token: Option<TokenResolver>,
+        http_options: Option<HttpOptionsWithProxyHosts>,
+        owned_stdio: Option<&Children>,
     ) -> Result<Self> {
         if name.is_empty()
             || !name
@@ -501,7 +682,11 @@ impl McpExtension {
         } else {
             None
         };
-        let timeout = Duration::from_secs(config.timeout.unwrap_or(60).clamp(1, 3600));
+        let timeout = match config.timeout {
+            None => Duration::from_secs(60),
+            Some(Duration::ZERO) => Duration::from_secs(1),
+            Some(timeout) => timeout.clamp(MIN_MCP_TIMEOUT, MAX_MCP_TIMEOUT),
+        };
         let lifecycle = match config.protocol_version.as_deref() {
             None => ClientLifecycleMode::Initialize,
             Some("2026-07-28") => ClientLifecycleMode::Discover {
@@ -537,7 +722,7 @@ impl McpExtension {
                 identity.update([0]);
             }
             for (key, value) in &config.env {
-                let value = resolve_value(value).await?;
+                let value = resolve_value_with_cleanup(value, owned_stdio).await?;
                 identity.update(json!([key, value]).to_string());
                 process.env(key, value);
             }
@@ -550,14 +735,34 @@ impl McpExtension {
             );
             process.kill_on_drop(true);
             let wrapped = wrap_process(process);
-            let transport = TokioChildProcess::new(wrapped)?;
-            tokio::time::timeout(
-                timeout.min(Duration::from_secs(10)),
-                NativeClient::default().serve_with_lifecycle(transport, lifecycle),
-            )
-            .await
-            .map_err(|_| Error::Config(format!("MCP {name} initialization timed out")))?
-            .map_err(|error| Error::Config(format!("MCP {name} initialization failed: {error}")))?
+            let initialize = async {
+                let service = match owned_stdio {
+                    Some(owner) => {
+                        let native = NativeClient::for_server(name, workspace).await;
+                        let transport = crate::mcp_log::LoggingTransport::new(
+                            owned_stdio_transport(wrapped, owner)?,
+                            Some(Arc::from(name)),
+                        );
+                        let transport = native.progress_transport(ResourceCompatibility(transport));
+                        native.serve_with_lifecycle(transport, lifecycle).await
+                    }
+                    None => {
+                        let native = NativeClient::for_server(name, workspace).await;
+                        let transport = crate::mcp_log::LoggingTransport::new(
+                            TokioChildProcess::new(wrapped)?,
+                            Some(Arc::from(name)),
+                        );
+                        let transport = native.progress_transport(ResourceCompatibility(transport));
+                        native.serve_with_lifecycle(transport, lifecycle).await
+                    }
+                };
+                service.map_err(|error| {
+                    Error::Config(format!("MCP {name} initialization failed: {error}"))
+                })
+            };
+            tokio::time::timeout(timeout.min(Duration::from_secs(10)), initialize)
+                .await
+                .map_err(|_| Error::Config(format!("MCP {name} initialization timed out")))??
         } else if let Some(url) = &config.url {
             if config
                 .transport
@@ -566,23 +771,13 @@ impl McpExtension {
             {
                 return Err(Error::Config("MCP URL requires streamable HTTP".into()));
             }
-            let parsed = reqwest_mcp::Url::parse(url)
-                .map_err(|_| Error::Config("invalid MCP URL".into()))?;
-            let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-            if !(parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback))
-                || !parsed.username().is_empty()
-                || parsed.password().is_some()
-            {
-                return Err(Error::Config(
-                    "MCP URL requires HTTPS or loopback HTTP and no embedded credentials".into(),
-                ));
-            }
+            validate_server_url(url)?;
             let mut headers = HashMap::new();
             for (name, value) in &config.headers {
                 let name: reqwest_mcp::header::HeaderName = name
                     .parse()
                     .map_err(|_| Error::Config("invalid MCP header name".into()))?;
-                let resolved = resolve_value(value).await?;
+                let resolved = resolve_value_with_cleanup(value, owned_stdio).await?;
                 identity.update(json!([name.as_str(), resolved]).to_string());
                 let value = resolved
                     .parse()
@@ -622,37 +817,44 @@ impl McpExtension {
                             "MCP OAuth cannot be combined with an Authorization header".into(),
                         ));
                     }
-                    let (client, generation) = crate::mcp_auth::client(name, url, client).await?;
+                    let (client, generation) = crate::mcp_auth::client_with_http_options(
+                        name,
+                        url,
+                        client,
+                        http_options.as_ref(),
+                    )
+                    .await?;
                     identity.update(generation.as_bytes());
                     oauth_generation =
                         Some(Uuid::parse_str(&generation).map_err(|_| {
                             Error::Config("invalid MCP credential generation".into())
                         })?);
-                    NativeClient::default()
-                        .serve_with_lifecycle(
-                            StreamableHttpClientTransport::with_client(client, transport_config),
-                            lifecycle,
-                        )
-                        .await
+                    let native = NativeClient {
+                        dispatch_closed: client.dispatch_state.clone(),
+                        ..NativeClient::for_server(name, workspace).await
+                    };
+                    start_http_service(native, client, transport_config, lifecycle).await
                 } else if let Some(resolver) = provider_token.clone() {
                     let client = ProviderClient {
                         client,
                         endpoint: Arc::from(url.as_str()),
                         resolver,
                     };
-                    NativeClient::default()
-                        .serve_with_lifecycle(
-                            StreamableHttpClientTransport::with_client(client, transport_config),
-                            lifecycle,
-                        )
-                        .await
+                    start_http_service(
+                        NativeClient::for_server(name, workspace).await,
+                        client,
+                        transport_config,
+                        lifecycle,
+                    )
+                    .await
                 } else {
-                    NativeClient::default()
-                        .serve_with_lifecycle(
-                            StreamableHttpClientTransport::with_client(client, transport_config),
-                            lifecycle,
-                        )
-                        .await
+                    start_http_service(
+                        NativeClient::for_server(name, workspace).await,
+                        client,
+                        transport_config,
+                        lifecycle,
+                    )
+                    .await
                 }
                 .map_err(|error| {
                     let challenge = error.auth_challenge().filter(|challenge| {
@@ -699,14 +901,15 @@ impl McpExtension {
             provider_token,
             http_options,
             closed: AtomicBool::new(false),
+            page_outputs: std::sync::Mutex::new(VecDeque::new()),
         });
-        Self::discover(connection).await
+        Self::discover(connection, config.exposure.clone()).await
     }
 
     /// Reload definitions while keeping the established transport and remote state.
     pub async fn refresh(&self) -> Result<Self> {
         drop(self.connection.active_service().await?);
-        Self::discover(self.connection.clone()).await
+        Self::discover(self.connection.clone(), self.exposure.clone()).await
     }
 
     /// Keep a notified catalog between turns and poll when notifications are unavailable.
@@ -725,12 +928,22 @@ impl McpExtension {
             }
         }
         drop(service);
-        Self::discover(self.connection.clone()).await.map(Some)
+        Self::discover(self.connection.clone(), self.exposure.clone())
+            .await
+            .map(Some)
     }
 
-    async fn discover(connection: Arc<Connection>) -> Result<Self> {
-        let name = connection.name.clone();
-        let config = connection.config.clone();
+    /// Rebuild the local declarations from the last catalog without restarting the server.
+    pub fn with_exposure(&self, exposure: String) -> Self {
+        Self::from_catalog(
+            self.connection.clone(),
+            self.catalog.clone(),
+            Some(exposure),
+        )
+    }
+
+    async fn discover(connection: Arc<Connection>, exposure: Option<String>) -> Result<Self> {
+        let name = &connection.name;
         let timeout = connection.timeout;
         let service = connection.service.lock().await;
         let info = service.peer_info();
@@ -741,7 +954,12 @@ impl McpExtension {
             .as_ref()
             .is_some_and(|info| info.capabilities.tools.is_some())
         {
-            tokio::time::timeout(timeout, service.list_all_tools())
+            let service = &*service;
+            let listing = all_pages("tools/list", |params| async move {
+                let result = service.list_tools(Some(params)).await?;
+                Ok((result.tools, result.next_cursor))
+            });
+            tokio::time::timeout(timeout, listing)
                 .await
                 .map_err(|_| Error::Config(format!("MCP {name} tool discovery timed out")))?
                 .map_err(|error| {
@@ -750,22 +968,46 @@ impl McpExtension {
         } else {
             Vec::new()
         };
-        drop(service);
-        let catalog = CatalogSnapshot {
+        let catalog = Arc::new(CatalogSnapshot {
             signal,
             revision,
             checked_at: Instant::now(),
-        };
+            definitions,
+            has_resources: info
+                .as_ref()
+                .is_some_and(|info| info.capabilities.resources.is_some()),
+            has_prompts: info
+                .as_ref()
+                .is_some_and(|info| info.capabilities.prompts.is_some()),
+            instructions: info.and_then(|info| info.instructions.clone()),
+        });
+        drop(service);
+        Ok(Self::from_catalog(connection, catalog, exposure))
+    }
+
+    fn from_catalog(
+        connection: Arc<Connection>,
+        catalog: Arc<CatalogSnapshot>,
+        exposure: Option<String>,
+    ) -> Self {
+        let name = connection.name.clone();
+        let mut config = connection.config.clone();
+        config.exposure = exposure.clone();
+        let server_tool_names = catalog
+            .definitions
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
         let prefix = format!("mcp__{}__", normalize(&name));
         let mut counts = BTreeMap::<String, usize>::new();
-        for definition in &definitions {
+        for definition in &catalog.definitions {
             *counts.entry(normalize(&definition.name)).or_default() += 1;
         }
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
         let mut deferred = BTreeSet::new();
         let mut has_codemode = false;
         let mut has_deferred = false;
-        for definition in definitions {
+        for definition in &catalog.definitions {
             if !tool_enabled(&config, &definition.name) {
                 continue;
             }
@@ -779,57 +1021,72 @@ impl McpExtension {
                 name: format!("{prefix}{normalized}{suffix}"),
                 description: definition
                     .description
-                    .map(|description| description.into_owned())
+                    .as_deref()
+                    .map(str::to_owned)
                     .unwrap_or_else(|| definition.name.to_string()),
                 parameters: Value::Object((*definition.input_schema).clone()),
             };
             if is_deferred(&config, &definition.name) {
-                has_deferred |= exposure(&config, &definition.name) == "deferred";
+                has_deferred |= tool_exposure(&config, &definition.name) == "deferred";
                 has_codemode |= matches!(
-                    exposure(&config, &definition.name),
+                    tool_exposure(&config, &definition.name),
                     "codemode" | "codemode-deferred"
                 );
                 deferred.insert(spec.name.clone());
             }
             tools.push(Arc::new(McpTool {
                 connection: connection.clone(),
-                remote_name: definition.name.into_owned(),
+                remote_name: definition.name.to_string(),
                 spec,
                 resource: false,
             }));
         }
-        if info
-            .clone()
-            .is_some_and(|info| info.capabilities.resources.is_some())
-        {
-            for (name, description, parameters) in [
+        if catalog.has_resources {
+            for (name, policy, description, parameters) in [
                 (
+                    "list_resources",
                     "list_resources",
                     "List this MCP server's available resources",
                     json!({"type":"object","properties":{},"additionalProperties":false}),
                 ),
                 (
                     "list_resource_templates",
+                    "list_resource_templates",
                     "List parameterized resource URI templates from this MCP server",
                     json!({"type":"object","properties":{},"additionalProperties":false}),
                 ),
                 (
+                    "list_resources_page",
+                    "list_resources",
+                    "List one page of this MCP server's resources; pass nextCursor as cursor to continue. For saved oversized pages, pass outputId and offset to read chunks",
+                    json!({"type":"object","properties":{"cursor":{"type":"string"},"outputId":{"type":"string"},"offset":{"type":"integer","minimum":0}},"additionalProperties":false}),
+                ),
+                (
+                    "list_resource_templates_page",
+                    "list_resource_templates",
+                    "List one page of this MCP server's resource templates; pass nextCursor as cursor to continue. For saved oversized pages, pass outputId and offset to read chunks",
+                    json!({"type":"object","properties":{"cursor":{"type":"string"},"outputId":{"type":"string"},"offset":{"type":"integer","minimum":0}},"additionalProperties":false}),
+                ),
+                (
+                    "read_resource",
                     "read_resource",
                     "Read a resource URI from this MCP server",
                     json!({"type":"object","properties":{"uri":{"type":"string"}},"required":["uri"],"additionalProperties":false}),
                 ),
             ] {
-                if !tool_enabled(&config, name) {
+                if !tool_enabled(&config, policy) {
                     continue;
                 }
                 let mut exposed = format!("{prefix}{name}");
                 while tools.iter().any(|tool| tool.spec().name == exposed) {
                     exposed.push_str("_resource");
                 }
-                if is_deferred(&config, name) {
-                    has_deferred |= exposure(&config, name) == "deferred";
-                    has_codemode |=
-                        matches!(exposure(&config, name), "codemode" | "codemode-deferred");
+                if is_deferred(&config, policy) {
+                    has_deferred |= tool_exposure(&config, policy) == "deferred";
+                    has_codemode |= matches!(
+                        tool_exposure(&config, policy),
+                        "codemode" | "codemode-deferred"
+                    );
                     deferred.insert(exposed.clone());
                 }
                 tools.push(Arc::new(McpTool {
@@ -844,10 +1101,7 @@ impl McpExtension {
                 }));
             }
         }
-        if info
-            .as_ref()
-            .is_some_and(|info| info.capabilities.prompts.is_some())
-        {
+        if catalog.has_prompts {
             for (name, description, parameters) in [
                 (
                     "list_prompts",
@@ -868,9 +1122,11 @@ impl McpExtension {
                     exposed.push_str("_prompt");
                 }
                 if is_deferred(&config, name) {
-                    has_deferred |= exposure(&config, name) == "deferred";
-                    has_codemode |=
-                        matches!(exposure(&config, name), "codemode" | "codemode-deferred");
+                    has_deferred |= tool_exposure(&config, name) == "deferred";
+                    has_codemode |= matches!(
+                        tool_exposure(&config, name),
+                        "codemode" | "codemode-deferred"
+                    );
                     deferred.insert(exposed.clone());
                 }
                 tools.push(Arc::new(McpTool {
@@ -887,21 +1143,19 @@ impl McpExtension {
         }
         let description = config
             .description
-            .clone()
             .or_else(|| {
-                info.clone()
-                    .and_then(|info| info.instructions.clone())
-                    .and_then(|instructions| {
-                        instructions
-                            .lines()
-                            .find(|line| !line.trim().is_empty())
-                            .map(str::to_owned)
-                    })
+                catalog.instructions.as_deref().and_then(|instructions| {
+                    instructions
+                        .lines()
+                        .find(|line| !line.trim().is_empty())
+                        .map(str::to_owned)
+                })
             })
             .unwrap_or_default();
-        Ok(Self {
+        Self {
             id: format!("mcp-{}", normalize(&name)),
             tools,
+            server_tool_names,
             deferred,
             has_codemode,
             has_deferred,
@@ -909,8 +1163,28 @@ impl McpExtension {
             description,
             connection,
             catalog,
-        })
+            exposure,
+        }
     }
+    /// Original server tool names from this discovery snapshot, including hidden tools.
+    pub fn remote_tool_names(&self) -> &[String] {
+        &self.server_tool_names
+    }
+
+    pub fn remote_tool_exposure(&self, name: &str) -> &str {
+        tool_exposure_with_default(&self.connection.config, name, self.exposure.as_deref())
+    }
+
+    /// Whether the running HTTP connection uses saved MCP OAuth credentials.
+    pub fn uses_oauth(&self) -> bool {
+        self.connection.identity().oauth_generation.is_some()
+    }
+
+    /// Whether the server advertised the resources capability at discovery.
+    pub fn offers_resources(&self) -> bool {
+        self.catalog.has_resources
+    }
+
     pub fn has_deferred(&self) -> bool {
         self.has_deferred
     }
@@ -924,8 +1198,23 @@ impl McpExtension {
             .filter(|tool| self.deferred.contains(&tool.name))
             .collect()
     }
+    /// Immediately prevent further requests to an obsolete catalog connection.
+    pub fn retire(&self) -> bool {
+        let was_closed = self.connection.closed.swap(true, Ordering::SeqCst);
+        self.connection
+            .page_outputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        !was_closed
+    }
+
+    pub fn is_retired(&self) -> bool {
+        self.connection.closed.load(Ordering::SeqCst)
+    }
+
     pub async fn close(&self) {
-        self.connection.closed.store(true, Ordering::SeqCst);
+        self.retire();
         let _ = self
             .connection
             .service
@@ -952,18 +1241,19 @@ impl Extension for McpExtension {
     }
     fn context(
         &self,
-        request: &mut pi_rs::ModelRequest,
+        request: &mut pi_rs::ContextRequest<'_>,
         _: Option<&pi_rs::ExtensionState>,
-    ) -> pi_rs::ExtensionResult<()> {
+    ) -> pi_rs::ExtensionResult<pi_rs::ContextChange> {
         if !self.description.is_empty()
-            && let Some(pi_rs::Message::System { content }) = request.messages.first_mut()
+            && let Some(content) = request.system_content_mut()
         {
             content.push_str(&format!(
                 "\n\nMCP server {}: {}",
                 self.server_name, self.description
             ));
+            return Ok(pi_rs::ContextChange::Changed);
         }
-        Ok(())
+        Ok(pi_rs::ContextChange::Unchanged)
     }
 }
 struct McpTool {
@@ -972,8 +1262,92 @@ struct McpTool {
     spec: ToolSpec,
     resource: bool,
 }
+enum PreparedPage {
+    Inline(Value),
+    Saved {
+        file: tempfile::NamedTempFile,
+        bytes: usize,
+        cursor: Option<String>,
+    },
+}
+
+type PageOutputs = std::sync::Mutex<VecDeque<(Uuid, String, tempfile::NamedTempFile)>>;
+
+async fn run_page_preparation<F>(
+    cancellation: &pi_rs::CancellationToken,
+    work: F,
+) -> Result<PreparedPage>
+where
+    F: FnOnce(pi_rs::CancellationToken) -> Result<PreparedPage> + Send + 'static,
+{
+    let worker_cancel = cancellation.child_token();
+    let _cancel_on_drop = worker_cancel.clone().drop_guard();
+    let task = tokio::task::spawn_blocking(move || work(worker_cancel));
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(Error::Cancelled),
+        result = task => result.map_err(|e| Error::Config(format!("MCP page preparation failed: {e}")))?,
+    }
+}
+
+// Serde may pass an entire large string to Write at once. Split those writes
+// so a dropped or cancelled invocation stops serialization cooperatively.
+struct CancellableWriter<W> {
+    inner: W,
+    cancellation: pi_rs::CancellationToken,
+}
+impl<W: Write> Write for CancellableWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.cancellation.is_cancelled() {
+            return Err(std::io::Error::other("MCP page preparation cancelled"));
+        }
+        self.inner.write(&bytes[..bytes.len().min(64 * 1024)])
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn publish_page_output(
+    outputs: &PageOutputs,
+    closed: &AtomicBool,
+    cancellation: &pi_rs::CancellationToken,
+    id: Uuid,
+    kind: String,
+    file: tempfile::NamedTempFile,
+) -> Result<()> {
+    let mut outputs = outputs.lock().unwrap_or_else(|e| e.into_inner());
+    if cancellation.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    if closed.load(Ordering::SeqCst) {
+        return Err(Error::Config("MCP connection is closed".into()));
+    }
+    if outputs.len() >= 8 {
+        outputs.pop_front();
+    }
+    outputs.push_back((id, kind, file));
+    // Cancellation can arrive from another thread while this lock is held.
+    if cancellation.is_cancelled() {
+        outputs.pop_back();
+        return Err(Error::Cancelled);
+    }
+    Ok(())
+}
+
+fn mcp_tool_outcome(mut data: Value) -> Outcome {
+    if let Some(fields) = data.as_object_mut() {
+        fields.shift_remove("_meta");
+    }
+    Outcome::Structured {
+        data,
+        attachments: vec![],
+    }
+}
+
 enum CallError {
     Other(String),
+    TransientHttp(String),
     Scope(Option<String>),
 }
 
@@ -989,12 +1363,80 @@ impl From<serde_json::Error> for CallError {
     }
 }
 
+fn transient_http_status(error: &StreamableHttpError<reqwest_mcp::Error>) -> Option<u16> {
+    let status = match error {
+        StreamableHttpError::HttpStatus(error) => Some(error.status),
+        StreamableHttpError::Client(error) => error.status().map(|status| status.as_u16()),
+        // rmcp 3.9 only preserves typed status metadata for 429 and 5xx.
+        StreamableHttpError::UnexpectedServerResponse(detail)
+            if detail.starts_with("HTTP 408 Request Timeout: ") =>
+        {
+            Some(408)
+        }
+        _ => None,
+    };
+    status.filter(|status| matches!(status, 408 | 429 | 500 | 502..=599))
+}
+
+fn transient_http_initialization(error: &ClientInitializeError) -> bool {
+    let transport = match error {
+        ClientInitializeError::TransportError { error, .. } => error,
+        ClientInitializeError::LegacyFallbackFailed { fallback, .. } => {
+            return transient_http_initialization(fallback);
+        }
+        _ => return false,
+    };
+    let mut cause = Some(transport.error.as_ref() as &dyn std::error::Error);
+    while let Some(error) = cause {
+        if let Some(error) = error.downcast_ref::<StreamableHttpError<reqwest_mcp::Error>>() {
+            return transient_http_status(error).is_some()
+                || matches!(error, StreamableHttpError::Client(error) if error.is_connect() || error.is_timeout() || error.is_request());
+        }
+        cause = error.source();
+    }
+    false
+}
+
+async fn start_http_service<C: StreamableHttpClient + Clone>(
+    native: NativeClient,
+    client: C,
+    config: StreamableHttpClientTransportConfig,
+    lifecycle: ClientLifecycleMode,
+) -> std::result::Result<RunningService<RoleClient, NativeClient>, ClientInitializeError> {
+    for delay in [Some(250), Some(1000), None] {
+        let transport = crate::mcp_log::LoggingTransport::new(
+            StreamableHttpClientTransport::with_client(client.clone(), config.clone()),
+            native.server_name.clone(),
+        );
+        let result = native
+            .clone()
+            .serve_with_lifecycle(
+                native.progress_transport(ResourceCompatibility(transport)),
+                lifecycle.clone(),
+            )
+            .await;
+        match (result, delay) {
+            (Err(error), Some(delay)) if transient_http_initialization(&error) => {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            (result, _) => return result,
+        }
+    }
+    unreachable!("last initialization attempt has no retry")
+}
+
 fn call_error(error: ServiceError) -> CallError {
     if let ServiceError::TransportSend(transport) = &error {
         let mut cause = Some(transport.error.as_ref() as &dyn std::error::Error);
         while let Some(error) = cause {
             if let Some(scope) = error.downcast_ref::<InsufficientScopeError>() {
                 return CallError::Scope(scope.get_required_scope().map(str::to_owned));
+            }
+            if let Some(status) = error
+                .downcast_ref::<StreamableHttpError<reqwest_mcp::Error>>()
+                .and_then(transient_http_status)
+            {
+                return CallError::TransientHttp(format!("MCP request returned HTTP {status}"));
             }
             cause = error.source();
         }
@@ -1030,48 +1472,263 @@ impl McpTool {
         context: ToolContext,
         host: Option<Arc<dyn pi_rs::ToolHost>>,
     ) -> Outcome {
+        let page_tool = self.resource
+            && matches!(
+                self.remote_name.as_str(),
+                "list_resources_page" | "list_resource_templates_page"
+            );
+        if page_tool && arguments.get("outputId").is_some() {
+            if context.cancellation.is_cancelled() || self.connection.closed.load(Ordering::SeqCst)
+            {
+                return Outcome::Failed("MCP page retrieval cancelled or connection closed".into());
+            }
+            return match self.read_page_output(&arguments) {
+                Ok(data) => Outcome::Structured {
+                    data,
+                    attachments: vec![],
+                },
+                Err(error) => Outcome::Failed(error.to_string()),
+            };
+        }
+        if page_tool && let Err(error) = resource_page_params(&arguments) {
+            return Outcome::Failed(error.to_string());
+        }
         let attempt = || async {
+            let dispatch_cancel = context.cancellation.child_token();
+            let (progress, updates) = mcp_progress::channel(self.connection.timeout);
+            // Keep the idle deadline independent of a slow or unavailable UI.
+            let report = async {
+                if let Some(host) = host.as_ref().filter(|host| host.supports_progress()) {
+                    mcp_progress::report(
+                        host.as_ref(),
+                        &self.connection.name,
+                        &self.remote_name,
+                        updates.clone(),
+                    )
+                    .await;
+                }
+                std::future::pending::<()>().await;
+            };
             tokio::select! {
+                biased;
                 _ = context.cancellation.cancelled() => {
                     Err(CallError::Other("MCP request cancelled after dispatch".into()))
                 }
-                result = tokio::time::timeout(
-                    self.connection.timeout, self.call_once(&arguments, &context, host.as_ref()),
-                ) => result.unwrap_or_else(|_| {
+                _ = async {
+                    mcp_progress::wait_for_idle(updates.clone()).await;
+                    dispatch_cancel.cancel();
+                } => {
                     Err(CallError::Other("MCP request timed out after dispatch".into()))
-                }),
+                }
+                _ = report => unreachable!("tool progress reporter is pending until the request ends"),
+                result = self.call_once(&arguments, &context, host.as_ref(), &dispatch_cancel, progress) => result,
             }
         };
-        let mut result = attempt().await;
-        if let Err(CallError::Scope(required)) = &result {
-            let Some(scopes) = required.as_deref().and_then(scope_tokens) else {
-                return Outcome::Failed("MCP server requires additional OAuth scopes but did not supply a valid scope list".into());
-            };
-            let authorized = tokio::select! {
-                _ = context.cancellation.cancelled() => Err(Error::Cancelled),
-                result = self.authorize_scopes(&scopes, host.as_deref()) => result,
-            };
-            if let Err(error) = authorized {
-                return Outcome::Failed(error.to_string());
+        let mut may_retry_read = self.resource
+            && matches!(
+                self.remote_name.as_str(),
+                "list_resources"
+                    | "list_resource_templates"
+                    | "list_resources_page"
+                    | "list_resource_templates_page"
+                    | "read_resource"
+            );
+        let mut may_upgrade_scope = true;
+        let result = loop {
+            match attempt().await {
+                Err(CallError::TransientHttp(_)) if may_retry_read => {
+                    may_retry_read = false;
+                    tokio::select! {
+                        biased;
+                        _ = context.cancellation.cancelled() => {
+                            return Outcome::Failed("MCP resource retry cancelled".into());
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    }
+                }
+                Err(CallError::Scope(required)) if may_upgrade_scope => {
+                    may_upgrade_scope = false;
+                    let Some(scopes) = required.as_deref().and_then(scope_tokens) else {
+                        return Outcome::Failed("MCP server requires additional OAuth scopes but did not supply a valid scope list".into());
+                    };
+                    let authorized = tokio::select! {
+                        _ = context.cancellation.cancelled() => Err(Error::Cancelled),
+                        result = self.authorize_scopes(&scopes, host.as_deref()) => result,
+                    };
+                    if let Err(error) = authorized {
+                        return Outcome::Failed(error.to_string());
+                    }
+                    // The 403 rejected dispatch. Keep the original operation ID.
+                }
+                result => break result,
             }
-            // The typed HTTP 403 rejected the request before tool dispatch.
-            // Retry once with the same operation identifier and new authorization.
-            result = attempt().await;
-        }
+        };
         match result {
+            Ok(CallResult::Data(data)) if !self.resource => mcp_tool_outcome(data),
             Ok(CallResult::Data(data)) if data["isError"] == true => {
                 Outcome::Failed(data.to_string())
             }
-            Ok(CallResult::Data(data)) => Outcome::Structured {
-                data,
-                attachments: vec![],
-            },
+            Ok(CallResult::Data(data)) => {
+                let data = if page_tool {
+                    match self.save_large_page(data, &context.cancellation).await {
+                        Ok(data) => data,
+                        Err(error) => return Outcome::Failed(error.to_string()),
+                    }
+                } else {
+                    data
+                };
+                Outcome::Structured {
+                    data,
+                    attachments: vec![],
+                }
+            }
             Ok(CallResult::Task(reference)) => Outcome::Pending { reference },
             Err(CallError::Scope(_)) => Outcome::Failed(
                 "MCP server still requires additional OAuth scopes after reauthorization".into(),
             ),
-            Err(CallError::Other(error)) => Outcome::Unknown(error),
+            Err(CallError::Other(error) | CallError::TransientHttp(error)) => {
+                Outcome::Unknown(error)
+            }
         }
+    }
+
+    // Preparation can serialize and write arbitrarily large pages. Run it off
+    // the async runtime and publish only after cancellation and close checks.
+    async fn save_large_page(
+        &self,
+        data: Value,
+        cancellation: &pi_rs::CancellationToken,
+    ) -> Result<Value> {
+        let prepared = run_page_preparation(cancellation, move |worker_cancel| {
+            let mut writer = CancellableWriter {
+                inner: Vec::new(),
+                cancellation: worker_cancel.clone(),
+            };
+            if let Err(error) = serde_json::to_writer(&mut writer, &data) {
+                return if worker_cancel.is_cancelled() {
+                    Err(Error::Cancelled)
+                } else {
+                    Err(error.into())
+                };
+            }
+            let text = writer.inner;
+            if worker_cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            if text.len() <= 512 * 1024 {
+                return Ok(PreparedPage::Inline(data));
+            }
+            let mut file = tempfile::NamedTempFile::new()
+                .map_err(|e| Error::Config(format!("cannot save MCP page: {e}")))?;
+            for chunk in text.chunks(64 * 1024) {
+                if worker_cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                file.write_all(chunk)
+                    .map_err(|e| Error::Config(format!("cannot save MCP page: {e}")))?;
+            }
+            if worker_cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let cursor = data
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|c| c.len() <= 16 * 1024)
+                .map(str::to_owned);
+            Ok(PreparedPage::Saved {
+                file,
+                bytes: text.len(),
+                cursor,
+            })
+        })
+        .await?;
+        match prepared {
+            PreparedPage::Inline(data) => {
+                if cancellation.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                if self.connection.closed.load(Ordering::SeqCst) {
+                    return Err(Error::Config("MCP connection is closed".into()));
+                }
+                Ok(data)
+            }
+            PreparedPage::Saved {
+                file,
+                bytes,
+                cursor,
+            } => {
+                let id = Uuid::new_v4();
+                publish_page_output(
+                    &self.connection.page_outputs,
+                    &self.connection.closed,
+                    cancellation,
+                    id,
+                    self.remote_name.clone(),
+                    file,
+                )?;
+                let mut result = json!({"server": self.connection.name, "outputId": id.to_string(),
+                    "outputBytes": bytes, "readTool": self.spec.name,
+                    "message": "Full page saved; call this tool with outputId and byte offset to retrieve JSON chunks."});
+                if let Some(cursor) = cursor {
+                    result["nextCursor"] = json!(cursor);
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    fn read_page_output(&self, arguments: &Value) -> Result<Value> {
+        if arguments.get("cursor").is_some() {
+            return Err(Error::Config(
+                "cursor cannot be combined with outputId".into(),
+            ));
+        }
+        let id = arguments
+            .get("outputId")
+            .and_then(Value::as_str)
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or_else(|| Error::Config("invalid outputId".into()))?;
+        let offset = match arguments.get("offset") {
+            None => 0,
+            Some(value) => value
+                .as_u64()
+                .ok_or_else(|| Error::Config("offset must be a non-negative integer".into()))?,
+        };
+        let mut outputs = self
+            .connection
+            .page_outputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_, _, file) = outputs
+            .iter_mut()
+            .find(|(key, kind, _)| *key == id && *kind == self.remote_name)
+            .ok_or_else(|| Error::Config("MCP page output expired or unknown".into()))?;
+        let size = file
+            .as_file()
+            .metadata()
+            .map_err(|e| Error::Config(e.to_string()))?
+            .len();
+        if offset > size {
+            return Err(Error::Config("offset exceeds page output".into()));
+        }
+        let file = file.as_file_mut();
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| Error::Config(e.to_string()))?;
+        let mut bytes = vec![0; (size - offset).min(16 * 1024) as usize];
+        file.read_exact(&mut bytes)
+            .map_err(|e| Error::Config(e.to_string()))?;
+        let valid = match std::str::from_utf8(&bytes) {
+            Ok(_) => bytes.len(),
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => return Err(Error::Config("offset is not a UTF-8 boundary".into())),
+        };
+        let chunk = std::str::from_utf8(&bytes[..valid]).expect("valid UTF-8");
+        let next = offset + valid as u64;
+        let mut result = json!({"outputId": id.to_string(), "offset": offset, "text": chunk});
+        if next < size {
+            result["nextOffset"] = json!(next);
+        }
+        Ok(result)
     }
 
     async fn authorize_scopes(
@@ -1105,8 +1762,15 @@ impl McpTool {
         if confirmation != pi_rs::UiResponse::Confirmed(true) {
             return Err(Error::Config("MCP scope upgrade declined".into()));
         }
-        let generation =
-            crate::mcp_auth::upgrade(&connection.name, url, previous, scopes, |_| {}).await?;
+        let generation = crate::mcp_auth::upgrade(
+            &connection.name,
+            url,
+            previous,
+            scopes,
+            connection.http_options.as_ref(),
+            |_| {},
+        )
+        .await?;
         connection.rebind_after_upgrade(previous, generation).await
     }
 
@@ -1115,6 +1779,8 @@ impl McpTool {
         arguments: &Value,
         context: &ToolContext,
         host: Option<&Arc<dyn pi_rs::ToolHost>>,
+        dispatch_cancel: &pi_rs::CancellationToken,
+        progress: mcp_progress::UpdatesSender,
     ) -> std::result::Result<CallResult, CallError> {
         if self.resource {
             return self.invoke_resource(arguments).await.map(CallResult::Data);
@@ -1123,6 +1789,11 @@ impl McpTool {
             json!({"name":self.remote_name,"arguments":arguments,"_meta":{"operationId":context.operation_id.to_string()}}),
         )?;
         let service = self.connection.active_service().await?;
+        let _progress = service.service().progress.register(
+            context.operation_id,
+            self.connection.timeout,
+            progress,
+        );
         let interaction = service.service().interaction.clone();
         *interaction
             .lock()
@@ -1131,7 +1802,25 @@ impl McpTool {
             cancellation: context.cancellation.clone(),
         });
         let _interaction = InteractionGuard(interaction);
-        let result = service.call_tool_once(params).await.map_err(call_error)?;
+        service
+            .service()
+            .dispatch_closed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cancellation = Some(dispatch_cancel.clone());
+        let mut abandoned = AbandonedCall {
+            closed: service.service().dispatch_closed.clone(),
+            service: Some(service.cancellation_token()),
+        };
+        let result = service.call_tool_once(params).await;
+        service
+            .service()
+            .dispatch_closed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cancellation = None;
+        abandoned.service = None;
+        let result = result.map_err(call_error)?;
         match result {
             CallToolResponse::Complete(result) => {
                 Ok(CallResult::Data(serde_json::to_value(result)?))
@@ -1147,20 +1836,61 @@ impl McpTool {
     }
     async fn invoke_resource(&self, arguments: &Value) -> std::result::Result<Value, CallError> {
         let service = self.connection.active_service().await?;
+        let service = &*service;
         match self.remote_name.as_str() {
             "list_resources" => {
-                let resources = service.list_all_resources().await.map_err(call_error)?;
-                Ok(json!({"resources":resources}))
+                let resources = all_pages("resources/list", |params| async move {
+                    let result = service.list_resources(Some(params)).await?;
+                    Ok((result.resources, result.next_cursor))
+                })
+                .await
+                .map_err(call_error)?;
+                Ok(json!({"resources": visible_resource_listing(serde_json::to_value(resources)?)}))
             }
             "list_resource_templates" => {
-                let templates = service
-                    .list_all_resource_templates()
+                let templates = templates_or_empty(
+                    all_pages("resources/templates/list", |params| async move {
+                        let result = service.list_resource_templates(Some(params)).await?;
+                        Ok((result.resource_templates, result.next_cursor))
+                    })
+                    .await,
+                )?;
+                Ok(
+                    json!({"resourceTemplates": visible_resource_listing(serde_json::to_value(templates)?)}),
+                )
+            }
+            "list_resources_page" => {
+                let result = service
+                    .list_resources(Some(resource_page_params(arguments)?))
                     .await
                     .map_err(call_error)?;
-                Ok(json!({"resourceTemplates":templates}))
+                Ok(resource_page(
+                    &self.connection.name,
+                    "resources",
+                    serde_json::to_value(result.resources)?,
+                    result.next_cursor,
+                ))
+            }
+            "list_resource_templates_page" => {
+                let result = templates_or_empty(
+                    service
+                        .list_resource_templates(Some(resource_page_params(arguments)?))
+                        .await,
+                )?;
+                Ok(resource_page(
+                    &self.connection.name,
+                    "resourceTemplates",
+                    serde_json::to_value(result.resource_templates)?,
+                    result.next_cursor,
+                ))
             }
             "list_prompts" => {
-                let prompts = service.list_all_prompts().await.map_err(call_error)?;
+                let prompts = all_pages("prompts/list", |params| async move {
+                    let result = service.list_prompts(Some(params)).await?;
+                    Ok((result.prompts, result.next_cursor))
+                })
+                .await
+                .map_err(call_error)?;
                 Ok(json!({"prompts":prompts}))
             }
             "get_prompt" => {
@@ -1189,6 +1919,110 @@ impl McpTool {
         }
     }
 }
+
+const MAX_LIST_PAGES: usize = 1_000;
+
+async fn all_pages<T, F>(
+    method: &str,
+    mut list: impl FnMut(PaginatedRequestParams) -> F,
+) -> std::result::Result<Vec<T>, ServiceError>
+where
+    F: std::future::Future<Output = std::result::Result<(Vec<T>, Option<String>), ServiceError>>,
+{
+    let invalid = |message| ServiceError::McpError(ErrorData::invalid_request(message, None));
+    let mut items = Vec::new();
+    let mut cursor = None;
+    let mut seen = BTreeSet::new();
+    for _ in 0..MAX_LIST_PAGES {
+        let mut params = PaginatedRequestParams::default();
+        params.cursor = cursor;
+        let (page, next) = list(params).await?;
+        items.extend(page);
+        let Some(next) = nonempty_cursor(next) else {
+            return Ok(items);
+        };
+        if !seen.insert(next.clone()) {
+            // Cursors are opaque server-provided data and can contain secrets.
+            return Err(invalid(format!("MCP {method} returned a duplicate cursor")));
+        }
+        cursor = Some(next);
+    }
+    Err(invalid(format!(
+        "MCP {method} exceeded {MAX_LIST_PAGES} pages"
+    )))
+}
+
+fn nonempty_cursor(cursor: Option<String>) -> Option<String> {
+    cursor.filter(|value| !value.is_empty())
+}
+
+// Servers can provide resources without implementing resource templates.
+fn templates_or_empty<T: Default>(
+    result: std::result::Result<T, ServiceError>,
+) -> std::result::Result<T, CallError> {
+    match result {
+        Err(ServiceError::McpError(error))
+            if error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
+        {
+            Ok(T::default())
+        }
+        other => other.map_err(call_error),
+    }
+}
+
+fn resource_page_params(arguments: &Value) -> Result<rmcp::model::PaginatedRequestParams> {
+    let cursor = match arguments.get("cursor") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => return Err(Error::Config("cursor must be a string".into())),
+    };
+    let mut params = rmcp::model::PaginatedRequestParams::default();
+    params.cursor = cursor;
+    Ok(params)
+}
+
+fn resource_page(server: &str, key: &str, items: Value, cursor: Option<String>) -> Value {
+    let items: Vec<_> = visible_resource_listing(items)
+        .into_iter()
+        .map(|mut item| {
+            item["server"] = json!(server);
+            item
+        })
+        .collect();
+    let mut result = json!({"server": server});
+    result[key] = json!(items);
+    if let Some(cursor) = nonempty_cursor(cursor) {
+        result["nextCursor"] = json!(cursor);
+    }
+    result
+}
+
+/// Match Pi's MCP App listing filter, including its MIME-profile prefix matching.
+fn visible_resource_listing(value: Value) -> Vec<Value> {
+    static APP_PROFILE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i);\s*profile\s*=\s*"?mcp-app"?"#).expect("MCP App MIME profile")
+    });
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let mut entry = entry.as_object()?.clone();
+            let uri = entry
+                .get("uri")
+                .or_else(|| entry.get("uriTemplate"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let mime = entry.get("mimeType").and_then(Value::as_str).unwrap_or("");
+            if uri.starts_with("ui://") || APP_PROFILE.is_match(mime) {
+                return None;
+            }
+            entry.remove("_meta");
+            entry.remove("icons");
+            Some(Value::Object(entry))
+        })
+        .collect()
+}
 fn connection_identity(name: &str, config: &ServerConfig, workspace: &Path) -> Result<Sha256> {
     let workspace = workspace.canonicalize()?;
     let mut identity = Sha256::new();
@@ -1202,7 +2036,16 @@ fn connection_identity(name: &str, config: &ServerConfig, workspace: &Path) -> R
     Ok(identity)
 }
 
-fn exposure<'a>(config: &'a ServerConfig, name: &str) -> &'a str {
+/// Returns the effective configured exposure for a remote tool name.
+pub fn tool_exposure<'a>(config: &'a ServerConfig, name: &str) -> &'a str {
+    tool_exposure_with_default(config, name, config.exposure.as_deref())
+}
+
+fn tool_exposure_with_default<'a>(
+    config: &'a ServerConfig,
+    name: &str,
+    default: Option<&'a str>,
+) -> &'a str {
     config
         .tool_exposure
         .get(name)
@@ -1220,16 +2063,16 @@ fn exposure<'a>(config: &'a ServerConfig, name: &str) -> &'a str {
                 })
                 .map(|(_, value)| value)
         })
-        .or(config.exposure.as_ref())
         .map(String::as_str)
+        .or(default)
         .unwrap_or("codemode")
 }
 fn tool_enabled(config: &ServerConfig, name: &str) -> bool {
-    !matches!(exposure(config, name), "hidden" | "off")
+    !matches!(tool_exposure(config, name), "hidden" | "off")
 }
 fn is_deferred(config: &ServerConfig, name: &str) -> bool {
     matches!(
-        exposure(config, name),
+        tool_exposure(config, name),
         "deferred" | "codemode" | "codemode-deferred"
     )
 }
@@ -1278,15 +2121,7 @@ impl Tool for McpTool {
             };
             match response.task.payload {
                 rmcp::model::TaskPayload::Completed { result } => {
-                    let data = Value::Object(result);
-                    return Some(if data["isError"] == true {
-                        Outcome::Failed(data.to_string())
-                    } else {
-                        Outcome::Structured {
-                            data,
-                            attachments: vec![],
-                        }
-                    });
+                    return Some(mcp_tool_outcome(Value::Object(result)));
                 }
                 rmcp::model::TaskPayload::Failed { error } => {
                     return Some(Outcome::Failed(Value::Object(error).to_string()));
@@ -1316,6 +2151,32 @@ impl Tool for McpTool {
         }
     }
 }
+fn owned_stdio_transport(
+    mut command: process_wrap::tokio::CommandWrap,
+    owner: &Children,
+) -> Result<
+    rmcp::transport::async_rw::AsyncRwTransport<
+        RoleClient,
+        tokio::process::ChildStdout,
+        tokio::process::ChildStdin,
+    >,
+> {
+    use std::process::Stdio;
+    command
+        .command_mut()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let (_, (stdout, stdin)) = owner.spawn(command, |child| {
+        (
+            child.stdout().take().expect("piped MCP stdout"),
+            child.stdin().take().expect("piped MCP stdin"),
+        )
+    })?;
+    Ok(rmcp::transport::async_rw::AsyncRwTransport::new(
+        stdout, stdin,
+    ))
+}
+
 fn wrap_process(process: tokio::process::Command) -> process_wrap::tokio::CommandWrap {
     let mut wrapped = process_wrap::tokio::CommandWrap::from(process);
     #[cfg(unix)]
@@ -1337,6 +2198,32 @@ fn normalize(name: &str) -> String {
         })
         .collect()
 }
+const MIN_MCP_TIMEOUT: Duration = Duration::from_millis(1);
+const MAX_MCP_TIMEOUT: Duration = Duration::from_secs(3600);
+
+fn deserialize_server_timeout<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<f64>::deserialize(deserializer)?
+        .map(|seconds| {
+            if !seconds.is_finite() || seconds < 0.0 {
+                return Err(serde::de::Error::custom(
+                    "MCP timeout must be a finite, non-negative number of seconds",
+                ));
+            }
+            let seconds = if seconds == 0.0 {
+                0.0
+            } else {
+                seconds.clamp(MIN_MCP_TIMEOUT.as_secs_f64(), MAX_MCP_TIMEOUT.as_secs_f64())
+            };
+            Ok(Duration::from_secs_f64(seconds))
+        })
+        .transpose()
+}
+
 fn expand_home(value: &str) -> String {
     value
         .strip_prefix("~/")
@@ -1353,6 +2240,11 @@ fn expand_home(value: &str) -> String {
         .unwrap_or_else(|| value.into())
 }
 pub async fn resolve_value(value: &str) -> Result<String> {
+    resolve_value_with_cleanup(value, None).await
+}
+
+#[doc(hidden)]
+pub async fn resolve_value_with_cleanup(value: &str, cleanup: Option<&Children>) -> Result<String> {
     if let Some(command) = value.strip_prefix('!') {
         let mut process = if cfg!(windows) {
             let mut command = tokio::process::Command::new("cmd");
@@ -1369,32 +2261,34 @@ pub async fn resolve_value(value: &str) -> Result<String> {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
-        let mut child = wrap_process(process).spawn()?;
+        let local = Children::default();
+        let owner = cleanup.unwrap_or(&local);
+        let (process, stdout) = owner.spawn(wrap_process(process), |child| {
+            child.stdout().take().expect("piped credential output")
+        })?;
         let operation = async {
+            let limit = 64 * 1024;
             let mut output = Vec::new();
-            child
-                .stdout()
-                .take()
-                .expect("piped credential output")
-                .take(64 * 1024 + 1)
-                .read_to_end(&mut output)
-                .await?;
-            if output.len() > 64 * 1024 {
-                Box::into_pin(child.kill()).await?;
+            stdout.take(limit + 1).read_to_end(&mut output).await?;
+            if output.len() as u64 > limit {
                 return Err(Error::Config(
                     "credential command output exceeds limit".into(),
                 ));
             }
-            if !child.wait().await?.success() {
+            if !process.wait().await?.success() {
                 return Err(Error::Config("credential command failed".into()));
             }
             String::from_utf8(output)
                 .map(|value| value.trim().into())
                 .map_err(|_| Error::Config("credential command returned non-UTF-8".into()))
         };
-        return tokio::time::timeout(Duration::from_secs(10), operation)
+        let result = tokio::time::timeout(Duration::from_secs(10), operation)
             .await
-            .map_err(|_| Error::Config("credential command timed out".into()))?;
+            .unwrap_or_else(|_| Err(Error::Config("credential command timed out".into())));
+        let reaped = local.finish().await;
+        let output = result?;
+        reaped?;
+        return Ok(output);
     }
 
     let expression =
@@ -1424,12 +2318,798 @@ pub async fn resolve_value(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct ProgressHost(std::sync::Mutex<Vec<Value>>);
+
+    #[async_trait::async_trait]
+    impl pi_rs::ToolHost for ProgressHost {
+        fn tools(&self) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn supports_progress(&self) -> bool {
+            true
+        }
+
+        async fn report_progress(&self, value: Value) -> pi_rs::ExtensionResult<()> {
+            self.0.lock().unwrap().push(value);
+            Ok(())
+        }
+
+        async fn call(&self, _name: &str, _arguments: Value) -> Outcome {
+            panic!("fixture does not call nested tools")
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn matching_tool_progress_renews_idle_timeout_and_reports_updates() {
+        assert_tool_progress("matching").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stringified_tool_progress_renews_idle_timeout() {
+        assert_tool_progress("stringified").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unmatched_tool_progress_does_not_renew_idle_timeout() {
+        assert_tool_progress("unmatched").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_progress_does_not_prevent_cancellation() {
+        assert_tool_progress("cancelled").await;
+    }
+
+    async fn assert_tool_progress(case: &str) {
+        use rmcp::transport::async_rw::AsyncRwTransport;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (client, server) = tokio::io::duplex(8192);
+        let (server_rx, mut server_tx) = tokio::io::split(server);
+        let cancellation = pi_rs::CancellationToken::new();
+        let cancel_fixture = cancellation.clone();
+        let case = case.to_owned();
+        let fixture_case = case.clone();
+        let fixture = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_rx).lines();
+            let init: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(init["method"], "initialize");
+            let reply = json!({
+                "jsonrpc": "2.0",
+                "id": init["id"],
+                "result": {
+                    "protocolVersion": init["params"]["protocolVersion"],
+                    "capabilities": {"tools":{}},
+                    "serverInfo": {"name":"fixture", "version":"1"}
+                }
+            });
+            server_tx
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            let notification: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(notification["method"], "notifications/initialized");
+            let call: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(call["method"], "tools/call");
+            let token = &call["params"]["_meta"]["progressToken"];
+            assert!(!token.is_null());
+            let numeric = token.as_i64().unwrap();
+            let token = match fixture_case.as_str() {
+                "unmatched" => json!(format!("0{numeric}")),
+                "stringified" => json!(numeric.to_string()),
+                _ => token.clone(),
+            };
+            for params in [
+                json!({"progressToken":token,"progress":1,"total":3}),
+                json!({"progressToken":token,"progress":2,"message":"working"}),
+            ] {
+                tokio::time::sleep(Duration::from_millis(70)).await;
+                let update =
+                    json!({"jsonrpc":"2.0","method":"notifications/progress","params":params});
+                let _ = server_tx.write_all(format!("{update}\n").as_bytes()).await;
+            }
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            if fixture_case == "cancelled" {
+                cancel_fixture.cancel();
+            } else {
+                let reply = json!({"jsonrpc":"2.0","id":call["id"],"result":{"content":[{"type":"text","text":"done"}]}});
+                let _ = server_tx.write_all(format!("{reply}\n").as_bytes()).await;
+            }
+            // Keep the connection open until the client receives the last message.
+            let _ = lines.next_line().await;
+        });
+        let (client_rx, client_tx) = tokio::io::split(client);
+        let native = NativeClient::default();
+        let dispatch = native.dispatch_closed.clone();
+        let transport = native.progress_transport(AsyncRwTransport::new(client_rx, client_tx));
+        let service = native
+            .serve_with_lifecycle(transport, ClientLifecycleMode::Initialize)
+            .await
+            .unwrap();
+        let tool = McpTool {
+            connection: Arc::new(Connection {
+                identity: RwLock::new(ConnectionIdentity {
+                    digest: "fixture".into(),
+                    oauth_generation: None,
+                }),
+                service: tokio::sync::Mutex::new(service),
+                timeout: Duration::from_millis(120),
+                name: "fixture".into(),
+                config: serde_json::from_value(json!({"command":"fixture"})).unwrap(),
+                workspace: PathBuf::new(),
+                provider_token: None,
+                http_options: None,
+                closed: AtomicBool::new(false),
+                page_outputs: std::sync::Mutex::new(VecDeque::new()),
+            }),
+            remote_name: "work".into(),
+            spec: ToolSpec {
+                name: "work".into(),
+                description: "fixture".into(),
+                parameters: json!({"type":"object"}),
+            },
+            resource: false,
+        };
+        let host = Arc::new(ProgressHost::default());
+        let result = tool
+            .invoke_with_host(
+                json!({}),
+                ToolContext {
+                    operation_id: Uuid::new_v4(),
+                    cancellation,
+                },
+                None,
+                host.clone(),
+            )
+            .await;
+        let updates = host.0.lock().unwrap();
+        if case == "unmatched" {
+            assert!(updates.is_empty());
+            assert!(matches!(result, Outcome::Unknown(error) if error.contains("timed out")));
+            assert!(dispatch.lock().unwrap().closed);
+        } else {
+            assert_eq!(
+                updates.as_slice(),
+                [
+                    json!({"content":[{"type":"text","text":"Progress 1/3"}],"details":{"server":"fixture","tool":"work"}}),
+                    json!({"content":[{"type":"text","text":"working"}],"details":{"server":"fixture","tool":"work"}}),
+                ]
+            );
+            if case == "cancelled" {
+                assert!(matches!(result, Outcome::Unknown(error) if error.contains("cancelled")));
+                assert!(dispatch.lock().unwrap().closed);
+            } else {
+                assert!(
+                    matches!(result, Outcome::Structured { data, .. } if data["content"][0]["text"] == "done")
+                );
+                assert!(!dispatch.lock().unwrap().closed);
+            }
+        }
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn pagination_preserves_items_and_treats_empty_cursors_as_terminal() {
+        let mut calls = 0;
+        let items = all_pages("resources/list", |params| {
+            calls += 1;
+            let page = if calls == 1 {
+                assert!(params.cursor.is_none());
+                (vec!["first"], Some(" through ".into()))
+            } else {
+                assert_eq!(params.cursor.as_deref(), Some(" through "));
+                (vec!["last"], Some(String::new()))
+            };
+            std::future::ready(Ok(page))
+        })
+        .await
+        .unwrap();
+        assert_eq!(items, ["first", "last"]);
+        assert_eq!(calls, 2);
+        assert!(
+            resource_page("fixture", "resources", json!([]), Some(String::new()))
+                .get("nextCursor")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_client_lists_only_its_workspace_root() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace café #1");
+        std::fs::create_dir(&workspace).unwrap();
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server = async move {
+            let mut transport = BufReader::new(server_transport);
+            let mut line = String::new();
+            transport.read_line(&mut line).await.unwrap();
+            let init: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(init["method"], "initialize");
+            assert_eq!(init["params"]["protocolVersion"], "2025-11-25");
+            assert!(init["params"]["capabilities"]["roots"].is_object());
+            let reply = json!({
+                "jsonrpc":"2.0", "id": init["id"],
+                "result":{
+                    "protocolVersion":init["params"]["protocolVersion"],
+                    "capabilities":{},
+                    "serverInfo":{"name":"fixture","version":"1"}
+                }
+            });
+            transport
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            line.clear();
+            transport.read_line(&mut line).await.unwrap();
+            let initialized: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(initialized["method"], "notifications/initialized");
+            transport
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":\"roots-fixture\",\"method\":\"roots/list\"}\n",
+                )
+                .await
+                .unwrap();
+            line.clear();
+            transport.read_line(&mut line).await.unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        let native = NativeClient::for_server("fixture", &workspace).await;
+        let (response, client) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                server,
+                native.serve_with_lifecycle(client_transport, ClientLifecycleMode::Initialize),
+            )
+        })
+        .await
+        .expect("MCP roots fixture timed out");
+        let _client = client.unwrap();
+        assert_eq!(response["id"], "roots-fixture");
+        let roots = response["result"]["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1);
+        let root = &roots[0];
+        assert_eq!(root["name"], "workspace café #1");
+        let uri = root["uri"].as_str().unwrap();
+        assert!(uri.ends_with("/workspace%20caf%C3%A9%20%231"), "{uri}");
+        assert_eq!(
+            reqwest_mcp::Url::parse(uri)
+                .unwrap()
+                .to_file_path()
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            workspace.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_workspace_root_resolves_symlinks_before_parent_components() {
+        let directory = tempfile::tempdir().unwrap();
+        let physical = directory.path().join("physical");
+        let child = physical.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&child, &alias).unwrap();
+        let native = NativeClient::for_server("fixture", &alias.join("..")).await;
+        let root = native.workspace_root.unwrap();
+        assert_eq!(root.name, "physical");
+        assert_eq!(
+            reqwest_mcp::Url::parse(&root.uri)
+                .unwrap()
+                .to_file_path()
+                .unwrap(),
+            physical.canonicalize().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_rejects_cycles_and_limits_pages() {
+        let mut calls = 0;
+        let error = all_pages("tools/list", |params| {
+            calls += 1;
+            let next = match params.cursor.as_deref() {
+                None | Some("another") => "opaque-secret",
+                Some("opaque-secret") => "another",
+                value => panic!("unexpected cursor {value:?}"),
+            };
+            std::future::ready(Ok((Vec::<()>::new(), Some(next.into()))))
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(calls, 3);
+        assert!(error.contains("duplicate cursor") && !error.contains("opaque-secret"));
+
+        for terminal_at_limit in [false, true] {
+            let mut calls = 0;
+            let results = all_pages("resources/templates/list", |_| {
+                calls += 1;
+                let next =
+                    (!(terminal_at_limit && calls == MAX_LIST_PAGES)).then(|| calls.to_string());
+                std::future::ready(Ok((vec![calls], next)))
+            })
+            .await;
+            assert_eq!(calls, MAX_LIST_PAGES);
+            if terminal_at_limit {
+                assert_eq!(results.unwrap().len(), MAX_LIST_PAGES);
+            } else {
+                assert!(
+                    results
+                        .unwrap_err()
+                        .to_string()
+                        .contains("exceeded 1000 pages")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_page_preparation_does_not_block_or_leak_file() {
+        let cancellation = pi_rs::CancellationToken::new();
+        let worker_token = cancellation.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_page_preparation(&worker_token, move |_worker_cancel| {
+                let file = tempfile::NamedTempFile::new().unwrap();
+                started_tx.send(file.path().to_owned()).unwrap();
+                release_rx.recv().unwrap();
+                let _ = finished_tx.send(());
+                Ok(PreparedPage::Saved {
+                    file,
+                    bytes: 1,
+                    cursor: None,
+                })
+            })
+            .await
+        });
+        let path = tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(path.exists());
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)));
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_preparation_cancels_worker_without_cancelling_parent() {
+        let parent = pi_rs::CancellationToken::new();
+        let caller_parent = parent.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_page_preparation(&caller_parent, move |worker_cancel| {
+                let file = tempfile::NamedTempFile::new().unwrap();
+                started_tx.send(file.path().to_owned()).unwrap();
+                while !worker_cancel.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                drop(file);
+                let _ = stopped_tx.send(());
+                Err(Error::Cancelled)
+            })
+            .await
+        });
+        let path = tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        tokio::time::timeout(Duration::from_secs(5), stopped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!parent.is_cancelled());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn serialization_checks_cancellation_during_large_string() {
+        struct CancellingSink {
+            token: pi_rs::CancellationToken,
+            bytes: usize,
+        }
+        impl Write for CancellingSink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes += bytes.len();
+                if self.bytes >= 64 * 1024 {
+                    self.token.cancel();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let token = pi_rs::CancellationToken::new();
+        let sink = CancellingSink {
+            token: token.clone(),
+            bytes: 0,
+        };
+        let mut writer = CancellableWriter {
+            inner: sink,
+            cancellation: token,
+        };
+        assert!(
+            serde_json::to_writer(&mut writer, &json!({"large": "x".repeat(1024 * 1024)})).is_err()
+        );
+        assert!(writer.inner.bytes < 128 * 1024);
+    }
+
+    #[test]
+    fn closing_while_page_waits_to_publish_discards_file() {
+        let outputs = Arc::new(PageOutputs::default());
+        let closed = Arc::new(AtomicBool::new(false));
+        let guard = outputs.lock().unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_owned();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let other_outputs = outputs.clone();
+        let other_closed = closed.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            publish_page_output(
+                &other_outputs,
+                &other_closed,
+                &pi_rs::CancellationToken::new(),
+                Uuid::new_v4(),
+                "list_resources_page".into(),
+                file,
+            )
+        });
+        started_rx.recv().unwrap();
+        // close sets the flag before taking the same cache lock and clearing it.
+        closed.store(true, Ordering::SeqCst);
+        drop(guard);
+        assert!(worker.join().unwrap().is_err());
+        assert!(outputs.lock().unwrap().is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cancelled_page_is_not_published() {
+        let outputs = PageOutputs::default();
+        let token = pi_rs::CancellationToken::new();
+        token.cancel();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_owned();
+        assert!(matches!(
+            publish_page_output(
+                &outputs,
+                &AtomicBool::new(false),
+                &token,
+                Uuid::new_v4(),
+                "list_resources_page".into(),
+                file
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert!(outputs.lock().unwrap().is_empty());
+        assert!(!path.exists());
+    }
+
+    struct ReleaseTestLatch(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for ReleaseTestLatch {
+        fn drop(&mut self) {
+            let (lock, wake) = &*self.0;
+            *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            wake.notify_all();
+        }
+    }
+
+    #[test]
+    fn frozen_transport_is_released_during_panic_unwind() {
+        let latch = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        // Install the cleanup guard before any fallible handshake so a failed
+        // assertion also releases the worker.
+        let release = ReleaseTestLatch(latch.clone());
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn({
+            let latch = latch.clone();
+            move || {
+                let (lock, wake) = &*latch;
+                let held = lock.lock().unwrap();
+                waiting_tx.send(()).unwrap();
+                let guard = wake.wait_while(held, |released| !*released).unwrap();
+                finished_tx.send(*guard).unwrap();
+            }
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let result = std::panic::catch_unwind(move || {
+            let _release = release;
+            // Reproduce slow work (such as a panic hook or delayed scheduling)
+            // before unwind without expiring the worker before it is released.
+            std::thread::sleep(Duration::from_millis(100));
+            panic!("fixture early failure");
+        });
+        assert!(result.is_err());
+        assert!(finished_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        worker.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_tool_refresh_never_dispatches_with_full_notification_queue() {
+        use rmcp::{
+            model::{ClientJsonRpcMessage, ClientNotification, ServerJsonRpcMessage},
+            transport::Transport,
+        };
+        use std::sync::{Condvar, Mutex, atomic::AtomicUsize};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        struct Freeze<T> {
+            inner: T,
+            armed: Arc<AtomicBool>,
+            blocked: std::sync::mpsc::Sender<()>,
+            latch: Arc<(Mutex<bool>, Condvar)>,
+            latch_expired: Arc<AtomicBool>,
+        }
+        impl<T: Transport<RoleClient>> Transport<RoleClient> for Freeze<T> {
+            type Error = T::Error;
+            fn send(
+                &mut self,
+                message: ClientJsonRpcMessage,
+            ) -> impl std::future::Future<Output = std::result::Result<(), Self::Error>> + Send + 'static
+            {
+                if matches!(message, ClientJsonRpcMessage::Notification(_))
+                    && self.armed.swap(false, Ordering::SeqCst)
+                {
+                    self.blocked.send(()).unwrap();
+                    let (lock, wake) = &*self.latch;
+                    let release = lock.lock().unwrap();
+                    let (_guard, timeout) = wake
+                        .wait_timeout_while(release, Duration::from_secs(30), |release| !*release)
+                        .unwrap();
+                    self.latch_expired
+                        .store(timeout.timed_out(), Ordering::SeqCst);
+                }
+                self.inner.send(message)
+            }
+            fn receive(
+                &mut self,
+            ) -> impl std::future::Future<Output = Option<ServerJsonRpcMessage>> + Send
+            {
+                self.inner.receive()
+            }
+            fn close(
+                &mut self,
+            ) -> impl std::future::Future<Output = std::result::Result<(), Self::Error>> + Send
+            {
+                self.inner.close()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let resource = format!("{base}/mcp");
+        let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let call_count = calls.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let refresh_tx = refresh_tx.clone();
+                let release = release.clone();
+                let count = call_count.clone();
+                tokio::spawn(async move {
+                    let mut socket = BufReader::new(socket);
+                    let mut first = String::new();
+                    if socket.read_line(&mut first).await.is_err() {
+                        return;
+                    }
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        if socket.read_line(&mut line).await.is_err()
+                            || line == "\r\n"
+                            || line.is_empty()
+                        {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut bytes = vec![0; length];
+                    if socket.read_exact(&mut bytes).await.is_err() {
+                        return;
+                    }
+                    let body = if first.starts_with("POST /token ") {
+                        let _ = refresh_tx.send(()).await;
+                        if let Some(receiver) = release.lock().await.take() {
+                            let _ = receiver.await;
+                        }
+                        r#"{"access_token":"new","token_type":"Bearer","refresh_token":"rotated"}"#
+                            .to_owned()
+                    } else {
+                        let request: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                        match request["method"].as_str() {
+                            Some("initialize") => json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":request["params"]["protocolVersion"],"capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}).to_string(),
+                            Some("tools/call") => { count.fetch_add(1, Ordering::SeqCst); json!({"jsonrpc":"2.0","id":request["id"],"result":{"content":[]}}).to_string() },
+                            _ => String::new(),
+                        }
+                    };
+                    let status = if body.is_empty() {
+                        "202 Accepted"
+                    } else {
+                        "200 OK"
+                    };
+                    let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                });
+            }
+        });
+        let client =
+            crate::mcp_auth::test_oauth_client(path.clone(), &resource, &format!("{base}/token"))
+                .await;
+        let native = NativeClient {
+            dispatch_closed: client.dispatch_state.clone(),
+            ..Default::default()
+        };
+        let transport = StreamableHttpClientTransport::with_client(
+            client,
+            StreamableHttpClientTransportConfig::with_uri(resource.clone()),
+        );
+        let armed = Arc::new(AtomicBool::new(false));
+        let latch = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_on_drop = ReleaseTestLatch(latch.clone());
+        let latch_expired = Arc::new(AtomicBool::new(false));
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let service = native
+            .serve_with_lifecycle(
+                Freeze {
+                    inner: transport,
+                    armed: armed.clone(),
+                    blocked: blocked_tx,
+                    latch: latch.clone(),
+                    latch_expired: latch_expired.clone(),
+                },
+                ClientLifecycleMode::Initialize,
+            )
+            .await
+            .unwrap();
+        let mut envelope: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        envelope["credentials"]["token_response"]["expires_in"] = json!(1);
+        envelope["credentials"]["token_received_at"] = json!(0);
+        std::fs::write(&path, envelope.to_string()).unwrap();
+        let config: ServerConfig = serde_json::from_value(json!({"url":resource})).unwrap();
+        let connection = Arc::new(Connection {
+            identity: RwLock::new(ConnectionIdentity {
+                digest: "fixture".into(),
+                oauth_generation: None,
+            }),
+            service: tokio::sync::Mutex::new(service),
+            timeout: Duration::from_secs(30),
+            name: "fixture".into(),
+            config,
+            workspace: dir.path().to_owned(),
+            provider_token: None,
+            http_options: None,
+            closed: AtomicBool::new(false),
+            page_outputs: std::sync::Mutex::new(VecDeque::new()),
+        });
+        let peer = connection.service.lock().await.peer().clone();
+        let tool = McpTool {
+            connection,
+            remote_name: "mutate".into(),
+            spec: ToolSpec {
+                name: "mutate".into(),
+                description: "fixture".into(),
+                parameters: json!({"type":"object"}),
+            },
+            resource: false,
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        let context = ToolContext {
+            operation_id: Uuid::new_v4(),
+            cancellation: cancellation.clone(),
+        };
+        let call = tokio::spawn(async move { tool.invoke_call(json!({}), context, None).await });
+        tokio::time::timeout(Duration::from_secs(5), refresh_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        armed.store(true, Ordering::SeqCst);
+        let notification: ClientNotification = serde_json::from_value(json!({"method":"notifications/progress","params":{"progressToken":"fixture","progress":1}})).unwrap();
+        let first = {
+            let peer = peer.clone();
+            let notification = notification.clone();
+            tokio::spawn(async move { peer.send_notification(notification).await })
+        };
+        tokio::task::spawn_blocking(move || {
+            blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        })
+        .await
+        .unwrap();
+        let submitted = Arc::new(AtomicUsize::new(0));
+        let mut flood = Vec::new();
+        // The service loop is held in send(), so these exceed rmcp's
+        // 1,024-entry peer queue before the tool's drop guard runs.
+        for _ in 0..1200 {
+            let peer = peer.clone();
+            let notification = notification.clone();
+            let submitted = submitted.clone();
+            flood.push(tokio::spawn(async move {
+                submitted.fetch_add(1, Ordering::SeqCst);
+                peer.send_notification(notification).await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while submitted.load(Ordering::SeqCst) < 1200 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .unwrap()
+                .unwrap(),
+            Outcome::Unknown(_)
+        ));
+        {
+            let (lock, wake) = &*latch;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        let _ = release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains("rotated") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !latch_expired.load(Ordering::SeqCst),
+            "transport latch expired before release"
+        );
+        first.abort();
+        for task in flood {
+            task.abort();
+        }
+        server.abort();
+    }
     #[tokio::test]
     async fn http_proxy_is_preserved_when_transport_reconnects() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy =
-            reqwest_mcp::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let proxy = reqwest_mcp::Proxy::all(format!(
+            "http://user:pass@{}",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap()
+        .tunnel_http(true);
         let initialized = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = initialized.clone();
         let server = tokio::spawn(async move {
@@ -1456,13 +3136,44 @@ mod tests {
                             length = value.trim().parse().unwrap();
                         }
                     }
+                    assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+                    if socket
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    first.clear();
+                    if socket.read_line(&mut first).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        let mut line = String::new();
+                        if socket.read_line(&mut line).await.is_err()
+                            || line == "\r\n"
+                            || line.is_empty()
+                        {
+                            break;
+                        }
+                        assert!(
+                            !line
+                                .to_ascii_lowercase()
+                                .starts_with("proxy-authorization:")
+                        );
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
                     let mut body = vec![0; length];
                     if socket.read_exact(&mut body).await.is_err() {
                         return;
                     }
                     let request: Value = serde_json::from_slice(&body).unwrap_or_default();
                     let response = if request["method"] == "initialize" {
-                        assert!(first.starts_with("POST http://127.0.0.1:1/mcp "));
+                        assert!(first.starts_with("POST /mcp "));
                         count.fetch_add(1, Ordering::SeqCst);
                         Some(json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":request["params"]["protocolVersion"],"capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}).to_string())
                     } else {
@@ -1493,6 +3204,8 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(extension.remote_tool_names().is_empty());
+        assert!(!extension.offers_resources());
         extension
             .connection
             .service
@@ -1509,9 +3222,28 @@ mod tests {
     #[test]
     fn exact_exposure_overrides_wildcard_selection() {
         let config: ServerConfig = serde_json::from_value(json!({"url":"http://127.0.0.1/mcp","exposure":"hidden","toolExposure":{"read*":"deferred","read_one":"direct"}})).unwrap();
-        assert_eq!(exposure(&config, "read_one"), "direct");
+        assert_eq!(tool_exposure(&config, "read_one"), "direct");
         assert!(is_deferred(&config, "read_many"));
         assert!(!tool_enabled(&config, "write"));
+    }
+    #[test]
+    fn tool_exposure_prefers_exact_names_then_the_first_matching_pattern() {
+        let config: ServerConfig = serde_json::from_value(json!({
+            "command":"server",
+            "toolExposure":{"read*":"direct","*":"deferred","read_secret":"hidden"}
+        }))
+        .unwrap();
+        assert_eq!(tool_exposure(&config, "read_secret"), "hidden");
+        assert_eq!(tool_exposure(&config, "read_public"), "direct");
+        assert_eq!(tool_exposure(&config, "write"), "deferred");
+
+        let reordered: ServerConfig = serde_json::from_value(json!({
+            "command":"server",
+            "toolExposure":{"*":"deferred","read*":"direct","read_secret":"hidden"}
+        }))
+        .unwrap();
+        assert_eq!(tool_exposure(&reordered, "read_public"), "deferred");
+        assert_ne!(config, reordered);
     }
     #[test]
     fn task_identity_uses_canonical_workspace_across_resume() {
@@ -1526,6 +3258,32 @@ mod tests {
         assert_eq!(relative, absolute);
     }
     #[test]
+    fn mcp_tool_results_keep_structured_errors_and_drop_private_metadata() {
+        let result = json!({
+            "isError":true,
+            "content":[{"type":"text","text":"not available"}],
+            "structuredContent":{"reason":"not_ready","_meta":"tool data"},
+            "_meta":{"secret":"private server metadata"}
+        });
+        let outcome = mcp_tool_outcome(result.clone());
+        assert!(outcome.is_error());
+        assert!(outcome.tool_content().contains("not available"));
+        assert!(!outcome.tool_content().contains("private server metadata"));
+        let Outcome::Structured { data, .. } = outcome else {
+            panic!("MCP error result was discarded");
+        };
+        assert_eq!(data["structuredContent"], result["structuredContent"]);
+        assert!(data.get("_meta").is_none());
+        assert_eq!(data["isError"], true);
+
+        let success = mcp_tool_outcome(json!({"content":[],"_meta":{"secret":"private"}}));
+        assert!(!success.is_error());
+        assert!(
+            matches!(success, Outcome::Structured { data, .. } if data == json!({"content":[]}))
+        );
+    }
+
+    #[test]
     fn resource_and_prompt_exposure_respects_server_and_tool_overrides() {
         let config: ServerConfig = serde_json::from_value(
             json!({"command":"server","exposure":"hidden","toolExposure":{"get_prompt":"direct"}}),
@@ -1534,6 +3292,27 @@ mod tests {
         assert!(!tool_enabled(&config, "list_resources"));
         assert!(!tool_enabled(&config, "list_prompts"));
         assert!(tool_enabled(&config, "get_prompt"));
+    }
+    #[test]
+    fn mcp_server_timeout_accepts_fractional_seconds() {
+        let parse = |timeout: Value| {
+            serde_json::from_value::<ServerConfig>(json!({"command":"server","timeout":timeout}))
+                .map(|config| config.timeout)
+        };
+        for (seconds, duration) in [
+            (json!(0.25), Duration::from_millis(250)),
+            (json!(1.5), Duration::from_millis(1500)),
+            (json!(30), Duration::from_secs(30)),
+            (json!(0), Duration::ZERO),
+            (json!(0.00001), MIN_MCP_TIMEOUT),
+            (json!(1e100), MAX_MCP_TIMEOUT),
+        ] {
+            assert_eq!(parse(seconds).unwrap(), Some(duration));
+        }
+        assert_eq!(parse(Value::Null).unwrap(), None);
+        for invalid in [json!(-0.25), json!("0.25"), json!(true)] {
+            assert!(parse(invalid).is_err());
+        }
     }
     #[test]
     fn normalizes_mcp_names_and_preserves_configuration_defaults() {

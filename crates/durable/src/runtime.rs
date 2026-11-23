@@ -27007,6 +27007,9 @@ fn append_tool(
     c.messages.push(Message::Tool {
         call_id: call.id.clone(),
         content,
+        // Durable result status and blocks are bound to transcript occurrences.
+        is_error: false,
+        is_structured: None,
     });
     c.auto_compaction_attempted = false;
     Ok(())
@@ -27402,10 +27405,14 @@ mod scheduler_tests {
         let second = Uuid::new_v4();
         c.messages = vec![
             Message::Tool {
+                is_error: false,
+                is_structured: None,
                 call_id: "same".into(),
                 content: String::new(),
             },
             Message::Tool {
+                is_error: false,
+                is_structured: None,
                 call_id: "same".into(),
                 content: String::new(),
             },
@@ -31787,6 +31794,8 @@ mod scheduler_tests {
                     replay: None,
                 });
                 c.messages.push(Message::Tool {
+                    is_error: false,
+                    is_structured: None,
                     call_id: "call".into(),
                     content: "done".into(),
                 });

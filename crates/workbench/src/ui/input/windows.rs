@@ -16,7 +16,7 @@ use winapi::um::{
 use super::windows_keys::{
     MouseButtonsPressed, handle_key_event, handle_mouse_event, handle_surrogate,
 };
-use super::{InputEvent, decoder::Decoder, escape_delay};
+use super::{InputEvent, decoder::Decoder};
 
 pub struct Reader {
     console: Console,
@@ -36,6 +36,19 @@ impl Reader {
         })
     }
 
+    // Console input is already read one record at a time.
+    pub fn new_for_handoff() -> io::Result<Self> {
+        Self::new()
+    }
+
+    pub fn drain(&mut self, max: Duration, idle: Duration) -> io::Result<()> {
+        super::drain_console_records(max, idle, wait_for_console, || {
+            // Discard raw records rather than decoding them: partial VT replies,
+            // key releases, and ignored records all extend the quiet period.
+            self.console.read_single_input_event().map(|_| ())
+        })
+    }
+
     pub fn next(&mut self, timeout: Duration) -> io::Result<Option<InputEvent>> {
         let started = Instant::now();
         loop {
@@ -44,29 +57,16 @@ impl Reader {
                 return Ok(Some(event));
             }
             let mut remaining = timeout.saturating_sub(started.elapsed());
-            if (self.decoder.buffer == b"\x1b"
-                || (self.decoder.buffer.starts_with(b"\x1b]")
-                    && self.decoder.buffer.len() < 5
-                    && !self.decoder.buffer.starts_with(b"\x1b]4;")))
-                && let Some(started) = self.decoder.escape_started
+            if let (Some(started), Some(delay)) =
+                (self.decoder.escape_started, self.decoder.escape_timeout())
             {
-                remaining = remaining.min(escape_delay().saturating_sub(started.elapsed()));
+                remaining = remaining.min(delay.saturating_sub(started.elapsed()));
             }
-            let handle = Handle::current_in_handle()?;
-            // Round up sub-millisecond waits and keep INFINITE reserved.
-            let millis =
-                remaining.as_millis() + u128::from(remaining.subsec_nanos() % 1_000_000 != 0);
-            let status = unsafe {
-                WaitForSingleObject(*handle, millis.min(u128::from(u32::MAX - 1)) as u32)
-            };
-            match status {
-                WAIT_OBJECT_0 => self.read_record()?,
-                WAIT_TIMEOUT => {
-                    self.decoder.flush_escape();
-                    return Ok(self.decoder.next());
-                }
-                WAIT_FAILED => return Err(io::Error::last_os_error()),
-                _ => return Err(io::Error::other("unexpected console wait result")),
+            if wait_for_console(remaining)? {
+                self.read_record()?;
+            } else {
+                self.decoder.flush_escape();
+                return Ok(self.decoder.next());
             }
             if started.elapsed() >= timeout {
                 self.decoder.flush_escape();
@@ -109,6 +109,18 @@ impl Reader {
             self.decoder.events.push_back(InputEvent::Event(event));
         }
         Ok(())
+    }
+}
+
+fn wait_for_console(timeout: Duration) -> io::Result<bool> {
+    let handle = Handle::current_in_handle()?;
+    // Round up sub-millisecond waits and keep INFINITE reserved.
+    let millis = timeout.as_millis() + u128::from(timeout.subsec_nanos() % 1_000_000 != 0);
+    match unsafe { WaitForSingleObject(*handle, millis.min(u128::from(u32::MAX - 1)) as u32) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => Err(io::Error::last_os_error()),
+        _ => Err(io::Error::other("unexpected console wait result")),
     }
 }
 
@@ -210,6 +222,50 @@ mod tests {
         assert!(
             matches!(decode_key(release, &mut decoder, &mut surrogate, &mut reply_surrogate), Some(Event::Key(key)) if key.kind == KeyEventKind::Release)
         );
+    }
+
+    #[test]
+    fn delayed_console_color_reply_does_not_hide_physical_keys() {
+        let mut decoder = Decoder::default();
+        let mut surrogate = None;
+        let mut reply_surrogate = None;
+        for value in "\x1b]10;rgb:ffff/".encode_utf16() {
+            decode_key(
+                key(value, 0),
+                &mut decoder,
+                &mut surrogate,
+                &mut reply_surrogate,
+            );
+        }
+        decoder.escape_started = Some(Instant::now() - Duration::from_secs(5));
+        decoder.flush_escape();
+        let event = decode_key(
+            key(u16::from(b'A'), 65),
+            &mut decoder,
+            &mut surrogate,
+            &mut reply_surrogate,
+        );
+        assert!(
+            matches!(event, Some(Event::Key(key)) if matches!(key.code, KeyCode::Char('a' | 'A')))
+        );
+        for value in "0000/8080\x07".encode_utf16() {
+            decode_key(
+                key(value, 0),
+                &mut decoder,
+                &mut surrogate,
+                &mut reply_surrogate,
+            );
+        }
+        assert_eq!(
+            decoder.next(),
+            Some(InputEvent::TerminalColor {
+                foreground: true,
+                red: 255,
+                green: 0,
+                blue: 128
+            })
+        );
+        assert!(decoder.next().is_none());
     }
 
     #[test]

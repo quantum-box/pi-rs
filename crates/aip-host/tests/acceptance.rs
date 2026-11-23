@@ -757,3 +757,243 @@ async fn assert_recovered_reply(with_tool: bool) {
     assert_eq!(receipts[1].2.cache_creation_input_tokens, Some(4));
     assert_eq!(platform.usage.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn prepared_model_keeps_aip_budget_and_usage_settlement() {
+    struct Resolving {
+        sends: Arc<AtomicUsize>,
+        receipts: Arc<AtomicUsize>,
+        large: bool,
+    }
+    struct Prepared {
+        sends: Arc<AtomicUsize>,
+        receipts: Arc<AtomicUsize>,
+        large: bool,
+    }
+    #[async_trait::async_trait]
+    impl Model for Resolving {
+        async fn prepare_context<'a>(
+            &'a self,
+            _: &ModelRequest,
+        ) -> Result<Option<Arc<dyn Model + 'a>>> {
+            Ok(Some(Arc::new(Prepared {
+                sends: self.sends.clone(),
+                receipts: self.receipts.clone(),
+                large: self.large,
+            })))
+        }
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            panic!("unprepared model was dispatched")
+        }
+    }
+    #[async_trait::async_trait]
+    impl Model for Prepared {
+        fn context_identity(&self) -> Option<String> {
+            Some("prepared-route".into())
+        }
+        fn estimate_request_tokens(&self, _: &ModelRequest) -> u64 {
+            if self.large { 2000 } else { 10 }
+        }
+        async fn stream(&self, _: ModelRequest) -> Result<ModelStream> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(ModelEvent::Text("done".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(Usage {
+                        input_tokens: 20,
+                        output_tokens: 8,
+                    }),
+                }),
+            ])))
+        }
+        async fn record_usage_with_metadata(
+            &self,
+            _: Uuid,
+            _: &UsageReport,
+            _: &ModelMetadata,
+        ) -> Result<()> {
+            self.receipts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    for large in [false, true] {
+        let platform = Arc::new(Platform::default());
+        let scope = scope();
+        let registry = HostRegistry::discover(&scope, platform.clone(), BTreeSet::new(), vec![])
+            .await
+            .unwrap();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let receipts = Arc::new(AtomicUsize::new(0));
+        let model = Resolving {
+            sends: sends.clone(),
+            receipts: receipts.clone(),
+            large,
+        };
+        let host = HostTurn {
+            scope: &scope,
+            budget: platform.as_ref(),
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "fixture",
+            limits: Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 64,
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let (_, mut inputs) = tokio::sync::mpsc::channel(1);
+        let result = host
+            .run(
+                &mut session,
+                Some("go".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut ignore,
+            )
+            .await;
+        assert_eq!(result.is_ok(), !large);
+        assert_eq!(sends.load(Ordering::SeqCst), usize::from(!large));
+        assert_eq!(receipts.load(Ordering::SeqCst), usize::from(!large));
+        assert_eq!(
+            platform.reservations.lock().unwrap().len(),
+            usize::from(!large)
+        );
+        assert_eq!(platform.usage.lock().unwrap().len(), usize::from(!large));
+    }
+}
+
+#[tokio::test]
+async fn hosted_review_excludes_failed_assistant_original_and_replacement() {
+    struct CaptureReview(Mutex<Vec<ModelRequest>>);
+    #[async_trait::async_trait]
+    impl Model for CaptureReview {
+        async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+            self.0.lock().unwrap().push(request);
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(ModelEvent::Text("review done".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    }),
+                }),
+            ])))
+        }
+    }
+    for edit in [false, true] {
+        let platform = Arc::new(Platform::default());
+        let parent_scope = RunScope {
+            parent_run: None,
+            ..scope()
+        };
+        let child_scope = RunScope {
+            journal_run_id: Uuid::new_v4(),
+            aip_run: "safe-review".into(),
+            parent_run: Some(parent_scope.aip_run.clone()),
+            audit_id: "review-audit".into(),
+            ..parent_scope.clone()
+        };
+        let parent_profile = HostRegistry::discover(
+            &parent_scope,
+            platform.clone(),
+            BTreeSet::new(),
+            vec![Arc::new(pi_rs_review::ReviewContext)],
+        )
+        .await
+        .unwrap();
+        let child_profile =
+            HostRegistry::discover(&child_scope, platform.clone(), BTreeSet::new(), vec![])
+                .await
+                .unwrap();
+        let parent_model = ModelFixture(Mutex::new(VecDeque::new()));
+        let child_model = CaptureReview(Mutex::new(Vec::new()));
+        let parent_turn = HostTurn {
+            scope: &parent_scope,
+            budget: platform.as_ref(),
+            model: &parent_model,
+            model_name: "fixture",
+            registry: &parent_profile,
+            system_prompt: "parent",
+            limits: Limits::default(),
+        };
+        let child_turn = HostTurn {
+            scope: &child_scope,
+            budget: platform.as_ref(),
+            model: &child_model,
+            model_name: "fixture",
+            registry: &child_profile,
+            system_prompt: "review",
+            limits: Limits::default(),
+        };
+        let mut initial = Session::with_store(MemoryStore::default()).unwrap();
+        parent_scope.bind(&mut initial).unwrap();
+        initial
+            .append_user_with_images("retained question".into(), vec![], None)
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        let mut records = initial.records().to_vec();
+        for event in [
+            Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Cancelled),
+                partial: String::new(),
+                reply: None,
+            },
+            Event::Assistant {
+                content: "partial sentinel".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            },
+        ] {
+            let parent = records.last().unwrap();
+            records.push(Record {
+                id: parent.id + 1,
+                parent: Some(parent.id),
+                version: parent.version,
+                timestamp: None,
+                run_id: None,
+                event,
+            });
+        }
+        let mut parent = Session::from_records(records).unwrap();
+        if edit {
+            let target = parent.head();
+            parent
+                .edit_context(target, Some(ContextContent::Text("edited sentinel".into())))
+                .unwrap();
+        }
+        let from_record = parent.head();
+        let mut child = Session::with_store(MemoryStore::default()).unwrap();
+        let review = ManagedReview {
+            parent: &parent_turn,
+            child: &child_turn,
+            from_record,
+            task: "review",
+            resume: false,
+        };
+        assert_eq!(
+            review
+                .run(
+                    &mut parent,
+                    &mut child,
+                    &CancellationToken::new(),
+                    &mut ignore
+                )
+                .await
+                .unwrap(),
+            "review done"
+        );
+        let request = serde_json::to_string(&child_model.0.lock().unwrap()[0]).unwrap();
+        assert!(request.contains("retained question"));
+        assert!(!request.contains("partial sentinel"));
+        assert!(!request.contains("edited sentinel"));
+    }
+}

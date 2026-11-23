@@ -20,6 +20,8 @@ Notes and TODOs are enabled by the terminal. In one-shot CLI mode, add
 show their saved state. `/extensions` lists the bundled terminal extensions.
 `--disable-extension <id>` removes an optional extension from composition.
 The TODO extension's ID is `todo-list`, while its CLI selector is `todo`.
+Command discovery distinguishes built-in, inline, and file-backed owners;
+see [extension command provenance](extension-command-provenance.md).
 
 All state changes use the existing journal. Reopening a session restores its
 state, and checking out an earlier record restores the state at that branch.
@@ -33,8 +35,10 @@ the extension state and its `entries` contain typed JSON data. Entries appear
 as Pi-style `custom` entries in RPC and follow the active branch across checkout
 and restart. An SDK host can also call `AgentSession::append_custom_entry`.
 [`bookmark_entry.rs`](../crates/extensions/examples/bookmark_entry.rs) shows an
-executable extension. This currently covers command results and the SDK; it
-does not yet expose immediate `appendEntry` calls from every hook or tool.
+executable extension. Session-owned resource discovery callbacks can also call
+`ToolHost::append_entry` immediately and read active-branch entries through the
+host. Other callback and tool paths do not yet all expose these operations; see
+the [native parity details](native-parity.md#active-run-native-custom-messages).
 
 Commands can also add messages to the next model context. Implement
 `supports_command_effects` and return `ExtensionCommandEffects` from
@@ -50,9 +54,103 @@ multiple trigger actions in one command produce one turn. SDK hosts can call
 `AgentSession::extension_command_and_run` for commands that may request a turn;
 the synchronous command API rejects those requests. An idle SDK host can also
 call `AgentSession::send_custom_message(message, true)` to start a model turn,
-or pass `false` to save the message without a turn. Hooks and tools do not yet
-expose Pi's immediate `sendMessage` API, streaming delivery modes, or custom
-message renderers.
+or pass `false` to save the message without a turn. Native tools and supported
+callbacks can call `ToolHost::send_message` with steering, follow-up, next-turn,
+trigger-turn, or after-turn delivery. Supported callbacks and recovery behavior
+are listed in the [native parity details](native-parity.md#active-run-native-custom-messages).
+To render a displayed message in the terminal, advertise its type through
+`custom_message_renderer_types` and implement `render_custom_message`. The
+first extension in load order for that type receives the message including
+its details, the expansion state, the configured output padding and the
+host's expand-key label. Return `RenderedCustomMessage` with styled rows,
+horizontal padding and an optional background theme role. The terminal
+applies its active theme and wraps the rows to fit. The callback runs off the
+terminal paint path with a one-second deadline. A missing or failed
+renderer leaves the default transcript presentation in place.
+
+Rust SDK hosts can acquire the same renderer snapshot through
+`AgentSession::custom_message_renderers`, invoke it asynchronously with a
+host-defined deadline, and apply their own palette. RPC and HTML exports
+retain the original custom-message content. This API uses native styled
+rows. Pi extensions can return arbitrary interactive TypeScript components.
+
+For UI-only custom entries, use `custom_entry_renderer_types` and
+`render_custom_entry`. Entry data remains outside model context. An entry
+with no renderer, or whose first render returns no content, stays out of
+the terminal transcript. Renderer failures show an error row. SDK hosts
+can render journal entries through `AgentSession::custom_entry_renderers`.
+
+To customize normal message Markdown for display, return `true` from
+`handles_markdown_transform` and implement `transform_markdown`. The context
+identifies user, assistant, or assistant thinking text and supplies the
+available content width and streaming status. A restored message includes
+its journal record ID and timestamp when available. Returning `None` keeps
+the current text for the next extension. The terminal runs these hooks in
+extension load order and renders the result with its Markdown theme. Embedded
+views can obtain the same chain through `AgentSession::markdown_transformers`.
+The callback receives only display text and context. The session journal and
+provider request continue to use the original message.
+
+Executable hosts advertising `command_failure_classification_v1` accept the
+`command_effects_classified_v1` request. Its successful protocol envelope
+contains a typed `Ok` effects value or an `Err` containing `Callback` or
+`Transport`. An outer protocol error is a host or dispatch failure. A host
+without this capability receives the existing command request; its untyped
+errors remain failures because their origin is unknown. The standard extension
+server advertises the capability and propagates typed errors from extensions it
+hosts, including executable extensions.
+
+## Render tool calls and results in an SDK host
+
+A Rust tool can implement `Tool::tool_renderers` to provide separate call
+and result callbacks. An extension can wrap or replace renderers for any
+tool by implementing `Extension::resolve_tool_renderers`. Call `next()`
+to keep the rest of the chain, which follows extension registration order
+and ends with the registered tool's callbacks and the embedding
+application's defaults for unspecified sections. Return `None` to stop resolution and use the host's ordinary presentation.
+
+A Rust host can snapshot the chain with `AgentSession::tool_renderers` and
+resolve it before rendering. Supply a `ToolRenderContext` with the current
+arguments, result and view state. Callbacks return semantic theme roles
+and styled rows for the host to lay out. The call renderer runs before
+the result renderer. Each has its own deadline and fallback. The host also owns
+the tool panel framing and image display. These callbacks do not execute
+tools or change their recorded results.
+
+Executable extensions can supply renderers on their own tool definitions
+using `Tool::tool_renderers`. Each advertised tool can include a
+`tools[].renderers` object in `Describe` with `shell` (`default` or `self`),
+`call` and `result` (booleans). The host sends a v1 `render_tool_section`
+request with `section` (`call` or `result`) and a camel-case `context`.
+The successful response envelope contains styled rows or `null` for
+fallback. Keep advertised sections stable across flag configurations
+because the initial capability check runs before configured flags take
+effect. Return `null` when a callback should opt out for a particular call.
+
+Call and result requests run in separate processes, so executable renderers
+should use the supplied context for their inputs. Resolver wrappers for
+other tools use the in-process API. Workbench terminal integration is
+tracked separately.
+
+## Share SDK extension events
+
+An embedding host can share a `pi_rs_extensions::ExtensionEventBus` with its
+Rust extension instances. `on` registers a listener and returns an owned
+subscription. Drop the subscription to remove that listener. The same bus
+can be reused while a host replaces extension instances. `emit` delivers a
+JSON value to listeners in registration order and returns callback errors.
+The native bus calls synchronous handlers on the emitting thread. It does
+not route events across executable extension processes.
+
+## Observe extension UI prompts
+
+Opt in with `handles_lifecycle` and `handles_ui_prompt_lifecycle` to observe
+`ui_prompt_start` and `ui_prompt_end` while tools wait on a native interactive
+or SDK host. The payload has a prompt kind and optional opening title.
+Simultaneous prompts within one tool turn share the same pair of events.
+Cancellation ends the prompt even if the response is discarded. The UI
+does not wait for extension observers to finish. Notifications, status, and
+editor reads do not produce these events.
 
 ## Write another extension
 
@@ -76,6 +174,25 @@ The public API supports tool registration, commands, request-context hooks,
 pre-tool decisions, post-tool state, state migrations, and compaction hooks.
 Use stable extension IDs and explicit state versions. Let the host select the
 allowed tools and register policy extensions before tools.
+
+For successful or failed text results, opt in with `handles_tool_result` and
+implement `tool_result_patch` to change output or details. Implement
+`tool_result_patch_v2` to also change `is_error` independently. Omitted fields
+retain their previous values, and handlers see earlier handlers' changes.
+Patched output is passed verbatim to the model, while details stay outside model
+context. This works for executable extensions. Existing patch hooks continue to
+work; older executables receive a lossy legacy projection of patched failures,
+which cannot represent failure details. The same projection applies to nested
+host-call responses sent to older executables; current executables receive the
+full result. Tool messages carry `is_error` independently of their text; older
+context-hook executables retain the original status by tool-call ID and retain
+structured provenance when content is unchanged. Their rewritten content has
+unknown provenance and follows legacy structured-envelope detection. Tool
+message `is_structured` marks known structured or plain results. Older serialized
+messages without the flag also use legacy detection, so images remain subject
+to normal filtering and extraction. Patches to
+non-text outcomes are reported as hook errors; use the full-outcome hook for
+those results.
 
 Extensions can intercept user-entered `!` and `!!` shell commands by opting in
 with `handles_user_bash` and implementing `user_bash`. The event includes the
@@ -137,12 +254,41 @@ Extensions that implement `handles_lifecycle` also receive `agent_settled`
 after `agent_end` when a run has finished its retries and automatic compaction.
 Its `aborted` field distinguishes cancellation from completion or failure.
 
+For an actionable callback before settlement, opt into
+`handles_agent_before_settle` and implement `agent_before_settle`.
+Handlers run in extension load order. Each can replace the proposed entries
+or continuation flag independently. The preview includes journal record IDs
+for projected messages and the next queued batch. Proposals can append
+custom entries, custom messages, context edits, or compaction summaries.
+The host validates the full list before writing its plan or any of its
+entries. A continuation runs within the original run's request and token
+limits. Cancelling during delivery of this callback preserves valid entries
+and suppresses continuation.
+
+Use `handles_turn_end_boundary` and `turn_end_boundary` for structural
+changes to the completed turn. The callback sees the assistant record and
+tool-result IDs before observational `turn_end` delivery. It uses the same
+draft types and ordered validation as settlement. Continuing shares the
+existing turn loop with tool results and queued input, so a natural next
+provider request also satisfies the decision.
+
+Executable extensions negotiate the callback capability in their description.
+`AgentSession::resume` recovers a saved plan under the original run ID,
+including proposals interrupted partway through persistence. Hosts that drive
+`Agent` directly can inspect `Session::pending_extension_boundary_run` to
+select the run ID for explicit recovery.
+Tree navigation and forks can select the completed proposal as a unit.
+Forks retain the applied entries and start with their own run lifecycle.
+
 Before a model request, an extension may opt into `context_with_system` to
 transform the complete message list, including system messages. All ordinary
 `before_request` hooks run first; these hooks then run in registration order.
 Changes apply only to the current request and do not rewrite the session.
 Executable extensions opt in through the same Rust trait and receive the
 `context_with_system` protocol request with `messages` and branch-local `state`.
+If a handler removes the leading system message, the host reports a non-fatal `context_with_system` extension error
+attributed to that handler. Later handlers and the model still receive the
+transformed messages, as in Pi v1.5.0.
 
 An extension can also add temporary skills, prompt templates, and themes:
 

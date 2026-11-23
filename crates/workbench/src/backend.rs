@@ -23,14 +23,39 @@ mod queue;
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Request {
+    #[serde(skip)]
+    TriggerCustom {
+        run_id: Uuid,
+    },
     Configure {
         model: String,
         thinking: Option<String>,
         #[serde(default)]
         reported_thinking: bool,
+        #[serde(default)]
+        reported_reasoning: Option<bool>,
         session: PathBuf,
     },
+    SelectLiveModel {
+        id: Uuid,
+        provider: String,
+        model: String,
+        thinking: Option<String>,
+        reported_reasoning: Option<bool>,
+        reported_thinking: bool,
+    },
     CacheWarmingChanged,
+    TransportChanged,
+    RenderTranscriptExtension {
+        id: Uuid,
+        record_id: u64,
+        options: pi_rs::CustomMessageRenderOptions,
+    },
+    TransformTranscriptMarkdown {
+        id: Uuid,
+        markdown: String,
+        context: pi_rs::MarkdownTransformContext,
+    },
     CheckSessionTransition {
         id: Uuid,
         event: pi_rs::BeforeSessionTransition,
@@ -98,7 +123,10 @@ enum Request {
         resume: bool,
         task: String,
     },
-    McpStatus,
+    McpStatus {
+        #[serde(default)]
+        inspect: bool,
+    },
     Bash {
         command: String,
         #[serde(default)]
@@ -115,6 +143,11 @@ enum Request {
     },
     SetSessionName {
         name: String,
+        id: Option<serde_json::Value>,
+    },
+    SetSessionLabel {
+        target: u64,
+        label: Option<String>,
         id: Option<serde_json::Value>,
     },
     SetQueueMode {
@@ -136,6 +169,10 @@ enum Request {
     GetCommands {
         id: Option<serde_json::Value>,
     },
+    GetShareContext {
+        id: Option<serde_json::Value>,
+        session: PathBuf,
+    },
     ReadSession {
         request: serde_json::Value,
         path: PathBuf,
@@ -150,19 +187,43 @@ enum Request {
 }
 struct ReaderControls {
     snapshot: Arc<Mutex<SessionSnapshot>>,
+    render_transcript: bool,
     auto_compaction: pi_rs::AutoCompactionControl,
     retry: pi_rs::RetryControl,
     command_catalog: Arc<Mutex<serde_json::Value>>,
     resources: Arc<Mutex<super::resources::Resources>>,
     resources_ready: tokio::sync::watch::Receiver<bool>,
+    share_ready: tokio::sync::watch::Receiver<bool>,
     registry: pi_rs::Registry,
     lifecycle_timeout: std::time::Duration,
     trace: bool,
     shell: ShellRunner,
 }
 
+struct LiveModelRun {
+    id: Uuid,
+    args: Cli,
+    control: pi_rs::LiveModelControl,
+    latest: Option<(
+        Arc<pi_rs::LiveModelSelection>,
+        super::image_policy::WorkbenchModel,
+    )>,
+}
+
+impl LiveModelRun {
+    fn new(args: &Cli) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            args: args.clone(),
+            control: pi_rs::LiveModelControl::default(),
+            latest: None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ControlState {
+    live_model: Option<LiveModelRun>,
     token: Option<CancellationToken>,
     queued: usize,
     pending_cancel: bool,
@@ -172,35 +233,542 @@ struct ControlState {
 
 struct SessionSnapshot {
     records: Vec<pi_rs::Record>,
+    record_metadata: std::collections::BTreeMap<u64, serde_json::Value>,
+    verified_metadata: std::collections::BTreeMap<u64, serde_json::Value>,
+    share_records: Vec<Arc<pi_rs::Record>>,
+    revision: u64,
     entries: Option<super::rpc_entries::Cursor>,
+    replay: pi_rs::pi_import::StreamVerifier,
+    deferred_from: Option<usize>,
+    deferred_until: Option<u64>,
+    projection_error: Option<String>,
+    #[cfg(test)]
+    validation_attempts: usize,
+    share_base: Option<Arc<super::sessions::ShareContext>>,
+    share_pending: bool,
 }
 
 impl SessionSnapshot {
     fn new(records: Vec<pi_rs::Record>, emit_entries: bool) -> Self {
         let mut entries = emit_entries.then(super::rpc_entries::Cursor::default);
+        let mut replay = pi_rs::pi_import::StreamVerifier::new();
         if let Some(cursor) = &mut entries {
+            match replay.advance(&records, &Default::default(), false) {
+                Ok(None) => cursor.set_verified_counts(replay.counts()),
+                _ => cursor.invalidate(),
+            }
+            let _ = replay.take_new_counts();
             cursor.advance(&records);
         }
-        Self { records, entries }
+        let share_records = records.iter().cloned().map(Arc::new).collect();
+        Self {
+            records,
+            record_metadata: Default::default(),
+            verified_metadata: Default::default(),
+            share_records,
+            revision: 0,
+            entries,
+            replay,
+            deferred_from: None,
+            deferred_until: None,
+            projection_error: None,
+            #[cfg(test)]
+            validation_attempts: 0,
+            share_base: None,
+            share_pending: false,
+        }
     }
 
-    fn refresh(&mut self, session: &Session) {
+    fn from_session(session: &Session, emit_entries: bool) -> Self {
+        let mut snapshot = Self::new(session.records().to_vec(), false);
+        snapshot.record_metadata = session
+            .records()
+            .iter()
+            .filter_map(|record| {
+                session
+                    .record_metadata(record.id)
+                    .map(|metadata| (record.id, metadata.clone()))
+            })
+            .collect();
+        snapshot.verified_metadata = snapshot.record_metadata.clone();
+        if emit_entries {
+            let mut cursor = super::rpc_entries::Cursor::default();
+            snapshot.replay = pi_rs::pi_import::StreamVerifier::new();
+            match session.validated_pi_conversion_counts().and_then(|counts| {
+                match snapshot
+                    .replay
+                    .advance(&snapshot.records, &snapshot.record_metadata, true)?
+                {
+                    None => Ok(counts),
+                    Some(_) => Err(Error::Session("incomplete imported Pi conversion".into())),
+                }
+            }) {
+                Ok(counts) => cursor.set_verified_counts(&counts),
+                Err(_) => cursor.invalidate(),
+            }
+            let _ = snapshot.replay.take_new_counts();
+            cursor.advance(&snapshot.records);
+            snapshot.entries = Some(cursor);
+        }
+        snapshot
+    }
+
+    #[cfg(test)]
+    fn share_snapshot(&self) -> Result<super::sessions::ShareSnapshot> {
+        if self.share_pending {
+            return Err(Error::Config(
+                "Model request context is changing; try sharing again".into(),
+            ));
+        }
+        let session = Session::from_records_with_metadata(
+            self.records.clone(),
+            self.record_metadata.clone(),
+        )?;
+        let base = self
+            .share_base
+            .as_ref()
+            .ok_or_else(|| Error::Config("share context is not ready".into()))?;
+        let (system_prompt, _) =
+            session.effective_system_context(&base.system_prompt, base.tools.clone());
+        let context = super::sessions::ShareContext {
+            system_prompt,
+            tools: base.tools.clone(),
+        };
+        Ok(super::sessions::ShareSnapshot {
+            session_id: session.session_id(),
+            head: session.head(),
+            context,
+        })
+    }
+
+    fn track_share_event(&mut self, event: &pi_rs::Notification<'_>, summary: &mut bool) {
+        match event {
+            pi_rs::Notification::ModelContext {
+                system_prompt,
+                registry,
+            } => {
+                self.revision = self.revision.wrapping_add(1);
+                self.share_base = Some(Arc::new(super::sessions::ShareContext {
+                    system_prompt: (*system_prompt).into(),
+                    tools: registry.active_tool_specs(),
+                }));
+            }
+            pi_rs::Notification::SummaryRequest => *summary = true,
+            pi_rs::Notification::Committed(record)
+                if matches!(record.event, pi_rs::Event::ModelRequested { .. }) =>
+            {
+                self.revision = self.revision.wrapping_add(1);
+                self.share_pending = true;
+            }
+            pi_rs::Notification::Request(_) => {
+                self.revision = self.revision.wrapping_add(1);
+                // Pi shares agent state, not request-only context transforms.
+                self.share_pending = false;
+                *summary = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn settle_share_context(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.share_pending = false;
+    }
+
+    fn refresh(&mut self, session: &Session) -> Vec<serde_json::Value> {
+        let preserve_deferred = self.deferred_from.zip(self.deferred_until).is_some_and(|(start, _)| {
+            session.records().len() >= self.records.len()
+                && self.records.iter().zip(session.records()).all(|(old, new)|
+                    matches!((serde_json::to_vec(old), serde_json::to_vec(new)), (Ok(a), Ok(b)) if a == b))
+                && self.records.get(start).is_some()
+        });
+        let prefix_metadata_same = self.deferred_from.is_none_or(|start| {
+            self.records.iter().take(start + 1).all(|record| {
+                self.record_metadata.get(&record.id) == session.record_metadata(record.id)
+            })
+        });
+        self.revision = self.revision.wrapping_add(1);
         self.records = session.records().to_vec();
+        self.record_metadata = session
+            .records()
+            .iter()
+            .filter_map(|record| {
+                session
+                    .record_metadata(record.id)
+                    .map(|metadata| (record.id, metadata.clone()))
+            })
+            .collect();
+        self.verified_metadata = self.record_metadata.clone();
+        self.share_records = self.records.iter().cloned().map(Arc::new).collect();
+        if preserve_deferred {
+            let (start, end) = self
+                .deferred_from
+                .zip(self.deferred_until)
+                .expect("pending conversion");
+            let Some(cursor) = &mut self.entries else {
+                return Vec::new();
+            };
+            if !prefix_metadata_same {
+                self.replay = pi_rs::pi_import::StreamVerifier::new();
+                self.replay.set_authoritative_end(&self.records);
+                match self
+                    .replay
+                    .advance(&self.records[..start], &self.record_metadata, false)
+                {
+                    Ok(None) => {}
+                    _ => {
+                        cursor.invalidate();
+                        return Vec::new();
+                    }
+                }
+                *cursor = super::rpc_entries::Cursor::default();
+                cursor.set_verified_counts(self.replay.counts());
+                let _ = self.replay.take_new_counts();
+                cursor.advance(&self.records[..start]);
+            }
+            if (self.records.len() as u64) < end {
+                if !prefix_metadata_same {
+                    match self
+                        .replay
+                        .advance(&self.records, &self.record_metadata, false)
+                    {
+                        Ok(Some(next)) => self.deferred_until = Some(next),
+                        _ => cursor.invalidate(),
+                    }
+                }
+                return Vec::new();
+            }
+            match self
+                .replay
+                .advance(&self.records[..end as usize], &self.record_metadata, false)
+            {
+                Ok(None) => {}
+                _ => {
+                    cursor.invalidate();
+                    return Vec::new();
+                }
+            }
+            for (id, count) in self.replay.take_new_counts() {
+                cursor.set_verified_count(id, count);
+            }
+            let mut emitted = Vec::new();
+            for index in start..end as usize {
+                emitted.extend(cursor.appended(
+                    &self.records[..=index],
+                    self.record_metadata.get(&self.records[index].id),
+                    &self.record_metadata,
+                ));
+            }
+            self.deferred_from = None;
+            self.deferred_until = None;
+            return emitted;
+        }
+        self.deferred_from = None;
+        self.deferred_until = None;
         if let Some(cursor) = &mut self.entries {
+            *cursor = super::rpc_entries::Cursor::default();
+            self.replay = pi_rs::pi_import::StreamVerifier::new();
+            match session.validated_pi_conversion_counts().and_then(|counts| {
+                match self
+                    .replay
+                    .advance(&self.records, &self.record_metadata, true)?
+                {
+                    None => Ok(counts),
+                    Some(_) => Err(Error::Session("incomplete imported Pi conversion".into())),
+                }
+            }) {
+                Ok(counts) => cursor.set_verified_counts(&counts),
+                Err(_) => cursor.invalidate(),
+            }
+            let _ = self.replay.take_new_counts();
             cursor.advance(&self.records);
+        }
+        Vec::new()
+    }
+
+    // The disk read may have completed before an in-flight run settled.
+    // Only advance this append-only snapshot when every retained record agrees.
+    #[cfg(test)]
+    fn refresh_if_extends(&mut self, session: &Session) {
+        let current = session.records();
+        if self.records.is_empty() || current.len() < self.records.len() {
+            return;
+        }
+        let extends = self.records.iter().zip(current).all(|(previous, next)| {
+            matches!((serde_json::to_vec(previous), serde_json::to_vec(next)), (Ok(a), Ok(b)) if a == b)
+        });
+        if extends {
+            let _ = self.refresh(session);
         }
     }
 
     fn record(&mut self, record: &pi_rs::Record) -> Vec<serde_json::Value> {
-        if let Some(existing) = self.records.get_mut(record.id.saturating_sub(1) as usize) {
+        self.revision = self.revision.wrapping_add(1);
+        let metadata = pi_rs::record_event_metadata(record.id);
+        let metadata_changed = metadata
+            .as_ref()
+            .is_some_and(|value| self.record_metadata.get(&record.id) != Some(value))
+            || (record.id <= self.records.len() as u64
+                && self.verified_metadata.get(&record.id) != self.record_metadata.get(&record.id));
+        if let Some(value) = &metadata {
+            self.record_metadata.insert(record.id, value.clone());
+        }
+        let mut changed = false;
+        let replacing = if let Some(existing) =
+            self.records.get_mut(record.id.saturating_sub(1) as usize)
+        {
+            changed = metadata_changed
+                || !matches!((serde_json::to_vec(&*existing), serde_json::to_vec(record)), (Ok(a), Ok(b)) if a == b);
             *existing = record.clone();
+            self.share_records[record.id.saturating_sub(1) as usize] = Arc::new(record.clone());
+            true
+        } else {
+            self.records.push(record.clone());
+            self.share_records.push(Arc::new(record.clone()));
+            false
+        };
+        let Some(cursor) = &mut self.entries else {
+            return Vec::new();
+        };
+        let processed = cursor.processed();
+        if replacing && !changed && self.deferred_from.is_none() && record.id as usize <= processed
+        {
             return Vec::new();
         }
-        self.records.push(record.clone());
-        self.entries
-            .as_mut()
-            .map_or_else(Vec::new, |cursor| cursor.appended(&self.records))
+        let repairing_invalid =
+            replacing && changed && cursor.is_invalid() && self.deferred_from.is_none();
+        let start = self.deferred_from.unwrap_or(if repairing_invalid {
+            self.records.len()
+        } else {
+            processed
+        });
+        let observed_end = if replacing {
+            (record.id as usize)
+                .max(processed)
+                .max(if repairing_invalid {
+                    self.records.len()
+                } else {
+                    0
+                })
+        } else {
+            self.records.len()
+        };
+        if self
+            .deferred_until
+            .is_some_and(|end| (observed_end as u64) < end)
+            && !changed
+        {
+            return Vec::new();
+        }
+        if cursor.is_invalid() && !changed && self.deferred_until.is_none() {
+            return Vec::new();
+        }
+        if changed {
+            self.replay = pi_rs::pi_import::StreamVerifier::new();
+            *cursor = super::rpc_entries::Cursor::default();
+        }
+        #[cfg(test)]
+        {
+            self.validation_attempts += 1;
+        }
+        match self
+            .replay
+            .advance(&self.records[..observed_end], &self.record_metadata, false)
+        {
+            Ok(Some(end)) => {
+                self.deferred_from = Some(start);
+                self.deferred_until = Some(end);
+                return Vec::new();
+            }
+            Err(error) => {
+                cursor.invalidate();
+                self.projection_error = Some(error.to_string());
+                self.deferred_from = Some(start);
+                self.deferred_until = None;
+                return Vec::new();
+            }
+            Ok(None) => {}
+        }
+        for (id, count) in self.replay.take_new_counts() {
+            cursor.set_verified_count(id, count);
+            if let Some(value) = self.record_metadata.get(&id) {
+                self.verified_metadata.insert(id, value.clone());
+            } else {
+                self.verified_metadata.remove(&id);
+            }
+        }
+        if changed {
+            cursor.advance(&self.records[..start]);
+            self.verified_metadata = self.record_metadata.clone();
+        }
+        let mut emitted = Vec::new();
+        for index in start..observed_end {
+            emitted.extend(cursor.appended(
+                &self.records[..=index],
+                self.record_metadata.get(&self.records[index].id),
+                &self.record_metadata,
+            ));
+        }
+        self.deferred_from = None;
+        self.deferred_until = None;
+        emitted
     }
+}
+
+fn emit_refreshed_entries(entries: Vec<serde_json::Value>) {
+    for entry in entries {
+        output(json!({"type":"entry_appended","entry":entry}));
+    }
+}
+
+fn refresh_snapshot(snapshot: &Mutex<SessionSnapshot>, session: &Session) {
+    let entries = { snapshot.lock().expect("session snapshot").refresh(session) };
+    emit_refreshed_entries(entries);
+}
+
+fn open_initial_snapshot(path: &std::path::Path, emit_entries: bool) -> Result<SessionSnapshot> {
+    let session = match Session::snapshot(path) {
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Session::open(path)?
+        }
+        result => result?,
+    };
+    if emit_entries {
+        session.validated_pi_conversion_counts()?;
+    }
+    // Any exclusive lock acquired while creating the journal ends when this
+    // function returns, before the worker opens the session for a run.
+    Ok(SessionSnapshot::from_session(&session, emit_entries))
+}
+
+fn snapshot_for_share(
+    active: &Mutex<ControlState>,
+    snapshot: &Mutex<SessionSnapshot>,
+    current: Option<Session>,
+) -> Result<super::sessions::ShareSnapshot> {
+    snapshot_for_share_with_hook(active, snapshot, current, || {})
+}
+
+fn snapshot_for_share_with_hook(
+    active: &Mutex<ControlState>,
+    snapshot: &Mutex<SessionSnapshot>,
+    current: Option<Session>,
+    hook: impl FnOnce(),
+) -> Result<super::sessions::ShareSnapshot> {
+    let changed = || Error::Config("Share context changed; try sharing again".into());
+    let (revision, count, base, pending, emit_entries, idle, record_metadata) = {
+        let state = active.lock().expect("worker control");
+        let snapshot = snapshot.lock().expect("session snapshot");
+        (
+            snapshot.revision,
+            snapshot.share_records.len(),
+            snapshot.share_base.clone(),
+            snapshot.share_pending,
+            snapshot.entries.is_some(),
+            state.token.is_none() && state.queued == 0,
+            snapshot.record_metadata.clone(),
+        )
+    };
+    if pending {
+        return Err(Error::Config(
+            "Model request context is changing; try sharing again".into(),
+        ));
+    }
+    let mut records = Vec::with_capacity(count);
+    while records.len() < count {
+        let snapshot = snapshot.lock().expect("session snapshot");
+        if snapshot.revision != revision {
+            return Err(changed());
+        }
+        let end = (records.len() + 64).min(count);
+        records.extend_from_slice(&snapshot.share_records[records.len()..end]);
+    }
+    hook();
+    let extends = idle && current.as_ref().is_some_and(|current| {
+        !records.is_empty() && current.records().len() >= records.len()
+            && records.iter().zip(current.records()).all(|(previous, next)| {
+                matches!((serde_json::to_vec(previous.as_ref()), serde_json::to_vec(next)), (Ok(a), Ok(b)) if a == b)
+            })
+    });
+    let prepared = if extends {
+        Some(SessionSnapshot::from_session(
+            current.as_ref().expect("checked"),
+            emit_entries,
+        ))
+    } else {
+        None
+    };
+    let session = if extends {
+        current.expect("checked")
+    } else {
+        Session::from_records_with_metadata(
+            records
+                .iter()
+                .map(|record| record.as_ref().clone())
+                .collect(),
+            record_metadata,
+        )?
+    };
+    let base = base.ok_or_else(|| Error::Config("share context is not ready".into()))?;
+    let (system_prompt, _) =
+        session.effective_system_context(&base.system_prompt, base.tools.clone());
+    let context = super::sessions::ShareContext {
+        system_prompt,
+        tools: base.tools.clone(),
+    };
+    let result = super::sessions::ShareSnapshot {
+        session_id: session.session_id(),
+        head: session.head(),
+        context,
+    };
+    let state = active.lock().expect("worker control");
+    let mut snapshot = snapshot.lock().expect("session snapshot");
+    if snapshot.revision != revision || idle != (state.token.is_none() && state.queued == 0) {
+        return Err(changed());
+    }
+    let old = prepared.map(|prepared| {
+        snapshot.revision = snapshot.revision.wrapping_add(1);
+        (
+            std::mem::replace(&mut snapshot.records, prepared.records),
+            std::mem::replace(&mut snapshot.record_metadata, prepared.record_metadata),
+            std::mem::replace(&mut snapshot.share_records, prepared.share_records),
+            std::mem::replace(&mut snapshot.entries, prepared.entries),
+        )
+    });
+    drop(snapshot);
+    drop(state);
+    drop(old);
+    Ok(result)
+}
+
+async fn share_snapshot_background<F>(
+    active: Arc<Mutex<ControlState>>,
+    snapshot: Arc<Mutex<SessionSnapshot>>,
+    slots: Arc<tokio::sync::Semaphore>,
+    read: F,
+) -> Result<super::sessions::ShareSnapshot>
+where
+    F: FnOnce() -> Option<Session> + Send + 'static,
+{
+    let permit = slots
+        .try_acquire_owned()
+        .map_err(|_| Error::Config("Share context is already being read".into()))?;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("share-snapshot".into())
+        .spawn(move || {
+            let _permit = permit;
+            let idle = {
+                let state = active.lock().expect("worker control");
+                state.token.is_none() && state.queued == 0
+            };
+            let current = if idle { read() } else { None };
+            let _ = send.send(snapshot_for_share(&active, &snapshot, current));
+        })
+        .map_err(|_| Error::Config("Share context reader could not start".into()))?;
+    receive
+        .await
+        .map_err(|_| Error::Config("Share context reader stopped".into()))?
 }
 
 struct ShellRunner {
@@ -210,24 +778,69 @@ struct ShellRunner {
     completed: mpsc::Sender<ShellCompletion>,
 }
 
+struct QueueMessageHost {
+    inputs: mpsc::Sender<AgentInput>,
+    cancellation: CancellationToken,
+}
+#[async_trait::async_trait]
+impl pi_rs::ToolHost for QueueMessageHost {
+    fn tools(&self) -> Vec<pi_rs::ToolSpec> {
+        Vec::new()
+    }
+    fn supports_custom_messages(&self) -> bool {
+        true
+    }
+    async fn call(&self, _: &str, _: serde_json::Value) -> pi_rs::Outcome {
+        pi_rs::Outcome::Skipped("tool calls unavailable in shell hooks".into())
+    }
+    async fn send_message(
+        &self,
+        message: pi_rs::CustomMessage,
+        delivery: pi_rs::CustomMessageDelivery,
+    ) -> pi_rs::ExtensionResult<()> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let input = AgentInput::EnqueueCustom {
+            message: pi_rs::QueuedCustomMessage {
+                id: Uuid::new_v4(),
+                delivery,
+                message,
+            },
+            reply,
+        };
+        tokio::select! { biased; _ = self.cancellation.cancelled() => return Err("shell callback cancelled".into()), result = self.inputs.send(input) => result.map_err(|_| "session owner unavailable".to_owned())? }
+        tokio::select! { biased; result = response => result.map_err(|_| "message acknowledgement lost".to_owned())?.map_err(|error| error.to_string()), _ = self.cancellation.cancelled() => Err("shell callback cancelled".into()) }
+    }
+}
+
 struct ShellCompletion {
     id: Uuid,
     request_id: Option<serde_json::Value>,
     result: Result<pi_rs::BashExecution>,
 }
 
-pub fn run(args: Cli) -> std::pin::Pin<Box<impl Future<Output = Result<()>>>> {
+pub fn run(
+    args: Cli,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> std::pin::Pin<Box<impl Future<Output = Result<()>>>> {
     // Keep the long-lived worker's future out of the frontend stack frame.
-    Box::pin(run_worker(args))
+    Box::pin(run_worker(args, ready))
 }
 
-async fn run_worker(mut args: Cli) -> Result<()> {
+async fn run_worker(
+    mut args: Cli,
+    mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     let (startup_reason, previous_session_file) =
         std::env::var(super::process::SESSION_TRANSITION_ENV)
             .ok()
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or((SessionStartReason::Startup, None));
     let mut runtime = runtime::configure(&args, true).await?;
+    if args.mode == Some(super::OutputMode::Rpc) {
+        super::output(
+            json!({"type":"worker_extension_sources", "sources":runtime.extension_sources}),
+        );
+    }
     let ui = Arc::new(super::extension_ui::Broker::default());
     runtime.registry.set_ui(ui.clone());
     let active = Arc::new(Mutex::new(ControlState::default()));
@@ -236,22 +849,15 @@ async fn run_worker(mut args: Cli) -> Result<()> {
     let (shell_completed, mut shell_results) = mpsc::channel(1);
     let stop_notify = Arc::new(tokio::sync::Notify::new());
     let (inputs, mut queued) = mpsc::channel(32);
-    let initial_records = match Session::snapshot(&args.session) {
-        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            Session::open(&args.session)?
-        }
-        result => result?,
-    }
-    .records()
-    .to_vec();
-    let snapshot = Arc::new(Mutex::new(SessionSnapshot::new(
-        initial_records,
+    let snapshot = Arc::new(Mutex::new(open_initial_snapshot(
+        &args.session,
         args.mode == Some(super::OutputMode::Rpc),
-    )));
+    )?));
     let command_catalog = Arc::new(Mutex::new(runtime.command_catalog(&args)));
     let shared_resources = Arc::new(Mutex::new(runtime.resources.clone()));
     let (resources_ready, ready_receiver) =
         tokio::sync::watch::channel(!runtime.registry.has_resource_discovery_hooks());
+    let (share_ready, share_receiver) = tokio::sync::watch::channel(false);
     read_requests(
         commands,
         inputs.clone(),
@@ -260,11 +866,13 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         ui.clone(),
         ReaderControls {
             snapshot: snapshot.clone(),
+            render_transcript: args.terminal_managed_worker,
             auto_compaction: runtime.auto_compaction.clone(),
             retry: runtime.retry.clone(),
             command_catalog: command_catalog.clone(),
             resources: shared_resources.clone(),
             resources_ready: ready_receiver,
+            share_ready: share_receiver,
             registry: runtime.registry.clone(),
             lifecycle_timeout: args.tool_timeout(),
             trace: args.trace,
@@ -282,13 +890,15 @@ async fn run_worker(mut args: Cli) -> Result<()> {
     let signal_active = active.clone();
     let signal_stopping = stopping.clone();
     let signal_notify = stop_notify.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
+    if !args.terminal_managed_worker {
+        super::install_ctrl_c(move || {
             signal_stopping.store(true, Ordering::SeqCst);
             signal_notify.notify_one();
             cancel_active(&signal_active);
-        }
-    });
+        })
+        .await;
+    }
+    super::startup_ready(&mut ready);
     notify_session_lifecycle(
         &args,
         &runtime,
@@ -298,11 +908,14 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         },
     )
     .await;
-    let session = Session::snapshot(&args.session)?;
+    let mut session = Session::snapshot(&args.session)?;
+    if session.host_binding().is_none() {
+        session = Session::open(&args.session)?;
+    }
     let discovered = runtime
         .discover_resources(
             &args,
-            &session,
+            &mut session,
             if matches!(startup_reason, SessionStartReason::Reload) {
                 pi_rs::ResourceDiscoveryReason::Reload
             } else {
@@ -310,69 +923,104 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             },
         )
         .await?;
+    let refreshed = {
+        let mut snapshot = snapshot.lock().expect("session snapshot");
+        let entries = snapshot.refresh(&session);
+        snapshot.share_base = Some(Arc::new(runtime.share_base()));
+        entries
+    };
+    emit_refreshed_entries(refreshed);
+    share_ready.send_replace(true);
+    let startup_trigger = session
+        .host_binding()
+        .is_none()
+        .then(|| {
+            session
+                .pending_extension_boundary_run()
+                .or_else(|| session.pending_custom_trigger())
+        })
+        .flatten();
+    drop(session);
     *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
     *command_catalog.lock().expect("command catalog") = runtime.command_catalog(&args);
     resources_ready.send_replace(true);
     if runtime.registry.has_resource_discovery_hooks() {
         output(json!({"type":"resources_discovered","resources":discovered}));
     }
-    output(json!({"type":"backend_ready"}));
+    if args.terminal_managed_worker {
+        let messages = runtime.registry.custom_message_renderers();
+        let entries = runtime.registry.custom_entry_renderers();
+        output(json!({
+            "type":"backend_ready",
+            "custom_message_renderers":messages.types().collect::<Vec<_>>(),
+            "custom_entry_renderers":entries.types().collect::<Vec<_>>(),
+            "markdown_transformers":!runtime.registry.markdown_transformers().is_empty()
+        }));
+    } else {
+        output(json!({"type":"backend_ready"}));
+    }
     let mut continue_queue = false;
+    let mut pending_discovery_trigger = startup_trigger;
     let cache = super::cache_warming::Controller::default();
     while !stopping.load(Ordering::SeqCst) {
-        let (request, scheduled) = tokio::select! {
-            _ = stop_notify.notified() => break,
-            Some(shell) = shell_results.recv() => {
-                cache.clear(&args.session, "conversation context changed");
-                save_shell(shell, &args, &snapshot, &active);
-                continue;
-            }
-            receipt = cache.wait() => {
-                if let Some(receipt) = receipt {
-                    receipt.persist(&args.session, &cache, |record| {
-                        observe_snapshot(pi_rs::Notification::Committed(record), args.trace, &snapshot);
-                    });
-                }
-                continue;
-            }
-            request = requests.recv() => match request { Some(request) => (request, true), None => break },
-            input = queued.recv() => match input {
-                Some(input) => {
+        let (request, scheduled) = if let Some(run_id) = pending_discovery_trigger.take() {
+            (Request::TriggerCustom { run_id }, false)
+        } else {
+            tokio::select! {
+                _ = stop_notify.notified() => break,
+                Some(shell) = shell_results.recv() => {
                     cache.clear(&args.session, "conversation context changed");
-                    let mut replies = Vec::new();
-                    let result = Session::open(&args.session).and_then(|mut session| {
-                        if session.host_binding().is_some() { return Err(Error::Session("managed session queue controls require its host".into())); }
-                        snapshot.lock().expect("session snapshot").refresh(&session);
-                        let mut observer = |event: pi_rs::Notification<'_>| observe_snapshot(event, args.trace, &snapshot);
-                        let capacity = queued.max_capacity();
-                        let pending = std::iter::from_fn(|| queued.try_recv().ok()).take(capacity);
-                        let mut starts_run = false;
-                        for input in std::iter::once(input).chain(pending) {
-                            match input {
-                                AgentInput::Enqueue { message, reply } => {
-                                    let result = AgentInput::from(message).apply(&mut session, &mut observer);
-                                    replies.push((reply, result));
-                                }
-                                input => {
-                                    starts_run |= matches!(input, AgentInput::Message(_));
-                                    input.apply(&mut session, &mut observer)?;
+                    save_shell(shell, &args, &snapshot, &active);
+                    continue;
+                }
+                receipt = cache.wait() => {
+                    if let Some(receipt) = receipt {
+                        receipt.persist(&args.session, &cache, |record| {
+                            observe_snapshot(pi_rs::Notification::Committed(record), args.trace, &snapshot);
+                        });
+                    }
+                    continue;
+                }
+                request = requests.recv() => match request { Some(request) => (request, true), None => break },
+                input = queued.recv() => match input {
+                    Some(input) => {
+                        cache.clear(&args.session, "conversation context changed");
+                        let mut replies = Vec::new();
+                        let result = Session::open(&args.session).and_then(|mut session| {
+                            if session.host_binding().is_some() { return Err(Error::Session("managed session queue controls require its host".into())); }
+                            refresh_snapshot(&snapshot, &session);
+                            let mut observer = |event: pi_rs::Notification<'_>| observe_snapshot(event, args.trace, &snapshot);
+                            let capacity = queued.max_capacity();
+                            let pending = std::iter::from_fn(|| queued.try_recv().ok()).take(capacity);
+                            let mut starts_run = false;
+                            for input in std::iter::once(input).chain(pending) {
+                                match input {
+                                    AgentInput::Enqueue { message, reply } => {
+                                        let result = AgentInput::from(message).apply(&mut session, &mut observer);
+                                        replies.push((reply, result));
+                                    }
+                                    input => {
+                                        starts_run |= matches!(input, AgentInput::Message(_));
+                                        input.apply(&mut session, &mut observer)?;
+                                    }
                                 }
                             }
+                            Ok((starts_run && !session.queued_inputs().is_empty(), session.pending_custom_trigger()))
+                        });
+                        for (reply, result) in replies {
+                            let _ = reply.send(result);
                         }
-                        Ok(starts_run && !session.queued_inputs().is_empty())
-                    });
-                    for (reply, result) in replies {
-                        let _ = reply.send(result);
+                        match result {
+                            Ok((_, Some(run_id))) => (Request::TriggerCustom { run_id }, false),
+                            Ok((true, None)) => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false, rpc: false, id: None }, false),
+                            Ok((false, None)) => continue,
+                            Err(error) => { output(json!({"type":"error","message":error.to_string()})); continue; }
+                        }
                     }
-                    match result {
-                        Ok(true) => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false, rpc: false, id: None }, false),
-                        Ok(false) => continue,
-                        Err(error) => { output(json!({"type":"error","message":error.to_string()})); continue; }
-                    }
-                }
-                None => break,
-            },
-            _ = std::future::ready(()), if continue_queue => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false, rpc: false, id: None }, false),
+                    None => break,
+                },
+                _ = std::future::ready(()), if continue_queue => (Request::Prompt { content: None, images: vec![], queued_only: true, require_command: false, rpc: false, id: None }, false),
+            }
         };
         cache.clear(&args.session, "conversation context changed");
         if stopping.load(Ordering::SeqCst) {
@@ -381,25 +1029,52 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         if matches!(request, Request::CacheWarmingChanged) {
             continue;
         }
-        if let Request::CheckSessionTransition { id, event } = request {
-            let result = if runtime.registry.has_session_transition_hooks() {
-                match Session::snapshot(&args.session) {
-                    Ok(session) if session.host_binding().is_none() => Ok(runtime
-                        .registry
-                        .session_transition_cancelled(
-                            &event,
-                            &session.extension_states(),
-                            args.tool_timeout(),
-                            &mut |notification| observe(notification, args.trace),
-                        )
-                        .await),
-                    Ok(_) => Err(Error::Session(
-                        "managed session transitions require their host".into(),
-                    )),
-                    Err(error) => Err(error),
+        if matches!(request, Request::TransportChanged) {
+            match args
+                .settings
+                .reload_with_fallback(&args.workspace, args.trusted, &args.settings)
+            {
+                Ok(settings) => {
+                    args.settings
+                        .apply_worker_settings(&settings, &["transport"]);
+                    runtime.update_codex_transport(&args.settings);
                 }
-            } else {
-                Ok(false)
+                Err(error) => output(json!({"type":"error","message":error.to_string()})),
+            }
+            continue;
+        }
+        if let Request::CheckSessionTransition { id, event } = request {
+            let result = tokio::select! {
+                result = async {
+                    if runtime.registry.has_session_transition_hooks() {
+                        match Session::open(&args.session) {
+                            Ok(mut session) if session.host_binding().is_none() => {
+                                let result = runtime
+                                    .registry
+                                    .session_transition_cancelled_in_session(
+                                        &event,
+                                        &mut session,
+                                        args.tool_timeout(),
+                                        &mut |notification| {
+                                            observe_snapshot(notification, args.trace, &snapshot)
+                                        },
+                                    )
+                                    .await;
+                                pending_discovery_trigger = session.pending_custom_trigger();
+                                result
+                            }
+                            Ok(_) => Err(Error::Session(
+                                "managed session transitions require their host".into(),
+                            )),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        Ok(false)
+                    }
+                } => result,
+                _ = async {
+                    while !stopping.load(Ordering::SeqCst) { tokio::time::sleep(std::time::Duration::from_millis(50)).await; }
+                } => Err(Error::Cancelled),
             };
             match result {
                 Ok(cancelled) => output(
@@ -432,14 +1107,20 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     LifecycleEvent::ModelSelect { .. } | LifecycleEvent::ThinkingLevelSelect { .. }
                 )
             {
-                pi_rs::notify_extension_lifecycle(
-                    &runtime.registry,
-                    event,
-                    &session.extension_states(),
-                    args.tool_timeout(),
-                    &mut |notification| observe(notification, args.trace),
-                )
-                .await;
+                let states = session.extension_states();
+                let mut observer =
+                    |notification: pi_rs::Notification<'_>| observe(notification, args.trace);
+                tokio::select! {
+                    _ = pi_rs::notify_extension_lifecycle(
+                        &runtime.registry, event, &states, args.tool_timeout(),
+                        &mut observer,
+                    ) => (),
+                    _ = async {
+                        while !stopping.load(Ordering::SeqCst) {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    } => (),
+                }
             }
             output(json!({"type":"selection_notified","id":id}));
             continue;
@@ -448,12 +1129,14 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             model,
             thinking,
             reported_thinking,
+            reported_reasoning,
             session,
         } = request
         {
             let previous_session = args.session.clone();
             let switched = previous_session != session;
             if switched {
+                share_ready.send_replace(false);
                 if runtime.registry.has_resource_discovery_hooks() {
                     resources_ready.send_replace(false);
                 }
@@ -468,13 +1151,12 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                 .await;
             }
             args.model = model;
+            args.thinking_profile = (reported_thinking || reported_reasoning.is_some())
+                .then(|| (args.model.clone(), Vec::new(), reported_reasoning));
             args.thinking = thinking;
             args.session = session;
             runtime.configure_model_options(&args, reported_thinking)?;
-            snapshot
-                .lock()
-                .expect("session snapshot")
-                .refresh(&Session::open(&args.session)?);
+            refresh_snapshot(&snapshot, &Session::open(&args.session)?);
             if switched {
                 notify_session_lifecycle(
                     &args,
@@ -485,10 +1167,20 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     },
                 )
                 .await;
-                let session = Session::snapshot(&args.session)?;
+                let mut session = Session::snapshot(&args.session)?;
+                if session.host_binding().is_none() {
+                    session = Session::open(&args.session)?;
+                }
                 let discovered = runtime
-                    .discover_resources(&args, &session, pi_rs::ResourceDiscoveryReason::Startup)
+                    .discover_resources(
+                        &args,
+                        &mut session,
+                        pi_rs::ResourceDiscoveryReason::Startup,
+                    )
                     .await?;
+                refresh_snapshot(&snapshot, &session);
+                pending_discovery_trigger = session.pending_custom_trigger();
+                drop(session);
                 *shared_resources.lock().expect("resource catalog") = runtime.resources.clone();
                 *command_catalog.lock().expect("command catalog") = runtime.command_catalog(&args);
                 resources_ready.send_replace(true);
@@ -496,6 +1188,12 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     output(json!({"type":"resources_discovered","resources":discovered}));
                 }
             }
+            {
+                let mut snapshot = snapshot.lock().expect("session snapshot");
+                snapshot.share_base = Some(Arc::new(runtime.share_base()));
+                snapshot.revision = snapshot.revision.wrapping_add(1);
+            }
+            share_ready.send_replace(true);
             continue;
         }
         let request = match request {
@@ -524,9 +1222,14 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             request => request,
         };
         continue_queue = false;
+        let idle_callback_operation = matches!(
+            &request,
+            Request::BranchSummary { .. } | Request::Compact { .. }
+        );
         let resume_queued = matches!(
             &request,
             Request::Prompt { .. }
+                | Request::TriggerCustom { .. }
                 | Request::Compact { .. }
                 | Request::Review { .. }
                 | Request::Extension { .. }
@@ -542,16 +1245,20 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         let mut started = prompt_response.is_none();
         let mut compact_result = serde_json::Value::Null;
         let cancel = CancellationToken::new();
-        {
+        let live_model = {
             let mut state = active.lock().expect("worker control");
             state.token = Some(cancel.clone());
+            state.live_model = (args.terminal_managed_worker
+                && matches!(&request, Request::Prompt { .. }))
+            .then(|| LiveModelRun::new(&args));
             if scheduled {
                 state.queued = state.queued.saturating_sub(1);
             }
             if std::mem::take(&mut state.pending_cancel) {
                 cancel.cancel();
             }
-        }
+            state.live_model.as_ref().map(|run| run.control.clone())
+        };
         if started {
             output(json!({"type":"agent_started"}));
         }
@@ -563,7 +1270,12 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             cache.clone(),
         );
         let mut operation = Box::pin(async {
-            if matches!(&request, Request::Prompt { .. } | Request::McpStatus) {
+            if matches!(
+                &request,
+                Request::Prompt { .. }
+                    | Request::TriggerCustom { .. }
+                    | Request::McpStatus { inspect: false }
+            ) {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
@@ -576,6 +1288,9 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             let session = run_session.insert(Session::open(&args.session)?);
             session.set_auto_compaction_control(runtime.auto_compaction.clone());
             session.set_retry_control(runtime.retry.clone());
+            if let Some(control) = &live_model {
+                session.set_live_model_control(control.clone());
+            }
             if session.host_binding().is_some() {
                 return Err(Error::Session(
                     "a managed session must be opened by its host".into(),
@@ -584,38 +1299,120 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             if session.working_directory().is_none() {
                 session.set_working_directory(&args.workspace)?;
             }
-            args.record_model_selection(session)?;
-            initialize_queue_modes(session, &args)?;
-            snapshot.lock().expect("session snapshot").refresh(session);
+            args.record_automatic_model_selection(session)?;
+            if args.worker_settings_stdin {
+                initialize_queue_modes_from_settings(session, &args.settings)?;
+            } else {
+                let mut queue_args = args.clone();
+                let _ = initialize_queue_modes(session, &mut queue_args)?;
+            }
+            let refreshed = {
+                let mut snapshot = snapshot.lock().expect("session snapshot");
+                let entries = snapshot.refresh(session);
+                snapshot.share_base = Some(Arc::new(runtime.share_base()));
+                entries
+            };
+            emit_refreshed_entries(refreshed);
             cache_capture.initialize(session, &runtime.registry);
-            let agent = runtime.agent(&args, session.session_id());
+            let agent = runtime.agent(&args, session);
+            let mut tool_model_context = live_model
+                .as_ref()
+                .map(|_| runtime.live_tool_model_context(&args, session));
+            let mut summary_request = false;
             let mut observer = |event: pi_rs::Notification<'_>| {
+                if let Some(update) = tool_model_context.as_mut()
+                    && let pi_rs::Notification::Committed(record) = &event
+                {
+                    update(record);
+                }
+                snapshot
+                    .lock()
+                    .expect("session snapshot")
+                    .track_share_event(&event, &mut summary_request);
                 cache_capture.observe(&event);
                 observe_snapshot(event, args.trace, &snapshot);
             };
             match request {
+                Request::TriggerCustom { run_id } => {
+                    if session
+                        .pending_extension_boundary_run()
+                        .or_else(|| session.pending_custom_trigger())
+                        != Some(run_id)
+                    {
+                        return Err(Error::Session("custom trigger is no longer pending".into()));
+                    }
+                    let answer = Box::pin(agent.run_correlated_with_events(
+                        session,
+                        run_id,
+                        None,
+                        &mut queued,
+                        &cancel,
+                        &mut |event| match event {
+                            pi_rs::AgentEvent::Notification(event) => observer(event),
+                            event if args.trace => {
+                                let mut event = super::agent_stream_event_json(event);
+                                if args.mode == Some(super::OutputMode::Rpc) {
+                                    super::attach_redacted_reasoning(&mut event);
+                                }
+                                output(super::trace_agent_event_json(event));
+                            }
+                            _ => {}
+                        },
+                    ))
+                    .await?;
+                    output(json!({"type":"answer","content":answer}));
+                }
                 Request::Prompt {
                     mut content,
                     mut images,
                     queued_only,
                     require_command,
+                    rpc,
                     ..
                 } => {
+                    let mut prompt_acknowledged = false;
                     if queued_only && !agent.apply_queued_inputs(session, &mut observer)? {
                         return Ok(());
                     }
-                    if images.is_empty()
-                        && let Some(input) = content.as_deref()
-                        && let Some(trigger) = agent.try_extension_command_with_trigger(
-                            session,
-                            input,
-                            &mut observer,
-                        )?
-                    {
+                    let command = if let Some(input) = content.as_deref() {
+                        if rpc {
+                            match agent.try_extension_command_rpc(session, input, &mut observer) {
+                                Err(pi_rs::CommandDispatchError::Callback { id, message }) => {
+                                    let name = input
+                                        .split_once(char::is_whitespace)
+                                        .map_or(input, |(name, _)| name)
+                                        .strip_prefix('/')
+                                        .unwrap_or(input);
+                                    output(
+                                        json!({"type":"extension_error","extension":id,"extensionPath":format!("command:{name}"),"event":"command","message":message}),
+                                    );
+                                    return Ok(());
+                                }
+                                Err(pi_rs::CommandDispatchError::Other(error)) => {
+                                    return Err(error);
+                                }
+                                Ok(result) => result,
+                            }
+                        } else {
+                            agent.try_extension_command_with_trigger(
+                                session,
+                                input,
+                                &mut observer,
+                            )?
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(trigger) = command {
                         if !trigger {
                             return Ok(());
                         }
+                        if let Some(id) = prompt_response.take() {
+                            control_response("prompt", id, Ok(json!({"disposition":"handled"})));
+                            prompt_acknowledged = true;
+                        }
                         content = None;
+                        images.clear();
                     }
                     if runtime.registry.has_input_hooks()
                         && (content.is_some() || !images.is_empty())
@@ -662,8 +1459,11 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                         return Err(Error::Cancelled);
                     }
                     if let Some(id) = prompt_response.take() {
-                        started = true;
                         control_response("prompt", id, Ok(json!({"disposition":"started"})));
+                        prompt_acknowledged = true;
+                    }
+                    if prompt_acknowledged {
+                        started = true;
                         output(json!({"type":"agent_started"}));
                     }
                     let run_id = Uuid::new_v4();
@@ -677,13 +1477,23 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                             session.records().last().expect("appended user input"),
                         ));
                     }
-                    let answer = Box::pin(agent.run_correlated(
+                    let answer = Box::pin(agent.run_correlated_with_events(
                         session,
                         run_id,
                         content,
                         &mut queued,
                         &cancel,
-                        &mut observer,
+                        &mut |event| match event {
+                            pi_rs::AgentEvent::Notification(event) => observer(event),
+                            event if args.trace => {
+                                let mut event = super::agent_stream_event_json(event);
+                                if args.mode == Some(super::OutputMode::Rpc) {
+                                    super::attach_redacted_reasoning(&mut event);
+                                }
+                                output(super::trace_agent_event_json(event));
+                            }
+                            _ => {}
+                        },
                     ))
                     .await?;
                     output(json!({"type":"answer","content":answer}));
@@ -708,14 +1518,24 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                                 runtime.refresh_mcp(&args).await
                             } => result?,
                         }
-                        let agent = runtime.agent(&args, session.session_id());
-                        let answer = Box::pin(agent.run_correlated(
+                        let agent = runtime.agent(&args, session);
+                        let answer = Box::pin(agent.run_correlated_with_events(
                             session,
                             Uuid::new_v4(),
                             None,
                             &mut queued,
                             &cancel,
-                            &mut observer,
+                            &mut |event| match event {
+                                pi_rs::AgentEvent::Notification(event) => observer(event),
+                                event if args.trace => {
+                                    let mut event = super::agent_stream_event_json(event);
+                                    if args.mode == Some(super::OutputMode::Rpc) {
+                                        super::attach_redacted_reasoning(&mut event);
+                                    }
+                                    output(super::trace_agent_event_json(event));
+                                }
+                                _ => {}
+                            },
                         ))
                         .await?;
                         output(json!({"type":"answer","content":answer}));
@@ -725,14 +1545,20 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     summary: Some(summary),
                     keep_turns,
                     ..
-                } => agent.compact(
-                    session,
-                    Compaction {
-                        summary,
-                        keep_turns,
-                    },
-                    &mut observer,
-                )?,
+                } => {
+                    agent
+                        .compact_with_host_and_inputs(
+                            session,
+                            Compaction {
+                                summary,
+                                keep_turns,
+                            },
+                            &cancel,
+                            &mut observer,
+                            &mut queued,
+                        )
+                        .await?
+                }
                 Request::Compact {
                     summary: None,
                     keep_turns,
@@ -741,6 +1567,7 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     ..
                 } => {
                     let tokens_before = session.estimated_context_tokens();
+                    let previous_records = session.records().len();
                     if use_token_settings {
                         agent
                             .summarize_configured(
@@ -763,18 +1590,33 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                             )
                             .await?;
                     }
-                    if let Some(record) = session.records().last()
+                    if let Some(record) = session.records()[previous_records..]
+                        .iter()
+                        .rfind(|record| matches!(record.event, pi_rs::Event::Compacted { .. }))
                         && let pi_rs::Event::Compacted {
                             summary,
                             retain_from,
+                            tokens_before: recorded_tokens,
                             ..
                         } = &record.event
                     {
                         compact_result = json!({
                             "summary": summary,
                             "firstKeptEntryId": retain_from.unwrap_or(record.id).to_string(),
-                            "tokensBefore": tokens_before,
+                            "tokensBefore": recorded_tokens.unwrap_or(tokens_before),
+                            "estimatedTokensAfter": session.estimated_context_tokens(),
                         });
+                        super::rpc_entries::add_summary_usage(
+                            &mut compact_result,
+                            session.records(),
+                            record,
+                        );
+                        if let Some(details) = session
+                            .record_metadata(record.id)
+                            .and_then(|metadata| metadata.get("details"))
+                        {
+                            compact_result["details"] = details.clone();
+                        }
                     }
                 }
                 Request::BranchSummary {
@@ -795,7 +1637,13 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     ))
                     .await?;
                 }
-                Request::McpStatus => runtime.mcp_status(&args)?,
+                Request::McpStatus { inspect } => {
+                    if inspect {
+                        runtime.manage_mcp(&args, ui.as_ref(), &cancel).await?;
+                    } else {
+                        runtime.mcp_status(&args)?;
+                    }
+                }
                 Request::Review {
                     child,
                     from_record,
@@ -877,7 +1725,41 @@ async fn run_worker(mut args: Cli) -> Result<()> {
             }
         };
         drop(operation);
-        active.lock().expect("worker control").token = None;
+        let live = {
+            let mut state = active.lock().expect("worker control");
+            state.token = None;
+            state.live_model.take()
+        };
+        let adopted = if let Some(mut live) = live
+            && let Some((selection, adapter)) = live.latest.take()
+        {
+            let persist = |session: &mut Session| {
+                if session.host_binding().is_some() {
+                    return Err(Error::Session(
+                        "managed session model changes require their host".into(),
+                    ));
+                }
+                session.apply_live_model_selection(&selection, &mut |event| {
+                    observe_snapshot(event, args.trace, &snapshot)
+                })
+            };
+            match run_session.as_mut().map_or_else(
+                || Session::open(&args.session).and_then(|mut session| persist(&mut session)),
+                persist,
+            ) {
+                Ok(()) => Some((live.args, adapter)),
+                Err(error) => {
+                    output(json!({"type":"live_model_reverted","error":error.to_string()}));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        snapshot
+            .lock()
+            .expect("session snapshot")
+            .settle_share_context();
         if let (Some(input), Some(session)) = (pending_usage, run_session.as_mut()) {
             let recorded = input.apply(session, &mut |event| {
                 observe_snapshot(event, args.trace, &snapshot)
@@ -887,8 +1769,14 @@ async fn run_worker(mut args: Cli) -> Result<()> {
         cache_capture.settle(
             run_session
                 .as_ref()
-                .filter(|_| result.is_ok() && completed_shells.is_empty()),
+                .filter(|_| result.is_ok() && completed_shells.is_empty() && adopted.is_none()),
         );
+        drop(cache_capture);
+        if let Some((selected, adapter)) = adopted {
+            args = selected;
+            runtime.refresh_read_image_policy(&args);
+            runtime.provider = adapter;
+        }
         for execution in completed_shells {
             let recorded = match run_session.as_mut() {
                 Some(session) => record_shell(session, &execution, &args, &snapshot),
@@ -901,6 +1789,11 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     json!({"type":"error","message":format!("Could not record shell output: {error}")}),
                 );
             }
+        }
+        if idle_callback_operation {
+            pending_discovery_trigger = run_session
+                .as_ref()
+                .and_then(Session::pending_custom_trigger);
         }
         drop(run_session);
         if started && resume_queued && (result.is_ok() || matches!(&result, Err(Error::Cancelled)))
@@ -917,21 +1810,16 @@ async fn run_worker(mut args: Cli) -> Result<()> {
                     .map(|_| json!({"disposition":"handled"}))
                     .map_err(|error| Error::Config(error.to_string())),
             );
-        } else if let Err(error) = &result {
+        } else if compact_response.is_none()
+            && let Err(error) = &result
+        {
             output(json!({"type":"error","message":error.to_string()}));
         }
         output(
             json!({"type":"agent_settled","success":result.is_ok(),"aborted":matches!(result, Err(Error::Cancelled)),"started":started}),
         );
         if let Some(id) = compact_response {
-            control_response(
-                "compact",
-                id,
-                result
-                    .as_ref()
-                    .map(|_| compact_result)
-                    .map_err(|error| Error::Config(error.to_string())),
-            );
+            control_response("compact", id, result.map(|_| compact_result));
         }
     }
     while let Ok(request) = requests.try_recv() {
@@ -1009,7 +1897,7 @@ fn record_shell(
 ) -> Result<()> {
     if session.working_directory().is_none() {
         session.set_working_directory(&args.workspace)?;
-        snapshot.lock().expect("session snapshot").refresh(session);
+        refresh_snapshot(snapshot, session);
     }
     session.append_local_bash_result(execution.clone())?;
     observe_snapshot(
@@ -1051,7 +1939,7 @@ fn apply_idle_queue(
             "managed session queue controls require its host".into(),
         ));
     }
-    snapshot.lock().expect("session snapshot").refresh(&session);
+    refresh_snapshot(snapshot, &session);
     input.apply(&mut session, &mut |event| {
         observe_snapshot(event, args.trace, snapshot)
     })
@@ -1062,6 +1950,26 @@ fn observe_snapshot(
     trace: bool,
     snapshot: &Mutex<SessionSnapshot>,
 ) {
+    if let pi_rs::Notification::Committed(record) = &event
+        && let pi_rs::Event::ToolFinished { operation_id, .. } = &record.event
+    {
+        let structured_content = pi_rs::tool_result_event_metadata(*operation_id);
+        let duration_ms =
+            super::rpc_events::tool_duration_ms(pi_rs::record_event_metadata(record.id).as_ref());
+        if structured_content.is_some() || duration_ms.is_some() {
+            let mut metadata = json!({
+                "type": "internal_tool_result_metadata",
+                "operationId": operation_id
+            });
+            if let Some(content) = structured_content {
+                metadata["structuredContent"] = content;
+            }
+            if let Some(duration_ms) = duration_ms {
+                metadata["durationMs"] = json!(duration_ms);
+            }
+            output(metadata);
+        }
+    }
     let name = match &event {
         pi_rs::Notification::Committed(record) => match &record.event {
             pi_rs::Event::SessionInfo {
@@ -1071,17 +1979,68 @@ fn observe_snapshot(
         },
         _ => None,
     };
-    let entries = if let pi_rs::Notification::Committed(record) = &event {
-        snapshot.lock().expect("session snapshot").record(record)
+    let (entries, projection_error) = if let pi_rs::Notification::Committed(record) = &event {
+        let mut snapshot = snapshot.lock().expect("session snapshot");
+        let entries = snapshot.record(record);
+        (entries, snapshot.projection_error.take())
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
     observe(event, trace);
+    if let Some(error) = projection_error {
+        output(json!({"type":"session_projection_error","error":error}));
+    }
     for entry in entries {
         output(json!({"type":"entry_appended","entry":entry}));
     }
     if let Some(name) = name {
         output(json!({"type":"session_info_changed","name":name}));
+    }
+}
+
+enum TranscriptRenderRecord {
+    Message(pi_rs::CustomMessage),
+    Entry(pi_rs::CustomEntryRecord),
+}
+
+impl TranscriptRenderRecord {
+    async fn render(
+        self,
+        messages: &pi_rs::CustomMessageRenderers,
+        entries: &pi_rs::CustomEntryRenderers,
+        options: &pi_rs::CustomMessageRenderOptions,
+    ) -> Option<pi_rs::RenderedExtensionContent> {
+        let deadline = std::time::Duration::from_secs(1);
+        match self {
+            Self::Message(message) => messages.render(&message, options, deadline).await,
+            Self::Entry(entry) => {
+                let entry_options = pi_rs::CustomEntryRenderOptions {
+                    expanded: options.expanded,
+                    expand_key: options.expand_key.clone(),
+                };
+                entries
+                    .render(&entry, &entry_options, deadline)
+                    .await
+                    .unwrap_or_else(|error| {
+                        let error: String = error.chars().take(512).collect();
+                        let label =
+                            format!("[{}] renderer failed: {error}", entry.entry.custom_type);
+                        Some(pi_rs::RenderedExtensionContent {
+                            padding: options.output_pad,
+                            background: Some("customMessageBg".into()),
+                            lines: vec![
+                                vec![],
+                                vec![pi_rs::UiComponentSpan {
+                                    text: label,
+                                    color: Some("error".into()),
+                                    ..Default::default()
+                                }],
+                                vec![],
+                            ],
+                        })
+                    })
+            }
+        }
     }
 }
 
@@ -1099,13 +2058,18 @@ fn read_requests(
         command_catalog,
         resources,
         resources_ready,
+        share_ready,
         registry,
         lifecycle_timeout,
         trace,
         snapshot,
+        render_transcript,
         shell,
     } = controls;
     let runtime = tokio::runtime::Handle::current();
+    let message_renderers = registry.custom_message_renderers();
+    let entry_renderers = registry.custom_entry_renderers();
+    let markdown_transformers = registry.markdown_transformers();
     let prepare_in_background =
         registry.has_input_hooks() || registry.has_resource_discovery_hooks();
     let processor = Arc::new(queue::Processor {
@@ -1119,6 +2083,9 @@ fn read_requests(
         lifecycle_timeout,
         trace,
     });
+    let share_slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let render_slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let markdown_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let (queue_requests, queue) = mpsc::channel(32);
     let queue = prepare_in_background.then(|| runtime.spawn(processor.clone().run(queue)));
     std::thread::spawn(move || {
@@ -1137,27 +2104,128 @@ fn read_requests(
                 }
             };
             match request {
+                Request::RenderTranscriptExtension {
+                    id,
+                    record_id,
+                    options,
+                } => {
+                    if !render_transcript {
+                        output(
+                            json!({"type":"input_rejected","reason":"terminal presentation unavailable"}),
+                        );
+                        continue;
+                    }
+                    let record = {
+                        let snapshot = snapshot.lock().expect("session snapshot");
+                        snapshot
+                            .records
+                            .binary_search_by_key(&record_id, |record| record.id)
+                            .ok()
+                            .and_then(|index| match &snapshot.records[index].event {
+                                pi_rs::Event::CustomMessage { message }
+                                | pi_rs::Event::CustomMessageDelivered { message, .. }
+                                    if message.display
+                                        && message_renderers.contains(&message.custom_type) =>
+                                {
+                                    Some(TranscriptRenderRecord::Message(message.clone()))
+                                }
+                                pi_rs::Event::CustomEntry { entry }
+                                    if entry_renderers.contains(&entry.custom_type) =>
+                                {
+                                    Some(TranscriptRenderRecord::Entry(pi_rs::CustomEntryRecord {
+                                        id: record_id,
+                                        entry: entry.clone(),
+                                    }))
+                                }
+                                _ => None,
+                            })
+                    };
+                    match (record, render_slots.clone().try_acquire_owned()) {
+                        (Some(record), Ok(slot)) => {
+                            let messages = message_renderers.clone();
+                            let entries = entry_renderers.clone();
+                            runtime.spawn(async move {
+                                let rendered = record.render(&messages, &entries, &options).await;
+                                drop(slot);
+                                output(json!({"type":"transcript_extension_rendered","id":id,"rendered":rendered}));
+                            });
+                        }
+                        _ => output(
+                            json!({"type":"transcript_extension_rendered","id":id,"rendered":null}),
+                        ),
+                    }
+                }
+                Request::TransformTranscriptMarkdown {
+                    id,
+                    markdown,
+                    context,
+                } => {
+                    if render_transcript
+                        && !markdown_transformers.is_empty()
+                        && let Ok(slot) = markdown_slots.clone().try_acquire_owned()
+                    {
+                        let transformers = markdown_transformers.clone();
+                        runtime.spawn(async move {
+                            let transformed = transformers
+                                .transform(&markdown, &context, std::time::Duration::from_secs(1))
+                                .await;
+                            drop(slot);
+                            output(json!({"type":"transcript_markdown_transformed","id":id,"transformed":transformed}));
+                        });
+                    } else {
+                        output(
+                            json!({"type":"transcript_markdown_transformed","id":id,"retry":render_transcript && !markdown_transformers.is_empty()}),
+                        );
+                    }
+                }
                 Request::ReadSession {
                     request,
                     path,
                     context_window,
                     state,
                 } => {
-                    let records = snapshot.lock().expect("session snapshot").records.clone();
-                    let result = Session::from_records(records).and_then(|session| {
-                        super::rpc::snapshot_response(
-                            &request,
-                            &session,
-                            &path,
-                            context_window,
-                            state,
-                        )
-                    });
+                    let (records, metadata) = {
+                        let snapshot = snapshot.lock().expect("session snapshot");
+                        (snapshot.records.clone(), snapshot.record_metadata.clone())
+                    };
+                    let result = Session::from_records_with_metadata(records, metadata).and_then(
+                        |session| {
+                            super::rpc::snapshot_response(
+                                &request,
+                                &session,
+                                &path,
+                                context_window,
+                                state,
+                            )
+                        },
+                    );
                     control_response(
                         request["type"].as_str().unwrap_or_default(),
                         request.get("id").cloned(),
                         result,
                     );
+                }
+                Request::GetShareContext { id, session } => {
+                    let mut ready = share_ready.clone();
+                    let snapshot = snapshot.clone();
+                    let active = active.clone();
+                    let slots = share_slots.clone();
+                    runtime.spawn(async move {
+                        while !*ready.borrow_and_update() {
+                            if ready.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                        let result =
+                            share_snapshot_background(active, snapshot, slots, move || {
+                                Session::snapshot(session).ok()
+                            })
+                            .await
+                            .and_then(|snapshot| {
+                                serde_json::to_value(snapshot).map_err(Into::into)
+                            });
+                        control_response("get_share_context", id, result);
+                    });
                 }
                 Request::GetCommands { id } => {
                     let mut ready = resources_ready.clone();
@@ -1209,6 +2277,7 @@ fn read_requests(
                     let timeout = shell.timeout;
                     let completed = shell.completed.clone();
                     let registry = processor.registry.clone();
+                    let host_inputs = processor.inputs.clone();
                     let snapshot = snapshot.clone();
                     let mut ready = resources_ready.clone();
                     runtime.spawn(async move {
@@ -1229,7 +2298,8 @@ fn read_requests(
                                 let records = snapshot.lock().expect("session snapshot").records.clone();
                                 let states = pi_rs::Session::from_records(records)?.extension_states();
                                 let event = pi_rs::UserBashEvent { command: command.clone(), exclude_from_context, cwd };
-                                match registry.prepare_user_bash(&event, &states, &cancel).await? {
+                                let host = Arc::new(QueueMessageHost { inputs: host_inputs, cancellation: cancel.clone() });
+                                match registry.prepare_user_bash_with_host(&event, &states, &cancel, host.clone()).await? {
                                     Some(pi_rs::UserBashReplacement::Result(result)) => {
                                         if !result.output.is_empty() {
                                             output(json!({"type":"bash_execution_update","executionId":id,"output":result.output,"id":request_id}));
@@ -1241,9 +2311,9 @@ fn read_requests(
                                         });
                                     }
                                     Some(pi_rs::UserBashReplacement::Operations { extension, state }) => {
-                                        return tools.execute_shell_operations(&event, extension.as_ref(), state.as_ref(), timeout, &cancel, &mut |chunk| {
+                                        return tools.execute_shell_operations_with_host(&event, extension.as_ref(), state.as_ref(), timeout, &cancel, &mut |chunk| {
                                             output(json!({"type":"bash_execution_update","executionId":id,"output":chunk,"id":request_id}));
-                                        }).await;
+                                        }, host).await;
                                     }
                                     None => {}
                                 }
@@ -1274,12 +2344,33 @@ fn read_requests(
                     auto_compaction.set_enabled(enabled);
                     control_response("set_auto_compaction", id, Ok(serde_json::Value::Null));
                 }
+                Request::SelectLiveModel {
+                    id,
+                    provider,
+                    model,
+                    thinking,
+                    reported_reasoning,
+                    reported_thinking,
+                } => {
+                    if let Err(error) = select_live_model(
+                        &active,
+                        id,
+                        &provider,
+                        model,
+                        thinking,
+                        reported_reasoning,
+                        reported_thinking,
+                    ) {
+                        control_response("select_live_model", Some(json!(id)), Err(error));
+                    }
+                }
                 Request::ExtensionUiResponse { id, value } => ui.resolve(id, value),
                 request @ (Request::Steer { .. }
                 | Request::Followup { .. }
                 | Request::QueueInput { .. }
                 | Request::ClearQueue { .. }
                 | Request::SetSessionName { .. }
+                | Request::SetSessionLabel { .. }
                 | Request::SetQueueMode { .. }) => {
                     if prepare_in_background {
                         if let Err(error) = queue_requests.try_send(request) {
@@ -1310,6 +2401,7 @@ fn read_requests(
                         request,
                         Request::Configure { .. }
                             | Request::CacheWarmingChanged
+                            | Request::TransportChanged
                             | Request::CheckSessionTransition { .. }
                             | Request::SessionInfoChanged { .. }
                             | Request::SelectionChanged { .. }
@@ -1340,6 +2432,63 @@ fn read_requests(
     });
 }
 
+fn select_live_model(
+    active: &Mutex<ControlState>,
+    request_id: Uuid,
+    provider: &str,
+    model: String,
+    thinking: Option<String>,
+    reported_reasoning: Option<bool>,
+    reported_thinking: bool,
+) -> Result<()> {
+    let unavailable = || Error::Config("No active prompt can change models".into());
+    let (id, mut args) = {
+        let state = active.lock().expect("worker control");
+        let live = state.live_model.as_ref().ok_or_else(unavailable)?;
+        (live.id, live.args.clone())
+    };
+    let provider = args
+        .model_profiles
+        .provider(provider)
+        .ok_or_else(|| Error::Config("Unknown model provider".into()))?;
+    args.activate_provider(provider, Some(&model))?;
+    args.model = model;
+    args.thinking_profile = (reported_thinking || reported_reasoning.is_some())
+        .then(|| (args.model.clone(), Vec::new(), reported_reasoning));
+    args.thinking = thinking;
+    let adapter = runtime::model_client(&args, reported_thinking, true)?;
+    let selection = Arc::new(pi_rs::LiveModelSelection {
+        adapter: Arc::new(adapter.clone()),
+        provider: args.recorded_provider().map(str::to_owned),
+        request_provider: args.provider.id().into(),
+        model: args.model.clone(),
+        thinking: args.thinking.clone(),
+        limits: pi_rs::Limits {
+            compaction_tokens: Some(
+                args.settings
+                    .compaction_tokens(args.provider.id(), &args.model),
+            ),
+            ..runtime::effective_limits(&args)
+        },
+    });
+    let mut state = active.lock().expect("worker control");
+    let live = state
+        .live_model
+        .as_mut()
+        .filter(|live| live.id == id)
+        .ok_or_else(unavailable)?;
+    live.control.select(selection.clone());
+    live.latest = Some((selection, adapter));
+    live.args = args;
+    // Keep the acknowledgement ordered before the run's settlement event.
+    control_response(
+        "select_live_model",
+        Some(json!(request_id)),
+        Ok(serde_json::Value::Null),
+    );
+    Ok(())
+}
+
 fn control_response(
     command: &str,
     id: Option<serde_json::Value>,
@@ -1352,6 +2501,12 @@ fn control_response(
     match result {
         Ok(data) if !data.is_null() => response["data"] = data,
         Ok(_) => {}
+        Err(Error::Cancelled) if command == "compact" => {
+            response["error"] = json!("Compaction cancelled");
+        }
+        Err(Error::Config(message)) if command == "compact" => {
+            response["error"] = json!(message);
+        }
         Err(error) => response["error"] = json!(error.to_string()),
     }
     output(response);
@@ -1366,8 +2521,23 @@ pub(super) fn configured_queue_mode(args: &Cli, key: &str) -> Result<QueueMode> 
             .unwrap_or_else(|| json!("one-at-a-time")),
     )?)
 }
-pub(super) fn initialize_queue_modes(session: &mut Session, args: &Cli) -> Result<()> {
-    let settings = super::config::Settings::load(&args.workspace, args.trusted)?;
+pub(super) fn initialize_queue_modes(session: &mut Session, args: &mut Cli) -> Result<Vec<String>> {
+    let fallback = args.settings.worker_fallback(&args.workspace, args.trusted);
+    let settings = args.settings.reload_with_fallback(
+        &args.workspace,
+        args.trusted,
+        fallback.as_ref().unwrap_or(&args.settings),
+    )?;
+    initialize_queue_modes_from_settings(session, &settings)?;
+    let diagnostics = settings.diagnostics().to_vec();
+    args.settings.apply_queue_reload(&settings);
+    Ok(diagnostics)
+}
+
+fn initialize_queue_modes_from_settings(
+    session: &mut Session,
+    settings: &super::config::Settings,
+) -> Result<()> {
     for (kind, key) in [
         (InputKind::Steer, "steeringMode"),
         (InputKind::FollowUp, "followUpMode"),
@@ -1378,4 +2548,1129 @@ pub(super) fn initialize_queue_modes(session: &mut Session, args: &Cli) -> Resul
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod share_context_tests {
+    use super::*;
+    use pi_rs::{Event, MemoryStore, Message, ModelRequest, Notification, Registry, Session};
+
+    #[test]
+    fn worker_queue_modes_use_its_settings_snapshot() {
+        let settings: super::super::config::Settings = serde_json::from_value(json!({
+            "value":{"steeringMode":"all","followUpMode":"one-at-a-time"},
+            "resource_layers":[], "diagnostics":["previous settings failed"],
+            "live_auto_retry":null, "live_auto_compaction":null
+        }))
+        .unwrap();
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        super::initialize_queue_modes_from_settings(&mut session, &settings).unwrap();
+        assert_eq!(session.queue_mode(InputKind::Steer), QueueMode::All);
+        assert_eq!(
+            session.queue_mode(InputKind::FollowUp),
+            QueueMode::OneAtATime
+        );
+    }
+
+    #[test]
+    fn refresh_replaces_replay_state_before_later_pi_entry() {
+        let first = Session::with_store(MemoryStore::default()).unwrap();
+        let mut snapshot = SessionSnapshot::from_session(&first, true);
+        let mut replacement = Session::with_store(MemoryStore::default()).unwrap();
+        replacement
+            .append_user_with_images("replacement".into(), vec![], None)
+            .unwrap();
+        assert!(snapshot.refresh(&replacement).is_empty());
+        let mut source = replacement.records().last().unwrap().clone();
+        source.id += 1;
+        source.parent = Some(source.id - 1);
+        source.timestamp = None;
+        source.event = Event::SourceEntry {
+            format: "pi".into(),
+            entry: json!({"type":"message","id":"new","parentId":null,"message":{"role":"user","content":"later"}}),
+        };
+        let mut child = source.clone();
+        child.id += 1;
+        child.parent = Some(source.id);
+        child.event = Event::User {
+            content: "later".into(),
+            input_id: None,
+        };
+        snapshot
+            .record_metadata
+            .insert(source.id, json!({"pi_rs_import_conversion_count_v1":1}));
+        assert!(snapshot.record(&source).is_empty());
+        let emitted = snapshot.record(&child);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0]["message"]["content"], "later");
+    }
+
+    #[test]
+    fn live_legacy_model_source_waits_for_timestamp_distinct_native_child() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), true);
+        let mut source = session.records()[0].clone();
+        source.id = 2;
+        source.parent = Some(1);
+        source.timestamp = Some("2026-01-01T00:00:00.000Z".into());
+        source.event = Event::SourceEntry {
+            format: "pi".into(),
+            entry: json!({"type":"model_change","id":"old","provider":"old","modelId":"shared"}),
+        };
+        let mut child = source.clone();
+        child.id = 3;
+        child.parent = Some(2);
+        child.timestamp = Some("2026-01-01T00:00:00.000000Z".into());
+        child.event = Event::ModelSelected {
+            provider: Some("new".into()),
+            model: "shared".into(),
+            thinking: None,
+        };
+        assert!(snapshot.record(&source).is_empty());
+        let emitted = snapshot.record(&child);
+        let batch = Session::from_records(snapshot.records.clone()).unwrap();
+        let batch = super::super::rpc_entries::Entries::new(&batch)
+            .after(None)
+            .unwrap();
+        assert_eq!(emitted, *batch["entries"].as_array().unwrap());
+        assert_eq!(emitted.len(), 3);
+        assert_eq!(emitted[0]["provider"], "old");
+        assert_eq!(emitted[1]["provider"], "new");
+        assert_eq!(emitted[2]["type"], "thinking_level_change");
+    }
+
+    #[test]
+    fn live_projection_emits_deferred_multirecord_source_once() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{}", json!({"type":"session","version":3})).unwrap();
+        writeln!(file, "{}", json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"stopReason":"stop"}})).unwrap();
+        let session = super::super::session_import::read(file.path()).unwrap();
+        let source = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a")).unwrap().id;
+        let mut snapshot =
+            SessionSnapshot::new(session.records()[..source as usize - 1].to_vec(), true);
+        snapshot
+            .record_metadata
+            .insert(source, session.record_metadata(source).unwrap().clone());
+        assert!(
+            snapshot
+                .record(&session.records()[source as usize - 1])
+                .is_empty()
+        );
+        assert!(
+            snapshot
+                .record(&session.records()[source as usize])
+                .is_empty()
+        );
+        let partial = Session::from_records_with_metadata(
+            snapshot.records.clone(),
+            snapshot.record_metadata.clone(),
+        )
+        .unwrap();
+        assert!(snapshot.refresh(&partial).is_empty());
+        assert_eq!(snapshot.deferred_from, Some(source as usize - 1));
+        let emitted = snapshot.record(&session.records()[source as usize + 1]);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0]["type"], "message");
+        assert_eq!(emitted[0]["message"]["role"], "assistant");
+        let projected = super::super::rpc_entries::Entries::new(&session)
+            .after(None)
+            .unwrap();
+        assert_eq!(
+            emitted[0],
+            projected["entries"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .clone()
+        );
+        let mut extra = session.records().last().unwrap().clone();
+        extra.id += 1;
+        extra.parent = Some(extra.id - 1);
+        extra.event = Event::SessionInfo {
+            name: None,
+            cwd: None,
+        };
+        assert!(snapshot.record(&extra).is_empty());
+    }
+
+    #[test]
+    fn live_projection_flushes_after_refresh_contains_final_conversion() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{}", json!({"type":"session","version":3})).unwrap();
+        writeln!(file, "{}", json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"stopReason":"stop"}})).unwrap();
+        let session = super::super::session_import::read(file.path()).unwrap();
+        let source = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a")).unwrap().id;
+        let mut snapshot =
+            SessionSnapshot::new(session.records()[..source as usize - 1].to_vec(), true);
+        snapshot
+            .record_metadata
+            .insert(source, session.record_metadata(source).unwrap().clone());
+        assert!(
+            snapshot
+                .record(&session.records()[source as usize - 1])
+                .is_empty()
+        );
+        assert!(
+            snapshot
+                .record(&session.records()[source as usize])
+                .is_empty()
+        );
+        let emitted = snapshot.refresh(&session);
+        assert!(snapshot.deferred_from.is_none());
+        let last = &session.records()[source as usize + 1];
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0]["type"], "message");
+        assert!(snapshot.record(last).is_empty());
+        assert!(snapshot.record(last).is_empty());
+    }
+
+    #[test]
+    fn deferred_refresh_revalidates_changed_ancestor_metadata() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}),
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}}),
+        ] {
+            writeln!(file, "{entry}").unwrap();
+        }
+        let session = super::super::session_import::read(file.path()).unwrap();
+        let user = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "u")).unwrap().id;
+        let assistant = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a")).unwrap().id;
+        let prefix = session.records()[..assistant as usize - 1].to_vec();
+        let metadata = prefix
+            .iter()
+            .filter_map(|record| {
+                session
+                    .record_metadata(record.id)
+                    .map(|value| (record.id, value.clone()))
+            })
+            .collect();
+        let prefix = Session::from_records_with_metadata(prefix, metadata).unwrap();
+        let mut snapshot = SessionSnapshot::from_session(&prefix, true);
+        snapshot.record_metadata.insert(
+            assistant,
+            session.record_metadata(assistant).unwrap().clone(),
+        );
+        assert!(
+            snapshot
+                .record(&session.records()[assistant as usize - 1])
+                .is_empty()
+        );
+        assert!(
+            snapshot
+                .record(&session.records()[assistant as usize])
+                .is_empty()
+        );
+        let mut changed = snapshot.record_metadata.clone();
+        changed.insert(user, json!({"pi_rs_import_conversion_count_v1":0}));
+        let partial =
+            Session::from_records_with_metadata(snapshot.records.clone(), changed).unwrap();
+        assert!(snapshot.refresh(&partial).is_empty());
+        assert!(snapshot.entries.as_ref().unwrap().is_invalid());
+        assert!(
+            snapshot
+                .record(&session.records()[assistant as usize + 1])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn deferred_refresh_flushes_after_valid_ancestor_metadata_change() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for entry in [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"hello"}}),
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}}),
+        ] {
+            writeln!(file, "{entry}").unwrap();
+        }
+        let session = super::super::session_import::read(file.path()).unwrap();
+        let user = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "u")).unwrap().id;
+        let assistant = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a")).unwrap().id;
+        let prefix = session.records()[..assistant as usize - 1].to_vec();
+        let metadata = prefix
+            .iter()
+            .filter_map(|r| session.record_metadata(r.id).map(|m| (r.id, m.clone())))
+            .collect();
+        let prefix = Session::from_records_with_metadata(prefix, metadata).unwrap();
+        let mut snapshot = SessionSnapshot::from_session(&prefix, true);
+        snapshot.record_metadata.insert(
+            assistant,
+            session.record_metadata(assistant).unwrap().clone(),
+        );
+        assert!(
+            snapshot
+                .record(&session.records()[assistant as usize - 1])
+                .is_empty()
+        );
+        assert!(
+            snapshot
+                .record(&session.records()[assistant as usize])
+                .is_empty()
+        );
+        let mut metadata: std::collections::BTreeMap<_, _> = session
+            .records()
+            .iter()
+            .filter_map(|r| session.record_metadata(r.id).map(|m| (r.id, m.clone())))
+            .collect();
+        metadata.insert(
+            user,
+            json!({"pi_rs_import_conversion_count_v1":1,"note":"updated"}),
+        );
+        let changed =
+            Session::from_records_with_metadata(session.records().to_vec(), metadata).unwrap();
+        let emitted = snapshot.refresh(&changed);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0]["message"]["role"], "assistant");
+        assert!(
+            snapshot
+                .record(&session.records()[assistant as usize + 1])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn completing_refresh_does_not_emit_later_record_before_notification() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{}", json!({"type":"session","version":3})).unwrap();
+        writeln!(file, "{}", json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"stopReason":"stop"}})).unwrap();
+        let mut session = super::super::session_import::read(file.path()).unwrap();
+        let source = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a")).unwrap().id;
+        let final_conversion = session.records()[source as usize + 1].clone();
+        session
+            .append_user_with_images("later".into(), vec![], None)
+            .unwrap();
+        let later = session.records().last().unwrap().clone();
+        let mut snapshot =
+            SessionSnapshot::new(session.records()[..source as usize - 1].to_vec(), true);
+        snapshot
+            .record_metadata
+            .insert(source, session.record_metadata(source).unwrap().clone());
+        assert!(
+            snapshot
+                .record(&session.records()[source as usize - 1])
+                .is_empty()
+        );
+        assert!(
+            snapshot
+                .record(&session.records()[source as usize])
+                .is_empty()
+        );
+        let emitted = snapshot.refresh(&session);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0]["message"]["role"], "assistant");
+        assert!(snapshot.record(&final_conversion).is_empty());
+        let emitted = snapshot.record(&later);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(
+            emitted[0]["message"]["content"],
+            json!([{ "type":"text", "text":"later" }])
+        );
+        assert!(snapshot.record(&later).is_empty());
+    }
+
+    #[test]
+    fn live_projection_validates_many_tool_records_only_at_completion() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{}", json!({"type":"session","version":3})).unwrap();
+        let calls: Vec<_> = (0..300).map(|index| json!({"type":"toolCall","id":format!("c{index}"),"name":"read","arguments":{}})).collect();
+        writeln!(file, "{}", json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":calls}})).unwrap();
+        let session = super::super::session_import::read(file.path()).unwrap();
+        let source = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "a")).unwrap().id;
+        let mut snapshot =
+            SessionSnapshot::new(session.records()[..source as usize - 1].to_vec(), true);
+        snapshot
+            .record_metadata
+            .insert(source, session.record_metadata(source).unwrap().clone());
+        let mut emitted = Vec::new();
+        for record in &session.records()[source as usize - 1..] {
+            emitted.extend(snapshot.record(record));
+        }
+        assert_eq!(snapshot.validation_attempts, 2);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0]["type"], "message");
+    }
+
+    #[test]
+    fn live_projection_replays_each_of_many_sources_once() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{}", json!({"type":"session","version":3})).unwrap();
+        let mut parent = serde_json::Value::Null;
+        for index in 0..400 {
+            let id = format!("m{index}");
+            writeln!(file, "{}", json!({"type":"message","id":id,"parentId":parent,"message":{"role":"user","content":format!("message{index}")}})).unwrap();
+            parent = json!(id);
+        }
+        let session = super::super::session_import::read(file.path()).unwrap();
+        let first = session.records().iter().find(|record| matches!(&record.event, Event::SourceEntry { entry, .. } if entry["id"] == "m0")).unwrap().id;
+        let mut snapshot =
+            SessionSnapshot::new(session.records()[..first as usize - 1].to_vec(), true);
+        let mut emitted = Vec::new();
+        for record in &session.records()[first as usize - 1..] {
+            if let Some(metadata) = session.record_metadata(record.id) {
+                snapshot.record_metadata.insert(record.id, metadata.clone());
+            }
+            emitted.extend(snapshot.record(record));
+        }
+        assert_eq!(emitted.len(), 400);
+        assert_eq!(snapshot.replay.checked_sources(), 400);
+        assert_eq!(snapshot.replay.processed(), session.records().len());
+    }
+
+    #[test]
+    fn replacing_source_provenance_rebuilds_live_projection() {
+        for (initial, replacement) in [(0, 1), (1, 0)] {
+            let base = Session::with_store(MemoryStore::default()).unwrap();
+            let mut records = base.records().to_vec();
+            let mut source = records[0].clone();
+            source.id = 2;
+            source.parent = Some(1);
+            source.timestamp = None;
+            source.event = Event::SourceEntry {
+                format: "pi".into(),
+                entry: json!({"type":"thinking_level_change","id":"s","thinkingLevel":"high"}),
+            };
+            records.push(source.clone());
+            let mut child = source.clone();
+            child.id = 3;
+            child.parent = Some(2);
+            child.event = Event::ModelSelected {
+                model: "first".into(),
+                provider: None,
+                thinking: Some("high".into()),
+            };
+            records.push(child.clone());
+            let session = Session::from_records_with_metadata(
+                records,
+                [(2, json!({"pi_rs_import_conversion_count_v1":initial}))]
+                    .into_iter()
+                    .collect(),
+            )
+            .unwrap();
+            let mut snapshot = SessionSnapshot::from_session(&session, true);
+            snapshot
+                .record_metadata
+                .insert(2, json!({"pi_rs_import_conversion_count_v1":replacement}));
+            assert!(snapshot.record(&source).is_empty());
+            let mut next = child;
+            next.id = 4;
+            next.parent = Some(3);
+            next.event = Event::ModelSelected {
+                model: "second".into(),
+                provider: None,
+                thinking: Some("high".into()),
+            };
+            let live = snapshot.record(&next);
+            let restored = Session::from_records_with_metadata(
+                snapshot.records.clone(),
+                snapshot.record_metadata.clone(),
+            )
+            .unwrap();
+            if replacement == 1 {
+                assert!(live.is_empty());
+                assert!(
+                    super::super::rpc_entries::Entries::new(&restored)
+                        .after(None)
+                        .is_err()
+                );
+                continue;
+            }
+            let projection = super::super::rpc_entries::Entries::new(&restored)
+                .after(None)
+                .unwrap();
+            let entries = projection["entries"].as_array().unwrap();
+            assert_eq!(live, vec![entries.last().unwrap().clone()]);
+            assert_eq!(
+                live[0]["parentId"],
+                if replacement == 0 { "3" } else { "2" }
+            );
+        }
+    }
+
+    #[test]
+    fn initial_snapshot_releases_new_journal_lock_for_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new-session.jsonl");
+        let snapshot = open_initial_snapshot(&path, true).unwrap();
+        let worker_session = Session::open(&path).unwrap();
+        assert_eq!(snapshot.records[0].id, worker_session.records()[0].id);
+    }
+
+    #[test]
+    fn live_session_snapshot_preserves_compaction_metadata_for_rpc_reads() {
+        let base = Session::with_store(MemoryStore::default()).unwrap();
+        let mut records = base.records().to_vec();
+        let id = records.len() as u64 + 1;
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: records[0].version,
+            id,
+            parent: Some(id - 1),
+            event: Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: None,
+                retain_from: None,
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            },
+        });
+        let metadata = json!({"fromExtension":true,"details":{"origin":"hook"}});
+        let session = Session::from_records_with_metadata(
+            records,
+            [(id, metadata.clone())].into_iter().collect(),
+        )
+        .unwrap();
+        let mut snapshot = SessionSnapshot::from_session(&session, true);
+        let restored = Session::from_records_with_metadata(
+            snapshot.records.clone(),
+            snapshot.record_metadata.clone(),
+        )
+        .unwrap();
+        assert_eq!(restored.record_metadata(id), Some(&metadata));
+        let _ = snapshot.refresh(&session);
+        assert_eq!(snapshot.record_metadata.get(&id), Some(&metadata));
+    }
+
+    #[test]
+    fn stalled_share_reader_does_not_delay_runtime_shutdown() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let session = Session::with_store(MemoryStore::default()).unwrap();
+                let snapshot = Arc::new(Mutex::new(SessionSnapshot::new(
+                    session.records().to_vec(),
+                    false,
+                )));
+                tokio::spawn(share_snapshot_background(
+                    Arc::new(Mutex::new(ControlState::default())),
+                    snapshot,
+                    Arc::new(tokio::sync::Semaphore::new(1)),
+                    move || {
+                        started_tx.send(()).unwrap();
+                        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+                        None
+                    },
+                ));
+                tokio::task::yield_now().await;
+                started_rx
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+            });
+            drop(runtime);
+            done_tx.send(()).unwrap();
+        });
+        let completed = done_rx.recv_timeout(std::time::Duration::from_secs(3));
+        let _ = release_tx.send(());
+        worker.join().unwrap();
+        completed.expect("runtime shutdown waited for a stalled reader");
+    }
+
+    #[test]
+    fn share_preparation_does_not_hold_worker_locks_and_rejects_changes() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), true);
+        initial.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        }));
+        let snapshot = Arc::new(Mutex::new(initial));
+        let active = Arc::new(Mutex::new(ControlState::default()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn({
+            let active = active.clone();
+            let snapshot = snapshot.clone();
+            move || {
+                snapshot_for_share_with_hook(&active, &snapshot, None, || {
+                    started_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                })
+            }
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        let mut state = active
+            .try_lock()
+            .expect("control lock held during preparation");
+        let mut worker = snapshot
+            .try_lock()
+            .expect("snapshot lock held during preparation");
+        state.token = Some(CancellationToken::new());
+        session
+            .append_user_with_images("foreground progress".into(), vec![], None)
+            .unwrap();
+        worker.record(session.records().last().unwrap());
+        state.token = None;
+        drop(worker);
+        drop(state);
+        release_tx.send(()).unwrap();
+        assert!(
+            reader
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("changed")
+        );
+        assert_eq!(
+            snapshot.lock().unwrap().records.len(),
+            session.records().len()
+        );
+    }
+
+    #[test]
+    fn transient_streaming_does_not_invalidate_large_shared_context() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let context = Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "x".repeat(2_000_000),
+            tools: vec![],
+        });
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), false);
+        initial.share_base = Some(context.clone());
+        let snapshot = Arc::new(Mutex::new(initial));
+        let active = Arc::new(Mutex::new(ControlState {
+            token: Some(CancellationToken::new()),
+            ..Default::default()
+        }));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn({
+            let active = active.clone();
+            let snapshot = snapshot.clone();
+            move || {
+                snapshot_for_share_with_hook(&active, &snapshot, None, || {
+                    started_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                })
+            }
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert!(
+            Arc::strong_count(&context) >= 3,
+            "share capture must retain references, not clone the context"
+        );
+        let _state = active
+            .try_lock()
+            .expect("control lock held during preparation");
+        let mut worker = snapshot
+            .try_lock()
+            .expect("snapshot lock held during preparation");
+        let version = worker.revision;
+        let mut summary = false;
+        worker.track_share_event(&Notification::Text("streaming"), &mut summary);
+        worker.track_share_event(&Notification::Reasoning("thinking"), &mut summary);
+        assert_eq!(worker.revision, version);
+        drop(worker);
+        drop(_state);
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            reader.join().unwrap().unwrap().context.system_prompt,
+            context.system_prompt
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_share_disk_read_does_not_block_worker_progress() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), true);
+        initial.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        }));
+        let snapshot = Arc::new(Mutex::new(initial));
+        let active = Arc::new(Mutex::new(ControlState::default()));
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let read = tokio::spawn(share_snapshot_background(
+            active.clone(),
+            snapshot.clone(),
+            slots.clone(),
+            move || {
+                let stale = Session::snapshot(path).unwrap();
+                let _ = started_tx.send(());
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .ok()?;
+                Some(stale)
+            },
+        ));
+        started_rx.await.unwrap();
+        // This runs on the same single-thread runtime while the filesystem
+        // reader is paused; a second read fails immediately without spawning.
+        let rejected =
+            share_snapshot_background(active.clone(), snapshot.clone(), slots.clone(), || {
+                panic!("reader must not start")
+            })
+            .await;
+        assert!(
+            rejected
+                .unwrap_err()
+                .to_string()
+                .contains("already being read")
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            {
+                active.lock().unwrap().token = Some(CancellationToken::new());
+            }
+            tokio::task::yield_now().await;
+            session
+                .append_user_with_images("model progressed".into(), vec![], None)
+                .unwrap();
+            let mut state = active.lock().unwrap();
+            let mut worker = snapshot.lock().unwrap();
+            assert_eq!(worker.record(session.records().last().unwrap()).len(), 1);
+            worker.settle_share_context();
+            state.token = None;
+        })
+        .await
+        .unwrap();
+        let head = session.head();
+        release_tx.send(()).unwrap();
+        let result = read.await.unwrap().unwrap();
+        assert_eq!(result.head, head);
+        session
+            .append_user_with_images("next event".into(), vec![], None)
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .lock()
+                .unwrap()
+                .record(session.records().last().unwrap())
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_share_uses_memory_without_reading_disk() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), false);
+        initial.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        }));
+        let result = share_snapshot_background(
+            Arc::new(Mutex::new(ControlState {
+                token: Some(CancellationToken::new()),
+                ..Default::default()
+            })),
+            Arc::new(Mutex::new(initial)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            || panic!("active share must not read the disk"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.context.system_prompt, "live");
+    }
+
+    #[test]
+    fn delayed_share_disk_read_cannot_rewind_settled_worker_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        let mut initial = SessionSnapshot::new(session.records().to_vec(), true);
+        initial.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "live".into(),
+            tools: vec![],
+        }));
+        let snapshot = Arc::new(Mutex::new(initial));
+        let active = Arc::new(Mutex::new(ControlState {
+            token: Some(CancellationToken::new()),
+            ..Default::default()
+        }));
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn({
+            let snapshot = snapshot.clone();
+            let active = active.clone();
+            let path = path.clone();
+            move || {
+                let stale = Session::snapshot(path).unwrap();
+                read_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                snapshot_for_share(&active, &snapshot, Some(stale)).unwrap()
+            }
+        });
+        read_rx.recv().unwrap();
+        session
+            .append_user_with_images("committed while reading".into(), vec![], None)
+            .unwrap();
+        {
+            let mut state = active.lock().unwrap();
+            let mut worker = snapshot.lock().unwrap();
+            assert_eq!(worker.record(session.records().last().unwrap()).len(), 1);
+            worker.settle_share_context();
+            state.token = None;
+        }
+        let committed_head = session.head();
+        resume_tx.send(()).unwrap();
+        let result = reader.join().unwrap();
+        assert_eq!(result.head, committed_head);
+        assert_eq!(result.context.system_prompt, "live");
+        session
+            .append_user_with_images("later event".into(), vec![], None)
+            .unwrap();
+        let mut worker = snapshot.lock().unwrap();
+        let entries = worker.record(session.records().last().unwrap());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], session.head().to_string());
+        assert_eq!(
+            entries[0]["message"]["content"],
+            json!([{ "type":"text", "text":"later event" }])
+        );
+        assert_eq!(worker.share_snapshot().unwrap().head, session.head());
+    }
+
+    #[test]
+    fn idle_share_rejects_divergent_journal_prefix() {
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        session
+            .append_user_with_images("original".into(), vec![], None)
+            .unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        let mut records = session.records().to_vec();
+        if let Event::User { content, .. } = &mut records[1].event {
+            *content = "changed".into();
+        } else {
+            panic!("expected user record");
+        }
+        let mut replacement = Session::from_records(records).unwrap();
+        replacement
+            .append_user_with_images("new".into(), vec![], None)
+            .unwrap();
+        snapshot.refresh_if_extends(&replacement);
+        assert_eq!(snapshot.records.len(), session.records().len());
+        assert!(
+            matches!(&snapshot.records[1].event, Event::User { content, .. } if content == "original")
+        );
+    }
+
+    #[test]
+    fn selected_catalog_survives_settling_and_uses_runtime_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        snapshot.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "old prompt".into(),
+            tools: vec![],
+        }));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(CodingTools::local(root.path()).unwrap()))
+            .unwrap();
+        let mut summary = false;
+        snapshot.track_share_event(
+            &Notification::ModelContext {
+                system_prompt: "refreshed prompt",
+                registry: &registry,
+            },
+            &mut summary,
+        );
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::System {
+                content: "request-specific prompt".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        snapshot.track_share_event(&Notification::Request(&request), &mut summary);
+        assert_eq!(
+            snapshot.share_snapshot().unwrap().context.system_prompt,
+            "refreshed prompt"
+        );
+        snapshot.settle_share_context();
+        let context = snapshot.share_snapshot().unwrap().context;
+        assert_eq!(context.system_prompt, "refreshed prompt");
+        assert!(context.tools.iter().any(|tool| tool.name == "read"));
+    }
+
+    #[test]
+    fn live_share_uses_current_tools_not_transcript_declarations() {
+        let root = tempfile::tempdir().unwrap();
+        let seed = Session::with_store(MemoryStore::default()).unwrap();
+        let mut records = seed.records().to_vec();
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: records[0].version,
+            id: 2,
+            parent: Some(1),
+            event: Event::SystemCheckpoint {
+                content: "session prompt".into(),
+                sections: vec![],
+                tools_added: vec![],
+                tools_removed: vec![],
+            },
+        });
+        let session = Session::from_records(records).unwrap();
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(CodingTools::local(root.path()).unwrap()))
+            .unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        let mut summary = false;
+        snapshot.track_share_event(
+            &Notification::ModelContext {
+                system_prompt: "fallback",
+                registry: &registry,
+            },
+            &mut summary,
+        );
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::System {
+                content: "transformed request".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        snapshot.track_share_event(&Notification::Request(&request), &mut summary);
+        let result = snapshot_for_share(
+            &Mutex::new(ControlState {
+                token: Some(CancellationToken::new()),
+                ..Default::default()
+            }),
+            &Mutex::new(snapshot),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.context.system_prompt, "session prompt");
+        assert!(result.context.tools.iter().any(|tool| tool.name == "read"));
+    }
+
+    #[tokio::test]
+    async fn running_agent_keeps_refreshed_catalog_after_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Refresh {
+            fired: AtomicBool,
+            workspace: PathBuf,
+        }
+        #[async_trait::async_trait]
+        impl pi_rs::RegistryRefresher for Refresh {
+            async fn refresh(&self, current: &Registry) -> Result<Option<pi_rs::RegistryUpdate>> {
+                if self.fired.swap(true, Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                let mut registry = current.clone();
+                registry.register(Arc::new(CodingTools::local(&self.workspace)?))?;
+                Ok(Some(pi_rs::RegistryUpdate {
+                    registry,
+                    system_prompt: Some("refreshed runtime prompt".into()),
+                }))
+            }
+        }
+        struct Model;
+        #[async_trait::async_trait]
+        impl pi_rs::Model for Model {
+            async fn stream(&self, _: ModelRequest) -> Result<pi_rs::ModelStream> {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(pi_rs::ModelEvent::Text("done".into())),
+                    Ok(pi_rs::ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut registry = Registry::default();
+        registry.set_refresher(Arc::new(Refresh {
+            fired: AtomicBool::new(false),
+            workspace: root.path().into(),
+        }));
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        snapshot.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "old".into(),
+            tools: vec![],
+        }));
+        let agent = pi_rs::Agent {
+            model: &Model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "old",
+            limits: Default::default(),
+        };
+        let (_tx, mut inputs) = tokio::sync::mpsc::channel(1);
+        let mut summary = false;
+        let mut saw_boundary = false;
+        agent
+            .run(
+                &mut session,
+                Some("hello".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| {
+                    snapshot.track_share_event(&event, &mut summary);
+                    if let Notification::Committed(record) = &event {
+                        snapshot.record(record);
+                        if matches!(record.event, Event::ModelRequested { .. }) {
+                            saw_boundary = true;
+                            assert!(snapshot.share_snapshot().is_err());
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(saw_boundary);
+        snapshot.settle_share_context();
+        let context = snapshot.share_snapshot().unwrap().context;
+        assert_eq!(context.system_prompt, "refreshed runtime prompt");
+        assert!(context.tools.iter().any(|tool| tool.name == "read"));
+    }
+
+    #[test]
+    fn request_commit_boundary_never_exposes_mismatched_context() {
+        let session = Session::with_store(MemoryStore::default()).unwrap();
+        let mut snapshot = SessionSnapshot::new(session.records().to_vec(), false);
+        snapshot.share_base = Some(Arc::new(super::super::sessions::ShareContext {
+            system_prompt: "base".into(),
+            tools: vec![],
+        }));
+        let record = pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: session.records()[0].version,
+            id: 2,
+            parent: Some(1),
+            event: Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 1,
+                tools: 0,
+                max_output_tokens: 1,
+                request_id: None,
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+                tool_decision: None,
+            },
+        };
+        let mut summary = false;
+        snapshot.track_share_event(&Notification::Committed(&record), &mut summary);
+        snapshot.record(&record);
+        assert!(
+            snapshot
+                .share_snapshot()
+                .unwrap_err()
+                .to_string()
+                .contains("context is changing")
+        );
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::System {
+                content: "new".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        snapshot.track_share_event(&Notification::Request(&request), &mut summary);
+        let result = snapshot.share_snapshot().unwrap();
+        assert_eq!(result.head, 2);
+        assert_eq!(result.context.system_prompt, "base");
+    }
+}
+
+#[cfg(test)]
+mod message_host_tests {
+    use super::*;
+
+    struct BashHook;
+    #[async_trait::async_trait]
+    impl pi_rs::Extension for BashHook {
+        fn id(&self) -> &str {
+            "bash-message"
+        }
+        fn handles_user_bash(&self) -> bool {
+            true
+        }
+        async fn user_bash_with_host(
+            &self,
+            _: &pi_rs::UserBashEvent,
+            _: Option<&pi_rs::ExtensionState>,
+            host: Arc<dyn pi_rs::ToolHost>,
+        ) -> pi_rs::ExtensionResult<Option<pi_rs::UserBashResult>> {
+            host.send_message(
+                pi_rs::CustomMessage {
+                    custom_type: "bash".into(),
+                    content: pi_rs::ContextContent::Text("from shell".into()),
+                    display: false,
+                    details: None,
+                },
+                pi_rs::CustomMessageDelivery::TriggerTurn,
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_callback_waits_until_idle_owner_journals_trigger() {
+        let mut registry = pi_rs::Registry::default();
+        registry.register(Arc::new(BashHook)).unwrap();
+        let (sender, mut receiver) = mpsc::channel(4);
+        let host = Arc::new(QueueMessageHost {
+            inputs: sender,
+            cancellation: CancellationToken::new(),
+        });
+        let event = pi_rs::UserBashEvent {
+            command: "echo hi".into(),
+            exclude_from_context: false,
+            cwd: "/".into(),
+        };
+        let states = pi_rs::ExtensionStates::new();
+        let cancel = CancellationToken::new();
+        let mut session = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let operation = registry.prepare_user_bash_with_host(&event, &states, &cancel, host);
+        let owner = async {
+            receiver
+                .recv()
+                .await
+                .unwrap()
+                .apply(&mut session, &mut |_| {})
+                .unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(operation, owner)
+        })
+        .await
+        .unwrap();
+        assert!(result.unwrap().is_none());
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert!(restored.pending_custom_trigger().is_some());
+        assert_eq!(
+            restored.queued_custom_messages()[0].1.message.content,
+            pi_rs::ContextContent::Text("from shell".into())
+        );
+    }
 }

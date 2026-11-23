@@ -159,7 +159,7 @@ async fn tool_block_survives_process_kill_and_fails_closed() {
         .find(|(i, _)| matches!(c.messages.get(**i), Some(Message::Tool { .. })))
         .unwrap();
     assert!(
-        matches!(&c.messages[*index], Message::Tool { call_id, content } if call_id == "c" && content.is_empty())
+        matches!(&c.messages[*index], Message::Tool { call_id, content, .. } if call_id == "c" && content.is_empty())
     );
     assert_eq!(
         binding.blocks,

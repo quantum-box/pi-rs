@@ -21,7 +21,15 @@ fn home() -> Option<std::ffi::OsString> {
     home
 }
 
-fn input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
+pub(super) fn input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
+    input_with_policy(value, home, false)
+}
+
+pub(super) fn remote_input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
+    input_with_policy(value, home, true)
+}
+
+fn input_with_policy(value: &str, home: Option<&Path>, remote: bool) -> Result<PathBuf> {
     let value: String = value
         .chars()
         .map(|ch| match ch {
@@ -29,10 +37,14 @@ fn input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
             ch => ch,
         })
         .collect();
-    plain_input(value.strip_prefix('@').unwrap_or(&value), home)
+    plain_input_with_policy(value.strip_prefix('@').unwrap_or(&value), home, remote)
 }
 
 fn plain_input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
+    plain_input_with_policy(value, home, false)
+}
+
+fn plain_input_with_policy(value: &str, home: Option<&Path>, remote: bool) -> Result<PathBuf> {
     #[cfg(windows)]
     let windows_value = windows_shell_path(value);
     #[cfg(windows)]
@@ -42,16 +54,25 @@ fn plain_input(value: &str, home: Option<&Path>) -> Result<PathBuf> {
         return Ok(if value == "~" {
             home.to_path_buf()
         } else {
-            home.join(&value[2..])
+            let tail = Path::new(&value[2..]);
+            if remote
+                && (tail.has_root()
+                    || matches!(tail.components().next(), Some(Component::Prefix(_))))
+            {
+                return Err(Error::Config("invalid backend home-relative path".into()));
+            }
+            home.join(tail)
         });
     }
     if value.starts_with("file://") {
-        return reqwest::Url::parse(value)
-            .map_err(|error| Error::Config(error.to_string()))?
-            .to_file_path()
-            .map_err(|_| Error::Config("invalid file URL".into()));
+        return pi_rs_file_url::to_file_path(value).map_err(Error::Config);
     }
     Ok(PathBuf::from(value))
+}
+
+#[cfg(test)]
+fn validate_file_url_path(path: &str, windows: bool) -> Result<()> {
+    pi_rs_file_url::validate_path(path, windows).map_err(Error::Config)
 }
 
 pub(super) fn resolve(root: &Path, input: &Path) -> PathBuf {
@@ -73,14 +94,25 @@ pub(super) fn resolve(root: &Path, input: &Path) -> PathBuf {
     resolved
 }
 
-pub(super) fn read_variant(path: PathBuf) -> PathBuf {
-    if path.exists() {
-        return path;
+pub(super) fn resolve_remote(root: &Path, input: &Path) -> Result<PathBuf> {
+    if !input.is_absolute() && matches!(input.components().next(), Some(Component::Prefix(_))) {
+        return Err(Error::Config(
+            "drive-relative backend path is not supported".into(),
+        ));
     }
+    let path = resolve(root, input);
+    if !path.is_absolute() {
+        return Err(Error::Config("backend path must be absolute".into()));
+    }
+    Ok(path)
+}
+
+pub(super) fn read_candidates(path: &Path) -> Vec<PathBuf> {
     let value = path.to_string_lossy();
     static AM_PM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let am_pm = AM_PM.get_or_init(|| regex::Regex::new(r" (?i:(AM|PM))\.").expect("AM/PM pattern"));
     let decomposed: String = value.nfd().collect();
+    let mut candidates = vec![path.to_owned()];
     for candidate in [
         am_pm.replace_all(&value, "\u{202f}$1.").into_owned(),
         decomposed.clone(),
@@ -88,22 +120,37 @@ pub(super) fn read_variant(path: PathBuf) -> PathBuf {
         decomposed.replace('\'', "\u{2019}"),
     ] {
         let candidate = PathBuf::from(candidate);
-        if candidate.exists() {
-            return candidate;
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
         }
     }
-    path
+    candidates
+}
+
+pub(super) fn read_variant(path: PathBuf) -> PathBuf {
+    read_candidates(&path)
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .unwrap_or(path)
 }
 
 #[cfg(any(windows, test))]
-fn windows_shell_path(value: &str) -> String {
-    if !value.starts_with('/') || value.starts_with("//") || value.contains('\\') {
+pub fn windows_shell_path(value: &str) -> String {
+    if !value.starts_with('/')
+        || value.starts_with("//")
+        || value.contains(['\\', '\n', '\r', '\u{2028}', '\u{2029}'])
+    {
         return value.into();
     }
-    let drive = value
-        .strip_prefix("/mnt/")
-        .or_else(|| value.strip_prefix("/cygdrive/"))
-        .unwrap_or(&value[1..]);
+    let path = &value[1..];
+    let drive = ["mnt/", "cygdrive/"]
+        .into_iter()
+        .find_map(|prefix| {
+            path.get(..prefix.len())
+                .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+                .map(|_| &path[prefix.len()..])
+        })
+        .unwrap_or(path);
     let bytes = drive.as_bytes();
     if bytes.first().is_some_and(u8::is_ascii_alphabetic)
         && (bytes.len() == 1 || bytes.get(1) == Some(&b'/'))
@@ -120,6 +167,66 @@ fn windows_shell_path(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_url_validation_matches_node_separator_and_utf8_rules() {
+        let message = |path: &str, windows: bool| match validate_file_url_path(path, windows) {
+            Err(Error::Config(message)) => message,
+            result => panic!("expected invalid URL path, got {result:?}"),
+        };
+        for path in ["/tmp/a%2Fb", "/tmp/a%2fb", "/tmp/%zz%2F"] {
+            assert_eq!(
+                message(path, false),
+                "File URL path must not include encoded / characters"
+            );
+            assert_eq!(
+                message(path, true),
+                "File URL path must not include encoded \\ or / characters"
+            );
+        }
+        assert!(validate_file_url_path("/tmp/a%5Cb", false).is_ok());
+        assert_eq!(
+            message("/tmp/a%5Cb", true),
+            "File URL path must not include encoded \\ or / characters"
+        );
+        for path in ["/tmp/%zz", "/tmp/%", "/tmp/%FF", "/tmp/%C3%28"] {
+            assert_eq!(message(path, false), "URI malformed");
+        }
+        assert!(validate_file_url_path("/tmp/a%20b/%E6%97%A5", false).is_ok());
+        assert!(validate_file_url_path("/tmp/a%252Fb", false).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_url_decodes_idn_unc_host() {
+        assert_eq!(
+            input("file://xn--n3h/share/a%20b", None).unwrap(),
+            PathBuf::from(r"\\☃\share\a b")
+        );
+        assert_eq!(
+            input("file:///C:/hello", None).unwrap(),
+            PathBuf::from(r"C:\hello")
+        );
+    }
+
+    #[test]
+    fn file_urls_reject_encoded_separator_before_filesystem_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("folder").join("note.txt");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, "contents").unwrap();
+        let file_url = reqwest::Url::from_file_path(&nested).unwrap().to_string();
+        let escaped = file_url.replace("folder/note.txt", "folder%2Fnote.txt");
+        assert_ne!(escaped, file_url);
+        assert!(
+            matches!(input(&escaped, None), Err(Error::Config(message)) if message.contains("encoded"))
+        );
+        assert_eq!(input(&file_url, None).unwrap(), nested);
+        assert_eq!(
+            input(&format!("{file_url}?ignored=%2F#%FF"), None).unwrap(),
+            nested
+        );
+    }
 
     #[test]
     fn normalizes_mentions_spaces_home_and_file_urls_without_trimming() {
@@ -164,14 +271,37 @@ mod tests {
         for (input, expected) in [
             ("/c/Users/name", "C:\\Users\\name"),
             ("/mnt/d/file", "D:\\file"),
+            ("/MNT/c/Work/a", "C:\\Work\\a"),
+            ("/MNT/z", "Z:\\"),
             ("/cygdrive/e/folder/file", "E:\\folder\\file"),
+            ("/CyGdRiVe/d/file", "D:\\file"),
             ("/c", "C:\\"),
             ("//host/share", "//host/share"),
             ("/usr/share", "/usr/share"),
+            ("/mnt/case/foo", "/mnt/case/foo"),
+            ("/MNT/c/a\\b", "/MNT/c/a\\b"),
+            ("/MNT/c/a\nb", "/MNT/c/a\nb"),
+            ("/MNT/c/a\rb", "/MNT/c/a\rb"),
+            ("/CyGdRiVe/d/a\u{2028}b", "/CyGdRiVe/d/a\u{2028}b"),
+            ("/CyGdRiVe/d/a\u{2029}b", "/CyGdRiVe/d/a\u{2029}b"),
+            ("/é/c", "/é/c"),
             ("/c/mixed\\path", "/c/mixed\\path"),
         ] {
             assert_eq!(windows_shell_path(input), expected);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_tool_input_normalizes_mixed_case_shell_prefixes() {
+        assert_eq!(
+            input("@/MnT/c/notes\u{202f}file.txt", None).unwrap(),
+            Path::new("C:\\notes file.txt")
+        );
+        assert_eq!(
+            input("/CYGDRIVE/d/notes.txt", None).unwrap(),
+            Path::new("D:\\notes.txt")
+        );
     }
 
     #[test]

@@ -676,10 +676,14 @@ mod tests {
             user("old"),
             assistant(vec![call("a"), call("b")]),
             Message::Tool {
+                is_error: false,
+                is_structured: None,
                 call_id: "b".into(),
                 content: "B".into(),
             },
             Message::Tool {
+                is_error: false,
+                is_structured: None,
                 call_id: "a".into(),
                 content: "A".into(),
             },
@@ -707,6 +711,8 @@ mod tests {
         let r = p.finish(completed("checkpoint")).unwrap();
         let mut current = h.clone();
         current.push(Message::Tool {
+            is_error: false,
+            is_structured: None,
             call_id: "c".into(),
             content: "C".into(),
         });
@@ -807,6 +813,8 @@ mod tests {
                 replay: None,
             },
             Message::Tool {
+                is_error: false,
+                is_structured: None,
                 call_id: "x".into(),
                 content: "result".into(),
             },
@@ -828,6 +836,8 @@ mod tests {
         );
         let text = serialize_summary_source(
             &[Message::Tool {
+                is_error: false,
+                is_structured: None,
                 call_id: "x".into(),
                 content: "a".repeat(2003),
             }],
@@ -853,6 +863,8 @@ mod tests {
     #[test]
     fn tool_block_summary_keeps_text_and_omits_images() {
         let messages = vec![Message::Tool {
+            is_error: false,
+            is_structured: None,
             call_id: "call".into(),
             content: String::new(),
         }];
@@ -885,6 +897,8 @@ mod tests {
         map.insert(0, binding);
         assert_eq!(serialize_summary_source(&messages, Some(&map)).unwrap(), "");
         let conflicting = vec![Message::Tool {
+            is_error: false,
+            is_structured: None,
             call_id: "call".into(),
             content: "hidden".into(),
         }];
@@ -922,6 +936,8 @@ mod tests {
         assert!(result.apply(&changed).is_err());
         let mut bad = h.clone();
         bad.push(Message::Tool {
+            is_error: false,
+            is_structured: None,
             call_id: "other".into(),
             content: "".into(),
         });

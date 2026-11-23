@@ -1,0 +1,7 @@
+# Injected model ls operations
+
+The independent `pi-rs-remote-ls` crate exposes `create_ls_tool` and `LsExtension` for hosts composing a tool set. Its backend supplies `exists`, `stat`, and `readdir` operations, enforces its own access policy, and stops work when an operation future is dropped. Entry names must be individual names, not paths; invalid names are rejected before entry-level stat calls. The host performs Pi-style case-insensitive locale ordering, directory suffixes, entry limits, bounded output formatting, and truncation metadata. Unstatable entries are skipped. The entry loop yields periodically even if backend stats complete immediately or fail. Cancellation returns promptly; a blocking sort already in progress runs to completion before its worker exits.
+
+`LsToolOptions::remote_home` explicitly configures an absolute backend home for `~`; the host home is never used. The factory uses unrestricted backend paths and does not claim a scoped workspace boundary. Like the pinned API, `readdir` returns a complete vector: the backend and sorting phase can allocate in proportion to directory size before display limits apply.
+
+This standalone crate does not modify `CodingTools`, #116 or #118. It is a root workspace crate covered by the standard native CI workflow. Shared infrastructure with remote find remains a follow-up. Hosts must compose tool sets explicitly and avoid duplicate `ls` tools. #116 must continue rejecting remote read combined with local search; remote grep and coherent full read-only tool-set configuration remain incomplete.

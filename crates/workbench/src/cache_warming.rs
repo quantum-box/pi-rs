@@ -35,17 +35,23 @@ enum Mode {
 
 impl Mode {
     fn from_settings(settings: &super::config::Settings) -> Self {
-        match settings.string("cacheWarming") {
-            Some("off") => Self::Off,
-            Some("idle") => Self::Idle,
-            _ => Self::Streaming,
+        match settings.cache_warming_mode() {
+            "off" => Self::Off,
+            "streaming" => Self::Streaming,
+            _ => Self::Idle,
         }
     }
 
     fn load(workspace: &Path) -> Option<Self> {
         super::config::Settings::load(workspace, false)
             .ok()
-            .map(|settings| Self::from_settings(&settings))
+            .and_then(|settings| Self::from_loaded(&settings))
+    }
+    fn from_loaded(settings: &super::config::Settings) -> Option<Self> {
+        settings
+            .diagnostics()
+            .is_empty()
+            .then(|| Self::from_settings(settings))
     }
 }
 
@@ -168,7 +174,15 @@ impl Policy {
                 .chat_cache_support(&args.provider, &args.model, Some(&model))
                 .ok_or("request disabled prompt caching")?,
             Adapter::PiMessages => true,
-            Adapter::Google | Adapter::OpenAiResponses => return Err("cache lifetime unavailable"),
+            Adapter::Google
+            | Adapter::GoogleVertex
+            | Adapter::Bedrock
+            | Adapter::OpenAiResponses
+            | Adapter::AzureResponses
+            | Adapter::CodexResponses
+            | Adapter::MistralConversations => {
+                return Err("cache lifetime unavailable");
+            }
         };
         let retention = super::providers::cache_retention(long_supported);
         let ttl = model
@@ -248,6 +262,15 @@ impl Policy {
     }
 }
 
+fn cache_warming_model(args: &Cli) -> pi_rs::Result<WorkbenchModel> {
+    let mut replay = args.clone();
+    replay.settings.disable_provider_retries();
+    let mut model =
+        runtime::model_client(&replay, super::thinking::reported(args).is_some(), false)?;
+    model.client = model.client.without_message_thread_continuation();
+    Ok(model)
+}
+
 impl<'a> Capture<'a> {
     pub fn new(args: &'a Cli, prompt: bool, controller: Controller) -> Self {
         let policy = if prompt {
@@ -255,11 +278,11 @@ impl<'a> Capture<'a> {
         } else {
             Err("waiting for first request")
         };
-        let model = policy.as_ref().ok().and_then(|_| {
-            runtime::model_client(args, super::thinking::reported(args).is_some(), false)
-                .ok()
-                .map(Arc::new)
-        });
+        let model = policy
+            .as_ref()
+            .ok()
+            .and_then(|_| cache_warming_model(args).ok())
+            .map(Arc::new);
         Self {
             args,
             controller,
@@ -302,6 +325,12 @@ impl<'a> Capture<'a> {
         match event {
             Notification::SummaryRequest => self.summary = true,
             Notification::Committed(record) => match &record.event {
+                Event::ModelSelected { .. } if record.run_id.is_some() => {
+                    // A live change can alter the provider, credentials or
+                    // request options. The capture was built for the old route.
+                    self.cancel("model selection changed");
+                    self.enabled = false;
+                }
                 Event::ModelRequested { request_id, .. } => {
                     self.cancel("conversation context changed");
                     self.request_id = *request_id;
@@ -396,6 +425,7 @@ impl<'a> Capture<'a> {
             },
             request,
             model: model.clone(),
+            mode: Mode::load,
             registry: self.registry.clone(),
             policy: policy.clone(),
             context,
@@ -538,7 +568,8 @@ struct Candidate {
     session: Uuid,
     identity: ResolvedModelIdentity,
     request: ModelRequest,
-    model: Arc<WorkbenchModel>,
+    model: Arc<dyn Model>,
+    mode: fn(&Path) -> Option<Mode>,
     registry: Option<Arc<Registry>>,
     policy: Arc<Policy>,
     context: Arc<Mutex<Context>>,
@@ -546,12 +577,12 @@ struct Candidate {
 }
 
 impl Candidate {
-    fn schedule(self, next: Instant) -> Option<Task> {
+    fn prepare_schedule(&self, next: Instant) -> bool {
         {
             let mut context = self.context.lock().expect("cache context");
             if next > context.started + context.scope.max_age() {
                 status::stopped(&self.path, context.scope.age_reason(), None);
-                return None;
+                return false;
             }
             context.next = next;
             context.refreshing = None;
@@ -561,6 +592,13 @@ impl Candidate {
                 self.policy.decision(context.scope, context.prompt_tokens),
                 context.scope.head(),
             );
+        }
+        true
+    }
+
+    fn schedule(self, next: Instant) -> Option<Task> {
+        if !self.prepare_schedule(next) {
+            return None;
         }
         Some(Box::pin(async move {
             sleep_until(next).await;
@@ -573,6 +611,7 @@ impl Candidate {
                 Err(reason) => return stop(reason, None),
             };
             let states = self.registry.as_ref().map(|_| snapshot.extension_states());
+            let external_id = snapshot.external_session_id();
             drop(snapshot);
             let mut decision = self.policy.decision(scope, prompt_tokens);
             let suggested = decision.action;
@@ -631,7 +670,15 @@ impl Candidate {
                 context.scope.head()
             };
             status::publish(&self.path, status::State::Refreshing { decision, head });
-            let Ok(Some((usage, metadata))) = timeout(self.timeout, self.refresh()).await else {
+            let result = timeout(self.timeout, self.refresh(&external_id)).await;
+            if result.is_err() {
+                // Dropping the local request does not prove that the provider
+                // stopped processing it. Do not overlap it with a retry.
+                return stop("cache refresh timed out", Some(decision));
+            }
+            let Some((usage, metadata)) = result.expect("checked refresh timeout") else {
+                // Adapter errors include broken streams and HTTP idle
+                // timeouts, which cannot establish provider settlement.
                 return stop("cache refresh failed", Some(decision));
             };
             Some(Receipt {
@@ -661,7 +708,7 @@ impl Candidate {
         if Instant::now() > deadline {
             return Err("cache refresh deadline missed");
         }
-        let mode = Mode::load(&self.workspace).ok_or("cache warming settings unavailable")?;
+        let mode = (self.mode)(&self.workspace).ok_or("cache warming settings unavailable")?;
         if !scope.allowed(mode) {
             return Err(if mode == Mode::Off {
                 "cache warming disabled"
@@ -677,10 +724,15 @@ impl Candidate {
         Ok((scope, prompt_tokens, deadline, snapshot))
     }
 
-    async fn refresh(&self) -> Option<(Usage, ModelMetadata)> {
+    async fn refresh(&self, external_id: &str) -> Option<(Usage, ModelMetadata)> {
         let mut stream = self
             .model
-            .stream_in_session(Uuid::new_v4(), self.session, self.request.clone())
+            .stream_in_session_with_identity(
+                Uuid::new_v4(),
+                self.session,
+                external_id,
+                self.request.clone(),
+            )
             .await
             .ok()?;
         let mut metadata = ModelMetadata::default();
@@ -737,7 +789,6 @@ impl Receipt {
             status::stopped(path, "conversation context changed", None);
             return;
         }
-        let cache_hit = self.metadata.cached_input_tokens.unwrap_or_default() > 0;
         let Ok(Some(record)) = session.record_cache_warm_with_note(
             self.candidate.session,
             head,
@@ -754,16 +805,8 @@ impl Receipt {
         };
         self.candidate.context.lock().expect("cache context").scope = Scope::Idle(record.id);
         observe(record);
-        if cache_hit {
-            let next = self.requested_at + self.candidate.policy.delay;
-            controller.set(self.candidate.schedule(next));
-        } else {
-            status::stopped(
-                &self.candidate.path,
-                "refresh missed the cache",
-                Some(self.decision),
-            );
-        }
+        let next = self.requested_at + self.candidate.policy.delay;
+        controller.set(self.candidate.schedule(next));
     }
 
     pub fn account(self, controller: &Controller) -> Option<AgentInput> {
@@ -771,7 +814,6 @@ impl Receipt {
         let Scope::Streaming(request_id) = scope else {
             return None;
         };
-        let cache_hit = self.metadata.cached_input_tokens.unwrap_or_default() > 0;
         let input = AgentInput::CacheWarm {
             session_id: self.candidate.session,
             request_id,
@@ -779,16 +821,415 @@ impl Receipt {
             metadata: Box::new(self.metadata),
             note: self.note,
         };
-        if cache_hit {
-            let next = self.requested_at + self.candidate.policy.delay;
-            controller.set(self.candidate.schedule(next));
-        } else {
-            status::stopped(
-                &self.candidate.path,
-                "refresh missed the cache",
-                Some(self.decision),
-            );
-        }
+        let next = self.requested_at + self.candidate.policy.delay;
+        controller.set(self.candidate.schedule(next));
         Some(input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pi_rs::ModelStream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn broken_settings_do_not_enable_cache_warming() {
+        let settings: super::super::config::Settings = serde_json::from_value(serde_json::json!({
+            "value":{}, "resource_layers":[], "diagnostics":["invalid settings"],
+            "live_auto_retry":null, "live_auto_compaction":null
+        }))
+        .unwrap();
+        assert!(Mode::from_loaded(&settings).is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_warming_disables_provider_retries_for_its_request_only() {
+        use clap::Parser;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, body) = loop {
+                let (socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("the cache refresh never reached its endpoint")
+                    .unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                let path = line.clone();
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                if path.starts_with("GET /v1/models/") {
+                    socket.get_mut().write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
+                assert!(path.starts_with("POST /v1/messages "), "{path:?}");
+                break (socket, body);
+            };
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["max_tokens"], 1);
+            socket
+                .get_mut()
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After-Ms: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            drop(socket);
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_err()
+        });
+        let endpoint = format!("http://{address}/v1/messages");
+        let mut args = Cli::parse_from([
+            "pi",
+            "--offline",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-opus-4-8",
+            "--endpoint",
+            &endpoint,
+            "--api-key",
+            "fixture",
+        ]);
+        args.provider = crate::providers::Provider::Anthropic;
+        args.endpoint_explicit = true;
+        args.initial_connection = Some((args.provider.clone(), endpoint));
+        args.settings = serde_json::from_value(serde_json::json!({
+            "value":{"retry":{"provider":{"maxRetries":2,"timeoutMs":1000}}},
+            "resource_layers":[], "diagnostics":[],
+            "live_auto_retry":null, "live_auto_compaction":null
+        }))
+        .unwrap();
+        let model = cache_warming_model(&args).unwrap();
+        let request = ModelRequest {
+            model: args.model.clone(),
+            messages: vec![pi_rs::Message::User {
+                content: "hello".into(),
+            }],
+            tools: Vec::new(),
+            max_output_tokens: 1,
+        };
+
+        assert!(
+            model
+                .stream_in_session_with_identity(Uuid::new_v4(), Uuid::new_v4(), "fixture", request)
+                .await
+                .is_err()
+        );
+        assert!(
+            server.await.unwrap(),
+            "cache warming retried an HTTP failure"
+        );
+        assert_eq!(args.settings.provider_retry().max_retries, 2);
+        assert_eq!(
+            args.settings.provider_retry().timeout,
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    struct FlakyRefresh {
+        attempts: AtomicUsize,
+        retry_started: tokio::sync::Notify,
+        release_retry: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for FlakyRefresh {
+        async fn stream(&self, request: ModelRequest) -> pi_rs::Result<ModelStream> {
+            assert_eq!(request.max_output_tokens, 1);
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                self.retry_started.notify_one();
+                self.release_retry.notified().await;
+            }
+            let metadata = ModelMetadata {
+                cached_input_tokens: Some(if attempt == 0 { 0 } else { 1_000_000 }),
+                ..Default::default()
+            };
+            Ok(Box::pin(futures_util::stream::iter([
+                Ok(ModelEvent::Metadata(metadata)),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(Usage {
+                        input_tokens: 1_000_000,
+                        output_tokens: 1,
+                    }),
+                }),
+            ])))
+        }
+    }
+
+    fn idle_mode(_: &Path) -> Option<Mode> {
+        Some(Mode::Idle)
+    }
+
+    struct DelayedRefresh {
+        attempts: AtomicUsize,
+        fail_early: bool,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        settled: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl Model for DelayedRefresh {
+        async fn stream(&self, _: ModelRequest) -> pi_rs::Result<ModelStream> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            let settled = self.settled.clone();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                entered.notify_one();
+                release.notified().await;
+                settled.notify_one();
+                let _ = sender.send(());
+            });
+            if self.fail_early {
+                return Err(pi_rs::Error::RetryableModel("HTTP idle timeout".into()));
+            }
+            let _ = receiver.await;
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_refresh_does_not_retry_while_provider_is_unsettled() {
+        for fail_early in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("session.jsonl");
+            let session = Session::open(&path).unwrap();
+            let (id, head) = (session.session_id(), session.head());
+            drop(session);
+            let model = Arc::new(DelayedRefresh {
+                attempts: AtomicUsize::new(0),
+                fail_early,
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+                settled: Arc::new(tokio::sync::Notify::new()),
+            });
+            let now = Instant::now();
+            let candidate = Candidate {
+            path: path.clone(), workspace: root.path().to_owned(), session: id,
+            identity: ResolvedModelIdentity { provider: "fixture".into(), model: "model".into() },
+            request: ModelRequest { model: "model".into(), messages: vec![], tools: vec![], max_output_tokens: 1 },
+            model: model.clone(), mode: idle_mode, registry: None,
+            policy: Arc::new(Policy { delay: Duration::from_millis(20), late_margin: Duration::from_secs(1), retention: CacheRetention::Short,
+                price: Some(serde_json::from_value(serde_json::json!({"input":10.0,"output":1.0,"cacheRead":1.0,"cacheWrite":20.0})).unwrap()) }),
+            context: Arc::new(Mutex::new(Context { scope: Scope::Idle(head), prompt_tokens: 1_000_000, started: now, next: now, refreshing: None })),
+            timeout: Duration::from_millis(40),
+        };
+            let controller = Controller::default();
+            controller.set(candidate.schedule(now));
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(controller.wait(), model.entered.notified())
+            })
+            .await
+            .unwrap();
+            assert!(result.is_none());
+            assert!(!controller.has_task());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), controller.wait())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(model.attempts.load(Ordering::SeqCst), 1);
+            assert!(
+                !Session::snapshot(&path)
+                    .unwrap()
+                    .records()
+                    .iter()
+                    .any(|r| matches!(r.event, Event::CacheWarm { .. }))
+            );
+            model.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), model.settled.notified())
+                .await
+                .unwrap();
+            assert_eq!(model.attempts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_miss_reschedules_without_double_accounting() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let session = Session::open(&path).unwrap();
+        let id = session.session_id();
+        let head = session.head();
+        drop(session);
+        let model = Arc::new(FlakyRefresh {
+            attempts: AtomicUsize::new(0),
+            retry_started: tokio::sync::Notify::new(),
+            release_retry: tokio::sync::Notify::new(),
+        });
+        let policy = Arc::new(Policy {
+            delay: Duration::from_millis(25), late_margin: Duration::from_secs(1),
+            retention: CacheRetention::Short,
+            price: Some(serde_json::from_value(serde_json::json!({"input":10.0,"output":1.0,"cacheRead":1.0,"cacheWrite":20.0})).unwrap()),
+        });
+        let now = Instant::now();
+        let candidate = Candidate {
+            path: path.clone(),
+            workspace: root.path().to_owned(),
+            session: id,
+            identity: ResolvedModelIdentity {
+                provider: "fixture".into(),
+                model: "model".into(),
+            },
+            request: ModelRequest {
+                model: "model".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 1,
+            },
+            model: model.clone(),
+            mode: idle_mode,
+            registry: None,
+            policy,
+            context: Arc::new(Mutex::new(Context {
+                scope: Scope::Idle(head),
+                prompt_tokens: 1_000_000,
+                started: now,
+                next: now,
+                refreshing: None,
+            })),
+            timeout: Duration::from_secs(2),
+        };
+        let controller = Controller::default();
+        controller.set(candidate.schedule(now));
+        let (receipt, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(controller.wait(), async {
+                model.retry_started.notified().await;
+                assert_eq!(model.attempts.load(Ordering::SeqCst), 1);
+                assert!(
+                    !Session::snapshot(&path)
+                        .unwrap()
+                        .records()
+                        .iter()
+                        .any(|r| matches!(r.event, Event::CacheWarm { .. }))
+                );
+                // The provider completes after the refresh interval has elapsed.
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                model.release_retry.notify_one();
+            })
+        })
+        .await
+        .unwrap();
+        let receipt = receipt.unwrap();
+        let next_from_start = receipt.requested_at + receipt.candidate.policy.delay;
+        let context = receipt.candidate.context.clone();
+        assert!(Instant::now() >= next_from_start);
+        receipt.persist(&path, &controller, |_| {});
+        assert_eq!(context.lock().unwrap().next, next_from_start);
+        let receipt = tokio::time::timeout(Duration::from_secs(2), controller.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        receipt.persist(&path, &controller, |_| {});
+        assert_eq!(model.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            Session::snapshot(&path)
+                .unwrap()
+                .records()
+                .iter()
+                .filter(|r| matches!(r.event, Event::CacheWarm { .. }))
+                .count(),
+            2
+        );
+        let mut changed = Session::open(&path).unwrap();
+        changed
+            .append_user_with_images("new context".into(), vec![], None)
+            .unwrap();
+        drop(changed);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), controller.wait())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(model.attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn streaming_cache_miss_is_accounted_and_rescheduled() {
+        let root = tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let request_id = Uuid::new_v4();
+        let candidate = Candidate {
+            path: root.path().join("session.jsonl"),
+            workspace: root.path().to_owned(),
+            session: Uuid::new_v4(),
+            identity: ResolvedModelIdentity {
+                provider: "fixture".into(),
+                model: "model".into(),
+            },
+            request: ModelRequest {
+                model: "model".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 1,
+            },
+            model: Arc::new(FlakyRefresh {
+                attempts: AtomicUsize::new(0),
+                retry_started: tokio::sync::Notify::new(),
+                release_retry: tokio::sync::Notify::new(),
+            }),
+            mode: idle_mode,
+            registry: None,
+            policy: Arc::new(Policy {
+                delay: Duration::from_secs(1),
+                late_margin: Duration::from_secs(1),
+                retention: CacheRetention::Short,
+                price: None,
+            }),
+            context: Arc::new(Mutex::new(Context {
+                scope: Scope::Streaming(request_id),
+                prompt_tokens: 0,
+                started: now,
+                next: now,
+                refreshing: None,
+            })),
+            timeout: Duration::from_secs(1),
+        };
+        let receipt = Receipt {
+            candidate,
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 1,
+            },
+            metadata: ModelMetadata::default(),
+            requested_at: now - Duration::from_secs(2),
+            note: None,
+            decision: status::Decision {
+                phase: CacheWarmingPhase::Streaming,
+                warm_cost: 0.0,
+                miss_cost: 0.0,
+                probability: 1.0,
+                available: false,
+                action: CacheWarmingAction::Warm,
+                overridden: true,
+            },
+        };
+        let context = receipt.candidate.context.clone();
+        let expected_next = receipt.requested_at + receipt.candidate.policy.delay;
+        let controller = Controller::default();
+        assert!(
+            matches!(receipt.account(&controller), Some(AgentInput::CacheWarm { request_id: id, .. }) if id == request_id)
+        );
+        assert!(controller.has_task());
+        assert_eq!(context.lock().unwrap().next, expected_next);
     }
 }

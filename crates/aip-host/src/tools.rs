@@ -228,7 +228,8 @@ pub async fn reconcile(
     let Some(
         outcome @ (Outcome::Succeeded(_)
         | Outcome::SucceededWithDetails { .. }
-        | Outcome::Failed(_)),
+        | Outcome::Failed(_)
+        | Outcome::TextResult { .. }),
     ) = port.inspect(scope, operation_id, reference).await?
     else {
         return Ok(false);

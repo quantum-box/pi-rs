@@ -9,6 +9,1022 @@ use pi_rs::{
 };
 use serde_json::{Value, json};
 
+#[tokio::test]
+async fn mcp_login_timeout_bounds_discovery_and_preserves_configuration() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let config = json!({"mcpServers":{"fixture":{"url":server}}}).to_string();
+    std::fs::write(root.path().join("mcp.json"), &config).unwrap();
+    let directory = root.path().join("mcp-auth");
+    std::fs::create_dir_all(&directory).unwrap();
+    let digest = Sha256::digest(serde_json::to_vec(&("fixture", &server)).unwrap());
+    let credential = directory.join(format!("{digest:x}.json"));
+    std::fs::write(&credential, "existing credentials").unwrap();
+    let run = |timeout: &str| {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .stderr(Stdio::piped())
+            .args(["mcp", "login", "fixture", "--timeout", timeout]);
+        command
+    };
+    for invalid in ["0", "-1", "NaN", "inf"] {
+        let output = run(invalid).output().await.unwrap();
+        assert!(!output.status.success(), "accepted {invalid}");
+    }
+    let child = run("2").kill_on_drop(true).spawn().unwrap();
+    let (_socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("MCP login timed out"));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("mcp.json")).unwrap(),
+        config
+    );
+    assert_eq!(
+        std::fs::read_to_string(credential).unwrap(),
+        "existing credentials"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_login_sigint_cancels_discovery() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = json!({"mcpServers":{"fixture":{"url":format!("http://{}/mcp", listener.local_addr().unwrap())}}}).to_string();
+    std::fs::write(root.path().join("mcp.json"), &config).unwrap();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args(["mcp", "login", "fixture", "--timeout", "60"])
+        .kill_on_drop(true);
+    let child = command.spawn().unwrap();
+    let (_socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) }, 0);
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(130));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("mcp.json")).unwrap(),
+        config
+    );
+    assert!(!root.path().join("mcp-auth").exists());
+}
+
+#[test]
+fn mcp_add_persists_oauth_client_options() {
+    let root = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = run(&[
+        "mcp",
+        "add",
+        "remote",
+        "--url",
+        "https://example.com/mcp",
+        "--oauth-client-id",
+        "client",
+        "--oauth-client-secret",
+        "${CLIENT_SECRET}",
+        "--oauth-callback-port",
+        "12345",
+        "--oauth-client-name",
+        "client name",
+        "--oauth-client-registration",
+        "dcr",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let path = root.path().join("mcp.json");
+    let config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        config["mcpServers"]["remote"]["oauth"],
+        json!({"clientId":"client","clientSecret":"${CLIENT_SECRET}","callbackPort":12345,"clientName":"client name","clientRegistration":"dcr"})
+    );
+    for args in [
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--oauth-client-id",
+            "client",
+            "--",
+            "server",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-secret",
+            "secret",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--oauth-client-registration",
+            "cimd",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-callback-port",
+            "0",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--bearer-token-env-var",
+            "TOKEN",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "client",
+            "--header",
+            "authorization=Bearer token",
+        ],
+    ] {
+        assert!(!run(&args).status.success());
+    }
+    let after: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(after, config);
+}
+
+#[test]
+fn mcp_added_oauth_secret_reference_is_resolved_for_login() {
+    let root = tempfile::tempdir().unwrap();
+    let command = |args: &[&str], secret: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("PI_RS_TEST_MCP_SECRET")
+            .args(args);
+        if let Some(secret) = secret {
+            command.env("PI_RS_TEST_MCP_SECRET", secret);
+        }
+        command.output().unwrap()
+    };
+    let added = command(
+        &[
+            "mcp",
+            "add",
+            "fixture",
+            "--url",
+            "http://127.0.0.1:1/mcp",
+            "--oauth-client-id",
+            "client",
+            "--oauth-client-secret",
+            "${PI_RS_TEST_MCP_SECRET}",
+        ],
+        None,
+    );
+    assert!(added.status.success());
+    let path = root.path().join("mcp.json");
+    let before = std::fs::read(&path).unwrap();
+    let missing = command(&["mcp", "login", "fixture"], None);
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("missing environment variable PI_RS_TEST_MCP_SECRET")
+    );
+    let resolved = command(&["mcp", "login", "fixture"], Some("private-fixture-secret"));
+    assert!(!resolved.status.success());
+    assert!(!String::from_utf8_lossy(&resolved.stderr).contains("missing environment variable"));
+    assert!(!String::from_utf8_lossy(&resolved.stderr).contains("private-fixture-secret"));
+    assert!(!String::from_utf8_lossy(&resolved.stdout).contains("private-fixture-secret"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!String::from_utf8_lossy(&before).contains("private-fixture-secret"));
+}
+
+#[test]
+fn mcp_logout_local_targets_trusted_project_credentials() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join(".pi");
+    let auth = home.join("mcp-auth");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&auth).unwrap();
+    let global_url = "https://global.example/mcp";
+    let local_url = "https://local.example/mcp";
+    std::fs::write(
+        home.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":global_url},"global-only":{"url":global_url}}})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":local_url}}}).to_string(),
+    )
+    .unwrap();
+    let credential = |url| {
+        let digest = Sha256::digest(serde_json::to_vec(&("service", url)).unwrap());
+        auth.join(format!("{digest:x}.json"))
+    };
+    let global = credential(global_url);
+    let local = credential(local_url);
+    std::fs::write(&global, "global").unwrap();
+    std::fs::write(&local, "local").unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(
+        !run(&["--trust", "mcp", "logout", "global-only", "--local"])
+            .status
+            .success()
+    );
+    assert!(
+        !run(&["--no-trust", "mcp", "logout", "service", "--local"])
+            .status
+            .success()
+    );
+    assert!(global.exists() && local.exists());
+    let output = run(&["--trust", "mcp", "logout", "service", "-l"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(global.exists());
+    assert!(!local.exists());
+    std::fs::write(&local, "local").unwrap();
+    let output = run(&["--trust", "mcp", "logout", "service"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(global.exists());
+    assert!(!local.exists());
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"enabled":false}}}).to_string(),
+    )
+    .unwrap();
+    let output = run(&["--trust", "mcp", "logout", "service", "--local"]);
+    assert!(!output.status.success());
+    assert!(global.exists());
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"type":"sse","url":global_url}}}).to_string(),
+    )
+    .unwrap();
+    assert!(
+        !run(&["--trust", "mcp", "logout", "service", "--local"])
+            .status
+            .success()
+    );
+    assert!(global.exists());
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":global_url,"exposure":"typo"}}}).to_string(),
+    )
+    .unwrap();
+    assert!(
+        !run(&["--trust", "mcp", "logout", "service", "--local"])
+            .status
+            .success()
+    );
+    assert!(global.exists());
+    std::fs::write(home.join("mcp.json"), json!({"mcpServers":{"service":{"url":global_url,"enabled":null,"exposure":null,"oauth":null,"description":null,"timeout":null}}}).to_string()).unwrap();
+    for project_config in [
+        json!({"mcpServers":{}}),
+        json!({"mcpServers":{"service":{"enabled":true}}}),
+    ] {
+        std::fs::write(project.join("mcp.json"), project_config.to_string()).unwrap();
+        std::fs::write(&global, "global").unwrap();
+        let output = run(&["--trust", "mcp", "logout", "service"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!global.exists());
+    }
+    std::fs::write(home.join("mcp.json"), json!({"mcpServers":{"service":{"url":global_url,"oauth":{"callbackUrl":null,"callbackPort":null}}}}).to_string()).unwrap();
+    for project_config in [
+        json!({"mcpServers":{}}),
+        json!({"mcpServers":{"service":{"enabled":true}}}),
+    ] {
+        std::fs::write(project.join("mcp.json"), project_config.to_string()).unwrap();
+        std::fs::write(&global, "global").unwrap();
+        let output = run(&["--trust", "mcp", "logout", "service"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!global.exists());
+    }
+    std::fs::write(
+        home.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":global_url,"timeout":0}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"enabled":true}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(&global, "global").unwrap();
+    let output = run(&["--trust", "mcp", "logout", "service"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!global.exists());
+    std::fs::write(
+        project.join("mcp.json"),
+        json!({"mcpServers":{"service":{"url":global_url,"timeout":0.25}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(&global, "global").unwrap();
+    let output = run(&["--trust", "mcp", "logout", "service", "--local"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!global.exists());
+    std::fs::write(&global, "global").unwrap();
+    for invalid in [json!(null), json!(-0.25), json!("0.25")] {
+        std::fs::write(
+            project.join("mcp.json"),
+            json!({"mcpServers":{"service":{"url":global_url,"timeout":invalid}}}).to_string(),
+        )
+        .unwrap();
+        assert!(
+            !run(&["--trust", "mcp", "logout", "service", "--local"])
+                .status
+                .success()
+        );
+        assert!(global.exists());
+    }
+    std::fs::write(home.join("mcp.json"), json!({"mcpServers":{"service":{"url":global_url,"headers":{"authorization":"Bearer static"}}}}).to_string()).unwrap();
+    assert!(
+        !run(&["--no-trust", "mcp", "logout", "service"])
+            .status
+            .success()
+    );
+    assert!(global.exists());
+}
+
+#[test]
+fn mcp_add_saves_stdio_and_http_options() {
+    let root = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        vec![
+            "mcp",
+            "add",
+            "local",
+            "--cwd",
+            "subdir",
+            "--description",
+            "Local tools",
+            "--env",
+            "FIRST=one=two",
+            "--env",
+            "EMPTY=",
+            "--",
+            "server",
+            "--flag",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "X-First=one",
+            "--header",
+            "X-Second=two=three",
+            "--header",
+            "x-first=latest",
+            "--bearer-token-env-var",
+            "TOKEN",
+            "--description",
+            "Remote tools",
+        ],
+    ] {
+        let output = run(&args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(
+        config["mcpServers"]["local"],
+        json!({"command":"server", "args":["--flag"], "cwd":"subdir", "description":"Local tools", "env":{"FIRST":"one=two", "EMPTY":""}})
+    );
+    assert_eq!(
+        config["mcpServers"]["remote"]["headers"],
+        json!({"x-first":"latest", "x-second":"two=three", "Authorization":"Bearer ${TOKEN}"})
+    );
+    assert_eq!(
+        config["mcpServers"]["remote"]["description"],
+        "Remote tools"
+    );
+    for args in [
+        vec![
+            "mcp",
+            "add",
+            "bad",
+            "--url",
+            "https://example.com/mcp",
+            "--cwd",
+            "dir",
+        ],
+        vec!["mcp", "add", "bad", "--header", "X=1", "--", "server"],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--env",
+            "VAR=value",
+        ],
+        vec!["mcp", "add", "local", "--env", "=value", "--", "server"],
+        vec![
+            "mcp",
+            "add",
+            "local",
+            "--bearer-token-env-var",
+            "TOKEN",
+            "--",
+            "server",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "bad",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "bad",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "Bad Name=value",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "X-Test=bad\nvalue",
+        ],
+        vec![
+            "mcp",
+            "add",
+            "bad",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "authorization=secret",
+            "--bearer-token-env-var",
+            "TOKEN",
+        ],
+    ] {
+        assert!(!run(&args).status.success());
+    }
+    let after: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(after, config);
+}
+
+#[test]
+fn mcp_config_writes_validate_urls_and_report_the_removal_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("agent");
+    let global = home.join("mcp.json");
+    let project = root.path().join(".pi/mcp.json");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &[
+            "mcp",
+            "add",
+            "global",
+            "--url",
+            "https://example.invalid/mcp?tenant=fixture",
+        ][..],
+        &[
+            "mcp",
+            "add",
+            "local",
+            "--url",
+            "http://127.0.0.1:1/mcp",
+            "--local",
+        ][..],
+    ] {
+        let output = run(args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let old_global = std::fs::read(&global).unwrap();
+    let old_project = std::fs::read(&project).unwrap();
+    for url in [
+        "not a URL",
+        "ftp://example.invalid/mcp",
+        "http://example.invalid/mcp",
+        "https://account:fixture-secret@example.invalid/mcp",
+    ] {
+        let result = run(&["mcp", "add", "global", "--url", url]);
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success());
+        assert!(error.contains("MCP URL"), "{error}");
+        assert!(!error.contains("fixture-secret"));
+    }
+    let result = run(&["mcp", "remove", "local"]);
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(
+        error.contains("No global MCP server named \"local\"") && error.contains("use --local"),
+        "{error}"
+    );
+    let result = run(&["mcp", "remove", "--local", "global"]);
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(
+        error.contains("No project MCP server named \"global\"") && error.contains("omit --local"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&global).unwrap(), old_global);
+    assert_eq!(std::fs::read(&project).unwrap(), old_project);
+    assert!(run(&["mcp", "remove", "--local", "local"]).status.success());
+    assert!(run(&["mcp", "remove", "global"]).status.success());
+}
+
+#[test]
+fn startup_fork_preserves_inert_sibling_history() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.jsonl");
+    let entries = [
+        json!({"type":"session","version":3,"id":"legacy"}),
+        json!({"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"root"}}),
+        json!({"type":"session_info","id":"n","parentId":"a","name":"shared name"}),
+        json!({"type":"message","id":"b","parentId":"n","message":{"role":"user","content":"sibling"}}),
+        json!({"type":"message","id":"c","parentId":"n","message":{"role":"user","content":"active"}}),
+    ];
+    let source_text = entries
+        .iter()
+        .map(|v| v.to_string() + "\n")
+        .collect::<String>();
+    std::fs::write(&source, &source_text).unwrap();
+    let sessions = root.path().join("sessions");
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args(["--offline", "--no-mcp", "--no-trust", "--session-dir"])
+        .arg(&sessions)
+        .arg("--fork")
+        .arg(&source)
+        .arg("--print")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), source_text);
+    let journals: Vec<_> = std::fs::read_dir(&sessions)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect();
+    assert_eq!(journals.len(), 1);
+    let destination = &journals[0];
+    let mut session = Session::open(destination).unwrap();
+    assert_ne!(session.external_session_id(), "legacy");
+    assert_eq!(session.parent_session(), Some(source.to_str().unwrap()));
+    assert_eq!(session.name(), Some("shared name"));
+    assert_eq!(
+        session
+            .records()
+            .iter()
+            .filter(|record| matches!(
+                &record.event,
+                pi_rs::Event::SessionInfo { name: Some(_), .. }
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        session
+            .current_messages()
+            .iter()
+            .any(|m| matches!(m, pi_rs::Message::User { content } if content == "active"))
+    );
+    let sibling = session
+        .records()
+        .iter()
+        .find(|record| {
+            matches!(&record.event,
+        pi_rs::Event::User { content, .. } if content == "sibling")
+        })
+        .unwrap()
+        .id;
+    session.checkout(sibling).unwrap();
+    assert!(
+        session
+            .current_messages()
+            .iter()
+            .any(|m| matches!(m, pi_rs::Message::User { content } if content == "sibling"))
+    );
+}
+
+#[test]
+fn repeated_session_id_selects_the_last_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args(["--offline", "--no-mcp", "--no-trust", "--session-dir"])
+        .arg(&sessions)
+        .args([
+            "--session-id",
+            "first",
+            "--session-id",
+            "last",
+            "name",
+            "selected",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!sessions.join("first.jsonl").exists());
+    assert!(sessions.join("last.jsonl").is_file());
+}
+
+#[test]
+fn jsonl_session_id_can_be_opened_by_session_and_resume() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let sessions = root.path().join("sessions");
+    let run = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args(["--offline", "--no-mcp", "--no-trust", "--session-dir"])
+            .arg(&sessions)
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let created = run(&["--session-id", "work.jsonl", "name", "existing-marker"]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert!(sessions.join("work.jsonl.jsonl").is_file());
+    for reference in [vec!["--session", "work.jsonl"], vec!["--resume=work.jsonl"]] {
+        let mut arguments = reference;
+        arguments.push("inspect");
+        let output = run(&arguments);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("existing-marker"));
+    }
+    assert!(!root.path().join("work.jsonl").exists());
+}
+
+#[test]
+fn missing_session_id_does_not_create_a_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args([
+            "--offline",
+            "--no-mcp",
+            "--no-trust",
+            "--session",
+            "missing-id",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("No session found matching 'missing-id'")
+    );
+    assert!(!root.path().join("missing-id").exists());
+}
+
+#[test]
+fn uninstall_alias_removes_packages_in_the_selected_scope() {
+    for command in ["remove", "uninstall"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join(".pi");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let source = "git:https://example.com/team/package.git";
+        let settings = json!({"packages": [source, "git:https://example.com/team/other.git"]});
+        for directory in [&home, &project] {
+            std::fs::write(directory.join("settings.json"), settings.to_string()).unwrap();
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .args([command, source, "--local"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let local: Value =
+            serde_json::from_slice(&std::fs::read(project.join("settings.json")).unwrap()).unwrap();
+        let global: Value =
+            serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(
+            local["packages"],
+            json!(["git:https://example.com/team/other.git"])
+        );
+        assert_eq!(global, settings);
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["type"], "package_removed");
+        assert_eq!(result["source"], source);
+    }
+}
+
+#[test]
+fn offline_package_update_is_a_noop_but_checks_requested_source() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let settings = home.join("settings.json");
+    let contents = json!({"packages": ["git:https://example.com/team/package.git"]}).to_string();
+    std::fs::write(&settings, &contents).unwrap();
+
+    for source in [None, Some("git:https://example.com/team/package.git")] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command.current_dir(root.path()).env("PI_RS_HOME", &home);
+        command.args(["--offline", "update"]);
+        if let Some(source) = source {
+            command.arg(source);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), contents);
+        assert!(!home.join("packages").exists());
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args([
+            "--offline",
+            "update",
+            "git:https://example.com/team/missing.git",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("package is not configured"));
+}
+
+#[test]
+fn explicit_prompt_directory_loads_immediate_files_in_rpc() {
+    let root = tempfile::tempdir().unwrap();
+    let prompts = root.path().join("custom");
+    std::fs::create_dir_all(prompts.join("nested")).unwrap();
+    std::fs::write(prompts.join("nested/deep.md"), "Nested").unwrap();
+    std::fs::write(prompts.join("top.md"), "Top level").unwrap();
+    std::fs::write(
+        prompts.join("unicode-space.md"),
+        "---\nother: value\n---\n\u{0085}\nvisible",
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("unicode-bom.md"),
+        "---\nother: value\n---\n\u{feff}\nvisible",
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("unicode-cut.md"),
+        format!("{}😀tail", "x".repeat(59)),
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("replacement-cut.md"),
+        format!("{}�tail", "x".repeat(59)),
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("replacement-before-cut.md"),
+        format!("{}�😀tail", "x".repeat(58)),
+    )
+    .unwrap();
+    std::fs::write(
+        prompts.join("two-boms.md"),
+        "\u{feff}\u{feff}---\ndescription: not frontmatter\n---\nbody",
+    )
+    .unwrap();
+    std::fs::write(prompts.join(".hidden.md"), "Hidden").unwrap();
+    std::fs::write(prompts.join("ignored.md"), "Ignored").unwrap();
+    std::fs::write(prompts.join(".gitignore"), "ignored.md\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("top.md", prompts.join("audit.md")).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-prompt-templates",
+            "--prompt-template",
+        ])
+        .arg(&prompts)
+        .args(["--mode", "rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            // serde_json rejects unpaired surrogate escapes; preserve the raw
+            // wire line for exact assertions and normalize only for inspection.
+            let normalized = line.replace("\\ud83d", "\\ufffd");
+            if sender
+                .send((line, serde_json::from_str::<Value>(&normalized).unwrap()))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(input, "{}", json!({"id":"commands", "type":"get_commands"})).unwrap();
+    input.flush().unwrap();
+    let (wire, response) = loop {
+        let (wire, event) = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+        if event["id"] == "commands" {
+            break (wire, event);
+        }
+    };
+    assert!(wire.contains(&format!("{}\\ud83d...", "x".repeat(59))));
+    assert!(wire.contains(&format!("{}�\\ud83d...", "x".repeat(58))));
+    assert!(wire.contains(&format!("{}�...", "x".repeat(59))));
+    assert!(!wire.contains("_pi_rs_prompt_surrogates"));
+    let commands = response["data"]["commands"]
+        .as_array()
+        .expect("command list");
+    for (name, expected) in [
+        ("unicode-space", "\u{0085}".to_owned()),
+        ("unicode-bom", "visible".to_owned()),
+        ("unicode-cut", format!("{}�...", "x".repeat(59))),
+        ("two-boms", "\u{feff}---".to_owned()),
+    ] {
+        let command = commands
+            .iter()
+            .find(|command| command["name"] == name)
+            .unwrap();
+        assert_eq!(command["description"], expected, "{name}");
+    }
+    let builtin = commands
+        .iter()
+        .find(|command| command["sourceInfo"]["path"] == "builtin:plan-mode")
+        .expect("builtin plan command provenance");
+    assert_eq!(builtin["sourceInfo"]["source"], "builtin");
+    assert_eq!(builtin["sourceInfo"]["scope"], "user");
+    for name in ["top", ".hidden", "ignored"] {
+        assert!(
+            commands
+                .iter()
+                .any(|command| command["name"] == name && command["source"] == "prompt"),
+            "{response}"
+        );
+    }
+    assert!(
+        !commands.iter().any(|command| command["name"] == "deep"),
+        "{response}"
+    );
+    #[cfg(unix)]
+    assert!(
+        commands
+            .iter()
+            .any(|command| command["name"] == "audit" && command["source"] == "prompt"),
+        "{response}"
+    );
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
 // Some hosted runners open idle connections to local listeners. Read each
 // connection independently so one idle peer cannot block the real request.
 fn accept_proxy_request(listener: TcpListener) -> (TcpStream, BufReader<TcpStream>, String) {
@@ -62,8 +1078,847 @@ fn openai_api_key_provider_streams_through_the_cli() {
 }
 
 #[test]
+fn meta_provider_streams_through_the_cli() {
+    responses_provider_streams_through_the_cli("meta");
+}
+
+#[test]
 fn xai_provider_streams_through_the_cli() {
     responses_provider_streams_through_the_cli("xai");
+}
+
+#[test]
+fn chat_completion_vllm_priority_respects_config_and_sampling_precedence() {
+    for (provider_compat, model_compat, override_compat, sampling, expected) in [
+        (
+            json!({"vllmPriority":7}),
+            json!({}),
+            json!({}),
+            json!({}),
+            json!(7),
+        ),
+        (
+            json!({"vllmPriority":7}),
+            json!({"vllmPriority":0}),
+            json!({}),
+            json!({}),
+            json!(0),
+        ),
+        (
+            json!({"vllmPriority":7}),
+            json!({"vllmPriority":2}),
+            json!({"vllmPriority":-3}),
+            json!({}),
+            json!(-3),
+        ),
+        (
+            json!({"vllmPriority":7}),
+            json!({}),
+            json!({}),
+            json!({"priority":4}),
+            json!(4),
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(
+            root.path().join("models.json"),
+            json!({"providers":{"relay":{
+                "baseUrl":base, "api":"openai-completions", "apiKey":"fixture",
+                "compat":provider_compat,
+                "models":[{"id":"fixture-model", "compat":model_compat, "samplingParams":sampling}],
+                "modelOverrides":{"fixture-model":{"compat":override_compat}}
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            assert!(first.starts_with("POST /v1/chat/completions "), "{first}");
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["priority"], expected);
+            let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--no-tools",
+                "--offline",
+                "--provider",
+                "relay",
+                "--model",
+                "fixture-model",
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn responses_model_sampling_uses_pi_thinking_level_and_overrides() {
+    for (level, temperature, top_k) in [("high", 0.2, 40), ("off", 0.7, 10)] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(root.path().join("models.json"), json!({"providers":{"openai":{
+            "baseUrl":base,
+            "models":[{"id":"fixture-model","reasoning":true,
+                "thinkingLevelMap":{"high":"strong"},
+                "samplingParams":{"temperature":0.7,"top_p":0.9,"top_k":10,"parallel_tool_calls":false,"max_tool_calls":3,"tool_choice":"required"},
+                "samplingParamsByThinkingLevel":{"high":{"temperature":0.5,"top_k":40}}}],
+            "modelOverrides":{"fixture-model":{"samplingParamsByThinkingLevel":{"high":{"temperature":0.2}}}}
+        }}}).to_string()).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            assert!(first.starts_with("POST /v1/responses "), "{first}");
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["temperature"], temperature);
+            assert_eq!(body["top_p"], 0.9);
+            assert_eq!(body["top_k"], top_k);
+            assert_eq!(body["parallel_tool_calls"], false);
+            assert_eq!(body["max_tool_calls"], 3);
+            assert_eq!(body["tool_choice"], "required");
+            if level == "high" {
+                assert_eq!(body["reasoning"]["effort"], "strong");
+            }
+            let events = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--no-tools",
+                "--offline",
+                "--provider",
+                "openai",
+                "--model",
+                "fixture-model",
+                "--api-key",
+                "fixture",
+                "--thinking",
+                level,
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn malformed_settings_warn_without_blocking_offline_model_listing() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(project.join(".pi")).unwrap();
+    let user = home.join("settings.json");
+    let local = project.join(".pi/settings.json");
+    std::fs::write(&user, "{}").unwrap();
+    std::fs::write(&local, "{").unwrap();
+    let run = |trust: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(&project)
+            .env("PI_RS_HOME", &home)
+            .args(trust)
+            .args(["--offline", "--no-mcp", "--list-models"])
+            .output()
+            .unwrap()
+    };
+    let result = run(&["--trust"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let warning = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        warning.contains("Invalid settings file") && warning.contains("settings.json"),
+        "{warning}"
+    );
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), "{");
+    std::fs::write(&user, "{").unwrap();
+    std::fs::write(&local, "{}").unwrap();
+    let result = run(&[]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Invalid settings file"));
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), "{");
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(&project)
+        .env("PI_RS_HOME", &home)
+        .arg("--session")
+        .arg(root.path().join("direct.jsonl"))
+        .args(["--no-trust", "--offline", "--no-mcp", "serve"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid settings file"));
+}
+
+#[test]
+fn malformed_settings_keep_other_scope_in_package_listing() {
+    for (bad_global, trusted) in [(true, true), (false, true), (false, false)] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        let user = home.join("settings.json");
+        let local = project.join(".pi/settings.json");
+        std::fs::write(
+            &user,
+            if bad_global {
+                "{"
+            } else {
+                r#"{"packages":["git:https://example.com/user.git"]}"#
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            &local,
+            if bad_global {
+                r#"{"packages":["git:https://example.com/project.git"]}"#
+            } else {
+                "{"
+            },
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(&project)
+            .env("PI_RS_HOME", &home)
+            .args([
+                if trusted { "--trust" } else { "--no-trust" },
+                "--offline",
+                "--no-mcp",
+                "list",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(if bad_global {
+                "project.git"
+            } else {
+                "user.git"
+            }),
+            "{stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.contains("Invalid settings file"),
+            bad_global || trusted,
+            "{stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(if bad_global { &user } else { &local }).unwrap(),
+            "{"
+        );
+    }
+}
+
+#[test]
+fn malformed_settings_keep_other_scope_package_resources_in_rpc() {
+    for bad_global in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        let package = root.path().join("package");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        std::fs::create_dir_all(package.join("skills/example")).unwrap();
+        std::fs::write(
+            package.join("pi-package.json"),
+            r#"{"pi":{"skills":["skills"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("skills/example/SKILL.md"),
+            "---\nname: example\ndescription: Example skill\n---\nbody",
+        )
+        .unwrap();
+        let valid = json!({"packages":[package]}).to_string();
+        let (broken, expected_reason) = if bad_global {
+            (
+                r#"{"theme""#,
+                "Expected ':' after property name in JSON at position 8 (line 1 column 9)",
+            )
+        } else {
+            (
+                "\u{feff}{\r\n  \"🐈\" 1\r\n}",
+                "Expected ':' after property name in JSON at position 10 (line 2 column 8)",
+            )
+        };
+        let user_settings = home.join("settings.json");
+        let project_settings = project.join(".pi/settings.json");
+        std::fs::write(&user_settings, if bad_global { broken } else { &valid }).unwrap();
+        std::fs::write(&project_settings, if bad_global { &valid } else { broken }).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(&project)
+            .env("PI_RS_HOME", &home)
+            .args([
+                "--trust",
+                "--offline",
+                "--no-mcp",
+                "--no-session",
+                "--mode",
+                "rpc",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.take().unwrap(),
+            "{}",
+            json!({"id":"commands","type":"get_commands"})
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        let broken_path = if bad_global {
+            user_settings
+        } else {
+            project_settings
+        };
+        let canonical_path = broken_path.canonicalize().unwrap();
+        let expected = format!(
+            "Warning: Invalid settings file {}: {expected_reason}",
+            canonical_path.display()
+        );
+        assert!(stderr.lines().any(|line| line == expected), "{stderr}");
+        assert_eq!(
+            stderr.matches("Invalid settings file").count(),
+            1,
+            "{stderr}"
+        );
+        assert_eq!(std::fs::read_to_string(broken_path).unwrap(), broken);
+        let replies: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            replies.iter().all(|reply| reply["type"] != "error"
+                || !reply["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Invalid settings file")),
+            "{replies:?}"
+        );
+        let reply = replies
+            .iter()
+            .find(|reply| reply["id"] == "commands")
+            .unwrap();
+        assert!(
+            reply["data"]["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|command| command["name"] == "skill:example"),
+            "{reply}"
+        );
+    }
+}
+
+#[test]
+fn new_rpc_session_recovers_queue_settings_per_scope() {
+    for bad_global in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        let user = home.join("settings.json");
+        let local = project.join(".pi/settings.json");
+        std::fs::write(&user, r#"{"steeringMode":"all"}"#).unwrap();
+        std::fs::write(&local, r#"{"followUpMode":"one-at-a-time"}"#).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(&project)
+            .env("PI_RS_HOME", &home)
+            .args([
+                "--trust",
+                "--offline",
+                "--no-mcp",
+                "--no-session",
+                "--mode",
+                "rpc",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if let Ok(event) = serde_json::from_str::<Value>(&line)
+                    && sender.send(event).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let request = |input: &mut std::process::ChildStdin, id: &str, kind: &str| {
+            writeln!(input, "{}", json!({"id":id,"type":kind})).unwrap();
+            input.flush().unwrap();
+            loop {
+                let event = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+                if event["id"] == id {
+                    return event;
+                }
+            }
+        };
+        assert!(request(&mut input, "initial", "get_state")["success"] == true);
+        std::fs::write(&user, r#"{"steeringMode":"one-at-a-time"}"#).unwrap();
+        std::fs::write(&local, r#"{"followUpMode":"all"}"#).unwrap();
+        assert!(request(&mut input, "intermediate", "new_session")["success"] == true);
+        if bad_global {
+            std::fs::write(&user, "{").unwrap();
+            std::fs::write(&local, r#"{"followUpMode":"one-at-a-time"}"#).unwrap();
+        } else {
+            std::fs::write(&user, r#"{"steeringMode":"all"}"#).unwrap();
+            std::fs::write(&local, "{").unwrap();
+        }
+        assert!(request(&mut input, "new", "new_session")["success"] == true);
+        let state = request(&mut input, "state", "get_state");
+        assert_eq!(
+            state["data"]["steeringMode"],
+            if bad_global { "one-at-a-time" } else { "all" }
+        );
+        assert_eq!(
+            state["data"]["followUpMode"],
+            if bad_global { "one-at-a-time" } else { "all" }
+        );
+        drop(input);
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        reader.join().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(stderr.contains("Invalid settings file"), "{stderr}");
+    }
+}
+
+#[test]
+fn new_rpc_session_uses_latest_worker_queue_fallback() {
+    for bad_global in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        std::fs::write(
+            home.join("models.json"),
+            r#"{"providers":{"openai":{"models":[{"id":"second"}]}}}"#,
+        )
+        .unwrap();
+        let user = home.join("settings.json");
+        let local = project.join(".pi/settings.json");
+        std::fs::write(&user, r#"{"steeringMode":"all"}"#).unwrap();
+        std::fs::write(&local, r#"{"followUpMode":"one-at-a-time"}"#).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(&project)
+            .env("PI_RS_HOME", &home)
+            .env("OPENAI_API_KEY", "test-key")
+            .args([
+                "--trust",
+                "--offline",
+                "--no-mcp",
+                "--no-session",
+                "--mode",
+                "rpc",
+                // Switch providers below to start a new worker with the updated queue settings.
+                "--provider",
+                "ollama",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if let Ok(event) = serde_json::from_str::<Value>(&line)
+                    && sender.send(event).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let request = |input: &mut std::process::ChildStdin, id: &str, kind: &str| {
+            writeln!(input, "{}", json!({"id":id,"type":kind})).unwrap();
+            input.flush().unwrap();
+            loop {
+                let event = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+                if event["id"] == id {
+                    return event;
+                }
+            }
+        };
+        assert!(request(&mut input, "initial", "get_commands")["success"] == true);
+        std::fs::write(&user, r#"{"steeringMode":"one-at-a-time"}"#).unwrap();
+        std::fs::write(&local, r#"{"followUpMode":"all"}"#).unwrap();
+        writeln!(
+            input,
+            "{}",
+            json!({"id":"model","type":"set_model","provider":"openai","modelId":"second"})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        loop {
+            let event = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+            if event["id"] == "model" {
+                assert_eq!(event["success"], true, "{event}");
+                break;
+            }
+        }
+        assert!(request(&mut input, "intermediate", "get_commands")["success"] == true);
+        if bad_global {
+            std::fs::write(&user, "{").unwrap();
+            std::fs::write(&local, r#"{"followUpMode":"one-at-a-time"}"#).unwrap();
+        } else {
+            std::fs::write(&user, r#"{"steeringMode":"all"}"#).unwrap();
+            std::fs::write(&local, "{").unwrap();
+        }
+        assert!(request(&mut input, "new", "new_session")["success"] == true);
+        let state = request(&mut input, "state", "get_state");
+        assert_eq!(
+            state["data"]["steeringMode"],
+            if bad_global { "one-at-a-time" } else { "all" }
+        );
+        assert_eq!(
+            state["data"]["followUpMode"],
+            if bad_global { "one-at-a-time" } else { "all" }
+        );
+        drop(input);
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        reader.join().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(stderr.contains("Invalid settings file"), "{stderr}");
+    }
+}
+
+#[test]
+fn switching_rpc_sessions_keeps_last_good_skill_settings() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let skill = root.path().join("skill/SKILL.md");
+    let session = root.path().join("initial.jsonl");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(
+        &skill,
+        "---\nname: retained-fixture\ndescription: retained skill\n---\nbody",
+    )
+    .unwrap();
+    let settings = home.join("settings.json");
+    std::fs::write(&settings, json!({"skills":[skill]}).to_string()).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .arg("--session")
+        .arg(&session)
+        .args(["--no-trust", "--offline", "--no-mcp", "--mode", "rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if let Ok(event) = serde_json::from_str::<Value>(&line)
+                && sender.send(event).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let request = |input: &mut std::process::ChildStdin, value: Value| {
+        let id = value["id"].as_str().unwrap().to_owned();
+        writeln!(input, "{value}").unwrap();
+        input.flush().unwrap();
+        loop {
+            let event = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+            if event["id"] == id {
+                return event;
+            }
+        }
+    };
+    assert!(request(&mut input, json!({"id":"before","type":"get_commands"}))["success"] == true);
+    std::fs::write(&settings, "{").unwrap();
+    assert!(request(&mut input, json!({"id":"new","type":"new_session"}))["success"] == true);
+    let switched = request(
+        &mut input,
+        json!({"id":"switch","type":"switch_session","sessionPath":session}),
+    );
+    assert!(switched["success"] == true, "{switched}");
+    let commands = request(&mut input, json!({"id":"after","type":"get_commands"}));
+    assert!(
+        commands["data"]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "skill:retained-fixture"),
+        "{commands}"
+    );
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    reader.join().unwrap();
+}
+
+#[test]
+fn model_listing_searches_ids_with_pi_token_swaps() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"ollama":{"models":[
+            {"id":"nova-2p", "name":"DistinctSparkName"},
+            {"id":"nova-4x", "name":"Other"}
+        ]}}})
+        .to_string(),
+    )
+    .unwrap();
+    for (search, expected, absent) in [
+        ("p2", "nova-2p", "nova-4x"),
+        ("DistinctSparkName", "No models matching", "nova-2p"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-mcp",
+                "--offline",
+                "--provider",
+                "ollama",
+                "--endpoint",
+                "http://127.0.0.1:1/v1/chat/completions",
+                "--list-models",
+                search,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains(expected), "{text}");
+        assert!(!text.contains(absent), "{text}");
+    }
+}
+
+#[test]
+fn model_listing_uses_pi_table_collation_and_spacing() {
+    let root = tempfile::tempdir().unwrap();
+    let models: Vec<_> = ["Za", "zA", "z-a", "z_a", "ä", "日本語", "😀"]
+        .into_iter()
+        .map(|id| {
+            json!({
+                "id":id, "contextWindow":1_250_000, "maxTokens":1_250,
+                "reasoning":false, "input":["text"],
+            })
+        })
+        .collect();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"fixture":{
+            "baseUrl":"http://127.0.0.1:1/v1",
+            "api":"openai-completions",
+            "apiKey":"fixture",
+            "models":models,
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    for (locale, expected) in [
+        (
+            "en_US.UTF-8",
+            ["😀", "ä", "z_a", "z-a", "zA", "Za", "日本語"],
+        ),
+        (
+            "sv_SE.UTF-8",
+            ["😀", "z_a", "z-a", "zA", "Za", "ä", "日本語"],
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("LC_ALL", locale)
+            .args([
+                "--offline",
+                "--no-mcp",
+                "--no-approve",
+                "--provider",
+                "fixture",
+                "--list-models",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        let ids: Vec<_> = text
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_ascii_whitespace().nth(1))
+            .collect();
+        assert_eq!(ids, expected);
+        assert!(text.contains("fixture   😀     1.3M     1.3K"));
+        assert!(text.contains("fixture   日本語    1.3M     1.3K"));
+    }
+}
+
+#[test]
+fn unrelated_provider_loads_legacy_responses_sampling_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{
+            "openai":{"models":[{"id":"legacy","samplingParams":{"stream":false}}]},
+            "ollama":{"models":[{"id":"local"}]}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-mcp",
+            "--offline",
+            "--provider",
+            "ollama",
+            "--endpoint",
+            "http://127.0.0.1:1/v1/chat/completions",
+            "--list-models",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("local"));
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "openai",
+            "--model",
+            "legacy",
+            "--api-key",
+            "fixture",
+            "--endpoint",
+            "http://127.0.0.1:1/v1/responses",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        error.contains("openai/legacy") && error.contains("stream"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -141,6 +1996,119 @@ fn kimi_coding_models_send_their_specific_reasoning_options() {
         assert!(
             output.status.success(),
             "{model}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn qwen_token_plans_use_model_specific_thinking_and_tool_format() {
+    for (provider, model, level, effort) in [
+        ("qwen-token-plan", "qwen3.7-plus", "high", None),
+        ("qwen-token-plan-cn", "glm-5.2", "high", Some("high")),
+        (
+            "qwen-token-plan-individual",
+            "qwen3.8-max",
+            "medium",
+            Some("medium"),
+        ),
+        (
+            "qwen-token-plan-individual-cn",
+            "qwen4-max-preview",
+            "xhigh",
+            Some("xhigh"),
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = loop {
+                let (mut socket, reader, first) =
+                    accept_proxy_request(listener.try_clone().unwrap());
+                if first.starts_with("GET ") {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                break (socket, reader, first);
+            };
+            assert!(first.starts_with("POST /v1/chat/completions "), "{first}");
+            let mut length = 0;
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                let line = line.to_ascii_lowercase();
+                if let Some(value) = line.strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            assert!(headers.contains("authorization: bearer fixture"));
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["model"], model);
+            assert_eq!(body["enable_thinking"], true);
+            assert_eq!(body.get("reasoning_effort").and_then(Value::as_str), effort);
+            assert!(body.get("store").is_none());
+            assert_eq!(body["messages"][0]["role"], "system");
+            let function = &body["tools"][0]["function"];
+            assert_eq!(function["strict"], true);
+            let required = function["parameters"]["required"].as_array().unwrap();
+            for field in ["path", "offset", "limit"] {
+                assert!(required.contains(&json!(field)), "missing {field}");
+            }
+            for field in ["offset", "limit"] {
+                let alternatives = function["parameters"]["properties"][field]["anyOf"]
+                    .as_array()
+                    .unwrap();
+                assert!(alternatives.contains(&json!({"type": "null"})));
+            }
+            assert_eq!(function["parameters"]["additionalProperties"], false);
+            let events = concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture answer\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--offline",
+                "--tools",
+                "read",
+                "--provider",
+                provider,
+                "--model",
+                model,
+                "--thinking",
+                level,
+                "--api-key",
+                "fixture",
+                "--endpoint",
+                &endpoint,
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{provider}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
@@ -231,6 +2199,78 @@ fn xiaomi_providers_send_thinking_and_bearer_credentials() {
 }
 
 #[test]
+fn vercel_gateway_streams_messages_with_api_key() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert!(first.starts_with("POST /v1/messages "), "{first}");
+        let mut length = 0;
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            let line = line.to_ascii_lowercase();
+            if let Some(value) = line.strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap();
+            }
+            headers.push_str(&line);
+        }
+        assert!(headers.contains("x-api-key: fixture"));
+        assert!(!headers.contains("authorization: bearer"));
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["model"], "anthropic/claude-sonnet-4.6");
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        let events = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"anthropic/claude-sonnet-4.6\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"fixture answer\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "vercel-ai-gateway",
+            "--model",
+            "anthropic/claude-sonnet-4.6",
+            "--thinking",
+            "high",
+            "--api-key",
+            "fixture",
+            "--endpoint",
+            &endpoint,
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
+    server.join().unwrap();
+}
+
+#[test]
 fn minimax_regional_providers_use_the_messages_adapter() {
     for provider in ["minimax", "minimax-cn"] {
         let root = tempfile::tempdir().unwrap();
@@ -309,6 +2349,123 @@ fn minimax_regional_providers_use_the_messages_adapter() {
     }
 }
 
+#[test]
+fn configured_messages_thinking_budget_respects_native_output_limits() {
+    for (provider, model, level, preferred, request_limit, run_limit) in [
+        (
+            "anthropic",
+            "fixture-budgeted",
+            "low",
+            1536_u64,
+            2048_u32,
+            8192_u32,
+        ),
+        ("anthropic", "fixture-budgeted", "high", 3456, 10000, 3000),
+        ("anthropic", "fixture-budgeted", "high", 3456, 10000, 10000),
+        ("anthropic", "fixture-budgeted", "off", 0, 2048, 8192),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            r#"{"thinkingBudgets":{"low":1536,"high":3456}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.path().join("models.json"), json!({"providers":{"anthropic":{"models":[{"id":"fixture-budgeted","reasoning":true,"compat":{"forceAdaptiveThinking":false}}]}}}).to_string()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!(
+            "http://{}/anthropic/v1/messages",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = loop {
+                let (mut socket, reader, first) =
+                    accept_proxy_request(listener.try_clone().unwrap());
+                if first.starts_with("GET /anthropic/v1/models/") {
+                    socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                break (socket, reader, first);
+            };
+            assert!(first.starts_with("POST /anthropic/v1/messages "), "{first}");
+            let mut length = 0;
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                let line = line.to_ascii_lowercase();
+                if let Some(value) = line.strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            assert!(headers.contains("x-api-key: fixture"));
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["model"], model);
+            assert_eq!(body["max_tokens"], request_limit.min(run_limit));
+            if level == "off" {
+                assert_eq!(body["thinking"]["type"], "disabled");
+            } else {
+                assert_eq!(body["thinking"]["type"], "enabled");
+                assert_eq!(body["thinking"]["display"], "summarized");
+                assert_eq!(
+                    body["thinking"]["budget_tokens"],
+                    preferred.min(body["max_tokens"].as_u64().unwrap() - 1024)
+                );
+            }
+            let events = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"fixture\"}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"fixture answer\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--no-tools",
+                "--offline",
+                "--provider",
+                provider,
+                "--model",
+                model,
+                "--thinking",
+                level,
+                "--max-output-tokens",
+                &request_limit.to_string(),
+                "--output-budget",
+                &run_limit.to_string(),
+                "--api-key",
+                "fixture",
+                "--endpoint",
+                &endpoint,
+                "--print",
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{provider}/{model}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixture answer"));
+        server.join().unwrap();
+    }
+}
+
 fn responses_provider_streams_through_the_cli(provider: &str) {
     let root = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -318,16 +2475,21 @@ fn responses_provider_streams_through_the_cli(provider: &str) {
         let (mut socket, mut reader, first) = accept_proxy_request(listener);
         assert!(first.starts_with("POST /v1/responses "), "{first}");
         let mut length = None;
+        let mut authorization = None;
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             if line == "\r\n" || line.is_empty() {
                 break;
             }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("authorization:") {
+                authorization = Some(value.trim().to_owned());
+            }
             if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                 length = Some(value.trim().parse::<usize>().unwrap());
             }
         }
+        assert_eq!(authorization.as_deref(), Some("bearer fixture"));
         let mut body = vec![0; length.unwrap()];
         reader.read_exact(&mut body).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
@@ -403,6 +2565,519 @@ fn chatgpt_account_switch_preserves_separate_saved_sessions() {
             .unwrap();
     assert_eq!(store["one"]["client_id"], "one");
     assert_eq!(store["two"]["client_id"], "two");
+}
+
+#[cfg(unix)]
+#[test]
+fn print_and_json_prompts_are_reported_as_interactive_input() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("input.py");
+    std::fs::write(
+        &extension,
+        r##"#!/usr/bin/env python3
+import json, os, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'input-fixture', 'dependencies':[], 'commands':[], 'tools':[], 'input_hook':True}
+elif request['type'] == 'input':
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'input-events.jsonl'), 'a') as log:
+        log.write(json.dumps(request['event']) + '\n')
+    result = {'action':'handled'}
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for mode in ["print", "json"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--offline",
+                "--extension",
+            ])
+            .arg(&extension)
+            .stdin(Stdio::null());
+        if mode == "print" {
+            command.arg("--print");
+        } else {
+            command.args(["--mode", "json"]);
+        }
+        let output = command.arg("hello").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let events = std::fs::read_to_string(root.path().join("input-events.jsonl")).unwrap();
+    let events: Vec<Value> = events
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2);
+    for event in events {
+        assert_eq!(event["source"], "interactive");
+        assert_eq!(event["text"], "hello");
+        assert!(event.get("streamingBehavior").is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_input_hooks_receive_empty_and_whitespace_messages() {
+    use std::os::unix::fs::PermissionsExt;
+    struct KillOnDrop(Option<std::process::Child>);
+    impl std::ops::Deref for KillOnDrop {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            self.0.as_ref().unwrap()
+        }
+    }
+    impl std::ops::DerefMut for KillOnDrop {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            self.0.as_mut().unwrap()
+        }
+    }
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    struct StopOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("empty-input.py");
+    std::fs::write(
+        &extension,
+        r##"#!/usr/bin/env python3
+import json, os, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'empty-input', 'dependencies':[], 'commands':[], 'tools':[], 'input_hook':True}
+elif request['type'] == 'input':
+    event = request['event']
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'input-events.jsonl'), 'a') as log:
+        log.write(json.dumps(event) + '\n')
+    if event['text'] in ('', ' '):
+        result = {'action':'handled'}
+    elif event['text'] in ('\t', '\n'):
+        result = {'action':'transform', 'text':'same input'}
+    else:
+        result = {'action':'continue'}
+elif request['type'] in ('context', 'before_request'):
+    result = request['request']
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (release, gate) = std::sync::mpsc::channel();
+    let server_stop = StopOnDrop(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        false,
+    )));
+    let (endpoint, server) = model_fixture_with_gate_timeout(
+        None,
+        "stop",
+        None,
+        Some(gate),
+        Duration::from_secs(150),
+        Some(server_stop.0.clone()),
+    );
+    let mut release = ReleaseOnDrop(Some(release));
+    let mut child = KillOnDrop(Some(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--endpoint",
+                &endpoint,
+                "--mode",
+                "rpc",
+                "--extension",
+            ])
+            .arg(&extension)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    for request in [
+        json!({"type":"prompt","id":"missing"}),
+        json!({"type":"prompt","id":"null","message":null}),
+    ] {
+        writeln!(input, "{request}").unwrap();
+        input.flush().unwrap();
+        let response = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(response["id"], request["id"]);
+        assert_eq!(response["success"], false, "{response}");
+    }
+    for (id, text, disposition) in [
+        ("empty", "", Some("handled")),
+        ("space", " ", Some("handled")),
+        ("tab", "\t", Some("started")),
+        ("newline", "\n", Some("started")),
+        ("unhandled", "  ", None),
+    ] {
+        writeln!(input, "{}", json!({"type":"prompt","id":id,"message":text})).unwrap();
+        input.flush().unwrap();
+        let mut response = None;
+        let mut ended = None;
+        let mut observed = Vec::new();
+        let mut streaming_handled = 0;
+        loop {
+            let event = receiver
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|error| {
+                    let _ = child.kill();
+                    panic!("RPC input timed out: {error}");
+                });
+            if event["type"] == "response" && event["id"] == id {
+                response = Some(event.clone());
+                if id == "tab" {
+                    for (command, request_id, behavior) in [
+                        ("steer", "stream-steer", None),
+                        ("follow_up", "stream-follow", None),
+                        ("prompt", "stream-prompt-steer", Some("steer")),
+                        ("prompt", "stream-prompt-follow", Some("followUp")),
+                    ] {
+                        let mut request = json!({"type":command,"id":request_id,"message":""});
+                        if let Some(behavior) = behavior {
+                            request["streamingBehavior"] = json!(behavior);
+                        }
+                        writeln!(input, "{request}").unwrap();
+                    }
+                    input.flush().unwrap();
+                }
+            }
+            if event["type"] == "response"
+                && event["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("stream-"))
+            {
+                assert_eq!(event["success"], true, "{event}");
+                assert_eq!(event["data"]["disposition"], "handled", "{event}");
+                streaming_handled += 1;
+                if streaming_handled == 4 {
+                    release.0.take().unwrap().send(()).unwrap();
+                }
+            }
+            if event["type"] == "agent_end" {
+                ended = Some(event.clone());
+            }
+            observed.push(event.clone());
+            if event["type"] == "agent_settled" {
+                break;
+            }
+        }
+        let response = response.expect("prompt response");
+        if id == "tab" {
+            assert_eq!(streaming_handled, 4);
+        }
+        if let Some(disposition) = disposition {
+            assert_eq!(response["success"], true, "{response}");
+            assert_eq!(response["data"]["disposition"], disposition, "{response}");
+            if disposition == "started" {
+                let ended = ended.expect("agent_end for transformed input");
+                assert_eq!(ended["success"], true, "{ended}; events: {observed:?}");
+            }
+        } else {
+            assert_eq!(response["success"], false, "{response}");
+        }
+    }
+    for command in ["steer", "follow_up"] {
+        writeln!(
+            input,
+            "{}",
+            json!({"type":command,"id":command,"message":""})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        loop {
+            let event = receiver
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|error| {
+                    let _ = child.kill();
+                    panic!("RPC queued input timed out: {error}");
+                });
+            if event["type"] == "response" && event["id"] == command {
+                assert_eq!(event["success"], true, "{event}");
+                assert_eq!(event["data"]["disposition"], "handled", "{event}");
+                break;
+            }
+        }
+    }
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "RPC did not exit after shutdown");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let result = child.0.take().unwrap().wait_with_output().unwrap();
+    reader.join().unwrap();
+    server.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let events: Vec<Value> = std::fs::read_to_string(root.path().join("input-events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["text"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["", " ", "\t", "", "", "", "", "\n", "  ", "", ""]
+    );
+    assert!(events.iter().all(|event| event["source"] == "rpc"));
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_idle_triggering_command_is_handled_even_when_model_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("trigger.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'trigger', 'dependencies':[], 'commands':['trigger'], 'tools':[], 'command_effects':True, 'input_hook':True}
+elif request['type'] == 'command_effects':
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'commands'), 'a') as log:
+        log.write('command\n')
+    result = {'actions':[{'type':'trigger_message','message':{'customType':'hint','content':'same input','display':False}}]}
+elif request['type'] == 'input':
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'hooks'), 'a') as log:
+        log.write('input\n')
+    result = {'action':'continue'}
+elif request['type'] in ('context', 'before_request'):
+    result = request['request']
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let (release, gate) = std::sync::mpsc::channel();
+    let (arrived, model_request) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let mut count = 0;
+        while count < 2 {
+            let (mut socket, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "model fixture timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("model fixture: {error}"),
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(&socket);
+            let mut length = 0;
+            let mut metadata = false;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+                metadata |= line.starts_with("GET /api/ps ");
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            if metadata {
+                write!(
+                    socket,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert!(!request.to_string().contains("aGVsbG8="));
+            assert!(
+                request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["content"] == "same input")
+            );
+            arrived.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(30))
+                .expect("model gate was not released");
+            let (status, body) = if count == 0 {
+                (
+                    "200 OK",
+                    "data: {\"id\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                )
+            } else {
+                ("400 Bad Request", "fixture model failure")
+            };
+            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            count += 1;
+        }
+    });
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--endpoint",
+                &endpoint,
+                "--mode",
+                "rpc",
+                "--extension",
+            ])
+            .arg(&extension)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    for (id, success) in [("ok", true), ("failure", false)] {
+        let mut request = json!({"type":"prompt", "id":id, "message":"/trigger"});
+        if id == "failure" {
+            request["images"] = json!([{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]);
+        }
+        writeln!(input, "{request}").unwrap();
+        input.flush().unwrap();
+        let mut events = Vec::new();
+        loop {
+            let event = receiver
+                .recv_timeout(Duration::from_secs(30))
+                .expect("RPC event timeout");
+            if event["type"] == "response" && event["id"] == id {
+                assert_eq!(event["success"], true, "{event}");
+                assert_eq!(event["data"]["disposition"], "handled", "{event}");
+                assert!(!events.iter().any(|e: &Value| e["type"] == "agent_end"));
+                model_request
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("model did not receive the triggered request");
+                release.send(()).unwrap();
+            }
+            let settled = event["type"] == "agent_settled";
+            events.push(event);
+            if settled {
+                break;
+            }
+        }
+        let responses: Vec<_> = events
+            .iter()
+            .filter(|e| e["type"] == "response" && e["id"] == id)
+            .collect();
+        assert_eq!(responses.len(), 1, "{events:?}");
+        assert_eq!(responses[0]["success"], true, "{events:?}");
+        assert_eq!(responses[0]["data"]["disposition"], "handled", "{events:?}");
+        assert_eq!(
+            events.iter().filter(|e| e["type"] == "agent_start").count(),
+            1,
+            "{events:?}"
+        );
+        let ends: Vec<_> = events.iter().filter(|e| e["type"] == "agent_end").collect();
+        assert_eq!(ends.len(), 1, "{events:?}");
+        assert_eq!(ends[0]["success"], success, "{events:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("commands")).unwrap(),
+        "command\ncommand\n"
+    );
+    assert!(!root.path().join("hooks").exists());
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "RPC did not shut down");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    reader.join().unwrap();
+    server.join().unwrap();
 }
 
 #[cfg(unix)]
@@ -536,19 +3211,28 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
         writeln!(
             input,
             "{}",
-            json!({"id": id, "type": "prompt", "message": "/trigger"})
+            json!({"id": id, "type": "prompt", "message": "/trigger", "images":[{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]})
         )
         .unwrap();
         input.flush().unwrap();
         let mut started = false;
         loop {
             let event = receive.recv_timeout(Duration::from_secs(60)).unwrap();
+            assert_ne!(event["message"]["role"], "user", "{event}");
             if event["type"] == "response" && event["id"] == id {
-                assert_eq!(event["data"]["disposition"], "started", "{event}");
+                assert_eq!(event["data"]["disposition"], "handled", "{event}");
                 started = true;
             }
             if event["type"] == "agent_end" {
                 assert!(started, "turn ended before prompt was acknowledged");
+                assert!(
+                    event["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|message| message["role"] != "user"),
+                    "{event}"
+                );
                 break;
             }
         }
@@ -630,7 +3314,7 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     writeln!(
         input,
         "{}",
-        json!({"id":"context", "type":"prompt", "message":"/context"})
+        json!({"id":"context", "type":"prompt", "message":"/context", "images":[{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]})
     )
     .unwrap();
     input.flush().unwrap();
@@ -805,6 +3489,112 @@ print(json.dumps({'version':1, 'response':{'Ok':result}}))
     let reopened = Session::snapshot(&session).unwrap();
     assert!(reopened.branch().iter().any(|record| matches!(&record.event, pi_rs::Event::CustomEntry { entry } if entry.custom_type == "bookmark" && entry.data.as_ref().unwrap()["note"] == "remember this")));
     assert!(reopened.current_messages().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_reports_native_extension_failures_with_pi_fields() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("error.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    response = {'Ok':{'id':'failure-fixture', 'dependencies':[], 'commands':[], 'tools':[], 'lifecycle_hook':True, 'session_lifecycle_hook':True, 'resource_discovery_hook':True, 'input_hook':True}}
+elif request['type'] == 'lifecycle' and request['event']['type'] == 'session_start':
+    response = {'Err':'fixture start failure'}
+elif request['type'] == 'discover_resources':
+    response = {'Err':'fixture discovery failure'}
+elif request['type'] == 'input':
+    response = {'Ok':{'action':'handled'}}
+else:
+    response = {'Ok':None}
+print(json.dumps({'version':1, 'response':response}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--extension",
+        ])
+        .arg(&extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(
+        input,
+        "{}",
+        json!({"type":"prompt", "id":"run", "message":"hello"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut failures = Vec::new();
+    let mut responded = false;
+    loop {
+        let event = receiver
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|error| {
+                let _ = child.kill();
+                panic!("RPC event timed out: {error}");
+            });
+        if event["type"] == "extension_error" {
+            failures.push(event.clone());
+        }
+        assert_ne!(event["type"], "error", "unexpected generic error: {event}");
+        if event["type"] == "response" && event["id"] == "run" {
+            assert_eq!(event["success"], true);
+            responded = true;
+        }
+        if responded && failures.len() >= 2 {
+            break;
+        }
+    }
+    for (kind, message) in [
+        ("session_start", "fixture start failure"),
+        ("resources_discover", "fixture discovery failure"),
+    ] {
+        let matching: Vec<_> = failures
+            .iter()
+            .filter(|failure| failure["event"] == kind)
+            .collect();
+        assert_eq!(matching.len(), 1, "expected one {kind} error: {failures:?}");
+        let failure = matching[0];
+        assert_eq!(
+            failure["extensionPath"],
+            extension.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(failure["extension"], "failure-fixture");
+        assert!(failure["error"].as_str().unwrap().contains(message));
+        assert_eq!(failure["message"], failure["error"]);
+    }
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    let status = child.wait().unwrap();
+    reader.join().unwrap();
+    assert!(status.success());
 }
 
 #[cfg(unix)]
@@ -1138,6 +3928,947 @@ print(json.dumps({'version': 1, 'response': {'Ok': result}}))
 }
 
 #[test]
+fn rpc_live_toggles_override_project_settings_for_the_session() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(root.path().join(".pi")).unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        r#"{"providers":{"openai":{"models":[{"id":"second"}]}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("settings.json"),
+        r#"{"compaction":{"enabled":false},"retry":{"enabled":false}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(".pi/settings.json"),
+        r#"{"compaction":{"enabled":true},"retry":{"enabled":true}}"#,
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "--trust",
+            "--no-mcp",
+            "--offline",
+            "--model",
+            "fixture",
+            "--no-session",
+            "--context-window",
+            "32",
+            "--max-output-tokens",
+            "128",
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    {
+        let mut request = |id: &str, kind: &str, enabled: Option<bool>| -> Value {
+            let mut command = json!({"id":id, "type":kind});
+            if let Some(enabled) = enabled {
+                command["enabled"] = json!(enabled);
+            }
+            writeln!(input, "{command}").unwrap();
+            input.flush().unwrap();
+            loop {
+                let reply = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+                if reply["id"] == id && reply["type"] == "response" {
+                    assert_eq!(reply["success"], true, "{reply}");
+                    break reply;
+                }
+            }
+        };
+        assert_eq!(
+            request("initial", "get_state", None)["data"]["autoCompactionEnabled"],
+            true
+        );
+        for enabled in [false, true, false] {
+            request("compact", "set_auto_compaction", Some(enabled));
+            assert_eq!(
+                request("state", "get_state", None)["data"]["autoCompactionEnabled"],
+                enabled
+            );
+            request("retry", "set_auto_retry", Some(enabled));
+            assert_eq!(
+                request("after-retry", "get_state", None)["data"]["autoCompactionEnabled"],
+                enabled
+            );
+            let saved: Value =
+                serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap())
+                    .unwrap();
+            assert_eq!(saved["compaction"]["enabled"], enabled);
+            assert_eq!(saved["retry"]["enabled"], enabled);
+        }
+    }
+    let command =
+        json!({"id":"switch", "type":"set_model", "provider":"openai", "modelId":"second"});
+    writeln!(input, "{command}").unwrap();
+    input.flush().unwrap();
+    loop {
+        let reply = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+        if reply["id"] == "switch" && reply["type"] == "response" {
+            assert_eq!(reply["success"], true, "{reply}");
+            break;
+        }
+    }
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"prompt", "type":"prompt", "message":"test worker restart"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut saw_disabled = false;
+    loop {
+        let event = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+        saw_disabled |= event
+            .to_string()
+            .contains("automatic compaction is disabled");
+        if event["type"] == "agent_settled"
+            || (event["id"] == "prompt" && event["success"] == false)
+        {
+            assert!(
+                saw_disabled,
+                "replacement worker ignored disabled compaction: {event}"
+            );
+            break;
+        }
+    }
+    writeln!(input, "{}", json!({"id":"stop", "type":"shutdown"})).unwrap();
+
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    // A new session resolves the still-unchanged trusted project settings.
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args([
+            "--trust",
+            "--no-mcp",
+            "--offline",
+            "--model",
+            "fixture",
+            "--no-session",
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut fresh = output;
+    fresh
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n",
+        )
+        .unwrap();
+    let result = fresh.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let state = String::from_utf8(result.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["id"] == "state")
+        .unwrap();
+    assert_eq!(state["data"]["autoCompactionEnabled"], true);
+}
+
+#[test]
+fn rpc_replacement_worker_reads_external_compaction_edit_with_retry_override() {
+    rpc_replacement_compaction_edit_case(true);
+}
+
+#[test]
+fn rpc_replacement_worker_reads_external_edit_without_live_overrides() {
+    rpc_replacement_compaction_edit_case(false);
+}
+
+fn rpc_replacement_compaction_edit_case(live_retry: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(root.path().join(".pi")).unwrap();
+    std::fs::write(
+        root.path().join(".pi/settings.json"),
+        r#"{"compaction":{"enabled":true},"retry":{"enabled":true}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        r#"{"providers":{"openai":{"models":[{"id":"second"}]}}}"#,
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "--trust",
+            "--no-mcp",
+            "--offline",
+            "--model",
+            "fixture",
+            "--no-session",
+            "--context-window",
+            "32",
+            "--max-output-tokens",
+            "128",
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    for command in [
+        if live_retry {
+            json!({"id":"startup","type":"set_auto_retry","enabled":false})
+        } else {
+            json!({"id":"startup","type":"get_commands"})
+        },
+        json!({"id":"switch","type":"set_model","provider":"openai","modelId":"second"}),
+    ] {
+        writeln!(input, "{command}").unwrap();
+        input.flush().unwrap();
+        loop {
+            let event = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+            if event["id"] == command["id"] && event["type"] == "response" {
+                assert_eq!(event["success"], true, "{event}");
+                break;
+            }
+        }
+        if command["id"] == "startup" {
+            std::fs::write(
+                root.path().join(".pi/settings.json"),
+                r#"{"compaction":{"enabled":false},"retry":{"enabled":true}}"#,
+            )
+            .unwrap();
+        }
+    }
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"prompt","type":"prompt","message":"test"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut disabled = false;
+    loop {
+        let event = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+        disabled |= event
+            .to_string()
+            .contains("automatic compaction is disabled");
+        if event["type"] == "agent_settled"
+            || (event["id"] == "prompt" && event["success"] == false)
+        {
+            break;
+        }
+    }
+    assert!(
+        disabled,
+        "replacement worker ignored externally disabled compaction"
+    );
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[tokio::test]
+async fn rpc_manual_compaction_preflight_has_only_compaction_events() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let root = tempfile::tempdir().unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--offline",
+            "--no-approve",
+            "--no-extensions",
+            "--no-mcp",
+            "--no-session",
+            "--mode",
+            "rpc",
+            "--provider",
+            "ollama",
+            "--model",
+            "fixture",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let events = tokio::time::timeout(Duration::from_secs(20), async {
+        input
+            .write_all(b"{\"id\":\"compact\",\"type\":\"compact\"}\n")
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(line) = output.next_line().await.unwrap() {
+            let event: Value = serde_json::from_str(&line).unwrap();
+            match event["type"].as_str().unwrap() {
+                "compaction_start" | "compaction_end" | "agent_start" | "agent_end"
+                | "agent_settled" | "error" | "response" => events.push(event),
+                _ => {}
+            }
+            if events.last().is_some_and(|event| event["id"] == "compact") {
+                break;
+            }
+        }
+        drop(input);
+        assert!(child.wait().await.unwrap().success());
+        events
+    })
+    .await
+    .expect("manual compaction did not settle");
+    assert_eq!(
+        events,
+        [
+            json!({"type":"compaction_start","reason":"manual"}),
+            json!({"type":"compaction_end","reason":"manual","aborted":false,"willRetry":false,
+            "errorMessage":"Compaction failed: Nothing to compact (session too small)"}),
+            json!({"id":"compact","type":"response","command":"compact","success":false,
+            "error":"Nothing to compact (session too small)"}),
+        ]
+    );
+}
+
+#[test]
+fn rpc_replacement_worker_keeps_retry_disabled() {
+    rpc_replacement_retry_case(true);
+}
+
+#[test]
+fn provider_retry_recovers_chat_completions_with_agent_retry_disabled() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        r#"{"retry":{"enabled":false,"provider":{"maxRetries":1}}}"#,
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = std::thread::spawn(move || {
+        let mut bodies = Vec::new();
+        for attempt in 0..2 {
+            let (mut socket, mut reader, first) =
+                accept_proxy_request(listener.try_clone().unwrap());
+            assert!(first.starts_with("POST /v1/chat/completions "), "{first}");
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            bodies.push(serde_json::from_slice::<Value>(&body).unwrap());
+            let (status, headers, body) = if attempt == 0 {
+                ("429 Too Many Requests", "Retry-After-Ms: 0\r\n", "")
+            } else {
+                (
+                    "200 OK",
+                    "Content-Type: text/event-stream\r\n",
+                    concat!(
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"retried answer\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    ),
+                )
+            };
+            write!(
+                socket,
+                "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .unwrap();
+        }
+        assert_eq!(bodies[0], bodies[1]);
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "kimi-coding",
+            "--model",
+            "k3.1-pro",
+            "--api-key",
+            "fixture",
+            "--endpoint",
+            &endpoint,
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("retried answer"));
+}
+
+#[test]
+fn json_mode_reports_a_failed_assistant_message() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(Instant::now() < deadline, "model request timed out");
+            let mut socket = match listener.accept() {
+                Ok((socket, _)) => socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("fixture: {error}"),
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                if header.is_empty() || header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            if line.starts_with("POST ") {
+                let body = r#"{"error":{"message":"provider-private-sentinel"}}"#;
+                write!(socket, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                break;
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .env_remove("http_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("all_proxy")
+        .env_remove("ALL_PROXY")
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--provider",
+            "openai",
+            "--model",
+            "fixture",
+            "--api-key",
+            "test-key",
+            "--endpoint",
+            &endpoint,
+            "--mode",
+            "json",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    let events: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let message = &events
+        .iter()
+        .find(|event| event["type"] == "message_end" && event["message"]["role"] == "assistant")
+        .unwrap()["message"];
+    assert_eq!(message["stopReason"], "error");
+    assert_eq!(message["errorMessage"], "Model request failed");
+    assert!(!message.to_string().contains("provider-private-sentinel"));
+    assert!(
+        events
+            .iter()
+            .find(|event| event["type"] == "agent_end")
+            .unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .contains(message)
+    );
+}
+
+#[test]
+fn rpc_replacement_worker_reads_external_retry_edit_with_compaction_override() {
+    rpc_replacement_retry_case(false);
+}
+
+fn rpc_replacement_retry_case(live_retry: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(root.path().join(".pi")).unwrap();
+    std::fs::write(
+        root.path().join(".pi/settings.json"),
+        r#"{"retry":{"enabled":true,"maxRetries":1,"baseDelayMs":0}}"#,
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    std::fs::write(
+        home.join("models.json"),
+        json!({"providers":{"openai":{"baseUrl":endpoint,"apiKey":"test-key","models":[{"id":"second"}]}}}).to_string(),
+    )
+    .unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (stop, stopping) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut count = 0;
+        while stopping.try_recv().is_err() {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    socket.set_nonblocking(false).unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut reader = BufReader::new(socket.try_clone().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    if line.starts_with("POST ") {
+                        count += 1;
+                    }
+                    let body = r#"{"error":{"message":"unavailable"}}"#;
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("fixture: {error}"),
+            }
+        }
+        count
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("OPENAI_API_KEY", "test-key")
+        .args([
+            "--trust",
+            "--no-mcp",
+            "--offline",
+            "--model",
+            "fixture",
+            "--no-session",
+            "--mode",
+            "rpc",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    for command in [
+        if live_retry {
+            json!({"id":"retry","type":"set_auto_retry","enabled":false})
+        } else {
+            json!({"id":"compaction","type":"set_auto_compaction","enabled":false})
+        },
+        json!({"id":"switch","type":"set_model","provider":"openai","modelId":"second"}),
+    ] {
+        writeln!(input, "{command}").unwrap();
+        input.flush().unwrap();
+        loop {
+            let event = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+            if event["id"] == command["id"] && event["type"] == "response" {
+                assert_eq!(event["success"], true, "{event}");
+                break;
+            }
+        }
+        if !live_retry && command["id"] == "compaction" {
+            std::fs::write(
+                root.path().join(".pi/settings.json"),
+                r#"{"retry":{"enabled":false,"maxRetries":1,"baseDelayMs":0}}"#,
+            )
+            .unwrap();
+        }
+    }
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"prompt","type":"prompt","message":"test"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut retry_event = false;
+    let mut failed_message = None;
+    let mut final_messages = None;
+    loop {
+        let event = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+        retry_event |= event.to_string().contains("auto_retry_start");
+        if event["type"] == "message_end" && event["message"]["role"] == "assistant" {
+            failed_message = Some(event["message"].clone());
+        }
+        if event["type"] == "agent_end" {
+            final_messages = event["messages"].as_array().cloned();
+        }
+        if event["type"] == "agent_settled" {
+            break;
+        }
+    }
+    let failed_message = failed_message.expect("failed assistant message");
+    assert_eq!(failed_message["stopReason"], "error");
+    assert_eq!(
+        failed_message["errorMessage"],
+        "Model request failed temporarily"
+    );
+    assert!(final_messages.unwrap().contains(&failed_message));
+    assert!(
+        !retry_event,
+        "replacement worker retried despite the live override"
+    );
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    stop.send(()).unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(server.join().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn headless_streams_delimit_retried_model_attempts() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    for (mode, rejects, abort_retry) in [
+        ("json", 1, false),
+        ("rpc", 1, false),
+        ("rpc", 2, false),
+        ("rpc", 1, true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(
+            root.path().join("models.json"),
+            json!({"providers":{"fixture":{"baseUrl":endpoint,"api":"openai-completions",
+                "apiKey":"fixture","models":[{"id":"fixture-model"}]}}})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"retry":{"enabled":true,"maxRetries":1,
+                "baseDelayMs":if abort_retry { 60000 } else { 0 },
+                "provider":{"maxRetries":0}}})
+            .to_string(),
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 0..if abort_retry { 1 } else { 2 } {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(30), listener.accept())
+                        .await
+                        .expect("model request timeout")
+                        .unwrap();
+                let mut request = tokio::io::BufReader::new(&mut socket);
+                let mut line = String::new();
+                request.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with("POST /v1/chat/completions "), "{line}");
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    if request.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                request.read_exact(&mut vec![0; length]).await.unwrap();
+                let (status, content_type, body) = if attempt < rejects {
+                    (
+                        "503 Service Unavailable",
+                        "application/json",
+                        r#"{"error":{"message":"fixture service temporarily unavailable"}}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        "text/event-stream",
+                        concat!(
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"recovered\"},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        ),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("NO_PROXY", "127.0.0.1")
+            .args([
+                "--offline",
+                "--no-session",
+                "--no-approve",
+                "--no-extensions",
+                "--no-mcp",
+                "--no-tools",
+                "--provider",
+                "fixture",
+                "--model",
+                "fixture-model",
+                "--mode",
+                mode,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true);
+        if mode == "json" {
+            command.arg("test");
+        }
+        let mut child = command.spawn().unwrap();
+        let mut input = child.stdin.take();
+        if mode == "json" {
+            drop(input.take());
+        } else if let Some(input) = input.as_mut() {
+            input
+                .write_all(b"{\"type\":\"prompt\",\"message\":\"test\"}\n")
+                .await
+                .unwrap();
+        }
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut events = Vec::new();
+        let mut acknowledged_abort = false;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(line) = output.next_line().await.unwrap() {
+                let event: Value = serde_json::from_str(&line).unwrap();
+                let kind = event["type"].as_str().unwrap();
+                if abort_retry && kind == "auto_retry_start" {
+                    input
+                        .as_mut()
+                        .expect("RPC stdin")
+                        .write_all(b"{\"id\":\"cancel-retry\",\"type\":\"abort_retry\"}\n")
+                        .await
+                        .unwrap();
+                }
+                if kind == "response" && event["id"] == "cancel-retry" {
+                    assert_eq!(event["success"], true, "{event}");
+                    acknowledged_abort = true;
+                }
+                if matches!(
+                    kind,
+                    "agent_start"
+                        | "agent_end"
+                        | "turn_start"
+                        | "turn_end"
+                        | "message_end"
+                        | "auto_retry_start"
+                        | "auto_retry_end"
+                        | "agent_settled"
+                ) {
+                    events.push(event);
+                }
+                if events
+                    .last()
+                    .is_some_and(|event| event["type"] == "agent_settled")
+                    && (!abort_retry || acknowledged_abort)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("{mode} with {rejects} rejects, abort={abort_retry}: {events:?}")
+        });
+        drop(input);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        server.await.unwrap();
+
+        let mut expected = vec![
+            "agent_start",
+            "turn_start",
+            "message_end",
+            "message_end",
+            "turn_end",
+            "agent_end",
+            "auto_retry_start",
+        ];
+        if abort_retry {
+            expected.push("auto_retry_end");
+        } else {
+            expected.extend(["agent_start", "turn_start", "message_end"]);
+            if rejects == 1 {
+                expected.extend(["auto_retry_end", "turn_end", "agent_end"]);
+            } else {
+                expected.extend(["turn_end", "agent_end", "auto_retry_end"]);
+            }
+        }
+        expected.push("agent_settled");
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds, expected,
+            "{mode}, {rejects} rejects, abort={abort_retry}"
+        );
+        let failed = &events[5];
+        assert_eq!(failed["willRetry"], true);
+        assert_eq!(failed["success"], false);
+        assert_eq!(
+            failed["messages"],
+            json!([events[2]["message"], events[3]["message"]])
+        );
+        assert_eq!(events[3]["message"]["stopReason"], "error");
+        let success = !abort_retry && rejects == 1;
+        let retry_end = events
+            .iter()
+            .find(|event| event["type"] == "auto_retry_end")
+            .unwrap();
+        assert_eq!(retry_end["success"], success);
+        if !abort_retry {
+            let end = events
+                .iter()
+                .rfind(|event| event["type"] == "agent_end")
+                .unwrap();
+            assert_eq!(end["willRetry"], false);
+            assert_eq!(end["success"], success);
+            assert_eq!(end["messages"], json!([events[9]["message"]]));
+        }
+    }
+}
+
+#[test]
 fn rpc_correlates_commands_and_rejects_unknown_commands() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .args(["--mode", "rpc", "--no-session"])
@@ -1153,7 +4884,6 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
         r#"{"id":"unknown","type":"unsupported"}"#,
         r#"{"id":"stats","type":"get_session_stats"}"#,
         r#"{"id":"native","type":"get_state","includeNative":true}"#,
-        r#"{"id":"stop","type":"shutdown"}"#,
     ] {
         writeln!(stdin, "{request}").unwrap();
     }
@@ -1169,7 +4899,7 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(replies.len(), 6);
+    assert_eq!(replies.len(), 5);
     assert_eq!(replies[0]["id"], "state");
     assert_eq!(replies[0]["data"]["isStreaming"], false);
     assert!(replies[0]["data"].get("sessionFile").is_none());
@@ -1181,7 +4911,562 @@ fn rpc_correlates_commands_and_rejects_unknown_commands() {
     assert!(replies[3]["data"].get("sessionFile").is_none());
     assert_eq!(replies[4]["id"], "native");
     assert!(replies[4]["data"]["sessionFile"].is_string());
-    assert_eq!(replies[5]["id"], "stop");
+}
+
+// A nonblocking listener may produce nonblocking accepted sockets. Each
+// fixture connection is read with a bounded blocking timeout, independently
+// of the listener and of any idle peers on the same port.
+fn read_rpc_model_fixture_request(
+    socket: &TcpStream,
+    after_setup: impl FnOnce(&TcpStream) -> std::io::Result<()>,
+) -> std::io::Result<(String, Vec<u8>)> {
+    socket.set_nonblocking(false)?;
+    socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+    after_setup(socket)?;
+    let mut reader = BufReader::new(socket.try_clone()?);
+    let mut request = String::new();
+    if reader.read_line(&mut request)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "missing request",
+        ));
+    }
+    let mut length = 0;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 || line == "\r\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            length = value
+                .trim()
+                .parse()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+    Ok((request, body))
+}
+
+#[test]
+fn radius_attachments_use_the_current_accounts_resize_profile() {
+    use base64::Engine;
+    use image::GenericImageView;
+    use sha2::{Digest, Sha256};
+
+    let root = tempfile::tempdir().unwrap();
+    image::RgbImage::new(40, 20)
+        .save(root.path().join("fixture.png"))
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let origin = format!("http://{}/", listener.local_addr().unwrap());
+    let mut models =
+        json!({"providers":{"radius":{"models":[{"id":"fixture","input":["text","image"]}]}}});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    let account = format!("key:{:x}", Sha256::digest(b"matching-key"));
+    let mut catalog = json!({
+        "origin":origin,"account":account,"baseUrl":format!("{origin}v1"),
+        "models":[{"id":"fixture","name":"Fixture","reasoning":false,"input":["text","image"],
+            "contextWindow":131072,"maxTokens":4096,"inputLimits":{"images":{"resize":{"maxWidth":16}}}}]
+    });
+    std::fs::write(root.path().join("radius-models.json"), catalog.to_string()).unwrap();
+    catalog["models"][0]["inputLimits"]["images"]["resize"]["maxWidth"] = json!(24);
+    let discovered = catalog.to_string();
+
+    let worker = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let mut dimensions = Vec::new();
+        while dimensions.len() < 4 && Instant::now() < deadline {
+            let (mut socket, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("Radius fixture failed: {error}"),
+            };
+            let (request, body) = read_rpc_model_fixture_request(&socket, |_| Ok(())).unwrap();
+            if request.starts_with("GET /v1/config ") {
+                if dimensions.len() == 3 {
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{discovered}", discovered.len()).unwrap();
+                } else {
+                    socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
+                continue;
+            }
+            let path = request.split_ascii_whitespace().nth(1).unwrap();
+            assert!(
+                request.starts_with("POST ") && matches!(path, "/v1/messages" | "/messages"),
+                "{request}"
+            );
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            let image = payload["context"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+                .find(|part| part["type"] == "image")
+                .unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(image["data"].as_str().unwrap())
+                .unwrap();
+            dimensions.push((
+                path.to_owned(),
+                image::load_from_memory(&bytes).unwrap().dimensions(),
+            ));
+            let reply = concat!(
+                "data: {\"type\":\"text_start\",\"contentIndex\":0}\n\n",
+                "data: {\"type\":\"text_end\",\"contentIndex\":0,\"content\":\"ok\"}\n\n",
+                "data: {\"type\":\"done\",\"reason\":\"stop\"}\n\n",
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        }
+        dimensions
+    });
+
+    for key in [
+        Some("matching-key"),
+        Some("different-key"),
+        None,
+        Some("matching-key"),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("PI_RADIUS_GATEWAY", &origin)
+            .env_remove("RADIUS_API_KEY");
+        if let Some(key) = key {
+            command.env("RADIUS_API_KEY", key);
+            models["providers"]["radius"]
+                .as_object_mut()
+                .unwrap()
+                .remove("apiKey");
+        } else {
+            models["providers"]["radius"]["apiKey"] = json!("!echo matching-key");
+        }
+        std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+        let output = command
+            .args([
+                "--offline",
+                "--no-trust",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-session",
+                "--provider",
+                "radius",
+                "--model",
+                "fixture",
+                "--print",
+                "describe",
+                "@fixture.png",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    assert_eq!(
+        worker.join().unwrap(),
+        [
+            ("/v1/messages".into(), (16, 8)),
+            ("/messages".into(), (40, 20)),
+            ("/v1/messages".into(), (16, 8)),
+            ("/v1/messages".into(), (24, 12)),
+        ]
+    );
+}
+
+#[test]
+fn rpc_model_fixture_waits_for_request_on_nonblocking_accepted_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (socket, _) = listener.accept().unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let mut reader = BufReader::new(socket.try_clone().unwrap());
+    let mut line = String::new();
+    let nonblocking_error = reader.read_line(&mut line).unwrap_err();
+    assert_eq!(nonblocking_error.kind(), std::io::ErrorKind::WouldBlock);
+    drop(reader);
+    let (request, body) = read_rpc_model_fixture_request(&socket, |socket| {
+        // Inspect the actual socket after the production fixture's setup,
+        // before the peer sends any bytes. No reader scheduling is involved.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
+        }
+        #[cfg(windows)]
+        {
+            socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+            let mut probe = BufReader::new(socket.try_clone()?);
+            let mut line = String::new();
+            let timed_out = probe.read_line(&mut line).unwrap_err();
+            assert_eq!(timed_out.kind(), std::io::ErrorKind::TimedOut);
+            assert_ne!(timed_out.raw_os_error(), nonblocking_error.raw_os_error());
+            socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+        }
+        client.write_all(b"POST /api/show HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")
+    })
+    .unwrap();
+    assert_eq!(request, "POST /api/show HTTP/1.1\r\n");
+    assert_eq!(body, b"{}");
+}
+
+#[test]
+fn rpc_discovered_ollama_thinking_budget_reaches_worker_wire() {
+    use std::sync::mpsc;
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"ollama":{"compat":{"supportsThinkingTokenBudget":true}}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        json!({"thinkingBudgets":{"low":1500}}).to_string(),
+    )
+    .unwrap();
+    let (send, receive) = mpsc::channel();
+    let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_stopping = stopping.clone();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut workers = Vec::new();
+        while Instant::now() < deadline
+            && !server_stopping.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    let send = send.clone();
+                    workers.push(std::thread::spawn(move || {
+                        let Ok((request, bytes)) = read_rpc_model_fixture_request(&socket, |_| Ok(())) else { return; };
+                        let (body, content_type) = if request.starts_with("POST /api/show ") {
+                            (r#"{"thinking":{"values":["off","low","high"]},"capabilities":["thinking"]}"#.to_owned(), "application/json")
+                        } else if request.starts_with("GET /api/ps ") {
+                            (r#"{"models":[]}"#.to_owned(), "application/json")
+                        } else if request.starts_with("GET /v1/models ") {
+                            (r#"{"data":[{"id":"dynamic"}]}"#.to_owned(), "application/json")
+                        } else if request.starts_with("POST /v1/chat/completions ") {
+                            let body: Value = serde_json::from_slice(&bytes).unwrap();
+                            let _ = send.send(body);
+                            ("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_owned(), "text/event-stream")
+                        } else { panic!("unexpected request {request}") };
+                        let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    }));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--workspace",
+                root.path().to_str().unwrap(),
+                "--offline",
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--max-output-tokens",
+                "4096",
+                "--model",
+                "dynamic",
+                "--endpoint",
+                &endpoint,
+                "--mode",
+                "rpc",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
+    let (events, replies) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && events.send(value).is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"thinking","type":"set_thinking_level","level":"low"})
+    )
+    .unwrap();
+    loop {
+        let event = replies
+            .recv_timeout(Duration::from_secs(10))
+            .expect("thinking response");
+        if event["id"] == "thinking" {
+            assert_eq!(event["success"], true, "{event}");
+            break;
+        }
+    }
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"prompt","type":"prompt","message":"hello"})
+    )
+    .unwrap();
+    let body = receive
+        .recv_timeout(Duration::from_secs(10))
+        .expect("model request");
+    assert_eq!(body["thinking_token_budget"], 1500);
+    stopping.store(true, std::sync::atomic::Ordering::Relaxed);
+    drop(input);
+    drop(child);
+    drop(replies);
+    reader.join().unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn rpc_model_input_survives_dynamic_selection_and_defaults_configured_models() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"ollama":{"models":[{"id":"configured"}]}}}).to_string(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let fixture_address = listener.local_addr().unwrap();
+    let endpoint = format!("http://{}/v1/chat/completions", fixture_address);
+    let stop = Arc::new(AtomicBool::new(false));
+    let _stop_guard = StopOnDrop(stop.clone());
+    let stopped = stop.clone();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = requests.clone();
+    let (idle_started, idle_ready) = mpsc::channel();
+    let (release_idle, idle_release) = mpsc::channel();
+    let (idle_finished, idle_done) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut connections = Vec::new();
+        let mut idle_signals = Some((idle_started, idle_release, idle_finished));
+        while !stopped.load(Ordering::Relaxed) {
+            let (mut socket, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(e) => panic!("{e}"),
+            };
+            let idle_gate = idle_signals.take();
+            let observed = observed.clone();
+            connections.push(std::thread::spawn(move || {
+                let (gate, idle_finished) = match idle_gate {
+                    Some((started, release, finished)) => {
+                        (Some((started, release)), Some(finished))
+                    }
+                    None => (None, None),
+                };
+                let result = read_rpc_model_fixture_request(&socket, |_| {
+                    if let Some((started, release)) = gate {
+                        let _ = started.send(());
+                        // Dropping the sender on panic releases the handler.
+                        let _ = release.recv();
+                    }
+                    Ok(())
+                });
+                if let Some(finished) = idle_finished {
+                    let _ = finished.send(());
+                }
+                let (request, request_body) = match result {
+                    Ok(request) => request,
+                    Err(error) => {
+                        observed
+                            .lock()
+                            .unwrap()
+                            .push(format!("fixture read failed: {error}"));
+                        return;
+                    }
+                };
+                observed.lock().unwrap().push(request.clone());
+                let body = if request.starts_with("GET /v1/models ") {
+                    r#"{"data":[{"id":"dynamic"}]}"#
+                } else if request.starts_with("GET /api/ps ") {
+                    r#"{"models":[]}"#
+                } else if request.starts_with("POST /api/show ") {
+                    let body: Value = serde_json::from_slice(&request_body).unwrap();
+                    match body["model"].as_str() {
+                        Some("dynamic") => r#"{"capabilities":["vision"]}"#,
+                        Some("configured") => r#"{"capabilities":[]}"#,
+                        _ => panic!("unexpected model request: {body}"),
+                    }
+                } else {
+                    panic!("unexpected request {request}")
+                };
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }));
+        }
+        for connection in connections {
+            connection.join().unwrap();
+        }
+    });
+    // Keep one accepted connection idle while the real discovery proceeds.
+    // A serial fixture would wait for this peer and miss the probe deadline.
+    let idle = TcpStream::connect(fixture_address).unwrap();
+    idle_ready.recv_timeout(Duration::from_secs(3)).unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--workspace",
+                root.path().to_str().unwrap(),
+                "--offline",
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--model",
+                "dynamic",
+                "--endpoint",
+                &endpoint,
+                "--mode",
+                "rpc",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && sender.send(value).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut request = |value: Value| -> Value {
+        let id = value["id"].clone();
+        writeln!(input, "{value}").unwrap();
+        loop {
+            let response = receiver
+                .recv_timeout(Duration::from_secs(20))
+                .expect("RPC response");
+            if response["id"] == id {
+                assert_eq!(response["success"], true, "{response}");
+                break response["data"].clone();
+            }
+        }
+    };
+    let models = request(json!({"type":"get_available_models", "id":"models"}));
+    assert!(matches!(
+        idle_done.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    release_idle.send(()).unwrap();
+    drop(idle);
+    idle_done.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert!(
+        models["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "dynamic" && m["input"] == json!(["text", "image"])),
+        "models: {models}; fixture requests: {:?}",
+        requests.lock().unwrap()
+    );
+    assert!(
+        models["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "configured" && m["input"] == json!(["text"]))
+    );
+    let selected = request(
+        json!({"type":"set_model", "id":"dynamic", "provider":"ollama", "modelId":"dynamic"}),
+    );
+    assert_eq!(selected["input"], json!(["text", "image"]));
+    let state = request(json!({"type":"get_state", "id":"state"}));
+    assert_eq!(state["model"]["input"], json!(["text", "image"]));
+    let selected = request(
+        json!({"type":"set_model", "id":"configured", "provider":"ollama", "modelId":"configured"}),
+    );
+    assert_eq!(selected["input"], json!(["text"]));
+    let state = request(json!({"type":"get_state", "id":"state2"}));
+    assert_eq!(state["model"]["input"], json!(["text"]));
+    drop(input);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+            panic!("RPC process did not exit after stdin closed");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    reader.join().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+    assert!(status.success());
 }
 
 #[test]
@@ -1196,20 +5481,32 @@ fn rpc_model_discovery_does_not_block_other_commands() {
     let (accepted, ready) = std::sync::mpsc::channel();
     let (release, gate) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
-        let (mut socket, mut reader, first) = accept_proxy_request(listener);
-        assert!(first.starts_with("GET "), "{first}");
         loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            if line == "\r\n" || line.is_empty() {
-                break;
+            let (mut socket, mut reader, first) =
+                accept_proxy_request(listener.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
             }
+            if first.starts_with("GET /api/ps ") {
+                socket
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                continue;
+            }
+            assert!(first.starts_with("GET /v1/models "), "{first}");
+            accepted.send(()).unwrap();
+            let _ = gate.recv_timeout(Duration::from_secs(30));
+            let body = br#"{"data":[{"id":"fixture-model"}]}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            socket.write_all(body).unwrap();
+            break;
         }
-        accepted.send(()).unwrap();
-        let _ = gate.recv_timeout(Duration::from_secs(30));
-        let body = br#"{"data":[{"id":"fixture-model"}]}"#;
-        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-        socket.write_all(body).unwrap();
     });
     let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
         .env("PI_RS_HOME", root.path())
@@ -1262,7 +5559,7 @@ fn rpc_model_discovery_does_not_block_other_commands() {
     assert_eq!(event["success"], true);
     let models = received.recv_timeout(Duration::from_secs(30)).unwrap();
     assert_eq!(models["id"], "models", "{models}");
-    assert_eq!(models["success"], true);
+    assert_eq!(models["success"], true, "{models}");
     assert!(
         models["data"]["models"]
             .as_array()
@@ -1274,6 +5571,834 @@ fn rpc_model_discovery_does_not_block_other_commands() {
     reader.join().unwrap();
     server.join().unwrap();
     assert!(status.success());
+}
+
+#[test]
+fn rpc_workspace_switch_defers_thinking_levels_and_orders_session_commands() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let launch = root.path().join("launch");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(launch.join(".pi")).unwrap();
+    std::fs::create_dir_all(target.join(".pi")).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    std::fs::write(
+        home.join("models.json"),
+        json!({"providers":{"ollama":{"baseUrl":base,"models":[{"id":"alpha","reasoning":false},{"id":"dynamic","reasoning":true}]}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        launch.join(".pi/settings.json"),
+        json!({"defaultProvider":"ollama","defaultModel":"alpha"}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        target.join(".pi/settings.json"),
+        json!({"enabledModels":["ollama/dynamic"]}).to_string(),
+    )
+    .unwrap();
+    let target_session = root.path().join("target.jsonl");
+    Session::open(&target_session)
+        .unwrap()
+        .set_working_directory(&target)
+        .unwrap();
+    let (accepted, ready) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert!(first.starts_with("GET /v1/models "), "{first}");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        accepted.send(()).unwrap();
+        gate.recv_timeout(Duration::from_secs(10)).unwrap();
+        let body = br#"{"data":[{"id":"dynamic"}]}"#;
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        socket.write_all(body).unwrap();
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", &home)
+        .arg("--workspace")
+        .arg(&launch)
+        .arg("--session")
+        .arg(root.path().join("launch.jsonl"))
+        .args(["--mode", "rpc", "--offline", "--no-mcp", "--approve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(child.stdout.take().unwrap())
+            .lines()
+            .map_while(Result::ok)
+        {
+            if send
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+        child.wait_with_output().unwrap()
+    });
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"switch","type":"switch_session","sessionPath":target_session})
+    )
+    .unwrap();
+    ready.recv_timeout(Duration::from_secs(10)).unwrap();
+    writeln!(input, "{}", json!({"id":"state","type":"get_state"})).unwrap();
+    writeln!(
+        input,
+        "{}",
+        json!({"id":"levels","type":"get_available_thinking_levels"})
+    )
+    .unwrap();
+    assert!(receive.recv_timeout(Duration::from_millis(150)).is_err());
+    writeln!(input, "{}", json!({"id":"new","type":"new_session"})).unwrap();
+    writeln!(input, "{}", json!({"id":"state2","type":"get_state"})).unwrap();
+    release.send(()).unwrap();
+    let mut replies = Vec::new();
+    while replies.len() < 5 {
+        let event = receive.recv_timeout(Duration::from_secs(10)).unwrap();
+        if ["switch", "state", "levels", "new", "state2"]
+            .contains(&event["id"].as_str().unwrap_or_default())
+        {
+            replies.push(event);
+        }
+    }
+    assert_eq!(replies[0]["id"], "switch");
+    assert_eq!(replies[0]["success"], true);
+    assert_eq!(replies[1]["id"], "state");
+    assert_eq!(replies[1]["data"]["model"]["id"], "dynamic");
+    assert_eq!(replies[2]["id"], "levels");
+    assert!(replies[2]["data"]["levels"].as_array().unwrap().len() > 1);
+    assert_eq!(replies[3]["id"], "new");
+    assert_eq!(replies[3]["success"], true);
+    assert_eq!(replies[4]["id"], "state2");
+    assert_eq!(replies[4]["data"]["model"]["id"], "dynamic");
+    writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+    drop(input);
+    let output = reader.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn rpc_abort_and_shutdown_cancel_pending_switch_and_queued_prompt() {
+    for control in ["abort", "shutdown"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(launch.join(".pi")).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":base,"models":[{"id":"alpha","reasoning":false}]}}}).to_string()).unwrap();
+        std::fs::write(
+            launch.join(".pi/settings.json"),
+            json!({"defaultProvider":"ollama","defaultModel":"alpha"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            json!({"enabledModels":["ollama/dynamic"]}).to_string(),
+        )
+        .unwrap();
+        let path = root.path().join("target.jsonl");
+        Session::open(&path)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let (accepted, ready) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, _) = accept_proxy_request(listener);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            accepted.send(()).unwrap();
+            let _ = gate.recv_timeout(Duration::from_secs(10));
+            let body = br#"{"data":[{"id":"dynamic"}]}"#;
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(body);
+        });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", &home)
+            .arg("--workspace")
+            .arg(&launch)
+            .arg("--session")
+            .arg(root.path().join("launch.jsonl"))
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--approve"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(child.stdout.take().unwrap())
+                .lines()
+                .map_while(Result::ok)
+            {
+                if send
+                    .send(serde_json::from_str::<Value>(&line).unwrap())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            child.wait_with_output().unwrap()
+        });
+        writeln!(
+            input,
+            "{}",
+            json!({"id":"switch","type":"switch_session","sessionPath":path})
+        )
+        .unwrap();
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        writeln!(
+            input,
+            "{}",
+            json!({"id":"prompt","type":"prompt","message":"must not run"})
+        )
+        .unwrap();
+        writeln!(input, "{}", json!({"id":"control","type":control})).unwrap();
+        let mut replies = Vec::new();
+        while replies.len() < 3 {
+            let event = receive
+                .recv_timeout(Duration::from_secs(3))
+                .expect("control blocked by discovery");
+            if event.get("id").is_some() {
+                replies.push(event);
+            }
+        }
+        assert_eq!(replies[0]["id"], "switch");
+        assert_eq!(replies[0]["data"]["cancelled"], true);
+        assert_eq!(replies[1]["id"], "prompt");
+        assert_eq!(replies[1]["success"], false);
+        assert_eq!(replies[2]["id"], "control");
+        assert_eq!(replies[2]["success"], true);
+        if control == "abort" {
+            writeln!(input, "{}", json!({"id":"state","type":"get_state"})).unwrap();
+            let state = receive.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(state["id"], "state");
+            assert_eq!(state["data"]["model"]["id"], "alpha");
+            writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+        }
+        drop(input);
+        let _ = release.send(());
+        let output = reader.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn rpc_new_session_recreates_cli_and_workspace_defaults() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let launch = root.path().join("launch");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha","reasoning":true},{"id":"beta","reasoning":true}]}}}).to_string()).unwrap();
+    for (workspace, model, thinking) in [(&launch, "alpha", "low"), (&target, "beta", "high")] {
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        std::fs::write(workspace.join(".pi/settings.json"), json!({"defaultProvider":"ollama","defaultModel":model,"defaultThinkingLevel":thinking,"enabledModels":[format!("ollama/{model}:{thinking}")]}).to_string()).unwrap();
+    }
+    let target_session = root.path().join("target.jsonl");
+    let mut session = Session::open(&target_session).unwrap();
+    session.set_working_directory(&target).unwrap();
+    drop(session);
+    for explicit in [true, false] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .env("PI_RS_HOME", &home)
+            .arg("--workspace")
+            .arg(&launch)
+            .arg("--session")
+            .arg(root.path().join(if explicit {
+                "explicit.jsonl"
+            } else {
+                "workspace.jsonl"
+            }))
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--approve"]);
+        if explicit {
+            command.args(["--model", "alpha", "--thinking", "low"]);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut requests = Vec::new();
+        if !explicit {
+            requests
+                .push(json!({"id":"switch","type":"switch_session","sessionPath":target_session}));
+        }
+        requests.push(json!({"id":"model","type":"set_model","provider":"ollama","modelId":if explicit { "beta" } else { "alpha" }}));
+        requests.push(json!({"id":"thinking","type":"set_thinking_level","level":if explicit { "high" } else { "low" }}));
+        requests.push(json!({"id":"new","type":"new_session"}));
+        requests.push(json!({"id":"state","type":"get_state"}));
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                requests
+                    .iter()
+                    .map(|request| format!("{request}\n"))
+                    .collect::<String>()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let responses: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for id in if explicit {
+            vec!["model", "thinking", "new"]
+        } else {
+            vec!["switch", "model", "thinking", "new"]
+        } {
+            let response = responses.iter().find(|value| value["id"] == id).unwrap();
+            assert_eq!(response["success"], true, "{response}");
+        }
+        let state = responses
+            .iter()
+            .find(|value| value["id"] == "state")
+            .unwrap();
+        assert_eq!(
+            state["data"]["model"]["id"],
+            if explicit { "alpha" } else { "beta" },
+            "{state}"
+        );
+        assert_eq!(
+            state["data"]["thinkingLevel"],
+            if explicit { "low" } else { "high" },
+            "{state}"
+        );
+    }
+}
+
+#[test]
+fn scoped_thinking_applies_to_new_sessions_and_resumes_restore_branch_thinking() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("settings.json"),
+        json!({
+            "defaultProvider":"ollama", "defaultModel":"alpha",
+            "defaultThinkingLevel":"medium",
+            "enabledModels":["ollama/alpha:high", "ollama/beta:high"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        json!({"providers":{"ollama":{
+            "baseUrl":"https://example.invalid/v1", "models":[
+                {"id":"alpha", "reasoning":true}, {"id":"beta", "reasoning":true},
+                {"id":"gamma", "reasoning":true}
+            ]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    for (index, arguments, saved_model, has_message, expected_model, expected_thinking) in [
+        (0, vec![], "alpha", false, "alpha", "high"),
+        (
+            1,
+            vec!["--model", "alpha"],
+            "alpha",
+            false,
+            "alpha",
+            "medium",
+        ),
+        (2, vec!["--model", "beta"], "alpha", false, "beta", "medium"),
+        (4, vec![], "gamma", false, "alpha", "high"),
+        (
+            3,
+            vec!["--model", "beta", "--thinking", "minimal"],
+            "alpha",
+            false,
+            "beta",
+            "minimal",
+        ),
+        (5, vec![], "alpha", true, "alpha", "low"),
+        (6, vec!["--model", "alpha"], "alpha", true, "alpha", "low"),
+        (7, vec!["--model", "beta"], "alpha", true, "beta", "low"),
+        (
+            8,
+            vec!["--model", "beta", "--thinking", "minimal"],
+            "alpha",
+            true,
+            "beta",
+            "minimal",
+        ),
+        (9, vec![], "gamma", true, "gamma", "low"),
+        (
+            10,
+            vec!["--provider", "ollama", "--model", "beta"],
+            "alpha",
+            true,
+            "beta",
+            "low",
+        ),
+    ] {
+        let path = directory.path().join(format!("session-{index}.jsonl"));
+        let mut session = Session::open(&path).unwrap();
+        session
+            .select_provider_model(None, saved_model, Some("low"))
+            .unwrap();
+        if has_message {
+            session
+                .append_user_with_images("existing conversation".into(), Vec::new(), None)
+                .unwrap();
+        }
+        drop(session);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", &home)
+            .args(["--session"])
+            .arg(&path)
+            .args(["--workspace"])
+            .arg(directory.path())
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--no-trust"])
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let state: Value =
+            serde_json::from_slice(output.stdout.split(|byte| *byte == b'\n').next().unwrap())
+                .unwrap();
+        assert_eq!(state["data"]["model"]["id"], expected_model, "{state}");
+        assert_eq!(state["data"]["thinkingLevel"], expected_thinking, "{state}");
+    }
+}
+
+#[test]
+fn resumed_pi_system_updates_follow_the_selected_provider_capability() {
+    for (api, input, path, events) in [
+        (
+            "openai-responses",
+            "input",
+            "/v1/responses",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+        ),
+        (
+            "openai-completions",
+            "messages",
+            "/v1/chat/completions",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        ),
+        (
+            "anthropic-messages",
+            "messages",
+            "/v1/messages",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+        ),
+    ] {
+        for supports_updates in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+            let profile = json!({"providers":{"fixture-provider":{
+                "api":api,"baseUrl":endpoint,"apiKey":"fixture",
+                "models":[{"id":"fixture-model","input":["text"],"contextWindow":65536,
+                    "maxTokens":4096,"compat":{"supportsMidConvoSystemMessages":supports_updates}}]
+            }}});
+            std::fs::write(root.join("models.json"), profile.to_string()).unwrap();
+            let source = root.join("source.jsonl");
+            let entries = [
+                json!({"type":"session","version":3}),
+                json!({"type":"message","id":"base","parentId":null,"message":{
+                    "role":"system","content":"Original","sections":{"keep":"Keep","state":"Old state"}
+                }}),
+                json!({"type":"message","id":"before","parentId":"base","message":{
+                    "role":"user","content":"Before update"
+                }}),
+                json!({"type":"message","id":"update","parentId":"before","message":{
+                    "role":"system","content":"Additional","sections":{"state":"New state","keep":null}
+                }}),
+                json!({"type":"message","id":"after","parentId":"update","message":{
+                    "role":"user","content":"After update"
+                }}),
+            ];
+            let journal: String = entries.iter().map(|entry| format!("{entry}\n")).collect();
+            std::fs::write(&source, &journal).unwrap();
+            let native = root.join("native.jsonl");
+            let command = || {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_pi-rs"));
+                command
+                    .current_dir(root)
+                    .env("PI_RS_HOME", root)
+                    .arg("--session")
+                    .arg(&native)
+                    .args(["--offline", "--no-trust", "--no-mcp", "--no-tools"]);
+                command
+            };
+            let imported = command().arg("import").arg(&source).output().unwrap();
+            assert!(
+                imported.status.success(),
+                "{}",
+                String::from_utf8_lossy(&imported.stderr)
+            );
+            let server = std::thread::spawn(move || {
+                let (mut socket, mut reader, first) = accept_proxy_request(listener);
+                assert!(first.starts_with(&format!("POST {path} ")), "{first}");
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let mut body = vec![0; length.unwrap()];
+                reader.read_exact(&mut body).unwrap();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}",
+                    events.len()
+                ).unwrap();
+                serde_json::from_slice::<Value>(&body).unwrap()
+            });
+            let output = command()
+                .args([
+                    "--provider",
+                    "fixture-provider",
+                    "--model",
+                    "fixture-model",
+                    "--print",
+                    "Continue",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{api}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let body = server.join().unwrap();
+            let messages = body[input].as_array().unwrap();
+            let roles: Vec<_> = messages
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect();
+            let update = "Additional\n\nUpdated system prompt section \"state\":\n\nNew state\n\nRemoved system prompt section \"keep\".";
+            if api == "anthropic-messages" && supports_updates {
+                assert_eq!(roles, ["user", "system"], "{body}");
+                assert_eq!(body["system"][0]["text"], "Original\n\nKeep\n\nOld state");
+                assert_eq!(messages[1]["content"][0]["text"], update);
+            } else if api == "anthropic-messages" {
+                assert_eq!(roles, ["user"], "{body}");
+                assert_eq!(
+                    body["system"][0]["text"],
+                    "Original\n\nAdditional\n\nNew state"
+                );
+            } else if supports_updates {
+                assert_eq!(roles, ["system", "user", "system", "user", "user"], "{api}");
+                assert_eq!(messages[0]["content"], "Original\n\nKeep\n\nOld state");
+                assert_eq!(messages[2]["content"], update);
+            } else {
+                assert_eq!(roles, ["system", "user", "user", "user"], "{api}");
+                assert_eq!(
+                    messages[0]["content"],
+                    "Original\n\nAdditional\n\nNew state"
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&source).unwrap(), journal);
+        }
+    }
+}
+
+#[test]
+fn rpc_worker_preserves_imported_selection_and_cli_provenance() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"defaultProvider":"ollama","defaultModel":"physical"}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":"https://example.invalid/v1","models":[{"id":"physical","reasoning":true}]}}}).to_string()).unwrap();
+    let source = root.path().join("pi.jsonl");
+    let entries = [
+        json!({"type":"session","version":3}),
+        json!({"type":"model_change","id":"change","parentId":null,"provider":"router","modelId":"virtual"}),
+        json!({"type":"message","id":"user","parentId":"change","message":{"role":"user","content":"question"}}),
+        json!({"type":"message","id":"assistant","parentId":"user","message":{"role":"assistant","provider":"ollama","model":"physical","content":[]}}),
+    ];
+    std::fs::write(
+        &source,
+        entries
+            .iter()
+            .map(|entry| format!("{entry}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    for (label, flags, expected) in [
+        ("implicit", vec![], vec!["virtual"]),
+        ("thinking", vec!["--thinking", "high"], vec!["virtual"]),
+        (
+            "model",
+            vec!["--model", "physical"],
+            vec!["virtual", "physical"],
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":base,"models":[{"id":"physical","reasoning":true}]}}}).to_string()).unwrap();
+        let server = std::thread::spawn(move || {
+            loop {
+                let (mut socket, mut reader, first) =
+                    accept_proxy_request(listener.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                if !first.starts_with("POST /v1/chat/completions ") {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                let events = concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+                break;
+            }
+        });
+        let native = root.path().join(format!("{label}.jsonl"));
+        let imported = Command::new(env!("CARGO_BIN_EXE_pi-rs"))
+            .env("PI_RS_HOME", &home)
+            .arg("--session")
+            .arg(&native)
+            .arg("--workspace")
+            .arg(root.path())
+            .args(["--offline", "--no-mcp", "--no-trust", "import"])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            imported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&imported.stderr)
+        );
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", &home)
+            .arg("--session")
+            .arg(&native)
+            .arg("--workspace")
+            .arg(root.path())
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--no-trust"])
+            .args(flags)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(child.stdout.take().unwrap())
+                .lines()
+                .map_while(Result::ok)
+            {
+                if send
+                    .send(serde_json::from_str::<Value>(&line).unwrap())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            child.wait_with_output().unwrap()
+        });
+        writeln!(
+            input,
+            "{}",
+            json!({"id":"prompt","type":"prompt","message":"continue"})
+        )
+        .unwrap();
+        loop {
+            let event = receive.recv_timeout(Duration::from_secs(15)).unwrap();
+            if event["type"] == "agent_settled" {
+                assert_eq!(event["aborted"], false, "{event}");
+                break;
+            }
+        }
+        writeln!(input, "{}", json!({"id":"entries","type":"get_entries"})).unwrap();
+        let projected = loop {
+            let event = receive.recv_timeout(Duration::from_secs(15)).unwrap();
+            if event["type"] == "response" && event["id"] == "entries" {
+                break event;
+            }
+        };
+        let changes: Vec<_> = projected["data"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["type"] == "model_change")
+            .filter_map(|entry| entry["modelId"].as_str())
+            .collect();
+        assert_eq!(changes, expected, "{label}: {projected}");
+        if label == "thinking" {
+            assert!(
+                projected["data"]["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["type"] == "thinking_level_change"
+                        && entry["thinkingLevel"] == "high"),
+                "{projected}"
+            );
+        }
+        writeln!(input, "{}", json!({"type":"shutdown"})).unwrap();
+        drop(input);
+        let output = reader.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn omitted_user_with_empty_failed_assistant_is_a_resumed_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("settings.json"), json!({"defaultProvider":"ollama", "defaultModel":"alpha", "enabledModels":["ollama/alpha:high"]}).to_string()).unwrap();
+    std::fs::write(home.join("models.json"), json!({"providers":{"ollama":{"baseUrl":"https://example.invalid/v1", "models":[{"id":"alpha", "reasoning":true}]}}}).to_string()).unwrap();
+    for (index, reason, omit_assistant, expected) in [
+        (0, "error", false, "low"),
+        (1, "aborted", false, "low"),
+        (2, "error", true, "high"),
+    ] {
+        let source = directory.path().join(format!("source-{index}.jsonl"));
+        let native = directory.path().join(format!("native-{index}.jsonl"));
+        let mut entries = vec![
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"m","parentId":null,"provider":"ollama","modelId":"alpha"}),
+            json!({"type":"thinking_level_change","id":"t","parentId":"m","thinkingLevel":"low"}),
+            json!({"type":"message","id":"u","parentId":"t","message":{"role":"user","content":"question"}}),
+            json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","provider":"ollama","model":"alpha","stopReason":reason,"content":[]}}),
+            json!({"type":"context_edit","id":"eu","parentId":"a","targetId":"u","replacement":null}),
+        ];
+        if omit_assistant {
+            entries.push(json!({"type":"context_edit","id":"ea","parentId":"eu","targetId":"a","replacement":null}));
+        }
+        std::fs::write(
+            &source,
+            entries
+                .iter()
+                .map(|entry| format!("{entry}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let imported = Command::new(env!("CARGO_BIN_EXE_pi-rs"))
+            .env("PI_RS_HOME", &home)
+            .arg("--session")
+            .arg(&native)
+            .arg("--workspace")
+            .arg(directory.path())
+            .args(["--offline", "--no-mcp", "--no-trust", "import"])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            imported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&imported.stderr)
+        );
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", &home)
+            .arg("--session")
+            .arg(&native)
+            .arg("--workspace")
+            .arg(directory.path())
+            .args(["--mode", "rpc", "--offline", "--no-mcp", "--no-trust"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let state: Value =
+            serde_json::from_slice(output.stdout.split(|byte| *byte == b'\n').next().unwrap())
+                .unwrap();
+        assert_eq!(state["data"]["thinkingLevel"], expected, "{state}");
+    }
 }
 
 #[test]
@@ -1383,6 +6508,24 @@ fn print_and_json_modes_accept_positional_prompts() {
                 .collect();
             assert_eq!(records[0]["type"], "session");
             assert_eq!(records[0]["version"], 3);
+            let mut saw_final_usage = false;
+            for update in records
+                .iter()
+                .filter(|event| event["type"] == "message_update")
+            {
+                let usage = &update["usage"];
+                assert!(usage.is_object(), "{update:?}");
+                assert_eq!(*usage, update["message"]["usage"]);
+                assert_eq!(*usage, update["assistantMessageEvent"]["partial"]["usage"]);
+                if update["assistantMessageEvent"]["type"] == "text_end" {
+                    assert_eq!(usage["input"], 12);
+                    assert_eq!(usage["output"], 2);
+                    assert_eq!(usage["cacheRead"], 7);
+                    assert_eq!(usage["totalTokens"], 21);
+                    saw_final_usage = true;
+                }
+            }
+            assert!(saw_final_usage);
             let updates: Vec<_> = records
                 .iter()
                 .filter_map(|event| event.get("assistantMessageEvent"))
@@ -1401,14 +6544,58 @@ fn print_and_json_modes_accept_positional_prompts() {
                     .iter()
                     .any(|event| event["type"] == "agent_end" && event["success"] == true)
             );
-            assert!(
-                records
-                    .iter()
-                    .any(|record| record["type"] == "answer"
-                        && record["content"] == "fixture answer")
-            );
+            assert!(!records.iter().any(|record| record["type"] == "answer"));
         }
     }
+    server.join().unwrap();
+}
+
+#[test]
+fn json_print_mode_emits_only_agent_events_for_multiple_prompts() {
+    let root = tempfile::tempdir().unwrap();
+    let (endpoint, server) = model_fixture();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--endpoint",
+            &endpoint,
+            "--mode",
+            "json",
+            "same input",
+            "second",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events[0]["type"], "session");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "agent_end")
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "agent_settled")
+            .count(),
+        2
+    );
+    assert!(!events.iter().any(|event| event["type"] == "answer"));
     server.join().unwrap();
 }
 
@@ -1478,7 +6665,25 @@ fn model_fixture_with_gate(
     effort: Option<&'static str>,
     finish: &'static str,
     expected_token: Option<&'static str>,
+    release_first: Option<std::sync::mpsc::Receiver<()>>,
+) -> (String, std::thread::JoinHandle<()>) {
+    model_fixture_with_gate_timeout(
+        effort,
+        finish,
+        expected_token,
+        release_first,
+        Duration::from_secs(15),
+        None,
+    )
+}
+
+fn model_fixture_with_gate_timeout(
+    effort: Option<&'static str>,
+    finish: &'static str,
+    expected_token: Option<&'static str>,
     mut release_first: Option<std::sync::mpsc::Receiver<()>>,
+    gate_timeout: Duration,
+    stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> (String, std::thread::JoinHandle<()>) {
     let server = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!(
@@ -1490,6 +6695,12 @@ fn model_fixture_with_gate(
         let mut completed = 0;
         let deadline = Instant::now() + Duration::from_secs(180);
         while completed < 2 {
+            if stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return;
+            }
             let (mut socket, _) = match server.accept() {
                 Ok(connection) => connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1558,7 +6769,7 @@ fn model_fixture_with_gate(
             ).replace("\"finish_reason\":\"stop\"", &format!("\"finish_reason\":\"{finish}\""));
             if let Some(release) = release_first.take() {
                 release
-                    .recv_timeout(Duration::from_secs(15))
+                    .recv_timeout(gate_timeout)
                     .expect("release first response");
             }
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
@@ -2023,6 +7234,14 @@ fn rpc_controls_apply_while_idle_and_streaming() {
             }
         }
     };
+    for command in ["set_steering_mode", "set_follow_up_mode"] {
+        for (id, mode) in [("idle-first", "all"), ("idle-last", "one-at-a-time")] {
+            send(json!({"type":command,"id":id,"mode":mode}));
+            let response = until(&|event| event["type"] == "response" && event["id"] == id);
+            assert_eq!(response["success"], true, "{response}");
+            assert!(response.get("data").is_none(), "{response}");
+        }
+    }
     send(serde_json::json!({"type":"steer","id":"idle-steer","message":"queued while idle"}));
     let updated = until(&|event| event["type"] == "queue_update" || event["id"] == "idle-steer");
     assert_eq!(
@@ -2043,6 +7262,19 @@ fn rpc_controls_apply_while_idle_and_streaming() {
     );
     send(serde_json::json!({"type":"prompt","message":"same input"}));
     until(&|event| event["record"]["event"]["type"] == "model_requested");
+    for command in ["set_steering_mode", "set_follow_up_mode"] {
+        for (id, mode) in [("active-first", "all"), ("active-last", "one-at-a-time")] {
+            send(json!({"type":command,"id":id,"mode":mode}));
+            let response = until(&|event| event["type"] == "response" && event["id"] == id);
+            assert_eq!(response["success"], true, "{response}");
+            assert!(response.get("data").is_none(), "{response}");
+        }
+    }
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("home/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(settings["steeringMode"], "one-at-a-time");
+    assert_eq!(settings["followUpMode"], "one-at-a-time");
     send(serde_json::json!({"type":"set_session_name","id":"rename","name":"  Active name  "}));
     let renamed = until(&|event| event["type"] == "session_info_changed");
     assert_eq!(renamed["name"], "Active name");
@@ -2367,6 +7599,22 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                     }
                     headers.push_str(&line.to_ascii_lowercase());
                 }
+                assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+                socket
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .unwrap();
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut origin_headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    origin_headers.push_str(&line.to_ascii_lowercase());
+                }
+                assert!(!origin_headers.contains("proxy-authorization:"));
                 if first.starts_with("GET ") {
                     socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                     continue;
@@ -2434,10 +7682,7 @@ fn model_requests_use_configured_http_proxy_and_environment_overrides() {
                     String::from_utf8_lossy(&stderr)
                 )
             });
-        assert!(
-            request.starts_with("POST http://127.0.0.1:1/"),
-            "{provider}: {request}"
-        );
+        assert!(request.starts_with("POST /"), "{provider}: {request}");
         assert!(
             headers.contains("proxy-authorization: basic dxnlcjpwyxnz"),
             "{provider}: {headers}"
@@ -2550,6 +7795,19 @@ fn model_listing_uses_proxy_before_a_model_request() {
     .unwrap();
     let server = std::thread::spawn(move || {
         let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
@@ -2586,12 +7844,7 @@ fn model_listing_uses_proxy_before_a_model_request() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        server
-            .join()
-            .unwrap()
-            .starts_with("GET http://127.0.0.1:1/v1/models ")
-    );
+    assert!(server.join().unwrap().starts_with("GET /v1/models "));
 }
 
 #[test]
@@ -2607,6 +7860,19 @@ fn radius_auth_refresh_uses_proxy_from_settings() {
     std::fs::write(root.path().join("auth.json"), json!({"radius":{"type":"oauth","gateway":"http://127.0.0.1:1/","access":"old-token","refresh":"fixture-refresh","expires":0}}).to_string()).unwrap();
     let server = std::thread::spawn(move || {
         let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
         let mut length = 0;
         loop {
             let mut line = String::new();
@@ -2645,7 +7911,7 @@ fn radius_auth_refresh_uses_proxy_from_settings() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "new-token");
     let (request, body) = server.join().unwrap();
-    assert!(request.starts_with("POST http://127.0.0.1:1/v1/oauth/token "));
+    assert!(request.starts_with("POST /v1/oauth/token "));
     assert!(
         String::from_utf8(body)
             .unwrap()
@@ -2666,6 +7932,19 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
     std::fs::write(root.path().join("mcp.json"), json!({"mcpServers":{"fixture":{"url":"http://127.0.0.1:1/mcp","auth":{"provider":"anthropic"},"oauth":false}}}).to_string()).unwrap();
     let server = std::thread::spawn(move || {
         let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert_eq!(first, "CONNECT 127.0.0.1:1 HTTP/1.1\r\n");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
         let mut headers = String::new();
         loop {
             let mut line = String::new();
@@ -2702,15 +7981,88 @@ fn mcp_provider_authenticated_connection_uses_configured_proxy() {
             String::from_utf8_lossy(&output.stderr)
         )
     });
-    assert!(
-        request.starts_with("POST http://127.0.0.1:1/mcp "),
-        "{request}"
-    );
+    assert!(request.starts_with("POST /mcp "), "{request}");
     assert!(
         headers.contains("authorization: bearer fixture-token"),
         "{headers}"
     );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-token"));
+}
+
+#[test]
+fn bare_model_patterns_search_provider_catalogs_before_local_model_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    let models = json!({"providers":{
+        "relay-one":{"api":"openai-completions","baseUrl":"https://one.example/v1","apiKey":"fixture",
+            "models":[{"id":"widget-a","name":"Widget Alpha"},{"id":"widget-z-20260101","name":"Widget Snapshot"},
+                {"id":"crystal-a","name":"Crystal"},{"id":"crystal-z","name":"Crystal Next"}]},
+        "relay-two":{"api":"openai-completions","baseUrl":"https://two.example/v1",
+            "models":[{"id":"widget-z","name":"Widget Pro"},{"id":"widget-a","name":"Widget Alpha"}]}
+    }});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    let run = |query: &str, inline: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_pi"));
+        cmd.current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "--mode",
+                "rpc",
+                "--no-session",
+                "--no-mcp",
+                "--offline",
+                "--model",
+                query,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if inline {
+            cmd.args(["--api-key", "inline-fixture"]);
+        }
+        let mut process = cmd.spawn().unwrap();
+        if let Err(error) = process
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n")
+        {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+        process.wait_with_output().unwrap()
+    };
+    for (query, inline, provider, model) in [
+        ("Widget", false, "relay-one", "widget-a"),
+        ("Widget:high", false, "relay-one", "widget-a"),
+        ("Widget", true, "relay-two", "widget-z"),
+        ("widget-z-20260101", false, "relay-one", "widget-z-20260101"),
+        ("Widget Pro", false, "relay-two", "widget-z"),
+        ("Crystal", false, "relay-one", "crystal-z"),
+        ("relay-one/Crystal", false, "relay-one", "crystal-a"),
+    ] {
+        let result = run(query, inline);
+        assert!(
+            result.status.success(),
+            "{query}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output = String::from_utf8(result.stdout).unwrap();
+        let response: Value = output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|reply| reply["id"] == "state")
+            .unwrap();
+        assert_eq!(response["data"]["model"]["provider"], provider, "{query}");
+        assert_eq!(response["data"]["model"]["id"], model, "{query}");
+    }
+    let ambiguous = run("Widget Alpha", true);
+    assert!(!ambiguous.status.success());
+    let stderr = String::from_utf8(ambiguous.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "relay-one/widget-a, relay-two/widget-a. --api-key does not choose a provider."
+        ),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -2743,7 +8095,7 @@ fn default_model_and_provider_are_read_as_separate_fields() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"stop\",\"type\":\"shutdown\"}\n").unwrap();
+        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
         let output = process.wait_with_output().unwrap();
         assert!(
             output.status.success(),
@@ -2758,5 +8110,2984 @@ fn default_model_and_provider_are_read_as_separate_fields() {
         let state = events.iter().find(|event| event["id"] == "state").unwrap();
         assert_eq!(state["data"]["model"]["provider"], provider);
         assert_eq!(state["data"]["model"]["id"], model);
+        let after = events.iter().find(|event| event["id"] == "after").unwrap();
+        assert_eq!(after["data"]["model"]["provider"], provider);
+        assert_eq!(after["data"]["model"]["id"], model);
+    }
+}
+
+#[test]
+fn automatic_startup_uses_radius_catalogs_without_making_a_request() {
+    let root = tempfile::tempdir().unwrap();
+    let server = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    server.set_nonblocking(true).unwrap();
+    let address = server.local_addr().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command.env_clear();
+    for name in ["PATH", "SystemRoot", "HOME", "USERPROFILE", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let mut child = command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .env("PI_RADIUS_GATEWAY", format!("http://{address}"))
+        .env("RADIUS_API_KEY", "radius-fixture")
+        .env("GEMINI_API_KEY", "google-fixture")
+        .args(["--mode", "rpc", "--no-session", "--no-mcp", "--offline"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["id"] == "state")
+        .unwrap();
+    assert_eq!(state["data"]["model"]["provider"], "google");
+    assert_eq!(
+        server.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn startup_chooses_authenticated_models_in_pi_provider_order() {
+    let root = tempfile::tempdir().unwrap();
+    let route = "https://example.invalid/v1";
+    let models = json!({"providers":{"relay":{
+        "api":"openai-completions", "baseUrl":route, "apiKey":"relay-fixture", "models":[{"id":"local-model"}]
+    }}});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    for (anthropic, google, extra, expected_provider, expected_model) in [
+        (true, true, vec![], "anthropic", "claude-opus-5-5"),
+        (false, true, vec![], "google", "gemini-4-argon"),
+        (false, false, vec![], "relay", "local-model"),
+        (
+            true,
+            true,
+            vec!["--provider", "ollama"],
+            "ollama",
+            "qwen2.5:7b",
+        ),
+        (
+            true,
+            true,
+            vec!["--api-key", "inline-fixture"],
+            "ollama",
+            "qwen2.5:7b",
+        ),
+        (
+            true,
+            true,
+            vec!["--models", "google/gemini-4-argon"],
+            "google",
+            "gemini-4-argon",
+        ),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command.env_clear();
+        for name in ["PATH", "SystemRoot", "HOME", "USERPROFILE", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        if anthropic {
+            command.env("ANTHROPIC_API_KEY", "anthropic-fixture");
+        }
+        if google {
+            command.env("GEMINI_API_KEY", "google-fixture");
+        }
+        let mut process = command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["--mode", "rpc", "--no-session", "--no-mcp", "--offline"])
+            .args(extra)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
+        let output = process.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for id in ["state", "after"] {
+            let event = events.iter().find(|event| event["id"] == id).unwrap();
+            assert_eq!(event["data"]["model"]["provider"], expected_provider);
+            assert_eq!(event["data"]["model"]["id"], expected_model);
+        }
+    }
+}
+
+#[test]
+fn selected_builtin_provider_uses_its_pi_default_without_a_model() {
+    for (settings, provider_args) in [
+        (json!({}), vec!["--provider", "google"]),
+        (json!({"defaultProvider":"google"}), vec![]),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("settings.json"), settings.to_string()).unwrap();
+        let mut process = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("GEMINI_API_KEY", "fixture")
+            .args(["--mode", "rpc", "--no-session", "--no-mcp", "--offline"])
+            .args(provider_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process.stdin.take().unwrap().write_all(b"{\"id\":\"state\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
+        let output = process.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for id in ["state", "after"] {
+            let event = events.iter().find(|event| event["id"] == id).unwrap();
+            assert_eq!(event["data"]["model"]["provider"], "google");
+            assert_eq!(event["data"]["model"]["id"], "gemini-4-argon");
+        }
+    }
+}
+
+#[test]
+fn provider_flag_without_model_survives_workspace_refresh_and_new_session() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("models.json"), json!({"providers":{
+        "ollama":{"baseUrl":"https://example.invalid/v1","models":[{"id":"alpha"}]},
+        "relay":{"baseUrl":"https://example.invalid/v1","api":"openai-completions","models":[{"id":"beta"}]}
+    }}).to_string()).unwrap();
+    std::fs::write(root.path().join("settings.json"), json!({"defaultProvider":"ollama","defaultModel":"alpha","enabledModels":["ollama/alpha","relay/beta"]}).to_string()).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--no-mcp",
+            "--offline",
+            "--provider",
+            "relay",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"{\"id\":\"before\",\"type\":\"get_state\"}\n{\"id\":\"new\",\"type\":\"new_session\"}\n{\"id\":\"after\",\"type\":\"get_state\"}\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for id in ["before", "after"] {
+        let state = events.iter().find(|event| event["id"] == id).unwrap();
+        assert_eq!(state["data"]["model"]["provider"], "relay", "{state}");
+        assert_eq!(state["data"]["model"]["id"], "beta", "{state}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn supplied_compaction_hooks_trigger_durable_turns_in_print_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("compact-hooks.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v2' in sys.argv:
+    frame=json.loads(sys.stdin.readline()); request=frame['request']; kind=request['type']
+    assert kind in ('before_compaction','after_compaction')
+    print(json.dumps({'type':'send_message','delivery':'triggerTurn','message':{'customType':'compact-hook','content':'same input','display':False}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    result=[request['summary'],request['keep_turns'],{'allow':True,'reason':None}] if kind=='before_compaction' else None
+    print(json.dumps({'type':'complete','response':{'Ok':result}}),flush=True)
+else:
+    request=json.load(sys.stdin)
+    if request['type']=='describe': result={'id':'compact-hook','dependencies':[],'commands':[],'tools':[],'compaction_hook_host_calls':True}
+    elif request['type']=='before_request': result=request['request']
+    else: result=None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = root.path().join("session.jsonl");
+    let mut session = Session::open(&path).unwrap();
+    session
+        .append_user_with_images("old".into(), vec![], None)
+        .unwrap();
+    drop(session);
+    let (endpoint, server) = model_fixture();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .arg("--session")
+        .arg(&path)
+        .args([
+            "--no-mcp",
+            "--no-trust",
+            "--endpoint",
+            &endpoint,
+            "--extension",
+        ])
+        .arg(&extension)
+        .args(["compact", "--summary", "summary", "--keep-turns", "0"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    let session = Session::open(path).unwrap();
+    assert!(session.pending_custom_trigger().is_none());
+    assert_eq!(session.records().iter().filter(|record| matches!(&record.event,
+        pi_rs::Event::CustomMessageDelivered { message, .. } if message.custom_type == "compact-hook")).count(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_discovered_prompt_reports_extension_source() {
+    use std::os::unix::fs::PermissionsExt;
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("fixture.js");
+    let prompt = root.path().join("discovered.md");
+    std::fs::write(&prompt, "---\ndescription: discovered prompt\n---\nHello").unwrap();
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+request=json.load(sys.stdin)
+if request['type']=='describe': result={'id':'fixture','dependencies':[],'commands':[],'tools':[],'resource_discovery_hook':True}
+elif request['type']=='discover_resources': result={'skillPaths':[],'promptPaths':['discovered.md'],'themePaths':[]}
+else: result=None
+print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path().join("home"))
+            .args([
+                "--mode",
+                "rpc",
+                "--no-mcp",
+                "--no-trust",
+                "--offline",
+                "--extension",
+            ])
+            .arg(&extension)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(input, "{}", json!({"id":"commands", "type":"get_commands"})).unwrap();
+    input.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let response = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = receiver.recv_timeout(remaining).unwrap();
+        if event["id"] == "commands" {
+            break event;
+        }
+    };
+    let command = response["data"]["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|command| command["name"] == "discovered")
+        .unwrap();
+    assert_eq!(
+        command["sourceInfo"],
+        json!({
+            "path":prompt.canonicalize().unwrap(), "source":"extension:fixture",
+            "scope":"temporary", "origin":"top-level", "baseDir":root.path().canonicalize().unwrap()
+        })
+    );
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "RPC process did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    reader.join().unwrap();
+    assert!(status.success(), "RPC process exited with {status}");
+}
+
+#[cfg(unix)]
+#[test]
+fn single_command_session_lifecycle_persists_custom_entries() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("lifecycle.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    request=json.load(sys.stdin)
+    if request['type']=='describe': result={'id':'lifecycle','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'session_lifecycle_hook':True,'lifecycle_host_calls':True}
+    elif request['type']=='before_request': result=request['request']
+    else: result=None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame=json.loads(sys.stdin.readline())
+    event=frame['request']['event']['type']
+    if event in ('session_start','session_shutdown'):
+        assert frame['has_custom_entries'] and frame['has_custom_entry_read']
+        print(json.dumps({'type':'list_custom_entries','custom_type':'lifecycle'}),flush=True)
+        previous=json.loads(sys.stdin.readline())['Ok']
+        assert len(previous)==(0 if event=='session_start' else 1)
+        print(json.dumps({'type':'append_entry','entry':{'customType':'lifecycle','data':{'event':event}}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}),flush=True)
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let session_path = root.path().join("session.jsonl");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (mut socket, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("model fixture accept failed: {error}"),
+                }
+            };
+            // Accepted sockets can inherit the listener's nonblocking mode on macOS.
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&socket);
+            let mut length = 0;
+            let mut metadata_request = false;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+                metadata_request |= line.starts_with("GET /api/ps ");
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            if metadata_request {
+                write!(
+                    socket,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                !serde_json::to_string(&request["messages"])
+                    .unwrap()
+                    .contains("session_start")
+            );
+            let response = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
+            break;
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .arg("--session")
+        .arg(&session_path)
+        .args([
+            "--no-mcp",
+            "--no-trust",
+            "--endpoint",
+            &endpoint,
+            "--extension",
+        ])
+        .arg(&extension)
+        .args(["--print", "same input"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    let session = Session::open(session_path).unwrap();
+    let entries: Vec<_> = session
+        .branch()
+        .iter()
+        .filter_map(|record| match &record.event {
+            pi_rs::Event::CustomEntry { entry } if entry.custom_type == "lifecycle" => {
+                entry.data.clone()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        vec![
+            json!({"event":"session_start"}),
+            json!({"event":"session_shutdown"})
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn resource_discovery_trigger_runs_before_print_prompt() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("resources.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v2' in sys.argv:
+    frame=json.loads(sys.stdin.readline())
+    assert frame['request']['type']=='discover_resources'
+    print(json.dumps({'type':'send_message','delivery':'triggerTurn','message':{'customType':'resources','content':'same input','display':False}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':{'skillPaths':[],'promptPaths':[],'themePaths':[]}}}),flush=True)
+else:
+    request=json.load(sys.stdin)
+    if request['type']=='describe': result={'id':'resources','dependencies':[],'commands':[],'tools':[],'resource_discovery_hook':True,'resources_hook_host_calls':True}
+    elif request['type']=='before_request': result=request['request']
+    else: result=None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let session_path = root.path().join("session.jsonl");
+    let (endpoint, server) = model_fixture();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .arg("--session")
+        .arg(&session_path)
+        .args([
+            "--no-mcp",
+            "--no-trust",
+            "--endpoint",
+            &endpoint,
+            "--extension",
+        ])
+        .arg(&extension)
+        .args(["--print", "same input"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    let session = Session::open(session_path).unwrap();
+    let branch = session.branch();
+    let custom = branch.iter().position(|r| matches!(&r.event, pi_rs::Event::CustomMessageDelivered { message, .. } if message.custom_type == "resources")).unwrap();
+    let user = branch
+        .iter()
+        .position(
+            |r| matches!(&r.event, pi_rs::Event::User { content, .. } if content == "same input"),
+        )
+        .unwrap();
+    assert!(custom < user);
+    assert!(session.pending_custom_trigger().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_shell_hook_journals_custom_message_before_reply() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("shell-message.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v2' in sys.argv:
+    frame=json.loads(sys.stdin.readline())
+    assert frame['request']['type']=='user_bash'
+    print(json.dumps({'type':'send_message','delivery':'nextTurn','message':{'customType':'shell','content':'queued from shell','display':False,'details':{'source':'shell'}}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':{'output':'intercepted','exitCode':0}}}),flush=True)
+else:
+    request=json.load(sys.stdin)
+    result={'id':'shell-message','dependencies':[],'commands':[],'tools':[],'user_bash_hook':True,'user_bash_hook_host_calls':True} if request['type']=='describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let session_path = root.path().join("session.jsonl");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .arg("--session")
+        .arg(&session_path)
+        .args([
+            "--mode",
+            "rpc",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--extension",
+        ])
+        .arg(&extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(
+        input,
+        "{}",
+        json!({"type":"bash","id":"shell","command":"echo hi"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    loop {
+        let event = receive
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|error| {
+                let _ = child.kill();
+                panic!("shell callback timed out: {error}")
+            });
+        if event["type"] == "response" && event["id"] == "shell" {
+            assert_eq!(event["success"], true, "{event}");
+            break;
+        }
+    }
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let session = Session::open(session_path).unwrap();
+    let pending = session.queued_custom_messages();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].1.message.custom_type, "shell");
+    assert_eq!(
+        pending[0].1.message.details,
+        Some(json!({"source":"shell"}))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_streamed_shell_operation_can_send_custom_message() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("shell-stream.py");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v2' in sys.argv:
+    frame=json.loads(sys.stdin.readline()); kind=frame['request']['type']
+    if kind=='user_bash_operations': result=True
+    elif kind=='execute_user_bash':
+        print(json.dumps({'type':'progress','partial_result':{'shellOutput':list(b'before')}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+        print(json.dumps({'type':'send_message','delivery':'nextTurn','message':{'customType':'stream-shell','content':'queued','display':False}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+        print(json.dumps({'type':'progress','partial_result':{'shellOutput':list(b'after')}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+        result=0
+    else: raise AssertionError(kind)
+    print(json.dumps({'type':'complete','response':{'Ok':result}}),flush=True)
+else:
+    request=json.load(sys.stdin)
+    result={'id':'shell-stream','dependencies':[],'commands':[],'tools':[],'user_bash_operations_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True} if request['type']=='describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let session_path = root.path().join("session.jsonl");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .arg("--session")
+        .arg(&session_path)
+        .args([
+            "--mode",
+            "rpc",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--extension",
+        ])
+        .arg(&extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    writeln!(
+        input,
+        "{}",
+        json!({"type":"bash","id":"shell","command":"echo hi"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    loop {
+        let event = receive
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|error| {
+                let _ = child.kill();
+                panic!("streamed shell timed out: {error}")
+            });
+        if event["type"] == "response" && event["id"] == "shell" {
+            assert_eq!(event["success"], true, "{event}");
+            assert_eq!(event["data"]["output"], "beforeafter");
+            break;
+        }
+    }
+    writeln!(input, "{{\"type\":\"shutdown\"}}").unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let session = Session::open(session_path).unwrap();
+    assert_eq!(session.queued_custom_messages().len(), 1);
+    assert_eq!(
+        session.queued_custom_messages()[0].1.message.custom_type,
+        "stream-shell"
+    );
+}
+
+fn read_kimi_fixture_request(stream: TcpStream) -> std::io::Result<(TcpStream, String, Vec<u8>)> {
+    // Accepted sockets can inherit nonblocking mode on Windows and macOS.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut first = String::new();
+    if reader.read_line(&mut first)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "missing HTTP request",
+        ));
+    }
+    let mut length = 0;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "incomplete HTTP headers",
+            ));
+        }
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        }
+    }
+    if length > 64 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "oversized HTTP request",
+        ));
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+    Ok((stream, first, body))
+}
+
+#[test]
+fn kimi_fixture_waits_for_request_bytes_after_accept() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let (read_tx, read_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        };
+        accepted_tx.send(()).unwrap();
+        let (_, first, body) = read_kimi_fixture_request(stream).unwrap();
+        read_tx.send((first, body)).unwrap();
+    });
+    let mut client = TcpStream::connect(address).unwrap();
+    accepted_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(read_rx.recv_timeout(Duration::from_millis(150)).is_err());
+    client
+        .write_all(b"POST /api/oauth/token HTTP/1.1\r\nContent-Length: 4\r\n\r\ntest")
+        .unwrap();
+    let (first, body) = read_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(first.starts_with("POST /api/oauth/token "));
+    assert_eq!(body, b"test");
+    server.join().unwrap();
+}
+
+#[test]
+fn kimi_bearer_minimum_matches_pi_window_after_persisting_refresh() {
+    for (minimum, expires_in, succeeds) in [
+        ("30s", 120, false),
+        ("3m", 120, false),
+        ("30s", 600, true),
+        ("15m", 600, false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let auth = root.path().join("auth.json");
+        std::fs::write(&auth, json!({"kimi-coding":{"type":"oauth","access":"old","refresh":"old-refresh","expires":0},"other":{"type":"api_key","key":"keep"}}).to_string()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("token request not received: {error}"),
+                }
+            };
+            let (mut stream, first, request) = read_kimi_fixture_request(stream).unwrap();
+            assert!(first.starts_with("POST /api/oauth/token "));
+            assert!(String::from_utf8_lossy(&request).contains("refresh_token=old-refresh"));
+            let body = format!(
+                r#"{{"access_token":"new","refresh_token":"rotated","expires_in":{expires_in}}}"#
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env("KIMI_CODE_OAUTH_HOST", host)
+            .env_remove("KIMI_API_KEY")
+            .args([
+                "--provider",
+                "kimi-coding",
+                "auth",
+                "print-bearer-token",
+                "--min-expiry",
+                minimum,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let timed_out = child.try_wait().unwrap().is_none();
+        if timed_out {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        server.join().unwrap();
+        assert!(
+            !timed_out,
+            "Kimi auth command timed out: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.status.success(),
+            succeeds,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if succeeds {
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "new");
+        }
+        let stored: Value = serde_json::from_slice(&std::fs::read(auth).unwrap()).unwrap();
+        assert_eq!(stored["kimi-coding"]["refresh"], "rotated");
+        assert_eq!(stored["other"]["key"], "keep");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn kimi_auth_commands_wait_for_refresh_after_sigint() {
+    for command in ["check", "print-bearer-token"] {
+        let root = tempfile::tempdir().unwrap();
+        let auth = root.path().join("auth.json");
+        std::fs::write(&auth, json!({"kimi-coding":{"type":"oauth","access":"old","refresh":"old-refresh","expires":0}}).to_string()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).unwrap() > 0);
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let barrier = tempfile::NamedTempFile::new().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_WORKER_REFRESH_BARRIER", barrier.path())
+            .env("PI_RS_HOME", root.path())
+            .env("KIMI_CODE_OAUTH_HOST", host)
+            .args(["--provider", "kimi-coding", "auth", command])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(matches!(
+            barrier.as_file().try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "{command} exited during refresh"
+        );
+        release_tx.send(()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stored: Value = serde_json::from_slice(&std::fs::read(&auth).unwrap()).unwrap();
+        assert_eq!(stored["kimi-coding"]["refresh"], "rotated");
+        barrier.as_file().try_lock().unwrap();
+        barrier.as_file().unlock().unwrap();
+    }
+}
+
+#[test]
+fn auth_check_with_model_uses_catalog_resolution_without_crossing_endpoints() {
+    let root = tempfile::tempdir().unwrap();
+    let models = json!({"providers":{
+        "relay-one":{"api":"openai-completions","baseUrl":"https://one.example/v1","apiKey":"fixture-one",
+            "models":[{"id":"widget-a","name":"Widget Alpha"},{"id":"widget-b","baseUrl":"https://other.example/v1"}]},
+        "relay-two":{"api":"openai-completions","baseUrl":"https://two.example/v1",
+            "models":[{"id":"widget-z","name":"Widget Pro"},{"id":"widget-a","name":"Widget Alpha"},{"id":"relay-one/local-only"}]}
+    }});
+    std::fs::write(root.path().join("models.json"), models.to_string()).unwrap();
+    for (model, code, provider, status, reason) in [
+        ("relay-one/Widget Alpha", 0, "relay-one", "ready", None),
+        ("relay-one/local-only", 0, "relay-one", "ready", None),
+        (
+            "Widget Alpha",
+            2,
+            "Widget Alpha",
+            "invalid",
+            Some("invalid_state"),
+        ),
+        (
+            "Widget:high",
+            1,
+            "relay-two",
+            "not_ready",
+            Some("credentials_not_configured"),
+        ),
+        (
+            "Widget Pro",
+            1,
+            "relay-two",
+            "not_ready",
+            Some("credentials_not_configured"),
+        ),
+        (
+            "relay-one/widget-b",
+            1,
+            "relay-one",
+            "not_ready",
+            Some("credentials_not_configured"),
+        ),
+        (
+            "unknown-local-catalog-id",
+            2,
+            "unknown-local-catalog-id",
+            "invalid",
+            Some("invalid_state"),
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["auth", "check", "--model", model, "--json", "--no-refresh"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{model}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["provider"], provider);
+        assert_eq!(response["status"], status);
+        assert_eq!(response["reason"].as_str(), reason);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn auth_check_reads_readonly_store_and_environment_keys() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let auth = home.join("auth.json");
+    std::fs::write(&auth, json!({"kimi-coding":{"type":"oauth","access":"cached","refresh":"refresh","expires":9_000_000_000_000_u64}}).to_string()).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let kimi = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args(["--provider", "kimi-coding", "auth", "check", "--json"])
+        .output()
+        .unwrap();
+    let env_key = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("OPENAI_API_KEY", "fixture-key")
+        .args(["--provider", "openai", "auth", "check", "--json"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        &auth,
+        json!({"kimi-coding":{"type":"oauth","access":"expired","refresh":"refresh","expires":0}})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let expired = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args(["--provider", "kimi-coding", "auth", "check", "--json"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_file(&auth).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let missing = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("OPENAI_API_KEY", "fixture-key")
+        .args(["--provider", "openai", "auth", "check", "--json"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(expired.status.code(), Some(2));
+    assert!(missing.status.success());
+    assert!(
+        kimi.status.success(),
+        "{}",
+        String::from_utf8_lossy(&kimi.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&kimi.stdout).unwrap()["status"],
+        "ready"
+    );
+    assert!(
+        env_key.status.success(),
+        "{}",
+        String::from_utf8_lossy(&env_key.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&env_key.stdout).unwrap()["status"],
+        "ready"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_for_child_open_file(child: &mut std::process::Child, path: &std::path::Path) {
+    let path = std::fs::canonicalize(path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        #[cfg(target_os = "linux")]
+        let opened = std::fs::read_dir(format!("/proc/{}/fd", child.id()))
+            .ok()
+            .is_some_and(|entries| {
+                entries.flatten().any(|entry| {
+                    std::fs::read_link(entry.path())
+                        .ok()
+                        .is_some_and(|target| target == path)
+                })
+            });
+        #[cfg(target_os = "macos")]
+        let opened = Command::new("/usr/sbin/lsof")
+            .args(["-Fn", "-p", &child.id().to_string()])
+            .output()
+            .ok()
+            .is_some_and(|output| {
+                let expected = format!("n{}", path.display());
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == expected)
+            });
+        if opened {
+            return;
+        }
+        if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("child never opened lock file {}", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn cancelled_chatgpt_login_and_logout_do_not_wait_for_held_refresh_lock() {
+    for action in ["login", "logout"] {
+        let root = tempfile::tempdir().unwrap();
+        let lock_path = root.path().join("chatgpt-refresh.lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args([action, "openai-chatgpt"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for_child_open_file(&mut child, &lock_path);
+        assert!(child.try_wait().unwrap().is_none());
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = child.try_wait().unwrap();
+        lock.unlock().unwrap();
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            status.is_some(),
+            "{action} did not cancel while the lock was held"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_interrupts_waiting_for_auth_json_lock() {
+    for arguments in [
+        vec!["--provider", "kimi-coding", "auth", "check"],
+        vec!["login", "openai-chatgpt"],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let lock = root.path().join("auth.json.lock");
+        std::fs::create_dir(&lock).unwrap();
+        std::fs::write(root.path().join("auth.json"), "{}").unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args(arguments)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(child.try_wait().unwrap().is_none());
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = child.try_wait().unwrap();
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(status.is_some(), "auth lock wait ignored SIGINT");
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(lock.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_cancels_running_package_install() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let marker = root.path().join("git-started");
+    let git = bin.join("git");
+    std::fs::write(
+        &git,
+        "#!/bin/sh\nprintf ready > \"$PI_TEST_GIT_STARTED\"\nexec /bin/sleep 30\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path().join("home"))
+        .env("PATH", path)
+        .env("PI_TEST_GIT_STARTED", &marker)
+        .args(["install", "git:https://example.invalid/pkg.git"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() && child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !marker.exists() {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "package did not start: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.try_wait().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(status.is_some(), "package ignored SIGINT");
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn auth_check_reads_root_owned_0755_directory_when_unprivileged() {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(home.join("auth.json"), json!({"kimi-coding":{"type":"oauth","access":"cached","refresh":"refresh","expires":9_000_000_000_000_u64}}).to_string()).unwrap();
+    let binary = root.path().join("pi-test");
+    std::fs::copy(env!("CARGO_BIN_EXE_pi"), &binary).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(&binary)
+        .uid(65534)
+        .gid(65534)
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .args([
+            "--provider",
+            "kimi-coding",
+            "auth",
+            "check",
+            "--json",
+            "--no-refresh",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["status"],
+        "ready"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_cancels_package_install_waiting_for_package_lock() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let source = "git:https://example.invalid/pkg.git";
+    let directory = root
+        .path()
+        .join("packages")
+        .join(format!("{:x}", Sha256::digest(source.as_bytes())));
+    std::fs::create_dir_all(&directory).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join("install.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args(["install", source])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.try_wait().unwrap();
+    lock.unlock().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(status.is_some(), "package lock wait ignored SIGINT");
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_interrupts_managed_model_discovery() {
+    for mode in [
+        vec!["--mode", "rpc"],
+        vec!["--models", "ollama/*", "serve"],
+        vec!["--models", "ollama/*", "mcp", "login", "fixture"],
+        vec!["--list-models=ollama/*", "mcp", "login", "fixture"],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).unwrap() > 0);
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .env_remove("HTTP_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .args(["--no-mcp", "--provider", "ollama", "--endpoint", &endpoint])
+            .args(&mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = child.try_wait().unwrap();
+        let _ = release_tx.send(());
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        server.join().unwrap();
+        assert!(status.is_some(), "model discovery ignored SIGINT");
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_interrupts_open_rpc_and_piped_stdin() {
+    for args in [vec!["--mode", "rpc"], vec!["--print"]] {
+        let root = tempfile::tempdir().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .env("PI_RS_HOME", root.path())
+            .args(["--no-mcp", "--offline", "--model", "fixture"])
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(child.try_wait().unwrap().is_none());
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = child.try_wait().unwrap();
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(status.is_some(), "{args:?} ignored SIGINT");
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn radius_refresh_survives_sigint_and_persists_rotated_token() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let gateway = format!("http://{}/", listener.local_addr().unwrap());
+    let auth = root.path().join("auth.json");
+    std::fs::write(&auth, json!({"radius":{"type":"oauth","gateway":gateway,"access":"old","refresh":"old-refresh","expires":0}}).to_string()).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut buffer = [0; 4096];
+        assert!(socket.read(&mut buffer).unwrap() > 0);
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        let body = r#"{"access_token":"new","refresh_token":"rotated","expires_in":3600}"#;
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .env("PI_RS_HOME", root.path())
+        .env("PI_RADIUS_GATEWAY", &gateway)
+        .args(["--provider", "radius", "auth", "print-bearer-token"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(child.try_wait().unwrap().is_none());
+    release_tx.send(()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stored: Value = serde_json::from_slice(&std::fs::read(auth).unwrap()).unwrap();
+    assert_eq!(stored["radius"]["refresh"], "rotated");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_interrupts_rpc_session_transition_hook() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("slow-transition.py");
+    let marker = root.path().join("transition-started");
+    std::fs::write(&extension, r##"#!/usr/bin/env python3
+import json, os, sys, time
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = {'id':'slow-transition', 'dependencies':[], 'commands':[], 'tools':[], 'session_transition_hook':True}
+elif request['type'] == 'before_session_transition':
+    with open(os.path.join(os.environ['PI_RS_HOME'], 'transition-started'), 'w') as f:
+        f.write(str(os.getpid()))
+    time.sleep(30)
+    result = False
+else:
+    result = None
+print(json.dumps({'version':1, 'response':{'Ok':result}}))
+"##).unwrap();
+    std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--offline",
+            "--model",
+            "fixture",
+            "--extension",
+        ])
+        .arg(extension)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{}", json!({"type":"new_session", "id":"test"})).unwrap();
+    stdin.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() && child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !marker.exists() {
+        let _ = child.kill();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "transition hook did not start: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.try_wait().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(status.is_some(), "RPC transition wait ignored SIGINT");
+    let extension_pid: i32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::kill(extension_pid, 0) } == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_ne!(
+        unsafe { libc::kill(extension_pid, 0) },
+        0,
+        "transition extension survived shutdown"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn anthropic_federation_auth_check_without_refresh_uses_only_the_identity_file() {
+    let root = tempfile::tempdir().unwrap();
+    let identity = root.path().join("jwt");
+    let assertion = "local-test-identity";
+    std::fs::write(&identity, assertion).unwrap();
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("ANTHROPIC_OAUTH_TOKEN")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env("ANTHROPIC_FEDERATION_RULE_ID", "federation-rule")
+            .env("ANTHROPIC_ORGANIZATION_ID", "organization")
+            .env("ANTHROPIC_IDENTITY_TOKEN_FILE", &identity)
+            .args(["--provider", "anthropic", "auth"]);
+        command
+    };
+    let check = || {
+        command()
+            .args(["check", "--json", "--no-refresh"])
+            .output()
+            .unwrap()
+    };
+    let output = check();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["status"], "ready");
+    assert_eq!(status["authType"], "oauth");
+    assert!(status.get("credentials").is_none());
+    assert_eq!(std::fs::read_to_string(&identity).unwrap(), assertion);
+
+    std::fs::write(&identity, "").unwrap();
+    let output = check();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["reason"], "invalid_state");
+
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"anthropic":{
+            "headers":{"Authorization":"Bearer fixture-header"}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let output = check();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["status"], "ready");
+    assert_eq!(status["authType"], "oauth");
+    assert!(status.get("credentials").is_none());
+
+    let output = command()
+        .args(["check", "--json", "--credentials", "--no-refresh"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["authType"], "oauth");
+    assert_eq!(status["credentials"], "fixture-header");
+
+    let export = command().arg("print-bearer-token").output().unwrap();
+    assert!(export.status.success(), "{export:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&export.stdout).trim(),
+        "fixture-header"
+    );
+    let export = command().arg("print-api-key").output().unwrap();
+    assert!(!export.status.success());
+
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"anthropic":{"headers":{"x-api-key":"fixture-key"}}}}).to_string(),
+    )
+    .unwrap();
+    let export = command().arg("print-api-key").output().unwrap();
+    assert!(export.status.success(), "{export:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&export.stdout).trim(),
+        "fixture-key"
+    );
+    let export = command().arg("print-bearer-token").output().unwrap();
+    assert!(!export.status.success());
+    assert!(String::from_utf8_lossy(&export.stderr).contains("No usable OAuth bearer token"));
+
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"anthropic":{
+            "headers":{"Authorization":"!pi-rs-missing-auth-fixture-command"}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let output = check();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(status.get("authType").is_none());
+
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"providers":{"anthropic":{
+            "headers":{"Authorization":"Bearer fixture-header", "x-other":"invalid\nvalue"}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let output = command().args(["check", "--json"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["reason"], "invalid_state");
+}
+
+#[test]
+fn auth_login_distinguishes_the_key_switch_from_the_global_key_option() {
+    let root = tempfile::tempdir().unwrap();
+    let invoke = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        ["auth", "login", "--api-key", "Anthropic"],
+        ["auth", "login", "Anthropic", "--api-key"],
+    ] {
+        let output = invoke(&args);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("requires an interactive terminal")
+        );
+    }
+    let output = invoke(&["auth", "login", "Anthropic", "--api-key", "--no-browser"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--no-browser only applies to account sign-in")
+    );
+    let output = invoke(&["--api-key", "unused-fixture", "auth", "login", "Anthropic"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("omit --api-key when resolving configured credentials")
+    );
+    assert!(!root.path().join("auth.json").exists());
+}
+
+#[test]
+fn legacy_enterprise_login_passes_the_domain_to_copilot_only() {
+    let root = tempfile::tempdir().unwrap();
+    for (provider, expected) in [
+        ("github-copilot", "invalid GitHub Enterprise domain"),
+        ("anthropic", "--enterprise-url requires github-copilot"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args([
+                "login",
+                provider,
+                "--enterprise-url",
+                "http://insecure.example",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{output:?}"
+        );
+    }
+    assert!(!root.path().join("auth.json").exists());
+}
+
+#[test]
+fn auth_logout_resolves_provider_names_and_preserves_other_credential_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("models.json");
+    let models = json!({"providers":{"example-lab":{
+        "name":"Example Lab", "api":"openai-completions",
+        "baseUrl":"https://example.test/v1", "apiKey":"configured-fixture",
+        "models":[{"id":"chat"}]
+    }}})
+    .to_string();
+    std::fs::write(&config, &models).unwrap();
+    let auth = root.path().join("auth.json");
+    let oauth =
+        json!({"type":"oauth", "access":"test-access", "refresh":"test-refresh", "expires":1});
+    let original = json!({
+        "example-lab":{"type":"api_key", "key":"saved-fixture", "endpoint":"https://example.test/v1/chat/completions"},
+        "extension-oauth":oauth,
+        "unrelated":{"type":"api_key", "key":"retained-fixture"}
+    });
+    std::fs::write(&auth, original.to_string()).unwrap();
+    let logout = |provider: &str| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["auth", "logout", provider])
+            .output()
+            .unwrap()
+    };
+    let output = logout("  eXaMpLe LAB  ");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Removed stored API key for Example Lab. Environment variables and models.json config are unchanged."
+    );
+    let output = logout("extension-oauth");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Logged out of extension-oauth."
+    );
+    let after = std::fs::read_to_string(&auth).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&after).unwrap(),
+        json!({"unrelated":original["unrelated"]})
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), models);
+
+    let output = logout("Google Vertex AI");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .starts_with("No stored credentials for Google Vertex AI.")
+    );
+    let output = logout("missing");
+    assert_eq!(output.status.code(), Some(1));
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostic.contains("Unknown provider \"missing\".\n"));
+    assert!(diagnostic.contains("Stored credentials: unrelated"));
+    assert_eq!(std::fs::read_to_string(&auth).unwrap(), after);
+}
+
+#[test]
+fn auth_logout_prioritizes_exact_stored_ids_and_works_with_invalid_model_config() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("models.json");
+    std::fs::write(
+        &config,
+        json!({"providers":{"relay":{
+            "name":"extension-oauth", "api":"openai-completions",
+            "baseUrl":"https://example.test/v1", "models":[{"id":"chat"}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let auth = root.path().join("auth.json");
+    let relay = json!({"type":"api_key", "key":"relay-key"});
+    let source = json!({"extension-oauth":{"type":"oauth"}, "relay":relay});
+    std::fs::write(&auth, source.to_string()).unwrap();
+    let logout = |id: &str| {
+        Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .args(["auth", "logout", id])
+            .output()
+            .unwrap()
+    };
+    let output = logout("extension-oauth");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&auth).unwrap()).unwrap(),
+        json!({"relay":relay})
+    );
+    std::fs::write(&config, "{").unwrap();
+    let output = logout("relay");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&auth).unwrap()).unwrap(),
+        json!({})
+    );
+}
+
+#[test]
+fn auth_logout_removes_unusable_oauth_for_the_selected_local_provider() {
+    let root = tempfile::tempdir().unwrap();
+    let auth = root.path().join("auth.json");
+    std::fs::write(
+        &auth,
+        json!({
+            "openai-chatgpt":{"type":"oauth", "credential":{"client_id":"broken-client"}},
+            "radius":{"type":"oauth", "gateway":"https://configured-gateway.example.test/"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let sessions = root.path().join("chatgpt-sessions.json");
+    std::fs::write(
+        &sessions,
+        json!({"broken-client":{}, "other-client":{}}).to_string(),
+    )
+    .unwrap();
+    for provider in ["openai-chatgpt", "radius"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env(
+                "PI_RADIUS_GATEWAY",
+                "https://configured-gateway.example.test/",
+            )
+            .args(["auth", "logout", provider])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&auth).unwrap()).unwrap(),
+        json!({})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&sessions).unwrap()).unwrap(),
+        json!({"other-client":{}})
+    );
+}
+
+#[test]
+fn auth_logout_keeps_radius_credentials_for_a_different_gateway() {
+    let root = tempfile::tempdir().unwrap();
+    let auth = root.path().join("auth.json");
+    let original = json!({"radius":{
+        "type":"oauth", "access":"test-access", "refresh":"test-refresh", "expires":1,
+        "gateway":"https://other-gateway.example.test/"
+    }});
+    std::fs::write(&auth, original.to_string()).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .env(
+            "PI_RADIUS_GATEWAY",
+            "https://configured-gateway.example.test/",
+        )
+        .args(["auth", "logout", "radius"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).starts_with("No stored credentials for Radius.")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&auth).unwrap()).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn chatgpt_auth_check_no_refresh_uses_saved_credential() {
+    let root = tempfile::tempdir().unwrap();
+    let credential = json!({"client_id":"client","subject":"subject","email":null,"id_token":"id","access_token":"cached","refresh_token":"refresh","expires_at":1,"scopes":["chatgpt.tokens.use.direct"]});
+    let auth = root.path().join("auth.json");
+    let original = json!({"openai-chatgpt":{"type":"oauth","credential":credential}}).to_string();
+    std::fs::write(&auth, &original).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args([
+            "--provider",
+            "openai-chatgpt",
+            "auth",
+            "check",
+            "--json",
+            "--no-refresh",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "ready");
+    assert_eq!(std::fs::read_to_string(auth).unwrap(), original);
+}
+
+#[test]
+fn chatgpt_access_and_account_login_wait_for_shared_auth_lock() {
+    for login in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let credential = json!({"client_id":"client","subject":"subject","email":null,"id_token":"id","access_token":"cached","refresh_token":"refresh","expires_at":4_000_000_000u64,"scopes":["chatgpt.tokens.use.direct"]});
+        std::fs::write(root.path().join("auth.json"), json!({"openai-chatgpt":{"type":"oauth","credential":credential},"kimi-coding":{"type":"api_key","key":"keep"}}).to_string()).unwrap();
+        std::fs::write(
+            root.path().join("chatgpt-sessions.json"),
+            json!({"client":credential}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(root.path().join("chatgpt-registrations.json"), json!({"active":"client","accounts":[{"client_id":"client","subject":"subject","email":null}]}).to_string()).unwrap();
+        let chat_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.path().join("chatgpt-refresh.lock"))
+            .unwrap();
+        chat_lock.lock().unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if login {
+            command.args(["login", "openai-chatgpt", "--account", "client"]);
+        } else {
+            command.args(["--provider", "openai-chatgpt", "auth", "check", "--json"]);
+        }
+        let mut child = command.spawn().unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(child.try_wait().unwrap().is_none());
+        let shared = root.path().join("auth.json.lock");
+        std::fs::create_dir(&shared).unwrap();
+        chat_lock.unlock().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let waited = child.try_wait().unwrap().is_none();
+        std::fs::remove_dir(shared).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            waited,
+            "ChatGPT exited instead of waiting for the shared auth lock"
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("auth.json")).unwrap()).unwrap();
+        assert_eq!(value["kimi-coding"]["key"], "keep");
+        assert_eq!(
+            value["openai-chatgpt"]["credential"]["refresh_token"],
+            "refresh"
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn cancelled_mcp_logout_does_not_wait_for_held_refresh_lock() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let name = "fixture";
+    let url = "http://127.0.0.1:8765/mcp";
+    std::fs::write(
+        root.path().join("mcp.json"),
+        json!({"mcpServers":{name:{"url":url,"oauth":true}}}).to_string(),
+    )
+    .unwrap();
+    let digest = Sha256::digest(serde_json::to_vec(&(name, url)).unwrap());
+    let directory = root.path().join("mcp-auth");
+    std::fs::create_dir_all(&directory).unwrap();
+    let credentials = directory.join(format!("{digest:x}.json"));
+    let lock_path = credentials.with_extension("lock");
+    std::fs::write(&credentials, b"unchanged").unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    lock.lock().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", root.path())
+        .args(["mcp", "logout", name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_child_open_file(&mut child, &lock_path);
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.try_wait().unwrap();
+    lock.unlock().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        status.is_some(),
+        "MCP logout did not cancel while the lock was held"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(credentials).unwrap(), b"unchanged");
+}
+
+#[test]
+fn reopened_tree_trigger_uses_origin_provider_and_restores_selected_branch() {
+    use pi_rs::{
+        ContextContent, CustomMessage, CustomMessageDelivery, Event, QueuedCustomMessage, Record,
+        RunState,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+    let selected = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint_a = format!("http://{}/v1", origin.local_addr().unwrap());
+    let endpoint_b = format!("http://{}/v1", selected.local_addr().unwrap());
+    std::fs::write(home.join("models.json"), json!({"providers":{
+        "relay-a":{"api":"openai-completions","baseUrl":endpoint_a,"apiKey":"key-a","models":[{"id":"shared","maxTokens":64,"contextWindow":12000}]},
+        "relay-b":{"api":"openai-completions","baseUrl":endpoint_b,"apiKey":"key-b","models":[{"id":"shared","maxTokens":128,"contextWindow":24000}]}
+    }}).to_string()).unwrap();
+    let trigger = uuid::Uuid::new_v4();
+    let message = CustomMessage {
+        custom_type: "tree".into(),
+        content: ContextContent::Text("trigger from A".into()),
+        display: false,
+        details: None,
+    };
+    let events = vec![
+        (
+            None,
+            None,
+            Event::Created {
+                session_id: uuid::Uuid::new_v4(),
+            },
+        ),
+        (
+            Some(1),
+            None,
+            Event::ModelSelected {
+                model: "shared".into(),
+                thinking: None,
+                provider: Some("relay-a".into()),
+            },
+        ),
+        (
+            Some(2),
+            None,
+            Event::TreeMessageQueued {
+                input: QueuedCustomMessage {
+                    id: trigger,
+                    delivery: CustomMessageDelivery::TriggerTurn,
+                    message: message.clone(),
+                },
+            },
+        ),
+        (
+            Some(3),
+            Some(trigger),
+            Event::Run {
+                state: RunState::Running,
+                initial: None,
+            },
+        ),
+        (
+            Some(4),
+            Some(trigger),
+            Event::CustomMessageDelivered {
+                id: trigger,
+                message,
+            },
+        ),
+        (Some(5), None, Event::Checkout { target: 1 }),
+        (
+            Some(1),
+            None,
+            Event::ModelSelected {
+                model: "shared".into(),
+                thinking: None,
+                provider: Some("relay-b".into()),
+            },
+        ),
+        (
+            Some(7),
+            None,
+            Event::User {
+                content: "selected branch B".into(),
+                input_id: None,
+            },
+        ),
+    ];
+    let records: Vec<Record> = events
+        .into_iter()
+        .enumerate()
+        .map(|(index, (parent, run_id, event))| Record {
+            id: index as u64 + 1,
+            parent,
+            run_id,
+            event,
+            version: 3,
+            timestamp: None,
+        })
+        .collect();
+    let path = root.path().join("session.jsonl");
+    Session::from_records(records)
+        .unwrap()
+        .export_jsonl(&path)
+        .unwrap();
+    let serve = |listener: TcpListener, expected: &'static str, max_tokens: u64| {
+        std::thread::spawn(move || {
+            let (mut socket, mut reader, request) = accept_proxy_request(listener);
+            assert!(request.starts_with("POST "), "{request}");
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                headers.push_str(&line.to_ascii_lowercase());
+            }
+            assert!(
+                headers.contains(&format!("authorization: bearer {expected}")),
+                "{headers}"
+            );
+            let content_length: usize = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["model"], "shared");
+            assert_eq!(body["max_tokens"], max_tokens);
+            let events = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).unwrap();
+        })
+    };
+    let a = serve(origin, "key-a", 64);
+    let b = serve(selected, "key-b", 128);
+    let output = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .arg("--session")
+        .arg(&path)
+        .args([
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "relay-b",
+            "--model",
+            "shared",
+            "--print",
+            "new prompt",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    a.join().unwrap();
+    b.join().unwrap();
+    let session = Session::open(&path).unwrap();
+    assert_eq!(session.model_provider(), Some("relay-b"));
+    assert!(session.branch().iter().any(|record| matches!(&record.event, Event::User { content, .. } if content == "selected branch B")));
+    assert_eq!(session.pending_custom_trigger(), None);
+}
+
+#[test]
+fn bedrock_auth_check_handles_saved_profile_and_ambient_chain() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let auth = home.join("auth.json");
+    let check = |args: &[&str], vars: &[(&str, &str)]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("AWS_CONFIG_FILE", root.path().join("missing-config"))
+            .env(
+                "AWS_SHARED_CREDENTIALS_FILE",
+                root.path().join("missing-credentials"),
+            );
+        for key in [
+            "AWS_PROFILE",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+        ] {
+            command.env_remove(key);
+        }
+        for (key, value) in vars {
+            command.env(key, value);
+        }
+        command
+            .args(["--provider", "amazon-bedrock", "auth"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    std::fs::write(
+        &auth,
+        json!({"amazon-bedrock":{"type":"api_key","env":{"AWS_PROFILE":"selected"}}}).to_string(),
+    )
+    .unwrap();
+    let profile = check(&["check", "--json"], &[]);
+    assert_eq!(profile.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&profile.stdout).unwrap(),
+        json!({"status":"ready","provider":"amazon-bedrock","authType":"api_key"})
+    );
+    let profile_secret = check(&["check", "--json", "--credentials"], &[]);
+    assert_eq!(profile_secret.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&profile_secret.stdout).unwrap()["reason"],
+        "credential_not_available"
+    );
+    assert!(!check(&["print-api-key"], &[]).status.success());
+
+    std::fs::write(
+        &auth,
+        json!({"amazon-bedrock":{"type":"api_key"}}).to_string(),
+    )
+    .unwrap();
+    let missing = check(&["check", "--json"], &[]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&missing.stdout).unwrap()["reason"],
+        "credentials_not_configured"
+    );
+    for vars in [
+        vec![("AWS_PROFILE", "ambient")],
+        vec![
+            ("AWS_ACCESS_KEY_ID", "key"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ],
+        vec![("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/fixture")],
+    ] {
+        let ambient = check(&["check", "--json"], &vars);
+        assert_eq!(
+            ambient.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&ambient.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&ambient.stdout).unwrap()["status"],
+            "ready"
+        );
+        let secret = check(&["check", "--json", "--credentials"], &vars);
+        assert_eq!(secret.status.code(), Some(1));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&secret.stdout).unwrap()["reason"],
+            "credential_not_available"
+        );
+    }
+    let bearer_only = check(
+        &["check", "--json"],
+        &[("AWS_BEARER_TOKEN_BEDROCK", "token")],
+    );
+    assert_eq!(bearer_only.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bearer_only.stdout).unwrap()["reason"],
+        "credentials_not_configured"
+    );
+    std::fs::write(&auth, "{}").unwrap();
+    let ambient_bearer = check(
+        &["check", "--json"],
+        &[("AWS_BEARER_TOKEN_BEDROCK", "token")],
+    );
+    assert_eq!(ambient_bearer.status.code(), Some(0));
+    std::fs::write(
+        &auth,
+        json!({"amazon-bedrock":{"type":"api_key","key":"stored-token"}}).to_string(),
+    )
+    .unwrap();
+    let bearer = check(&["check", "--json", "--credentials"], &[]);
+    assert_eq!(bearer.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bearer.stdout).unwrap()["credentials"],
+        "stored-token"
+    );
+}
+
+#[test]
+fn bedrock_saved_chain_overrides_models_json_api_key_for_requests_and_auth_check() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        json!({"providers":{"amazon-bedrock":{"apiKey":"models-bearer"}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("auth.json"),
+        json!({"amazon-bedrock":{"type":"api_key"}}).to_string(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut socket, mut reader, first) = accept_proxy_request(listener);
+        assert!(first.starts_with("POST /model/"), "{first}");
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            headers.push_str(&line);
+        }
+        let lower = headers.to_ascii_lowercase();
+        assert!(
+            lower.contains("authorization: aws4-hmac-sha256"),
+            "{headers}"
+        );
+        assert!(headers.contains("Credential=CHAINACCESS/"), "{headers}");
+        assert!(!headers.contains("models-bearer"));
+        write!(
+            socket,
+            "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+        .unwrap();
+    });
+    let configure = |command: &mut Command| {
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_ACCESS_KEY_ID", "CHAINACCESS")
+            .env("AWS_SECRET_ACCESS_KEY", "chain-secret")
+            .env("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", &endpoint)
+            .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("AWS_CONFIG_FILE", root.path().join("missing-config"))
+            .env(
+                "AWS_SHARED_CREDENTIALS_FILE",
+                root.path().join("missing-credentials"),
+            )
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env_remove("AWS_PROFILE")
+            .env_remove("AWS_SESSION_TOKEN")
+            .env_remove("AWS_BEARER_TOKEN_BEDROCK");
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    configure(&mut command);
+    let output = command
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "amazon-bedrock",
+            "--model",
+            "amazon.nova-2-lite-v1:0",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        !output.status.success(),
+        "fixture intentionally returns an error"
+    );
+    let mut check = Command::new(env!("CARGO_BIN_EXE_pi"));
+    configure(&mut check);
+    let output = check
+        .args([
+            "--provider",
+            "amazon-bedrock",
+            "auth",
+            "check",
+            "--json",
+            "--credentials",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["reason"],
+        "credential_not_available"
+    );
+    std::fs::write(home.join("auth.json"), "{}").unwrap();
+    let mut fallback = Command::new(env!("CARGO_BIN_EXE_pi"));
+    configure(&mut fallback);
+    let output = fallback
+        .args(["--provider", "amazon-bedrock", "auth", "print-api-key"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "models-bearer"
+    );
+}
+
+#[test]
+fn bedrock_explicit_auth_modes_ignore_ambient_bearer() {
+    for mode in ["chain", "profile", "ambient", "stored", "override"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let auth = match mode {
+            "chain" | "override" => json!({"amazon-bedrock":{"type":"api_key"}}),
+            "profile" => {
+                json!({"amazon-bedrock":{"type":"api_key","env":{"AWS_PROFILE":"selected"}}})
+            }
+            "stored" => json!({"amazon-bedrock":{"type":"api_key","key":"stored-token"}}),
+            _ => json!({}),
+        };
+        std::fs::write(home.join("auth.json"), auth.to_string()).unwrap();
+        let credentials = root.path().join("credentials");
+        std::fs::write(
+            &credentials,
+            "[selected]\naws_access_key_id=PROFILEACCESS\naws_secret_access_key=profile-secret\n",
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, mut reader, first) = accept_proxy_request(listener);
+            assert!(first.starts_with("POST /model/"), "{first}");
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            match mode {
+                "chain" | "profile" => {
+                    assert!(
+                        headers
+                            .to_ascii_lowercase()
+                            .contains("authorization: aws4-hmac-sha256"),
+                        "{headers}"
+                    );
+                    let key = if mode == "chain" {
+                        "CHAINACCESS"
+                    } else {
+                        "PROFILEACCESS"
+                    };
+                    assert!(headers.contains(&format!("Credential={key}/")), "{headers}");
+                    assert!(!headers.contains("ambient-token"));
+                }
+                "ambient" => assert!(headers.contains("Bearer ambient-token"), "{headers}"),
+                "stored" => assert!(headers.contains("Bearer stored-token"), "{headers}"),
+                "override" => assert!(headers.contains("Bearer override-token"), "{headers}"),
+                _ => unreachable!(),
+            }
+            write!(
+                socket,
+                "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", &home)
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_ACCESS_KEY_ID", "CHAINACCESS")
+            .env("AWS_SECRET_ACCESS_KEY", "chain-secret")
+            .env("AWS_BEARER_TOKEN_BEDROCK", "ambient-token")
+            .env("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", endpoint)
+            .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("AWS_CONFIG_FILE", root.path().join("missing-config"))
+            .env("AWS_SHARED_CREDENTIALS_FILE", credentials)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env_remove("AWS_PROFILE")
+            .env_remove("AWS_SESSION_TOKEN")
+            .args([
+                "--no-session",
+                "--no-mcp",
+                "--no-trust",
+                "--no-tools",
+                "--offline",
+                "--provider",
+                "amazon-bedrock",
+                "--model",
+                "amazon.nova-2-lite-v1:0",
+            ]);
+        if mode == "override" {
+            command.args(["--api-key", "override-token"]);
+        }
+        let output = command.args(["--print", "hello"]).output().unwrap();
+        server.join().unwrap();
+        assert!(
+            !output.status.success(),
+            "fixture intentionally returns an error"
+        );
+    }
+}
+
+#[test]
+fn bedrock_explicit_chain_fails_without_aws_credentials_instead_of_using_bearer() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("auth.json"),
+        json!({"amazon-bedrock":{"type":"api_key"}}).to_string(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    command
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_BEARER_TOKEN_BEDROCK", "ambient-token")
+        .env(
+            "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+            format!("http://{}", listener.local_addr().unwrap()),
+        )
+        .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("AWS_CONFIG_FILE", root.path().join("missing-config"))
+        .env(
+            "AWS_SHARED_CREDENTIALS_FILE",
+            root.path().join("missing-credentials"),
+        )
+        .env("NO_PROXY", "127.0.0.1,localhost");
+    for key in [
+        "AWS_PROFILE",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+    ] {
+        command.env_remove(key);
+    }
+    let output = command
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "amazon-bedrock",
+            "--model",
+            "amazon.nova-2-lite-v1:0",
+            "--print",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "request was sent despite missing chain credentials"
+    );
+}
+
+#[test]
+fn bedrock_uses_configured_provider_and_model_headers() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("models.json"),
+        json!({"providers":{"amazon-bedrock":{
+            "headers":{"X-Route":"provider", "X-Private":"$PI_RS_TEST_BEDROCK_HEADER"},
+            "models":[{"id":"test-model", "headers":{"x-route":"model"}}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.path())
+        .env("PI_RS_HOME", &home)
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        .env("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", endpoint)
+        .env("AWS_BEARER_TOKEN_BEDROCK", "test-token")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("PI_RS_TEST_BEDROCK_HEADER", "route-secret")
+        .env_remove("AWS_PROFILE")
+        .args([
+            "--no-session",
+            "--no-mcp",
+            "--no-trust",
+            "--no-tools",
+            "--offline",
+            "--provider",
+            "amazon-bedrock",
+            "--model",
+            "test-model",
+            "--print",
+            "hello",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (mut socket, mut reader, request) = accept_proxy_request(listener);
+    assert!(
+        request.starts_with("POST /model/test-model/converse-stream"),
+        "{request}"
+    );
+    let mut headers = String::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        headers.push_str(&line.to_ascii_lowercase());
+    }
+    assert!(headers.contains("x-route: model"), "{headers}");
+    assert!(headers.contains("x-private: route-secret"), "{headers}");
+    assert!(
+        headers.contains("authorization: bearer test-token"),
+        "{headers}"
+    );
+    socket
+        .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+        .unwrap();
+    drop(socket);
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("route-secret"));
+}
+
+#[tokio::test]
+async fn mcp_oauth_login_uses_workbench_proxy_setting_and_no_proxy() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener as AsyncListener;
+    use tokio::process::Command as AsyncCommand;
+
+    async fn headers<R: tokio::io::AsyncBufRead + Unpin>(
+        reader: &mut R,
+        deadline: tokio::time::Instant,
+    ) -> (String, usize) {
+        tokio::time::timeout_at(deadline, async {
+            let mut first = String::new();
+            assert_ne!(
+                reader.read_line(&mut first).await.unwrap(),
+                0,
+                "missing request line"
+            );
+            let mut total = first.len();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(
+                    reader.read_line(&mut line).await.unwrap(),
+                    0,
+                    "incomplete request headers"
+                );
+                total += line.len();
+                assert!(total <= 64 * 1024, "headers too large");
+                if line == "\r\n" {
+                    break;
+                }
+                assert!(
+                    !line
+                        .to_ascii_lowercase()
+                        .starts_with("proxy-authorization:")
+                );
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            assert!(length <= 64 * 1024, "body too large");
+            (first, length)
+        })
+        .await
+        .expect("fixture header deadline")
+    }
+
+    for (bypass, explicit_metadata) in [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let root = tempfile::tempdir().unwrap();
+        let origin = AsyncListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = AsyncListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let base = format!("http://{origin_addr}");
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"httpProxy":format!("http://localhost:{proxy_port}")}).to_string(),
+        )
+        .unwrap();
+        let mut oauth = json!({"clientRegistration":"dcr"});
+        if explicit_metadata {
+            oauth["authServerMetadataUrl"] = json!(format!("{base}/metadata"));
+        }
+        std::fs::write(
+            root.path().join("mcp.json"),
+            json!({"mcpServers":{"fixture":{"url":format!("{base}/mcp"),"oauth":oauth}}})
+                .to_string(),
+        )
+        .unwrap();
+        let (selected, unused) = if bypass {
+            (origin, proxy)
+        } else {
+            (proxy, origin)
+        };
+        let server_base = base.clone();
+        // Share one deadline with the subprocess, including startup and discovery.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            loop {
+                let Ok(Ok((socket, _))) =
+                    tokio::time::timeout_at(deadline, selected.accept()).await
+                else {
+                    break;
+                };
+                let mut socket = tokio::io::BufReader::new(socket);
+                let (mut first, mut length) = headers(&mut socket, deadline).await;
+                if !bypass {
+                    assert_eq!(first, format!("CONNECT {origin_addr} HTTP/1.1\r\n"));
+                    socket
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .unwrap();
+                    (first, length) = headers(&mut socket, deadline).await;
+                }
+                let mut body = vec![0; length];
+                tokio::time::timeout_at(
+                    deadline,
+                    tokio::io::AsyncReadExt::read_exact(&mut socket, &mut body),
+                )
+                .await
+                .expect("fixture body deadline")
+                .unwrap();
+                let registration = first.starts_with("POST /register ");
+                let metadata = first.starts_with("GET /metadata ")
+                    || first.contains("/.well-known/oauth-authorization-server")
+                    || first.contains("/.well-known/openid-configuration");
+                let issuer = if first.contains("oauth-authorization-server/mcp") {
+                    format!("{server_base}/mcp")
+                } else {
+                    server_base.clone()
+                };
+                requests.push(first);
+                let (status, body) = if metadata {
+                    ("200 OK", json!({"issuer":issuer,"authorization_endpoint":format!("{server_base}/authorize"),"token_endpoint":format!("{server_base}/token"),"registration_endpoint":format!("{server_base}/register"),"response_types_supported":["code"]}).to_string())
+                } else if registration {
+                    ("400 Bad Request", "{}".to_owned())
+                } else {
+                    ("404 Not Found", "{}".to_owned())
+                };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                if registration {
+                    break;
+                }
+            }
+            requests
+        });
+        let mut command = AsyncCommand::new(env!("CARGO_BIN_EXE_pi"));
+        command
+            .current_dir(root.path())
+            .env("PI_RS_HOME", root.path())
+            .env_remove("http_proxy")
+            .env_remove("HTTP_PROXY")
+            .env_remove("https_proxy")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("all_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("NO_PROXY")
+            .env("no_proxy", if bypass { "127.0.0.1" } else { "" })
+            .args(["mcp", "login", "fixture"])
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = tokio::time::timeout_at(deadline, command.output())
+            .await
+            .expect("login exceeded fixture deadline")
+            .unwrap();
+        assert!(!output.status.success(), "fixture rejects registration");
+        let requests = tokio::time::timeout_at(deadline + Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            requests.iter().any(|line| if explicit_metadata {
+                line.starts_with("GET /metadata ")
+            } else {
+                line.starts_with("GET /.well-known/")
+            }),
+            "bypass={bypass} explicit={explicit_metadata} requests={requests:?} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            requests
+                .last()
+                .is_some_and(|line| line.starts_with("POST /register ")),
+            "bypass={bypass} explicit={explicit_metadata} requests={requests:?} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), unused.accept())
+                .await
+                .is_err(),
+            "unexpected route"
+        );
     }
 }

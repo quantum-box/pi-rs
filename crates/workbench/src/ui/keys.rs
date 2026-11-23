@@ -15,6 +15,11 @@ pub struct Keys {
     bindings: BTreeMap<String, Vec<KeyEvent>>,
 }
 impl Keys {
+    #[cfg(test)]
+    pub(super) fn set_test_binding(&mut self, action: &str, key: &str) {
+        self.bindings
+            .insert(action.into(), vec![parse(key).unwrap()]);
+    }
     fn defaults() -> Result<BTreeMap<String, Vec<KeyEvent>>> {
         Self::defaults_for(cfg!(windows), windows_keybindings())
     }
@@ -225,6 +230,12 @@ impl Keys {
                 .any(|binding| binding.code == key.code && binding.modifiers == key.modifiers)
         })
     }
+    pub(super) fn editor_action(&self, key: KeyEvent) -> Option<&str> {
+        self.bindings
+            .keys()
+            .find(|action| action.starts_with("tui.editor.") && self.matches(action, key))
+            .map(String::as_str)
+    }
     pub fn action(&self, key: KeyEvent, empty: bool) -> Option<&str> {
         let key = normalize(key);
         // Exit shares Ctrl+D with forward delete, and applies only to an empty editor.
@@ -409,7 +420,7 @@ impl Keys {
         lines.join("\n")
     }
 }
-pub(super) fn binding_hint(key: Option<KeyEvent>) -> String {
+pub(crate) fn binding_hint(key: Option<KeyEvent>) -> String {
     let Some(key) = key else {
         return "—".into();
     };

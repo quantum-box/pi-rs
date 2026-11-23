@@ -1,11 +1,13 @@
 //! Deferred tool discovery, with ranking adapted from Pi v1.5.0 under MIT.
 //! Copyright (c) 2025 Mario Zechner. See ../PI-LICENSE.
+#[cfg(test)]
+use pi_rs_core::ModelRequest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 
 use pi_rs_core::{
-    Extension, ExtensionResult, ExtensionState, ModelRequest, Outcome, RequestPurpose, Tool,
-    ToolContext, ToolExecution, ToolSpec,
+    Extension, ExtensionResult, ExtensionState, Outcome, RequestPurpose, Tool, ToolContext,
+    ToolExecution, ToolSpec,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -65,12 +67,13 @@ impl Extension for ToolSearch {
     }
     async fn before_request(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         _: RequestPurpose,
         previous: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
+        let original_tools = request.tools.clone();
         let loaded = state(previous)?.loaded;
-        request.tools.retain(|tool| {
+        request.tools_mut().retain(|tool| {
             loaded.contains(&tool.name)
                 || !self
                     .documents
@@ -87,10 +90,14 @@ impl Extension for ToolSearch {
                 .iter()
                 .any(|tool| tool.name == document.tool.name)
             {
-                request.tools.push(document.tool.clone());
+                request.tools_mut().push(document.tool.clone());
             }
         }
-        Ok(())
+        Ok(if request.tools == original_tools {
+            pi_rs_core::ContextChange::Unchanged
+        } else {
+            pi_rs_core::ContextChange::Changed
+        })
     }
     fn after_tool(
         &self,
@@ -278,25 +285,35 @@ pub fn rank(query: &str, documents: &[SearchDocument], limit: usize) -> Vec<(usi
         .map(|(index, score, _, _)| (index, score))
         .collect()
 }
-fn schema_text(value: &Value, text: &mut String) {
-    if let Some(description) = value["description"].as_str() {
-        text.push(' ');
-        text.push_str(description);
-    }
-    if let Some(properties) = value["properties"].as_object() {
-        for (name, property) in properties {
-            text.push(' ');
-            text.push_str(name);
-            schema_text(property, text);
+fn schema_text(root: &Value, text: &mut String) {
+    let mut pending = vec![root];
+    let mut referenced = BTreeSet::from([std::ptr::from_ref(root)]);
+    while let Some(value) = pending.pop() {
+        if let Some(target) = value["$ref"]
+            .as_str()
+            .and_then(|reference| crate::schema_ref::resolve(root, reference))
+            && target.is_object()
+            && referenced.insert(std::ptr::from_ref(target))
+        {
+            pending.push(target);
         }
-    }
-    if let Some(items) = value.get("items") {
-        schema_text(items, text);
-    }
-    for key in ["anyOf", "oneOf", "allOf"] {
-        if let Some(variants) = value[key].as_array() {
-            for variant in variants {
-                schema_text(variant, text);
+        if let Some(description) = value["description"].as_str() {
+            text.push(' ');
+            text.push_str(description);
+        }
+        if let Some(properties) = value["properties"].as_object() {
+            for (name, property) in properties {
+                text.push(' ');
+                text.push_str(name);
+                pending.push(property);
+            }
+        }
+        if let Some(items) = value.get("items") {
+            pending.push(items);
+        }
+        for key in ["anyOf", "oneOf", "allOf"] {
+            if let Some(variants) = value[key].as_array() {
+                pending.extend(variants);
             }
         }
     }
@@ -366,6 +383,32 @@ mod tests {
             namespace: "Desktop operations".into(),
         }
     }
+    #[test]
+    fn indexes_referenced_schema_fields_once_and_skips_unreachable_definitions() {
+        let mut tool = document("mcp__ledger__read", "Read ledger");
+        tool.tool.parameters = json!({
+            "type": "object",
+            "properties": {
+                "option": {"$ref": "#/$defs/ledger~1entry"},
+                "alias": {"$ref": "#/$defs/%6Cedger~1entry"},
+                "elsewhere": {"$ref": "https://example.com/#/$defs/unused"}
+            },
+            "$defs": {
+                "ledger/entry": {
+                    "description": "Reconciliation",
+                    "properties": {"parent": {"$ref": "#"}}
+                },
+                "unused": {"description": "Inaccessible"}
+            }
+        });
+        let mut indexed = String::new();
+        schema_text(&tool.tool.parameters, &mut indexed);
+        assert_eq!(indexed.matches("Reconciliation").count(), 1);
+        assert!(!indexed.contains("Inaccessible"));
+        assert_eq!(rank("reconciliation", &[tool.clone()], 1)[0].0, 0);
+        assert!(rank("inaccessible", &[tool], 1).is_empty());
+    }
+
     #[test]
     fn ranking_prefers_coverage_then_exact_names_and_normalizes_identifiers() {
         let documents = [
@@ -469,7 +512,7 @@ mod tests {
                 .unwrap()
                 .in_memory()
                 .unwrap();
-            let initial = session.journal().head();
+            let initial = session.journal().unwrap().head();
             assert_eq!(session.prompt("first").await.unwrap(), "done");
             let mut fork = session.fork_at(initial).unwrap();
             assert_eq!(fork.prompt("fork").await.unwrap(), "done");

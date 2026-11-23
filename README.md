@@ -4,6 +4,18 @@ An embeddable Rust agent loop with streaming model responses, tools, an
 append-only session journal, and native Rust extensions. The workbench offers
 an interactive terminal, print and JSON output, and a JSONL control interface.
 
+For native Rust embedding, including a Tauri host example and the current
+browser-WASM limitations, see [the SDK embedding guide](docs/sdk-embedding.md).
+
+To try a native SDK session with a local Ollama server:
+
+```sh
+ollama pull qwen2.5:7b
+cargo run --locked -p pi-rs-ollama --example sdk_chat
+```
+
+Set `PI_RS_EXAMPLE_MODEL` to select a different installed model.
+
 ## Interactive terminal
 
 ```sh
@@ -46,6 +58,11 @@ data resets it. Use `/settings` to change it, or set `httpIdleTimeoutMs` in
 `settings.json` to a number of milliseconds or `"disabled"`. For example,
 `{"httpIdleTimeoutMs":"disabled"}` removes the HTTP idle deadline.
 `--model-timeout-secs` separately sets a deadline for the complete operation.
+Bedrock Runtime uses the AWS SDK's timeouts rather than `httpIdleTimeoutMs`,
+matching the pinned Pi adapter's handling of that setting. Bedrock Runtime
+requests and AWS credential-provider calls support the workbench HTTP proxy
+setting and proxy environment variables with `no_proxy` bypasses. AWS instance
+and container metadata endpoints connect directly.
 
 To use an OpenAI API key and API billing, set `OPENAI_API_KEY` and select the
 `openai` provider, for example `pi --provider openai --model gpt-4.1`.
@@ -65,6 +82,21 @@ Use `pi login openai-chatgpt --new-account` to add another account or workspace,
 `pi login openai-chatgpt --list-accounts` to list registrations, and
 `pi login openai-chatgpt --account <client-id>` to select one. The terminal's
 `/login` menu also offers saved accounts and a new-account option.
+
+For Amazon Bedrock, use `/login amazon-bedrock` in the terminal to choose a
+bearer token, a named AWS profile, or the existing AWS credential chain. The
+choice is saved in Pi's `auth.json`; `/logout amazon-bedrock` removes it. Named
+profiles are resolved by the AWS SDK without changing the process environment.
+An explicitly selected profile or credential chain ignores the ambient
+`AWS_BEARER_TOKEN_BEDROCK` token. This intentionally differs from the pinned Pi
+v1.5 behavior, which gives that token priority. Without an explicit choice, the
+ambient token retains priority.
+
+To use a Kimi Code subscription, run `pi login kimi-coding` and complete the
+device authorization, then select `--provider kimi-coding`. In the terminal,
+`/login kimi-coding` and `/logout kimi-coding` sign in and out. Tokens are
+shared with Pi through `auth.json` and refreshed automatically. To enter an
+API key instead, use `/login kimi-coding api-key` or `KIMI_API_KEY`.
 
 ## Native extensions
 

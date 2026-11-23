@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pi_rs::{
-    Compaction, Decision, Error, Extension, ExtensionResult, ExtensionState, Message, ModelRequest,
-    Outcome, Result, Tool, ToolContext, ToolExecution, ToolSpec,
+    Compaction, Decision, Error, Extension, ExtensionResult, ExtensionState, Outcome, Result, Tool,
+    ToolContext, ToolExecution, ToolSpec,
 };
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
@@ -15,20 +15,51 @@ use tokio::io::AsyncReadExt;
 const MAX_FILE: u64 = 64 * 1024;
 const MAX_COMMAND_INPUT: u64 = 1024 * 1024;
 
+pub mod auth_factory;
+mod cli_attachment_sniff;
 pub mod coding;
+pub mod coding_factories;
 mod coding_paths;
 pub use coding_paths::normalize_plain as normalize_path;
+#[cfg(windows)]
+#[doc(hidden)]
+pub use coding_paths::windows_shell_path;
+#[doc(hidden)]
+pub mod diff_sequence;
 mod file_search;
 pub mod image_profile;
+mod locale;
 pub mod mcp;
 pub mod mcp_auth;
+mod mcp_log;
+mod mcp_login_config_lock;
+#[doc(hidden)]
+pub use mcp_login_config_lock::lock_edit as mcp_config_edit_lock;
+#[doc(hidden)]
+pub mod mcp_oauth_client;
+mod mcp_progress;
 mod mcp_provider_auth;
 #[doc(hidden)]
+pub mod mcp_refresh;
+mod mcp_resource_compat;
+pub mod model_factory;
+pub mod model_file;
+#[doc(hidden)]
 pub mod oauth_callback;
+#[doc(hidden)]
+pub mod process_cleanup;
+pub mod prompt_resources;
+pub mod prompt_template_arguments;
+pub mod resource_factory;
 mod shell_config;
 mod shell_output;
+pub mod skill_resources;
+pub mod template_resources;
 mod text_edit;
 mod text_page;
+#[doc(hidden)]
+pub mod theme_parser;
+pub mod theme_resources;
 mod tool_output;
 
 pub fn agent_dir() -> PathBuf {
@@ -123,10 +154,10 @@ impl Extension for ProjectInstructions {
 
     fn context(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs::ContextRequest<'_>,
         _: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
-        let Some(Message::System { content }) = request.messages.first_mut() else {
+    ) -> ExtensionResult<pi_rs::ContextChange> {
+        let Some(content) = request.system_content_mut() else {
             return Err("system message missing".into());
         };
         content.push_str(
@@ -135,7 +166,7 @@ impl Extension for ProjectInstructions {
                 .context(&self.skills)
                 .map_err(|error| error.to_string())?,
         );
-        Ok(())
+        Ok(pi_rs::ContextChange::Changed)
     }
 }
 
@@ -169,17 +200,18 @@ impl Extension for WorkbenchContext {
 
     fn context(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs::ContextRequest<'_>,
         _: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs::ContextChange> {
         if let Some(instruction) = &self.instruction {
-            let Some(Message::System { content }) = request.messages.first_mut() else {
+            let Some(content) = request.system_content_mut() else {
                 return Err("system message missing".into());
             };
             content.push_str("\n\n");
             content.push_str(instruction);
+            return Ok(pi_rs::ContextChange::Changed);
         }
-        Ok(())
+        Ok(pi_rs::ContextChange::Unchanged)
     }
 
     fn after_tool(

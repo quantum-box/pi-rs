@@ -9,13 +9,22 @@ use std::time::{Duration, Instant};
 use pi_rs_core::{
     CacheWarmingAction, CacheWarmingDecision, CancellationToken, Compaction, Decision, Error,
     Extension, ExtensionFlag, ExtensionFlagValue, ExtensionResult, ExtensionState, InputAction,
-    InputEvent, LifecycleEvent, Message, ModelRequest, Outcome, RequestPurpose, Result, Tool,
-    ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec, TreeDecision, TreePreparation,
+    InputEvent, LifecycleEvent, Message, ModelRequest, Outcome, RenderedExtensionRows,
+    RequestPurpose, Result, Tool, ToolContext, ToolExecution, ToolHost, ToolRenderContext,
+    ToolRenderShell, ToolRenderers, ToolReply, ToolSectionRenderer, ToolSpec, TreeDecision,
+    TreePreparation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_MESSAGE: u64 = 4 * 1024 * 1024;
+// Maximum compact-JSON overhead of {"outcome":...,"output_unchanged":false}.
+const PRESENCE_RESPONSE_OVERHEAD: u64 = 37;
+// A duplex tool-result request and its completion can each contain an 8 MiB
+// journaled outcome, including JSON-escaped structured shell output.
+const MAX_DUPLEX_MESSAGE: u64 = 16 * 1024 * 1024;
+#[cfg(test)]
+use super::json_size::MAX_NESTED_ARGUMENT_BYTES;
 // A lifecycle event can include an 8 MiB journaled tool result, whose JSON
 // representation may expand to six times its original size when escaped.
 const MAX_REQUEST: u64 = 64 * 1024 * 1024;
@@ -38,9 +47,33 @@ struct Endpoint {
     path: PathBuf,
     flags: Option<Arc<str>>,
     pi_lifecycle_fields: bool,
+    compaction_overflow_reason_v1: bool,
+    text_result_v2: bool,
+    structured_text_result: bool,
 }
 
 impl Endpoint {
+    async fn request_async<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        request: ProtocolRequest,
+    ) -> ExtensionResult<T> {
+        let path = self.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
+    fn project_outcome(&self, outcome: &Outcome) -> Outcome {
+        if self.structured_text_result && self.text_result_v2 {
+            outcome.clone()
+        } else if self.text_result_v2 {
+            outcome.protocol_text_result()
+        } else {
+            outcome.legacy_text_result()
+        }
+    }
     fn command(&self, protocol: &str) -> Command {
         let mut command = Command::new(&self.path);
         if let Some(flags) = &self.flags {
@@ -82,35 +115,43 @@ fn extension_context(request: &ModelRequest) -> ModelRequest {
     }
 }
 
-fn restore_provider_replay(original: &ModelRequest, updated: &mut ModelRequest) {
-    let same_model = original.model == updated.model;
-    for (index, message) in updated.messages.iter_mut().enumerate() {
-        let Message::Assistant {
+// Older executable hooks discard unknown tool-message fields. Retain provenance
+// only for unchanged content; rewrites have unknown legacy provenance.
+fn restore_legacy_tool_metadata(
+    original: &ModelRequest,
+    updated: &mut ModelRequest,
+    restore_status: bool,
+    restore_structure: bool,
+) {
+    for message in &mut updated.messages {
+        if let Message::Tool {
+            call_id,
             content,
-            calls,
-            replay,
+            is_error,
+            is_structured,
+            ..
         } = message
-        else {
-            continue;
-        };
-        if !same_model {
-            *replay = None;
-            continue;
+            && let Some(Message::Tool {
+                content: previous_content,
+                is_error: previous_error,
+                is_structured: previous_structure,
+                ..
+            }) = original
+                .messages
+                .iter()
+                .find(|item| matches!(item, Message::Tool { call_id: id, .. } if id == call_id))
+        {
+            if restore_status {
+                *is_error = *previous_error;
+            }
+            if restore_structure {
+                *is_structured = if content == previous_content {
+                    *previous_structure
+                } else {
+                    None
+                };
+            }
         }
-        let matching = |previous: &Message| match previous {
-            Message::Assistant {
-                content: original_content,
-                calls: original_calls,
-                replay,
-            } if original_content == content && original_calls == calls => replay.clone(),
-            _ => None,
-        };
-        // Tool IDs identify a continuation even if a hook inserted other messages.
-        *replay = original.messages.get(index).and_then(matching).or_else(|| {
-            (!calls.is_empty())
-                .then(|| original.messages.iter().find_map(matching))
-                .flatten()
-        });
     }
 }
 
@@ -118,6 +159,12 @@ fn restore_provider_replay(original: &ModelRequest, updated: &mut ModelRequest) 
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ProtocolRequest {
     Describe,
+    ToolCall {
+        name: String,
+        arguments: Value,
+        operation_id: String,
+        state: Option<ExtensionState>,
+    },
     Migrate {
         state: Option<ExtensionState>,
     },
@@ -126,6 +173,14 @@ enum ProtocolRequest {
         arguments: Value,
     },
     Context {
+        request: ModelRequest,
+        state: Option<ExtensionState>,
+    },
+    ContextV2 {
+        request: ModelRequest,
+        state: Option<ExtensionState>,
+    },
+    ContextV3 {
         request: ModelRequest,
         state: Option<ExtensionState>,
     },
@@ -141,9 +196,52 @@ enum ProtocolRequest {
         event: pi_rs_core::UserBashEvent,
         state: Option<ExtensionState>,
     },
+    ExecuteUserBash {
+        event: pi_rs_core::UserBashEvent,
+        state: Option<ExtensionState>,
+        timeout_secs: Option<f64>,
+    },
+    MessageLifecycle {
+        event: pi_rs_core::MessageLifecycleEvent,
+        state: Option<ExtensionState>,
+    },
     Lifecycle {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
+    },
+    TurnEndBoundary {
+        event: pi_rs_core::TurnEndBoundary,
+        state: Option<ExtensionState>,
+    },
+    AfterProviderResponse {
+        event: pi_rs_core::ProviderResponseEvent,
+        state: Option<ExtensionState>,
+    },
+    AgentBeforeSettle {
+        event: pi_rs_core::AgentBeforeSettle,
+        state: Option<ExtensionState>,
+    },
+    CompactionLifecycleV1 {
+        event: LifecycleEvent,
+        trigger: pi_rs_core::CompactionTrigger,
+        metadata: Option<Value>,
+        state: Option<ExtensionState>,
+    },
+    RenderToolSection {
+        section: ToolSection,
+        context: ToolRenderContext,
+    },
+    RenderCustomMessage {
+        message: pi_rs_core::CustomMessage,
+        options: pi_rs_core::CustomMessageRenderOptions,
+    },
+    RenderCustomEntry {
+        entry: pi_rs_core::CustomEntryRecord,
+        options: pi_rs_core::CustomEntryRenderOptions,
+    },
+    TransformMarkdown {
+        markdown: String,
+        context: pi_rs_core::MarkdownTransformContext,
     },
     DiscoverResources {
         event: pi_rs_core::ResourceDiscoveryEvent,
@@ -170,6 +268,24 @@ enum ProtocolRequest {
         messages: Vec<Message>,
         state: Option<ExtensionState>,
     },
+    BeforeRequestV2 {
+        request: ModelRequest,
+        summary: bool,
+        state: Option<ExtensionState>,
+    },
+    ContextWithSystemV2 {
+        messages: Vec<Message>,
+        state: Option<ExtensionState>,
+    },
+    BeforeRequestV3 {
+        request: ModelRequest,
+        summary: bool,
+        state: Option<ExtensionState>,
+    },
+    ContextWithSystemV3 {
+        messages: Vec<Message>,
+        state: Option<ExtensionState>,
+    },
     Command {
         name: String,
         arguments: String,
@@ -181,6 +297,11 @@ enum ProtocolRequest {
         state: Option<ExtensionState>,
     },
     CommandEffects {
+        name: String,
+        arguments: String,
+        state: Option<ExtensionState>,
+    },
+    CommandEffectsClassifiedV1 {
         name: String,
         arguments: String,
         state: Option<ExtensionState>,
@@ -217,10 +338,18 @@ enum ProtocolRequest {
         outcome: Outcome,
         operation_id: String,
         state: Option<ExtensionState>,
+        #[serde(default)]
+        text_result_v2: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        presence_v1: bool,
     },
     BeforeCompaction {
         summary: String,
         keep_turns: usize,
+        state: Option<ExtensionState>,
+    },
+    BeforeSummaryCompaction {
+        preparation: pi_rs_core::CompactionPreparation,
         state: Option<ExtensionState>,
     },
     AfterCompaction {
@@ -230,6 +359,12 @@ enum ProtocolRequest {
     },
 }
 #[derive(Serialize, Deserialize)]
+struct ToolResultPresence {
+    outcome: Option<Outcome>,
+    output_unchanged: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize)]
 struct Envelope {
     version: u16,
     response: std::result::Result<Value, String>,
@@ -238,9 +373,15 @@ struct Envelope {
 struct Description {
     id: String,
     dependencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    custom_message_renderers: Vec<String>,
     commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     flags: Vec<ExtensionFlag>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    custom_entry_renderers: Vec<String>,
+    #[serde(default)]
+    markdown_transform_hook: bool,
     tools: Vec<DescriptionTool>,
     #[serde(default)]
     host_calls: bool,
@@ -249,21 +390,84 @@ struct Description {
     #[serde(default)]
     command_effects: bool,
     #[serde(default)]
+    command_failure_classification_v1: bool,
+    #[serde(default)]
     input_hook: bool,
     #[serde(default)]
     tool_result_hook: bool,
     #[serde(default)]
+    result_presence_v1: bool,
+    #[serde(default)]
+    text_result_v2: bool,
+    #[serde(default)]
+    structured_text_result: bool,
+    #[serde(default)]
+    tool_message_error: bool,
+    #[serde(default)]
+    tool_message_structured: bool,
+    /// This executable distinguishes explicit false from missing provenance.
+    #[serde(default)]
+    tool_message_provenance_v2: bool,
+    #[serde(default)]
+    tool_call_hook: bool,
+    #[serde(default)]
     user_bash_hook: bool,
     #[serde(default)]
     user_bash_operations_hook: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mcp_server_declarations: Vec<pi_rs_core::McpServerDeclaration>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    mcp_servers_change_hook: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    mcp_registry_host_calls: bool,
     #[serde(default)]
     lifecycle_hook: bool,
+    #[serde(default)]
+    message_lifecycle_hook: bool,
+    #[serde(default)]
+    agent_before_settle_hook: bool,
+    #[serde(default)]
+    turn_end_boundary_hook: bool,
+    #[serde(default)]
+    lifecycle_host_calls: bool,
+    #[serde(default)]
+    tool_hook_host_calls: bool,
+    #[serde(default)]
+    before_tool_host_calls: bool,
+    #[serde(default)]
+    request_hook_host_calls: bool,
+    #[serde(default)]
+    input_hook_host_calls: bool,
+    #[serde(default)]
+    context_hook_host_calls: bool,
+    #[serde(default)]
+    transition_hook_host_calls: bool,
+    #[serde(default)]
+    tree_hook_host_calls: bool,
+    #[serde(default)]
+    compaction_hook_host_calls: bool,
+    #[serde(default)]
+    before_summary_compaction_v1: bool,
+    #[serde(default)]
+    compaction_overflow_reason_v1: bool,
+    #[serde(default)]
+    compaction_lifecycle_v1: bool,
+    #[serde(default)]
+    resources_hook_host_calls: bool,
+    #[serde(default)]
+    user_bash_hook_host_calls: bool,
+    #[serde(default)]
+    user_bash_stream_host_calls: bool,
     #[serde(default)]
     tool_execution_lifecycle_hook: bool,
     #[serde(default)]
     tool_execution_update_hook: bool,
     #[serde(default)]
+    ui_prompt_lifecycle_hook: bool,
+    #[serde(default)]
     model_selection_hook: bool,
+    #[serde(default)]
+    after_provider_response_hook: bool,
     #[serde(default)]
     session_lifecycle_hook: bool,
     #[serde(default)]
@@ -283,11 +487,232 @@ struct Description {
     resource_discovery_hook: bool,
     #[serde(default)]
     context_with_system_hook: bool,
+    #[serde(default)]
+    context_provenance_v1: bool,
+    #[serde(default)]
+    context_safe_patch_v1: bool,
 }
+#[derive(Serialize)]
+#[serde(tag = "change", rename_all = "snake_case")]
+enum ContextResponse<T> {
+    Unchanged,
+    Changed { value: T },
+    SafePatch { patch: ContextPatch },
+}
+impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for ContextResponse<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let mut object = value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| serde::de::Error::custom("invalid context response"))?;
+        match object
+            .remove("change")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .as_deref()
+        {
+            Some("unchanged") if object.is_empty() => Ok(Self::Unchanged),
+            Some("safe_patch") if object.len() == 1 && object.contains_key("patch") => {
+                let patch = object.remove("patch").expect("checked patch");
+                serde_json::from_value(patch)
+                    .map(|patch| Self::SafePatch { patch })
+                    .map_err(serde::de::Error::custom)
+            }
+            Some("changed") if object.len() == 1 && object.contains_key("value") => {
+                let payload = object.remove("value").expect("checked value");
+                serde_json::from_value(payload)
+                    .map(|value| Self::Changed { value })
+                    .map_err(serde::de::Error::custom)
+            }
+            _ => Err(serde::de::Error::custom("invalid context response")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    user_edits: Vec<pi_rs_core::ContextUserEdit>,
+}
+
+fn validate_patch_limits(patch: &ContextPatch) -> ExtensionResult<()> {
+    if patch.user_edits.len() > 4096
+        || patch.tools.as_ref().is_some_and(|tools| tools.len() > 4096)
+        || serde_json::to_vec(patch)
+            .map_err(|_| "invalid context patch")?
+            .len()
+            > 8 * 1024 * 1024
+    {
+        return Err("context patch exceeds limits".into());
+    }
+    Ok(())
+}
+fn apply_request_patch(
+    request: &mut pi_rs_core::ContextRequest<'_>,
+    patch: &ContextPatch,
+) -> ExtensionResult<()> {
+    for edit in &patch.user_edits {
+        match edit {
+            pi_rs_core::ContextUserEdit::Insert { index, message } => {
+                request.insert_user(*index, message.clone())?
+            }
+            pi_rs_core::ContextUserEdit::Remove { index } => {
+                request.remove_user(*index)?;
+            }
+        }
+    }
+    if let Some(tools) = &patch.tools {
+        *request.tools_mut() = tools.clone();
+    }
+    if let Some(system) = &patch.system {
+        *request
+            .system_content_mut()
+            .ok_or("context patch requires leading system message")? = system.clone();
+    }
+    Ok(())
+}
+fn apply_messages_patch(
+    messages: &mut pi_rs_core::ContextMessages<'_>,
+    patch: &ContextPatch,
+) -> ExtensionResult<()> {
+    if patch.tools.is_some() {
+        return Err("message context patch cannot change tools".into());
+    }
+    for edit in &patch.user_edits {
+        match edit {
+            pi_rs_core::ContextUserEdit::Insert { index, message } => {
+                messages.insert_user(*index, message.clone())?
+            }
+            pi_rs_core::ContextUserEdit::Remove { index } => {
+                messages.remove_user(*index)?;
+            }
+        }
+    }
+    if let Some(system) = &patch.system {
+        *messages
+            .system_content_mut()
+            .ok_or("context patch requires leading system message")? = system.clone();
+    }
+    Ok(())
+}
+// Validate against a detached copy before touching the live tracked wrapper.
+fn commit_request_patch(
+    request: &mut pi_rs_core::ContextRequest<'_>,
+    patch: &ContextPatch,
+) -> ExtensionResult<()> {
+    validate_patch_limits(patch)?;
+    if request
+        .access()
+        .user_edits()
+        .len()
+        .saturating_add(patch.user_edits.len())
+        > 4096
+    {
+        return Err("too many context user edits".into());
+    }
+    let mut trial = (**request).clone();
+    apply_request_patch(&mut pi_rs_core::ContextRequest::new(&mut trial), patch)?;
+    apply_request_patch(request, patch)
+}
+fn commit_messages_patch(
+    messages: &mut pi_rs_core::ContextMessages<'_>,
+    patch: &ContextPatch,
+) -> ExtensionResult<()> {
+    validate_patch_limits(patch)?;
+    if messages
+        .access()
+        .user_edits()
+        .len()
+        .saturating_add(patch.user_edits.len())
+        > 4096
+    {
+        return Err("too many context user edits".into());
+    }
+    let mut trial = (**messages).clone();
+    apply_messages_patch(&mut pi_rs_core::ContextMessages::new(&mut trial), patch)?;
+    apply_messages_patch(messages, patch)
+}
+fn request_patch(
+    original: &ModelRequest,
+    updated: &ModelRequest,
+    user_edits: Vec<pi_rs_core::ContextUserEdit>,
+) -> Option<ContextPatch> {
+    let mut patch = ContextPatch {
+        tools: (original.tools != updated.tools).then(|| updated.tools.clone()),
+        user_edits,
+        ..Default::default()
+    };
+    let mut trial = original.clone();
+    apply_request_patch(&mut pi_rs_core::ContextRequest::new(&mut trial), &patch).ok()?;
+    if let (Some(Message::System { content: before }), Some(Message::System { content: after })) =
+        (trial.messages.first(), updated.messages.first())
+        && before != after
+    {
+        patch.system = Some(after.clone());
+    }
+    let mut trial = original.clone();
+    commit_request_patch(&mut pi_rs_core::ContextRequest::new(&mut trial), &patch).ok()?;
+    (trial == *updated).then_some(patch)
+}
+fn messages_patch(
+    original: &[Message],
+    updated: &[Message],
+    user_edits: Vec<pi_rs_core::ContextUserEdit>,
+) -> Option<ContextPatch> {
+    let mut patch = ContextPatch {
+        user_edits,
+        ..Default::default()
+    };
+    let mut trial = original.to_vec();
+    apply_messages_patch(&mut pi_rs_core::ContextMessages::new(&mut trial), &patch).ok()?;
+    if let (Some(Message::System { content: before }), Some(Message::System { content: after })) =
+        (trial.first(), updated.first())
+        && before != after
+    {
+        patch.system = Some(after.clone());
+    }
+    let mut trial = original.to_vec();
+    commit_messages_patch(&mut pi_rs_core::ContextMessages::new(&mut trial), &patch).ok()?;
+    (trial == updated).then_some(patch)
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ToolSection {
+    Call,
+    Result,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct DescriptionToolRenderers {
+    shell: ToolRenderShell,
+    call: bool,
+    result: bool,
+}
+
+impl From<ToolRenderers> for DescriptionToolRenderers {
+    fn from(renderers: ToolRenderers) -> Self {
+        Self {
+            shell: renderers.shell,
+            call: renderers.call.is_some(),
+            result: renderers.result.is_some(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct DescriptionTool {
     spec: ToolSpec,
     execution: ToolExecution,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    renderers: Option<DescriptionToolRenderers>,
     #[serde(default)]
     can_poll: bool,
     #[serde(default)]
@@ -336,22 +761,51 @@ pub struct ExecutableExtension {
 }
 impl ExecutableExtension {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let executable = path.as_ref().canonicalize()?;
+        let endpoint = Self::describe_endpoint(path.as_ref())?;
+        let description =
+            call(&endpoint, ProtocolRequest::Describe, None).map_err(Error::Config)?;
+        Self::from_description(endpoint, description)
+    }
+
+    pub async fn load_async(path: impl AsRef<Path>) -> Result<Self> {
+        let endpoint = Self::describe_endpoint(path.as_ref())?;
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let (endpoint, description) = tokio::task::spawn_blocking(move || {
+            let description = call(&endpoint, ProtocolRequest::Describe, Some(&cancelled))
+                .map_err(Error::Config)?;
+            Ok::<_, Error>((endpoint, description))
+        })
+        .await
+        .map_err(|error| Error::Config(format!("native extension discovery failed: {error}")))??;
+        Self::from_description(endpoint, description)
+    }
+
+    fn describe_endpoint(path: &Path) -> Result<Endpoint> {
+        let executable = path.canonicalize()?;
         if !executable.is_file() {
             return Err(Error::Config("extension executable must be a file".into()));
         }
-        let endpoint = Endpoint {
+        Ok(Endpoint {
             path: executable,
             flags: None,
             pi_lifecycle_fields: false,
-        };
-        let description =
-            call(&endpoint, ProtocolRequest::Describe, None).map_err(Error::Config)?;
+            compaction_overflow_reason_v1: false,
+            text_result_v2: false,
+            structured_text_result: false,
+        })
+    }
+
+    fn from_description(endpoint: Endpoint, description: Description) -> Result<Self> {
         let mut extension = Self {
             endpoint,
             description,
         };
         extension.endpoint.pi_lifecycle_fields = extension.description.pi_lifecycle_fields;
+        extension.endpoint.compaction_overflow_reason_v1 =
+            extension.description.compaction_overflow_reason_v1;
+        extension.endpoint.text_result_v2 = extension.description.text_result_v2;
+        extension.endpoint.structured_text_result = extension.description.structured_text_result;
         extension.apply_flags(&mut BTreeMap::new())?;
         Ok(extension)
     }
@@ -419,17 +873,44 @@ impl ExecutableExtension {
         &self,
         request: ProtocolRequest,
     ) -> ExtensionResult<T> {
-        let path = self.endpoint.clone();
-        let guard = CancelOnDrop(CancellationToken::new());
-        let cancelled = guard.0.clone();
-        tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
-            .await
-            .map_err(|error| error.to_string())?
+        self.endpoint.request_async(request).await
     }
 }
 
 #[async_trait::async_trait]
 impl Extension for ExecutableExtension {
+    fn handles_turn_end_boundary(&self) -> bool {
+        self.description.turn_end_boundary_hook
+    }
+
+    async fn turn_end_boundary(
+        &self,
+        event: &pi_rs_core::TurnEndBoundary,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<pi_rs_core::BoundaryDecision> {
+        self.request_async(ProtocolRequest::TurnEndBoundary {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+
+    fn handles_agent_before_settle(&self) -> bool {
+        self.description.agent_before_settle_hook
+    }
+
+    async fn agent_before_settle(
+        &self,
+        event: &pi_rs_core::AgentBeforeSettle,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<pi_rs_core::BoundaryDecision> {
+        self.request_async(ProtocolRequest::AgentBeforeSettle {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+
     fn id(&self) -> &str {
         &self.description.id
     }
@@ -462,6 +943,7 @@ impl Extension for ExecutableExtension {
                     endpoint: self.endpoint.clone(),
                     spec: tool.spec.clone(),
                     execution: tool.execution,
+                    renderers: tool.renderers,
                     can_poll: tool.can_poll,
                     transactional: tool.transactional,
                     prepares_arguments: tool.prepares_arguments,
@@ -485,6 +967,27 @@ impl Extension for ExecutableExtension {
         })
         .await
     }
+    async fn input_with_host(
+        &self,
+        event: &InputEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<InputAction> {
+        if !self.description.input_hook_host_calls {
+            return self.input(event, state).await;
+        }
+        let request = ProtocolRequest::Input {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
+    }
     fn handles_user_bash(&self) -> bool {
         self.description.user_bash_hook
     }
@@ -499,6 +1002,27 @@ impl Extension for ExecutableExtension {
         })
         .await
     }
+    async fn user_bash_with_host(
+        &self,
+        event: &pi_rs_core::UserBashEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<pi_rs_core::UserBashResult>> {
+        if !self.description.user_bash_hook_host_calls {
+            return self.user_bash(event, state).await;
+        }
+        let request = ProtocolRequest::UserBash {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
+    }
     fn handles_user_bash_operations(&self) -> bool {
         self.description.user_bash_operations_hook
     }
@@ -512,6 +1036,27 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })
         .await
+    }
+    async fn user_bash_operations_with_host(
+        &self,
+        event: &pi_rs_core::UserBashEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<bool> {
+        if !self.description.user_bash_hook_host_calls {
+            return self.user_bash_operations(event, state).await;
+        }
+        let request = ProtocolRequest::UserBashOperations {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
     }
     async fn execute_user_bash(
         &self,
@@ -535,6 +1080,43 @@ impl Extension for ExecutableExtension {
         .await
         .map_err(|error| error.to_string())?
     }
+    async fn execute_user_bash_with_host(
+        &self,
+        event: &pi_rs_core::UserBashEvent,
+        state: Option<&ExtensionState>,
+        timeout: Option<Duration>,
+        cancel: CancellationToken,
+        output: tokio::sync::mpsc::Sender<Vec<u8>>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<i32>> {
+        if !self.description.user_bash_stream_host_calls {
+            return self
+                .execute_user_bash(event, state, timeout, cancel, output)
+                .await;
+        }
+        let request = ProtocolRequest::ExecuteUserBash {
+            event: event.clone(),
+            state: state.cloned(),
+            timeout_secs: timeout.map(|duration| duration.as_secs_f64()),
+        };
+        let host = Arc::new(ShellProgressHost {
+            inner: host,
+            output,
+        });
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(cancel.child_token());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+    fn mcp_server_declarations(&self) -> Vec<pi_rs_core::McpServerDeclaration> {
+        self.description.mcp_server_declarations.clone()
+    }
+    fn handles_mcp_servers_change(&self) -> bool {
+        self.description.mcp_servers_change_hook
+    }
     fn handles_lifecycle(&self) -> bool {
         self.description.lifecycle_hook
     }
@@ -544,8 +1126,62 @@ impl Extension for ExecutableExtension {
     fn handles_tool_execution_updates(&self) -> bool {
         self.description.tool_execution_update_hook
     }
+    fn custom_message_renderer_types(&self) -> Vec<&str> {
+        self.description
+            .custom_message_renderers
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+    async fn render_custom_message(
+        &self,
+        message: &pi_rs_core::CustomMessage,
+        options: &pi_rs_core::CustomMessageRenderOptions,
+    ) -> ExtensionResult<Option<pi_rs_core::RenderedCustomMessage>> {
+        self.request_async(ProtocolRequest::RenderCustomMessage {
+            message: message.clone(),
+            options: options.clone(),
+        })
+        .await
+    }
+
+    fn handles_ui_prompt_lifecycle(&self) -> bool {
+        self.description.ui_prompt_lifecycle_hook
+    }
     fn handles_model_selection(&self) -> bool {
         self.description.model_selection_hook
+    }
+    fn custom_entry_renderer_types(&self) -> Vec<&str> {
+        self.description
+            .custom_entry_renderers
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+    async fn render_custom_entry(
+        &self,
+        entry: &pi_rs_core::CustomEntryRecord,
+        options: &pi_rs_core::CustomEntryRenderOptions,
+    ) -> ExtensionResult<Option<pi_rs_core::RenderedExtensionContent>> {
+        self.request_async(ProtocolRequest::RenderCustomEntry {
+            entry: entry.clone(),
+            options: options.clone(),
+        })
+        .await
+    }
+    fn handles_markdown_transform(&self) -> bool {
+        self.description.markdown_transform_hook
+    }
+    async fn transform_markdown(
+        &self,
+        markdown: &str,
+        context: &pi_rs_core::MarkdownTransformContext,
+    ) -> ExtensionResult<Option<String>> {
+        self.request_async(ProtocolRequest::TransformMarkdown {
+            markdown: markdown.to_owned(),
+            context: context.clone(),
+        })
+        .await
     }
     fn handles_resource_discovery(&self) -> bool {
         self.description.resource_discovery_hook
@@ -561,6 +1197,64 @@ impl Extension for ExecutableExtension {
         })
         .await
     }
+    async fn discover_resources_with_host(
+        &self,
+        event: &pi_rs_core::ResourceDiscoveryEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<pi_rs_core::DiscoveredResources> {
+        if !self.description.resources_hook_host_calls {
+            return self.discover_resources(event, state).await;
+        }
+        let request = ProtocolRequest::DiscoverResources {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+    fn handles_message_lifecycle(&self) -> bool {
+        self.description.message_lifecycle_hook
+    }
+
+    async fn message_lifecycle(
+        &self,
+        event: &pi_rs_core::MessageLifecycleEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<Message>> {
+        if !self.handles_message_lifecycle() {
+            return Ok(None);
+        }
+        self.request_async(ProtocolRequest::MessageLifecycle {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+
+    fn handles_after_provider_response(&self) -> bool {
+        self.description.after_provider_response_hook
+    }
+    async fn after_provider_response(
+        &self,
+        event: &pi_rs_core::ProviderResponseEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        if !self.handles_after_provider_response() {
+            return Ok(());
+        }
+        self.request_async(ProtocolRequest::AfterProviderResponse {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+
     fn handles_session_lifecycle(&self) -> bool {
         self.description.session_lifecycle_hook
     }
@@ -569,6 +1263,12 @@ impl Extension for ExecutableExtension {
         event: &LifecycleEvent,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<()> {
+        if matches!(event, LifecycleEvent::McpServersChange { .. })
+            && !self.handles_mcp_servers_change()
+        {
+            return Ok(());
+        }
+
         use pi_rs_core::{SessionShutdownReason as Shutdown, SessionStartReason as Start};
         if matches!(event, LifecycleEvent::SessionInfoChanged { .. })
             && !self.description.session_info_hook
@@ -601,6 +1301,99 @@ impl Extension for ExecutableExtension {
         })
         .await
     }
+    fn handles_mcp_registry(&self) -> bool {
+        self.description.mcp_registry_host_calls
+    }
+
+    async fn lifecycle_with_mcp_registry(
+        &self,
+        event: &LifecycleEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+        mcp: Arc<dyn pi_rs_core::McpRegistryHost>,
+    ) -> ExtensionResult<()> {
+        if matches!(event, LifecycleEvent::McpServersChange { .. })
+            && !self.handles_mcp_servers_change()
+        {
+            return Ok(());
+        }
+        if !self.handles_mcp_registry() {
+            return self.lifecycle_with_host(event, state, host).await;
+        }
+        let request = ProtocolRequest::Lifecycle {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let endpoint = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancellation = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            call_duplex_inner(&endpoint, request, host, &cancellation, &runtime, Some(mcp))
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    async fn lifecycle_with_host(
+        &self,
+        event: &LifecycleEvent,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        if matches!(event, LifecycleEvent::McpServersChange { .. })
+            && !self.handles_mcp_servers_change()
+        {
+            return Ok(());
+        }
+
+        if !self.description.lifecycle_host_calls {
+            return self.lifecycle(event, state).await;
+        }
+        let request = ProtocolRequest::Lifecycle {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancellation = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            call_duplex(&path, request, host, &cancellation, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+    async fn compaction_lifecycle_with_host(
+        &self,
+        event: &LifecycleEvent,
+        trigger: pi_rs_core::CompactionTrigger,
+        metadata: Option<&Value>,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<()> {
+        if !self.description.compaction_lifecycle_v1 {
+            return self.lifecycle_with_host(event, state, host).await;
+        }
+        let request = ProtocolRequest::CompactionLifecycleV1 {
+            event: event.clone(),
+            trigger,
+            metadata: metadata.cloned(),
+            state: state.cloned(),
+        };
+        if !self.description.lifecycle_host_calls {
+            return self.request_async(request).await;
+        }
+        let endpoint = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancellation = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            call_duplex(&endpoint, request, host, &cancellation, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
     fn handles_cache_warming(&self) -> bool {
         self.description.cache_warming_hook
     }
@@ -632,6 +1425,27 @@ impl Extension for ExecutableExtension {
         })
         .await
     }
+    async fn before_session_transition_with_host(
+        &self,
+        event: &pi_rs_core::BeforeSessionTransition,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<bool> {
+        if !self.description.transition_hook_host_calls {
+            return self.before_session_transition(event, state).await;
+        }
+        let request = ProtocolRequest::BeforeSessionTransition {
+            event: event.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
+    }
     async fn before_tree(
         &self,
         preparation: &TreePreparation,
@@ -644,6 +1458,28 @@ impl Extension for ExecutableExtension {
         })
         .await
     }
+    async fn before_tree_with_host(
+        &self,
+        preparation: &TreePreparation,
+        state: Option<&ExtensionState>,
+        cancel: &CancellationToken,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<TreeDecision>> {
+        if !self.description.tree_hook_host_calls {
+            return self.before_tree(preparation, state, cancel).await;
+        }
+        let request = ProtocolRequest::BeforeTree {
+            preparation: preparation.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
+    }
     fn migrate(
         &self,
         previous: Option<&ExtensionState>,
@@ -654,61 +1490,300 @@ impl Extension for ExecutableExtension {
     }
     fn context(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
-        let mut updated = self.request(ProtocolRequest::Context {
-            request: extension_context(request),
-            state: state.cloned(),
-        })?;
-        restore_provider_replay(request, &mut updated);
-        *request = updated;
-        Ok(())
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
+        let mut updated = if self.description.context_provenance_v1 {
+            let payload = extension_context(request);
+            let message = if self.description.context_safe_patch_v1 {
+                ProtocolRequest::ContextV3 {
+                    request: payload,
+                    state: state.cloned(),
+                }
+            } else {
+                ProtocolRequest::ContextV2 {
+                    request: payload,
+                    state: state.cloned(),
+                }
+            };
+            match self.request(message)? {
+                ContextResponse::Unchanged => return Ok(pi_rs_core::ContextChange::Unchanged),
+                ContextResponse::SafePatch { patch } => {
+                    if !self.description.context_safe_patch_v1 {
+                        return Err("unnegotiated context patch".into());
+                    }
+                    commit_request_patch(request, &patch)?;
+                    return Ok(pi_rs_core::ContextChange::Changed);
+                }
+                ContextResponse::Changed { value } => value,
+            }
+        } else {
+            self.request(ProtocolRequest::Context {
+                request: extension_context(request),
+                state: state.cloned(),
+            })?
+        };
+        restore_legacy_tool_metadata(
+            request,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_provenance_v2,
+        );
+        **request = updated;
+        Ok(pi_rs_core::ContextChange::Changed)
     }
     async fn before_request(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         purpose: RequestPurpose,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
-        let message = ProtocolRequest::BeforeRequest {
-            request: extension_context(request),
-            summary: purpose == RequestPurpose::Summary,
-            state: state.cloned(),
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
+        let mut updated = if self.description.context_provenance_v1 {
+            match self
+                .request_async(if self.description.context_safe_patch_v1 {
+                    ProtocolRequest::BeforeRequestV3 {
+                        request: extension_context(request),
+                        summary: purpose == RequestPurpose::Summary,
+                        state: state.cloned(),
+                    }
+                } else {
+                    ProtocolRequest::BeforeRequestV2 {
+                        request: extension_context(request),
+                        summary: purpose == RequestPurpose::Summary,
+                        state: state.cloned(),
+                    }
+                })
+                .await?
+            {
+                ContextResponse::Unchanged => return Ok(pi_rs_core::ContextChange::Unchanged),
+                ContextResponse::SafePatch { patch } => {
+                    if !self.description.context_safe_patch_v1 {
+                        return Err("unnegotiated context patch".into());
+                    }
+                    commit_request_patch(request, &patch)?;
+                    return Ok(pi_rs_core::ContextChange::Changed);
+                }
+                ContextResponse::Changed { value } => value,
+            }
+        } else {
+            self.request_async(ProtocolRequest::BeforeRequest {
+                request: extension_context(request),
+                summary: purpose == RequestPurpose::Summary,
+                state: state.cloned(),
+            })
+            .await?
         };
-        let mut updated = self.request_async(message).await?;
-        restore_provider_replay(request, &mut updated);
-        *request = updated;
-        Ok(())
+        restore_legacy_tool_metadata(
+            request,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_provenance_v2,
+        );
+        **request = updated;
+        Ok(pi_rs_core::ContextChange::Changed)
+    }
+    async fn before_request_with_host(
+        &self,
+        request: &mut pi_rs_core::ContextRequest<'_>,
+        purpose: RequestPurpose,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
+        if !self.description.request_hook_host_calls {
+            return self.before_request(request, purpose, state).await;
+        }
+        let payload = if self.description.context_provenance_v1 {
+            if self.description.context_safe_patch_v1 {
+                ProtocolRequest::BeforeRequestV3 {
+                    request: extension_context(request),
+                    summary: purpose == RequestPurpose::Summary,
+                    state: state.cloned(),
+                }
+            } else {
+                ProtocolRequest::BeforeRequestV2 {
+                    request: extension_context(request),
+                    summary: purpose == RequestPurpose::Summary,
+                    state: state.cloned(),
+                }
+            }
+        } else {
+            ProtocolRequest::BeforeRequest {
+                request: extension_context(request),
+                summary: purpose == RequestPurpose::Summary,
+                state: state.cloned(),
+            }
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let mut updated: ModelRequest = if self.description.context_provenance_v1 {
+            let response: ContextResponse<ModelRequest> = tokio::task::spawn_blocking(move || {
+                call_duplex(&path, payload, host, &cancelled, &runtime)
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+            match response {
+                ContextResponse::Unchanged => return Ok(pi_rs_core::ContextChange::Unchanged),
+                ContextResponse::SafePatch { patch } => {
+                    if !self.description.context_safe_patch_v1 {
+                        return Err("unnegotiated context patch".into());
+                    }
+                    commit_request_patch(request, &patch)?;
+                    return Ok(pi_rs_core::ContextChange::Changed);
+                }
+                ContextResponse::Changed { value } => value,
+            }
+        } else {
+            tokio::task::spawn_blocking(move || {
+                call_duplex(&path, payload, host, &cancelled, &runtime)
+            })
+            .await
+            .map_err(|error| error.to_string())??
+        };
+        restore_legacy_tool_metadata(
+            request,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_provenance_v2,
+        );
+        **request = updated;
+        Ok(pi_rs_core::ContextChange::Changed)
     }
     fn handles_context_with_system(&self) -> bool {
         self.description.context_with_system_hook
     }
     async fn context_with_system(
         &self,
-        messages: &mut Vec<Message>,
+        messages: &mut pi_rs_core::ContextMessages<'_>,
         state: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
         let original = ModelRequest {
             model: String::new(),
             messages: messages.clone(),
             tools: Vec::new(),
             max_output_tokens: 0,
         };
-        let updated = self
-            .request_async(ProtocolRequest::ContextWithSystem {
+        let updated = if self.description.context_provenance_v1 {
+            match self
+                .request_async(if self.description.context_safe_patch_v1 {
+                    ProtocolRequest::ContextWithSystemV3 {
+                        messages: extension_context(&original).messages,
+                        state: state.cloned(),
+                    }
+                } else {
+                    ProtocolRequest::ContextWithSystemV2 {
+                        messages: extension_context(&original).messages,
+                        state: state.cloned(),
+                    }
+                })
+                .await?
+            {
+                ContextResponse::Unchanged => return Ok(pi_rs_core::ContextChange::Unchanged),
+                ContextResponse::SafePatch { patch } => {
+                    if !self.description.context_safe_patch_v1 {
+                        return Err("unnegotiated context patch".into());
+                    }
+                    commit_messages_patch(messages, &patch)?;
+                    return Ok(pi_rs_core::ContextChange::Changed);
+                }
+                ContextResponse::Changed { value } => value,
+            }
+        } else {
+            self.request_async(ProtocolRequest::ContextWithSystem {
                 messages: extension_context(&original).messages,
                 state: state.cloned(),
             })
-            .await?;
+            .await?
+        };
         let mut updated = ModelRequest {
             messages: updated,
             ..original.clone()
         };
-        restore_provider_replay(&original, &mut updated);
-        *messages = updated.messages;
-        Ok(())
+        restore_legacy_tool_metadata(
+            &original,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_provenance_v2,
+        );
+        **messages = updated.messages;
+        Ok(pi_rs_core::ContextChange::Changed)
     }
+    async fn context_with_system_with_host(
+        &self,
+        messages: &mut pi_rs_core::ContextMessages<'_>,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
+        if !self.description.context_hook_host_calls {
+            return self.context_with_system(messages, state).await;
+        }
+        let original = ModelRequest {
+            model: String::new(),
+            messages: messages.clone(),
+            tools: Vec::new(),
+            max_output_tokens: 0,
+        };
+        let payload = if self.description.context_provenance_v1 {
+            if self.description.context_safe_patch_v1 {
+                ProtocolRequest::ContextWithSystemV3 {
+                    messages: extension_context(&original).messages,
+                    state: state.cloned(),
+                }
+            } else {
+                ProtocolRequest::ContextWithSystemV2 {
+                    messages: extension_context(&original).messages,
+                    state: state.cloned(),
+                }
+            }
+        } else {
+            ProtocolRequest::ContextWithSystem {
+                messages: extension_context(&original).messages,
+                state: state.cloned(),
+            }
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let updated: Vec<Message> = if self.description.context_provenance_v1 {
+            let response: ContextResponse<Vec<Message>> = tokio::task::spawn_blocking(move || {
+                call_duplex(&path, payload, host, &cancelled, &runtime)
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+            match response {
+                ContextResponse::Unchanged => return Ok(pi_rs_core::ContextChange::Unchanged),
+                ContextResponse::SafePatch { patch } => {
+                    if !self.description.context_safe_patch_v1 {
+                        return Err("unnegotiated context patch".into());
+                    }
+                    commit_messages_patch(messages, &patch)?;
+                    return Ok(pi_rs_core::ContextChange::Changed);
+                }
+                ContextResponse::Changed { value } => value,
+            }
+        } else {
+            tokio::task::spawn_blocking(move || {
+                call_duplex(&path, payload, host, &cancelled, &runtime)
+            })
+            .await
+            .map_err(|error| error.to_string())??
+        };
+        let mut updated = ModelRequest {
+            messages: updated,
+            ..original.clone()
+        };
+        restore_legacy_tool_metadata(
+            &original,
+            &mut updated,
+            !self.description.tool_message_error,
+            !self.description.tool_message_provenance_v2,
+        );
+        **messages = updated.messages;
+        Ok(pi_rs_core::ContextChange::Changed)
+    }
+
     fn command(
         &self,
         name: &str,
@@ -772,6 +1847,30 @@ impl Extension for ExecutableExtension {
                 })
         }
     }
+    fn command_effects_classified(
+        &self,
+        name: &str,
+        arguments: &str,
+        previous: Option<&ExtensionState>,
+    ) -> std::result::Result<pi_rs_core::ExtensionCommandEffects, pi_rs_core::CommandCallbackFailure>
+    {
+        if self.description.command_failure_classification_v1 {
+            let response: std::result::Result<
+                pi_rs_core::ExtensionCommandEffects,
+                pi_rs_core::CommandCallbackFailure,
+            > = self
+                .request(ProtocolRequest::CommandEffectsClassifiedV1 {
+                    name: name.into(),
+                    arguments: arguments.into(),
+                    state: previous.cloned(),
+                })
+                .map_err(pi_rs_core::CommandCallbackFailure::Transport)?;
+            response
+        } else {
+            self.command_effects(name, arguments, previous)
+                .map_err(pi_rs_core::CommandCallbackFailure::Transport)
+        }
+    }
     async fn before_tool(
         &self,
         name: &str,
@@ -794,6 +1893,97 @@ impl Extension for ExecutableExtension {
                 .map_err(|error| error.to_string())??;
         Ok(result.into())
     }
+    async fn before_tool_with_host(
+        &self,
+        name: &str,
+        arguments: &Value,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        if !self.description.before_tool_host_calls {
+            return self.before_tool(name, arguments, context, state).await;
+        }
+        let request = ProtocolRequest::BeforeTool {
+            name: name.into(),
+            arguments: arguments.clone(),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let result: DecisionValue = tokio::task::spawn_blocking(move || {
+            call_duplex(&path, request, host, &cancelled, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        Ok(result.into())
+    }
+    fn handles_tool_call(&self) -> bool {
+        self.description.tool_call_hook
+    }
+    async fn tool_call(
+        &self,
+        name: &str,
+        arguments: &mut Value,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Decision> {
+        if !self.description.tool_call_hook {
+            return self.before_tool(name, arguments, context, state).await;
+        }
+        let request = ProtocolRequest::ToolCall {
+            name: name.into(),
+            arguments: arguments.clone(),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        let (updated, decision): (Value, DecisionValue) =
+            tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
+                .await
+                .map_err(|error| error.to_string())??;
+        *arguments = updated;
+        Ok(decision.into())
+    }
+    async fn tool_call_with_host(
+        &self,
+        name: &str,
+        arguments: &mut Value,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        if !self.description.tool_call_hook {
+            return self
+                .before_tool_with_host(name, arguments, context, state, host)
+                .await;
+        }
+        if !self.description.tool_hook_host_calls {
+            return self.tool_call(name, arguments, context, state).await;
+        }
+        let request = ProtocolRequest::ToolCall {
+            name: name.into(),
+            arguments: arguments.clone(),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (updated, decision): (Value, DecisionValue) = tokio::task::spawn_blocking(move || {
+            call_duplex(&path, request, host, &cancelled, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        *arguments = updated;
+        Ok(decision.into())
+    }
     fn handles_tool_result(&self) -> bool {
         self.description.tool_result_hook
     }
@@ -804,19 +1994,141 @@ impl Extension for ExecutableExtension {
         context: &ToolContext,
         state: Option<&ExtensionState>,
     ) -> ExtensionResult<Option<Outcome>> {
+        let legacy = !self.endpoint.text_result_v2;
+        let sent = self.endpoint.project_outcome(outcome);
         let request = ProtocolRequest::ToolResult {
             call: call_data.clone(),
-            outcome: outcome.clone(),
+            outcome: sent.clone(),
             operation_id: context.operation_id.to_string(),
             state: state.cloned(),
+            text_result_v2: !legacy,
+            presence_v1: false,
         };
         let path = self.endpoint.clone();
         let guard = CancelOnDrop(context.cancellation.child_token());
         let cancelled = guard.0.clone();
-        tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
-            .await
-            .map_err(|error| error.to_string())?
+        let updated: Option<Outcome> =
+            tokio::task::spawn_blocking(move || call(&path, request, Some(&cancelled)))
+                .await
+                .map_err(|error| error.to_string())??;
+        // An older executable cannot represent patched failure metadata. Preserve
+        // it when the old hook makes no change, or changes only the text.
+        if legacy
+            && let Outcome::TextResult {
+                output, details, ..
+            }
+            | Outcome::TextResultWithStructuredContent {
+                output, details, ..
+            } = outcome
+        {
+            return Ok(updated.map(|result| {
+                if result == sent
+                    && !matches!(outcome, Outcome::TextResultWithStructuredContent { .. })
+                {
+                    return outcome.clone();
+                }
+                match result {
+                    Outcome::Failed(text) => Outcome::TextResult {
+                        output: if text == *output {
+                            output.clone()
+                        } else {
+                            text
+                        },
+                        details: details.clone(),
+                        is_error: true,
+                    },
+                    other => other,
+                }
+            }));
+        }
+        Ok(updated)
     }
+
+    async fn tool_result_update_with_host(
+        &self,
+        call_data: &pi_rs_core::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<Outcome>> {
+        if !self.description.tool_hook_host_calls || !self.endpoint.text_result_v2 {
+            return self
+                .tool_result_update(call_data, outcome, context, state)
+                .await;
+        }
+        let request = ProtocolRequest::ToolResult {
+            call: call_data.clone(),
+            outcome: self.endpoint.project_outcome(outcome),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+            text_result_v2: true,
+            presence_v1: false,
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let updated: Option<Outcome> = tokio::task::spawn_blocking(move || {
+            call_duplex(&path, request, host, &cancelled, &runtime)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        Ok(updated)
+    }
+
+    async fn tool_result_update_with_presence(
+        &self,
+        call_data: &pi_rs_core::ToolCall,
+        outcome: &Outcome,
+        context: &ToolContext,
+        state: Option<&ExtensionState>,
+        host: Option<Arc<dyn ToolHost>>,
+    ) -> ExtensionResult<(Option<Outcome>, Option<bool>)> {
+        if !self.description.result_presence_v1 || !self.endpoint.text_result_v2 {
+            let result = match host {
+                Some(host) => {
+                    self.tool_result_update_with_host(call_data, outcome, context, state, host)
+                        .await?
+                }
+                None => {
+                    self.tool_result_update(call_data, outcome, context, state)
+                        .await?
+                }
+            };
+            return Ok((result, None));
+        }
+        let request = ProtocolRequest::ToolResult {
+            call: call_data.clone(),
+            outcome: self.endpoint.project_outcome(outcome),
+            operation_id: context.operation_id.to_string(),
+            state: state.cloned(),
+            text_result_v2: true,
+            presence_v1: true,
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(context.cancellation.child_token());
+        let cancelled = guard.0.clone();
+        let use_duplex = self.description.tool_hook_host_calls && host.is_some();
+        let runtime = tokio::runtime::Handle::current();
+        let result: ToolResultPresence = tokio::task::spawn_blocking(move || {
+            if use_duplex {
+                call_duplex(
+                    &path,
+                    request,
+                    host.expect("checked host"),
+                    &cancelled,
+                    &runtime,
+                )
+            } else {
+                call(&path, request, Some(&cancelled))
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        Ok((result.outcome, result.output_unchanged))
+    }
+
     fn after_tool(
         &self,
         name: &str,
@@ -825,10 +2137,43 @@ impl Extension for ExecutableExtension {
     ) -> ExtensionResult<Option<ExtensionState>> {
         self.request(ProtocolRequest::AfterTool {
             name: name.into(),
-            outcome: outcome.clone(),
+            outcome: self.endpoint.project_outcome(outcome),
             state: state.cloned(),
         })
     }
+    fn handles_before_summary_compaction(&self) -> bool {
+        self.description.before_summary_compaction_v1
+    }
+
+    async fn before_summary_compaction(
+        &self,
+        preparation: &pi_rs_core::CompactionPreparation,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<pi_rs_core::BeforeSummaryCompactionResult>> {
+        if !self.description.before_summary_compaction_v1 {
+            return Ok(None);
+        }
+        let request = ProtocolRequest::BeforeSummaryCompaction {
+            preparation: preparation.clone(),
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let duplex = self.description.compaction_hook_host_calls;
+        tokio::task::spawn_blocking(move || {
+            if duplex {
+                call_duplex(&path, request, host, &cancelled, &runtime)
+            } else {
+                call(&path, request, Some(&cancelled))
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
     fn before_compaction(
         &self,
         compaction: &mut Compaction,
@@ -844,6 +2189,34 @@ impl Extension for ExecutableExtension {
         compaction.keep_turns = keep_turns;
         Ok(decision.into())
     }
+    async fn before_compaction_with_host(
+        &self,
+        compaction: &mut Compaction,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Decision> {
+        if !self.description.compaction_hook_host_calls {
+            return self.before_compaction(compaction, state);
+        }
+        let request = ProtocolRequest::BeforeCompaction {
+            summary: compaction.summary.clone(),
+            keep_turns: compaction.keep_turns,
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (summary, keep_turns, decision): (String, usize, DecisionValue) =
+            tokio::task::spawn_blocking(move || {
+                call_duplex(&path, request, host, &cancelled, &runtime)
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+        compaction.summary = summary;
+        compaction.keep_turns = keep_turns;
+        Ok(decision.into())
+    }
     fn after_compaction(
         &self,
         compaction: &Compaction,
@@ -855,12 +2228,35 @@ impl Extension for ExecutableExtension {
             state: state.cloned(),
         })
     }
+    async fn after_compaction_with_host(
+        &self,
+        compaction: &Compaction,
+        state: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ExtensionResult<Option<ExtensionState>> {
+        if !self.description.compaction_hook_host_calls {
+            return self.after_compaction(compaction, state);
+        }
+        let request = ProtocolRequest::AfterCompaction {
+            summary: compaction.summary.clone(),
+            keep_turns: compaction.keep_turns,
+            state: state.cloned(),
+        };
+        let path = self.endpoint.clone();
+        let guard = CancelOnDrop(CancellationToken::new());
+        let cancelled = guard.0.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || call_duplex(&path, request, host, &cancelled, &runtime))
+            .await
+            .map_err(|error| error.to_string())?
+    }
 }
 
 struct ExecutableTool {
     endpoint: Endpoint,
     spec: ToolSpec,
     execution: ToolExecution,
+    renderers: Option<DescriptionToolRenderers>,
     can_poll: bool,
     transactional: bool,
     prepares_arguments: bool,
@@ -920,8 +2316,48 @@ impl ExecutableTool {
         }
     }
 }
+struct ExecutableToolRenderer {
+    endpoint: Endpoint,
+    tool_name: String,
+    section: ToolSection,
+}
+
+#[async_trait::async_trait]
+impl ToolSectionRenderer for ExecutableToolRenderer {
+    async fn render(
+        &self,
+        context: &ToolRenderContext,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        if context.tool_name != self.tool_name {
+            return Err("tool renderer received a different tool name".into());
+        }
+        self.endpoint
+            .request_async(ProtocolRequest::RenderToolSection {
+                section: self.section,
+                context: context.clone(),
+            })
+            .await
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for ExecutableTool {
+    fn tool_renderers(&self) -> Option<ToolRenderers> {
+        let renderers = self.renderers?;
+        let section = |section| -> Arc<dyn ToolSectionRenderer> {
+            Arc::new(ExecutableToolRenderer {
+                endpoint: self.endpoint.clone(),
+                tool_name: self.spec.name.clone(),
+                section,
+            })
+        };
+        Some(ToolRenderers {
+            shell: renderers.shell,
+            call: renderers.call.then(|| section(ToolSection::Call)),
+            result: renderers.result.then(|| section(ToolSection::Result)),
+        })
+    }
+
     async fn prepare_arguments(&self, arguments: Value) -> ExtensionResult<Value> {
         if !self.prepares_arguments {
             return Ok(arguments);
@@ -1012,6 +2448,68 @@ impl Tool for ExecutableTool {
             .flatten()
     }
 }
+struct ShellProgressHost {
+    inner: Arc<dyn ToolHost>,
+    output: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+#[async_trait::async_trait]
+impl ToolHost for ShellProgressHost {
+    fn supports_prevalidated_call_accounting(&self) -> bool {
+        self.inner.supports_prevalidated_call_accounting()
+    }
+    fn tools(&self) -> Vec<ToolSpec> {
+        self.inner.tools()
+    }
+    fn supports_progress(&self) -> bool {
+        true
+    }
+    fn supports_custom_messages(&self) -> bool {
+        self.inner.supports_custom_messages()
+    }
+    fn supports_keyed_messages(&self) -> bool {
+        self.inner.supports_keyed_messages()
+    }
+    async fn send_message_with_key(
+        &self,
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+        key: &str,
+    ) -> ExtensionResult<()> {
+        self.inner
+            .send_message_with_key(message, delivery, key)
+            .await
+    }
+    async fn send_message(
+        &self,
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+    ) -> ExtensionResult<()> {
+        self.inner.send_message(message, delivery).await
+    }
+    async fn call(&self, name: &str, arguments: Value) -> Outcome {
+        self.inner.call(name, arguments).await
+    }
+    async fn call_batch(&self, calls: Vec<(String, Value)>) -> Vec<Outcome> {
+        self.inner.call_batch(calls).await
+    }
+    async fn call_batch_prevalidated(&self, calls: Vec<(String, Option<Value>)>) -> Vec<Outcome> {
+        self.inner.call_batch_prevalidated(calls).await
+    }
+    async fn report_progress(&self, value: Value) -> ExtensionResult<()> {
+        let data: Vec<u8> = serde_json::from_value(
+            value
+                .get("shellOutput")
+                .cloned()
+                .ok_or_else(|| "invalid shell progress".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
+        self.output
+            .send(data)
+            .await
+            .map_err(|_| "shell output consumer closed".to_owned())
+    }
+}
+
 struct DetachedHost;
 #[async_trait::async_trait]
 impl ToolHost for DetachedHost {
@@ -1031,10 +2529,42 @@ struct DuplexRequest {
     has_ui: bool,
     #[serde(default)]
     has_progress: bool,
+    #[serde(default)]
+    has_custom_messages: bool,
+    #[serde(default)]
+    has_custom_entries: bool,
+    #[serde(default)]
+    has_custom_entry_read: bool,
+    #[serde(default)]
+    has_keyed_messages: bool,
+    #[serde(default)]
+    has_prevalidated_calls: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    has_mcp_registry: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DuplexFrame {
+    ListMcpServers,
+    RegisterMcpServer {
+        server: pi_rs_core::McpServerDeclaration,
+    },
+    UnregisterMcpServer {
+        name: String,
+    },
+    ListCustomEntries {
+        #[serde(default)]
+        custom_type: Option<String>,
+    },
+    AppendEntry {
+        entry: pi_rs_core::CustomEntry,
+    },
+    SendMessage {
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
     Progress {
         partial_result: Value,
     },
@@ -1043,37 +2573,313 @@ enum DuplexFrame {
     },
     Call {
         calls: Vec<(String, Value)>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rejected: Vec<usize>,
+    },
+    #[serde(skip)]
+    CheckedCall {
+        calls: Vec<(String, Option<Value>)>,
     },
     Complete {
         response: std::result::Result<Value, String>,
     },
 }
 
-fn write_line(writer: &mut impl Write, value: &impl Serialize) -> ExtensionResult<()> {
-    let mut bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-    if bytes.len() as u64 >= MAX_MESSAGE {
-        return Err("native extension frame exceeds 4 MiB".into());
+// Count the old response envelope without allocating another copy of its
+// potentially large outcome. Only the negotiated wrapper may exceed the cap.
+fn check_presence_response(
+    response: &std::result::Result<Value, String>,
+    limit: u64,
+    duplex: bool,
+    newline: bool,
+) -> ExtensionResult<()> {
+    #[derive(Serialize)]
+    struct Single<'a> {
+        version: u16,
+        response: std::result::Result<&'a Value, &'a String>,
     }
-    bytes.push(b'\n');
+    #[derive(Serialize)]
+    struct Complete<'a> {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        response: std::result::Result<&'a Value, &'a String>,
+    }
+    struct Counter {
+        length: u64,
+        limit: u64,
+    }
+    impl Write for Counter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.length = self.length.saturating_add(data.len() as u64);
+            if self.length > self.limit {
+                return Err(std::io::Error::other("response limit exceeded"));
+            }
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let response = match response {
+        Ok(value) => Ok(value.get("outcome").ok_or("invalid presence response")?),
+        Err(error) => Err(error),
+    };
+    let mut counter = Counter {
+        length: u64::from(newline),
+        limit,
+    };
+    let result = if duplex {
+        serde_json::to_writer(
+            &mut counter,
+            &Complete {
+                kind: "complete",
+                response,
+            },
+        )
+    } else {
+        serde_json::to_writer(
+            &mut counter,
+            &Single {
+                version: PROTOCOL,
+                response,
+            },
+        )
+    };
+    result.map_err(|_| {
+        format!(
+            "native extension response exceeds {} MiB",
+            limit / (1024 * 1024)
+        )
+    })
+}
+
+fn write_line(writer: &mut impl Write, value: &impl Serialize) -> ExtensionResult<()> {
+    write_bounded_line(writer, value, MAX_MESSAGE)
+}
+fn duplex_write_line(writer: &mut impl Write, value: &impl Serialize) -> ExtensionResult<()> {
+    write_bounded_line(writer, value, MAX_DUPLEX_MESSAGE)
+}
+fn write_bounded_line(
+    writer: &mut impl Write,
+    value: &impl Serialize,
+    limit: u64,
+) -> ExtensionResult<()> {
+    struct Bounded {
+        bytes: Vec<u8>,
+        limit: usize,
+        exceeded: bool,
+    }
+    impl Write for Bounded {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            if data.len() > self.limit.saturating_sub(self.bytes.len()) {
+                self.exceeded = true;
+                return Err(std::io::Error::other("frame limit exceeded"));
+            }
+            self.bytes.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = Bounded {
+        bytes: Vec::new(),
+        limit: (limit - 1) as usize,
+        exceeded: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut buffer, value) {
+        return Err(if buffer.exceeded {
+            format!(
+                "native extension frame exceeds {} MiB",
+                limit / (1024 * 1024)
+            )
+        } else {
+            error.to_string()
+        });
+    }
+    buffer.bytes.push(b'\n');
     writer
-        .write_all(&bytes)
+        .write_all(&buffer.bytes)
         .and_then(|_| writer.flush())
         .map_err(|error| error.to_string())
 }
 fn read_line<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> ExtensionResult<T> {
+    read_bounded_line(reader, MAX_MESSAGE)
+}
+fn duplex_read_line<T: serde::de::DeserializeOwned>(
+    reader: &mut impl BufRead,
+) -> ExtensionResult<T> {
+    read_bounded_line(reader, MAX_DUPLEX_MESSAGE)
+}
+fn read_bounded_line<T: serde::de::DeserializeOwned>(
+    reader: &mut impl BufRead,
+    limit: u64,
+) -> ExtensionResult<T> {
+    let bytes = read_bounded_frame(reader, limit)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid native extension frame: {error}"))
+}
+fn read_bounded_frame(reader: &mut impl BufRead, limit: u64) -> ExtensionResult<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
-        .take(MAX_MESSAGE + 1)
+        .take(limit + 1)
         .read_until(b'\n', &mut bytes)
         .map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > MAX_MESSAGE {
-        return Err("native extension frame exceeds 4 MiB".into());
+    if bytes.len() as u64 > limit {
+        return Err(format!(
+            "native extension frame exceeds {} MiB",
+            limit / (1024 * 1024)
+        ));
     }
     if bytes.is_empty() {
         return Err("native extension connection closed".into());
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|error| format!("invalid native extension frame: {error}"))
+    Ok(bytes)
+}
+
+// Inspect call count without allocating their arbitrary JSON arguments. The
+// frame may put `type` after `calls`, so borrow the raw array before parsing it.
+#[cfg(test)]
+fn read_duplex_frame(reader: &mut impl BufRead) -> ExtensionResult<DuplexFrame> {
+    read_duplex_frame_with_presence(reader, false)
+}
+
+fn read_duplex_frame_with_presence(
+    reader: &mut impl BufRead,
+    presence: bool,
+) -> ExtensionResult<DuplexFrame> {
+    #[derive(Deserialize)]
+    struct Preflight<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: std::borrow::Cow<'a, str>,
+        #[serde(borrow)]
+        calls: Option<&'a serde_json::value::RawValue>,
+        #[serde(borrow)]
+        rejected: Option<&'a serde_json::value::RawValue>,
+    }
+    struct BoundedCalls<'a>(
+        Vec<(
+            &'a serde_json::value::RawValue,
+            &'a serde_json::value::RawValue,
+        )>,
+    );
+    impl<'de> Deserialize<'de> for BoundedCalls<'de> {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = BoundedCalls<'de>;
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("an array of at most 4096 tool calls")
+                }
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut sequence: A,
+                ) -> std::result::Result<Self::Value, A::Error> {
+                    let mut calls = Vec::new();
+                    for _ in 0..4096 {
+                        match sequence.next_element::<(
+                            &'de serde_json::value::RawValue,
+                            &'de serde_json::value::RawValue,
+                        )>()? {
+                            None => return Ok(BoundedCalls(calls)),
+                            Some(call) => calls.push(call),
+                        }
+                    }
+                    if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                        return Err(serde::de::Error::custom(
+                            "native extension batch exceeds execution limit",
+                        ));
+                    }
+                    Ok(BoundedCalls(calls))
+                }
+            }
+            deserializer.deserialize_seq(Visitor)
+        }
+    }
+    let allowance = if presence {
+        PRESENCE_RESPONSE_OVERHEAD
+    } else {
+        0
+    };
+    let bytes = read_bounded_frame(reader, MAX_DUPLEX_MESSAGE + allowance)?;
+    let prefix: Preflight<'_> = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid native extension frame: {error}"))?;
+    if bytes.len() as u64 > MAX_DUPLEX_MESSAGE && (!presence || prefix.kind != "complete") {
+        return Err("native extension frame exceeds 16 MiB".into());
+    }
+    if prefix.kind == "call"
+        && let Some(calls) = prefix.calls
+    {
+        let BoundedCalls(calls) = serde_json::from_str::<BoundedCalls<'_>>(calls.get())
+            .map_err(|error| format!("invalid native extension frame: {error}"))?;
+        let rejected = if let Some(raw) = prefix.rejected {
+            struct Indices(Vec<usize>);
+            impl<'de> Deserialize<'de> for Indices {
+                fn deserialize<D: serde::Deserializer<'de>>(
+                    deserializer: D,
+                ) -> std::result::Result<Self, D::Error> {
+                    struct V;
+                    impl<'de> serde::de::Visitor<'de> for V {
+                        type Value = Indices;
+                        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                            f.write_str("at most 4096 ordered indices")
+                        }
+                        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                            self,
+                            mut seq: A,
+                        ) -> std::result::Result<Self::Value, A::Error> {
+                            let mut indices = Vec::new();
+                            while let Some(index) = seq.next_element::<usize>()? {
+                                if indices.len() == 4096
+                                    || indices.last().is_some_and(|prior| *prior >= index)
+                                {
+                                    return Err(serde::de::Error::custom(
+                                        "invalid prevalidated call indices",
+                                    ));
+                                }
+                                indices.push(index);
+                            }
+                            Ok(Indices(indices))
+                        }
+                    }
+                    deserializer.deserialize_seq(V)
+                }
+            }
+            serde_json::from_str::<Indices>(raw.get())
+                .map_err(|error| format!("invalid native extension frame: {error}"))?
+                .0
+        } else {
+            Vec::new()
+        };
+        if rejected.last().is_some_and(|index| *index >= calls.len()) {
+            return Err("invalid prevalidated call indices".into());
+        }
+        let mut rejected = rejected.into_iter().peekable();
+        let calls = calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, arguments))| {
+                let name = serde_json::from_str::<String>(name.get())?;
+                let value = if rejected.peek() == Some(&index) {
+                    rejected.next();
+                    None
+                } else {
+                    super::json_size::compact_value(arguments.get())?
+                };
+                Ok::<_, serde_json::Error>((name, value))
+            })
+            .collect::<serde_json::Result<Vec<_>>>()
+            .map_err(|error| format!("invalid native extension frame: {error}"))?;
+        return Ok(DuplexFrame::CheckedCall { calls });
+    }
+    let frame: DuplexFrame = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid native extension frame: {error}"))?;
+    if presence && let DuplexFrame::Complete { response } = &frame {
+        check_presence_response(response, MAX_DUPLEX_MESSAGE, true, bytes.ends_with(b"\n"))?;
+    }
+    Ok(frame)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1178,22 +2984,55 @@ fn serve_bash_stream(extension: Arc<dyn Extension>) -> Result<()> {
     })
 }
 
-fn call_duplex(
+fn call_duplex<T: serde::de::DeserializeOwned>(
     endpoint: &Endpoint,
     request: ProtocolRequest,
     host: Arc<dyn ToolHost>,
     cancellation: &CancellationToken,
     runtime: &tokio::runtime::Handle,
-) -> ExtensionResult<ToolReply> {
+) -> ExtensionResult<T> {
+    call_duplex_inner(endpoint, request, host, cancellation, runtime, None)
+}
+
+fn call_duplex_inner<T: serde::de::DeserializeOwned>(
+    endpoint: &Endpoint,
+    mut request: ProtocolRequest,
+    host: Arc<dyn ToolHost>,
+    cancellation: &CancellationToken,
+    runtime: &tokio::runtime::Handle,
+    mcp: Option<Arc<dyn pi_rs_core::McpRegistryHost>>,
+) -> ExtensionResult<T> {
+    project_overflow_reason(&mut request, endpoint.compaction_overflow_reason_v1);
+    if let ProtocolRequest::Lifecycle {
+        event: LifecycleEvent::ToolExecutionEnd { result, .. },
+        ..
+    } = &mut request
+    {
+        *result = endpoint.project_outcome(result);
+    }
+    let presence = matches!(
+        &request,
+        ProtocolRequest::ToolResult {
+            presence_v1: true,
+            text_result_v2: true,
+            ..
+        }
+    );
     let command = endpoint.command("--pi-rs-extension-v2");
+    if cancellation.is_cancelled() {
+        return Err("native extension operation cancelled".into());
+    }
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
+    if cancellation.is_cancelled() {
+        return Err("native extension operation cancelled".into());
+    }
     let mut input = child.stdin().take().expect("piped stdin");
     let output = child.stdout().take().expect("piped stdout");
     let (writer, writes) = std::sync::mpsc::sync_channel::<Value>(1);
     let (errors, failed) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         for value in writes {
-            if let Err(error) = write_line(&mut input, &value) {
+            if let Err(error) = duplex_write_line(&mut input, &value) {
                 let _ = errors.send(error);
                 break;
             }
@@ -1203,10 +3042,17 @@ fn call_duplex(
     std::thread::spawn(move || {
         let mut output = std::io::BufReader::new(output);
         loop {
-            let frame = read_line::<DuplexFrame>(&mut output);
+            let frame = read_duplex_frame_with_presence(&mut output, presence);
             let terminal = !matches!(
                 frame,
-                Ok(DuplexFrame::Call { .. }
+                Ok(DuplexFrame::ListMcpServers
+                    | DuplexFrame::RegisterMcpServer { .. }
+                    | DuplexFrame::UnregisterMcpServer { .. }
+                    | DuplexFrame::Call { .. }
+                    | DuplexFrame::CheckedCall { .. }
+                    | DuplexFrame::SendMessage { .. }
+                    | DuplexFrame::AppendEntry { .. }
+                    | DuplexFrame::ListCustomEntries { .. }
                     | DuplexFrame::Ui { .. }
                     | DuplexFrame::Progress { .. })
             );
@@ -1215,17 +3061,22 @@ fn call_duplex(
             }
         }
     });
-    writer
-        .send(
-            serde_json::to_value(DuplexRequest {
-                request,
-                tools: host.tools(),
-                has_ui: host.has_ui(),
-                has_progress: host.supports_progress(),
-            })
-            .map_err(|error| error.to_string())?,
-        )
-        .map_err(|_| "native extension input closed")?;
+    let send = |value| send_duplex_input(&writer, value, cancellation);
+    send(
+        serde_json::to_value(DuplexRequest {
+            request,
+            tools: host.tools(),
+            has_ui: host.has_ui(),
+            has_progress: host.supports_progress(),
+            has_custom_messages: host.supports_custom_messages(),
+            has_custom_entries: host.supports_custom_entries(),
+            has_custom_entry_read: host.supports_custom_entry_read(),
+            has_keyed_messages: host.supports_keyed_messages(),
+            has_prevalidated_calls: host.supports_prevalidated_call_accounting(),
+            has_mcp_registry: mcp.is_some(),
+        })
+        .map_err(|error| error.to_string())?,
+    )?;
     loop {
         if cancellation.is_cancelled() {
             return Err(
@@ -1236,27 +3087,103 @@ fn call_duplex(
             return Err(error);
         }
         match frames.recv_timeout(Duration::from_millis(5)) {
-            Ok(Ok(DuplexFrame::Progress { partial_result })) => {
-                let response = runtime.block_on(host.report_progress(partial_result));
-                writer
-                    .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
-                    .map_err(|_| "native extension input closed")?;
+            Ok(Ok(
+                frame @ (DuplexFrame::ListMcpServers
+                | DuplexFrame::RegisterMcpServer { .. }
+                | DuplexFrame::UnregisterMcpServer { .. }),
+            )) => {
+                let response: ExtensionResult<Value> = runtime.block_on(async {
+                    let Some(mcp) = &mcp else {
+                        return Err("MCP registry access is unavailable".into());
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err("native extension cancelled during MCP registration".into()),
+                        result = async {
+                            match frame {
+                                DuplexFrame::ListMcpServers => encode(mcp.mcp_servers().await),
+                                DuplexFrame::RegisterMcpServer { server } => encode(mcp.register_mcp_server(server).await),
+                                DuplexFrame::UnregisterMcpServer { name } => encode(mcp.unregister_mcp_server(&name).await),
+                                _ => unreachable!("matched MCP registry frames"),
+                            }
+                        } => result,
+                    }
+                });
+                send(serde_json::to_value(response).map_err(|error| error.to_string())?)?;
             }
-            Ok(Ok(DuplexFrame::Call { calls })) => {
+            Ok(Ok(DuplexFrame::ListCustomEntries { custom_type })) => {
+                let response = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err("native extension cancelled during entry lookup".to_owned()),
+                        result = host.custom_entries(custom_type.as_deref()) => result,
+                    }
+                });
+                send(serde_json::to_value(response).map_err(|error| error.to_string())?)?;
+            }
+            Ok(Ok(DuplexFrame::AppendEntry { entry })) => {
+                let response = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err("native extension cancelled during entry persistence".to_owned()),
+                        result = host.append_entry(entry) => result,
+                    }
+                });
+                send(serde_json::to_value(response).map_err(|error| error.to_string())?)?;
+            }
+            Ok(Ok(DuplexFrame::SendMessage {
+                message,
+                delivery,
+                key,
+            })) => {
+                let response = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err("native extension cancelled during message delivery".to_owned()),
+                        result = async { match key { Some(key) => host.send_message_with_key(message, delivery, &key).await, None => host.send_message(message, delivery).await } } => result,
+                    }
+                });
+                send(serde_json::to_value(response).map_err(|error| error.to_string())?)?;
+            }
+            Ok(Ok(DuplexFrame::Progress { partial_result })) => {
+                let response = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Err("native extension cancelled during progress notification".to_owned()),
+                        result = host.report_progress(partial_result) => result,
+                    }
+                });
+                send(serde_json::to_value(response).map_err(|error| error.to_string())?)?;
+            }
+            Ok(Ok(DuplexFrame::CheckedCall { calls })) => {
                 if calls.len() > 4096 {
                     return Err("native extension batch exceeds execution limit".into());
                 }
-                let results = runtime.block_on(async {
+                let results = if !host.supports_prevalidated_call_accounting()
+                    && calls.iter().any(|(_, value)| value.is_none())
+                {
+                    calls
+                        .into_iter()
+                        .map(|_| {
+                            Outcome::Skipped("host cannot account for prevalidated calls".into())
+                        })
+                        .collect()
+                } else {
+                    runtime.block_on(async {
                     tokio::select! {
                         biased;
                         _ = cancellation.cancelled() => Err("native extension cancelled during host call".to_owned()),
-                        results = host.call_batch(calls) => Ok(results),
+                        results = host.call_batch_prevalidated(calls) => Ok(results),
                     }
-                })?;
-                writer
-                    .send(serde_json::to_value(results).map_err(|error| error.to_string())?)
-                    .map_err(|_| "native extension input closed")?;
+                })?
+                };
+                let results: Vec<_> = results
+                    .into_iter()
+                    .map(|result| endpoint.project_outcome(&result))
+                    .collect();
+                send(serde_json::to_value(results).map_err(|error| error.to_string())?)?;
             }
+            Ok(Ok(DuplexFrame::Call { .. })) => unreachable!("call frames are prevalidated"),
             Ok(Ok(DuplexFrame::Ui { request })) => {
                 let response = runtime.block_on(async {
                     tokio::select! {
@@ -1265,9 +3192,7 @@ fn call_duplex(
                         result = host.ui(request) => result,
                     }
                 });
-                writer
-                    .send(serde_json::to_value(response).map_err(|error| error.to_string())?)
-                    .map_err(|_| "native extension input closed")?;
+                send(serde_json::to_value(response).map_err(|error| error.to_string())?)?;
             }
             Ok(Ok(DuplexFrame::Complete { response })) => {
                 let result = serde_json::from_value(response?)
@@ -1284,14 +3209,148 @@ fn call_duplex(
     }
 }
 
+fn send_duplex_input(
+    writer: &std::sync::mpsc::SyncSender<Value>,
+    mut value: Value,
+    cancellation: &CancellationToken,
+) -> ExtensionResult<()> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err("native extension operation cancelled while writing input".into());
+        }
+        match writer.try_send(value) {
+            Ok(()) => return Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return Err("native extension input closed".into());
+            }
+            Err(std::sync::mpsc::TrySendError::Full(pending)) => {
+                value = pending;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 struct RemoteHost {
     tools: Vec<ToolSpec>,
     has_ui: bool,
     has_progress: bool,
+    has_custom_messages: bool,
+    has_custom_entries: bool,
+    has_custom_entry_read: bool,
+    entry_lifetime: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    entry_waiting: Option<std::sync::mpsc::Sender<()>>,
+    has_keyed_messages: bool,
+    has_prevalidated_calls: bool,
     io: Arc<std::sync::Mutex<(std::io::BufReader<std::io::Stdin>, std::io::Stdout)>>,
+}
+impl RemoteHost {
+    async fn send_calls(&self, calls: Vec<(String, Value)>, rejected: Vec<usize>) -> Vec<Outcome> {
+        let count = calls.len();
+        let io = self.io.clone();
+        let result = tokio::task::spawn_blocking(move || -> ExtensionResult<Vec<Outcome>> {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            duplex_write_line(&mut io.1, &DuplexFrame::Call { calls, rejected })?;
+            let outcomes: Vec<Outcome> = duplex_read_line(&mut io.0)?;
+            if outcomes.len() != count {
+                return Err("native extension received an invalid batch size".into());
+            }
+            Ok(outcomes)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+        result.unwrap_or_else(|error| vec![Outcome::Unknown(error); count])
+    }
+}
+fn wire_prevalidated_calls(
+    calls: Vec<(String, Option<Value>)>,
+) -> (Vec<(String, Value)>, Vec<usize>) {
+    let mut rejected = Vec::new();
+    let calls = calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, value))| {
+            if value.is_none() {
+                rejected.push(index);
+            }
+            (name, value.unwrap_or(Value::Null))
+        })
+        .collect();
+    (calls, rejected)
 }
 #[async_trait::async_trait]
 impl ToolHost for RemoteHost {
+    fn supports_custom_entry_read(&self) -> bool {
+        self.has_custom_entry_read
+            && self
+                .entry_lifetime
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+    async fn custom_entries(
+        &self,
+        custom_type: Option<&str>,
+    ) -> ExtensionResult<Vec<pi_rs_core::CustomEntryRecord>> {
+        if !self.supports_custom_entry_read() {
+            return Err("custom entry reading is unavailable".into());
+        }
+        let io = self.io.clone();
+        let lifetime = self.entry_lifetime.clone();
+        let custom_type = custom_type.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            if !lifetime.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("extension callback has finished".into());
+            }
+            duplex_write_line(&mut io.1, &DuplexFrame::ListCustomEntries { custom_type })?;
+            duplex_read_line::<ExtensionResult<Vec<pi_rs_core::CustomEntryRecord>>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+    fn close_custom_entry_scope(&self) {
+        self.entry_lifetime
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    fn supports_custom_entries(&self) -> bool {
+        self.has_custom_entries
+            && self
+                .entry_lifetime
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+    async fn append_entry(&self, entry: pi_rs_core::CustomEntry) -> ExtensionResult<()> {
+        if !self.supports_custom_entries() {
+            return Err("custom entry persistence is unavailable".into());
+        }
+        let io = self.io.clone();
+        let lifetime = self.entry_lifetime.clone();
+        #[cfg(test)]
+        let waiting = self.entry_waiting.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(waiting) = waiting {
+                let _ = waiting.send(());
+            }
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            if !lifetime.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("extension callback has finished".into());
+            }
+            duplex_write_line(&mut io.1, &DuplexFrame::AppendEntry { entry })?;
+            duplex_read_line::<ExtensionResult<()>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+    fn supports_prevalidated_call_accounting(&self) -> bool {
+        self.has_prevalidated_calls
+    }
     fn supports_progress(&self) -> bool {
         self.has_progress
     }
@@ -1304,8 +3363,8 @@ impl ToolHost for RemoteHost {
             let mut io = io
                 .lock()
                 .map_err(|_| "native extension connection lock failed")?;
-            write_line(&mut io.1, &DuplexFrame::Progress { partial_result })?;
-            read_line::<ExtensionResult<()>>(&mut io.0)?
+            duplex_write_line(&mut io.1, &DuplexFrame::Progress { partial_result })?;
+            duplex_read_line::<ExtensionResult<()>>(&mut io.0)?
         })
         .await
         .map_err(|error| error.to_string())?
@@ -1323,8 +3382,8 @@ impl ToolHost for RemoteHost {
             let mut io = io
                 .lock()
                 .map_err(|_| "native extension connection lock failed")?;
-            write_line(&mut io.1, &DuplexFrame::Ui { request })?;
-            read_line::<ExtensionResult<pi_rs_core::UiResponse>>(&mut io.0)?
+            duplex_write_line(&mut io.1, &DuplexFrame::Ui { request })?;
+            duplex_read_line::<ExtensionResult<pi_rs_core::UiResponse>>(&mut io.0)?
         })
         .await
         .map_err(|error| error.to_string())?
@@ -1332,49 +3391,203 @@ impl ToolHost for RemoteHost {
     fn tools(&self) -> Vec<ToolSpec> {
         self.tools.clone()
     }
+    fn supports_custom_messages(&self) -> bool {
+        self.has_custom_messages
+    }
+    async fn send_message(
+        &self,
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+    ) -> ExtensionResult<()> {
+        if !self.has_custom_messages {
+            return Err("custom message delivery is unavailable".into());
+        }
+        let io = self.io.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            duplex_write_line(
+                &mut io.1,
+                &DuplexFrame::SendMessage {
+                    message,
+                    delivery,
+                    key: None,
+                },
+            )?;
+            duplex_read_line::<ExtensionResult<()>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+    fn supports_keyed_messages(&self) -> bool {
+        self.has_keyed_messages
+    }
+    async fn send_message_with_key(
+        &self,
+        message: pi_rs_core::CustomMessage,
+        delivery: pi_rs_core::CustomMessageDelivery,
+        key: &str,
+    ) -> ExtensionResult<()> {
+        if !self.has_keyed_messages {
+            return Err("keyed custom messages are unavailable".into());
+        }
+        let io = self.io.clone();
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut io = io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            duplex_write_line(
+                &mut io.1,
+                &DuplexFrame::SendMessage {
+                    message,
+                    delivery,
+                    key: Some(key),
+                },
+            )?;
+            duplex_read_line::<ExtensionResult<()>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
     async fn call(&self, name: &str, arguments: Value) -> Outcome {
         self.call_batch(vec![(name.into(), arguments)])
             .await
             .remove(0)
     }
     async fn call_batch(&self, calls: Vec<(String, Value)>) -> Vec<Outcome> {
-        let count = calls.len();
-        let io = self.io.clone();
-        let result = tokio::task::spawn_blocking(move || -> ExtensionResult<Vec<Outcome>> {
-            let mut io = io
-                .lock()
-                .map_err(|_| "native extension connection lock failed")?;
-            write_line(&mut io.1, &DuplexFrame::Call { calls })?;
-            let outcomes: Vec<Outcome> = read_line(&mut io.0)?;
-            if outcomes.len() != count {
-                return Err("native extension received an invalid batch size".into());
-            }
-            Ok(outcomes)
-        })
+        self.send_calls(calls, Vec::new()).await
+    }
+    async fn call_batch_prevalidated(&self, calls: Vec<(String, Option<Value>)>) -> Vec<Outcome> {
+        if self.has_prevalidated_calls {
+            let (calls, rejected) = wire_prevalidated_calls(calls);
+            return self.send_calls(calls, rejected).await;
+        }
+        // An older peer cannot charge rejected positions. Fail the batch closed
+        // rather than silently letting invalid attempts bypass its call budget.
+        if calls.iter().any(|(_, value)| value.is_none()) {
+            return calls
+                .into_iter()
+                .map(|_| Outcome::Skipped("host cannot account for prevalidated calls".into()))
+                .collect();
+        }
+        self.call_batch(
+            calls
+                .into_iter()
+                .map(|(name, value)| (name, value.expect("checked above")))
+                .collect(),
+        )
         .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result);
-        result.unwrap_or_else(|error| vec![Outcome::Unknown(error); count])
     }
 }
+struct RemoteMcpRegistry(Arc<RemoteHost>);
+
+impl RemoteMcpRegistry {
+    async fn request<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        frame: DuplexFrame,
+    ) -> ExtensionResult<T> {
+        let host = self.0.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut io = host
+                .io
+                .lock()
+                .map_err(|_| "native extension connection lock failed")?;
+            if !host
+                .entry_lifetime
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err("MCP registry callback has finished".into());
+            }
+            duplex_write_line(&mut io.1, &frame)?;
+            duplex_read_line::<ExtensionResult<T>>(&mut io.0)?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+}
+
+#[async_trait::async_trait]
+impl pi_rs_core::McpRegistryHost for RemoteMcpRegistry {
+    async fn mcp_servers(&self) -> ExtensionResult<Vec<pi_rs_core::RegisteredMcpServer>> {
+        self.request(DuplexFrame::ListMcpServers).await
+    }
+    async fn register_mcp_server(
+        &self,
+        server: pi_rs_core::McpServerDeclaration,
+    ) -> ExtensionResult<()> {
+        self.request(DuplexFrame::RegisterMcpServer { server })
+            .await
+    }
+    async fn unregister_mcp_server(&self, name: &str) -> ExtensionResult<bool> {
+        self.request(DuplexFrame::UnregisterMcpServer { name: name.into() })
+            .await
+    }
+}
+
 fn serve_duplex(extension: Arc<dyn Extension>) -> Result<()> {
     let mut input = std::io::BufReader::new(std::io::stdin());
-    let request: DuplexRequest = read_line(&mut input).map_err(Error::Config)?;
+    let request: DuplexRequest = duplex_read_line(&mut input).map_err(Error::Config)?;
+    let presence = matches!(
+        &request.request,
+        ProtocolRequest::ToolResult {
+            presence_v1: true,
+            text_result_v2: true,
+            ..
+        }
+    );
     let host = Arc::new(RemoteHost {
         tools: request.tools,
         has_ui: request.has_ui,
         has_progress: request.has_progress,
+        has_custom_messages: request.has_custom_messages,
+        has_custom_entries: request.has_custom_entries,
+        has_custom_entry_read: request.has_custom_entry_read,
+        entry_lifetime: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        #[cfg(test)]
+        entry_waiting: None,
+        has_keyed_messages: request.has_keyed_messages,
+        has_prevalidated_calls: request.has_prevalidated_calls,
         io: Arc::new(std::sync::Mutex::new((input, std::io::stdout()))),
     });
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let response = runtime.block_on(dispatch_with_host(extension, request.request, host.clone()));
+    let mcp = request
+        .has_mcp_registry
+        .then(|| Arc::new(RemoteMcpRegistry(host.clone())) as Arc<dyn pi_rs_core::McpRegistryHost>);
+    let response = if mcp.is_some() {
+        runtime.block_on(dispatch_inner(
+            extension,
+            request.request,
+            Some(host.clone()),
+            mcp,
+        ))
+    } else {
+        runtime.block_on(dispatch_with_host(extension, request.request, host.clone()))
+    };
+    host.entry_lifetime
+        .store(false, std::sync::atomic::Ordering::Release);
     let mut io = host
         .io
         .lock()
         .map_err(|_| Error::Config("native extension connection lock failed".into()))?;
-    write_line(&mut io.1, &DuplexFrame::Complete { response }).map_err(Error::Config)
+    if presence {
+        check_presence_response(&response, MAX_DUPLEX_MESSAGE, true, true)
+            .map_err(Error::Config)?;
+    }
+    write_bounded_line(
+        &mut io.1,
+        &DuplexFrame::Complete { response },
+        MAX_DUPLEX_MESSAGE
+            + if presence {
+                PRESENCE_RESPONSE_OVERHEAD
+            } else {
+                0
+            },
+    )
+    .map_err(Error::Config)
 }
 
 struct CancelOnDrop(CancellationToken);
@@ -1386,6 +3599,21 @@ impl Drop for CancelOnDrop {
 
 /// Select the field naming advertised by the executable. Older v1 executables
 /// never advertised this capability and must keep receiving the v1 names.
+// Older executable peers deserialize a closed CompactionReason enum. Project
+// the new automatic reason to their existing threshold value on both transports.
+fn project_overflow_reason(request: &mut ProtocolRequest, supported: bool) {
+    if supported {
+        return;
+    }
+    let reason = match request {
+        ProtocolRequest::BeforeSummaryCompaction { preparation, .. } => &mut preparation.reason,
+        _ => return,
+    };
+    if matches!(*reason, pi_rs_core::CompactionTrigger::Overflow) {
+        *reason = pi_rs_core::CompactionTrigger::Threshold;
+    }
+}
+
 fn wire_request(request: &ProtocolRequest, pi_fields: bool) -> ExtensionResult<Value> {
     let mut value = serde_json::to_value(request).map_err(|error| error.to_string())?;
     if pi_fields {
@@ -1462,16 +3690,56 @@ fn wire_request(request: &ProtocolRequest, pi_fields: bool) -> ExtensionResult<V
 
 fn call<T: serde::de::DeserializeOwned>(
     endpoint: &Endpoint,
-    request: ProtocolRequest,
+    mut request: ProtocolRequest,
     cancel: Option<&CancellationToken>,
 ) -> ExtensionResult<T> {
-    let bytes = serde_json::to_vec(&wire_request(&request, endpoint.pi_lifecycle_fields)?)
-        .map_err(|error| error.to_string())?;
+    project_overflow_reason(&mut request, endpoint.compaction_overflow_reason_v1);
+    let presence_response = matches!(
+        &request,
+        ProtocolRequest::ToolResult {
+            presence_v1: true,
+            ..
+        }
+    );
+    let legacy_response_limit = if endpoint.text_result_v2
+        && endpoint.structured_text_result
+        && matches!(
+            &request,
+            ProtocolRequest::ToolResult {
+                outcome: Outcome::TextResultWithStructuredContent { .. },
+                ..
+            }
+        ) {
+        MAX_DUPLEX_MESSAGE
+    } else {
+        MAX_MESSAGE
+    };
+    let response_limit = legacy_response_limit
+        + if presence_response {
+            PRESENCE_RESPONSE_OVERHEAD
+        } else {
+            0
+        };
+    let mut wire = wire_request(&request, endpoint.pi_lifecycle_fields)?;
+    if wire["type"] == "lifecycle" && wire["event"]["type"] == "tool_execution_end" {
+        let result = &mut wire["event"]["result"];
+        if let Ok(outcome) = serde_json::from_value::<Outcome>(result.clone()) {
+            *result = serde_json::to_value(endpoint.project_outcome(&outcome))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    let bytes = serde_json::to_vec(&wire).map_err(|error| error.to_string())?;
     if bytes.len() as u64 > MAX_REQUEST {
         return Err("extension request exceeds 64 MiB".into());
     }
     let command = endpoint.command("--pi-rs-extension-v1");
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Err("native extension operation cancelled".into());
+    }
     let mut child = ChildGuard::spawn(command).map_err(|error| error.to_string())?;
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Err("native extension operation cancelled".into());
+    }
     let mut input = child.stdin().take().expect("piped stdin");
     let output = child.stdout().take().expect("piped stdout");
     let (writer, written) = std::sync::mpsc::sync_channel(1);
@@ -1482,12 +3750,14 @@ fn call<T: serde::de::DeserializeOwned>(
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let result = output
-            .take(MAX_MESSAGE + 1)
+            .take(response_limit + 1)
             .read_to_end(&mut bytes)
             .map(|_| bytes);
         let _ = reader.send(result);
     });
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut completed_write = false;
+    let mut completed_read = None;
     let status = loop {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err(
@@ -1499,34 +3769,53 @@ fn call<T: serde::de::DeserializeOwned>(
                 "native extension exceeded 30 seconds; outcome requires reconciliation".into(),
             );
         }
-        if let Some(status) = child
-            .process
-            .try_wait()
-            .map_err(|error| error.to_string())?
+        if completed_read.is_none()
+            && let Ok(result) = read.try_recv()
         {
+            let bytes = result.map_err(|error| error.to_string())?;
+            if bytes.len() as u64 > response_limit {
+                return Err(format!(
+                    "native extension response exceeds {} MiB",
+                    response_limit / (1024 * 1024)
+                ));
+            }
+            completed_read = Some(bytes);
+        }
+        if !completed_write && let Ok(result) = written.try_recv() {
+            result.map_err(|error| error.to_string())?;
+            completed_write = true;
+        }
+        // Keep the group leader's PID until both protocol pipes have finished.
+        // If a descendant is holding either pipe, cancellation must still be
+        // able to signal that owned process group.
+        if completed_write
+            && completed_read.is_some()
+            && let Some(status) = child
+                .process
+                .try_wait()
+                .map_err(|error| error.to_string())?
+        {
+            child.finished = true;
             break status;
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    written
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| "extension input writer timed out")?
-        .map_err(|error| error.to_string())?;
-    let bytes = read
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| "extension output reader timed out")?
-        .map_err(|error| error.to_string())?;
-    child.finished = true;
+    let bytes = completed_read.expect("response collected before waiting for exit");
     if !status.success() {
         return Err(format!("native extension exited with {status}"));
-    }
-    if bytes.len() as u64 > MAX_MESSAGE {
-        return Err("native extension response exceeds 4 MiB".into());
     }
     let envelope: Envelope = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid native extension response: {error}"))?;
     if envelope.version != PROTOCOL {
         return Err("unsupported native extension protocol version".into());
+    }
+    if presence_response {
+        check_presence_response(
+            &envelope.response,
+            legacy_response_limit,
+            false,
+            bytes.ends_with(b"\n"),
+        )?;
     }
     serde_json::from_value(envelope.response?)
         .map_err(|error| format!("invalid native extension result: {error}"))
@@ -1662,7 +3951,7 @@ async fn dispatch(
     extension: Arc<dyn Extension>,
     request: ProtocolRequest,
 ) -> ExtensionResult<Value> {
-    dispatch_with_host(extension, request, Arc::new(DetachedHost)).await
+    dispatch_inner(extension, request, None, None).await
 }
 
 async fn dispatch_with_host(
@@ -1670,6 +3959,17 @@ async fn dispatch_with_host(
     request: ProtocolRequest,
     host: Arc<dyn ToolHost>,
 ) -> ExtensionResult<Value> {
+    dispatch_inner(extension, request, Some(host), None).await
+}
+
+async fn dispatch_inner(
+    extension: Arc<dyn Extension>,
+    request: ProtocolRequest,
+    host: Option<Arc<dyn ToolHost>>,
+    mcp: Option<Arc<dyn pi_rs_core::McpRegistryHost>>,
+) -> ExtensionResult<Value> {
+    let host_available = host.is_some();
+    let host = host.unwrap_or_else(|| Arc::new(DetachedHost));
     match request {
         ProtocolRequest::Describe => encode(Ok(Description {
             id: extension.id().into(),
@@ -1683,18 +3983,60 @@ async fn dispatch_with_host(
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            custom_message_renderers: extension
+                .custom_message_renderer_types()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            markdown_transform_hook: extension.handles_markdown_transform(),
+            custom_entry_renderers: extension
+                .custom_entry_renderer_types()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             flags: extension.cli_flags(),
             host_calls: true,
             command_entries: extension.supports_command_entries(),
             command_effects: extension.supports_command_effects(),
+            command_failure_classification_v1: true,
             input_hook: extension.handles_input(),
             tool_result_hook: extension.handles_tool_result(),
+            result_presence_v1: true,
+            text_result_v2: true,
+            structured_text_result: true,
+            tool_message_error: true,
+            tool_message_structured: true,
+            tool_message_provenance_v2: true,
+            tool_call_hook: extension.handles_tool_call(),
             user_bash_hook: extension.handles_user_bash(),
             user_bash_operations_hook: extension.handles_user_bash_operations(),
+            mcp_server_declarations: extension.mcp_server_declarations(),
+            mcp_servers_change_hook: extension.handles_mcp_servers_change(),
+            mcp_registry_host_calls: extension.handles_mcp_registry(),
             lifecycle_hook: extension.handles_lifecycle(),
+            message_lifecycle_hook: extension.handles_message_lifecycle(),
+            agent_before_settle_hook: extension.handles_agent_before_settle(),
+            turn_end_boundary_hook: extension.handles_turn_end_boundary(),
+            lifecycle_host_calls: true,
+            tool_hook_host_calls: true,
+            before_tool_host_calls: true,
+            request_hook_host_calls: true,
+            input_hook_host_calls: true,
+            context_hook_host_calls: true,
+            transition_hook_host_calls: true,
+            tree_hook_host_calls: true,
+            compaction_hook_host_calls: true,
+            before_summary_compaction_v1: extension.handles_before_summary_compaction(),
+            compaction_overflow_reason_v1: true,
+            compaction_lifecycle_v1: true,
+            resources_hook_host_calls: true,
+            user_bash_hook_host_calls: true,
+            user_bash_stream_host_calls: true,
             tool_execution_lifecycle_hook: extension.handles_tool_execution_lifecycle(),
             tool_execution_update_hook: extension.handles_tool_execution_updates(),
+            ui_prompt_lifecycle_hook: extension.handles_ui_prompt_lifecycle(),
             model_selection_hook: extension.handles_model_selection(),
+            after_provider_response_hook: extension.handles_after_provider_response(),
             session_lifecycle_hook: extension.handles_session_lifecycle(),
             session_transition_reasons: true,
             pi_lifecycle_fields: true,
@@ -1704,12 +4046,15 @@ async fn dispatch_with_host(
             session_transition_hook: extension.handles_session_transitions(),
             resource_discovery_hook: extension.handles_resource_discovery(),
             context_with_system_hook: extension.handles_context_with_system(),
+            context_provenance_v1: true,
+            context_safe_patch_v1: true,
             tools: extension
                 .tools()
                 .into_iter()
                 .map(|tool| DescriptionTool {
                     spec: tool.spec(),
                     execution: tool.execution(),
+                    renderers: tool.tool_renderers().map(DescriptionToolRenderers::from),
                     can_poll: tool.can_poll(),
                     transactional: true,
                     prepares_arguments: true,
@@ -1726,39 +4071,250 @@ async fn dispatch_with_host(
             encode(tool.prepare_arguments(arguments).await)
         }
         ProtocolRequest::Context { mut request, state } => {
-            extension.context(&mut request, state.as_ref())?;
+            extension.context(
+                &mut pi_rs_core::ContextRequest::new(&mut request),
+                state.as_ref(),
+            )?;
             encode(Ok(request))
         }
+        ProtocolRequest::ContextV2 { mut request, state } => {
+            let original = request.clone();
+            let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+            let access = guarded.access();
+            extension.context(&mut guarded, state.as_ref())?;
+            let unsafe_access = access.assistant_accessed();
+            encode(Ok(if !unsafe_access && request == original {
+                ContextResponse::Unchanged
+            } else {
+                ContextResponse::Changed { value: request }
+            }))
+        }
+        ProtocolRequest::ContextV3 { mut request, state } => {
+            let original = request.clone();
+            let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+            let access = guarded.access();
+            extension.context(&mut guarded, state.as_ref())?;
+            let unsafe_access = access.assistant_accessed();
+            encode(Ok(if !unsafe_access && request == original {
+                ContextResponse::Unchanged
+            } else if !unsafe_access
+                && let Some(patch) = request_patch(&original, &request, access.user_edits())
+            {
+                ContextResponse::SafePatch { patch }
+            } else {
+                ContextResponse::Changed { value: request }
+            }))
+        }
         ProtocolRequest::Input { event, state } => {
-            encode(extension.input(&event, state.as_ref()).await)
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .input_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.input(&event, state.as_ref()).await)
+            }
         }
         ProtocolRequest::UserBash { event, state } => {
-            encode(extension.user_bash(&event, state.as_ref()).await)
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .user_bash_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.user_bash(&event, state.as_ref()).await)
+            }
         }
         ProtocolRequest::UserBashOperations { event, state } => {
-            encode(extension.user_bash_operations(&event, state.as_ref()).await)
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .user_bash_operations_with_host(&event, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.user_bash_operations(&event, state.as_ref()).await)
+            }
+        }
+        ProtocolRequest::ExecuteUserBash {
+            event,
+            state,
+            timeout_secs,
+        } => {
+            let timeout = timeout_secs
+                .map(Duration::try_from_secs_f64)
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let result = extension.execute_user_bash_with_host(
+                &event,
+                state.as_ref(),
+                timeout,
+                CancellationToken::new(),
+                sender,
+                host.clone(),
+            );
+            tokio::pin!(result);
+            let mut open = true;
+            loop {
+                tokio::select! {
+                    biased;
+                    data = receiver.recv(), if open => match data { Some(data) => host.report_progress(serde_json::json!({"shellOutput":data})).await?, None => open = false },
+                    response = &mut result => {
+                        while let Ok(data) = receiver.try_recv() { host.report_progress(serde_json::json!({"shellOutput":data})).await?; }
+                        break encode(response);
+                    }
+                }
+            }
+        }
+        ProtocolRequest::MessageLifecycle { event, state } => {
+            encode(extension.message_lifecycle(&event, state.as_ref()).await)
         }
         ProtocolRequest::Lifecycle { event, state } => {
-            encode(extension.lifecycle(&event, state.as_ref()).await)
+            if let Some(mcp) = mcp
+                && extension.handles_mcp_registry()
+            {
+                let result = extension
+                    .lifecycle_with_mcp_registry(&event, state.as_ref(), host.clone(), mcp)
+                    .await;
+                host.close_custom_entry_scope();
+                encode(result)
+            } else if host.supports_custom_messages()
+                || host.supports_custom_entries()
+                || host.supports_custom_entry_read()
+            {
+                let result = extension
+                    .lifecycle_with_host(&event, state.as_ref(), host.clone())
+                    .await;
+                host.close_custom_entry_scope();
+                encode(result)
+            } else {
+                encode(extension.lifecycle(&event, state.as_ref()).await)
+            }
+        }
+        ProtocolRequest::TurnEndBoundary { event, state } => {
+            encode(extension.turn_end_boundary(&event, state.as_ref()).await)
+        }
+        ProtocolRequest::AfterProviderResponse { event, state } => encode(
+            extension
+                .after_provider_response(&event, state.as_ref())
+                .await,
+        ),
+        ProtocolRequest::AgentBeforeSettle { event, state } => {
+            encode(extension.agent_before_settle(&event, state.as_ref()).await)
+        }
+        ProtocolRequest::CompactionLifecycleV1 {
+            event,
+            trigger,
+            metadata,
+            state,
+        } => encode(
+            extension
+                .compaction_lifecycle_with_host(
+                    &event,
+                    trigger,
+                    metadata.as_ref(),
+                    state.as_ref(),
+                    host,
+                )
+                .await,
+        ),
+        ProtocolRequest::RenderToolSection { section, context } => {
+            let renderers = extension
+                .tools()
+                .into_iter()
+                .find(|tool| tool.spec().name == context.tool_name)
+                .and_then(|tool| tool.tool_renderers());
+            let renderer = renderers.and_then(|renderers| match section {
+                ToolSection::Call => renderers.call,
+                ToolSection::Result if context.result.is_some() => renderers.result,
+                ToolSection::Result => None,
+            });
+            match renderer {
+                Some(renderer) => encode(renderer.render(&context).await),
+                None => Ok(Value::Null),
+            }
+        }
+        ProtocolRequest::RenderCustomMessage { message, options } => {
+            if !message.display
+                || !extension
+                    .custom_message_renderer_types()
+                    .contains(&message.custom_type.as_str())
+            {
+                return encode(Ok(Option::<pi_rs_core::RenderedCustomMessage>::None));
+            }
+            encode(extension.render_custom_message(&message, &options).await)
+        }
+        ProtocolRequest::RenderCustomEntry { entry, options } => {
+            if !extension
+                .custom_entry_renderer_types()
+                .contains(&entry.entry.custom_type.as_str())
+            {
+                return encode(Ok(Option::<pi_rs_core::RenderedExtensionContent>::None));
+            }
+            encode(extension.render_custom_entry(&entry, &options).await)
+        }
+        ProtocolRequest::TransformMarkdown { markdown, context } => {
+            if !extension.handles_markdown_transform() {
+                return encode(Ok(Option::<String>::None));
+            }
+            encode(extension.transform_markdown(&markdown, &context).await)
         }
         ProtocolRequest::DiscoverResources { event, state } => {
-            encode(extension.discover_resources(&event, state.as_ref()).await)
+            if host.supports_custom_messages()
+                || host.supports_custom_entries()
+                || host.supports_custom_entry_read()
+            {
+                let result = extension
+                    .discover_resources_with_host(&event, state.as_ref(), host.clone())
+                    .await;
+                host.close_custom_entry_scope();
+                encode(result)
+            } else {
+                encode(extension.discover_resources(&event, state.as_ref()).await)
+            }
         }
         ProtocolRequest::CacheWarmingDecision { event, state } => encode(
             extension
                 .cache_warming_decision(&event, state.as_ref())
                 .await,
         ),
-        ProtocolRequest::BeforeTree { preparation, state } => encode(
-            extension
-                .before_tree(&preparation, state.as_ref(), &CancellationToken::new())
-                .await,
-        ),
-        ProtocolRequest::BeforeSessionTransition { event, state } => encode(
-            extension
-                .before_session_transition(&event, state.as_ref())
-                .await,
-        ),
+        ProtocolRequest::BeforeTree { preparation, state } => {
+            let cancel = CancellationToken::new();
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .before_tree_with_host(&preparation, state.as_ref(), &cancel, host)
+                        .await,
+                )
+            } else {
+                encode(
+                    extension
+                        .before_tree(&preparation, state.as_ref(), &cancel)
+                        .await,
+                )
+            }
+        }
+        ProtocolRequest::BeforeSessionTransition { event, state } => {
+            if host.supports_custom_messages()
+                || host.supports_custom_entries()
+                || host.supports_custom_entry_read()
+            {
+                let result = extension
+                    .before_session_transition_with_host(&event, state.as_ref(), host.clone())
+                    .await;
+                host.close_custom_entry_scope();
+                encode(result)
+            } else {
+                encode(
+                    extension
+                        .before_session_transition(&event, state.as_ref())
+                        .await,
+                )
+            }
+        }
         ProtocolRequest::BeforeRequest {
             mut request,
             summary,
@@ -1769,19 +4325,145 @@ async fn dispatch_with_host(
             } else {
                 RequestPurpose::Turn
             };
-            extension
-                .before_request(&mut request, purpose, state.as_ref())
-                .await?;
+            let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+            if host.supports_custom_messages() {
+                extension
+                    .before_request_with_host(&mut guarded, purpose, state.as_ref(), host)
+                    .await?;
+            } else {
+                extension
+                    .before_request(&mut guarded, purpose, state.as_ref())
+                    .await?;
+            }
             encode(Ok(request))
         }
         ProtocolRequest::ContextWithSystem {
             mut messages,
             state,
         } => {
-            extension
-                .context_with_system(&mut messages, state.as_ref())
-                .await?;
+            let mut guarded = pi_rs_core::ContextMessages::new(&mut messages);
+            if host.supports_custom_messages() {
+                extension
+                    .context_with_system_with_host(&mut guarded, state.as_ref(), host)
+                    .await?;
+            } else {
+                extension
+                    .context_with_system(&mut guarded, state.as_ref())
+                    .await?;
+            }
             encode(Ok(messages))
+        }
+        ProtocolRequest::BeforeRequestV2 {
+            mut request,
+            summary,
+            state,
+        } => {
+            let purpose = if summary {
+                RequestPurpose::Summary
+            } else {
+                RequestPurpose::Turn
+            };
+            let original = request.clone();
+            let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+            let access = guarded.access();
+            if host.supports_custom_messages() {
+                extension
+                    .before_request_with_host(&mut guarded, purpose, state.as_ref(), host)
+                    .await?;
+            } else {
+                extension
+                    .before_request(&mut guarded, purpose, state.as_ref())
+                    .await?;
+            }
+            let unsafe_access = access.assistant_accessed();
+            encode(Ok(if !unsafe_access && request == original {
+                ContextResponse::Unchanged
+            } else {
+                ContextResponse::Changed { value: request }
+            }))
+        }
+        ProtocolRequest::BeforeRequestV3 {
+            mut request,
+            summary,
+            state,
+        } => {
+            let purpose = if summary {
+                RequestPurpose::Summary
+            } else {
+                RequestPurpose::Turn
+            };
+            let original = request.clone();
+            let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+            let access = guarded.access();
+            if host.supports_custom_messages() {
+                extension
+                    .before_request_with_host(&mut guarded, purpose, state.as_ref(), host)
+                    .await?;
+            } else {
+                extension
+                    .before_request(&mut guarded, purpose, state.as_ref())
+                    .await?;
+            }
+            let unsafe_access = access.assistant_accessed();
+            encode(Ok(if !unsafe_access && request == original {
+                ContextResponse::Unchanged
+            } else if !unsafe_access
+                && let Some(patch) = request_patch(&original, &request, access.user_edits())
+            {
+                ContextResponse::SafePatch { patch }
+            } else {
+                ContextResponse::Changed { value: request }
+            }))
+        }
+        ProtocolRequest::ContextWithSystemV2 {
+            mut messages,
+            state,
+        } => {
+            let original = messages.clone();
+            let mut guarded = pi_rs_core::ContextMessages::new(&mut messages);
+            let access = guarded.access();
+            if host.supports_custom_messages() {
+                extension
+                    .context_with_system_with_host(&mut guarded, state.as_ref(), host)
+                    .await?;
+            } else {
+                extension
+                    .context_with_system(&mut guarded, state.as_ref())
+                    .await?;
+            }
+            let unsafe_access = access.assistant_accessed();
+            encode(Ok(if !unsafe_access && messages == original {
+                ContextResponse::Unchanged
+            } else {
+                ContextResponse::Changed { value: messages }
+            }))
+        }
+        ProtocolRequest::ContextWithSystemV3 {
+            mut messages,
+            state,
+        } => {
+            let original = messages.clone();
+            let mut guarded = pi_rs_core::ContextMessages::new(&mut messages);
+            let access = guarded.access();
+            if host.supports_custom_messages() {
+                extension
+                    .context_with_system_with_host(&mut guarded, state.as_ref(), host)
+                    .await?;
+            } else {
+                extension
+                    .context_with_system(&mut guarded, state.as_ref())
+                    .await?;
+            }
+            let unsafe_access = access.assistant_accessed();
+            encode(Ok(if !unsafe_access && messages == original {
+                ContextResponse::Unchanged
+            } else if !unsafe_access
+                && let Some(patch) = messages_patch(&original, &messages, access.user_edits())
+            {
+                ContextResponse::SafePatch { patch }
+            } else {
+                ContextResponse::Changed { value: messages }
+            }))
         }
         ProtocolRequest::Command {
             name,
@@ -1813,6 +4495,38 @@ async fn dispatch_with_host(
             }
             encode(extension.command_effects(&name, &arguments, state.as_ref()))
         }
+        ProtocolRequest::CommandEffectsClassifiedV1 {
+            name,
+            arguments,
+            state,
+        } => {
+            if !extension.command_names().contains(&name.as_str()) {
+                return Err("unknown extension command".into());
+            }
+            encode(Ok(extension.command_effects_classified(
+                &name,
+                &arguments,
+                state.as_ref(),
+            )))
+        }
+        ProtocolRequest::ToolCall {
+            name,
+            mut arguments,
+            operation_id,
+            state,
+        } => {
+            let context = context(&operation_id)?;
+            let decision = if host.supports_custom_messages() {
+                extension
+                    .tool_call_with_host(&name, &mut arguments, &context, state.as_ref(), host)
+                    .await?
+            } else {
+                extension
+                    .tool_call(&name, &mut arguments, &context, state.as_ref())
+                    .await?
+            };
+            encode(Ok((arguments, DecisionValue::from(decision))))
+        }
         ProtocolRequest::BeforeTool {
             name,
             arguments,
@@ -1820,12 +4534,16 @@ async fn dispatch_with_host(
             state,
         } => {
             let context = context(&operation_id)?;
-            encode(
+            let decision = if host.supports_custom_messages() {
+                extension
+                    .before_tool_with_host(&name, &arguments, &context, state.as_ref(), host)
+                    .await
+            } else {
                 extension
                     .before_tool(&name, &arguments, &context, state.as_ref())
                     .await
-                    .map(DecisionValue::from),
-            )
+            };
+            encode(decision.map(DecisionValue::from))
         }
         ProtocolRequest::Invoke {
             name,
@@ -1878,9 +4596,53 @@ async fn dispatch_with_host(
             outcome,
             operation_id,
             state,
-        } => encode(
+            text_result_v2,
+            presence_v1,
+        } => {
+            let context = context(&operation_id)?;
+            if presence_v1 {
+                if !text_result_v2 {
+                    return Err("result presence requires text-result v2".into());
+                }
+                // A duplex host can support nested calls without supporting
+                // custom messages; single-shot dispatch has no host at all.
+                let host = host_available.then_some(host);
+                return encode(
+                    pi_rs_core::track_tool_result_presence(
+                        extension.as_ref(),
+                        &call,
+                        &outcome,
+                        &context,
+                        state.as_ref(),
+                        host,
+                    )
+                    .await
+                    .map(|(outcome, output_unchanged)| ToolResultPresence {
+                        outcome,
+                        output_unchanged,
+                    }),
+                );
+            }
+            let result = if host.supports_custom_messages() {
+                extension
+                    .tool_result_update_with_host(&call, &outcome, &context, state.as_ref(), host)
+                    .await
+            } else {
+                extension
+                    .tool_result_update(&call, &outcome, &context, state.as_ref())
+                    .await
+            };
+            encode(result.map(|result| {
+                if text_result_v2 {
+                    result
+                } else {
+                    result.map(|outcome| outcome.legacy_text_result())
+                }
+            }))
+        }
+        ProtocolRequest::BeforeSummaryCompaction { preparation, state } => encode(
             extension
-                .tool_result(&call, &outcome, &context(&operation_id)?, state.as_ref())
+                .before_summary_compaction(&preparation, state.as_ref(), host)
                 .await,
         ),
         ProtocolRequest::BeforeCompaction {
@@ -1892,7 +4654,13 @@ async fn dispatch_with_host(
                 summary,
                 keep_turns,
             };
-            let decision = extension.before_compaction(&mut compaction, state.as_ref())?;
+            let decision = if host.supports_custom_messages() {
+                extension
+                    .before_compaction_with_host(&mut compaction, state.as_ref(), host)
+                    .await?
+            } else {
+                extension.before_compaction(&mut compaction, state.as_ref())?
+            };
             encode(Ok((
                 compaction.summary,
                 compaction.keep_turns,
@@ -1903,13 +4671,21 @@ async fn dispatch_with_host(
             summary,
             keep_turns,
             state,
-        } => encode(extension.after_compaction(
-            &Compaction {
+        } => {
+            let compaction = Compaction {
                 summary,
                 keep_turns,
-            },
-            state.as_ref(),
-        )),
+            };
+            if host.supports_custom_messages() {
+                encode(
+                    extension
+                        .after_compaction_with_host(&compaction, state.as_ref(), host)
+                        .await,
+                )
+            } else {
+                encode(extension.after_compaction(&compaction, state.as_ref()))
+            }
+        }
     }
 }
 fn context(operation_id: &str) -> ExtensionResult<ToolContext> {
@@ -1925,6 +4701,79 @@ fn encode<T: Serialize>(value: ExtensionResult<T>) -> ExtensionResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_extension_write_returns_with_a_full_queue() {
+        let (writer, _reader) = std::sync::mpsc::sync_channel(1);
+        writer.try_send(Value::Null).unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = send_duplex_input(&writer, Value::Null, &cancellation).unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+    }
+
+    #[test]
+    fn cancelled_extension_request_does_not_spawn_process() {
+        let endpoint = Endpoint {
+            path: std::env::temp_dir().join("pi-cancelled-extension-does-not-exist"),
+            flags: None,
+            pi_lifecycle_fields: false,
+            compaction_overflow_reason_v1: false,
+            text_result_v2: false,
+            structured_text_result: false,
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error =
+            call::<Value>(&endpoint, ProtocolRequest::Describe, Some(&cancellation)).unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = call_duplex::<Value>(
+            &endpoint,
+            ProtocolRequest::Describe,
+            Arc::new(DetachedHost),
+            &cancellation,
+            runtime.handle(),
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+    }
+
+    #[test]
+    fn legacy_tool_messages_decode_without_status_and_omit_false_on_wire() {
+        let legacy = serde_json::json!({"role":"tool","call_id":"call","content":"text"});
+        let message: Message = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            &message,
+            Message::Tool {
+                is_error: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &message,
+            Message::Tool {
+                is_structured: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(message).unwrap(), legacy);
+        let explicit = Message::Tool {
+            call_id: "call".into(),
+            content: "text".into(),
+            is_error: false,
+            is_structured: Some(false),
+        };
+        let encoded = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(encoded["is_structured"], false);
+        assert_eq!(
+            serde_json::from_value::<Message>(encoded).unwrap(),
+            explicit
+        );
+    }
 
     #[test]
     fn lifecycle_wire_naming_is_negotiated_without_duplicate_fields() {
@@ -1968,6 +4817,366 @@ mod tests {
         }))
         .unwrap();
         assert!(!description.pi_lifecycle_fields);
+        assert!(!description.before_summary_compaction_v1);
+        assert!(!description.compaction_overflow_reason_v1);
+        assert!(!description.compaction_lifecycle_v1);
+    }
+
+    #[tokio::test]
+    async fn native_message_lifecycle_is_negotiated_and_returns_native_message() {
+        struct Rewrite;
+        #[async_trait::async_trait]
+        impl Extension for Rewrite {
+            fn id(&self) -> &str {
+                "rewrite"
+            }
+
+            fn handles_message_lifecycle(&self) -> bool {
+                true
+            }
+
+            async fn message_lifecycle(
+                &self,
+                event: &pi_rs_core::MessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Message>> {
+                let pi_rs_core::MessageLifecycleEvent::End {
+                    message: Message::Assistant { calls, content, .. },
+                    status: pi_rs_core::MessageStatus::Complete,
+                } = event
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(Message::Assistant {
+                    content: format!("{content}/edited"),
+                    calls: calls.clone(),
+                    replay: None,
+                }))
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Rewrite);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["message_lifecycle_hook"], true);
+        let output = dispatch(
+            extension,
+            ProtocolRequest::MessageLifecycle {
+                event: pi_rs_core::MessageLifecycleEvent::End {
+                    message: Message::Assistant {
+                        content: "raw".into(),
+                        calls: vec![],
+                        replay: None,
+                    },
+                    status: pi_rs_core::MessageStatus::Complete,
+                },
+                state: None,
+            },
+        )
+        .await
+        .unwrap();
+        let edited: Message = serde_json::from_value(output).unwrap();
+        assert!(matches!(edited, Message::Assistant { content, .. } if content == "raw/edited"));
+    }
+
+    #[tokio::test]
+    async fn native_mcp_registration_negotiates_declarations_and_change_events() {
+        use std::sync::Mutex;
+        let legacy: Description = serde_json::from_value(serde_json::json!({
+            "id":"legacy","dependencies":[],"commands":[],"tools":[],"lifecycle_hook":true,
+        }))
+        .unwrap();
+        assert!(!legacy.mcp_servers_change_hook);
+        assert!(legacy.mcp_server_declarations.is_empty());
+
+        struct Owner(Arc<Mutex<Vec<String>>>);
+        #[async_trait::async_trait]
+        impl Extension for Owner {
+            fn id(&self) -> &str {
+                "mcp-owner"
+            }
+            fn mcp_server_declarations(&self) -> Vec<pi_rs_core::McpServerDeclaration> {
+                vec![pi_rs_core::McpServerDeclaration {
+                    name: "example".into(),
+                    config: serde_json::json!({"command":"mcp-fixture"}),
+                }]
+            }
+            fn handles_mcp_servers_change(&self) -> bool {
+                true
+            }
+            async fn lifecycle(
+                &self,
+                event: &LifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                if let LifecycleEvent::McpServersChange { servers } = event {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .extend(servers.iter().map(|server| server.server.name.clone()));
+                }
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let extension: Arc<dyn Extension> = Arc::new(Owner(seen.clone()));
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["mcp_servers_change_hook"], true);
+        assert_eq!(description["mcp_server_declarations"][0]["name"], "example");
+        let request = serde_json::from_value(serde_json::json!({
+            "type":"lifecycle",
+            "event":{"type":"mcp_servers_change","servers":[{
+                "name":"example","config":{"command":"mcp-fixture"},"extensionId":"mcp-owner",
+            }]},
+        }))
+        .unwrap();
+        dispatch(extension, request).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["example"]);
+    }
+
+    #[tokio::test]
+    async fn detailed_compaction_protocol_preserves_trigger_and_metadata() {
+        use std::sync::Mutex;
+        struct Hook(Arc<Mutex<Option<Value>>>);
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "detailed"
+            }
+            async fn compaction_lifecycle_with_host(
+                &self,
+                _: &LifecycleEvent,
+                trigger: pi_rs_core::CompactionTrigger,
+                metadata: Option<&Value>,
+                _: Option<&ExtensionState>,
+                _: Arc<dyn ToolHost>,
+            ) -> ExtensionResult<()> {
+                *self.0.lock().unwrap() =
+                    Some(serde_json::json!({"trigger":trigger,"metadata":metadata}));
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(None));
+        let extension: Arc<dyn Extension> = Arc::new(Hook(seen.clone()));
+        let request = ProtocolRequest::CompactionLifecycleV1 {
+            event: LifecycleEvent::SessionCompactFailed {
+                reason: pi_rs_core::CompactionReason::Threshold,
+                error_message: None,
+                aborted: false,
+                will_retry: false,
+                from_extension: true,
+            },
+            trigger: pi_rs_core::CompactionTrigger::Overflow,
+            metadata: Some(serde_json::json!({"details":{"source":"hook"}})),
+            state: None,
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let decoded = serde_json::from_slice(&encoded).unwrap();
+        dispatch_with_host(extension, decoded, Arc::new(DetachedHost))
+            .await
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(
+                serde_json::json!({"trigger":"overflow","metadata":{"details":{"source":"hook"}}})
+            )
+        );
+    }
+
+    #[test]
+    fn overflow_reason_is_negotiated_for_legacy_executables() {
+        for supported in [false, true] {
+            let mut pre = ProtocolRequest::BeforeSummaryCompaction {
+                preparation: pi_rs_core::CompactionPreparation {
+                    branch_entries: vec![],
+                    first_kept_entry: None,
+                    tokens_before: 0,
+                    reason: pi_rs_core::CompactionTrigger::Overflow,
+                    will_retry: true,
+                    custom_instructions: None,
+                },
+                state: None,
+            };
+            project_overflow_reason(&mut pre, supported);
+            let pre = serde_json::to_value(pre).unwrap();
+            assert_eq!(
+                pre["preparation"]["reason"],
+                if supported { "overflow" } else { "threshold" }
+            );
+            assert_eq!(pre["preparation"]["willRetry"], true);
+        }
+    }
+
+    struct PreSummaryFixture;
+    #[async_trait::async_trait]
+    impl Extension for PreSummaryFixture {
+        fn id(&self) -> &str {
+            "pre-summary"
+        }
+        fn handles_before_summary_compaction(&self) -> bool {
+            true
+        }
+        async fn before_summary_compaction(
+            &self,
+            preparation: &pi_rs_core::CompactionPreparation,
+            _: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<Option<pi_rs_core::BeforeSummaryCompactionResult>> {
+            assert!(host.tools().is_empty());
+            Ok(Some(pi_rs_core::BeforeSummaryCompactionResult {
+                cancel: false,
+                compaction: Some(pi_rs_core::ExtensionCompaction {
+                    summary: "provided".into(),
+                    first_kept_entry: preparation.first_kept_entry,
+                    tokens_before: preparation.tokens_before,
+                    usage: None,
+                    details: None,
+                }),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_response_hook_negotiates_and_dispatches_read_only_metadata() {
+        struct Observe;
+        #[async_trait::async_trait]
+        impl Extension for Observe {
+            fn id(&self) -> &str {
+                "response"
+            }
+            fn handles_after_provider_response(&self) -> bool {
+                true
+            }
+            async fn after_provider_response(
+                &self,
+                event: &pi_rs_core::ProviderResponseEvent,
+                state: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                assert_eq!(event.status, 429);
+                assert_eq!(event.headers["retry-after"], "3");
+                assert_eq!(
+                    state,
+                    Some(&ExtensionState {
+                        version: 1,
+                        data: serde_json::json!({"seen": 1})
+                    })
+                );
+                Ok(())
+            }
+        }
+
+        let fixture: Arc<dyn Extension> = Arc::new(Observe);
+        let descriptor = dispatch(fixture.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(descriptor["after_provider_response_hook"], true);
+        let request = serde_json::from_value(serde_json::json!({
+            "type": "after_provider_response",
+            "event": {"status": 429, "headers": {"retry-after": "3"}},
+            "state": {"version": 1, "data": {"seen": 1}}
+        }))
+        .unwrap();
+        assert_eq!(dispatch(fixture, request).await.unwrap(), Value::Null);
+    }
+
+    #[tokio::test]
+    async fn pre_summary_dispatch_advertises_and_returns_hook_result() {
+        let fixture: Arc<dyn Extension> = Arc::new(PreSummaryFixture);
+        let descriptor: Description = serde_json::from_value(
+            dispatch(fixture.clone(), ProtocolRequest::Describe)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(descriptor.before_summary_compaction_v1);
+        assert!(descriptor.compaction_overflow_reason_v1);
+        let result = dispatch_with_host(
+            fixture,
+            ProtocolRequest::BeforeSummaryCompaction {
+                preparation: pi_rs_core::CompactionPreparation {
+                    branch_entries: vec![],
+                    first_kept_entry: Some(8),
+                    tokens_before: 17,
+                    reason: pi_rs_core::CompactionTrigger::Threshold,
+                    will_retry: false,
+                    custom_instructions: None,
+                },
+                state: None,
+            },
+            Arc::new(DetachedHost),
+        )
+        .await
+        .unwrap();
+        let result: Option<pi_rs_core::BeforeSummaryCompactionResult> =
+            serde_json::from_value(result).unwrap();
+        let result = result.unwrap().compaction.unwrap();
+        assert_eq!(result.summary, "provided");
+        assert_eq!(result.first_kept_entry, Some(8));
+        assert_eq!(result.tokens_before, 17);
+    }
+
+    #[tokio::test]
+    async fn legacy_process_is_not_sent_pre_summary_request() {
+        let description: Description = serde_json::from_value(serde_json::json!({
+            "id":"legacy", "dependencies":[], "commands":[], "tools":[]
+        }))
+        .unwrap();
+        let extension = ExecutableExtension {
+            description,
+            endpoint: Endpoint {
+                path: PathBuf::from("nonexistent-pre-summary-executable"),
+                flags: None,
+                pi_lifecycle_fields: false,
+                compaction_overflow_reason_v1: false,
+                text_result_v2: false,
+                structured_text_result: false,
+            },
+        };
+        let preparation = pi_rs_core::CompactionPreparation {
+            branch_entries: vec![],
+            first_kept_entry: None,
+            tokens_before: 0,
+            reason: pi_rs_core::CompactionTrigger::Manual,
+            will_retry: false,
+            custom_instructions: None,
+        };
+        assert!(!extension.handles_before_summary_compaction());
+        assert!(
+            extension
+                .before_summary_compaction(&preparation, None, Arc::new(DetachedHost))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pre_summary_request_round_trips_only_with_explicit_capability() {
+        let description: Description = serde_json::from_value(serde_json::json!({
+            "id":"modern", "dependencies":[], "commands":[], "tools":[],
+            "before_summary_compaction_v1":true
+        }))
+        .unwrap();
+        assert!(description.before_summary_compaction_v1);
+        let request = ProtocolRequest::BeforeSummaryCompaction {
+            preparation: pi_rs_core::CompactionPreparation {
+                branch_entries: vec![],
+                first_kept_entry: Some(7),
+                tokens_before: 42,
+                reason: pi_rs_core::CompactionTrigger::Manual,
+                will_retry: false,
+                custom_instructions: Some("instructions".into()),
+            },
+            state: None,
+        };
+        let wire = serde_json::to_value(&request).unwrap();
+        let decoded: ProtocolRequest = serde_json::from_value(wire).unwrap();
+        assert!(
+            matches!(decoded, ProtocolRequest::BeforeSummaryCompaction { preparation, .. } if preparation.first_kept_entry == Some(7) && preparation.tokens_before == 42)
+        );
     }
 
     #[test]
@@ -2013,6 +5222,21 @@ mod tests {
         }))
         .unwrap();
         assert!(!request.has_progress);
+        assert!(!request.has_keyed_messages);
+        assert!(!request.has_custom_entry_read);
+        let legacy: DuplexFrame = serde_json::from_value(serde_json::json!({"type":"send_message","message":{"customType":"test","content":"hello","display":false},"delivery":"steer"})).unwrap();
+        assert!(matches!(legacy, DuplexFrame::SendMessage { key: None, .. }));
+        let keyed = DuplexFrame::SendMessage {
+            message: pi_rs_core::CustomMessage {
+                custom_type: "test".into(),
+                content: pi_rs_core::ContextContent::Text("hello".into()),
+                display: false,
+                details: None,
+            },
+            delivery: pi_rs_core::CustomMessageDelivery::Steer,
+            key: Some("stable".into()),
+        };
+        assert_eq!(serde_json::to_value(keyed).unwrap()["key"], "stable");
         let frame = DuplexFrame::Progress {
             partial_result: serde_json::json!({"text":"halfway"}),
         };
@@ -2023,6 +5247,468 @@ mod tests {
             serde_json::from_value::<DuplexFrame>(encoded).unwrap(),
             DuplexFrame::Progress { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn markdown_transform_negotiates_capability_and_context() {
+        struct Transformer;
+        #[async_trait::async_trait]
+        impl Extension for Transformer {
+            fn id(&self) -> &str {
+                "markdown-transformer"
+            }
+
+            fn handles_markdown_transform(&self) -> bool {
+                true
+            }
+
+            async fn transform_markdown(
+                &self,
+                markdown: &str,
+                context: &pi_rs_core::MarkdownTransformContext,
+            ) -> ExtensionResult<Option<String>> {
+                assert_eq!(context.message_type, pi_rs_core::MarkdownMessageType::User);
+                assert!(!context.is_streaming);
+                assert_eq!(context.message_id, Some(8));
+                assert_eq!(context.timestamp.as_deref(), Some("2026-11-21T07:00:00Z"));
+                Ok(Some(format!("{markdown} [{}]", context.available_width)))
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Transformer);
+        let mut description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["markdown_transform_hook"], true);
+        description
+            .as_object_mut()
+            .unwrap()
+            .remove("markdown_transform_hook");
+        assert!(
+            !serde_json::from_value::<Description>(description)
+                .unwrap()
+                .markdown_transform_hook
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "type": "transform_markdown",
+            "markdown": "original",
+            "context": {
+                "messageType": "user",
+                "isStreaming": false,
+                "availableWidth": 18,
+                "messageId": 8,
+                "timestamp": "2026-11-21T07:00:00Z"
+            }
+        }))
+        .unwrap();
+        assert_eq!(dispatch(extension, request).await.unwrap(), "original [18]");
+    }
+
+    #[tokio::test]
+    async fn custom_message_renderer_capability_and_request_round_trip() {
+        struct Renderer;
+        #[async_trait::async_trait]
+        impl Extension for Renderer {
+            fn id(&self) -> &str {
+                "renderer"
+            }
+            fn custom_message_renderer_types(&self) -> Vec<&str> {
+                vec!["card"]
+            }
+            async fn render_custom_message(
+                &self,
+                message: &pi_rs_core::CustomMessage,
+                options: &pi_rs_core::CustomMessageRenderOptions,
+            ) -> ExtensionResult<Option<pi_rs_core::RenderedCustomMessage>> {
+                assert_eq!(
+                    message.details,
+                    Some(serde_json::json!({"label":"rendered"}))
+                );
+                assert!(options.expanded);
+                Ok(Some(pi_rs_core::RenderedCustomMessage {
+                    lines: vec![],
+                    padding: options.output_pad,
+                    background: None,
+                }))
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Renderer);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(
+            description["custom_message_renderers"],
+            serde_json::json!(["card"])
+        );
+        let mut legacy = description;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("custom_message_renderers");
+        assert!(
+            serde_json::from_value::<Description>(legacy)
+                .unwrap()
+                .custom_message_renderers
+                .is_empty()
+        );
+        let mut message = serde_json::json!({
+            "type":"render_custom_message",
+            "message":{"customType":"card","content":"model context","display":true,"details":{"label":"rendered"}},
+            "options":{"expanded":true,"outputPad":3}
+        });
+        let request = serde_json::from_value(message.clone()).unwrap();
+        assert_eq!(
+            dispatch(extension.clone(), request).await.unwrap()["padding"],
+            3
+        );
+        message["message"]["display"] = false.into();
+        let request = serde_json::from_value(message).unwrap();
+        assert!(dispatch(extension, request).await.unwrap().is_null());
+    }
+
+    #[tokio::test]
+    async fn tool_renderer_capability_and_request_round_trip() {
+        struct RenderedExtension;
+        struct RenderedTool;
+        struct Echo;
+
+        #[async_trait::async_trait]
+        impl ToolSectionRenderer for Echo {
+            async fn render(
+                &self,
+                context: &ToolRenderContext,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                assert_eq!(context.tool_call_id, "example-call");
+                assert_eq!(context.args["path"], "notes");
+                assert!(context.expanded);
+                Ok(Some(RenderedExtensionRows {
+                    lines: vec![vec![pi_rs_core::UiComponentSpan {
+                        text: context.args["path"].as_str().unwrap().into(),
+                        color: Some("accent".into()),
+                        ..Default::default()
+                    }]],
+                    padding: context.output_pad,
+                    background: None,
+                }))
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for RenderedTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "owned".into(),
+                    description: "Example tool".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+
+            fn tool_renderers(&self) -> Option<ToolRenderers> {
+                Some(ToolRenderers {
+                    shell: ToolRenderShell::SelfFramed,
+                    call: Some(Arc::new(Echo)),
+                    result: None,
+                })
+            }
+
+            async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+                panic!("rendering must not execute the tool")
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Extension for RenderedExtension {
+            fn id(&self) -> &str {
+                "tool-renderer"
+            }
+
+            fn tools(&self) -> Vec<Arc<dyn Tool>> {
+                vec![Arc::new(RenderedTool)]
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(RenderedExtension);
+        let mut description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(
+            description["tools"][0]["renderers"],
+            serde_json::json!({"shell": "self", "call": true, "result": false})
+        );
+        description["tools"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("renderers");
+        let legacy = serde_json::from_value::<Description>(description).unwrap();
+        assert!(legacy.tools[0].renderers.is_none());
+
+        let mut context = ToolRenderContext::new(
+            "owned",
+            "example-call",
+            serde_json::json!({"path": "notes"}),
+            ".",
+        );
+        context.expanded = true;
+        context.output_pad = 2;
+        let request = ProtocolRequest::RenderToolSection {
+            section: ToolSection::Call,
+            context: context.clone(),
+        };
+        let request = serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        let response = dispatch(extension.clone(), request).await.unwrap();
+        assert_eq!(response["lines"][0][0]["text"], "notes");
+        assert_eq!(response["lines"][0][0]["color"], "accent");
+        assert_eq!(response["padding"], 2);
+
+        context.result = Some(pi_rs_core::ToolRenderResult {
+            content: serde_json::json!([{"type": "text", "text": "result"}]),
+            details: None,
+            is_partial: false,
+            is_error: false,
+            duration_ms: Some(10),
+        });
+        let unsupported = ProtocolRequest::RenderToolSection {
+            section: ToolSection::Result,
+            context: context.clone(),
+        };
+        assert!(
+            dispatch(extension.clone(), unsupported)
+                .await
+                .unwrap()
+                .is_null()
+        );
+        context.tool_name = "unknown".into();
+        let unknown = ProtocolRequest::RenderToolSection {
+            section: ToolSection::Call,
+            context,
+        };
+        assert!(dispatch(extension, unknown).await.unwrap().is_null());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_tool_renderer_requests_only_advertised_sections() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("extension");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+IFS= read -r request
+case "$request" in
+    *'"type":"describe"'*)
+        cat "$(dirname "$0")/description.json"
+        ;;
+    *'"type":"render_tool_section"'*)
+        case "$request" in *'"section":"call"'*) ;; *) exit 2 ;; esac
+        case "$request" in *'"toolName":"owned"'*) ;; *) exit 2 ;; esac
+        printf '%s\n' '{"version":1,"response":{"Ok":{"lines":[[{"text":"remote call","color":"accent"}]]}}}'
+        ;;
+    *)
+        exit 2
+        ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let description = serde_json::json!({
+            "version": 1,
+            "response": {"Ok": {
+                "id": "renderer",
+                "dependencies": [],
+                "commands": [],
+                "tools": [{
+                    "spec": {"name": "owned", "description": "Example", "parameters": {"type": "object"}},
+                    "execution": "sequential",
+                    "renderers": {"shell": "default", "call": true, "result": false}
+                }]
+            }}
+        });
+        std::fs::write(
+            directory.path().join("description.json"),
+            format!("{description}\n"),
+        )
+        .unwrap();
+        let extension = ExecutableExtension::load_async(executable).await.unwrap();
+        let mut registry = pi_rs_core::Registry::default();
+        registry.register(Arc::new(extension)).unwrap();
+        let renderers = registry
+            .tool_renderers()
+            .resolve("owned", &|| None)
+            .unwrap();
+        assert!(renderers.result.is_none());
+        let mut context = ToolRenderContext::new("owned", "call-id", Value::Null, ".");
+        context.tool_name = "different".into();
+        assert!(
+            renderers
+                .call
+                .as_ref()
+                .unwrap()
+                .render(&context)
+                .await
+                .is_err()
+        );
+        context.tool_name = "owned".into();
+        let rendered = renderers.render(&context, Duration::from_secs(1)).await;
+        let rows = rendered.call.unwrap();
+        assert_eq!(rows.lines[0][0].text, "remote call");
+        assert_eq!(rows.lines[0][0].color.as_deref(), Some("accent"));
+    }
+
+    #[tokio::test]
+    async fn ui_prompt_lifecycle_capability_and_payload_round_trip() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "ui-prompt-lifecycle"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_ui_prompt_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle(
+                &self,
+                event: &LifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                assert!(matches!(
+                    event,
+                    LifecycleEvent::UiPromptEnd {
+                        reason: pi_rs_core::UiPromptReason::UiPrompt,
+                        kind: pi_rs_core::UiPromptKind::Custom,
+                        title: None,
+                    }
+                ));
+                Ok(())
+            }
+        }
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let mut description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["ui_prompt_lifecycle_hook"], true);
+        description
+            .as_object_mut()
+            .unwrap()
+            .remove("ui_prompt_lifecycle_hook");
+        assert!(
+            !serde_json::from_value::<Description>(description)
+                .unwrap()
+                .ui_prompt_lifecycle_hook
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "type":"lifecycle","state":null,
+            "event":{"type":"ui_prompt_end","reason":"ui_prompt","kind":"custom"},
+        }))
+        .unwrap();
+        dispatch(extension, request).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actionable_turn_end_negotiates_separately_from_observation() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "turn-boundary"
+            }
+
+            fn handles_turn_end_boundary(&self) -> bool {
+                true
+            }
+
+            async fn turn_end_boundary(
+                &self,
+                event: &pi_rs_core::TurnEndBoundary,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<pi_rs_core::BoundaryDecision> {
+                assert_eq!(event.message_entry_id, 4);
+                assert_eq!(event.tool_result_entry_ids, [5]);
+                Ok(pi_rs_core::BoundaryDecision {
+                    entries: Some(event.entries.clone()),
+                    should_continue: Some(true),
+                })
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["turn_end_boundary_hook"], true);
+        assert_eq!(description["lifecycle_hook"], false);
+        let entry = serde_json::json!({"type":"context_edit","targetId":4,"replacement":null});
+        let request = serde_json::from_value(serde_json::json!({
+            "type": "turn_end_boundary",
+            "event": {
+                "runId": "00000000-0000-0000-0000-000000000000",
+                "turnIndex": 0, "messageEntryId":4,
+                "message":{"role":"assistant","content":"answer","calls":[]},
+                "toolResultEntryIds":[5], "toolResults":[],
+                "outcome": "completed", "entries":[entry], "continue":false,
+                "context":{"contextMessages":[],"pendingMessages":[],"canContinue":false}
+            }
+        }))
+        .unwrap();
+        let response = dispatch(extension, request).await.unwrap();
+        assert_eq!(response["entries"][0], entry);
+        assert_eq!(response["continue"], true);
+    }
+
+    #[tokio::test]
+    async fn agent_before_settle_capability_carries_structural_decisions() {
+        struct Hook;
+
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "boundary-hook"
+            }
+
+            fn handles_agent_before_settle(&self) -> bool {
+                true
+            }
+
+            async fn agent_before_settle(
+                &self,
+                event: &pi_rs_core::AgentBeforeSettle,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<pi_rs_core::BoundaryDecision> {
+                assert!(event.context.can_continue);
+                assert_eq!(event.context.context_messages[0].record_id, 4);
+                Ok(pi_rs_core::BoundaryDecision {
+                    entries: Some(event.entries.clone()),
+                    should_continue: Some(false),
+                })
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["agent_before_settle_hook"], true);
+        let entry = serde_json::json!({"type":"context_edit","targetId":4,"replacement":null});
+        let request = serde_json::from_value(serde_json::json!({
+            "type": "agent_before_settle",
+            "event": {
+                "outcome": "completed", "entries": [entry], "continue": true,
+                "context": {
+                    "contextMessages": [{"recordId":4,"message":{"role":"user","content":"hello"}}],
+                    "pendingMessages": [], "canContinue": true
+                }
+            }
+        }))
+        .unwrap();
+        let response = dispatch(extension, request).await.unwrap();
+        assert_eq!(response["entries"][0], entry);
+        assert_eq!(response["continue"], false);
     }
 
     #[tokio::test]
@@ -2074,6 +5760,298 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_call_hook_is_advertised_and_transports_mutations() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "arguments"
+            }
+            fn handles_tool_call(&self) -> bool {
+                true
+            }
+            async fn tool_call(
+                &self,
+                _: &str,
+                args: &mut Value,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Decision> {
+                args["path"] = "changed".into();
+                Ok(Decision::Allow)
+            }
+        }
+        let extension: Arc<dyn Extension> = Arc::new(Hook);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["tool_call_hook"], true);
+        let request = ProtocolRequest::ToolCall {
+            name: "fixture".into(),
+            arguments: serde_json::json!({"path":"original"}),
+            operation_id: "00000000-0000-4000-8000-000000000001".into(),
+            state: None,
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let result = dispatch(extension, serde_json::from_slice(&encoded).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(result[0]["path"], "changed");
+        assert_eq!(result[1]["allow"], true);
+    }
+
+    #[tokio::test]
+    async fn presence_duplex_host_is_independent_of_custom_message_capability() {
+        struct Host {
+            custom: bool,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                self.custom
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                assert_eq!(name, "nested");
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Outcome::Succeeded("nested-result".into())
+            }
+            async fn send_message(
+                &self,
+                _: pi_rs_core::CustomMessage,
+                _: pi_rs_core::CustomMessageDelivery,
+            ) -> ExtensionResult<()> {
+                if self.custom {
+                    Ok(())
+                } else {
+                    Err("custom messages unavailable".into())
+                }
+            }
+        }
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "nested-hook"
+            }
+            async fn tool_result_update_with_host(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> ExtensionResult<Option<Outcome>> {
+                assert_eq!(
+                    host.call("nested", serde_json::json!({})).await,
+                    Outcome::Succeeded("nested-result".into())
+                );
+                let message = pi_rs_core::CustomMessage {
+                    custom_type: "hook".into(),
+                    content: pi_rs_core::ContextContent::Text("message".into()),
+                    display: false,
+                    details: None,
+                };
+                assert_eq!(
+                    host.send_message(message, pi_rs_core::CustomMessageDelivery::NextTurn)
+                        .await
+                        .is_ok(),
+                    host.supports_custom_messages()
+                );
+                Ok(Some(Outcome::Succeeded("host-used".into())))
+            }
+            async fn tool_result_update(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Outcome>> {
+                Ok(Some(Outcome::Succeeded("detached".into())))
+            }
+        }
+        let request = |presence_v1| ProtocolRequest::ToolResult {
+            call: pi_rs_core::ToolCall {
+                id: "call".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+            outcome: Outcome::Succeeded("original".into()),
+            operation_id: "00000000-0000-4000-8000-000000000001".into(),
+            state: None,
+            text_result_v2: true,
+            presence_v1,
+        };
+        for custom in [false, true] {
+            let host = Arc::new(Host {
+                custom,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let response = dispatch_with_host(Arc::new(Hook), request(true), host.clone())
+                .await
+                .unwrap();
+            let result: ToolResultPresence = serde_json::from_value(response).unwrap();
+            assert_eq!(result.outcome, Some(Outcome::Succeeded("host-used".into())));
+            assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        let host = Arc::new(Host {
+            custom: false,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let legacy: Option<Outcome> = serde_json::from_value(
+            dispatch_with_host(Arc::new(Hook), request(false), host.clone())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(legacy, Some(Outcome::Succeeded("detached".into())));
+        assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let single: ToolResultPresence =
+            serde_json::from_value(dispatch(Arc::new(Hook), request(true)).await.unwrap()).unwrap();
+        assert_eq!(single.outcome, Some(Outcome::Succeeded("detached".into())));
+
+        // The actual duplex proxy still fails closed before writing a frame.
+        let remote = RemoteHost {
+            tools: vec![],
+            has_ui: false,
+            has_progress: false,
+            has_custom_messages: false,
+            has_custom_entries: false,
+            has_custom_entry_read: false,
+            entry_lifetime: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            entry_waiting: None,
+            has_keyed_messages: false,
+            has_prevalidated_calls: false,
+            io: Arc::new(std::sync::Mutex::new((
+                std::io::BufReader::new(std::io::stdin()),
+                std::io::stdout(),
+            ))),
+        };
+        let message = pi_rs_core::CustomMessage {
+            custom_type: "hook".into(),
+            content: pi_rs_core::ContextContent::Text("message".into()),
+            display: false,
+            details: None,
+        };
+        assert_eq!(
+            remote
+                .send_message(message, pi_rs_core::CustomMessageDelivery::NextTurn)
+                .await
+                .unwrap_err(),
+            "custom message delivery is unavailable"
+        );
+        assert!(!remote.supports_custom_entries());
+        assert!(!remote.supports_custom_entry_read());
+        assert!(remote.custom_entries(None).await.is_err());
+        assert_eq!(
+            remote
+                .append_entry(pi_rs_core::CustomEntry {
+                    custom_type: "fixture".into(),
+                    data: None
+                })
+                .await
+                .unwrap_err(),
+            "custom entry persistence is unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn result_presence_protocol_preserves_legacy_and_distinguishes_same_text() {
+        struct Patch(bool);
+        #[async_trait::async_trait]
+        impl Extension for Patch {
+            fn id(&self) -> &str {
+                "presence"
+            }
+            fn handles_tool_result(&self) -> bool {
+                true
+            }
+            async fn tool_result_patch_v2(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<pi_rs_core::ToolResultPatchV2>> {
+                tokio::task::yield_now().await;
+                Ok(Some(pi_rs_core::ToolResultPatchV2 {
+                    output: self.0.then(|| "same".into()),
+                    details: Some(serde_json::json!({"patched":true})),
+                    is_error: None,
+                }))
+            }
+        }
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                unreachable!()
+            }
+        }
+        let mut legacy_reference = None;
+        for replace in [false, true] {
+            for duplex in [false, true] {
+                let extension: Arc<dyn Extension> = Arc::new(Patch(replace));
+                let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+                    .await
+                    .unwrap();
+                assert_eq!(description["result_presence_v1"], true);
+                let request = |presence_v1| ProtocolRequest::ToolResult {
+                    call: pi_rs_core::ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                    outcome: Outcome::Succeeded("same".into()),
+                    operation_id: "00000000-0000-4000-8000-000000000001".into(),
+                    state: None,
+                    text_result_v2: true,
+                    presence_v1,
+                };
+                let result = if duplex {
+                    dispatch_with_host(extension.clone(), request(true), Arc::new(Host)).await
+                } else {
+                    dispatch(extension.clone(), request(true)).await
+                }
+                .unwrap();
+                let result: ToolResultPresence = serde_json::from_value(result).unwrap();
+                assert_eq!(result.output_unchanged, Some(!replace));
+                assert!(
+                    matches!(result.outcome, Some(Outcome::SucceededWithDetails { output, details }) if output == "same" && details["patched"] == true)
+                );
+                let legacy = dispatch(extension.clone(), request(false)).await.unwrap();
+                if let Some(reference) = &legacy_reference {
+                    assert_eq!(&legacy, reference);
+                } else {
+                    legacy_reference = Some(legacy.clone());
+                }
+                assert!(
+                    serde_json::from_value::<Option<Outcome>>(legacy)
+                        .unwrap()
+                        .is_some()
+                );
+                let old_wire = serde_json::to_value(request(false)).unwrap();
+                assert!(old_wire.get("presence_v1").is_none());
+                let mut invalid = serde_json::to_value(request(true)).unwrap();
+                invalid["text_result_v2"] = serde_json::json!(false);
+                let error = dispatch(extension, serde_json::from_value(invalid).unwrap())
+                    .await
+                    .unwrap_err();
+                assert_eq!(error, "result presence requires text-result v2");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn tool_result_hook_is_advertised_and_dispatched() {
         struct Hook;
         #[async_trait::async_trait]
@@ -2112,6 +6090,8 @@ mod tests {
                 outcome: Outcome::Succeeded("original".into()),
                 operation_id: "00000000-0000-4000-8000-000000000001".into(),
                 state: None,
+                text_result_v2: true,
+                presence_v1: false,
             },
         )
         .await
@@ -2120,6 +6100,2635 @@ mod tests {
             serde_json::from_value::<Option<Outcome>>(result).unwrap(),
             Some(Outcome::Succeeded("changed".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn result_patch_dispatch_preserves_details() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "patch"
+            }
+            fn handles_tool_result(&self) -> bool {
+                true
+            }
+            async fn tool_result_patch(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<pi_rs_core::ToolResultPatch>> {
+                Ok(Some(pi_rs_core::ToolResultPatch {
+                    output: Some("changed".into()),
+                    details: None,
+                }))
+            }
+        }
+        let result = dispatch(
+            Arc::new(Hook),
+            ProtocolRequest::ToolResult {
+                call: pi_rs_core::ToolCall {
+                    id: "call".into(),
+                    name: "fixture".into(),
+                    arguments: "{}".into(),
+                },
+                outcome: Outcome::SucceededWithDetails {
+                    output: "original".into(),
+                    details: serde_json::json!({"retained": true}),
+                },
+                operation_id: "00000000-0000-4000-8000-000000000001".into(),
+                state: None,
+                text_result_v2: true,
+                presence_v1: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<Option<Outcome>>(result).unwrap(),
+            Some(Outcome::SucceededWithDetails {
+                output: "changed".into(),
+                details: serde_json::json!({"retained": true})
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_result_patch_is_dispatched() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "patch"
+            }
+            fn handles_tool_result(&self) -> bool {
+                true
+            }
+            async fn tool_result_patch(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<pi_rs_core::ToolResultPatch>> {
+                Ok(Some(pi_rs_core::ToolResultPatch {
+                    output: Some("changed".into()),
+                    details: None,
+                }))
+            }
+        }
+        let result = dispatch(
+            Arc::new(Hook),
+            ProtocolRequest::ToolResult {
+                call: pi_rs_core::ToolCall {
+                    id: "call".into(),
+                    name: "fixture".into(),
+                    arguments: "{}".into(),
+                },
+                outcome: Outcome::Failed("original".into()),
+                operation_id: "00000000-0000-4000-8000-000000000001".into(),
+                state: None,
+                text_result_v2: true,
+                presence_v1: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<Option<Outcome>>(result).unwrap(),
+            Some(Outcome::TextResult {
+                output: "changed".into(),
+                details: None,
+                is_error: true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn executable_notes_emits_tracked_user_patch() {
+        let notes = crate::Notes;
+        let state = notes.command("set", "remember", None).unwrap();
+        let extension: Arc<dyn Extension> = Arc::new(notes);
+        let request = ModelRequest {
+            model: "m".into(),
+            messages: vec![
+                Message::System {
+                    content: "system".into(),
+                },
+                Message::Assistant {
+                    content: "visible".into(),
+                    calls: vec![],
+                    replay: None,
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: 8,
+        };
+        let result = dispatch(
+            extension,
+            ProtocolRequest::BeforeRequestV3 {
+                request,
+                summary: false,
+                state: Some(state),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["change"], "safe_patch");
+        assert_eq!(result["patch"]["user_edits"][0]["op"], "insert");
+        assert!(
+            result["patch"]["user_edits"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("remember")
+        );
+    }
+
+    #[test]
+    fn versioned_patches_cannot_split_tool_result_groups() {
+        for count in [1, 3] {
+            let calls: Vec<_> = (0..count)
+                .map(|i| pi_rs_core::ToolCall {
+                    id: format!("c{i}"),
+                    name: "tool".into(),
+                    arguments: "{}".into(),
+                })
+                .collect();
+            let mut messages = vec![
+                Message::System {
+                    content: "system".into(),
+                },
+                Message::Assistant {
+                    content: String::new(),
+                    calls,
+                    replay: Some(Box::new(pi_rs_core::ProviderReplay {
+                        identity: pi_rs_core::ResolvedModelIdentity {
+                            provider: "p".into(),
+                            model: "m".into(),
+                        },
+                        blocks: vec![serde_json::json!({"private":"signature"})],
+                    })),
+                },
+            ];
+            messages.extend((0..count).map(|i| Message::Tool {
+                call_id: format!("c{i}"),
+                content: "result".into(),
+                is_error: false,
+                is_structured: Some(false),
+            }));
+            messages.push(Message::User {
+                content: "later".into(),
+            });
+            for index in 2..2 + count {
+                let response:ContextResponse<ModelRequest> = serde_json::from_value(serde_json::json!({"change":"safe_patch","patch":{"user_edits":[{"op":"insert","index":index,"message":{"role":"user","content":"injected"}}]}})).unwrap();
+                let ContextResponse::SafePatch { patch } = response else {
+                    panic!("expected patch")
+                };
+                let mut request = ModelRequest {
+                    model: "m".into(),
+                    messages: messages.clone(),
+                    tools: vec![],
+                    max_output_tokens: 8,
+                };
+                let snapshot = request.clone();
+                let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+                let access = guarded.access();
+                assert!(commit_request_patch(&mut guarded, &patch).is_err());
+                assert!(access.user_edits().is_empty());
+                assert_eq!(request, snapshot);
+                let mut list = messages.clone();
+                let mut guarded = pi_rs_core::ContextMessages::new(&mut list);
+                let access = guarded.access();
+                assert!(commit_messages_patch(&mut guarded, &patch).is_err());
+                assert!(access.user_edits().is_empty());
+                assert_eq!(list, messages);
+            }
+            // A valid edit preceding an invalid edit must not be applied either.
+            let patch = ContextPatch {
+                user_edits: vec![
+                    pi_rs_core::ContextUserEdit::Insert {
+                        index: 1,
+                        message: Message::User {
+                            content: "first".into(),
+                        },
+                    },
+                    pi_rs_core::ContextUserEdit::Insert {
+                        index: 3,
+                        message: Message::User {
+                            content: "split".into(),
+                        },
+                    },
+                ],
+                ..Default::default()
+            };
+            let mut request = ModelRequest {
+                model: "m".into(),
+                messages: messages.clone(),
+                tools: vec![],
+                max_output_tokens: 8,
+            };
+            let snapshot = request.clone();
+            assert!(
+                commit_request_patch(&mut pi_rs_core::ContextRequest::new(&mut request), &patch)
+                    .is_err()
+            );
+            assert_eq!(request, snapshot);
+            let patch = ContextPatch {
+                user_edits: vec![pi_rs_core::ContextUserEdit::Insert {
+                    index: 2 + count,
+                    message: Message::User {
+                        content: "after results".into(),
+                    },
+                }],
+                ..Default::default()
+            };
+            let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+            let access = guarded.access();
+            commit_request_patch(&mut guarded, &patch).unwrap();
+            assert!(!access.assistant_accessed());
+            assert!(guarded.messages.iter().any(|m| matches!(
+                m,
+                Message::Assistant {
+                    replay: Some(_),
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn safe_patch_preserves_private_replay_and_rejects_invalid_edits_atomically() {
+        let mut original = ModelRequest {
+            model: "m".into(),
+            messages: vec![
+                Message::System {
+                    content: "system".into(),
+                },
+                Message::User {
+                    content: "old".into(),
+                },
+                Message::Assistant {
+                    content: "same".into(),
+                    calls: vec![],
+                    replay: None,
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: 8,
+        };
+        let mut changed = original.clone();
+        let mut tracked = pi_rs_core::ContextRequest::new(&mut changed);
+        let access = tracked.access();
+        tracked
+            .insert_user(
+                1,
+                Message::User {
+                    content: "new".into(),
+                },
+            )
+            .unwrap();
+        tracked.remove_user(2).unwrap();
+        tracked.system_content_mut().unwrap().push_str(" updated");
+        tracked.tools_mut().push(ToolSpec {
+            name: "search".into(),
+            description: "safe".into(),
+            parameters: serde_json::json!({}),
+        });
+        let patch = request_patch(&original, &changed, access.user_edits()).unwrap();
+        if let Message::Assistant { replay, .. } = &mut original.messages[2] {
+            *replay = Some(Box::new(pi_rs_core::ProviderReplay {
+                identity: pi_rs_core::ResolvedModelIdentity {
+                    provider: "p".into(),
+                    model: "m".into(),
+                },
+                blocks: vec![serde_json::json!({"private":"signature"})],
+            }));
+        }
+        let mut host = pi_rs_core::ContextRequest::new(&mut original);
+        let access = host.access();
+        commit_request_patch(&mut host, &patch).unwrap();
+        assert!(!access.assistant_accessed());
+        assert_eq!(access.user_edits().len(), 2);
+        assert!(matches!(
+            &host.messages[2],
+            Message::Assistant {
+                replay: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            host.messages[0],
+            Message::System {
+                content: "system updated".into()
+            }
+        );
+        let snapshot = (*host).clone();
+        let invalid = ContextPatch {
+            user_edits: vec![
+                pi_rs_core::ContextUserEdit::Insert {
+                    index: 1,
+                    message: Message::User {
+                        content: "temporary".into(),
+                    },
+                },
+                pi_rs_core::ContextUserEdit::Remove { index: 3 },
+            ],
+            ..Default::default()
+        };
+        assert!(commit_request_patch(&mut host, &invalid).is_err());
+        assert_eq!(*host, snapshot);
+        let invalid = ContextPatch {
+            user_edits: vec![pi_rs_core::ContextUserEdit::Insert {
+                index: 0,
+                message: Message::Assistant {
+                    content: "forged".into(),
+                    calls: vec![],
+                    replay: None,
+                },
+            }],
+            ..Default::default()
+        };
+        assert!(commit_request_patch(&mut host, &invalid).is_err());
+        assert_eq!(*host, snapshot);
+        assert!(
+            serde_json::from_value::<ContextResponse<ModelRequest>>(
+                serde_json::json!({"change":"safe_patch","patch":{"model":"other"}})
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn versioned_protocol_uses_tracked_access_not_hook_claims() {
+        struct Hook(u8);
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "tracked-hook"
+            }
+            async fn before_request(
+                &self,
+                request: &mut pi_rs_core::ContextRequest<'_>,
+                _: RequestPurpose,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<pi_rs_core::ContextChange> {
+                if self.0 == 1 {
+                    let removed = request.messages.remove(0);
+                    request.messages.insert(0, removed);
+                    Ok(pi_rs_core::ContextChange::Unchanged)
+                } else if self.0 == 2 {
+                    request.tools_mut().push(ToolSpec {
+                        name: "new".into(),
+                        description: "safe".into(),
+                        parameters: serde_json::json!({}),
+                    });
+                    request.insert_user(
+                        0,
+                        Message::User {
+                            content: "inserted".into(),
+                        },
+                    )?;
+                    Ok(pi_rs_core::ContextChange::Changed)
+                } else {
+                    request.tools_mut().clear();
+                    Ok(pi_rs_core::ContextChange::Changed)
+                }
+            }
+        }
+        for mode in [0, 1, 2] {
+            let extension: Arc<dyn Extension> = Arc::new(Hook(mode));
+            let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+                .await
+                .unwrap();
+            assert_eq!(description["context_provenance_v1"], true);
+            assert_eq!(description["context_safe_patch_v1"], true);
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![Message::User {
+                    content: "hello".into(),
+                }],
+                tools: vec![],
+                max_output_tokens: 8,
+            };
+            if mode == 2 {
+                let previous = dispatch(
+                    extension.clone(),
+                    ProtocolRequest::BeforeRequestV2 {
+                        request: request.clone(),
+                        summary: false,
+                        state: None,
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(previous["change"], "changed");
+                assert!(previous.get("value").is_some());
+            }
+            let result = dispatch(
+                extension,
+                ProtocolRequest::BeforeRequestV3 {
+                    request,
+                    summary: false,
+                    state: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result["change"],
+                match mode {
+                    1 => "changed",
+                    2 => "safe_patch",
+                    _ => "unchanged",
+                }
+            );
+            assert_eq!(result.get("value").is_some(), mode == 1);
+            assert_eq!(result.get("patch").is_some(), mode == 2);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_context_provenance_negotiates_unchanged_and_rejects_extra_payload() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = r##"#!/usr/bin/env python3
+import json,sys,os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+if r['type']=='describe':
+    v={'id':name,'dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True,'context_provenance_v1':name!='legacy','context_safe_patch_v1':name=='patch'}
+elif r['type']=='migrate': v=None
+else:
+    x=r.get('request',r.get('messages'))
+    messages=x['messages'] if isinstance(x,dict) else x
+    assert all('replay' not in m for m in messages)
+    if name=='legacy': v=x
+    elif name=='invalid': v={'change':'unchanged','value':x}
+    elif name=='changed': v={'change':'changed','value':x}
+    elif name in ('patch','unnegotiated'):
+        patch={'user_edits':[{'op':'insert','index':0,'message':{'role':'user','content':'injected'}}]}
+        if isinstance(x,dict): patch['tools']=[{'name':'tool','description':'safe','parameters':{}}]
+        v={'change':'safe_patch','patch':patch}
+    else: v={'change':'unchanged'}
+print(json.dumps({'version':1,'response':{'Ok':v}}))
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "legacy",
+            "unchanged",
+            "changed",
+            "invalid",
+            "patch",
+            "unnegotiated",
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let extension = ExecutableExtension::load(&path).unwrap();
+            let mut request = ModelRequest {
+                model: "m".into(),
+                messages: vec![Message::Assistant {
+                    content: "visible".into(),
+                    calls: vec![],
+                    replay: Some(Box::new(pi_rs_core::ProviderReplay {
+                        identity: pi_rs_core::ResolvedModelIdentity {
+                            provider: "p".into(),
+                            model: "m".into(),
+                        },
+                        blocks: vec![serde_json::json!({"private":"secret"})],
+                    })),
+                }],
+                tools: vec![],
+                max_output_tokens: 8,
+            };
+            let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+            let access = guarded.access();
+            let result = extension
+                .before_request(&mut guarded, RequestPurpose::Turn, None)
+                .await;
+            if name == "invalid" || name == "unnegotiated" {
+                assert!(result.is_err());
+                continue;
+            }
+            assert!(result.is_ok());
+            assert_eq!(
+                access.assistant_accessed(),
+                name == "legacy" || name == "changed"
+            );
+            assert_eq!(
+                matches!(
+                    &request.messages[if name == "patch" { 1 } else { 0 }],
+                    Message::Assistant {
+                        replay: Some(_),
+                        ..
+                    }
+                ),
+                name == "unchanged" || name == "patch"
+            );
+            let mut sync_request = ModelRequest {
+                model: "m".into(),
+                messages: vec![Message::User {
+                    content: "visible".into(),
+                }],
+                tools: vec![],
+                max_output_tokens: 8,
+            };
+            let mut sync_guard = pi_rs_core::ContextRequest::new(&mut sync_request);
+            let sync_access = sync_guard.access();
+            extension.context(&mut sync_guard, None).unwrap();
+            assert_eq!(
+                sync_access.assistant_accessed(),
+                name == "legacy" || name == "changed"
+            );
+            let mut messages = vec![Message::User {
+                content: "visible".into(),
+            }];
+            let mut guarded = pi_rs_core::ContextMessages::new(&mut messages);
+            let access = guarded.access();
+            extension
+                .context_with_system(&mut guarded, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                access.assistant_accessed(),
+                name == "legacy" || name == "changed"
+            );
+            if name == "patch" || name == "changed" {
+                struct Capture(std::sync::Mutex<Vec<ModelRequest>>);
+                #[async_trait::async_trait]
+                impl pi_rs_core::Model for Capture {
+                    async fn stream(
+                        &self,
+                        request: ModelRequest,
+                    ) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+                        self.0.lock().unwrap().push(request);
+                        Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                            pi_rs_core::ModelEvent::Complete {
+                                calls: vec![],
+                                usage: None,
+                            },
+                        )])))
+                    }
+                }
+                let initial =
+                    pi_rs_core::Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+                let mut records = initial.records().to_vec();
+                let version = records[0].version;
+                let id = Default::default();
+                let events = vec![
+                    pi_rs_core::Event::User {
+                        content: "initial".into(),
+                        input_id: None,
+                    },
+                    pi_rs_core::Event::ModelFinished {
+                        request_id: id,
+                        metadata: pi_rs_core::ModelMetadata {
+                            replay: Some(Box::new(pi_rs_core::ProviderReplay {
+                                identity: pi_rs_core::ResolvedModelIdentity {
+                                    provider: "p".into(),
+                                    model: "m".into(),
+                                },
+                                blocks: vec![serde_json::json!({"private":"secret"})],
+                            })),
+                            ..Default::default()
+                        },
+                        usage: pi_rs_core::UsageReport::Unconfirmed,
+                        failure: None,
+                        partial: String::new(),
+                        reply: None,
+                    },
+                    pi_rs_core::Event::Assistant {
+                        content: "visible".into(),
+                        invocations: vec![],
+                        usage: None,
+                        request_id: Some(id),
+                    },
+                ];
+                for event in events {
+                    let record_id = records.len() as u64 + 1;
+                    records.push(pi_rs_core::Record {
+                        timestamp: None,
+                        run_id: None,
+                        version,
+                        id: record_id,
+                        parent: Some(record_id - 1),
+                        event,
+                    });
+                }
+                let mut session = pi_rs_core::Session::from_records(records).unwrap();
+                let mut registry = pi_rs_core::Registry::default();
+                registry.register(Arc::new(extension)).unwrap();
+                let model = Capture(std::sync::Mutex::new(Vec::new()));
+                let agent = pi_rs_core::Agent {
+                    model: &model,
+                    model_name: "m",
+                    registry: &registry,
+                    system_prompt: "system",
+                    limits: pi_rs_core::Limits::default(),
+                };
+                let (_sender, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+                agent
+                    .run(
+                        &mut session,
+                        Some("continue".into()),
+                        &mut inputs,
+                        &CancellationToken::new(),
+                        &mut |_| {},
+                    )
+                    .await
+                    .unwrap();
+                let captured = model.0.lock().unwrap();
+                let replay = captured[0]
+                    .messages
+                    .iter()
+                    .find_map(|message| match message {
+                        Message::Assistant { replay, .. } => Some(replay),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(replay.is_some(), name == "patch");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_context_hooks_distinguish_unchanged_and_rewritten_provenance() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = r##"#!/usr/bin/env python3
+import json,sys,os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+if r['type']=='describe':
+    value={'id':name,'dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True,'tool_message_error':name!='legacy','tool_message_structured':name in ('prior','modern'),'tool_message_provenance_v2':name=='modern'}
+else:
+    value=r.get('messages') if r['type']=='context_with_system' else r['request']
+    messages=value if isinstance(value,list) else value['messages']
+    for m in messages:
+        if m['role']=='tool':
+            if name=='legacy': m.pop('is_error',None)
+            if name!='modern': m.pop('is_structured',None)
+            if m['call_id']=='to_text':
+                m['content']='replacement text'
+                if name=='modern': m['is_structured']=False
+            if m['call_id']=='to_structured':
+                m['content']='{"data":{"content":[{"type":"image","mimeType":"image/png","data":"YWJj"}]}}'
+                if name=='modern': m['is_structured']=True
+print(json.dumps({'version':1,'response':{'Ok':value}}))
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["legacy", "intermediate", "prior", "modern"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let extension = ExecutableExtension::load(path).unwrap();
+            let item = |id: &str, content: &str, is_structured| Message::Tool {
+                call_id: id.into(),
+                content: content.into(),
+                is_error: true,
+                is_structured: Some(is_structured),
+            };
+            let original = ModelRequest {
+                model: "fixture".into(),
+                messages: vec![
+                    item("unchanged_structured", "structured", true),
+                    item("unchanged_plain", "plain", false),
+                    item("to_text", "old structured", true),
+                    item("to_structured", "old plain", false),
+                ],
+                tools: vec![],
+                max_output_tokens: 10,
+            };
+            let check = |messages: &[Message]| {
+                assert!(matches!(
+                    &messages[0],
+                    Message::Tool {
+                        is_error: true,
+                        is_structured: Some(true),
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    &messages[1],
+                    Message::Tool {
+                        is_error: true,
+                        is_structured: Some(false),
+                        ..
+                    }
+                ));
+                for (index, expected) in [(2, false), (3, true)] {
+                    let Message::Tool {
+                        content,
+                        is_error,
+                        is_structured,
+                        ..
+                    } = &messages[index]
+                    else {
+                        panic!("tool message missing")
+                    };
+                    assert!(*is_error);
+                    assert_eq!(
+                        *is_structured,
+                        if name == "modern" {
+                            Some(expected)
+                        } else {
+                            None
+                        }
+                    );
+                    assert_eq!(
+                        pi_rs_core::tool_content_is_structured(content, *is_structured),
+                        expected
+                    );
+                }
+            };
+            let mut request = original.clone();
+            extension
+                .context(&mut pi_rs_core::ContextRequest::new(&mut request), None)
+                .unwrap();
+            check(&request.messages);
+            let mut request = original.clone();
+            extension
+                .before_request(
+                    &mut pi_rs_core::ContextRequest::new(&mut request),
+                    RequestPurpose::Turn,
+                    None,
+                )
+                .await
+                .unwrap();
+            check(&request.messages);
+            let mut messages = original.messages;
+            extension
+                .context_with_system(&mut pi_rs_core::ContextMessages::new(&mut messages), None)
+                .await
+                .unwrap();
+            check(&messages);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nested_host_results_negotiate_outcome_variants_across_processes() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                Outcome::TextResult {
+                    output: format!("{name} output"),
+                    details: Some(serde_json::json!({"id": name})),
+                    is_error: name == "failure",
+                }
+            }
+        }
+        let script = r##"#!/usr/bin/env python3
+import json, sys, os
+name=os.path.basename(sys.argv[0])
+if '--pi-rs-extension-v1' in sys.argv:
+    r=json.load(sys.stdin)
+    assert r['type']=='describe'
+    d={'id':name, 'dependencies':[], 'commands':[], 'host_calls':True, 'text_result_v2':name=='modern', 'tools':[{'spec':{'name':'outer','description':'test','parameters':{'type':'object'}},'execution':'sequential','transactional':True}]}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    request=json.loads(sys.stdin.readline())
+    assert request['request']['type']=='invoke'
+    print(json.dumps({'type':'call','calls':[['success',{}],['failure',{}]]}),flush=True)
+    results=json.loads(sys.stdin.readline())
+    if name=='modern':
+        assert results[0]['status']=='text_result' and results[0]['detail']['is_error'] is False
+        assert results[1]['status']=='text_result' and results[1]['detail']['is_error'] is True
+        assert results[1]['detail']['details']=={'id':'failure'}
+    else:
+        assert results[0]=={'status':'succeeded_with_details','detail':{'output':'success output','details':{'id':'success'}}}
+        assert results[1]=={'status':'failed','detail':'failure output'}
+    print(json.dumps({'type':'complete','response':{'Ok':{'outcome':{'status':'succeeded','detail':'nested calls complete'}}}}),flush=True)
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["legacy", "modern"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let extension = ExecutableExtension::load(path).unwrap();
+            assert_eq!(extension.endpoint.text_result_v2, name == "modern");
+            let tool = extension.tools().pop().unwrap();
+            let context = ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: CancellationToken::new(),
+            };
+            let result = tool
+                .invoke_with_host(serde_json::json!({}), context, None, Arc::new(Host))
+                .await;
+            assert_eq!(
+                result,
+                Outcome::Succeeded("nested calls complete".into()),
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_custom_message_host_call_preserves_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+            async fn send_message(
+                &self,
+                message: pi_rs_core::CustomMessage,
+                delivery: pi_rs_core::CustomMessageDelivery,
+            ) -> ExtensionResult<()> {
+                assert_eq!(delivery, pi_rs_core::CustomMessageDelivery::FollowUp);
+                assert_eq!(message.custom_type, "notice");
+                assert!(!message.display);
+                assert_eq!(message.details, Some(serde_json::json!({"key": 3})));
+                Ok(())
+            }
+        }
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    r=json.load(sys.stdin)
+    d={'id':'message-test','dependencies':[],'commands':[],'host_calls':True,'tools':[{'spec':{'name':'outer','description':'test','parameters':{'type':'object'}},'execution':'sequential','transactional':True}]}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    r=json.loads(sys.stdin.readline())
+    assert r['has_custom_messages'] is True
+    print(json.dumps({'type':'send_message','delivery':'followUp','message':{'customType':'notice','content':'hello','display':False,'details':{'key':3}}}),flush=True)
+    assert json.loads(sys.stdin.readline()) == {'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':{'outcome':{'status':'succeeded','detail':'done'}}}}),flush=True)
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("message-test");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let tool = extension.tools().pop().unwrap();
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        assert_eq!(
+            tool.invoke_with_host(serde_json::json!({}), context, None, Arc::new(Host))
+                .await,
+            Outcome::Succeeded("done".into())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_lifecycle_callback_uses_negotiated_message_host() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            fn supports_keyed_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+            async fn send_message_with_key(
+                &self,
+                message: pi_rs_core::CustomMessage,
+                delivery: pi_rs_core::CustomMessageDelivery,
+                key: &str,
+            ) -> ExtensionResult<()> {
+                assert_eq!(key, "stable");
+                assert_eq!(message.custom_type, "from-hook");
+                assert_eq!(delivery, pi_rs_core::CustomMessageDelivery::TriggerTurn);
+                Ok(())
+            }
+        }
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    r=json.load(sys.stdin)
+    d={'id':'hook-test','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'lifecycle_host_calls':True,'pi_lifecycle_fields':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    r=json.loads(sys.stdin.readline())
+    assert r['request']['type']=='lifecycle' and r['has_custom_messages'] is True and r['has_keyed_messages'] is True
+    print(json.dumps({'type':'send_message','delivery':'triggerTurn','key':'stable','message':{'customType':'from-hook','content':'hello','display':False}}),flush=True)
+    assert json.loads(sys.stdin.readline()) == {'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}),flush=True)
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook-test");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        extension
+            .lifecycle_with_host(
+                &LifecycleEvent::AgentSettled { aborted: false },
+                None,
+                Arc::new(Host),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_live_mcp_registration_executable_uses_scoped_duplex_requests() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    descriptor={'id':'register-mcp','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'session_lifecycle_hook':True,'mcp_registry_host_calls':True}
+    print(json.dumps({'version':1,'response':{'Ok':descriptor}}))
+else:
+    request=json.loads(sys.stdin.readline())
+    assert request['has_mcp_registry'] and request['request']['event']['type']=='session_start'
+    print(json.dumps({'type':'register_mcp_server','server':{'name':'fixture','config':{'command':'fixture'}}}), flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'list_mcp_servers'}), flush=True)
+    snapshot=json.loads(sys.stdin.readline())['Ok']
+    assert snapshot[0]['name']=='fixture' and snapshot[0]['extensionId']=='register-mcp'
+    print(json.dumps({'type':'unregister_mcp_server','name':'missing'}), flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':False}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}), flush=True)
+"##;
+
+        struct NoModel;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Model for NoModel {
+            async fn stream(&self, _: ModelRequest) -> Result<pi_rs_core::ModelStream> {
+                panic!("registration must not run a model")
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("register-mcp");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        assert!(extension.handles_mcp_registry());
+        let mut session = pi_rs_core::SessionBuilder::new(Arc::new(NoModel), "fixture")
+            .extension(Arc::new(extension))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session.start().await.unwrap();
+        let servers = session.registered_mcp_servers();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].server.name, "fixture");
+        assert_eq!(servers[0].extension_id, "register-mcp");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_host_context_preserves_tracked_safe_edits_and_hides_replay() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+            async fn send_message(
+                &self,
+                _: pi_rs_core::CustomMessage,
+                _: pi_rs_core::CustomMessageDelivery,
+            ) -> ExtensionResult<()> {
+                Ok(())
+            }
+        }
+        let script = r##"#!/usr/bin/env python3
+import json,sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    print(json.dumps({'version':1,'response':{'Ok':{'id':'tracked-host','dependencies':[],'commands':[],'tools':[],'context_with_system_hook':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_provenance_v1':True,'context_safe_patch_v1':True}}}))
+else:
+    frame=json.loads(sys.stdin.readline()); r=frame['request']; kind=r['type']
+    assert kind in ('before_request_v3','context_with_system_v3'),kind
+    payload=r.get('request',r.get('messages')); messages=payload['messages'] if isinstance(payload,dict) else payload
+    assert 'private-secret' not in json.dumps(messages)
+    print(json.dumps({'type':'send_message','delivery':'nextTurn','message':{'customType':'tracked','content':'host','display':False}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    patch={'user_edits':[{'op':'insert','index':0,'message':{'role':'user','content':'injected'}}]}
+    print(json.dumps({'type':'complete','response':{'Ok':{'change':'safe_patch','patch':patch}}}),flush=True)
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracked-host");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let mut request = ModelRequest {
+            model: "m".into(),
+            tools: vec![],
+            max_output_tokens: 10,
+            messages: vec![Message::Assistant {
+                content: "visible".into(),
+                calls: vec![],
+                replay: Some(Box::new(pi_rs_core::ProviderReplay {
+                    identity: pi_rs_core::ResolvedModelIdentity {
+                        provider: "p".into(),
+                        model: "m".into(),
+                    },
+                    blocks: vec![serde_json::json!({"private":"private-secret"})],
+                })),
+            }],
+        };
+        let mut guarded = pi_rs_core::ContextRequest::new(&mut request);
+        let access = guarded.access();
+        extension
+            .before_request_with_host(&mut guarded, RequestPurpose::Turn, None, Arc::new(Host))
+            .await
+            .unwrap();
+        assert!(!access.assistant_accessed());
+        assert!(matches!(
+            &request.messages[1],
+            Message::Assistant {
+                replay: Some(_),
+                ..
+            }
+        ));
+        let mut guarded = pi_rs_core::ContextMessages::new(&mut request.messages);
+        let access = guarded.access();
+        extension
+            .context_with_system_with_host(&mut guarded, None, Arc::new(Host))
+            .await
+            .unwrap();
+        assert!(!access.assistant_accessed());
+        assert!(matches!(
+            &request.messages[2],
+            Message::Assistant {
+                replay: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_discovery_persists_custom_entry_in_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("entry-hook");
+        std::fs::write(&path, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    result={'id':'entry-hook','dependencies':[],'commands':[],'tools':[],'resource_discovery_hook':True,'resources_hook_host_calls':True}
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame=json.loads(sys.stdin.readline())
+    assert frame['has_custom_entries'] and frame['has_custom_entry_read'] and frame['request']['type']=='discover_resources'
+    print(json.dumps({'type':'list_custom_entries','custom_type':'fixture'}),flush=True)
+    assert json.loads(sys.stdin.readline())['Ok'][0]['entry']['data']=={'count':1}
+    print(json.dumps({'type':'append_entry','entry':{'customType':'fixture','data':{'count':7}}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'list_custom_entries','custom_type':'fixture'}),flush=True)
+    assert [r['entry']['data']['count'] for r in json.loads(sys.stdin.readline())['Ok']]==[1,7]
+    print(json.dumps({'type':'complete','response':{'Ok':{'skillPaths':[],'promptPaths':[],'themePaths':[]}}}),flush=True)
+"##).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let mut registry = pi_rs_core::Registry::default();
+        registry.register(Arc::new(extension)).unwrap();
+        let mut session =
+            pi_rs_core::Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+        session
+            .append_custom_entry(pi_rs_core::CustomEntry {
+                custom_type: "fixture".into(),
+                data: Some(serde_json::json!({"count":1})),
+            })
+            .unwrap();
+        registry
+            .discover_resources_in_session(
+                &pi_rs_core::ResourceDiscoveryEvent {
+                    cwd: directory.path().into(),
+                    reason: pi_rs_core::ResourceDiscoveryReason::Startup,
+                },
+                &mut session,
+                Duration::from_secs(5),
+                &mut |_| {},
+                |id, error| panic!("{id}: {error}"),
+            )
+            .await
+            .unwrap();
+        let restored = pi_rs_core::Session::from_records(session.records().to_vec()).unwrap();
+        assert!(restored.branch().iter().any(|record| matches!(&record.event,
+            pi_rs_core::Event::CustomEntry { entry } if entry.custom_type == "fixture" && entry.data == Some(serde_json::json!({"count":7}))
+        )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_transition_reads_and_appends_entry_before_veto() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transition-hook");
+        std::fs::write(&path, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    result={'id':'transition-hook','dependencies':[],'commands':[],'tools':[],'session_transition_hook':True,'transition_hook_host_calls':True}
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame=json.loads(sys.stdin.readline())
+    assert frame['has_custom_entries'] and frame['has_custom_entry_read'] and frame['request']['type']=='before_session_transition'
+    print(json.dumps({'type':'list_custom_entries','custom_type':'transition'}),flush=True)
+    assert json.loads(sys.stdin.readline())['Ok'][0]['entry']['data']=={'value':1}
+    print(json.dumps({'type':'append_entry','entry':{'customType':'transition','data':{'value':2}}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':True}}),flush=True)
+"##).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let mut registry = pi_rs_core::Registry::default();
+        registry.register(Arc::new(extension)).unwrap();
+        let mut session =
+            pi_rs_core::Session::with_store(pi_rs_core::MemoryStore::default()).unwrap();
+        session
+            .append_custom_entry(pi_rs_core::CustomEntry {
+                custom_type: "transition".into(),
+                data: Some(serde_json::json!({"value":1})),
+            })
+            .unwrap();
+        let entry_id = session.head();
+        let cancelled = registry
+            .session_transition_cancelled_in_session(
+                &pi_rs_core::BeforeSessionTransition::Fork {
+                    entry_id,
+                    position: pi_rs_core::ForkPosition::At,
+                },
+                &mut session,
+                Duration::from_secs(5),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(cancelled);
+        assert!(session.branch().iter().any(|record| matches!(&record.event,
+            pi_rs_core::Event::CustomEntry { entry } if entry.custom_type == "transition" && entry.data == Some(serde_json::json!({"value":2}))
+        )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_scoped_sdk_start_reads_and_appends_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        struct UnusedModel;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Model for UnusedModel {
+            async fn stream(&self, _: ModelRequest) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+                Err(pi_rs_core::Error::Config("unexpected model request".into()))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("startup-hook");
+        std::fs::write(&path, r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    request=json.load(sys.stdin)
+    result={'id':'startup-hook','dependencies':[],'commands':[],'tools':[],'lifecycle_hook':True,'session_lifecycle_hook':True,'lifecycle_host_calls':True} if request['type']=='describe' else None
+    print(json.dumps({'version':1,'response':{'Ok':result}}))
+else:
+    frame=json.loads(sys.stdin.readline())
+    if frame['request']['event']['type']=='session_start':
+        assert frame['has_custom_entries'] and frame['has_custom_entry_read']
+        print(json.dumps({'type':'list_custom_entries','custom_type':'startup'}),flush=True)
+        assert json.loads(sys.stdin.readline())['Ok'][0]['entry']['data']=={'before':True}
+        print(json.dumps({'type':'append_entry','entry':{'customType':'startup','data':{'after':True}}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+    print(json.dumps({'type':'complete','response':{'Ok':None}}),flush=True)
+"##).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let mut session = pi_rs_core::SessionBuilder::new(Arc::new(UnusedModel), "fixture")
+            .extension(Arc::new(extension))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        session
+            .append_custom_entry(pi_rs_core::CustomEntry {
+                custom_type: "startup".into(),
+                data: Some(serde_json::json!({"before":true})),
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), session.start())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session.journal().unwrap().branch().iter().any(|record| matches!(&record.event,
+            pi_rs_core::Event::CustomEntry { entry } if entry.custom_type == "startup" && entry.data == Some(serde_json::json!({"after":true}))
+        )));
+        session.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_input_request_and_tool_hooks_use_message_channel() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+            async fn send_message(
+                &self,
+                _: pi_rs_core::CustomMessage,
+                _: pi_rs_core::CustomMessageDelivery,
+            ) -> ExtensionResult<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    d={'id':'hooks','dependencies':[],'commands':[],'tools':[],'input_hook':True,'input_hook_host_calls':True,'request_hook_host_calls':True,'context_hook_host_calls':True,'context_with_system_hook':True,'transition_hook_host_calls':True,'tree_hook_host_calls':True,'tree_navigation_hook':True,'compaction_hook_host_calls':True,'before_summary_compaction_v1':True,'resources_hook_host_calls':True,'resource_discovery_hook':True,'user_bash_hook_host_calls':True,'user_bash_stream_host_calls':True,'user_bash_hook':True,'user_bash_operations_hook':True,'tool_hook_host_calls':True,'before_tool_host_calls':True,'tool_call_hook':True,'tool_result_hook':True,'text_result_v2':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    frame=json.loads(sys.stdin.readline()); r=frame['request']; kind=r['type']
+    assert frame['has_custom_messages']
+    print(json.dumps({'type':'send_message','delivery':'steer','message':{'customType':kind,'content':'hello','display':False}}),flush=True)
+    assert json.loads(sys.stdin.readline())=={'Ok':None}
+    if kind=='input': result={'action':'continue'}
+    elif kind=='before_request': result=r['request']
+    elif kind=='context_with_system': result=r['messages']
+    elif kind=='user_bash': result=None
+    elif kind=='user_bash_operations': result=False
+    elif kind=='execute_user_bash':
+        print(json.dumps({'type':'progress','partial_result':{'shellOutput':[111,107]}}),flush=True)
+        assert json.loads(sys.stdin.readline())=={'Ok':None}
+        result=0
+    elif kind=='discover_resources': result={'skillPaths':[],'promptPaths':['fixture.md'],'themePaths':[]}
+    elif kind=='before_session_transition': result=False
+    elif kind=='before_tree': result=None
+    elif kind=='before_summary_compaction': result={'cancel':False,'compaction':{'summary':'supplied','firstKeptEntry':1,'tokensBefore':2,'usage':None,'details':None}}
+    elif kind=='before_compaction': result=[r['summary'],r['keep_turns'],{'allow':True,'reason':None}]
+    elif kind=='after_compaction': result=None
+    elif kind=='before_tool': result={'allow':True,'reason':None}
+    elif kind=='tool_call': result=[r['arguments'],{'allow':True,'reason':None}]
+    elif kind=='tool_result': result=None
+    else: raise AssertionError(kind)
+    print(json.dumps({'type':'complete','response':{'Ok':result}}),flush=True)
+"##;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let host = Arc::new(Host(std::sync::atomic::AtomicUsize::new(0)));
+        let event = InputEvent {
+            text: "input".into(),
+            images: vec![],
+            source: pi_rs_core::InputSource::Interactive,
+            streaming_behavior: None,
+        };
+        assert!(matches!(
+            extension
+                .input_with_host(&event, None, host.clone())
+                .await
+                .unwrap(),
+            InputAction::Continue
+        ));
+        let mut request = ModelRequest {
+            model: "model".into(),
+            messages: vec![Message::User {
+                content: "hello".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 64,
+        };
+        extension
+            .before_request_with_host(
+                &mut pi_rs_core::ContextRequest::new(&mut request),
+                RequestPurpose::Turn,
+                None,
+                host.clone(),
+            )
+            .await
+            .unwrap();
+        extension
+            .context_with_system_with_host(
+                &mut pi_rs_core::ContextMessages::new(&mut request.messages),
+                None,
+                host.clone(),
+            )
+            .await
+            .unwrap();
+        let bash = pi_rs_core::UserBashEvent {
+            command: "echo hi".into(),
+            exclude_from_context: false,
+            cwd: "/workspace".into(),
+        };
+        assert!(
+            extension
+                .user_bash_with_host(&bash, None, host.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !extension
+                .user_bash_operations_with_host(&bash, None, host.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            extension
+                .before_tree_with_host(
+                    &TreePreparation {
+                        target_id: 3,
+                        old_leaf_id: 5,
+                        common_ancestor_id: Some(2),
+                        entries_to_summarize: Vec::new(),
+                        user_wants_summary: false,
+                        custom_instructions: None,
+                        replace_instructions: false,
+                        label: None,
+                    },
+                    None,
+                    &CancellationToken::new(),
+                    host.clone()
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (output, mut received) = tokio::sync::mpsc::channel(4);
+        assert_eq!(
+            extension
+                .execute_user_bash_with_host(
+                    &bash,
+                    None,
+                    None,
+                    CancellationToken::new(),
+                    output,
+                    host.clone()
+                )
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(received.recv().await.unwrap(), b"ok");
+        let discovered = extension
+            .discover_resources_with_host(
+                &pi_rs_core::ResourceDiscoveryEvent {
+                    cwd: "/workspace".into(),
+                    reason: pi_rs_core::ResourceDiscoveryReason::Startup,
+                },
+                None,
+                host.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            discovered.prompt_paths,
+            [std::path::PathBuf::from("fixture.md")]
+        );
+        assert!(
+            !extension
+                .before_session_transition_with_host(
+                    &pi_rs_core::BeforeSessionTransition::Fork {
+                        entry_id: 1,
+                        position: pi_rs_core::ForkPosition::At
+                    },
+                    None,
+                    host.clone()
+                )
+                .await
+                .unwrap()
+        );
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let mut args = serde_json::json!({});
+        assert_eq!(
+            extension
+                .before_tool_with_host("tool", &args, &context, None, host.clone())
+                .await
+                .unwrap(),
+            Decision::Allow
+        );
+        assert_eq!(
+            extension
+                .tool_call_with_host("tool", &mut args, &context, None, host.clone())
+                .await
+                .unwrap(),
+            Decision::Allow
+        );
+        let call = pi_rs_core::ToolCall {
+            id: "id".into(),
+            name: "tool".into(),
+            arguments: "{}".into(),
+        };
+        assert!(
+            extension
+                .tool_result_update_with_host(
+                    &call,
+                    &Outcome::Succeeded("ok".into()),
+                    &context,
+                    None,
+                    host.clone()
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let preparation = pi_rs_core::CompactionPreparation {
+            branch_entries: vec![],
+            first_kept_entry: Some(1),
+            tokens_before: 2,
+            reason: pi_rs_core::CompactionTrigger::Manual,
+            will_retry: false,
+            custom_instructions: None,
+        };
+        let supplied = extension
+            .before_summary_compaction(&preparation, None, host.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .compaction
+            .unwrap();
+        assert_eq!(supplied.summary, "supplied");
+        assert_eq!(supplied.first_kept_entry, Some(1));
+        let mut compaction = Compaction {
+            summary: "summary".into(),
+            keep_turns: 1,
+        };
+        assert_eq!(
+            extension
+                .before_compaction_with_host(&mut compaction, None, host.clone())
+                .await
+                .unwrap(),
+            Decision::Allow
+        );
+        assert!(
+            extension
+                .after_compaction_with_host(&compaction, None, host.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 15);
+    }
+
+    #[tokio::test]
+    async fn streamed_shell_dispatch_forwards_output_and_message_host_calls() {
+        struct Host(std::sync::Mutex<Vec<u8>>, std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_progress(&self) -> bool {
+                true
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+            async fn report_progress(&self, value: Value) -> ExtensionResult<()> {
+                self.0.lock().unwrap().extend(
+                    serde_json::from_value::<Vec<u8>>(value["shellOutput"].clone()).unwrap(),
+                );
+                Ok(())
+            }
+            async fn send_message(
+                &self,
+                _: pi_rs_core::CustomMessage,
+                _: pi_rs_core::CustomMessageDelivery,
+            ) -> ExtensionResult<()> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        struct Shell;
+        #[async_trait::async_trait]
+        impl Extension for Shell {
+            fn id(&self) -> &str {
+                "shell"
+            }
+            async fn execute_user_bash_with_host(
+                &self,
+                _: &pi_rs_core::UserBashEvent,
+                _: Option<&ExtensionState>,
+                _: Option<Duration>,
+                _: CancellationToken,
+                output: tokio::sync::mpsc::Sender<Vec<u8>>,
+                host: Arc<dyn ToolHost>,
+            ) -> ExtensionResult<Option<i32>> {
+                output.send(b"before".to_vec()).await.unwrap();
+                host.send_message(
+                    pi_rs_core::CustomMessage {
+                        custom_type: "shell".into(),
+                        content: pi_rs_core::ContextContent::Text("message".into()),
+                        display: false,
+                        details: None,
+                    },
+                    pi_rs_core::CustomMessageDelivery::NextTurn,
+                )
+                .await?;
+                output.send(b"after".to_vec()).await.unwrap();
+                Ok(Some(0))
+            }
+        }
+        let host = Arc::new(Host(
+            std::sync::Mutex::new(Vec::new()),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let result = dispatch_with_host(
+            Arc::new(Shell),
+            ProtocolRequest::ExecuteUserBash {
+                event: pi_rs_core::UserBashEvent {
+                    command: "echo".into(),
+                    exclude_from_context: false,
+                    cwd: "/".into(),
+                },
+                state: None,
+                timeout_secs: None,
+            },
+            host.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, serde_json::json!(0));
+        assert_eq!(&*host.0.lock().unwrap(), b"beforeafter");
+        assert_eq!(host.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn older_host_receives_legacy_result_from_new_extension() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "hook"
+            }
+            async fn tool_result_patch_v2(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<pi_rs_core::ToolResultPatchV2>> {
+                Ok(Some(pi_rs_core::ToolResultPatchV2 {
+                    output: Some("fixed".into()),
+                    details: Some(serde_json::json!({"code": 42})),
+                    is_error: Some(true),
+                }))
+            }
+        }
+        let raw = serde_json::json!({"type":"tool_result", "call":{"id":"id", "name":"tool", "arguments":"{}"}, "outcome":{"status":"failed","detail":"bad"}, "operation_id":"00000000-0000-4000-8000-000000000001", "state":null});
+        let request = serde_json::from_value(raw).unwrap();
+        let response = dispatch(Arc::new(Hook), request).await.unwrap();
+        assert_eq!(
+            serde_json::from_value::<Option<Outcome>>(response).unwrap(),
+            Some(Outcome::Failed("fixed".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiated_result_retains_presence_through_dispatch() {
+        struct Hook(bool);
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "hook"
+            }
+            async fn tool_result_patch_v2(
+                &self,
+                _: &pi_rs_core::ToolCall,
+                _: &Outcome,
+                _: &ToolContext,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<pi_rs_core::ToolResultPatchV2>> {
+                Ok(Some(pi_rs_core::ToolResultPatchV2 {
+                    output: self.0.then(|| "secret".into()),
+                    details: Some(serde_json::json!({"changed":true})),
+                    is_error: None,
+                }))
+            }
+        }
+        for replace in [false, true] {
+            let original = Outcome::TextResultWithStructuredContent {
+                output: "secret".into(),
+                details: None,
+                structured_content: serde_json::json!({"output":"secret"}),
+                is_error: false,
+            };
+            let response = dispatch(
+                Arc::new(Hook(replace)),
+                ProtocolRequest::ToolResult {
+                    call: pi_rs_core::ToolCall {
+                        id: "id".into(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    },
+                    outcome: original,
+                    operation_id: "00000000-0000-4000-8000-000000000001".into(),
+                    state: None,
+                    text_result_v2: true,
+                    presence_v1: false,
+                },
+            )
+            .await
+            .unwrap();
+            let outcome: Outcome = serde_json::from_value::<Option<Outcome>>(response)
+                .unwrap()
+                .unwrap();
+            if replace {
+                assert!(matches!(outcome, Outcome::TextResult { .. }));
+            } else {
+                assert!(
+                    matches!(outcome, Outcome::TextResultWithStructuredContent { details:Some(details), .. } if details["changed"] == true)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn duplex_presence_wrapper_preserves_complete_frame_boundary() {
+        let empty = Outcome::Succeeded(String::new());
+        let frame = |outcome: &Outcome| DuplexFrame::Complete {
+            response: Ok(serde_json::to_value(outcome).unwrap()),
+        };
+        let mut original = Vec::new();
+        duplex_write_line(&mut original, &frame(&empty)).unwrap();
+        let count = MAX_DUPLEX_MESSAGE as usize - original.len();
+        let outcome = Outcome::Succeeded("x".repeat(count));
+        original.clear();
+        duplex_write_line(&mut original, &frame(&outcome)).unwrap();
+        assert_eq!(original.len() as u64, MAX_DUPLEX_MESSAGE);
+        assert!(matches!(
+            read_duplex_frame(&mut std::io::Cursor::new(&original)),
+            Ok(DuplexFrame::Complete { .. })
+        ));
+        drop(original);
+
+        let response = Ok(serde_json::to_value(ToolResultPresence {
+            outcome: Some(outcome),
+            output_unchanged: Some(false),
+        })
+        .unwrap());
+        check_presence_response(&response, MAX_DUPLEX_MESSAGE, true, true).unwrap();
+        let wrapped = DuplexFrame::Complete { response };
+        assert!(duplex_write_line(&mut std::io::sink(), &wrapped).is_err());
+        let mut bytes = Vec::new();
+        write_bounded_line(
+            &mut bytes,
+            &wrapped,
+            MAX_DUPLEX_MESSAGE + PRESENCE_RESPONSE_OVERHEAD,
+        )
+        .unwrap();
+        assert_eq!(
+            bytes.len() as u64,
+            MAX_DUPLEX_MESSAGE + PRESENCE_RESPONSE_OVERHEAD
+        );
+        assert!(matches!(
+            read_duplex_frame_with_presence(&mut std::io::Cursor::new(&bytes), true),
+            Ok(DuplexFrame::Complete { .. })
+        ));
+        assert!(read_duplex_frame(&mut std::io::Cursor::new(&bytes)).is_err());
+        drop(bytes);
+        drop(wrapped);
+
+        // A shorter boolean wrapper must not admit a one-byte oversized outcome.
+        let oversized = Outcome::Succeeded("x".repeat(count + 1));
+        let response = Ok(serde_json::to_value(ToolResultPresence {
+            outcome: Some(oversized),
+            output_unchanged: Some(true),
+        })
+        .unwrap());
+        assert!(check_presence_response(&response, MAX_DUPLEX_MESSAGE, true, true).is_err());
+        let mut bytes = Vec::new();
+        write_bounded_line(
+            &mut bytes,
+            &DuplexFrame::Complete { response },
+            MAX_DUPLEX_MESSAGE + PRESENCE_RESPONSE_OVERHEAD,
+        )
+        .unwrap();
+        assert!(read_duplex_frame_with_presence(&mut std::io::Cursor::new(&bytes), true).is_err());
+        drop(bytes);
+
+        // The allowance never applies to progress or other nonterminal frames.
+        let empty_progress = DuplexFrame::Progress {
+            partial_result: serde_json::json!(""),
+        };
+        let mut bytes = Vec::new();
+        duplex_write_line(&mut bytes, &empty_progress).unwrap();
+        let progress_size = MAX_DUPLEX_MESSAGE as usize + 1 - bytes.len();
+        let frame = DuplexFrame::Progress {
+            partial_result: serde_json::json!("x".repeat(progress_size)),
+        };
+        bytes.clear();
+        write_bounded_line(
+            &mut bytes,
+            &frame,
+            MAX_DUPLEX_MESSAGE + PRESENCE_RESPONSE_OVERHEAD,
+        )
+        .unwrap();
+        assert!(read_duplex_frame_with_presence(&mut std::io::Cursor::new(&bytes), true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn single_shot_presence_wrapper_preserves_legacy_frame_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = r##"#!/usr/bin/env python3
+import json,sys,os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+presence=name.startswith('presence')
+def wire(v): return json.dumps({'version':1,'response':{'Ok':v}},separators=(',',':'))+'\n'
+if r['type']=='describe':
+    v={'id':name,'dependencies':[],'commands':[],'tools':[],'tool_result_hook':True,'text_result_v2':True,'result_presence_v1':presence}
+    print(wire(v),end='');sys.exit(0)
+outcome={'status':'succeeded','detail':''}
+n=4*1024*1024-len(wire(outcome))
+if name.endswith('_over') or name.endswith('_short'): n+=1
+outcome['detail']='x'*n
+assert len(wire(outcome))==4*1024*1024+(1 if name.endswith('_over') or name.endswith('_short') else 0)
+if presence:
+    assert r['presence_v1'] is True
+    v={'outcome':outcome,'output_unchanged':name.endswith('_short')}
+else:
+    assert 'presence_v1' not in r
+    v=outcome
+print(wire(v),end='')
+"##;
+        let call = pi_rs_core::ToolCall {
+            id: "id".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        for (name, accepted) in [
+            ("legacy", true),
+            ("legacy_over", false),
+            ("presence", true),
+            ("presence_over", false),
+            ("presence_short", false),
+        ] {
+            let path = root.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let ext = ExecutableExtension::load(path).unwrap();
+            let result = ext
+                .tool_result_update_with_presence(
+                    &call,
+                    &Outcome::Succeeded("same".into()),
+                    &context,
+                    None,
+                    None,
+                )
+                .await;
+            if accepted {
+                assert!(
+                    matches!(result, Ok((Some(Outcome::Succeeded(_)), _))),
+                    "{name}: {result:?}"
+                );
+            } else {
+                assert!(
+                    result.unwrap_err().contains("response exceeds 4 MiB"),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_presence_is_negotiated_and_legacy_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = r##"#!/usr/bin/env python3
+import json,sys,os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+if r['type']=='describe':
+    value={'id':name,'dependencies':[],'commands':[],'tools':[], 'tool_result_hook':True, 'text_result_v2':True, 'result_presence_v1':name!='legacy'}
+elif r['type']=='tool_result':
+    result={'status':'succeeded_with_details','detail':{'output':'same','details':{'patched':True}}}
+    if name=='legacy':
+        assert 'presence_v1' not in r
+        value=result
+    else:
+        assert r['presence_v1'] is True
+        value={'outcome':result,'output_unchanged':name=='metadata'}
+else: raise RuntimeError(r['type'])
+print(json.dumps({'version':1,'response':{'Ok':value}}))
+"##;
+        let call = pi_rs_core::ToolCall {
+            id: "id".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        for (name, expected) in [
+            ("legacy", None),
+            ("metadata", Some(true)),
+            ("same_output", Some(false)),
+        ] {
+            let path = root.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let ext = ExecutableExtension::load(path).unwrap();
+            let (outcome, presence) = ext
+                .tool_result_update_with_presence(
+                    &call,
+                    &Outcome::Succeeded("same".into()),
+                    &context,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, Some(Outcome::SucceededWithDetails { output, .. }) if output == "same")
+            );
+            assert_eq!(presence, expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_result_patch_chain_and_legacy_negotiation() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = r##"#!/usr/bin/env python3
+import json, sys, os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+if r['type']=='describe':
+    value={'id':name,'dependencies':[],'commands':[],'tools':[], 'tool_result_hook':True, 'text_result_v2':name!='legacy'}
+elif r['type']=='tool_result':
+    o=r['outcome']
+    if name=='first':
+        assert o['status']=='failed' and r['text_result_v2']
+        value={'status':'text_result','detail':{'output':'exact','details':{'code':42},'is_error':True}}
+    elif name=='second':
+        assert o['detail']=={'output':'legacy changed','details':{'code':42},'is_error':True}
+        value={'status':'text_result','detail':{'output':'legacy changed','details':{'code':42},'is_error':False}}
+    else:
+        assert o['status']=='failed' and o['detail']=='exact'
+        value={'status':'failed','detail':'legacy changed'}
+else:
+    raise RuntimeError(r['type'])
+print(json.dumps({'version':1,'response':{'Ok':value}}))
+"##;
+        let mut extensions = Vec::new();
+        for name in ["first", "legacy", "second"] {
+            let path = root.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            extensions.push(ExecutableExtension::load(path).unwrap());
+        }
+        let call = pi_rs_core::ToolCall {
+            id: "id".into(),
+            name: "tool".into(),
+            arguments: "{}".into(),
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let mut outcome = Outcome::Failed("original".into());
+        for ext in extensions {
+            outcome = ext
+                .tool_result_update(&call, &outcome, &context, None)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(outcome.tool_content(), "legacy changed");
+        assert!(!outcome.is_error());
+        assert!(
+            matches!(outcome, Outcome::TextResult { details: Some(details), .. } if details["code"] == 42)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn structured_result_negotiation_preserves_metadata_and_drops_replaced_content() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = r##"#!/usr/bin/env python3
+import json, sys, os
+r=json.load(sys.stdin)
+name=os.path.basename(sys.argv[0])
+if r['type']=='describe':
+    value={'id':name,'dependencies':[],'commands':[],'tools':[], 'tool_result_hook':True, 'text_result_v2':name.startswith('modern'), 'structured_text_result':name.startswith('modern')}
+elif r['type']=='tool_result':
+    o=r['outcome']
+    if name=='modern_metadata':
+        assert o['status']=='text_result_with_structured_content'
+        o['detail']['details']={'changed':True}
+        value=o
+    elif name=='modern_replace':
+        assert o['status']=='text_result_with_structured_content'
+        value={'status':'text_result','detail':{'output':o['detail']['output'],'details':None,'is_error':False}}
+    elif name=='legacy_metadata':
+        assert o['status']=='succeeded'
+        value={'status':'succeeded_with_details','detail':{'output':o['detail'],'details':{'changed':True}}}
+    else:
+        assert o['status']=='failed'
+        value={'status':'failed','detail':'redacted'}
+else: raise RuntimeError(r['type'])
+print(json.dumps({'version':1,'response':{'Ok':value}}))
+"##;
+        let call = pi_rs_core::ToolCall {
+            id: "id".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        for name in [
+            "modern_metadata",
+            "modern_replace",
+            "legacy_metadata",
+            "legacy_failed",
+        ] {
+            let path = root.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let ext = ExecutableExtension::load(path).unwrap();
+            let failure = name == "legacy_failed";
+            let original = Outcome::TextResultWithStructuredContent {
+                output: "secret".into(),
+                details: failure.then(|| serde_json::json!({"truncation":{"truncated":true}})),
+                structured_content: serde_json::json!({"output":"secret"}),
+                is_error: failure,
+            };
+            let updated = ext
+                .tool_result_update(&call, &original, &context, None)
+                .await
+                .unwrap()
+                .unwrap();
+            match name {
+                "modern_metadata" => assert!(
+                    matches!(updated, Outcome::TextResultWithStructuredContent { details:Some(details), structured_content, .. } if details["changed"] == true && structured_content["output"] == "secret")
+                ),
+                "modern_replace" => assert!(
+                    matches!(updated, Outcome::TextResult { output, .. } if output == "secret")
+                ),
+                "legacy_metadata" => assert!(
+                    matches!(updated, Outcome::SucceededWithDetails { details, .. } if details["changed"] == true)
+                ),
+                _ => assert!(
+                    matches!(updated, Outcome::TextResult { output, details:Some(details), is_error:true } if output == "redacted" && details["truncation"]["truncated"] == true)
+                ),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duplex_structured_result_accepts_escaped_shell_output() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host;
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_custom_messages(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                Outcome::Skipped("unused".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    d={'id':'test','dependencies':[],'commands':[],'tools':[], 'tool_result_hook':True, 'tool_hook_host_calls':True, 'text_result_v2':True, 'structured_text_result':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    request=json.loads(sys.stdin.readline())['request']
+    outcome=request['outcome']
+    assert len(outcome['detail']['structured_content']['output']) == 1024 * 1024
+    assert outcome['detail']['structured_content']['output'] == '\0' * (1024 * 1024)
+    print(json.dumps({'type':'complete','response':{'Ok':outcome}}),flush=True)
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let call = pi_rs_core::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let outcome = Outcome::TextResultWithStructuredContent {
+            output: "display".into(),
+            details: None,
+            structured_content: serde_json::json!({"output":"\0".repeat(1024 * 1024)}),
+            is_error: false,
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let returned = extension
+            .tool_result_update_with_host(&call, &outcome, &context, None, Arc::new(Host))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(returned, outcome);
+    }
+
+    #[test]
+    fn duplex_frame_limit_is_symmetric_and_bounded() {
+        let value = "\0".repeat(1024 * 1024);
+        let mut frame = Vec::new();
+        duplex_write_line(&mut frame, &value).unwrap();
+        assert!(frame.len() > MAX_MESSAGE as usize);
+        assert_eq!(
+            duplex_read_line::<String>(&mut std::io::Cursor::new(&frame)).unwrap(),
+            value
+        );
+        assert!(read_line::<String>(&mut std::io::Cursor::new(&frame)).is_err());
+        let oversized = "x".repeat(MAX_DUPLEX_MESSAGE as usize);
+        assert!(
+            duplex_write_line(&mut Vec::new(), &oversized)
+                .unwrap_err()
+                .contains("16 MiB")
+        );
+        let oversized_frame = vec![b'x'; MAX_DUPLEX_MESSAGE as usize + 1];
+        assert!(
+            duplex_read_line::<Value>(&mut std::io::Cursor::new(oversized_frame))
+                .unwrap_err()
+                .contains("16 MiB")
+        );
+    }
+
+    #[test]
+    fn duplex_batch_checks_count_before_materializing_arguments() {
+        let call = r#"["tool",{}]"#;
+        let valid = format!(
+            "{{\"calls\":[{}],\"type\":\"call\"}}\n",
+            vec![call; 4096].join(",")
+        );
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(valid)), Ok(DuplexFrame::CheckedCall { calls }) if calls.len() == 4096)
+        );
+        let invalid = format!(
+            "{{\"calls\":[{},[\"tool\",[{}]]],\"type\":\"call\"}}\n",
+            vec![call; 4096].join(","),
+            vec!["{}"; 100_000].join(",")
+        );
+        let error = match read_duplex_frame(&mut std::io::Cursor::new(invalid)) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized batch accepted"),
+        };
+        assert!(error.contains("batch exceeds execution limit"));
+    }
+
+    #[test]
+    fn duplex_preflight_bounds_compact_arguments_before_materialization() {
+        let at_limit = format!("\"{}\"", "x".repeat(MAX_NESTED_ARGUMENT_BYTES - 2));
+        let frame = format!(
+            "{{\"calls\":[[\"first\",{{\"a\":1}}],[\"limit\",{at_limit}],[\"last\",[true,null]]],\"type\":\"call\"}}\n"
+        );
+        let parsed = read_duplex_frame(&mut std::io::Cursor::new(frame))
+            .unwrap_or_else(|error| panic!("valid batch rejected: {error}"));
+        assert!(
+            matches!(parsed, DuplexFrame::CheckedCall { calls } if calls.len() == 3 && calls[0].1.as_ref().unwrap()["a"] == 1 && calls[1].1.as_ref().unwrap().as_str().unwrap().len() == MAX_NESTED_ARGUMENT_BYTES - 2 && calls[2].1 == Some(serde_json::json!([true,null])))
+        );
+        let over_limit = format!("\"{}\"", "x".repeat(MAX_NESTED_ARGUMENT_BYTES - 1));
+        let frame = format!("{{\"type\":\"call\",\"calls\":[[\"large\",{over_limit}]]}}\n");
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls[0].1.is_none())
+        );
+        let structured = format!("[{}{{}}]", "{},".repeat(2_000_000));
+        assert!(structured.len() > MAX_NESTED_ARGUMENT_BYTES);
+        let frame = format!("{{\"calls\":[[\"large\",{structured}]],\"type\":\"call\"}}\n");
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls.len()==1 && calls[0].1.is_none())
+        );
+        let escaped = format!("\"{}\"", "\\u0061".repeat(200_000));
+        let whitespace = format!("[{}1]", " ".repeat(MAX_NESTED_ARGUMENT_BYTES));
+        let frame = format!(
+            "{{\"type\":\"call\",\"calls\":[[\"escaped\",{escaped}],[\"space\",{whitespace}]]}}\n"
+        );
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls[0].1.as_ref().unwrap().as_str().unwrap().len() == 200_000 && calls[1].1 == Some(serde_json::json!([1])))
+        );
+        let discarded = format!("{{\"x\":[{}{{}}],\"x\":0}}", "{},".repeat(500_000));
+        let frame = format!("{{\"type\":\"call\",\"calls\":[[\"duplicate\",{discarded}]]}}\n");
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls[0].1 == Some(serde_json::json!({"x":0})))
+        );
+    }
+
+    #[test]
+    fn duplex_prevalidated_positions_keep_null_arguments_distinct() {
+        let (calls, rejected) = wire_prevalidated_calls(vec![
+            ("null".into(), Some(Value::Null)),
+            ("oversized".into(), None),
+            ("after".into(), Some(serde_json::json!({}))),
+        ]);
+        let mut frame = Vec::new();
+        duplex_write_line(&mut frame, &DuplexFrame::Call { calls, rejected }).unwrap();
+        assert!(
+            matches!(read_duplex_frame(&mut std::io::Cursor::new(frame)), Ok(DuplexFrame::CheckedCall { calls }) if calls[0].1 == Some(Value::Null) && calls[1].1.is_none() && calls[2].1 == Some(serde_json::json!({})))
+        );
+        for rejected in ["[1,1]", "[2,1]", "[3]"] {
+            let frame = format!(
+                "{{\"type\":\"call\",\"calls\":[[\"a\",null],[\"b\",null],[\"c\",null]],\"rejected\":{rejected}}}"
+            );
+            assert!(read_duplex_frame(&mut std::io::Cursor::new(frame)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn old_duplex_peer_fails_mixed_prevalidated_batch_closed() {
+        let mut host = RemoteHost {
+            tools: vec![],
+            has_ui: false,
+            has_progress: false,
+            has_custom_messages: false,
+            has_custom_entries: false,
+            has_custom_entry_read: false,
+            entry_lifetime: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            entry_waiting: None,
+            has_keyed_messages: false,
+            has_prevalidated_calls: false,
+            io: Arc::new(std::sync::Mutex::new((
+                std::io::BufReader::new(std::io::stdin()),
+                std::io::stdout(),
+            ))),
+        };
+        assert!(!host.supports_prevalidated_call_accounting());
+        host.has_custom_entries = true;
+        host.entry_lifetime
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(!host.supports_custom_entries());
+        assert!(
+            host.append_entry(pi_rs_core::CustomEntry {
+                custom_type: "late".into(),
+                data: None
+            })
+            .await
+            .is_err()
+        );
+        host.has_prevalidated_calls = true;
+        assert!(host.supports_prevalidated_call_accounting());
+        host.has_prevalidated_calls = false;
+        let results = host
+            .call_batch_prevalidated(vec![
+                ("large".into(), None),
+                ("valid".into(), Some(Value::Null)),
+            ])
+            .await;
+        assert_eq!(
+            results,
+            vec![Outcome::Skipped("host cannot account for prevalidated calls".into()); 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn executable_entry_waiting_for_transport_is_rejected_after_callback() {
+        let (waiting, seen_waiting) = std::sync::mpsc::channel();
+        let host = Arc::new(RemoteHost {
+            tools: vec![],
+            has_ui: false,
+            has_progress: false,
+            has_custom_messages: false,
+            has_custom_entries: true,
+            has_custom_entry_read: true,
+            entry_lifetime: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            entry_waiting: Some(waiting),
+            has_keyed_messages: false,
+            has_prevalidated_calls: false,
+            io: Arc::new(std::sync::Mutex::new((
+                std::io::BufReader::new(std::io::stdin()),
+                std::io::stdout(),
+            ))),
+        });
+        let (locked, acquired) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn({
+            let io = host.io.clone();
+            move || {
+                let _guard = io.lock().unwrap();
+                let _ = locked.send(());
+                let _ = released.recv();
+            }
+        });
+        acquired.await.unwrap();
+        let pending = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.append_entry(pi_rs_core::CustomEntry {
+                    custom_type: "late".into(),
+                    data: None,
+                })
+                .await
+            }
+        });
+        tokio::task::spawn_blocking(move || seen_waiting.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .unwrap();
+        host.close_custom_entry_scope();
+        release.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        holder.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duplex_batch_skips_only_oversized_call_and_preserves_order() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Host(std::sync::Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl ToolHost for Host {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_prevalidated_call_accounting(&self) -> bool {
+                true
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                self.0.lock().unwrap().push(name.into());
+                Outcome::Succeeded(name.into())
+            }
+            async fn call_batch_prevalidated(
+                &self,
+                calls: Vec<(String, Option<Value>)>,
+            ) -> Vec<Outcome> {
+                let mut outputs = Vec::new();
+                for (name, value) in calls {
+                    outputs.push(if let Some(value) = value {
+                        self.call(&name, value).await
+                    } else {
+                        Outcome::Skipped("nested tool arguments exceed size limit".into())
+                    });
+                }
+                outputs
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json,sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    d={'id':'fixture','dependencies':[],'commands':[],'tools':[{'spec':{'name':'outer','description':'test','parameters':{'type':'object'}},'execution':'sequential','transactional':True}], 'host_calls':True, 'text_result_v2':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    assert json.loads(sys.stdin.readline())['has_prevalidated_calls'] is True
+    print(json.dumps({'type':'call','calls':[['first',{}],['too_large',[{}]*400000],['last',{}]]},separators=(',',':')),flush=True)
+    values=json.loads(sys.stdin.readline())
+    assert [v['status'] for v in values] == ['succeeded','skipped','succeeded']
+    assert values[0]['detail']=='first' and values[2]['detail']=='last'
+    assert values[1]['detail']=='nested tool arguments exceed size limit'
+    print(json.dumps({'type':'complete','response':{'Ok':{'outcome':{'status':'succeeded','detail':'done'}}}}),flush=True)
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let tool = extension.tools().pop().unwrap();
+        let host = Arc::new(Host(std::sync::Mutex::new(Vec::new())));
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let outcome = tool
+            .invoke_transaction(serde_json::json!({}), context, None, host.clone())
+            .await
+            .outcome;
+        assert_eq!(outcome, Outcome::Succeeded("done".into()));
+        assert_eq!(*host.0.lock().unwrap(), vec!["first", "last"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duplex_default_custom_host_does_not_advertise_or_bypass_accounting() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct DefaultHost(AtomicUsize);
+        #[async_trait::async_trait]
+        impl ToolHost for DefaultHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Outcome::Succeeded(name.into())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json,sys
+if '--pi-rs-extension-v1' in sys.argv:
+    json.load(sys.stdin)
+    d={'id':'fixture','dependencies':[],'commands':[],'tools':[{'spec':{'name':'outer','description':'test','parameters':{'type':'object'}},'execution':'sequential','transactional':True}],'host_calls':True,'text_result_v2':True}
+    print(json.dumps({'version':1,'response':{'Ok':d}}))
+else:
+    assert json.loads(sys.stdin.readline())['has_prevalidated_calls'] is False
+    print(json.dumps({'type':'call','calls':[['valid',{}]]}),flush=True)
+    assert json.loads(sys.stdin.readline())[0]['detail']=='valid'
+    print(json.dumps({'type':'call','calls':[['large',[{}]*400000],['not-dispatched',{}]]},separators=(',',':')),flush=True)
+    values=json.loads(sys.stdin.readline())
+    assert len(values)==2 and all(v['status']=='skipped' and v['detail']=='host cannot account for prevalidated calls' for v in values)
+    print(json.dumps({'type':'call','calls':[['large',None],['not-dispatched',{}]],'rejected':[0]}),flush=True)
+    values=json.loads(sys.stdin.readline())
+    assert len(values)==2 and all(v['status']=='skipped' and v['detail']=='host cannot account for prevalidated calls' for v in values)
+    print(json.dumps({'type':'complete','response':{'Ok':{'outcome':{'status':'succeeded','detail':'done'}}}}),flush=True)
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let tool = extension.tools().pop().unwrap();
+        let host = Arc::new(DefaultHost(AtomicUsize::new(0)));
+        assert!(!host.supports_prevalidated_call_accounting());
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let wrapper = Arc::new(ShellProgressHost {
+            inner: host.clone(),
+            output,
+        });
+        assert!(!wrapper.supports_prevalidated_call_accounting());
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let outcome = tool
+            .invoke_transaction(serde_json::json!({}), context, None, wrapper.clone())
+            .await
+            .outcome;
+        assert_eq!(outcome, Outcome::Succeeded("done".into()));
+        assert_eq!(host.0.load(Ordering::SeqCst), 1);
+        let calls = vec![
+            ("large".into(), None),
+            ("valid".into(), Some(serde_json::json!({}))),
+        ];
+        let denied = vec![Outcome::Skipped("host cannot account for prevalidated calls".into()); 2];
+        assert_eq!(host.call_batch_prevalidated(calls.clone()).await, denied);
+        assert_eq!(wrapper.call_batch_prevalidated(calls).await, denied);
+        assert_eq!(host.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shell_progress_wrapper_forwards_prevalidated_calls_and_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Budgeted {
+            attempts: AtomicUsize,
+            dispatched: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl ToolHost for Budgeted {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            fn supports_prevalidated_call_accounting(&self) -> bool {
+                true
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                panic!("batch must be forwarded")
+            }
+            async fn call_batch_prevalidated(
+                &self,
+                calls: Vec<(String, Option<Value>)>,
+            ) -> Vec<Outcome> {
+                calls
+                    .into_iter()
+                    .map(|(name, args)| {
+                        if self.attempts.fetch_add(1, Ordering::Relaxed) >= 4096 {
+                            Outcome::Skipped("nested tool execution limit reached".into())
+                        } else if args.is_none() {
+                            Outcome::Skipped("nested tool arguments exceed size limit".into())
+                        } else {
+                            self.dispatched.lock().unwrap().push(name.clone());
+                            Outcome::Succeeded(name)
+                        }
+                    })
+                    .collect()
+            }
+        }
+        let inner = Arc::new(Budgeted {
+            attempts: AtomicUsize::new(4094),
+            dispatched: std::sync::Mutex::new(Vec::new()),
+        });
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let wrapper = ShellProgressHost {
+            inner: inner.clone(),
+            output,
+        };
+        assert!(wrapper.supports_prevalidated_call_accounting());
+        let result = wrapper
+            .call_batch_prevalidated(vec![
+                ("large".into(), None),
+                ("valid".into(), Some(serde_json::json!({}))),
+                ("over-budget".into(), Some(serde_json::json!({}))),
+            ])
+            .await;
+        assert_eq!(
+            result,
+            vec![
+                Outcome::Skipped("nested tool arguments exceed size limit".into()),
+                Outcome::Succeeded("valid".into()),
+                Outcome::Skipped("nested tool execution limit reached".into())
+            ]
+        );
+        assert_eq!(*inner.dispatched.lock().unwrap(), vec!["valid"]);
+        assert_eq!(inner.attempts.load(Ordering::Relaxed), 4097);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonduplex_structured_result_accepts_escaped_shell_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json, sys
+r=json.load(sys.stdin)
+if r['type']=='describe':
+    value={'id':'test','dependencies':[],'commands':[],'tools':[], 'tool_result_hook':True, 'text_result_v2':True, 'structured_text_result':True}
+else:
+    value=r['outcome']
+    assert len(value['detail']['structured_content']['output']) == 1024 * 1024
+    value['detail']['details']={'updated':True}
+print(json.dumps({'version':1,'response':{'Ok':value}}))
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let call = pi_rs_core::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let outcome = Outcome::TextResultWithStructuredContent {
+            output: "display".into(),
+            details: None,
+            structured_content: serde_json::json!({"output":"\0".repeat(1024 * 1024)}),
+            is_error: false,
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let returned = extension
+            .tool_result_update(&call, &outcome, &context, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(returned, Outcome::TextResultWithStructuredContent { details:Some(details), structured_content, .. } if details["updated"] == true && structured_content["output"].as_str().unwrap().len() == 1024 * 1024)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonduplex_unnegotiated_oversize_response_fails_without_waiting_for_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extension");
+        let script = r##"#!/usr/bin/env python3
+import json, sys, time
+r=json.load(sys.stdin)
+if r['type']=='describe':
+    print(json.dumps({'version':1,'response':{'Ok':{'id':'old','dependencies':[],'commands':[],'tools':[],'tool_result_hook':True}}}))
+else:
+    sys.stdout.write('x' * (5 * 1024 * 1024))
+    sys.stdout.flush()
+    time.sleep(20)
+"##;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let extension = ExecutableExtension::load(path).unwrap();
+        let call = pi_rs_core::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let context = ToolContext {
+            operation_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            cancellation: CancellationToken::new(),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            extension.tool_result_update(&call, &Outcome::Succeeded("ok".into()), &context, None),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().contains("response exceeds 4 MiB"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn classified_command_protocol_preserves_relay_and_legacy_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        for classified in [false, true] {
+            let path = root
+                .path()
+                .join(if classified { "new.py" } else { "old.py" });
+            let script = format!(
+                r##"#!/usr/bin/env python3
+import json,sys
+r=json.load(sys.stdin)
+if r['type']=='describe':
+ result={{'Ok':{{'id':'relay','dependencies':[],'commands':['callback','transport'],'tools':[],'command_effects':True,'command_failure_classification_v1':{}}}}}
+elif r['type']=='command_effects_classified_v1':
+ result={{'Ok':{{'Err':{{'Callback' if r['name']=='callback' else 'Transport':'failure'}}}}}}
+elif r['type']=='command_effects': result={{'Err':'legacy failure'}}
+else: result={{'Ok':None}}
+print(json.dumps({{'version':1,'response':result}}))
+"##,
+                if classified { "True" } else { "False" }
+            );
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let executable: Arc<dyn Extension> = Arc::new(ExecutableExtension::load(path).unwrap());
+            assert_eq!(
+                executable
+                    .command_effects("callback", "", None)
+                    .unwrap_err(),
+                "legacy failure"
+            );
+            for name in ["callback", "transport"] {
+                let request = ProtocolRequest::CommandEffectsClassifiedV1 {
+                    name: name.into(),
+                    arguments: String::new(),
+                    state: None,
+                };
+                let response = dispatch(executable.clone(), request).await.unwrap();
+                let kind = if classified && name == "callback" {
+                    "Callback"
+                } else {
+                    "Transport"
+                };
+                assert!(response["Err"][kind].is_string(), "{response}");
+            }
+            let unknown = dispatch(
+                executable,
+                ProtocolRequest::CommandEffectsClassifiedV1 {
+                    name: "unknown".into(),
+                    arguments: String::new(),
+                    state: None,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(unknown, "unknown extension command");
+        }
     }
 
     #[tokio::test]
@@ -2257,6 +8866,7 @@ mod tests {
         .unwrap();
         assert!(!descriptor.command_entries);
         assert!(!descriptor.command_effects);
+        assert!(!descriptor.command_failure_classification_v1);
         assert!(!descriptor.cache_warming_hook);
         assert!(!descriptor.session_lifecycle_hook);
         assert!(!descriptor.session_transition_reasons);
@@ -2534,15 +9144,15 @@ mod tests {
             }
             async fn context_with_system(
                 &self,
-                messages: &mut Vec<Message>,
+                messages: &mut pi_rs_core::ContextMessages<'_>,
                 state: Option<&ExtensionState>,
-            ) -> ExtensionResult<()> {
+            ) -> ExtensionResult<pi_rs_core::ContextChange> {
                 assert_eq!(state.unwrap().data["value"], "saved");
                 assert!(matches!(messages.first(), Some(Message::System { .. })));
                 messages.push(Message::User {
                     content: "added".into(),
                 });
-                Ok(())
+                Ok(pi_rs_core::ContextChange::Changed)
             }
         }
         let runtime = tokio::runtime::Builder::new_current_thread()

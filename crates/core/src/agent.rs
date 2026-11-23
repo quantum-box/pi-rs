@@ -1,4 +1,9 @@
-use std::collections::{HashSet, VecDeque};
+mod display_layout;
+use crate::runtime::time as platform_time;
+#[path = "turn_scheduler.rs"]
+mod turn_scheduler;
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -13,12 +18,95 @@ use uuid::Uuid;
 use crate::extension::{RegisteredTool, hook};
 use crate::journal::{conversation_entries, ensure_settled};
 use crate::{
-    AgentInput, CancellationToken, Compaction, Decision, Error, Event, ExtensionStates, InputKind,
-    Invocation, Message, Model, ModelEvent, ModelFailure, ModelMetadata, ModelRequest,
-    OperationState, Outcome, QueuedMessage, Record, RecordedReply, Registry, RequestPurpose,
-    Result, RunState, Session, ToolContext, ToolExecution, ToolHost, ToolReply, ToolSpec, Usage,
-    UsageReport,
+    AgentInput, CancellationToken, Compaction, Decision, EnrichedModelEvent, Error, Event,
+    ExtensionStates, InputKind, Invocation, Message, Model, ModelEvent, ModelFailure,
+    ModelMetadata, ModelRequest, OperationState, Outcome, QueuedMessage, Record, RecordedReply,
+    Registry, RequestPurpose, Result, RunState, Session, ToolContext, ToolExecution, ToolHost,
+    ToolReply, ToolSpec, Usage, UsageReport,
 };
+
+/// A command callback failure is separate from host and session failures.
+#[derive(Debug)]
+pub enum CommandDispatchError {
+    Callback { id: String, message: String },
+    Other(Error),
+}
+
+impl From<Error> for CommandDispatchError {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl CommandDispatchError {
+    fn into_error(self) -> Error {
+        match self {
+            Self::Callback { id, message } => Error::Extension { id, message },
+            Self::Other(error) => error,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CommandInvocation {
+    Host,
+    Trigger,
+    Rpc,
+}
+
+// Provider replay may contain private thinking and opaque signatures. Hooks and
+// observers receive portable messages; only unchanged messages regain replay.
+fn portable_request(request: &ModelRequest) -> ModelRequest {
+    let mut portable = request.clone();
+    for message in &mut portable.messages {
+        if let Message::Assistant { replay, .. } = message {
+            *replay = None;
+        }
+    }
+    portable
+}
+
+// Only used when the host-controlled wrapper never exposed mutable assistant
+// messages or the message container to the hook.
+fn retain_replay_after_safe_hook(
+    original: &ModelRequest,
+    updated: &mut ModelRequest,
+    edits: &[crate::ContextUserEdit],
+) {
+    let mut mapping: Vec<Option<usize>> = (0..original.messages.len()).map(Some).collect();
+    for edit in edits {
+        match edit {
+            crate::ContextUserEdit::Insert { index, .. } if *index <= mapping.len() => {
+                mapping.insert(*index, None)
+            }
+            crate::ContextUserEdit::Remove { index } if *index < mapping.len() => {
+                mapping.remove(*index);
+            }
+            _ => return,
+        }
+    }
+    if mapping.len() != updated.messages.len() {
+        return;
+    }
+    for (source, after) in mapping.iter().zip(&updated.messages) {
+        if let Some(index) = source
+            && let Message::Assistant { content, calls, .. } = &original.messages[*index]
+            && !matches!(after, Message::Assistant { content: other, calls: other_calls, .. } if content == other && calls == other_calls)
+        {
+            return;
+        }
+    }
+    for (source, after) in mapping.into_iter().zip(&mut updated.messages) {
+        if let Some(index) = source
+            && let (
+                Message::Assistant { replay: source, .. },
+                Message::Assistant { replay: target, .. },
+            ) = (&original.messages[index], after)
+        {
+            *target = source.clone();
+        }
+    }
+}
 
 /// Shared switch checked before each automatic context compaction.
 #[derive(Clone, Debug)]
@@ -92,6 +180,9 @@ pub struct Limits {
     pub tool_timeout: Duration,
     /// Explicit input/output context capacity. Otherwise use provider discovery when available.
     pub context_window: Option<u32>,
+    /// Per-run compaction settings, used for a recovered model handoff.
+    /// None follows the session's live compaction control.
+    pub compaction_tokens: Option<CompactionTokens>,
 }
 
 impl Default for Limits {
@@ -103,6 +194,7 @@ impl Default for Limits {
             model_timeout: Duration::from_secs(120),
             tool_timeout: Duration::from_secs(30),
             context_window: None,
+            compaction_tokens: None,
         }
     }
 }
@@ -115,15 +207,60 @@ pub struct Agent<'a> {
     pub limits: Limits,
 }
 
+/// Runtime registry selection point. These snapshots do not grant access to tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolInventoryPhase {
+    /// Registry selected before request hooks prepare a new model request.
+    RequestPreparation,
+    /// Registry selected for dispatch after any dispatch-time refresh.
+    Dispatch,
+}
+
+/// Progress of an automatic threshold or overflow summary.
+pub enum AutoCompactionUpdate {
+    Started,
+    Completed {
+        compaction_entry: Box<Record>,
+        details: Option<serde_json::Value>,
+        estimated_tokens_after: u64,
+        will_retry: bool,
+    },
+    Failed {
+        aborted: bool,
+        error_message: Option<String>,
+    },
+}
+
 pub enum Notification<'a> {
+    RunStarted {
+        run_id: Uuid,
+    },
+    RunEnded {
+        run_id: Uuid,
+        succeeded: bool,
+        error: Option<&'a str>,
+    },
     Retry(crate::RetryEvent),
     Committed(&'a Record),
+    /// The session switched branch; replace host hook state. May contain private extension data.
+    BranchState(&'a ExtensionStates),
     /// The following model request generates a compaction summary.
     SummaryRequest,
     /// Current queued text after a message was added, accepted, or cleared.
     QueueUpdated {
         steering: Vec<&'a str>,
         follow_up: Vec<&'a str>,
+    },
+    /// Registry selected at a runtime boundary; may include private source paths.
+    ToolInventory {
+        run_id: Uuid,
+        phase: ToolInventoryPhase,
+        registry: &'a Registry,
+    },
+    /// Selected runtime prompt and registry before request-specific hooks.
+    ModelContext {
+        system_prompt: &'a str,
+        registry: &'a Registry,
     },
     /// Final logical context after extensions, before provider encoding. May contain sensitive data.
     Request(&'a ModelRequest),
@@ -133,6 +270,8 @@ pub enum Notification<'a> {
     Reasoning(&'a str),
     /// Transient tool call fragments. Tool dispatch uses only the completed response.
     ToolCallDelta(&'a crate::ToolCallDelta),
+    /// A transient tool update, or a start when the host enables tool attempts.
+    ToolProgress(&'a crate::LifecycleEvent),
     /// A non-fatal failure in an observing extension hook.
     ExtensionLifecycleError {
         extension: &'a str,
@@ -142,6 +281,152 @@ pub enum Notification<'a> {
 }
 
 pub type Observer<'a> = dyn for<'event> FnMut(Notification<'event>) + Send + 'a;
+
+/// An ordered agent notification or a provider reasoning item event.
+/// Reasoning item events are transient and are not journal records.
+pub enum AgentEvent<'a> {
+    Notification(Notification<'a>),
+    AutoCompaction {
+        reason: crate::CompactionTrigger,
+        update: &'a AutoCompactionUpdate,
+    },
+    TextStart {
+        index: u64,
+    },
+    TextDelta {
+        index: u64,
+        delta: &'a str,
+    },
+    TextEnd {
+        index: u64,
+        content: &'a str,
+    },
+    ReasoningStart {
+        index: u64,
+    },
+    ReasoningDelta {
+        index: u64,
+        delta: &'a str,
+    },
+    ReasoningEnd {
+        index: u64,
+        content: &'a str,
+    },
+}
+
+pub type AgentObserver<'a> = dyn for<'event> FnMut(AgentEvent<'event>) + Send + 'a;
+
+// The metadata is scoped to the synchronous call, never across an await. The
+// internal adapter preserves all non-reasoning notifications and their order.
+fn dispatch_agent_event(event: Notification<'_>, observer: &mut AgentObserver<'_>) {
+    if matches!(event, Notification::SummaryRequest)
+        && let Some((reason, update)) =
+            AUTO_COMPACTION_EVENT.with(|stack| stack.borrow().last().cloned())
+    {
+        observer(AgentEvent::AutoCompaction {
+            reason,
+            update: &update,
+        });
+        return;
+    }
+    if let Notification::Text(delta) = &event {
+        match text_event_metadata() {
+            Some(TextEventMetadata::Start { index }) => {
+                observer(AgentEvent::TextStart { index });
+                return;
+            }
+            Some(TextEventMetadata::Delta { index }) => {
+                observer(AgentEvent::TextDelta { index, delta });
+                return;
+            }
+            Some(TextEventMetadata::End { index, content }) => {
+                observer(AgentEvent::TextEnd {
+                    index,
+                    content: &content,
+                });
+                return;
+            }
+            None => {}
+        }
+    }
+    if let Notification::Reasoning(delta) = &event {
+        match reasoning_event_metadata() {
+            Some(ReasoningEventMetadata::Start { index }) => {
+                observer(AgentEvent::ReasoningStart { index });
+                return;
+            }
+            Some(ReasoningEventMetadata::Delta { index }) => {
+                observer(AgentEvent::ReasoningDelta { index, delta });
+                return;
+            }
+            Some(ReasoningEventMetadata::End { index, content }) => {
+                observer(AgentEvent::ReasoningEnd {
+                    index,
+                    content: &content,
+                });
+                return;
+            }
+            None => {}
+        }
+    }
+    observer(AgentEvent::Notification(event));
+}
+
+fn dispatch_legacy_event(event: Notification<'_>, observer: &mut Observer<'_>) {
+    if matches!(event, Notification::SummaryRequest)
+        && AUTO_COMPACTION_EVENT.with(|stack| !stack.borrow().is_empty())
+    {
+        return;
+    }
+    if matches!(&event, Notification::Text(_))
+        && matches!(
+            text_event_metadata(),
+            Some(TextEventMetadata::Start { .. } | TextEventMetadata::End { .. })
+        )
+    {
+        return;
+    }
+    if matches!(&event, Notification::Reasoning(_))
+        && matches!(
+            reasoning_event_metadata(),
+            Some(ReasoningEventMetadata::Start { .. } | ReasoningEventMetadata::End { .. })
+        )
+    {
+        return;
+    }
+    observer(event);
+}
+
+struct DriveStart {
+    input: Option<(Uuid, String)>,
+    force_request: bool,
+    settled_previous_pass: bool,
+    in_process_continuation: bool,
+    check_turn_continuation: bool,
+}
+
+fn run_state(result: &Result<String>) -> RunState {
+    match result {
+        Ok(_) => RunState::Completed,
+        Err(Error::Cancelled) => RunState::Cancelled,
+        Err(Error::Reconciliation(_)) => RunState::WaitingForReconciliation,
+        Err(Error::PendingOperation(_)) => RunState::WaitingForOperation,
+        Err(_) => RunState::Failed,
+    }
+}
+
+fn finish_tree_handoff(
+    session: &mut Session,
+    return_to: u64,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
+    observer(Notification::Committed(
+        session.finish_tree_trigger_handoff(return_to)?,
+    ));
+    let states = session.extension_states();
+    observer(Notification::BranchState(&states));
+    Ok(())
+}
 
 /// Options for a model-generated branch summary when navigating the tree.
 #[derive(Clone, Copy, Debug)]
@@ -158,7 +443,41 @@ pub struct TreeNavigationOptions<'a> {
     pub label: Option<&'a str>,
 }
 
+pub(crate) struct TreeModelResolution {
+    pub provider: String,
+    pub model: String,
+    pub client: Arc<dyn Model>,
+    pub fallback: bool,
+    pub require_existing: bool,
+    pub legacy: bool,
+    pub revoked: Arc<std::sync::atomic::AtomicBool>,
+}
+
 impl Agent<'_> {
+    pub(crate) async fn settle_recovery_before_hooks(
+        &self,
+        session: &Session,
+        run_id: Uuid,
+    ) -> Result<()> {
+        self.settle_recorded_recovery(durable_recovery_usage(session, run_id))
+            .await
+    }
+
+    async fn settle_recorded_recovery(
+        &self,
+        records: Vec<(Uuid, UsageReport, ModelMetadata)>,
+    ) -> Result<()> {
+        for (id, usage, metadata) in records {
+            self.settle_usage(id, &usage, &metadata).await?;
+        }
+        Ok(())
+    }
+    fn compaction_tokens(&self, session: &Session) -> CompactionTokens {
+        self.limits
+            .compaction_tokens
+            .unwrap_or_else(|| session.auto_compaction_control().token_settings())
+    }
+
     /// A fresh prompt appends a user message. Resume starts from the existing branch.
     /// Follow-ups are consumed at safe boundaries, in FIFO order. The sender owns
     /// any input left in the receiver when this call returns.
@@ -180,13 +499,59 @@ impl Agent<'_> {
         session: &mut Session,
         observer: &mut Observer<'_>,
     ) -> Result<bool> {
+        if resumable_compaction_run(session).is_some() {
+            return Err(Error::Session(
+                "pending compaction recovery must be resumed before applying queued input".into(),
+            ));
+        }
         ensure_settled(session.operations())?;
         apply_inputs(session, true, observer)
     }
 
     /// A repeated initial submission never starts a second run. Passing no
     /// input is an explicit resume request authorized by the host.
+    /// Run with explicit, ordered reasoning item events.
+    pub async fn run_with_events(
+        &self,
+        session: &mut Session,
+        input: Option<String>,
+        followups: &mut mpsc::Receiver<String>,
+        cancel: &CancellationToken,
+        observer: &mut AgentObserver<'_>,
+    ) -> Result<String> {
+        self.run_correlated_with_events(session, Uuid::new_v4(), input, followups, cancel, observer)
+            .await
+    }
+
+    pub async fn run_correlated_with_events<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        input: Option<String>,
+        followups: &mut mpsc::Receiver<T>,
+        cancel: &CancellationToken,
+        observer: &mut AgentObserver<'_>,
+    ) -> Result<String> {
+        let mut adapter = |event: Notification<'_>| dispatch_agent_event(event, observer);
+        self.run_correlated_inner(session, run_id, input, followups, cancel, &mut adapter)
+            .await
+    }
+
     pub async fn run_correlated<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        input: Option<String>,
+        followups: &mut mpsc::Receiver<T>,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<String> {
+        let mut adapter = |event: Notification<'_>| dispatch_legacy_event(event, observer);
+        self.run_correlated_inner(session, run_id, input, followups, cancel, &mut adapter)
+            .await
+    }
+
+    async fn run_correlated_inner<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
         run_id: Uuid,
@@ -198,8 +563,54 @@ impl Agent<'_> {
         if input.as_ref().is_some_and(|text| text.trim().is_empty()) {
             return Err(Error::Config("empty user input".into()));
         }
+        if session
+            .pending_extension_boundary_run()
+            .is_some_and(|pending| pending != run_id)
+        {
+            return Err(Error::Session(
+                "pending extension boundary recovery must be resumed before starting another run"
+                    .into(),
+            ));
+        }
+        if resumable_compaction_run(session)
+            .is_some_and(|(pending_run, _, _)| pending_run != run_id)
+        {
+            return Err(Error::Session(
+                "pending compaction recovery must be resumed before starting another run".into(),
+            ));
+        }
+        if let Some(record) = session.recover_tree_trigger_handoff()? {
+            observer(Notification::Committed(record));
+            let states = session.extension_states();
+            observer(Notification::BranchState(&states));
+        }
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
+        }
+        let selected_provider = session.model_provider().map(str::to_owned);
+        let handoff = if input.is_none() {
+            match session.begin_tree_trigger_handoff(run_id) {
+                Ok(handoff) => handoff,
+                Err(error) => {
+                    observer(Notification::RunStarted { run_id });
+                    let message = error.to_string();
+                    observer(Notification::RunEnded {
+                        run_id,
+                        succeeded: false,
+                        error: Some(&message),
+                    });
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        if let Some((_, records)) = &handoff {
+            for record in records {
+                observer(Notification::Committed(record));
+            }
+            let states = session.extension_states();
+            observer(Notification::BranchState(&states));
         }
         let recorded = session
             .records()
@@ -207,22 +618,214 @@ impl Agent<'_> {
             .any(|record| record.run_id == Some(run_id));
         if recorded {
             let branch = session.branch();
-            if input.is_some() || !branch.iter().any(|record| record.run_id == Some(run_id)) {
-                return Err(Error::DuplicateRun(run_id));
-            }
-            if branch.iter().rev().find_map(|record| match record.event {
-                Event::Run { .. } => record.run_id,
-                _ => None,
-            }) != Some(run_id)
-            {
+            let invalid = input.is_some()
+                || !branch.iter().any(|record| record.run_id == Some(run_id))
+                || (branch.iter().rev().find_map(|record| match record.event {
+                    Event::Run { .. } => record.run_id,
+                    _ => None,
+                }) != Some(run_id)
+                    && session.pending_custom_trigger() != Some(run_id));
+            if invalid {
+                if let Some((return_to, _)) = handoff {
+                    finish_tree_handoff(session, return_to, observer)?;
+                }
                 return Err(Error::DuplicateRun(run_id));
             }
         }
+        let branch_model = handoff
+            .as_ref()
+            .and_then(|_| session.model_selection().map(|selection| selection.0));
+        let provider_changed =
+            handoff.is_some() && session.model_provider() != selected_provider.as_deref();
+        let model = match branch_model
+            .as_deref()
+            .filter(|name| *name != self.model_name || provider_changed)
+        {
+            Some(name) => match session
+                .model_provider()
+                .and_then(|provider| {
+                    self.registry
+                        .provider_branch_config(session.session_id(), provider, name)
+                })
+                .or_else(|| {
+                    session
+                        .model_provider()
+                        .is_none()
+                        .then(|| {
+                            self.registry
+                                .branch_model(session.session_id(), name)
+                                .map(|model| (model, None))
+                        })
+                        .flatten()
+                }) {
+                Some(model) => Some(model),
+                None => {
+                    let error = if let Some((return_to, _)) = handoff {
+                        finish_tree_handoff(session, return_to, observer)
+                            .err()
+                            .unwrap_or_else(|| {
+                                Error::Config(format!(
+                                    "tree trigger recovery requires registered model {name}"
+                                ))
+                            })
+                    } else {
+                        Error::Config(format!(
+                            "tree trigger recovery requires registered model {name}"
+                        ))
+                    };
+                    observer(Notification::RunStarted { run_id });
+                    let message = error.to_string();
+                    observer(Notification::RunEnded {
+                        run_id,
+                        succeeded: false,
+                        error: Some(&message),
+                    });
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         session.set_run_id(Some(run_id));
-        let result = self
+        observer(Notification::RunStarted { run_id });
+        let branch_agent = Agent {
+            model: model
+                .as_ref()
+                .map(|(model, _)| model.as_ref())
+                .unwrap_or(self.model),
+            model_name: branch_model.as_deref().unwrap_or(self.model_name),
+            registry: self.registry,
+            system_prompt: self.system_prompt,
+            limits: model
+                .as_ref()
+                .and_then(|(_, limits)| limits.clone())
+                .unwrap_or_else(|| self.limits.clone()),
+        };
+        let mut result = branch_agent
             .run_turns(session, run_id, input, followups, cancel, observer)
             .await;
         session.set_run_id(None);
+        if let Some((return_to, _)) = handoff
+            && let Err(error) = finish_tree_handoff(session, return_to, observer)
+        {
+            result = Err(error);
+        }
+        let error = result.as_ref().err().map(ToString::to_string);
+        observer(Notification::RunEnded {
+            run_id,
+            succeeded: result.is_ok(),
+            error: error.as_deref(),
+        });
+        while !cancel.is_cancelled()
+            && ensure_settled(session.operations()).is_ok()
+            && !(result.is_err() && resumable_compaction_run(session).is_some())
+        {
+            let Some(trigger_id) = session.pending_custom_trigger() else {
+                break;
+            };
+            let selected_provider = session.model_provider().map(str::to_owned);
+            let handoff = match session.begin_tree_trigger_handoff(trigger_id) {
+                Ok(Some((return_to, records))) => {
+                    for record in &records {
+                        observer(Notification::Committed(record));
+                    }
+                    let states = session.extension_states();
+                    observer(Notification::BranchState(&states));
+                    Some(return_to)
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    observer(Notification::RunStarted { run_id: trigger_id });
+                    let message = error.to_string();
+                    observer(Notification::RunEnded {
+                        run_id: trigger_id,
+                        succeeded: false,
+                        error: Some(&message),
+                    });
+                    break;
+                }
+            };
+            session.set_run_id(Some(trigger_id));
+            observer(Notification::RunStarted { run_id: trigger_id });
+            let branch_model =
+                handoff.and_then(|_| session.model_selection().map(|selection| selection.0));
+            let provider_changed =
+                handoff.is_some() && session.model_provider() != selected_provider.as_deref();
+            let model = match branch_model
+                .as_deref()
+                .filter(|name| *name != self.model_name || provider_changed)
+            {
+                Some(name) => match session
+                    .model_provider()
+                    .and_then(|provider| {
+                        self.registry
+                            .provider_branch_config(session.session_id(), provider, name)
+                    })
+                    .or_else(|| {
+                        session
+                            .model_provider()
+                            .is_none()
+                            .then(|| {
+                                self.registry
+                                    .branch_model(session.session_id(), name)
+                                    .map(|model| (model, None))
+                            })
+                            .flatten()
+                    }) {
+                    Some(model) => Some(model),
+                    None => {
+                        session.set_run_id(None);
+                        let message =
+                            format!("tree trigger recovery requires registered model {name}");
+                        let error = if let Some(return_to) = handoff {
+                            finish_tree_handoff(session, return_to, observer)
+                                .err()
+                                .map(|error| error.to_string())
+                                .unwrap_or(message)
+                        } else {
+                            message
+                        };
+                        observer(Notification::RunEnded {
+                            run_id: trigger_id,
+                            succeeded: false,
+                            error: Some(&error),
+                        });
+                        break;
+                    }
+                },
+                None => None,
+            };
+            let branch_agent = Agent {
+                model: model
+                    .as_ref()
+                    .map(|(model, _)| model.as_ref())
+                    .unwrap_or(self.model),
+                model_name: branch_model.as_deref().unwrap_or(self.model_name),
+                registry: self.registry,
+                system_prompt: self.system_prompt,
+                limits: model
+                    .as_ref()
+                    .and_then(|(_, limits)| limits.clone())
+                    .unwrap_or_else(|| self.limits.clone()),
+            };
+            let mut trigger_result = branch_agent
+                .run_turns(session, trigger_id, None, followups, cancel, observer)
+                .await;
+            session.set_run_id(None);
+            if let Some(return_to) = handoff
+                && let Err(error) = finish_tree_handoff(session, return_to, observer)
+            {
+                trigger_result = Err(error);
+            }
+            let trigger_error = trigger_result.as_ref().err().map(ToString::to_string);
+            observer(Notification::RunEnded {
+                run_id: trigger_id,
+                succeeded: trigger_result.is_ok(),
+                error: trigger_error.as_deref(),
+            });
+            if trigger_result.is_err() {
+                break;
+            }
+        }
         result
     }
 
@@ -235,6 +838,27 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
+        use crate::extension_boundary::{
+            RecoveredBoundary, activity_marker, continuation_is_runnable,
+            dispatch_agent_before_settle, has_activity_queue, recover_agent_before_settle,
+        };
+
+        let recovered = if session.pending_extension_boundary_run() == Some(run_id) {
+            recover_agent_before_settle(session, run_id, observer)?
+        } else {
+            None
+        };
+        let lifecycle = crate::lifecycle::enabled(self.registry);
+        if let Some(RecoveredBoundary::Stop(result)) = recovered {
+            self.finish_run(session, run_id, &result, lifecycle, true, observer)
+                .await?;
+            return result;
+        }
+        let boundary = self
+            .registry
+            .extensions
+            .iter()
+            .any(|ext| ext.handles_agent_before_settle());
         let branch = session.branch();
         let accepted = branch.iter().any(
             |record| matches!(record.event, Event::User { input_id: Some(id), .. } | Event::UserWithImages { input_id: Some(id), .. } if id == run_id),
@@ -247,7 +871,7 @@ impl Agent<'_> {
                 _ => None,
             })
         };
-        let effective_input = input
+        let mut effective_input = input
             .clone()
             .or(pending_initial)
             .map(|content| (run_id, content));
@@ -259,66 +883,191 @@ impl Agent<'_> {
             },
             observer,
         )?;
-        let lifecycle = crate::lifecycle::enabled(self.registry);
-        if lifecycle {
-            self.observe_lifecycle(
-                crate::LifecycleEvent::AgentStart {
-                    session_id: session.session_id(),
-                    run_id,
-                    model: self.model_name.into(),
-                },
-                &session.extension_states(),
-                Some(cancel),
-                observer,
-            )
+        let mut prior_result = self
+            .resolve_prior_turn_end(session, run_id, cancel, observer)
             .await;
-        }
-        let mut retry_attempt = 0;
-        let mut retry_observer = |event: Notification<'_>| {
-            match &event {
-                Notification::Retry(crate::RetryEvent::Start { attempt, .. }) => {
-                    retry_attempt = *attempt
-                }
-                Notification::Retry(crate::RetryEvent::End { .. }) => retry_attempt = 0,
-                _ => {}
+        session.set_run_id(Some(run_id));
+        let mut check_turn_continuation =
+            matches!(recovered, Some(RecoveredBoundary::TurnContinue));
+        let mut force_request = matches!(recovered, Some(RecoveredBoundary::Continue { .. }));
+        let mut start_new_activity = matches!(
+            recovered,
+            Some(RecoveredBoundary::Continue {
+                activity_started: false
+            })
+        );
+        let mut recovered_failure = match recovered {
+            Some(RecoveredBoundary::ProviderFailure(error)) => Some(error),
+            _ => None,
+        };
+        let mut settled_previous_pass = false;
+        let mut in_process_continuation = false;
+        loop {
+            if start_new_activity {
+                commit(session, activity_marker(), observer)?;
             }
-            observer(event);
-        };
-        let mut result = self
-            .drive(
-                session,
-                run_id,
-                effective_input,
-                followups,
-                cancel,
-                &mut retry_observer,
-            )
-            .await;
-        if retry_attempt > 0 {
-            observer(Notification::Retry(crate::RetryEvent::End {
-                success: result.is_ok(),
-                attempt: retry_attempt,
-                final_error: result.as_ref().err().map(|error| {
-                    if matches!(error, Error::Cancelled) {
-                        "Retry cancelled".into()
-                    } else {
-                        error.to_string()
-                    }
-                }),
-            }));
+            let activity_head = session.head();
+            let resuming_failed_activity = recovered_failure.is_some();
+            let start = if let Some(error) = recovered_failure.take() {
+                let records = durable_recovery_usage(session, run_id);
+                self.settle_recorded_recovery(records).await.and(Err(error))
+            } else if prior_result.is_ok() && lifecycle {
+                let states = session.extension_states();
+                self.observe_active_lifecycle_with_inputs(
+                    session,
+                    crate::LifecycleEvent::AgentStart {
+                        session_id: session.session_id(),
+                        run_id,
+                        model: self.model_name.into(),
+                    },
+                    &states,
+                    cancel,
+                    observer,
+                    Some(followups),
+                )
+                .await
+            } else {
+                prior_result
+            };
+            prior_result = Ok(());
+
+            let started = resuming_failed_activity || start.is_ok();
+            let mut retry_attempt = 0;
+            let mut result = match start {
+                Ok(()) => {
+                    let mut retry_observer = |event: Notification<'_>| {
+                        match &event {
+                            Notification::Retry(crate::RetryEvent::Start { attempt, .. }) => {
+                                retry_attempt = *attempt
+                            }
+                            Notification::Retry(crate::RetryEvent::End { .. }) => retry_attempt = 0,
+                            _ => {}
+                        }
+                        observer(event);
+                    };
+                    let ui_events = crate::ui_prompt::RunEvents::default();
+                    let result = ui_events
+                        .scope(self.drive(
+                            session,
+                            run_id,
+                            DriveStart {
+                                input: effective_input.take(),
+                                force_request,
+                                settled_previous_pass,
+                                in_process_continuation,
+                                check_turn_continuation: std::mem::take(
+                                    &mut check_turn_continuation,
+                                ),
+                            },
+                            followups,
+                            cancel,
+                            &mut retry_observer,
+                        ))
+                        .await;
+                    ui_events.finish(&mut retry_observer).await;
+                    result
+                }
+                Err(error) => Err(error),
+            };
+            if retry_attempt > 0 {
+                observer(Notification::Retry(crate::RetryEvent::End {
+                    success: result.is_ok(),
+                    attempt: retry_attempt,
+                    final_error: result.as_ref().err().map(|error| {
+                        if matches!(error, Error::Cancelled) {
+                            "Retry cancelled".into()
+                        } else {
+                            error.to_string()
+                        }
+                    }),
+                }));
+            }
+            if let Err(error) = queue_inputs(session, followups, observer)
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+            let settled = ensure_settled(session.operations()).is_ok();
+            if settled {
+                apply_settled_after_turn(session, observer)?;
+            }
+            let mut ended = false;
+            if boundary
+                && started
+                && settled
+                && !cancel.is_cancelled()
+                && (!in_process_continuation
+                    || session.records()[activity_head as usize..]
+                        .iter()
+                        .any(|record| matches!(record.event, Event::ModelRequested { .. })))
+                && !matches!(
+                    result,
+                    Err(Error::Cancelled
+                        | Error::Budget
+                        | Error::PendingOperation(_)
+                        | Error::Reconciliation(_))
+                )
+            {
+                if lifecycle {
+                    let event = self.agent_end_event(session, run_id, run_state(&result));
+                    let states = session.extension_states();
+                    self.observe_active_lifecycle_with_inputs(
+                        session,
+                        event,
+                        &states,
+                        cancel,
+                        observer,
+                        Some(followups),
+                    )
+                    .await?;
+                    ended = true;
+                }
+                queue_inputs(session, followups, observer)?;
+                apply_settled_after_turn(session, observer)?;
+                let queued = has_activity_queue(session);
+                let should_continue = if cancel.is_cancelled() || queued {
+                    false
+                } else {
+                    dispatch_agent_before_settle(
+                        self.registry,
+                        session,
+                        &result,
+                        cancel,
+                        self.limits.model_timeout,
+                        observer,
+                    )
+                    .await?
+                };
+                queue_inputs(session, followups, observer)?;
+                apply_settled_after_turn(session, observer)?;
+                if cancel.is_cancelled() {
+                    result = Err(Error::Cancelled);
+                } else if has_activity_queue(session)
+                    || continuation_is_runnable(session, should_continue, observer)
+                {
+                    force_request = true;
+                    start_new_activity = true;
+                    in_process_continuation = true;
+                    settled_previous_pass = result.is_ok();
+                    continue;
+                }
+            }
+            self.finish_run(session, run_id, &result, lifecycle, ended, observer)
+                .await?;
+            return result;
         }
-        if let Err(error) = queue_inputs(session, followups, observer)
-            && result.is_ok()
-        {
-            result = Err(error);
-        }
-        let state = match &result {
-            Ok(_) => RunState::Completed,
-            Err(Error::Cancelled) => RunState::Cancelled,
-            Err(Error::Reconciliation(_)) => RunState::WaitingForReconciliation,
-            Err(Error::PendingOperation(_)) => RunState::WaitingForOperation,
-            Err(_) => RunState::Failed,
-        };
+    }
+
+    async fn finish_run(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        result: &Result<String>,
+        lifecycle: bool,
+        ended: bool,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        let state = run_state(result);
         commit(
             session,
             Event::Run {
@@ -328,40 +1077,73 @@ impl Agent<'_> {
             observer,
         )?;
         if lifecycle {
-            let messages = crate::lifecycle::messages(session, |id| {
-                session.records().get((id - 1) as usize).is_some_and(|record| {
-                    record.run_id == Some(run_id)
-                        || matches!(record.event, Event::UserWithImages { input_id: Some(id), .. } if id == run_id)
-                })
-            });
-            self.observe_lifecycle(
-                crate::LifecycleEvent::AgentEnd {
-                    session_id: session.session_id(),
-                    run_id,
-                    state,
-                    messages,
-                },
-                &session.extension_states(),
-                None,
-                observer,
-            )
-            .await;
+            if !ended {
+                self.notify_agent_end(session, run_id, state, observer)
+                    .await?;
+            }
             if !matches!(
                 state,
                 RunState::WaitingForOperation | RunState::WaitingForReconciliation
             ) {
-                self.observe_lifecycle(
+                crate::lifecycle::notify_idle_with_host(
+                    self.registry,
+                    session,
                     crate::LifecycleEvent::AgentSettled {
-                        aborted: matches!(state, RunState::Cancelled),
+                        aborted: state == RunState::Cancelled,
                     },
-                    &session.extension_states(),
-                    None,
+                    self.limits.model_timeout,
                     observer,
                 )
-                .await;
+                .await?;
             }
         }
-        result
+        Ok(())
+    }
+
+    fn agent_end_event(
+        &self,
+        session: &Session,
+        run_id: Uuid,
+        state: RunState,
+    ) -> crate::LifecycleEvent {
+        let activity = crate::extension_boundary::activity_marker_id(session, run_id);
+        let messages = crate::lifecycle::messages(session, |id| {
+            activity.is_none_or(|start| id > start)
+                && session.records().get((id - 1) as usize).is_some_and(|record| {
+                record.run_id == Some(run_id)
+                    || matches!(record.event, Event::UserWithImages { input_id: Some(id), .. } if id == run_id)
+            })
+        });
+        crate::LifecycleEvent::AgentEnd {
+            session_id: session.session_id(),
+            run_id,
+            state,
+            messages,
+        }
+    }
+
+    async fn notify_agent_end(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        state: RunState,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        let end = self.agent_end_event(session, run_id, state);
+        if ensure_settled(session.operations()).is_ok() {
+            crate::lifecycle::notify_idle_with_host(
+                self.registry,
+                session,
+                end,
+                self.limits.model_timeout,
+                observer,
+            )
+            .await
+        } else {
+            self.observe_lifecycle(end, &session.extension_states(), None, observer)
+                .await;
+            Ok(())
+        }
     }
 
     async fn observe_lifecycle(
@@ -389,17 +1171,334 @@ impl Agent<'_> {
         }
     }
 
+    async fn observe_active_lifecycle(
+        &self,
+        session: &mut Session,
+        event: crate::LifecycleEvent,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        self.observe_active_lifecycle_with_inputs::<AgentInput>(
+            session, event, states, cancel, observer, None,
+        )
+        .await
+    }
+
+    async fn observe_active_lifecycle_with_inputs<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        event: crate::LifecycleEvent,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        mut inputs: Option<&mut mpsc::Receiver<T>>,
+    ) -> Result<()> {
+        let (sender, mut incoming) = mpsc::channel(32);
+        let host: Arc<dyn ToolHost> = match &event {
+            crate::LifecycleEvent::AgentStart { run_id, .. } => {
+                let phase = crate::extension_boundary::activity_marker_id(session, *run_id)
+                    .map_or_else(
+                        || "agent_start".to_owned(),
+                        |activity| format!("agent_start:{activity}"),
+                    );
+                callback_root_host(session, sender, *run_id, phase)
+            }
+            crate::LifecycleEvent::TurnStart {
+                run_id, turn_index, ..
+            } => callback_root_host(
+                session,
+                sender,
+                *run_id,
+                callback_turn_phase("turn_start", *turn_index),
+            ),
+            crate::LifecycleEvent::TurnEnd {
+                run_id, turn_index, ..
+            } => callback_root_host(
+                session,
+                sender,
+                *run_id,
+                callback_turn_phase("turn_end", *turn_index),
+            ),
+            _ => Arc::new(LifecycleMessageHost {
+                sender,
+                idle: false,
+            }),
+        };
+        let mut errors = Vec::new();
+        let mut collect = |event: Notification<'_>| {
+            if let Notification::ExtensionLifecycleError {
+                extension,
+                event,
+                message,
+            } = event
+            {
+                errors.push((extension.to_owned(), event, message.to_owned()));
+            }
+        };
+        {
+            let notify = crate::lifecycle::notify_with_host(
+                self.registry,
+                event,
+                states,
+                self.limits.model_timeout,
+                &mut collect,
+                host,
+            );
+            tokio::pin!(notify);
+            loop {
+                tokio::select! {
+                    biased;
+                    Some((message, reply)) = incoming.recv() => {
+                        match queue_custom_message(session, message, observer) {
+                            Ok(()) => { let _ = reply.send(Ok(())); }
+                            Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                        }
+                    }
+                    Some(input) = receive_input(&mut inputs) => {
+                        queue_input(session, input.into(), observer)?;
+                    }
+                    _ = cancel.cancelled() => break,
+                    _ = &mut notify => break,
+                }
+            }
+        }
+        for (extension, event, message) in &errors {
+            observer(Notification::ExtensionLifecycleError {
+                extension,
+                event,
+                message,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn resolve_prior_turn_end(
+        &self,
+        session: &mut Session,
+        incoming_run: Uuid,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        let branch = session.branch();
+        let pending = session.queued_custom_messages();
+        let previous: Vec<_> = branch
+            .iter()
+            .filter_map(|record| {
+                let run_id = record.run_id.filter(|id| *id != incoming_run)?;
+                if !matches!(record.event, Event::Assistant { .. })
+                    || branch.iter().any(|entry| {
+                        matches!(entry.event,
+                Event::TurnEndBoundaryApplied { assistant_record } if assistant_record == record.id)
+                    })
+                {
+                    return None;
+                }
+                if record.version < crate::journal::TURN_END_JOURNAL_VERSION {
+                    let later = branch.iter().any(|entry| {
+                        entry.id > record.id
+                            && entry.run_id == Some(run_id)
+                            && matches!(entry.event, Event::Assistant { .. })
+                    });
+                    let has_deferred = pending.iter().any(|(id, message)| {
+                        message.delivery == crate::CustomMessageDelivery::AfterTurn
+                            && session.records()[(*id - 1) as usize].run_id == Some(run_id)
+                    });
+                    if later || !has_deferred {
+                        return None;
+                    }
+                }
+                Some((run_id, record.id, record.version))
+            })
+            .collect();
+        for (run_id, assistant_record, version) in previous {
+            session.set_run_id(Some(run_id));
+            let result = async {
+                let mut states = self.migrate(session, observer)?;
+                match recover(session, observer) {
+                    Ok(()) => {}
+                    Err(Error::PendingOperation(_)) => {
+                        if let Some((invocation, _)) =
+                            session
+                                .operations()
+                                .into_iter()
+                                .find(|(invocation, state)| {
+                                    matches!(
+                                        state,
+                                        OperationState::Finished(Outcome::Pending { .. })
+                                    ) && !self
+                                        .registry
+                                        .tools
+                                        .get(&invocation.call.name)
+                                        .is_some_and(|tool| tool.tool.can_poll())
+                                })
+                        {
+                            return Err(Error::PendingOperation(invocation.operation_id));
+                        }
+                        self.poll_pending(session, &mut states, cancel, observer, None)
+                            .await?;
+                        recover(session, observer)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+                self.finish_recovered_turn_end(
+                    session,
+                    run_id,
+                    assistant_record,
+                    version,
+                    false,
+                    &states,
+                    cancel,
+                    observer,
+                )
+                .await
+            }
+            .await;
+            session.set_run_id(None);
+            result?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_recovered_turn_end(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        assistant_record: u64,
+        version: u32,
+        actionable: bool,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<bool> {
+        let mut requested = false;
+        let completed = session.branch().iter().any(|record| {
+            matches!(record.event,
+            Event::TurnEndCallbacksCompleted { assistant_record: id } if id == assistant_record)
+        });
+        if !completed && version >= crate::journal::TURN_END_JOURNAL_VERSION {
+            let turn_index = session
+                .branch()
+                .iter()
+                .filter(|record| {
+                    record.id <= assistant_record
+                        && record.run_id == Some(run_id)
+                        && matches!(record.event, Event::Assistant { .. })
+                })
+                .count()
+                .saturating_sub(1) as u32;
+            if actionable {
+                requested = crate::extension_boundary::dispatch_turn_end(
+                    self.registry,
+                    session,
+                    (run_id, turn_index, assistant_record),
+                    cancel,
+                    self.limits.model_timeout,
+                    observer,
+                )
+                .await?;
+            }
+            if crate::lifecycle::enabled(self.registry) {
+                let next_assistant = session.branch().iter().find_map(|record| {
+                    (record.id > assistant_record
+                        && record.run_id == Some(run_id)
+                        && matches!(record.event, Event::Assistant { .. }))
+                    .then_some(record.id)
+                });
+                let turn_index = session
+                    .branch()
+                    .iter()
+                    .filter(|record| {
+                        record.id <= assistant_record
+                            && record.run_id == Some(run_id)
+                            && matches!(record.event, Event::Assistant { .. })
+                    })
+                    .count()
+                    .saturating_sub(1) as u32;
+                let messages = crate::extension_boundary::recovered_turn_observation(
+                    session,
+                    run_id,
+                    assistant_record,
+                    |id| {
+                        id >= assistant_record
+                            && next_assistant.is_none_or(|end| id < end)
+                            && session
+                                .records()
+                                .get((id - 1) as usize)
+                                .is_some_and(|record| record.run_id == Some(run_id))
+                    },
+                );
+                self.observe_active_lifecycle(
+                    session,
+                    crate::LifecycleEvent::TurnEnd {
+                        run_id,
+                        turn_index,
+                        messages,
+                    },
+                    states,
+                    cancel,
+                    observer,
+                )
+                .await?;
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+            }
+            commit(
+                session,
+                Event::TurnEndCallbacksCompleted { assistant_record },
+                observer,
+            )?;
+        }
+        let next_request = session.branch().iter().find_map(|record| {
+            (record.id > assistant_record
+                && record.run_id == Some(run_id)
+                && matches!(record.event, Event::ModelRequested { .. }))
+            .then_some(record.id)
+        });
+        for (queued_at, pending) in session.queued_custom_messages() {
+            if pending.delivery == crate::CustomMessageDelivery::AfterTurn
+                && session.records()[(queued_at - 1) as usize].run_id == Some(run_id)
+                && next_request.is_none_or(|boundary| queued_at < boundary)
+            {
+                commit(
+                    session,
+                    Event::CustomMessageDelivered {
+                        id: pending.id,
+                        message: pending.message,
+                    },
+                    observer,
+                )?;
+            }
+        }
+        commit(
+            session,
+            Event::TurnEndBoundaryApplied { assistant_record },
+            observer,
+        )?;
+        Ok(requested)
+    }
+
     async fn drive<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
         run_id: Uuid,
-        input: Option<(Uuid, String)>,
+        start: DriveStart,
         followups: &mut mpsc::Receiver<T>,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<String> {
+        let DriveStart {
+            input,
+            force_request,
+            settled_previous_pass,
+            in_process_continuation,
+            mut check_turn_continuation,
+        } = start;
         let recovery = recover(session, observer);
         let mut states = match recovery {
+            Ok(()) if in_process_continuation => session.extension_states(),
             Ok(()) => self.migrate(session, observer)?,
             Err(Error::PendingOperation(_)) => {
                 if let Some((invocation, _)) =
@@ -418,44 +1517,183 @@ impl Agent<'_> {
                     return Err(Error::PendingOperation(invocation.operation_id));
                 }
                 let mut states = self.migrate(session, observer)?;
-                self.poll_pending(session, &mut states, cancel, observer)
+                self.poll_pending(session, &mut states, cancel, observer, None)
                     .await?;
                 recover(session, observer)?;
                 states
             }
             Err(error) => return Err(error),
         };
-        if let Some((id, content)) = input {
-            commit(
-                session,
-                Event::User {
-                    content,
-                    input_id: Some(id),
-                },
-                observer,
-            )?;
+        if let Some((assistant_record, version)) =
+            session.branch().iter().rev().find_map(|record| {
+                (record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. }))
+                    .then_some((record.id, record.version))
+            })
+            && !session.branch().iter().any(|record| matches!(record.event,
+                Event::TurnEndBoundaryApplied { assistant_record: applied } if applied == assistant_record))
+        {
+            let actionable = !session.records().iter().any(|record| record.run_id == Some(run_id)
+                && matches!(record.event, Event::Run { state: RunState::Completed | RunState::Failed | RunState::Cancelled, .. }));
+            check_turn_continuation |= self.finish_recovered_turn_end(
+                session, run_id, assistant_record, version, actionable, &states, cancel, observer,
+            ).await?;
         }
-
+        let force_request = force_request
+            || (!cancel.is_cancelled()
+                && crate::extension_boundary::turn_continuation_is_runnable(
+                    session,
+                    check_turn_continuation,
+                    observer,
+                ));
+        let recovering_compaction =
+            resumable_compaction_run(session).is_some_and(|(id, _, _)| id == run_id);
+        if !recovering_compaction {
+            // The trigger UUID is its run ID, so a restart resumes the same run.
+            if let Some((_, message)) =
+                session
+                    .queued_custom_messages()
+                    .into_iter()
+                    .find(|(_, message)| {
+                        message.id == run_id
+                            && message.delivery == crate::CustomMessageDelivery::TriggerTurn
+                    })
+            {
+                commit(
+                    session,
+                    Event::CustomMessageDelivered {
+                        id: message.id,
+                        message: message.message,
+                    },
+                    observer,
+                )?;
+            }
+            let trigger_started = session
+                .branch()
+                .iter()
+                .find_map(|record| match &record.event {
+                    Event::Run {
+                        state: RunState::Running,
+                        ..
+                    } if record.run_id == Some(run_id) => Some(record.id),
+                    _ => None,
+                });
+            if has_trigger_message(session, run_id)
+                && let Some(started_at) = trigger_started
+            {
+                for (queued_at, pending) in session.queued_custom_messages() {
+                    if pending.delivery == crate::CustomMessageDelivery::NextTurn
+                        && queued_at < started_at
+                    {
+                        commit(
+                            session,
+                            Event::CustomMessageDelivered {
+                                id: pending.id,
+                                message: pending.message,
+                            },
+                            observer,
+                        )?;
+                    }
+                }
+            }
+            // A prior interrupted run may have left deferred messages while a tool
+            // needed reconciliation. Recovery above must finish before they appear.
+            for (queued_at, deferred) in session.queued_custom_messages() {
+                let origin = session.records()[(queued_at - 1) as usize].run_id;
+                if deferred.delivery == crate::CustomMessageDelivery::AfterTurn
+                    && origin != Some(run_id)
+                    && !origin.is_some_and(|id| has_unfinished_turn_end(session, id))
+                {
+                    commit(
+                        session,
+                        Event::CustomMessageDelivered {
+                            id: deferred.id,
+                            message: deferred.message,
+                        },
+                        observer,
+                    )?;
+                }
+            }
+            if let Some((id, content)) = input {
+                commit(
+                    session,
+                    Event::User {
+                        content,
+                        input_id: Some(id),
+                    },
+                    observer,
+                )?;
+            }
+            // Only messages queued before this run's initial user entry belong to it.
+            // This also covers image prompts and avoids consuming newly queued next-turn
+            // messages if a partially completed run is restored.
+            if let Some(initial_id) =
+                session
+                    .branch()
+                    .iter()
+                    .find_map(|record| match &record.event {
+                        Event::User {
+                            input_id: Some(id), ..
+                        }
+                        | Event::UserWithImages {
+                            input_id: Some(id), ..
+                        } if *id == run_id => Some(record.id),
+                        _ => None,
+                    })
+            {
+                for (queued_at, input) in session.queued_custom_messages() {
+                    if queued_at < initial_id
+                        && session.records()[(queued_at - 1) as usize].run_id != Some(run_id)
+                        && input.delivery == crate::CustomMessageDelivery::NextTurn
+                    {
+                        commit(
+                            session,
+                            Event::CustomMessageDelivered {
+                                id: input.id,
+                                message: input.message,
+                            },
+                            observer,
+                        )?;
+                    }
+                }
+            }
+        }
         let mut pending = pending_reply(session, run_id);
         queue_inputs(session, followups, observer)?;
-        if pending.is_none() {
-            apply_inputs(session, false, observer)?;
+        if pending.is_none() && !recovering_compaction {
+            let accepted = apply_inputs(session, false, observer)?;
+            if force_request && !accepted {
+                apply_inputs(session, true, observer)?;
+            }
         }
         let current_entries: std::collections::HashSet<_> = session
             .current_message_entries()
             .into_iter()
             .map(|(id, _)| id)
             .collect();
+        let failed_assistants = crate::journal::failed_assistant_records(&session.branch());
+        let trigger_unanswered = has_trigger_message(session, run_id)
+            && !session.branch().iter().any(|record| {
+                record.run_id == Some(run_id) && matches!(&record.event, Event::Assistant { .. })
+            });
         if let Some(answer) = session
             .branch()
             .iter()
             .rev()
             .find_map(|record| match &record.event {
-                Event::CustomMessage { .. } | Event::User { .. } | Event::UserWithImages { .. }
+                Event::CustomMessage { .. }
+                | Event::User { .. }
+                | Event::UserWithImages { .. }
                     if current_entries.contains(&record.id) =>
                 {
                     Some(None)
                 }
+                Event::CustomMessageDelivered { id, .. }
+                    if current_entries.contains(&record.id)
+                        && !session.records().iter().any(|entry| matches!(&entry.event,
+                            Event::CustomMessageQueued { input } if input.id == *id && input.delivery == crate::CustomMessageDelivery::AfterTurn)) => Some(None),
+                // A failed attempt is a boundary, not a completed answer. Do
+                // not return its partial text or fall back to an older reply.
+                Event::Assistant { .. } if failed_assistants.contains(&record.id) => Some(None),
                 Event::Assistant {
                     content,
                     invocations,
@@ -464,14 +1702,24 @@ impl Agent<'_> {
                 _ => None,
             })
             .flatten()
+            .filter(|_| !trigger_unanswered && !force_request)
         {
+            if recovering_compaction {
+                self.compact_silent_overflow(session, run_id, &states, cancel, observer, followups).await?;
+            }
             if !apply_inputs(session, true, observer)? {
+                if !recovering_compaction {
+                    self.compact_silent_overflow(session, run_id, &states, cancel, observer, followups).await?;
+                }
                 return Ok(answer);
             }
-        } else if !session.branch().iter().any(|record| {
+        } else if !recovering_compaction && !session.branch().iter().any(|record| {
             matches!(
                 record.event,
-                Event::User { .. } | Event::UserWithImages { .. } | Event::CustomMessage { .. }
+                Event::User { .. }
+                    | Event::UserWithImages { .. }
+                    | Event::CustomMessage { .. }
+                    | Event::CustomMessageDelivered { .. }
             ) && current_entries.contains(&record.id)
         }) {
             apply_inputs(session, true, observer)?;
@@ -479,16 +1727,83 @@ impl Agent<'_> {
 
         let mut runtime_registry = self.registry.clone();
         let mut runtime_prompt = self.system_prompt.to_owned();
-        let mut budget = self.limits.output_tokens_per_run;
-        let mut compacted = false;
+        // Durable requests already consumed the same run's limits before a
+        // restart. Pending replies and saved summaries are charged below when
+        // replayed, so exclude them here to avoid charging them twice.
+        let pending_id = pending.as_ref().map(|(id, ..)| *id);
+        let mut settled = HashSet::new();
+        if !settled_previous_pass {
+            for (id, usage, metadata) in durable_recovery_usage(session, run_id) {
+                self.settle_usage(id, &usage, &metadata).await?;
+                settled.insert(id);
+            }
+        }
+        if let Some((id, metadata, usage, _)) = &pending
+            && metadata.finish_reason.as_deref() == Some("length")
+            && settled.insert(*id)
+        {
+            self.settle_usage(*id, usage, metadata).await?;
+        }
+        let saved_summary =
+            completed_overflow_summary(session, run_id, "pi-rs:overflow-recovery", self.model_name);
+        if let Some((_, _, _, _, id, usage, metadata)) = &saved_summary
+            && settled.insert(*id)
+        {
+            self.settle_usage(*id, usage, metadata).await?;
+        }
+        let saved_summary_id = saved_summary.as_ref().map(|(_, _, _, _, id, _, _)| *id);
+        let excluded = [pending_id, saved_summary_id];
+        let branch = session.branch();
+        let completions: HashMap<_, _> = branch
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::ModelFinished {
+                    request_id, usage, ..
+                } if record.run_id == Some(run_id) => Some((*request_id, usage)),
+                _ => None,
+            })
+            .collect();
+        let mut requests_used = 0usize;
+        let mut output_used = 0u64;
+        for record in branch.iter().filter(|record| record.run_id == Some(run_id)) {
+            if let Event::ModelRequested {
+                request_id,
+                max_output_tokens,
+                ..
+            } = &record.event
+            {
+                if request_id.is_some_and(|id| excluded.contains(&Some(id))) {
+                    continue;
+                }
+                requests_used = requests_used.saturating_add(1);
+                let usage = request_id.and_then(|id| completions.get(&id).copied());
+                let spent = match usage {
+                    Some(UsageReport::Measured { usage }) => usage.output_tokens,
+                    Some(UsageReport::Estimated { output_tokens }) => *output_tokens,
+                    Some(UsageReport::Unconfirmed) | None => u64::from(*max_output_tokens),
+                };
+                output_used = output_used.saturating_add(spent);
+            }
+        }
+        let mut budget = self
+            .limits
+            .output_tokens_per_run
+            .saturating_sub(output_used.min(u64::from(u32::MAX)) as u32);
+        let mut compacted =
+            overflow_recovery_state(session, run_id).is_some_and(|state| state.compacted);
         let mut retry_attempt = 0;
+        let mut recovery_marker_created_in_run = false;
         let lifecycle = crate::lifecycle::enabled(self.registry);
-        let mut turn_index = 0;
-        for request_index in 0..self.limits.model_requests {
+        let mut turn_index = completed_run_turns(session, run_id);
+        let mut next_request_index = requests_used;
+        let mut selected = None;
+        while next_request_index < self.limits.model_requests {
+            let request_index = next_request_index;
+            next_request_index += 1;
             let update = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                update = tokio::time::timeout(self.limits.model_timeout, runtime_registry.refreshed()) => update.map_err(|_| Error::Config("tool catalog refresh timed out".into()))??,
+                update = platform_time::timeout(self.limits.model_timeout, runtime_registry.refreshed()) => update.map_err(|_| Error::Config("tool catalog refresh timed out".into()))??,
             };
             if let Some(update) = update {
                 runtime_registry = update.registry;
@@ -496,17 +1811,155 @@ impl Agent<'_> {
                     runtime_prompt = prompt;
                 }
             }
-            let active = Agent {
-                registry: &runtime_registry,
-                system_prompt: &runtime_prompt,
-                model: self.model,
-                model_name: self.model_name,
-                limits: self.limits.clone(),
-            };
-
             queue_inputs(session, followups, observer)?;
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
+            }
+            // Use one adapter and its limits for the entire request and tool
+            // dispatch. A selection received during streaming is used only
+            // once this turn reaches a new request boundary.
+            if let Some(next) = session
+                .live_model
+                .as_ref()
+                .and_then(crate::LiveModelControl::selection)
+                && selected
+                    .as_ref()
+                    .is_none_or(|current| !Arc::ptr_eq(current, &next))
+                && pending.is_none()
+                && overflow_recovery_state(session, run_id)
+                    .is_none_or(|recovery| recovery.compacted)
+            {
+                session.apply_live_model_selection(&next, observer)?;
+                selected = Some(next);
+            }
+            let (model, model_name, limits) = selected.as_ref().map_or_else(
+                || (self.model, self.model_name, self.limits.clone()),
+                |selection| {
+                    (
+                        selection.adapter.as_ref(),
+                        selection.model.as_str(),
+                        selection.limits.clone(),
+                    )
+                },
+            );
+            let active = Agent {
+                registry: &runtime_registry,
+                system_prompt: &runtime_prompt,
+                model,
+                model_name,
+                limits: limits.clone(),
+            };
+            // A recorded provider overflow survives process interruption. The
+            // marker is committed before compaction so recovery is attempted at
+            // most once, including after reopening the journal.
+            if let Some(recovery) = overflow_recovery_state(session, run_id)
+                && !recovery.compacted
+            {
+                if !session.auto_compaction_control().enabled() {
+                    return Err(Error::Model(
+                        "context overflow and automatic compaction is disabled".into(),
+                    ));
+                }
+                if recovery.started
+                    && !recovery.summary_started
+                    && !recovery_marker_created_in_run
+                    && !active.registry.extensions.is_empty()
+                {
+                    // The prior process may have entered a pre-summary hook
+                    // before crashing. Its external side effects cannot be
+                    // inferred from the marker, so never invoke it again.
+                    return Err(Error::Model(
+                        "interrupted overflow hook requires reconciliation".into(),
+                    ));
+                }
+                if recovery.summary_started {
+                    // With no extensions there are no external compaction hooks
+                    // to replay. A validated completed summary can be committed
+                    // without a second billable provider request.
+                    if active.registry.extensions.is_empty()
+                        && let Some((summary, spent, billing, retention, _, _, _)) =
+                            completed_overflow_summary(
+                                session,
+                                run_id,
+                                "pi-rs:overflow-recovery",
+                                active.model_name,
+                            )
+                    {
+                        // The durable completion was settled before limits and
+                        // auto-compaction gates were evaluated.
+                        if spent > budget {
+                            return Err(Error::Budget);
+                        }
+                        active
+                            .commit_recovered_overflow(
+                                session, summary, retention, &states, billing, cancel, observer,
+                                followups, true,
+                            )
+                            .await?;
+                        budget -= spent;
+                        compacted = true;
+                        pending = None;
+                        continue;
+                    }
+                    // An unconfirmed response or externally visible hook may
+                    // already have run. Never silently repeat either one.
+                    return Err(Error::Model(
+                        "interrupted overflow summary requires reconciliation".into(),
+                    ));
+                }
+                if !recovery.started {
+                    commit(
+                        session,
+                        Event::SourceEntry {
+                            format: "pi-rs:overflow-recovery".into(),
+                            entry: serde_json::json!({"requestId": recovery.request_id}),
+                        },
+                        observer,
+                    )?;
+                }
+                let retention = configured_retention(
+                    session,
+                    active.compaction_tokens(session).keep_recent_tokens,
+                    1,
+                )?;
+                let summary_limit = if next_request_index < active.limits.model_requests {
+                    active
+                        .limits
+                        .output_tokens_per_request
+                        .min(512)
+                        .min(budget / 2)
+                } else {
+                    0
+                };
+                let Some((spent, provided)) = active
+                    .summarize_prefix(
+                        session,
+                        &states,
+                        SummaryScope {
+                            retention,
+                            instructions: None,
+                            output_limit: summary_limit,
+                            cancellation: cancel,
+                            reason: crate::CompactionTrigger::Overflow,
+                            will_retry: true,
+                            skip_without_model: false,
+                        },
+                        observer,
+                        Some(followups),
+                    )
+                    .await?
+                else {
+                    return Err(Error::Budget);
+                };
+                budget -= spent;
+                states = session.extension_states();
+                compacted = true;
+                // A recovered length-stop reply was intentionally omitted.
+                pending = None;
+                if provided {
+                    next_request_index -= 1;
+                }
+                continue;
             }
             let turn_start = |recovered| crate::LifecycleEvent::TurnStart {
                 run_id,
@@ -519,10 +1972,19 @@ impl Agent<'_> {
             {
                 if lifecycle {
                     active
-                        .observe_lifecycle(turn_start(true), &states, Some(cancel), observer)
-                        .await;
+                        .observe_active_lifecycle_with_inputs(
+                            session,
+                            turn_start(true),
+                            &states,
+                            cancel,
+                            observer,
+                            Some(followups),
+                        )
+                        .await?;
                 }
-                active.settle_usage(request, &usage, &metadata).await?;
+                if !settled.contains(&request) {
+                    active.settle_usage(request, &usage, &metadata).await?;
+                }
                 let allowance = recorded
                     .max_output_tokens
                     .min(active.limits.output_tokens_per_request)
@@ -553,7 +2015,16 @@ impl Agent<'_> {
                 if max_output_tokens == 0 {
                     return Err(Error::Budget);
                 }
-                let mut request = active
+                observer(Notification::ModelContext {
+                    system_prompt: active.system_prompt,
+                    registry: active.registry,
+                });
+                observer(Notification::ToolInventory {
+                    run_id,
+                    phase: ToolInventoryPhase::RequestPreparation,
+                    registry: active.registry,
+                });
+                let (mut request, transformed, transcript) = active
                     .request(
                         session,
                         &states,
@@ -561,6 +2032,7 @@ impl Agent<'_> {
                         None,
                         RequestPurpose::Turn,
                         cancel,
+                        observer,
                     )
                     .await?;
                 // A context extension can lower the budget but cannot increase the host's limit.
@@ -568,19 +2040,183 @@ impl Agent<'_> {
                 if request.max_output_tokens == 0 {
                     return Err(Error::Budget);
                 }
-                let capacity = active.context_capacity(&request, cancel).await?;
-                let estimate = session.context_usage_estimate();
-                let input_tokens = if estimate.last_usage_record.is_some() {
-                    estimate.tokens
+                let tool_transcript = if !transformed
+                    && active.model.uses_tool_transcript(&request.model)
+                {
+                    let branch = session.branch();
+                    let conversation = model_conversation_entries(&branch, session.operations());
+                    let sources: Vec<_> = conversation.iter().map(|(source, _)| *source).collect();
+                    let inserted = transcript
+                        .as_ref()
+                        .map_or(0, |system| system.inserted_count());
+                    let start = request
+                        .messages
+                        .len()
+                        .saturating_sub(sources.len() + inserted);
+                    let mut tools = crate::tool_transcript::replay(
+                        &branch,
+                        &sources,
+                        start,
+                        &active.registry.tool_specs(),
+                        &active.registry.declarations_for_request(&request),
+                    );
+                    for tool in &mut tools {
+                        if let Some(offset) = tool.message_index.checked_sub(start) {
+                            let results = conversation[offset..]
+                                .iter()
+                                .take_while(|(_, message)| matches!(message, Message::Tool { .. }))
+                                .count();
+                            tool.message_index += results;
+                        }
+                        if let Some(system) = &transcript {
+                            tool.message_index = system.project_tool_boundary(tool.message_index);
+                        }
+                    }
+                    tools
                 } else {
-                    crate::estimate_request_tokens(&request)
+                    Vec::new()
                 };
+                let preparation = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                    result = platform_time::timeout(active.limits.model_timeout, active.model.prepare_context_with_tool_transcript(&request, &tool_transcript)) =>
+                        result.unwrap_or_else(|_| Err(Error::RetryableModel("model preparation timed out".into()))),
+                };
+                let prepared = match preparation {
+                    Ok(prepared) => prepared,
+                    Err(Error::RetryableModel(message))
+                        if session.retry_control().settings().enabled
+                            && retry_attempt < session.retry_control().settings().max_retries
+                            && request_index + 1 < active.limits.model_requests =>
+                    {
+                        if lifecycle && retry_attempt == 0 {
+                            active
+                                .observe_active_lifecycle_with_inputs(
+                                    session,
+                                    turn_start(false),
+                                    &states,
+                                    cancel,
+                                    observer,
+                                    Some(followups),
+                                )
+                                .await?;
+                        }
+                        let control = session.retry_control();
+                        let settings = control.settings();
+                        retry_attempt += 1;
+                        let delay_ms = settings.delay_ms(retry_attempt);
+                        let retry_wait = control.begin_wait();
+                        observer(Notification::Retry(crate::RetryEvent::Start {
+                            attempt: retry_attempt,
+                            max_attempts: settings.max_retries,
+                            delay_ms,
+                            error_message: message,
+                        }));
+                        let sleep = platform_time::sleep(Duration::from_millis(delay_ms));
+                        tokio::pin!(sleep);
+                        let waited = loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => break Err(Error::Cancelled),
+                                _ = retry_wait.cancel.cancelled() => break Err(Error::Cancelled),
+                                _ = &mut sleep => break Ok(()),
+                                Some(input) = followups.recv() => {
+                                    if let Err(error) = queue_input(session, input.into(), observer) { break Err(error); }
+                                }
+                            }
+                        };
+                        drop(retry_wait);
+                        waited?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let active = Agent {
+                    model: prepared.as_deref().unwrap_or(active.model),
+                    limits: active.limits.clone(),
+                    ..active
+                };
+                let projected_system = transcript
+                    .is_some_and(|transcript| transcript.finish(active.model, &mut request));
+                let mut attempt = match active
+                    .prepare_attempt(
+                        session,
+                        request,
+                        true,
+                        transformed,
+                        cancel,
+                        observer,
+                        Some(followups),
+                    )
+                    .await
+                {
+                    Ok(attempt) => attempt,
+                    Err(Error::RetryableModel(message))
+                        if session.retry_control().settings().enabled
+                            && retry_attempt < session.retry_control().settings().max_retries
+                            && request_index + 1 < active.limits.model_requests =>
+                    {
+                        if lifecycle && retry_attempt == 0 {
+                            active
+                                .observe_active_lifecycle_with_inputs(
+                                    session,
+                                    turn_start(false),
+                                    &states,
+                                    cancel,
+                                    observer,
+                                    Some(followups),
+                                )
+                                .await?;
+                        }
+                        let control = session.retry_control();
+                        let settings = control.settings();
+                        retry_attempt += 1;
+                        let delay_ms = settings.delay_ms(retry_attempt);
+                        let retry_wait = control.begin_wait();
+                        observer(Notification::Retry(crate::RetryEvent::Start {
+                            attempt: retry_attempt,
+                            max_attempts: settings.max_retries,
+                            delay_ms,
+                            error_message: message,
+                        }));
+                        let sleep = platform_time::sleep(Duration::from_millis(delay_ms));
+                        tokio::pin!(sleep);
+                        let waited = loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => break Err(Error::Cancelled),
+                                _ = retry_wait.cancel.cancelled() => break Err(Error::Cancelled),
+                                _ = &mut sleep => break Ok(()),
+                                Some(input) = followups.recv() => {
+                                    if let Err(error) = queue_input(session, input.into(), observer) { break Err(error); }
+                                }
+                            }
+                        };
+                        drop(retry_wait);
+                        waited?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                attempt.transformed |= projected_system;
+                let budget_request = attempt.reservation_request();
+                let capacity = active.context_capacity(budget_request, cancel).await?;
+                let input_tokens = capacity.map_or(0, |_| {
+                    let estimate = session.context_budget_estimate();
+                    active.request_budget_tokens(
+                        session,
+                        budget_request,
+                        estimate,
+                        attempt.transformed,
+                        attempt.configuration.as_deref(),
+                    )
+                });
                 let exceeds = capacity.is_some_and(|window| {
-                    input_tokens.saturating_add(u64::from(request.max_output_tokens))
+                    input_tokens.saturating_add(u64::from(attempt.request.max_output_tokens))
                         > u64::from(window)
                 });
                 let control = session.auto_compaction_control();
-                let tokens = control.token_settings();
+                let tokens = active.compaction_tokens(session);
                 let retention = configured_retention(session, tokens.keep_recent_tokens, 1)?;
                 let reserve_reached =
                     capacity
@@ -592,11 +2228,19 @@ impl Agent<'_> {
                     // Metadata alone does not provide anything to summarize.
                     has_summary_prefix(session, retention.boundary)
                 };
+                let has_pre_summary_hook = active
+                    .registry
+                    .extensions
+                    .iter()
+                    .any(|extension| extension.handles_before_summary_compaction());
+                let summary_budget = max_output_tokens.min(512).min(budget / 2);
+                let model_summary_available = summary_budget
+                    >= active.model.minimum_output_tokens()
+                    && request_index + 1 < active.limits.model_requests;
                 if exceeds
                     || (control.enabled()
                         && !compacted
-                        && budget > 1
-                        && request_index + 1 < active.limits.model_requests
+                        && (model_summary_available || has_pre_summary_hook)
                         && reserve_reached
                         && has_prefix)
                 {
@@ -605,13 +2249,24 @@ impl Agent<'_> {
                             "context does not fit and automatic compaction is disabled".into(),
                         ));
                     }
-                    if compacted || request_index + 1 >= active.limits.model_requests {
+                    if compacted || (!model_summary_available && !has_pre_summary_hook) {
                         return Err(Error::Model(
                             "context does not fit after the bounded compaction attempt".into(),
                         ));
                     }
-                    let summary_limit = max_output_tokens.min(512).min(budget / 2);
-                    let spent = active
+                    let summary_limit = if model_summary_available {
+                        summary_budget
+                    } else {
+                        0
+                    };
+                    // Keep the existing durable callback boundary when a model
+                    // summary is available or compaction is mandatory. For an
+                    // optional extension-only attempt, defer abandonment until
+                    // the extension actually supplies a summary.
+                    if model_summary_available || exceeds {
+                        abandon_turn_request_for_summary(session, observer)?;
+                    }
+                    let summary = active
                         .summarize_prefix(
                             session,
                             &states,
@@ -620,29 +2275,67 @@ impl Agent<'_> {
                                 instructions: None,
                                 output_limit: summary_limit,
                                 cancellation: cancel,
-                                reason: crate::CompactionReason::Threshold,
+                                reason: crate::CompactionTrigger::Threshold,
+                                will_retry: false,
+                                skip_without_model: !exceeds && !model_summary_available,
                             },
                             observer,
                             Some(followups),
                         )
                         .await?;
-                    budget -= spent;
-                    states = session.extension_states();
-                    compacted = true;
-                    continue;
+                    if let Some((spent, provided)) = summary {
+                        budget -= spent;
+                        states = session.extension_states();
+                        compacted = true;
+                        if provided {
+                            // A supplied summary did not use a model request.
+                            next_request_index -= 1;
+                        }
+                        continue;
+                    }
+                    if exceeds {
+                        return Err(Error::Model(
+                            "context does not fit after compaction produced no summary".into(),
+                        ));
+                    }
                 }
-                let advertised: HashSet<_> =
-                    request.tools.iter().map(|spec| spec.name.clone()).collect();
-                let allowance = request.max_output_tokens;
+                let advertised: HashSet<_> = attempt
+                    .request
+                    .tools
+                    .iter()
+                    .map(|spec| spec.name.clone())
+                    .collect();
+                let allowance = attempt.request.max_output_tokens;
                 if lifecycle && retry_attempt == 0 {
                     active
-                        .observe_lifecycle(turn_start(false), &states, Some(cancel), observer)
-                        .await;
+                        .observe_active_lifecycle_with_inputs(
+                            session,
+                            turn_start(false),
+                            &states,
+                            cancel,
+                            observer,
+                            Some(followups),
+                        )
+                        .await?;
                 }
-                let result = active
-                    .reply(session, request, true, cancel, observer, Some(followups))
-                    .await?
-                    .outcome;
+                let attempt = active
+                    .reply(session, attempt, true, cancel, observer, Some(followups))
+                    .await?;
+                let result = attempt.outcome;
+                if let Err(Error::Model(message) | Error::RetryableModel(message)) = &result
+                    && crate::retry::context_overflow_error(message)
+                    && session.auto_compaction_control().enabled()
+                    && request_index + 1 < active.limits.model_requests
+                    && !overflow_recovery_attempted(session, run_id)
+                    && configured_retention(
+                        session,
+                        active.compaction_tokens(session).keep_recent_tokens,
+                        1,
+                    )
+                    .is_ok_and(|retention| has_summary_prefix(session, retention.boundary))
+                {
+                    continue;
+                }
                 let control = session.retry_control();
                 let settings = control.settings();
                 if let Err(Error::RetryableModel(message)) = &result
@@ -659,7 +2352,7 @@ impl Agent<'_> {
                         delay_ms,
                         error_message: message.clone(),
                     }));
-                    let sleep = tokio::time::sleep(Duration::from_millis(delay_ms));
+                    let sleep = platform_time::sleep(Duration::from_millis(delay_ms));
                     tokio::pin!(sleep);
                     let waited = loop {
                         tokio::select! {
@@ -687,10 +2380,6 @@ impl Agent<'_> {
                 }
                 (reply, advertised, allowance)
             };
-            let finished = reply.invocations.is_empty();
-            let answer = finished.then(|| reply.content.clone());
-            let invocations = reply.invocations.clone();
-            let truncated = reply.truncated;
             let output_tokens = reply
                 .usage
                 .map_or(u64::from(allowance), |usage| usage.output_tokens);
@@ -698,6 +2387,38 @@ impl Agent<'_> {
                 return Err(Error::Budget);
             }
             budget -= output_tokens as u32;
+            let recoverable_length = reply.truncated
+                && reply.usage.is_some_and(|usage| {
+                    usage.output_tokens < u64::from(active.limits.output_tokens_per_request)
+                });
+            if recoverable_length
+                && session.auto_compaction_control().enabled()
+                && request_index + 1 < active.limits.model_requests
+                && !overflow_recovery_attempted(session, run_id)
+                && configured_retention(
+                    session,
+                    active.compaction_tokens(session).keep_recent_tokens,
+                    1,
+                )
+                .is_ok_and(|retention| has_summary_prefix(session, retention.boundary))
+            {
+                // The completed attempt is durable in ModelFinished but never
+                // becomes a model-visible assistant/tool message.
+                commit(
+                    session,
+                    Event::SourceEntry {
+                        format: "pi-rs:overflow-recovery".into(),
+                        entry: serde_json::json!({"requestId": reply.request_id, "kind": "length"}),
+                    },
+                    observer,
+                )?;
+                recovery_marker_created_in_run = true;
+                continue;
+            }
+            let finished = reply.invocations.is_empty();
+            let answer = finished.then(|| reply.content.clone());
+            let invocations = reply.invocations.clone();
+            let truncated = reply.truncated;
             commit(
                 session,
                 Event::Assistant {
@@ -716,7 +2437,7 @@ impl Agent<'_> {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => Err(Error::Cancelled),
-                    update = tokio::time::timeout(active.limits.model_timeout, active.registry.refreshed()) => update.unwrap_or_else(|_| Err(Error::Config("tool catalog refresh timed out".into()))),
+                    update = platform_time::timeout(active.limits.model_timeout, active.registry.refreshed_for_dispatch()) => update.unwrap_or_else(|_| Err(Error::Config("tool catalog refresh timed out".into()))),
                 }
             };
             let dispatch_update = match dispatch_update {
@@ -735,13 +2456,20 @@ impl Agent<'_> {
                 model_name: active.model_name,
                 limits: active.limits.clone(),
             };
+            if !invocations.is_empty() && !truncated {
+                observer(Notification::ToolInventory {
+                    run_id,
+                    phase: ToolInventoryPhase::Dispatch,
+                    registry: dispatcher.registry,
+                });
+            }
             let dispatched = if truncated {
                 dispatcher
-                    .reject_truncated_tools(session, &invocations, &states, observer)
+                    .reject_truncated_tools(session, &invocations, &states, cancel, observer)
                     .await
             } else {
                 dispatcher
-                    .tool_batch(
+                    .dispatch_turn(
                         session,
                         &invocations,
                         &DispatchScope {
@@ -761,21 +2489,50 @@ impl Agent<'_> {
                 return Err(err);
             }
 
-            if lifecycle {
-                let messages = crate::lifecycle::messages(session, |id| id >= assistant_record);
+            let turn_messages =
+                lifecycle.then(|| crate::lifecycle::messages(session, |id| id >= assistant_record));
+            let requested = crate::extension_boundary::dispatch_turn_end(
+                dispatcher.registry,
+                session,
+                (run_id, turn_index, assistant_record),
+                cancel,
+                self.limits.model_timeout,
+                observer,
+            )
+            .await?;
+
+            if let Some(messages) = turn_messages {
                 dispatcher
-                    .observe_lifecycle(
+                    .observe_active_lifecycle_with_inputs(
+                        session,
                         crate::LifecycleEvent::TurnEnd {
                             run_id,
                             turn_index,
                             messages,
                         },
                         &states,
-                        Some(cancel),
+                        cancel,
                         observer,
+                        Some(followups),
                     )
-                    .await;
+                    .await?;
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
             }
+            commit(
+                session,
+                Event::TurnEndCallbacksCompleted { assistant_record },
+                observer,
+            )?;
+            // Context-only messages must follow every tool result in the turn,
+            // but do not themselves cause another model request.
+            apply_settled_after_turn(session, observer)?;
+            commit(
+                session,
+                Event::TurnEndBoundaryApplied { assistant_record },
+                observer,
+            )?;
             turn_index += 1;
 
             if let Some(update) = dispatch_update {
@@ -794,12 +2551,354 @@ impl Agent<'_> {
                 if apply_inputs(session, false, observer)? {
                     continue;
                 }
-                if !apply_inputs(session, true, observer)? {
+                if !apply_inputs(session, true, observer)?
+                    && !crate::extension_boundary::turn_continuation_is_runnable(
+                        session, requested, observer,
+                    )
+                {
+                    let compact_agent = Agent {
+                        registry: &runtime_registry,
+                        system_prompt: &runtime_prompt,
+                        model,
+                        model_name,
+                        limits,
+                    };
+                    compact_agent
+                        .compact_silent_overflow(
+                            session, run_id, &states, cancel, observer, followups,
+                        )
+                        .await?;
                     return Ok(answer);
                 }
             }
         }
         Err(Error::Budget)
+    }
+
+    async fn compact_silent_overflow<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        run_id: Uuid,
+        states: &ExtensionStates,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        followups: &mut mpsc::Receiver<T>,
+    ) -> Result<()> {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let branch = session.branch();
+        let pending_silent_request = branch
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event {
+                Event::SourceEntry { format, entry }
+                    if record.run_id == Some(run_id) && format == "pi-rs:silent-overflow" =>
+                {
+                    entry["requestId"]
+                        .as_str()
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                }
+                Event::Compacted { .. } | Event::User { .. } | Event::UserWithImages { .. }
+                    if record.run_id == Some(run_id) =>
+                {
+                    None
+                }
+                _ => None,
+            })
+            .filter(|_| resumable_compaction_run(session).is_some_and(|(id, _, _)| id == run_id));
+        if let Some(request_id) = pending_silent_request {
+            // A completed summary is safe to reuse only when no external
+            // hooks could have run before the interruption.
+            if self.registry.extensions.is_empty()
+                && let Some((summary, _, billing, retention, request_id, usage, metadata)) =
+                    completed_overflow_summary(
+                        session,
+                        run_id,
+                        "pi-rs:silent-overflow",
+                        self.model_name,
+                    )
+            {
+                self.settle_usage(request_id, &usage, &metadata).await?;
+                self.commit_recovered_overflow(
+                    session, summary, retention, states, billing, cancel, observer, followups,
+                    false,
+                )
+                .await?;
+                return Ok(());
+            }
+            let marker_index = branch.iter().rposition(|record| matches!(&record.event,
+                Event::SourceEntry { format, entry } if format == "pi-rs:silent-overflow" && entry["requestId"] == request_id.to_string())).expect("marker was found");
+            let following = &branch[marker_index + 1..];
+            if following.iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")) {
+                return Ok(());
+            }
+            let summary_request = following.iter().find_map(|record| match &record.event {
+                Event::ModelRequested { request_id, .. } if record.run_id == Some(run_id) => {
+                    Some(*request_id)
+                }
+                _ => None,
+            });
+            let summary_id = match summary_request {
+                Some(Some(id)) => Some(id),
+                Some(None) => {
+                    return Err(Error::Model(
+                        "interrupted silent summary requires reconciliation".into(),
+                    ));
+                }
+                None => None,
+            };
+            if let Some(id) = summary_id {
+                let (usage, metadata) = following
+                    .iter()
+                    .find_map(|record| match &record.event {
+                        Event::ModelFinished {
+                            request_id,
+                            usage,
+                            metadata,
+                            ..
+                        } if *request_id == id => Some((usage.clone(), metadata.clone())),
+                        _ => None,
+                    })
+                    .unwrap_or((UsageReport::Unconfirmed, ModelMetadata::default()));
+                self.settle_usage(id, &usage, &metadata).await?;
+            }
+            commit(
+                session,
+                Event::SourceEntry {
+                    format: "pi-rs:silent-overflow-skipped-v1".into(),
+                    entry: serde_json::json!({"requestId": request_id, "summaryRequestId": summary_id}),
+                },
+                observer,
+            )?;
+            return Ok(());
+        }
+        if !session.auto_compaction_control().enabled() {
+            return Ok(());
+        }
+        let window = match self.limits.context_window {
+            Some(window) => Some(window),
+            None => platform_time::timeout(
+                self.limits.model_timeout,
+                self.model.context_window(self.model_name),
+            )
+            .await
+            .ok()
+            .flatten(),
+        };
+        let Some(window) = window.filter(|window| *window > 0) else {
+            return Ok(());
+        };
+        let branch = session.branch();
+        let Some((index, record)) = branch.iter().enumerate().rev().find(|(_, record)| {
+            record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. })
+        }) else {
+            return Ok(());
+        };
+        let Event::Assistant {
+            invocations,
+            usage: Some(usage),
+            request_id: Some(request_id),
+            ..
+        } = &record.event
+        else {
+            return Ok(());
+        };
+        if !invocations.is_empty()
+            || usage.input_tokens <= u64::from(window)
+            || !session
+                .current_message_entries()
+                .iter()
+                .any(|(id, _)| *id == record.id)
+            || branch[index + 1..].iter().any(|record| {
+                matches!(
+                    record.event,
+                    Event::ContextEdited { .. }
+                        | Event::Compacted { .. }
+                        | Event::User { .. }
+                        | Event::UserWithImages { .. }
+                )
+            })
+        {
+            return Ok(());
+        }
+        let request_id = *request_id;
+        let requests_used = branch
+            .iter()
+            .filter(|record| {
+                record.run_id == Some(run_id)
+                    && matches!(record.event, Event::ModelRequested { .. })
+            })
+            .count();
+        let output_used = branch
+            .iter()
+            .filter(|record| record.run_id == Some(run_id))
+            .try_fold(0_u64, |total, record| match &record.event {
+                Event::ModelFinished {
+                    usage: UsageReport::Measured { usage },
+                    ..
+                } => Some(total.saturating_add(usage.output_tokens)),
+                Event::ModelFinished {
+                    usage: UsageReport::Estimated { output_tokens },
+                    ..
+                } => Some(total.saturating_add(*output_tokens)),
+                Event::ModelFinished {
+                    usage: UsageReport::Unconfirmed,
+                    ..
+                } => None,
+                _ => Some(total),
+            });
+        let matching = branch.iter().any(|record| matches!(&record.event,
+            Event::ModelRequested { request_id: Some(id), model, .. } if *id == request_id && model == self.model_name));
+        let completion = branch.iter().find_map(|record| match &record.event {
+            Event::ModelFinished {
+                request_id: id,
+                failure: None,
+                metadata,
+                ..
+            } if *id == request_id && metadata.finish_reason.as_deref() != Some("length") => {
+                Some(metadata)
+            }
+            _ => None,
+        });
+        // Native Anthropic usage includes cache writes in input_tokens. Pi's
+        // overflow check counts input plus cache reads, excluding writes.
+        if !matching
+            || completion.is_none_or(|metadata| {
+                usage
+                    .input_tokens
+                    .saturating_sub(metadata.cache_creation_input_tokens.unwrap_or(0))
+                    <= u64::from(window)
+            })
+        {
+            return Ok(());
+        }
+        let Ok(retention) = configured_retention(
+            session,
+            self.compaction_tokens(session).keep_recent_tokens,
+            1,
+        ) else {
+            return Ok(());
+        };
+        if !has_summary_prefix(session, retention.boundary) {
+            return Ok(());
+        }
+        if commit(
+            session,
+            Event::SourceEntry {
+                format: "pi-rs:silent-overflow".into(),
+                entry: serde_json::json!({"requestId":request_id}),
+            },
+            observer,
+        )
+        .is_err()
+        {
+            return Ok(());
+        }
+        let output_limit = if requests_used < self.limits.model_requests && output_used.is_some() {
+            self.limits.output_tokens_per_request.min(512).min(
+                self.limits
+                    .output_tokens_per_run
+                    .saturating_sub(output_used.unwrap_or_default().min(u64::from(u32::MAX)) as u32),
+            )
+        } else {
+            0
+        };
+        let result = self
+            .summarize_prefix(
+                session,
+                states,
+                SummaryScope {
+                    retention,
+                    instructions: None,
+                    output_limit,
+                    cancellation: cancel,
+                    reason: crate::CompactionTrigger::Overflow,
+                    will_retry: false,
+                    skip_without_model: false,
+                },
+                observer,
+                Some(followups),
+            )
+            .await;
+        if let Err(error) = result {
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            if self.registry.extensions.is_empty()
+                && completed_overflow_summary(
+                    session,
+                    run_id,
+                    "pi-rs:silent-overflow",
+                    self.model_name,
+                )
+                .is_some()
+            {
+                // Preserve a completed response when its settlement failed.
+                return Err(error);
+            }
+            // The marker now exists. Resolve it through the same durable skip
+            // path used after a restart, without repeating the summary call.
+            Box::pin(
+                self.compact_silent_overflow(session, run_id, states, cancel, observer, followups),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_recovered_overflow<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        summary: String,
+        retention: RetentionPlan,
+        states: &ExtensionStates,
+        billing: Option<(Usage, Option<Box<crate::SummaryUsageMetadata>>)>,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        followups: &mut mpsc::Receiver<T>,
+        will_retry: bool,
+    ) -> Result<()> {
+        let reason = crate::CompactionTrigger::Overflow;
+        notify_auto_compaction(reason, AutoCompactionUpdate::Started, observer);
+        let result = self
+            .commit_compaction_with_host(
+                session,
+                Compaction {
+                    summary,
+                    keep_turns: retention.keep_turns,
+                },
+                states,
+                billing,
+                Some(retention),
+                None,
+                cancel,
+                observer,
+                Some(followups),
+            )
+            .await;
+        let event = match &result {
+            Ok(from_extension) => crate::LifecycleEvent::SessionCompact {
+                compaction_entry: Box::new(
+                    session
+                        .records()
+                        .last()
+                        .expect("compaction was committed")
+                        .clone(),
+                ),
+                from_extension: *from_extension,
+                reason: reason.legacy_reason(),
+                will_retry,
+            },
+            Err(error) => compaction_failed_event(reason, error, cancel),
+        };
+        notify_auto_compaction(
+            reason,
+            auto_compaction_update(session, event, will_retry),
+            observer,
+        );
+        result.map(|_| ())
     }
 
     fn migrate(
@@ -826,6 +2925,7 @@ impl Agent<'_> {
         Ok(states)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn request(
         &self,
         session: &mut Session,
@@ -834,7 +2934,12 @@ impl Agent<'_> {
         before: Option<u64>,
         purpose: RequestPurpose,
         cancel: &CancellationToken,
-    ) -> Result<ModelRequest> {
+        observer: &mut Observer<'_>,
+    ) -> Result<(
+        ModelRequest,
+        bool,
+        Option<crate::journal::SystemTranscriptFallback>,
+    )> {
         let branch = session.branch();
         let summary = branch.iter().rev().find_map(|record| match &record.event {
             Event::Compacted { summary, .. } => Some(summary.as_str()),
@@ -858,25 +2963,27 @@ impl Agent<'_> {
                 content: format!("Prior conversation summary (context only):\n{summary}"),
             });
         }
+        let mut conversation = model_conversation_entries(&branch, session.operations());
         if let Some(boundary) = before {
             let mut keep_group = false;
-            messages.extend(
-                model_conversation_entries(&branch, session.operations())
-                    .into_iter()
-                    .filter_map(|(source, message)| {
-                        if !matches!(message, Message::Tool { .. }) {
-                            keep_group = source < boundary;
-                        }
-                        keep_group.then_some(message)
-                    }),
-            );
-        } else {
-            messages.extend(
-                model_conversation_entries(history, session.operations())
-                    .into_iter()
-                    .map(|(_, message)| message),
-            );
+            conversation.retain(|(source, message)| {
+                if !matches!(message, Message::Tool { .. }) {
+                    keep_group = *source < boundary;
+                }
+                keep_group
+            });
         }
+        let transcript = if purpose == RequestPurpose::Turn {
+            crate::journal::system_transcript(
+                history,
+                &conversation,
+                messages.len(),
+                self.system_prompt,
+            )
+        } else {
+            None
+        };
+        messages.extend(conversation.into_iter().map(|(_, message)| message));
         if messages.len() == 1 {
             return Err(Error::Session("there is no conversation to resume".into()));
         }
@@ -886,79 +2993,419 @@ impl Agent<'_> {
             tools,
             max_output_tokens,
         };
-        for extension in &self.registry.extensions {
-            let result = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.model_timeout, extension.before_request(&mut request, purpose, states.get(extension.id()))) =>
-                    result.map_err(|_| Error::Config("request context hook timed out".into()))?,
+        let transcript = transcript.and_then(|transcript| transcript.apply(&mut request.messages));
+        let original = request.clone();
+        let invocation = if let Some(run_id) = session.current_run_id()
+            && !self.registry.extensions.is_empty()
+        {
+            let id = match open_request_callback(session, run_id, purpose) {
+                Some(id) => id,
+                None => {
+                    let id = Uuid::new_v4();
+                    commit(
+                        session,
+                        Event::RequestCallbackStarted {
+                            id,
+                            purpose: request_purpose_name(purpose).to_owned(),
+                        },
+                        observer,
+                    )?;
+                    id
+                }
             };
+            Some(id)
+        } else {
+            None
+        };
+        for extension in &self.registry.extensions {
+            let mut portable = portable_request(&request);
+            let mut guarded = crate::ContextRequest::new(&mut portable);
+            let access = guarded.access();
+            let (sender, mut incoming) = mpsc::channel(32);
+            let host: Arc<dyn ToolHost> = match session.current_run_id() {
+                Some(run_id) => callback_root_host(
+                    session,
+                    sender,
+                    run_id,
+                    format!(
+                        "before_request:invocation:{}",
+                        invocation.expect("active callback invocation")
+                    ),
+                )
+                .for_extension(extension.id())
+                .expect("callback host scope"),
+                None => Arc::new(LifecycleMessageHost {
+                    sender,
+                    idle: false,
+                }),
+            };
+            let result = {
+                let future = platform_time::timeout(
+                    self.limits.model_timeout,
+                    extension.before_request_with_host(
+                        &mut guarded,
+                        purpose,
+                        states.get(extension.id()),
+                        host,
+                    ),
+                );
+                tokio::pin!(future);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some((message, reply)) = incoming.recv() => {
+                            match queue_custom_message(session, message, observer) {
+                                Ok(()) => { let _ = reply.send(Ok(())); }
+                                Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                            }
+                        }
+                        _ = cancel.cancelled() => return Err(Error::Cancelled),
+                        result = &mut future => break result.map_err(|_| Error::Config("request context hook timed out".into()))?,
+                    }
+                }
+            };
+            let unsafe_access = access.assistant_accessed();
             hook(extension.as_ref(), result)?;
+            if !unsafe_access {
+                retain_replay_after_safe_hook(&request, &mut portable, &access.user_edits());
+            } else {
+                portable = portable_request(&portable);
+            }
+            request = portable;
         }
         for extension in &self.registry.extensions {
             if !extension.handles_context_with_system() {
                 continue;
             }
-            let result = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.model_timeout, extension.context_with_system(&mut request.messages, states.get(extension.id()))) =>
-                    result.map_err(|_| Error::Config("context with system hook timed out".into()))?,
+            let had_leading_system =
+                matches!(request.messages.first(), Some(Message::System { .. }));
+            let mut portable = portable_request(&request);
+            let mut guarded = crate::ContextMessages::new(&mut portable.messages);
+            let access = guarded.access();
+            let (sender, mut incoming) = mpsc::channel(32);
+            let host: Arc<dyn ToolHost> = match session.current_run_id() {
+                Some(run_id) => callback_root_host(
+                    session,
+                    sender,
+                    run_id,
+                    format!(
+                        "context_with_system:invocation:{}",
+                        invocation.expect("active callback invocation")
+                    ),
+                )
+                .for_extension(extension.id())
+                .expect("callback host scope"),
+                None => Arc::new(LifecycleMessageHost {
+                    sender,
+                    idle: false,
+                }),
             };
+            let result = {
+                let future = platform_time::timeout(
+                    self.limits.model_timeout,
+                    extension.context_with_system_with_host(
+                        &mut guarded,
+                        states.get(extension.id()),
+                        host,
+                    ),
+                );
+                tokio::pin!(future);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some((message, reply)) = incoming.recv() => {
+                            match queue_custom_message(session, message, observer) {
+                                Ok(()) => { let _ = reply.send(Ok(())); }
+                                Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                            }
+                        }
+                        _ = cancel.cancelled() => return Err(Error::Cancelled),
+                        result = &mut future => break result.map_err(|_| Error::Config("context with system hook timed out".into()))?,
+                    }
+                }
+            };
+            let unsafe_access = access.assistant_accessed();
             hook(extension.as_ref(), result)?;
+            if !unsafe_access {
+                retain_replay_after_safe_hook(&request, &mut portable, &access.user_edits());
+            } else {
+                portable = portable_request(&portable);
+            }
+            request = portable;
+            if had_leading_system
+                && !matches!(request.messages.first(), Some(Message::System { .. }))
+            {
+                observer(Notification::ExtensionLifecycleError {
+                    extension: extension.id(),
+                    event: "context_with_system",
+                    message: "Handler removed the leading system message; the request has no system prompt. Keep it at index 0 or replace the dropped prefix with a system message.",
+                });
+            }
         }
         request
             .tools
             .retain(|spec| self.registry.has_tool(&spec.name));
-        Ok(request)
+        let transformed = request.model != original.model
+            || request.messages != original.messages
+            || request.tools != original.tools;
+        Ok((request, transformed, transcript))
     }
 
+    fn request_budget_tokens(
+        &self,
+        session: &Session,
+        request: &ModelRequest,
+        estimate: crate::ContextUsageEstimate,
+        transformed: bool,
+        configuration: Option<&str>,
+    ) -> u64 {
+        let Some(anchor) = estimate.last_usage_record.filter(|_| !transformed) else {
+            return self.model.estimate_request_tokens(request);
+        };
+        let branch = session.branch();
+        let (request_id, output_tokens) = branch
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::Assistant {
+                    request_id,
+                    usage: Some(usage),
+                    ..
+                } if record.id == anchor => Some((*request_id, usage.output_tokens)),
+                _ => None,
+            })
+            .unwrap_or((None, 0));
+        let safe = configuration.is_some_and(|configuration| {
+            request_id.is_some_and(|id| branch.iter().any(|record| matches!(&record.event,
+                Event::ModelRequested { request_id: Some(request_id), context_transformed: Some(false), context_configuration_sha256: Some(previous), .. }
+                    if *request_id == id && previous == configuration)))
+        });
+        if !safe {
+            return self.model.estimate_request_tokens(request);
+        }
+        let entries = model_conversation_entries(&branch, session.operations());
+        // The measured output already includes generated reasoning on providers
+        // such as Google. Only replay beyond that measurement is additional.
+        let anchor_extra =
+            entries
+                .iter()
+                .find(|(source, _)| *source == anchor)
+                .map_or(0, |(_, message)| {
+                    self.model
+                        .estimate_message_tokens(request, message)
+                        .saturating_sub(crate::estimate_message_tokens(message).max(output_tokens))
+                });
+        let trailing = entries
+            .into_iter()
+            .filter(|(source, _)| *source > anchor)
+            .map(|(_, message)| self.model.estimate_message_tokens(request, &message))
+            .fold(0_u64, u64::saturating_add);
+        estimate
+            .usage_tokens
+            .saturating_add(anchor_extra)
+            .saturating_add(trailing)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_attempt<'a, T: Into<AgentInput> + Send>(
+        &'a self,
+        session: &mut Session,
+        request: ModelRequest,
+        retain_reply: bool,
+        transformed: bool,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        mut inputs: Option<&mut mpsc::Receiver<T>>,
+    ) -> Result<PreparedAttempt<'a>> {
+        let declarations = self.registry.declarations_for_request(&request);
+        let request_id = Uuid::new_v4();
+        let dispatch_context = crate::ToolDispatchContext {
+            request_id,
+            session_id: session.session_id(),
+            external_id: session.external_session_id(),
+            summary: !retain_reply,
+        };
+        let constrained = declarations.iter().any(|declaration| {
+            declaration
+                .constrained_sampling
+                .as_ref()
+                .is_some_and(|constraint| !matches!(constraint, crate::ToolConstraint::Disabled))
+        });
+        let prepared = if constrained {
+            let preparing = platform_time::timeout(
+                self.limits.model_timeout,
+                self.model
+                    .prepare_tool_dispatch(&request, &declarations, &dispatch_context),
+            );
+            tokio::pin!(preparing);
+            let prepared = loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                    result = &mut preparing => break result.map_err(|_| Error::RetryableModel("tool dispatch preparation timed out".into()))??,
+                    Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
+                }
+            };
+            if let Some(prepared) = &prepared {
+                crate::validate_prepared_tool_dispatch(
+                    prepared.as_ref(),
+                    &dispatch_context,
+                    &request,
+                    &declarations,
+                )?;
+            } else {
+                crate::validate_legacy_tool_declarations(&request, &declarations)?;
+            }
+            prepared
+        } else {
+            None
+        };
+        let configuration = prepared_configuration_hash(self.model, &request, prepared.as_deref());
+        Ok(PreparedAttempt {
+            request,
+            declarations,
+            dispatch_context,
+            prepared,
+            transformed,
+            known_loadout: !transformed,
+            configuration,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn reply<T: Into<AgentInput> + Send>(
         &self,
         session: &mut Session,
-        request: ModelRequest,
+        attempt: PreparedAttempt<'_>,
         retain_reply: bool,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
         mut inputs: Option<&mut mpsc::Receiver<T>>,
     ) -> Result<ReplyAttempt> {
-        let request_id = Uuid::new_v4();
+        let PreparedAttempt {
+            request,
+            declarations,
+            dispatch_context,
+            prepared,
+            transformed,
+            known_loadout,
+            configuration,
+        } = attempt;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let request_id = dispatch_context.request_id;
         let allowance = request.max_output_tokens;
         let advertised_tools =
             retain_reply.then(|| request.tools.iter().map(|tool| tool.name.clone()).collect());
+        if retain_reply
+            && known_loadout
+            && self.model.uses_tool_transcript(&request.model)
+            && let Some(loadout) =
+                crate::tool_transcript::changed_loadout(&session.branch(), &declarations)
+        {
+            commit(session, loadout, observer)?;
+        }
         let context_head = session.head();
         let context_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&request)?));
         if !retain_reply {
             observer(Notification::SummaryRequest);
         }
-        commit(
-            session,
-            Event::ModelRequested {
-                model: request.model.clone(),
-                messages: request.messages.len(),
-                tools: request.tools.len(),
-                max_output_tokens: allowance,
-                request_id: Some(request_id),
-                context_head: Some(context_head),
-                context_sha256: Some(context_sha256),
-            },
-            observer,
-        )?;
-        observer(Notification::Request(&request));
+        let requested = Event::ModelRequested {
+            model: request.model.clone(),
+            messages: request.messages.len(),
+            tools: request.tools.len(),
+            max_output_tokens: allowance,
+            request_id: Some(request_id),
+            context_head: Some(context_head),
+            context_sha256: Some(context_sha256),
+            context_transformed: Some(transformed),
+            context_configuration_sha256: configuration,
+            tool_decision: None,
+        };
+        if let Some(prepared) = &prepared {
+            let decision = prepared
+                .decision_snapshot()
+                .clone()
+                .with_registered_tools(self.registry)
+                .map_err(|error| Error::Session(error.to_string()))?;
+            let record = session.append_tool_decision_request(
+                requested,
+                &decision,
+                &request,
+                prepared.dispatch_request(),
+                &declarations,
+            )?;
+            observer(Notification::Committed(record));
+        } else {
+            commit(session, requested, observer)?;
+        }
+        observer(Notification::Request(&portable_request(&request)));
         const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-        let mut content = String::new();
+        const MAX_ENRICHED_ITEMS: usize = 256;
+        const MAX_LEGACY_TEXT_SEGMENTS: usize = 128;
         let mut metadata = ModelMetadata::default();
+        let mut display_candidate = display_layout::Candidate::default();
         let mut tool_delta_bytes = 0_usize;
         let mut reasoning_delta_bytes = 0_usize;
+        let mut text_item_ids = std::collections::HashMap::<u64, usize>::new();
+        let mut text_parts = Vec::<String>::new();
+        let mut legacy_text_slot = None;
+        let mut legacy_text_segments = 0usize;
+        let mut text_len = 0usize;
+        let mut text_delta_bytes = 0usize;
+        let mut text_final_bytes = 0usize;
+        let mut reasoning_item_ids = HashSet::new();
+        let mut observed_reasoning = std::collections::HashMap::<u64, String>::new();
+        let mut reasoning_final_bytes = 0_usize;
+        use crate::AssistantMessageUpdate;
+        let mut message_hooks = retain_reply
+            .then(|| {
+                crate::message_hooks::MessageHooks::for_session(
+                    self.registry,
+                    session,
+                    self.limits.model_timeout,
+                )
+            })
+            .flatten();
+        let response_hooks = retain_reply
+            .then(|| {
+                crate::provider_response::ResponseHooks::for_session(
+                    self.registry,
+                    session,
+                    self.limits.model_timeout,
+                )
+            })
+            .flatten();
         let collect = async {
+            macro_rules! message_update {
+                ($update:expr) => {
+                    if let Some(hooks) = &mut message_hooks {
+                        hooks.update(&text_parts, $update).await;
+                    }
+                };
+            }
             let session_id = session.session_id();
-            let opening = if retain_reply {
-                self.model
-                    .stream_in_session(request_id, session_id, request)
-            } else {
-                self.model
-                    .stream_for_summary(request_id, session_id, request)
+            let external_id = session.external_session_id();
+            let opening = async {
+                if let Some(prepared) = prepared {
+                    prepared.dispatch().await
+                } else if retain_reply {
+                    self.model
+                        .stream_detailed_in_session_with_identity(
+                            request_id,
+                            session_id,
+                            &external_id,
+                            request,
+                        )
+                        .await
+                } else {
+                    self.model
+                        .stream_detailed_for_summary(request_id, session_id, request)
+                        .await
+                }
             };
+            let opening =
+                crate::provider_response::ResponseHooks::scope(response_hooks.clone(), opening);
             tokio::pin!(opening);
             let mut stream = loop {
                 tokio::select! {
@@ -968,7 +3415,7 @@ impl Agent<'_> {
             };
             loop {
                 let event = tokio::select! {
-                    event = stream.next() => event,
+                    event = crate::provider_response::ResponseHooks::scope(response_hooks.clone(), stream.next()) => event,
                     Some(input) = receive_input(&mut inputs) => {
                         queue_input(session, input.into(), observer)?;
                         continue;
@@ -977,21 +3424,201 @@ impl Agent<'_> {
                 let Some(event) = event else {
                     break;
                 };
-                match event? {
-                    ModelEvent::Text(delta) => {
-                        if content.len() + delta.len() > MAX_RESPONSE_BYTES {
+                let event = event?;
+                if let Some(hooks) = &mut message_hooks {
+                    hooks.start(false).await;
+                }
+                let redacted_start = event.is_redacted_start();
+                display_candidate.observe(&event.event);
+                match event.event {
+                    EnrichedModelEvent::Legacy(ModelEvent::Text(delta)) => {
+                        text_delta_bytes = text_delta_bytes.saturating_add(delta.len());
+                        if text_delta_bytes > MAX_RESPONSE_BYTES
+                            || text_len.saturating_add(delta.len()) > MAX_RESPONSE_BYTES
+                        {
                             return Err(Error::Model("response exceeds size limit".into()));
                         }
+                        let slot = match legacy_text_slot {
+                            Some(slot) => slot,
+                            None => {
+                                if legacy_text_segments >= MAX_LEGACY_TEXT_SEGMENTS {
+                                    return Err(Error::Model("too many text segments".into()));
+                                }
+                                legacy_text_segments += 1;
+                                let slot = text_parts.len();
+                                text_parts.push(String::new());
+                                legacy_text_slot = Some(slot);
+                                slot
+                            }
+                        };
+                        text_parts[slot].push_str(&delta);
+                        text_len += delta.len();
+                        message_update!(AssistantMessageUpdate::TextDelta {
+                            content_index: None,
+                            delta: delta.clone()
+                        });
                         observer(Notification::Text(&delta));
-                        content.push_str(&delta);
                     }
-                    ModelEvent::Reasoning(delta) => {
+                    EnrichedModelEvent::TextStart { index } => {
+                        legacy_text_slot = None;
+                        if !text_item_ids.contains_key(&index) {
+                            if text_item_ids.len() >= MAX_ENRICHED_ITEMS {
+                                return Err(Error::Model("too many text items".into()));
+                            }
+                            text_item_ids.insert(index, text_parts.len());
+                            text_parts.push(String::new());
+                        }
+                        message_update!(AssistantMessageUpdate::TextStart {
+                            content_index: index
+                        });
+                        with_text_event_metadata(TextEventMetadata::Start { index }, || {
+                            observer(Notification::Text(""))
+                        });
+                    }
+                    EnrichedModelEvent::TextDelta { index, delta } => {
+                        legacy_text_slot = None;
+                        text_delta_bytes = text_delta_bytes.saturating_add(delta.len());
+                        if text_delta_bytes > MAX_RESPONSE_BYTES {
+                            return Err(Error::Model("response exceeds size limit".into()));
+                        }
+                        let slot = match text_item_ids.get(&index) {
+                            Some(slot) => *slot,
+                            None => {
+                                if text_item_ids.len() >= MAX_ENRICHED_ITEMS {
+                                    return Err(Error::Model("too many text items".into()));
+                                }
+                                let slot = text_parts.len();
+                                text_parts.push(String::new());
+                                text_item_ids.insert(index, slot);
+                                slot
+                            }
+                        };
+                        if text_len.saturating_add(delta.len()) > MAX_RESPONSE_BYTES {
+                            return Err(Error::Model("response exceeds size limit".into()));
+                        }
+                        text_parts[slot].push_str(&delta);
+                        text_len += delta.len();
+                        message_update!(AssistantMessageUpdate::TextDelta {
+                            content_index: Some(index),
+                            delta: delta.clone(),
+                        });
+                        with_text_event_metadata(TextEventMetadata::Delta { index }, || {
+                            observer(Notification::Text(&delta))
+                        });
+                    }
+                    EnrichedModelEvent::TextEnd {
+                        index,
+                        content: final_content,
+                    } => {
+                        legacy_text_slot = None;
+                        text_final_bytes = text_final_bytes.saturating_add(final_content.len());
+                        if text_final_bytes > MAX_RESPONSE_BYTES {
+                            return Err(Error::Model("text items exceed size limit".into()));
+                        }
+                        let slot = match text_item_ids.get(&index) {
+                            Some(slot) => *slot,
+                            None => {
+                                if text_item_ids.len() >= MAX_ENRICHED_ITEMS {
+                                    return Err(Error::Model("too many text items".into()));
+                                }
+                                let slot = text_parts.len();
+                                text_parts.push(String::new());
+                                text_item_ids.insert(index, slot);
+                                slot
+                            }
+                        };
+                        if text_len
+                            .saturating_sub(text_parts[slot].len())
+                            .saturating_add(final_content.len())
+                            > MAX_RESPONSE_BYTES
+                        {
+                            return Err(Error::Model("response exceeds size limit".into()));
+                        }
+                        text_len = text_len - text_parts[slot].len() + final_content.len();
+                        text_parts[slot] = final_content.clone();
+                        message_update!(AssistantMessageUpdate::TextEnd {
+                            content_index: index,
+                            content: final_content.clone(),
+                        });
+                        with_text_event_metadata(
+                            TextEventMetadata::End {
+                                index,
+                                content: final_content,
+                            },
+                            || observer(Notification::Text("")),
+                        );
+                    }
+                    EnrichedModelEvent::Legacy(ModelEvent::Reasoning(delta)) => {
                         reasoning_delta_bytes = reasoning_delta_bytes.saturating_add(delta.len());
                         if reasoning_delta_bytes <= MAX_RESPONSE_BYTES {
+                            message_update!(AssistantMessageUpdate::ThinkingDelta {
+                                content_index: None,
+                                delta: delta.clone()
+                            });
                             observer(Notification::Reasoning(&delta));
                         }
                     }
-                    ModelEvent::ToolCallDelta(delta) => {
+                    EnrichedModelEvent::ReasoningDelta { index, delta } => {
+                        reasoning_item_ids.insert(index);
+                        if reasoning_item_ids.len() > MAX_ENRICHED_ITEMS {
+                            return Err(Error::Model("too many reasoning items".into()));
+                        }
+                        reasoning_delta_bytes = reasoning_delta_bytes.saturating_add(delta.len());
+                        if reasoning_delta_bytes <= MAX_RESPONSE_BYTES {
+                            observed_reasoning
+                                .entry(index)
+                                .or_default()
+                                .push_str(&delta);
+                            message_update!(AssistantMessageUpdate::ThinkingDelta {
+                                content_index: Some(index),
+                                delta: delta.clone(),
+                            });
+                            with_reasoning_event_metadata(
+                                ReasoningEventMetadata::Delta { index },
+                                || observer(Notification::Reasoning(&delta)),
+                            );
+                        }
+                    }
+                    EnrichedModelEvent::ReasoningStart { index } => {
+                        reasoning_item_ids.insert(index);
+                        if reasoning_item_ids.len() > MAX_ENRICHED_ITEMS {
+                            return Err(Error::Model("too many reasoning items".into()));
+                        }
+                        message_update!(AssistantMessageUpdate::ThinkingStart {
+                            content_index: index,
+                            redacted: redacted_start,
+                        });
+                        with_redacted_reasoning_start(redacted_start, || {
+                            with_reasoning_event_metadata(
+                                ReasoningEventMetadata::Start { index },
+                                || observer(Notification::Reasoning("")),
+                            );
+                        });
+                    }
+                    EnrichedModelEvent::ReasoningEnd { index, content } => {
+                        reasoning_item_ids.insert(index);
+                        reasoning_final_bytes = reasoning_final_bytes.saturating_add(content.len());
+                        if reasoning_item_ids.len() > MAX_ENRICHED_ITEMS {
+                            return Err(Error::Model("reasoning items exceed size limit".into()));
+                        }
+                        // Always close the item. If the final-content budget is
+                        // exhausted, use only deltas already delivered for this item.
+                        let observed = observed_reasoning.remove(&index).unwrap_or_default();
+                        let content = if reasoning_final_bytes <= MAX_RESPONSE_BYTES {
+                            content
+                        } else {
+                            observed
+                        };
+                        message_update!(AssistantMessageUpdate::ThinkingEnd {
+                            content_index: index,
+                            content: content.clone(),
+                        });
+                        with_reasoning_event_metadata(
+                            ReasoningEventMetadata::End { index, content },
+                            || observer(Notification::Reasoning("")),
+                        );
+                    }
+                    EnrichedModelEvent::Legacy(ModelEvent::ToolCallDelta(delta)) => {
                         tool_delta_bytes = tool_delta_bytes.saturating_add(
                             std::mem::size_of_val(&delta.index)
                                 + delta.id.len()
@@ -999,11 +3626,14 @@ impl Agent<'_> {
                                 + delta.arguments.len(),
                         );
                         if retain_reply && tool_delta_bytes <= MAX_RESPONSE_BYTES {
+                            message_update!(AssistantMessageUpdate::ToolCallDelta {
+                                tool_call: delta.clone()
+                            });
                             observer(Notification::ToolCallDelta(&delta));
                         }
                     }
-                    ModelEvent::Metadata(update) => metadata = update,
-                    ModelEvent::Complete { calls, usage } => {
+                    EnrichedModelEvent::Legacy(ModelEvent::Metadata(update)) => metadata = update,
+                    EnrichedModelEvent::Legacy(ModelEvent::Complete { calls, usage }) => {
                         let mut seen = HashSet::new();
                         let mut invocations = Vec::with_capacity(calls.len());
                         if calls.len() > 64 {
@@ -1025,7 +3655,7 @@ impl Agent<'_> {
                         }
                         return Ok(Reply {
                             request_id,
-                            content: std::mem::take(&mut content),
+                            content: text_parts.concat(),
                             invocations,
                             usage,
                             truncated: metadata.finish_reason.as_deref() == Some("length"),
@@ -1035,12 +3665,72 @@ impl Agent<'_> {
             }
             Err(Error::Model("stream ended before completion".into()))
         };
-        let result = tokio::select! {
+        let mut result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(Error::Cancelled),
-            result = tokio::time::timeout(self.limits.model_timeout, collect) =>
+            result = platform_time::timeout(self.limits.model_timeout, collect) =>
                 result.unwrap_or_else(|_| Err(Error::RetryableModel("request timed out".into()))),
         };
+        if let Some(hooks) = response_hooks {
+            hooks.report_errors(observer);
+        }
+        metadata.assistant_text_edited = false;
+        if let Some(mut hooks) = message_hooks {
+            match &mut result {
+                Ok(reply) => {
+                    let calls: Vec<_> = reply
+                        .invocations
+                        .iter()
+                        .map(|invocation| invocation.call.clone())
+                        .collect();
+                    // A complete provider response must be journaled consistently.
+                    // Finish the bounded edits even if cancellation arrived while observing.
+                    let edited = hooks
+                        .end(
+                            &reply.content,
+                            &calls,
+                            crate::MessageStatus::Complete,
+                            MAX_RESPONSE_BYTES,
+                        )
+                        .await;
+                    if let Some(content) = edited {
+                        reply.content = content;
+                        metadata.replay = crate::context_replay::replace_assistant_replay_text(
+                            &metadata,
+                            &reply.content,
+                        );
+                        metadata.assistant_text_edited = true;
+                    }
+                }
+                Err(error) => {
+                    let status = if matches!(error, Error::Cancelled) {
+                        crate::MessageStatus::Aborted
+                    } else {
+                        crate::MessageStatus::Failed
+                    };
+                    let partial = text_parts.concat();
+                    hooks.fail(&partial, status, MAX_RESPONSE_BYTES).await;
+                }
+            }
+            hooks.report_errors(observer);
+        }
+        let content = if result.is_ok() {
+            String::new()
+        } else {
+            text_parts.concat()
+        };
+        if retain_reply && result.is_err() {
+            let is_overflow = matches!(&result,
+                Err(Error::Model(message) | Error::RetryableModel(message))
+                    if crate::retry::context_overflow_error(message));
+            // Persist only the host's classification, never provider error text.
+            // A provider-supplied reason must not forge this recovery marker.
+            if is_overflow {
+                metadata.finish_reason = Some("pi-rs:context-overflow".into());
+            } else if metadata.finish_reason.as_deref() == Some("pi-rs:context-overflow") {
+                metadata.finish_reason = None;
+            }
+        }
         let (usage, failure) = match &result {
             Ok(reply) => (
                 reply.usage.map_or(
@@ -1060,25 +3750,78 @@ impl Agent<'_> {
                 }),
             ),
         };
-        commit(
-            session,
-            Event::ModelFinished {
-                request_id,
-                metadata: metadata.clone(),
-                usage: usage.clone(),
-                failure,
-                partial: content,
-                reply: advertised_tools.and_then(|advertised_tools| {
-                    result.as_ref().ok().map(|reply| RecordedReply {
-                        content: reply.content.clone(),
-                        invocations: reply.invocations.clone(),
-                        advertised_tools,
-                        max_output_tokens: allowance,
-                    })
-                }),
+        // Only turn replies are displayable. Summary requests can contain
+        // private prompt material and must never enter the RPC transcript.
+        if retain_reply && matches!(result, Err(Error::Cancelled)) && !content.is_empty() {
+            commit(
+                session,
+                Event::SourceEntry {
+                    format: "pi-rs:aborted-turn-partial".into(),
+                    entry: serde_json::json!({"requestId": request_id}),
+                },
+                observer,
+            )?;
+        }
+        let display_metadata = if retain_reply
+            && !metadata.assistant_text_edited
+            && metadata.provider_api == Some(crate::ModelApi::AnthropicMessages)
+            && metadata.reasoning.is_none()
+            && metadata.replay.is_none()
+        {
+            result.as_ref().ok().and_then(|reply| {
+                display_candidate.finish(
+                    &reply.content,
+                    reply
+                        .invocations
+                        .iter()
+                        .map(|invocation| invocation.call.clone()),
+                )
+            })
+        } else {
+            None
+        };
+        let completion = Event::ModelFinished {
+            request_id,
+            metadata: metadata.clone(),
+            usage: usage.clone(),
+            failure,
+            // A completed summary must survive interruption between the
+            // billable response and the compaction commit. Turn replies
+            // already use RecordedReply for that purpose.
+            partial: if retain_reply {
+                content
+            } else {
+                match &result {
+                    Ok(reply)
+                        if self.registry.extensions.is_empty()
+                            && !reply.truncated
+                            && reply.invocations.is_empty()
+                            && !reply.content.trim().is_empty()
+                            && reply.content.len() <= 64 * 1024 =>
+                    {
+                        reply.content.clone()
+                    }
+                    Ok(_) => String::new(),
+                    Err(_) => content,
+                }
             },
-            observer,
-        )?;
+            reply: advertised_tools.and_then(|advertised_tools| {
+                result.as_ref().ok().map(|reply| RecordedReply {
+                    content: reply.content.clone(),
+                    invocations: reply.invocations.clone(),
+                    advertised_tools,
+                    max_output_tokens: allowance,
+                })
+            }),
+        };
+        let record_id = session
+            .append_with_advisory_metadata(completion, display_metadata)?
+            .id;
+        let record_metadata = session.record_metadata(record_id).cloned();
+        let record = &session.records()[record_id as usize - 1];
+        with_record_event_metadata(record_id, record_metadata, || {
+            observer(Notification::Committed(record));
+        });
         self.settle_usage(request_id, &usage, &metadata).await?;
         Ok(ReplyAttempt { outcome: result })
     }
@@ -1089,7 +3832,7 @@ impl Agent<'_> {
         usage: &UsageReport,
         metadata: &ModelMetadata,
     ) -> Result<()> {
-        tokio::time::timeout(
+        platform_time::timeout(
             self.limits.model_timeout,
             self.model
                 .record_usage_with_metadata(request_id, usage, metadata),
@@ -1103,6 +3846,7 @@ impl Agent<'_> {
         session: &mut Session,
         invocations: &[Invocation],
         states: &ExtensionStates,
+        cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
         let observe_tools = self.registry.extensions.iter().any(|extension| {
@@ -1110,7 +3854,8 @@ impl Agent<'_> {
         });
         for invocation in invocations {
             if observe_tools {
-                self.observe_lifecycle(
+                self.observe_active_lifecycle(
+                    session,
                     crate::LifecycleEvent::ToolExecutionStart {
                         tool_call_id: invocation.call.id.clone(),
                         tool_name: invocation.call.name.clone(),
@@ -1119,10 +3864,10 @@ impl Agent<'_> {
                         parent_tool_call_id: None,
                     },
                     states,
-                    None,
+                    cancel,
                     observer,
                 )
-                .await;
+                .await?;
             }
             let outcome = Outcome::Failed(format!(
                 "Tool call \"{}\" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.",
@@ -1138,7 +3883,8 @@ impl Agent<'_> {
                 observer,
             )?;
             if observe_tools {
-                self.observe_lifecycle(
+                self.observe_active_lifecycle(
+                    session,
                     crate::LifecycleEvent::ToolExecutionEnd {
                         tool_call_id: invocation.call.id.clone(),
                         tool_name: invocation.call.name.clone(),
@@ -1148,410 +3894,13 @@ impl Agent<'_> {
                         parent_tool_call_id: None,
                     },
                     states,
-                    None,
+                    cancel,
                     observer,
                 )
-                .await;
+                .await?;
             }
         }
         Ok(())
-    }
-
-    async fn tool_batch<T: Into<AgentInput> + Send>(
-        &self,
-        session: &mut Session,
-        invocations: &[Invocation],
-        scope: &DispatchScope<'_>,
-        states: &mut ExtensionStates,
-        observer: &mut Observer<'_>,
-        mut inputs: Option<&mut mpsc::Receiver<T>>,
-    ) -> Result<()> {
-        let cancel = scope.cancellation;
-        let observe_tools = self.registry.extensions.iter().any(|extension| {
-            extension.handles_lifecycle() && extension.handles_tool_execution_lifecycle()
-        });
-        let observe_progress = self.registry.extensions.iter().any(|extension| {
-            extension.handles_lifecycle()
-                && extension.handles_tool_execution_lifecycle()
-                && extension.handles_tool_execution_updates()
-        });
-        let parallel = |inv: &Invocation| {
-            self.registry
-                .tools
-                .get(&inv.call.name)
-                .is_some_and(|tool| tool.tool.execution() == ToolExecution::ParallelRead)
-        };
-        let mut remaining = invocations;
-        while let Some((first, rest)) = remaining.split_first() {
-            // Only consecutive read-only tools overlap. Writes and job dispatches are barriers.
-            let count = if parallel(first) {
-                1 + rest.iter().take(7).take_while(|inv| parallel(inv)).count()
-            } else {
-                1
-            };
-            let (group, next) = remaining.split_at(count);
-            let mut prepared = Vec::with_capacity(count);
-            let mut parents = Vec::with_capacity(count);
-            for invocation in group {
-                let parent = if observe_tools {
-                    tool_parent_call_id(session, invocation.operation_id)
-                } else {
-                    None
-                };
-                if observe_tools {
-                    self.observe_lifecycle(
-                        crate::LifecycleEvent::ToolExecutionStart {
-                            tool_call_id: invocation.call.id.clone(),
-                            tool_name: invocation.call.name.clone(),
-                            args: crate::parse_tool_arguments(&invocation.call.arguments)
-                                .unwrap_or(serde_json::Value::Null),
-                            parent_tool_call_id: parent.clone(),
-                        },
-                        states,
-                        Some(cancel),
-                        observer,
-                    )
-                    .await;
-                }
-                parents.push(parent);
-                let preparation = self.prepare_tool(invocation, scope.advertised, states, cancel);
-                tokio::pin!(preparation);
-                let preparation = loop {
-                    tokio::select! {
-                        result = &mut preparation => break result?,
-                        Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
-                    }
-                };
-                prepared.push(preparation);
-            }
-            if cancel.is_cancelled() {
-                return Err(Error::Cancelled);
-            }
-            let mut dispatches = Vec::new();
-            for (invocation, preparation) in group.iter().zip(&prepared) {
-                if matches!(preparation, Preparation::Ready { .. }) {
-                    if cancel.is_cancelled() {
-                        for operation_id in dispatches {
-                            commit(
-                                session,
-                                Event::ToolFinished {
-                                    operation_id,
-                                    outcome: Outcome::Skipped(
-                                        "cancelled before the parallel group dispatched".into(),
-                                    ),
-                                    states: ExtensionStates::new(),
-                                },
-                                observer,
-                            )?;
-                        }
-                        return Err(Error::Cancelled);
-                    }
-                    commit(
-                        session,
-                        Event::ToolStarted {
-                            operation_id: invocation.operation_id,
-                        },
-                        observer,
-                    )?;
-                    dispatches.push(invocation.operation_id);
-                }
-            }
-            let (requests, mut incoming) = mpsc::channel(32);
-            let (updates, mut progress) = mpsc::channel(32);
-            let (finish_progress, mut finish_signal) = oneshot::channel();
-            let progress_registry = self.registry.clone();
-            let progress_states = states.clone();
-            let progress_cancel = cancel.clone();
-            let progress_timeout = self.limits.model_timeout;
-            let progress_worker = observe_progress.then(|| tokio::spawn(async move {
-                let mut errors = Vec::new();
-                let mut closing = false;
-                loop {
-                    let event = tokio::select! {
-                        _ = &mut finish_signal, if !closing => {
-                            closing = true;
-                            progress.close();
-                            continue;
-                        }
-                        event = progress.recv() => match event { Some(event) => event, None => break },
-                    };
-                    let mut collect = |notification: Notification<'_>| {
-                        if let Notification::ExtensionLifecycleError { extension, event, message } = notification {
-                            errors.push((extension.to_owned(), event, message.to_owned()));
-                        }
-                    };
-                    tokio::select! {
-                        biased;
-                        _ = progress_cancel.cancelled() => {},
-                        _ = crate::lifecycle::notify(&progress_registry, event, &progress_states, progress_timeout, &mut collect) => {},
-                    }
-                }
-                errors
-            }));
-            let specs = Arc::new(self.registry.tool_specs());
-            let invocations =
-                group
-                    .iter()
-                    .zip(prepared)
-                    .zip(&parents)
-                    .map(|((invocation, prepared), parent)| {
-                        let cancellation = match &prepared {
-                            Preparation::Ready { context, .. } => context.cancellation.clone(),
-                            Preparation::Skipped(_) => cancel.child_token(),
-                        };
-                        let host = Arc::new(NestedHost {
-                            requests: requests.clone(),
-                            specs: specs.clone(),
-                            parent_operation: invocation.operation_id,
-                            cancellation,
-                            depth: scope.depth,
-                            call_count: scope.call_count.clone(),
-                            ui: self.registry.ui.clone(),
-                            progress: observe_progress.then(|| ProgressReporter {
-                                sender: updates.clone(),
-                                tool_call_id: invocation.call.id.clone(),
-                                tool_name: invocation.call.name.clone(),
-                                args: crate::parse_tool_arguments(&invocation.call.arguments)
-                                    .unwrap_or(serde_json::Value::Null),
-                                parent_tool_call_id: parent.clone(),
-                            }),
-                        });
-                        let ran = matches!(&prepared, Preparation::Ready { .. });
-                        async move {
-                            let started = std::time::Instant::now();
-                            let reply = self.invoke(prepared, cancel, host, scope.depth > 0).await;
-                            let duration = ran.then(|| {
-                                started.elapsed().as_millis().min(u64::MAX as u128) as u64
-                            });
-                            (reply, duration)
-                        }
-                    });
-            let outcomes = futures_util::future::join_all(invocations);
-            tokio::pin!(outcomes);
-            let mut nested_error = None;
-            let mut pending_requests = VecDeque::<NestedRequest>::new();
-            let outcomes = loop {
-                tokio::select! {
-                    completed = &mut outcomes => break completed,
-                    Some(input) = receive_input(&mut inputs) => queue_input(session, input.into(), observer)?,
-                    Some(request) = async {
-                        if pending_requests.is_empty() {
-                            pending_requests.extend(incoming.recv().await?);
-                        }
-                        pending_requests.pop_front()
-                    } => {
-                        let parent = request.parent_operation;
-                        let mut batch = vec![request];
-                        while batch.len() < 8 {
-                            if pending_requests.is_empty() {
-                                match incoming.try_recv() {
-                                    Ok(requests) => pending_requests.extend(requests),
-                                    Err(_) => break,
-                                }
-                            }
-                            let request = pending_requests.pop_front().expect("queued nested request");
-                            if request.parent_operation != parent {
-                                pending_requests.push_front(request);
-                                break;
-                            }
-                            batch.push(request);
-                        }
-                        let nested = self.nested_tools(session, batch, states, observer, inputs.as_deref_mut());
-                        tokio::pin!(nested);
-                        tokio::select! {
-                            result = &mut nested => {
-                                if let Err(error) = result { nested_error.get_or_insert(error); }
-                            },
-                            completed = &mut outcomes => {
-                                if let Err(error) = nested.await { nested_error.get_or_insert(error); }
-                                break completed;
-                            }
-                        }
-                    }
-                }
-            };
-            let _ = finish_progress.send(());
-            if let Some(worker) = progress_worker {
-                match worker.await {
-                    Ok(errors) => {
-                        for (extension, event, message) in &errors {
-                            observer(Notification::ExtensionLifecycleError {
-                                extension,
-                                event,
-                                message,
-                            });
-                        }
-                    }
-                    Err(error) => observer(Notification::ExtensionLifecycleError {
-                        extension: "tool-progress",
-                        event: "tool_execution_update",
-                        message: &error.to_string(),
-                    }),
-                }
-            }
-            let mut first_error = None;
-            // All started outcomes are recorded even if one parallel member failed.
-            for ((invocation, (mut outcome, duration)), parent) in
-                group.iter().zip(outcomes).zip(parents)
-            {
-                self.transform_tool_result(invocation, &mut outcome, states, cancel, observer)
-                    .await;
-                let finished = self.finish_tool(session, invocation, outcome, states, observer);
-                if observe_tools
-                    && let Some(result) =
-                        session
-                            .records()
-                            .iter()
-                            .rev()
-                            .find_map(|record| match &record.event {
-                                Event::ToolFinished {
-                                    operation_id,
-                                    outcome,
-                                    ..
-                                } if *operation_id == invocation.operation_id => {
-                                    Some(outcome.clone())
-                                }
-                                _ => None,
-                            })
-                {
-                    let is_error = matches!(
-                        &result,
-                        Outcome::Failed(_) | Outcome::Skipped(_) | Outcome::Unknown(_)
-                    ) || matches!(&result, Outcome::Structured { data, .. } if data["isError"] == true);
-                    self.observe_lifecycle(
-                        crate::LifecycleEvent::ToolExecutionEnd {
-                            tool_call_id: invocation.call.id.clone(),
-                            tool_name: invocation.call.name.clone(),
-                            result,
-                            is_error,
-                            duration_ms: duration,
-                            parent_tool_call_id: parent,
-                        },
-                        states,
-                        None,
-                        observer,
-                    )
-                    .await;
-                }
-                if let Err(error) = finished
-                    && (first_error.is_none()
-                        || (matches!(first_error, Some(Error::PendingOperation(_)))
-                            && !matches!(error, Error::PendingOperation(_))))
-                {
-                    first_error = Some(error);
-                }
-            }
-            match first_error {
-                Some(Error::PendingOperation(_)) => {
-                    self.poll_pending(session, states, cancel, observer).await?
-                }
-                Some(error) => return Err(error),
-                None => {}
-            }
-            if let Some(error) = nested_error {
-                return Err(error);
-            }
-            remaining = next;
-        }
-        Ok(())
-    }
-
-    async fn nested_tools<T: Into<AgentInput> + Send>(
-        &self,
-        session: &mut Session,
-        requests: Vec<NestedRequest>,
-        states: &mut ExtensionStates,
-        observer: &mut Observer<'_>,
-        inputs: Option<&mut mpsc::Receiver<T>>,
-    ) -> Result<()> {
-        let invocations: Vec<_> = requests
-            .iter()
-            .map(|request| {
-                let operation_id = Uuid::new_v4();
-                Invocation {
-                    operation_id,
-                    call: crate::ToolCall {
-                        id: operation_id.to_string(),
-                        name: request.name.clone(),
-                        arguments: request.arguments.to_string(),
-                    },
-                }
-            })
-            .collect();
-        let execute = async {
-            for (request, invocation) in requests.iter().zip(&invocations) {
-                commit(
-                    session,
-                    Event::ToolPlanned {
-                        invocation: invocation.clone(),
-                        parent_operation: request.parent_operation,
-                    },
-                    observer,
-                )?;
-            }
-            let advertised = self.registry.tools.keys().cloned().collect();
-            Box::pin(self.tool_batch(
-                session,
-                &invocations,
-                &DispatchScope {
-                    cancellation: &requests[0].cancellation,
-                    advertised: &advertised,
-                    depth: requests[0].depth,
-                    call_count: requests[0].call_count.clone(),
-                },
-                states,
-                observer,
-                inputs,
-            ))
-            .await
-        }
-        .await;
-        if execute.is_err() {
-            requests[0].cancellation.cancel();
-        }
-        for (request, invocation) in requests.into_iter().zip(invocations) {
-            let operation_id = invocation.operation_id;
-            let operation = session
-                .operations()
-                .into_iter()
-                .find(|(current, _)| current.operation_id == operation_id);
-            if matches!(
-                operation.as_ref().map(|(_, state)| state),
-                Some(OperationState::Planned)
-            ) {
-                let reason = execute
-                    .as_ref()
-                    .err()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "nested dispatch did not start".into());
-                commit(
-                    session,
-                    Event::ToolFinished {
-                        operation_id,
-                        outcome: Outcome::Skipped(reason),
-                        states: ExtensionStates::new(),
-                    },
-                    observer,
-                )?;
-            }
-            let outcome = session
-                .operations()
-                .into_iter()
-                .find_map(|(current, state)| {
-                    if current.operation_id != operation_id {
-                        return None;
-                    }
-                    match state {
-                        OperationState::Finished(outcome) => Some(outcome),
-                        _ => None,
-                    }
-                })
-                .unwrap_or_else(|| {
-                    Outcome::Unknown("nested tool produced no durable result".into())
-                });
-            let _ = request.reply.send(outcome);
-        }
-        execute
     }
 
     async fn poll_pending(
@@ -1560,6 +3909,7 @@ impl Agent<'_> {
         states: &mut ExtensionStates,
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
+        replies: Option<&HashMap<Uuid, ReplySnapshot>>,
     ) -> Result<()> {
         for (invocation, state) in session.operations() {
             let OperationState::Finished(Outcome::Pending { reference }) = state else {
@@ -1568,118 +3918,269 @@ impl Agent<'_> {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let operation_id = invocation.operation_id;
-            let tool = self
-                .registry
-                .tools
-                .get(&invocation.call.name)
-                .ok_or(Error::PendingOperation(operation_id))?;
-            if !tool.tool.can_poll() {
-                return Err(Error::PendingOperation(operation_id));
+            let starts = session
+                .branch()
+                .into_iter()
+                .filter(|record| matches!(&record.event, Event::ToolStarted { operation_id, .. } if *operation_id == invocation.operation_id))
+                .collect::<Vec<_>>();
+            if starts.len() > 1 {
+                return Err(Error::PendingOperation(invocation.operation_id));
             }
-            let arguments = crate::parse_tool_arguments(&invocation.call.arguments)
-                .map_err(|_| Error::PendingOperation(operation_id))?;
-            let arguments = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.prepare_arguments(arguments)) =>
-                    result.ok().and_then(std::result::Result::ok).ok_or(Error::PendingOperation(operation_id))?,
-            };
-            if arguments.to_string().len() > 16 * 1024 * 1024
-                || !tool.validator.is_valid(&arguments)
-            {
-                return Err(Error::PendingOperation(operation_id));
-            }
-            let context = ToolContext {
-                operation_id,
-                cancellation: cancel.child_token(),
-            };
-            if self
-                .authorize(&invocation.call.name, &arguments, &context, states)
+            let marked = starts.first().is_some_and(|record| {
+                matches!(
+                    &record.event,
+                    Event::ToolStarted {
+                        tool_execution: Some(_),
+                        ..
+                    }
+                )
+            });
+            let prepared = if marked {
+                let tool = self
+                    .registry
+                    .tools
+                    .get(&invocation.call.name)
+                    .filter(|tool| tool.tool.can_poll())
+                    .cloned()
+                    .ok_or(Error::PendingOperation(invocation.operation_id))?;
+                let identity = turn_scheduler::turn_recovery_identity(&tool)
+                    .map_err(|_| Error::PendingOperation(invocation.operation_id))?;
+                let arguments = session
+                    .recorded_tool_execution(starts[0].id, &tool.owner, &tool.spec, &identity)
+                    .map_err(|_| Error::PendingOperation(invocation.operation_id))?
+                    .ok_or(Error::PendingOperation(invocation.operation_id))?;
+                (tool, arguments)
+            } else {
+                if starts.first().is_some_and(|record| {
+                    session
+                        .record_metadata(record.id)
+                        .is_some_and(|metadata| metadata.get("toolExecution").is_some())
+                }) {
+                    return Err(Error::PendingOperation(invocation.operation_id));
+                }
+                // A request with a durable decision must not be recovered by
+                // re-preparing its raw arguments if its start metadata is lost.
+                let branch = session.branch();
+                let origins = branch
+                    .iter()
+                    .flat_map(|record| {
+                        let (items, request_id, nested): (&[Invocation], Option<Uuid>, bool) =
+                            match &record.event {
+                                Event::Assistant {
+                                    invocations,
+                                    request_id,
+                                    ..
+                                } => (invocations, *request_id, false),
+                                Event::ToolPlanned { invocation, .. } => {
+                                    (std::slice::from_ref(invocation), None, true)
+                                }
+                                _ => (&[], None, false),
+                            };
+                        items
+                            .iter()
+                            .filter(move |item| item.operation_id == invocation.operation_id)
+                            .map(move |item| {
+                                (
+                                    record.id,
+                                    item,
+                                    request_id,
+                                    record.version,
+                                    nested,
+                                    record.run_id,
+                                )
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                if origins.len() != 1
+                    || origins[0].1 != &invocation
+                    || starts.first().is_some_and(|start| origins[0].0 >= start.id)
+                {
+                    return Err(Error::PendingOperation(invocation.operation_id));
+                }
+                let request_id = if let Some(id) = origins[0].2 {
+                    let requests = branch.iter().filter(|record| {
+                        matches!(&record.event, Event::ModelRequested { request_id: Some(request), .. } if *request == id)
+                    }).collect::<Vec<_>>();
+                    if requests.len() > 1
+                        || requests.first().is_some_and(|request| {
+                            request.id >= origins[0].0 || request.run_id != origins[0].5
+                        })
+                    {
+                        return Err(Error::PendingOperation(invocation.operation_id));
+                    }
+                    (!requests.is_empty()).then_some(id)
+                } else {
+                    None
+                };
+                if request_id.is_none() && !origins[0].4 {
+                    let old_record = origins[0].3 < crate::journal::TOOL_DECISION_JOURNAL_VERSION;
+                    let imported = if old_record {
+                        false
+                    } else {
+                        session
+                            .validated_pi_conversion_counts()
+                            .map_err(|_| Error::PendingOperation(invocation.operation_id))?
+                            .into_iter()
+                            .any(|(source, count)| {
+                                source < origins[0].0
+                                    && origins[0].0 <= source.saturating_add(count)
+                            })
+                    };
+                    if !old_record && !imported {
+                        return Err(Error::PendingOperation(invocation.operation_id));
+                    }
+                }
+                if let Some(request_id) = request_id {
+                    match session
+                        .active_tool_decision(request_id)
+                        .map_err(|_| Error::PendingOperation(invocation.operation_id))?
+                    {
+                        crate::RecordedToolDecision::Legacy => {}
+                        crate::RecordedToolDecision::Current(snapshot) => {
+                            let start = starts
+                                .first()
+                                .ok_or(Error::PendingOperation(invocation.operation_id))?;
+                            let tool = self
+                                .registry
+                                .tools
+                                .get(&invocation.call.name)
+                                .ok_or(Error::PendingOperation(invocation.operation_id))?;
+                            let (proven, _) = session
+                                .execution_provenance(
+                                    request_id,
+                                    invocation.operation_id,
+                                    start.id,
+                                    start.run_id,
+                                    &tool.owner,
+                                    &tool.spec,
+                                )
+                                .map_err(|_| Error::PendingOperation(invocation.operation_id))?;
+                            if proven != invocation {
+                                return Err(Error::PendingOperation(invocation.operation_id));
+                            }
+                            // active_tool_decision already verified these digests
+                            // against the separately recorded request marker.
+                            let validated = snapshot
+                                .validate_recorded(
+                                    snapshot.context(),
+                                    snapshot.request_sha256(),
+                                    snapshot.dispatch_sha256(),
+                                    snapshot.binding_sha256(),
+                                )
+                                .map_err(|_| Error::PendingOperation(invocation.operation_id))?;
+                            if !validated.effective_tools().iter().any(|entry| {
+                                entry.spec.name == invocation.call.name
+                                    && match entry.sampling {
+                                        crate::EffectiveToolSampling::Unconstrained => true,
+                                        crate::EffectiveToolSampling::OpenAiGrammar { .. } => {
+                                            validated.normalized_arguments(&invocation.call).is_ok()
+                                        }
+                                        crate::EffectiveToolSampling::StrictJsonSchema {
+                                            ..
+                                        } => false,
+                                    }
+                            }) {
+                                return Err(Error::PendingOperation(invocation.operation_id));
+                            }
+                        }
+                        crate::RecordedToolDecision::Historical(_) => {
+                            return Err(Error::PendingOperation(invocation.operation_id));
+                        }
+                    }
+                }
+                Self::turn_poll_normalize(
+                    self.registry,
+                    self.limits.tool_timeout,
+                    &invocation,
+                    cancel,
+                )
                 .await?
-                != Decision::Allow
-            {
-                return Err(Error::PendingOperation(operation_id));
-            }
-            let outcome = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.poll(&reference, context)) => result.ok().flatten().ok_or(Error::PendingOperation(operation_id))?,
             };
-            let mut reply = outcome.into();
-            self.transform_tool_result(&invocation, &mut reply, states, cancel, observer)
-                .await;
-            self.finish_tool(session, &invocation, reply, states, observer)?;
+            let (sender, mut incoming) = mpsc::channel(32);
+            let host = Arc::new(LifecycleMessageHost {
+                sender: sender.clone(),
+                idle: false,
+            });
+            let result_host = callback_root_host(
+                session,
+                sender,
+                invocation.operation_id,
+                "recovered_tool_result",
+            );
+            let mut errors = Vec::new();
+            let mut collect = |event: Notification<'_>| {
+                if let Notification::ExtensionLifecycleError {
+                    extension,
+                    event,
+                    message,
+                } = event
+                {
+                    errors.push((extension.to_owned(), event, message.to_owned()));
+                }
+            };
+            let reply = {
+                let future = async {
+                    let outcome = Self::turn_poll_authorize_and_run(
+                        self.registry,
+                        self.limits.tool_timeout,
+                        &invocation,
+                        &reference,
+                        prepared,
+                        states,
+                        cancel,
+                        Some(host.clone()),
+                    )
+                    .await?;
+                    let mut reply = outcome.into();
+                    Self::turn_transform(
+                        self.registry,
+                        self.limits.tool_timeout,
+                        &invocation,
+                        &mut reply,
+                        states,
+                        cancel,
+                        &mut collect,
+                        Some(result_host),
+                    )
+                    .await;
+                    Ok::<_, Error>(reply)
+                };
+                tokio::pin!(future);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some((input, response)) = incoming.recv() => {
+                            match queue_custom_message(session, input, observer) {
+                                Ok(()) => { let _ = response.send(Ok(())); },
+                                Err(error) => { let _ = response.send(Err(error.to_string())); return Err(error); }
+                            }
+                        }
+                        result = &mut future => break result?,
+                    }
+                }
+            };
+            for (extension, event, message) in &errors {
+                observer(Notification::ExtensionLifecycleError {
+                    extension,
+                    event,
+                    message,
+                });
+            }
+            self.finish_tool(
+                session,
+                &invocation,
+                reply,
+                states,
+                observer,
+                replies,
+                false,
+                None,
+            )?;
         }
         Ok(())
     }
 
-    async fn prepare_tool(
-        &self,
-        invocation: &Invocation,
-        advertised: &HashSet<String>,
-        states: &ExtensionStates,
-        cancel: &CancellationToken,
-    ) -> Result<Preparation<'_>> {
-        let call = &invocation.call;
-        let Some(tool) = self
-            .registry
-            .tools
-            .get(&call.name)
-            .filter(|_| advertised.contains(&call.name))
-        else {
-            return Ok(Preparation::Skipped(
-                "tool is not registered or advertised".into(),
-            ));
-        };
-        let args = match crate::parse_tool_arguments(&call.arguments) {
-            Ok(arguments) => arguments,
-            Err(error) => {
-                return Ok(Preparation::Skipped(format!(
-                    "Invalid arguments for tool \"{}\": {error}",
-                    call.name
-                )));
-            }
-        };
-        let args = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(Error::Cancelled),
-            result = tokio::time::timeout(self.limits.tool_timeout, tool.tool.prepare_arguments(args)) => match result {
-                Ok(Ok(arguments)) if arguments.to_string().len() <= 16 * 1024 * 1024 => arguments,
-                Ok(Ok(_)) => return Ok(Preparation::Skipped("prepared arguments exceed size limit".into())),
-                Ok(Err(error)) => return Ok(Preparation::Skipped(format!("argument preparation failed: {error}"))),
-                Err(_) => return Ok(Preparation::Skipped("argument preparation timed out".into())),
-            },
-        };
-        if !tool.validator.is_valid(&args) {
-            return Ok(Preparation::Skipped(
-                "arguments do not match the tool's JSON Schema".into(),
-            ));
-        }
-        let cancellation = cancel.child_token();
-        let guard = cancellation.clone().drop_guard();
-        let context = ToolContext {
-            operation_id: invocation.operation_id,
-            cancellation,
-        };
-        let decision = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(Error::Cancelled),
-            decision = tokio::time::timeout(self.limits.tool_timeout, self.authorize(&call.name, &args, &context, states)) =>
-                decision.map_err(|_| Error::Config("pre-tool hooks timed out".into()))??,
-        };
-        Ok(match decision {
-            Decision::Allow => Preparation::Ready {
-                tool,
-                args,
-                context,
-                state: states.get(&tool.owner).cloned(),
-                guard,
-            },
-            Decision::Deny(reason) => Preparation::Skipped(reason),
-        })
-    }
-
+    #[cfg(test)]
     async fn transform_tool_result(
         &self,
         invocation: &Invocation,
@@ -1688,53 +4189,20 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) {
-        if matches!(
-            reply.outcome,
-            Outcome::Skipped(_) | Outcome::Unknown(_) | Outcome::Pending { .. }
-        ) {
-            return;
-        }
-        for extension in self
-            .registry
-            .extensions
-            .iter()
-            .filter(|item| item.handles_tool_result())
-        {
-            let context = ToolContext {
-                operation_id: invocation.operation_id,
-                cancellation: cancel.child_token(),
-            };
-            let _cancel_on_drop = context.cancellation.clone().drop_guard();
-            let result = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break,
-                result = tokio::time::timeout(self.limits.tool_timeout, extension.tool_result(
-                    &invocation.call, &reply.outcome, &context, states.get(extension.id()),
-                )) => result,
-            };
-            let error = match result {
-                Ok(Ok(Some(outcome)))
-                    if !matches!(
-                        outcome,
-                        Outcome::Skipped(_) | Outcome::Unknown(_) | Outcome::Pending { .. }
-                    ) =>
-                {
-                    reply.outcome = outcome;
-                    continue;
-                }
-                Ok(Ok(None)) => continue,
-                Ok(Ok(Some(_))) => "invalid replacement outcome".to_owned(),
-                Ok(Err(error)) => error,
-                Err(_) => "tool result hook timed out".to_owned(),
-            };
-            observer(Notification::ExtensionLifecycleError {
-                extension: extension.id(),
-                event: "tool_result",
-                message: &error,
-            });
-        }
+        Self::turn_transform(
+            self.registry,
+            self.limits.tool_timeout,
+            invocation,
+            reply,
+            states,
+            cancel,
+            observer,
+            None,
+        )
+        .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_tool(
         &self,
         session: &mut Session,
@@ -1742,6 +4210,9 @@ impl Agent<'_> {
         reply: ToolReply,
         states: &mut ExtensionStates,
         observer: &mut Observer<'_>,
+        replies: Option<&HashMap<Uuid, ReplySnapshot>>,
+        allow_event_metadata: bool,
+        duration_ms: Option<u64>,
     ) -> Result<()> {
         let ToolReply {
             outcome,
@@ -1771,15 +4242,21 @@ impl Agent<'_> {
                     outcome
                 }
             }
-            outcome @ Outcome::Structured { .. } => {
-                let size = outcome.tool_content().len();
+            outcome @ (Outcome::TextResult { .. }
+            | Outcome::TextResultWithStructuredContent { .. }) => {
+                let size = serde_json::to_vec(&outcome)?.len();
                 if size > max_output_bytes {
-                    Outcome::Truncated {
-                        original_bytes: size,
+                    Outcome::TextResult {
+                        output: format!("Tool output omitted ({size} bytes exceeded the limit)."),
+                        details: None,
+                        is_error: outcome.is_error(),
                     }
                 } else {
                     outcome
                 }
+            }
+            outcome @ (Outcome::Structured { .. } | Outcome::StructuredWithDetails { .. }) => {
+                bound_structured_tool_outcome(outcome, max_output_bytes)?
             }
             Outcome::Failed(reason) if reason.len() > max_output_bytes => {
                 Outcome::Failed("failure detail exceeds size limit".into())
@@ -1798,6 +4275,17 @@ impl Agent<'_> {
             outcome => outcome,
         };
         let operation_id = invocation.operation_id;
+        let event_metadata = if allow_event_metadata {
+            self.registry
+                .tools
+                .get(&invocation.call.name)
+                .and_then(|registered| registered.tool.event_structured_content(&outcome))
+                .filter(|value| {
+                    serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= max_output_bytes)
+                })
+        } else {
+            None
+        };
         let waiting = match &outcome {
             Outcome::Unknown(_) => Some(Error::Reconciliation(operation_id)),
             Outcome::Pending { .. } => Some(Error::PendingOperation(operation_id)),
@@ -1805,15 +4293,19 @@ impl Agent<'_> {
         };
         let changes = self.tool_state_changes(&invocation.call.name, &outcome, states, update);
         let persisted = changes.as_ref().cloned().unwrap_or_default();
-        commit(
-            session,
-            Event::ToolFinished {
-                operation_id,
-                outcome,
-                states: persisted,
-            },
-            observer,
-        )?;
+        with_tool_result_event_metadata(operation_id, event_metadata, || {
+            commit_with_reply(
+                session,
+                Event::ToolFinished {
+                    operation_id,
+                    outcome,
+                    states: persisted,
+                },
+                observer,
+                replies,
+                duration_ms,
+            )
+        })?;
         if let Some(error) = waiting {
             return Err(error);
         }
@@ -1856,63 +4348,6 @@ impl Agent<'_> {
             }
         }
         Ok(changes)
-    }
-
-    async fn authorize(
-        &self,
-        name: &str,
-        args: &serde_json::Value,
-        context: &ToolContext,
-        states: &ExtensionStates,
-    ) -> Result<Decision> {
-        for extension in &self.registry.extensions {
-            let decision = hook(
-                extension.as_ref(),
-                extension
-                    .before_tool(name, args, context, states.get(extension.id()))
-                    .await,
-            )?;
-            if decision != Decision::Allow {
-                return Ok(decision);
-            }
-        }
-        Ok(Decision::Allow)
-    }
-
-    async fn invoke(
-        &self,
-        preparation: Preparation<'_>,
-        cancel: &CancellationToken,
-        host: Arc<dyn ToolHost>,
-        programmatic: bool,
-    ) -> ToolReply {
-        let (tool, args, context, state, _guard) = match preparation {
-            Preparation::Ready {
-                tool,
-                args,
-                context,
-                state,
-                guard,
-            } => (tool, args, context, state, guard),
-            Preparation::Skipped(reason) => return Outcome::Skipped(reason).into(),
-        };
-        let invocation = async {
-            if programmatic {
-                tool.tool
-                    .invoke_programmatic(args, context, state.as_ref(), host)
-                    .await
-            } else {
-                tool.tool
-                    .invoke_transaction(args, context, state.as_ref(), host)
-                    .await
-            }
-        };
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Outcome::Unknown("cancelled after dispatch was committed".into()).into(),
-            result = tokio::time::timeout(self.limits.tool_timeout, invocation) =>
-                result.unwrap_or_else(|_| Outcome::Unknown("tool timed out".into()).into()),
-        }
     }
 
     /// Execute a discovered slash command before treating input as model text.
@@ -1973,6 +4408,36 @@ impl Agent<'_> {
         .map(Some)
     }
 
+    /// Dispatch a command with a distinct callback failure for RPC projection.
+    pub fn try_extension_command_rpc(
+        &self,
+        session: &mut Session,
+        input: &str,
+        observer: &mut Observer<'_>,
+    ) -> std::result::Result<Option<bool>, CommandDispatchError> {
+        let (name, arguments) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+        let Some(name) = name.strip_prefix('/') else {
+            return Ok(None);
+        };
+        let Some(command) = self
+            .registry
+            .registered_commands()
+            .into_iter()
+            .find(|command| command.invocation_name == name)
+        else {
+            return Ok(None);
+        };
+        self.extension_command_inner(
+            session,
+            &command.extension_id,
+            &command.name,
+            arguments.trim_start(),
+            observer,
+            CommandInvocation::Rpc,
+        )
+        .map(Some)
+    }
+
     /// Run a host-only extension command against this branch's durable state.
     pub fn extension_command(
         &self,
@@ -1982,7 +4447,15 @@ impl Agent<'_> {
         arguments: &str,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
-        self.extension_command_inner(session, extension_id, command, arguments, observer, false)?;
+        self.extension_command_inner(
+            session,
+            extension_id,
+            command,
+            arguments,
+            observer,
+            CommandInvocation::Host,
+        )
+        .map_err(CommandDispatchError::into_error)?;
         Ok(())
     }
 
@@ -1995,7 +4468,15 @@ impl Agent<'_> {
         arguments: &str,
         observer: &mut Observer<'_>,
     ) -> Result<bool> {
-        self.extension_command_inner(session, extension_id, command, arguments, observer, true)
+        self.extension_command_inner(
+            session,
+            extension_id,
+            command,
+            arguments,
+            observer,
+            CommandInvocation::Trigger,
+        )
+        .map_err(CommandDispatchError::into_error)
     }
 
     fn extension_command_inner(
@@ -2005,8 +4486,8 @@ impl Agent<'_> {
         command: &str,
         arguments: &str,
         observer: &mut Observer<'_>,
-        allow_trigger: bool,
-    ) -> Result<bool> {
+        invocation: CommandInvocation,
+    ) -> std::result::Result<bool, CommandDispatchError> {
         ensure_settled(session.operations())?;
         let extension = self
             .registry
@@ -2017,10 +4498,29 @@ impl Agent<'_> {
             })
             .ok_or_else(|| Error::Config("unknown or disabled extension command".into()))?;
         let states = self.migrate(session, observer)?;
-        let result = hook(
-            extension.as_ref(),
-            extension.command_effects(command, arguments, states.get(extension_id)),
-        )?;
+        let result = if matches!(invocation, CommandInvocation::Rpc) {
+            extension
+                .command_effects_classified(command, arguments, states.get(extension_id))
+                .map_err(|error| match error {
+                    crate::CommandCallbackFailure::Callback(message) => {
+                        CommandDispatchError::Callback {
+                            id: extension_id.into(),
+                            message,
+                        }
+                    }
+                    crate::CommandCallbackFailure::Transport(message) => {
+                        CommandDispatchError::Other(Error::Extension {
+                            id: extension_id.into(),
+                            message,
+                        })
+                    }
+                })?
+        } else {
+            hook(
+                extension.as_ref(),
+                extension.command_effects(command, arguments, states.get(extension_id)),
+            )?
+        };
         let mut trigger = false;
         for action in &result.actions {
             match action {
@@ -2036,10 +4536,11 @@ impl Agent<'_> {
                 trigger = true;
             }
         }
-        if trigger && !allow_trigger {
+        if trigger && matches!(invocation, CommandInvocation::Host) {
             return Err(Error::Config(
                 "extension command requires a host that supports triggering a model turn".into(),
-            ));
+            )
+            .into());
         }
         if let Some(state) = result.state {
             commit(
@@ -2076,6 +4577,49 @@ impl Agent<'_> {
             .map(|_| ())
     }
 
+    /// Compact a supplied summary while servicing asynchronous extension host calls.
+    pub async fn compact_with_host(
+        &self,
+        session: &mut Session,
+        compaction: Compaction,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        ensure_settled(session.operations())?;
+        let states = self.migrate(session, observer)?;
+        self.commit_compaction_with_host::<AgentInput>(
+            session, compaction, &states, None, None, None, cancel, observer, None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Compact while also servicing queue controls submitted during hooks.
+    pub async fn compact_with_host_and_inputs(
+        &self,
+        session: &mut Session,
+        compaction: Compaction,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        inputs: &mut mpsc::Receiver<AgentInput>,
+    ) -> Result<()> {
+        ensure_settled(session.operations())?;
+        let states = self.migrate(session, observer)?;
+        self.commit_compaction_with_host(
+            session,
+            compaction,
+            &states,
+            None,
+            None,
+            None,
+            cancel,
+            observer,
+            Some(inputs),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Commit a caller-supplied summary using configured token retention.
     pub fn compact_configured(
         &self,
@@ -2087,10 +4631,7 @@ impl Agent<'_> {
         let states = self.migrate(session, observer)?;
         let retention = configured_retention(
             session,
-            session
-                .auto_compaction_control()
-                .token_settings()
-                .keep_recent_tokens,
+            self.compaction_tokens(session).keep_recent_tokens,
             1,
         )?;
         self.commit_compaction(
@@ -2104,6 +4645,39 @@ impl Agent<'_> {
             Some(retention),
             observer,
         )
+        .map(|_| ())
+    }
+
+    /// Compact a supplied summary with configured retention and host-aware hooks.
+    pub async fn compact_configured_with_host(
+        &self,
+        session: &mut Session,
+        summary: String,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        ensure_settled(session.operations())?;
+        let states = self.migrate(session, observer)?;
+        let retention = configured_retention(
+            session,
+            self.compaction_tokens(session).keep_recent_tokens,
+            1,
+        )?;
+        self.commit_compaction_with_host::<AgentInput>(
+            session,
+            Compaction {
+                summary,
+                keep_turns: retention.keep_turns,
+            },
+            &states,
+            None,
+            Some(retention),
+            None,
+            cancel,
+            observer,
+            None,
+        )
+        .await
         .map(|_| ())
     }
 
@@ -2141,11 +4715,12 @@ impl Agent<'_> {
         inputs: Option<&mut mpsc::Receiver<T>>,
         instructions: Option<&str>,
     ) -> Result<()> {
+        let mut adapter = |event: Notification<'_>| dispatch_legacy_event(event, observer);
         self.summarize_selected(
             session,
             Some(keep_turns),
             cancel,
-            observer,
+            &mut adapter,
             inputs,
             instructions,
         )
@@ -2161,7 +4736,8 @@ impl Agent<'_> {
         inputs: Option<&mut mpsc::Receiver<T>>,
         instructions: Option<&str>,
     ) -> Result<()> {
-        self.summarize_selected(session, None, cancel, observer, inputs, instructions)
+        let mut adapter = |event: Notification<'_>| dispatch_legacy_event(event, observer);
+        self.summarize_selected(session, None, cancel, &mut adapter, inputs, instructions)
             .await
     }
 
@@ -2219,24 +4795,47 @@ impl Agent<'_> {
         cancel: &CancellationToken,
         observer: &mut Observer<'_>,
     ) -> Result<()> {
+        self.navigate_tree_with_resolution(session, selected, options, cancel, observer, None)
+            .await
+    }
+
+    pub(crate) async fn navigate_tree_with_resolution(
+        &self,
+        session: &mut Session,
+        selected: u64,
+        options: TreeNavigationOptions<'_>,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        resolution: Option<TreeModelResolution>,
+    ) -> Result<()> {
+        let mut adapter = |event: Notification<'_>| dispatch_legacy_event(event, observer);
+        self.navigate_tree_with_resolution_inner(
+            session,
+            selected,
+            options,
+            cancel,
+            &mut adapter,
+            resolution,
+        )
+        .await
+    }
+
+    async fn navigate_tree_with_resolution_inner(
+        &self,
+        session: &mut Session,
+        selected: u64,
+        options: TreeNavigationOptions<'_>,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        resolution: Option<TreeModelResolution>,
+    ) -> Result<()> {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        session.validate_checkout(selected)?;
-        let from = session.head();
-        if selected == from {
+        let Some(target) = session.tree_navigation_target(selected)? else {
             return Ok(());
-        }
-        let record = &session.records()[selected as usize - 1];
-        let target = if matches!(
-            record.event,
-            Event::User { .. } | Event::UserWithImages { .. }
-        ) {
-            record.parent.unwrap_or(1)
-        } else {
-            selected
         };
-        session.validate_checkout(target)?;
+        let from = session.head();
         let mut decision = crate::TreeDecision::default();
         if self
             .registry
@@ -2261,18 +4860,46 @@ impl Agent<'_> {
                 label: options.label.map(str::to_owned),
             };
             let states = session.extension_states();
-            let deadline =
-                tokio::time::Instant::now() + self.limits.tool_timeout.min(Duration::from_secs(10));
+            let deadline = platform_time::Instant::now()
+                + self.limits.tool_timeout.min(Duration::from_secs(10));
             for extension in self
                 .registry
                 .extensions
                 .iter()
                 .filter(|extension| extension.handles_tree_navigation())
             {
-                let result = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = tokio::time::timeout_at(deadline, extension.before_tree(&preparation, states.get(extension.id()), cancel)) => result,
+                let (sender, mut incoming) = mpsc::channel(32);
+                let host = Arc::new(LifecycleMessageHost { sender, idle: true });
+                let result = {
+                    let future = platform_time::timeout_at(
+                        deadline,
+                        extension.before_tree_with_host(
+                            &preparation,
+                            states.get(extension.id()),
+                            cancel,
+                            host,
+                        ),
+                    );
+                    tokio::pin!(future);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Err(Error::Cancelled),
+                            Some((input, reply)) = incoming.recv() => {
+                                let result = if matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
+                                    commit(session, Event::TreeMessageQueued { input }, observer)
+                                } else {
+                                    session.append_custom_message(input.message)
+                                        .map(|()| observer(Notification::Committed(session.records().last().expect("appended custom message"))))
+                                };
+                                match result {
+                                    Ok(()) => { let _ = reply.send(Ok(())); }
+                                    Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); }
+                                }
+                            }
+                            result = &mut future => break result,
+                        }
+                    }
                 };
                 let message = match result {
                     Ok(Ok(Some(next))) => {
@@ -2304,6 +4931,7 @@ impl Agent<'_> {
                 }
                 from_extension = Some(true);
                 Some(Event::BranchSummary {
+                    fallback_model: None,
                     summary: summary.summary,
                     extension_summary: Some(crate::ExtensionTreeSummary {
                         details: summary.details,
@@ -2345,11 +4973,58 @@ impl Agent<'_> {
             return Err(Error::Cancelled);
         }
         let summary_id = summary.as_ref().map(|_| session.records().len() as u64 + 1);
-        commit(
-            session,
-            summary.unwrap_or(Event::Checkout { target }),
-            observer,
-        )?;
+        let mut transition = summary.unwrap_or(Event::Checkout { target });
+        if let Some(resolved) = resolution.as_ref().filter(|value| value.fallback) {
+            match &mut transition {
+                Event::BranchSummary { fallback_model, .. } => {
+                    *fallback_model = Some(crate::BranchFallbackModel {
+                        provider: resolved.provider.clone(),
+                        model: resolved.model.clone(),
+                    });
+                }
+                _ => {
+                    transition = Event::BranchModelSelected {
+                        target,
+                        provider: resolved.provider.clone(),
+                        model: resolved.model.clone(),
+                    }
+                }
+            }
+        }
+        if let Some(resolved) = resolution {
+            let session_id = session.session_id();
+            let commit = || session.append(transition).cloned();
+            let (record, revoked) = if resolved.legacy {
+                self.registry.commit_existing_legacy_model(
+                    session_id,
+                    &resolved.model,
+                    resolved.client,
+                    commit,
+                )?
+            } else if resolved.require_existing {
+                self.registry.commit_existing_session_model(
+                    session_id,
+                    &resolved.provider,
+                    &resolved.model,
+                    resolved.client,
+                    commit,
+                )?
+            } else {
+                self.registry.commit_resolved_session_model(
+                    session_id,
+                    &resolved.provider,
+                    &resolved.model,
+                    resolved.client,
+                    commit,
+                )?
+            };
+            resolved
+                .revoked
+                .store(revoked, std::sync::atomic::Ordering::SeqCst);
+            observer(Notification::Committed(&record));
+        } else {
+            commit(session, transition, observer)?;
+        }
         if let Some(label) = decision
             .label
             .as_deref()
@@ -2371,20 +5046,21 @@ impl Agent<'_> {
             .iter()
             .any(|extension| extension.handles_tree_navigation() && extension.handles_lifecycle())
         {
-            crate::lifecycle::notify(
+            let event = crate::LifecycleEvent::SessionTree {
+                new_leaf_id: session.head(),
+                old_leaf_id: from,
+                summary_entry: summary_id
+                    .map(|id| Box::new(session.records()[id as usize - 1].clone())),
+                from_extension,
+            };
+            crate::lifecycle::notify_idle_with_host(
                 self.registry,
-                crate::LifecycleEvent::SessionTree {
-                    new_leaf_id: session.head(),
-                    old_leaf_id: from,
-                    summary_entry: summary_id
-                        .map(|id| Box::new(session.records()[id as usize - 1].clone())),
-                    from_extension,
-                },
-                &session.extension_states(),
+                session,
+                event,
                 self.limits.tool_timeout,
                 observer,
             )
-            .await;
+            .await?;
         }
         Ok(())
     }
@@ -2420,8 +5096,20 @@ impl Agent<'_> {
         if request.max_output_tokens == 0 || self.limits.model_requests == 0 {
             return Err(Error::Budget);
         }
+        let prepared = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            result = platform_time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
+                result.map_err(|_| Error::Config("model preparation timed out".into()))??,
+        };
+        let active = Agent {
+            model: prepared.as_deref().unwrap_or(self.model),
+            limits: self.limits.clone(),
+            ..*self
+        };
         let capacity = u64::from(
-            self.context_capacity(&request, cancel)
+            active
+                .context_capacity(&request, cancel)
                 .await?
                 .unwrap_or(128_000),
         );
@@ -2442,7 +5130,7 @@ impl Agent<'_> {
         }
         let mut remaining = capacity
             .saturating_sub(reserve)
-            .saturating_sub(crate::estimate_request_tokens(&request))
+            .saturating_sub(active.model.estimate_request_tokens(&request))
             .saturating_sub(crate::estimate_message_tokens(&Message::User {
                 content: prompt.clone(),
             }))
@@ -2472,7 +5160,7 @@ impl Agent<'_> {
             ),
         });
         let allowance = request.max_output_tokens;
-        let reply = self
+        let reply = active
             .reply_for_branch_summary(session, request, cancel, observer)
             .await?;
         if reply.truncated {
@@ -2509,6 +5197,7 @@ impl Agent<'_> {
             }
         }
         Ok(Some(Event::BranchSummary {
+            fallback_model: None,
             summary,
             extension_summary: None,
             from: Some(from),
@@ -2533,14 +5222,20 @@ impl Agent<'_> {
             if cancel.is_cancelled() {
                 break Err(Error::Cancelled);
             }
-            let attempt = match Box::pin(self.reply::<AgentInput>(
-                session,
-                request.clone(),
-                false,
-                cancel,
-                observer,
-                None,
-            ))
+            let prepared = self
+                .prepare_attempt::<AgentInput>(
+                    session,
+                    request.clone(),
+                    false,
+                    false,
+                    cancel,
+                    observer,
+                    None,
+                )
+                .await?;
+            let attempt = match Box::pin(
+                self.reply::<AgentInput>(session, prepared, false, cancel, observer, None),
+            )
             .await
             {
                 Ok(attempt) => attempt.outcome,
@@ -2569,7 +5264,7 @@ impl Agent<'_> {
                 biased;
                 _ = cancel.cancelled() => break Err(Error::Cancelled),
                 _ = waiting.cancel.cancelled() => break Err(Error::Cancelled),
-                _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                _ = platform_time::sleep(Duration::from_millis(delay_ms)) => {}
             }
         };
         if retries > 0 {
@@ -2591,18 +5286,44 @@ impl Agent<'_> {
         inputs: Option<&mut mpsc::Receiver<T>>,
         instructions: Option<&str>,
     ) -> Result<()> {
-        ensure_settled(session.operations())?;
-        let states = self.migrate(session, observer)?;
-        let retention = match keep_turns {
-            Some(turns) => RetentionPlan::turns(session, turns),
-            None => configured_retention(
-                session,
-                session
-                    .auto_compaction_control()
-                    .token_settings()
-                    .keep_recent_tokens,
-                1,
-            )?,
+        let preparation = (|| {
+            ensure_settled(session.operations())?;
+            let states = self.migrate(session, observer)?;
+            let retention = match keep_turns {
+                Some(turns) => RetentionPlan::turns(session, turns),
+                None => configured_retention(
+                    session,
+                    self.compaction_tokens(session).keep_recent_tokens,
+                    1,
+                )?,
+            };
+            Ok((states, retention))
+        })();
+        let (states, retention) = match preparation {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                let event =
+                    compaction_failed_event(crate::CompactionTrigger::Manual, &error, cancel);
+                let idle = session.current_run_id().is_none();
+                if let Err(notification_error) = crate::lifecycle::notify_session_with_host(
+                    self.registry,
+                    session,
+                    event,
+                    self.limits.model_timeout,
+                    observer,
+                    idle,
+                )
+                .await
+                {
+                    let message = notification_error.to_string();
+                    observer(Notification::ExtensionLifecycleError {
+                        extension: "session host",
+                        event: "session_compact_failed",
+                        message: &message,
+                    });
+                }
+                return Err(error);
+            }
         };
         let limit = self
             .limits
@@ -2616,7 +5337,9 @@ impl Agent<'_> {
                 instructions,
                 output_limit: limit,
                 cancellation: cancel,
-                reason: crate::CompactionReason::Manual,
+                reason: crate::CompactionTrigger::Manual,
+                will_retry: false,
+                skip_without_model: false,
             },
             observer,
             inputs,
@@ -2632,13 +5355,19 @@ impl Agent<'_> {
         scope: SummaryScope<'_>,
         observer: &mut Observer<'_>,
         inputs: Option<&mut mpsc::Receiver<T>>,
-    ) -> Result<u32> {
+    ) -> Result<Option<(u32, bool)>> {
         let reason = scope.reason;
+        let will_retry = scope.will_retry;
+        let cancellation = scope.cancellation;
+        let mut progress = SummaryProgress::default();
         let result = self
-            .summarize_prefix_inner(session, states, scope, observer, inputs)
+            .summarize_prefix_inner(session, states, scope, observer, inputs, &mut progress)
             .await;
+        if matches!(result, Ok(None)) {
+            return Ok(None);
+        }
         let event = match &result {
-            Ok((_, from_extension)) => crate::LifecycleEvent::SessionCompact {
+            Ok(Some((_, from_extension))) => crate::LifecycleEvent::SessionCompact {
                 compaction_entry: Box::new(
                     session
                         .records()
@@ -2647,20 +5376,61 @@ impl Agent<'_> {
                         .clone(),
                 ),
                 from_extension: *from_extension,
-                reason,
-                will_retry: false,
+                reason: reason.legacy_reason(),
+                will_retry,
             },
-            Err(error) => crate::LifecycleEvent::SessionCompactFailed {
-                reason,
-                error_message: (!matches!(error, Error::Cancelled)).then(|| error.to_string()),
-                aborted: matches!(error, Error::Cancelled),
-                will_retry: false,
-                from_extension: false,
-            },
+            Ok(None) => unreachable!("skipped above"),
+            Err(error) => {
+                let mut event = compaction_failed_event(reason, error, cancellation);
+                if let crate::LifecycleEvent::SessionCompactFailed {
+                    from_extension: value,
+                    ..
+                } = &mut event
+                {
+                    *value = progress.supplied_without_model;
+                }
+                event
+            }
         };
-        self.observe_lifecycle(event, &session.extension_states(), None, observer)
-            .await;
-        result.map(|(spent, _)| spent)
+        let reported_event = progress.reported.then(|| event.clone());
+        let idle = session.current_run_id().is_none();
+        let metadata = match &event {
+            crate::LifecycleEvent::SessionCompact {
+                compaction_entry, ..
+            } => session.record_metadata(compaction_entry.id).cloned(),
+            _ => None,
+        };
+        let notification = crate::lifecycle::notify_session_compaction_with_host(
+            self.registry,
+            session,
+            event,
+            self.limits.model_timeout,
+            observer,
+            idle,
+            Some((reason, metadata)),
+        )
+        .await;
+        if let Some(mut event) = reported_event {
+            if result.is_ok()
+                && let Err(error) = &notification
+            {
+                event = compaction_failed_event(reason, error, cancellation);
+            }
+            let update = auto_compaction_update(session, event, will_retry);
+            notify_auto_compaction(reason, update, observer);
+        }
+        if let Err(notification_error) = notification {
+            if result.is_ok() {
+                return Err(notification_error);
+            }
+            let message = notification_error.to_string();
+            observer(Notification::ExtensionLifecycleError {
+                extension: "session host",
+                event: "session_compact_failed",
+                message: &message,
+            });
+        }
+        result.map(|value| value.map(|(spent, _)| (spent, progress.supplied_without_model)))
     }
 
     async fn summarize_prefix_inner<T: Into<AgentInput> + Send>(
@@ -2669,16 +5439,27 @@ impl Agent<'_> {
         states: &ExtensionStates,
         scope: SummaryScope<'_>,
         observer: &mut Observer<'_>,
-        inputs: Option<&mut mpsc::Receiver<T>>,
-    ) -> Result<(u32, bool)> {
+        mut inputs: Option<&mut mpsc::Receiver<T>>,
+        progress: &mut SummaryProgress,
+    ) -> Result<Option<(u32, bool)>> {
         let SummaryScope {
             retention,
             instructions,
             output_limit: limit,
             cancellation: cancel,
-            reason: _,
+            reason,
+            will_retry,
+            skip_without_model,
         } = scope;
-        if limit == 0 || self.limits.model_requests == 0 {
+        let has_pre_summary_hook = self
+            .registry
+            .extensions
+            .iter()
+            .any(|extension| extension.handles_before_summary_compaction());
+        let minimum_output_tokens = self.model.minimum_output_tokens().max(1);
+        let model_summary_available =
+            limit >= minimum_output_tokens && self.limits.model_requests > 0;
+        if !has_pre_summary_hook && !model_summary_available {
             return Err(Error::Budget);
         }
         let before = retention.boundary;
@@ -2687,7 +5468,108 @@ impl Agent<'_> {
                 "Nothing to compact (session too small)".into(),
             ));
         }
-        let mut request = self
+        if !skip_without_model {
+            progress.start(reason, observer);
+        }
+        let preparation = crate::CompactionPreparation {
+            branch_entries: if has_pre_summary_hook {
+                session.branch().into_iter().cloned().collect()
+            } else {
+                Vec::new()
+            },
+            first_kept_entry: before,
+            tokens_before: if has_pre_summary_hook {
+                session.context_usage_estimate().tokens
+            } else {
+                0
+            },
+            reason,
+            will_retry,
+            custom_instructions: instructions.map(str::to_owned),
+        };
+        let mut supplied = None;
+        for extension in self
+            .registry
+            .extensions
+            .iter()
+            .filter(|extension| extension.handles_before_summary_compaction())
+        {
+            let (sender, incoming) = mpsc::channel(32);
+            let idle = session.current_run_id().is_none();
+            let host = Arc::new(LifecycleMessageHost { sender, idle });
+            let result = serve_compaction_hook(
+                session,
+                incoming,
+                extension.before_summary_compaction(&preparation, states.get(extension.id()), host),
+                idle,
+                cancel,
+                self.limits.tool_timeout,
+                observer,
+                &mut inputs,
+            )
+            .await?;
+            match result {
+                Ok(Some(result)) if result.cancel => return Err(Error::Cancelled),
+                Ok(Some(result)) => supplied = result.compaction,
+                Ok(None) => {}
+                Err(message) => observer(Notification::ExtensionLifecycleError {
+                    extension: extension.id(),
+                    event: "session_before_compact",
+                    message: &message,
+                }),
+            }
+        }
+        if let Some(result) = supplied {
+            progress.start(reason, observer);
+            progress.supplied_without_model = true;
+            let boundary = result.first_kept_entry.ok_or_else(|| {
+                Error::Config("extension compaction requires a retained branch entry".into())
+            })?;
+            if !preparation
+                .branch_entries
+                .iter()
+                .any(|entry| entry.id == boundary)
+                || before.is_some_and(|minimum| boundary > minimum)
+                || !has_summary_prefix(session, Some(boundary))
+                || !complete_compaction_boundary(&session.branch(), boundary)
+            {
+                return Err(Error::Config(
+                    "invalid extension compaction retention boundary".into(),
+                ));
+            }
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let retained = RetentionPlan {
+                boundary: Some(boundary),
+                ..retention
+            };
+            abandon_turn_request_for_summary(session, observer)?;
+            self.commit_compaction_with_host(
+                session,
+                Compaction {
+                    summary: result.summary.clone(),
+                    keep_turns: retained.keep_turns,
+                },
+                states,
+                result.usage.map(|usage| (usage, None)),
+                Some(retained),
+                Some(&result),
+                cancel,
+                observer,
+                inputs,
+            )
+            .await?;
+            return Ok(Some((0, true)));
+        }
+        if !model_summary_available {
+            if skip_without_model {
+                return Ok(None);
+            }
+            return Err(Error::Budget);
+        }
+        abandon_turn_request_for_summary(session, observer)?;
+        let (mut request, transformed, _) = self
             .request(
                 session,
                 states,
@@ -2695,10 +5577,11 @@ impl Agent<'_> {
                 before,
                 RequestPurpose::Summary,
                 cancel,
+                observer,
             )
             .await?;
         request.max_output_tokens = request.max_output_tokens.min(limit);
-        if request.max_output_tokens == 0 {
+        if request.max_output_tokens < minimum_output_tokens {
             return Err(Error::Budget);
         }
         request.tools.clear();
@@ -2714,14 +5597,56 @@ impl Agent<'_> {
             content.push_str("\n\nAdditional focus: ");
             content.push_str(instructions);
         }
-        if self.exceeds_context(&request, cancel).await? {
+        let prepared = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            result = platform_time::timeout(self.limits.model_timeout, self.model.prepare_context(&request)) =>
+                result.map_err(|_| Error::Config("model preparation timed out".into()))??,
+        };
+        let active = Agent {
+            model: prepared.as_deref().unwrap_or(self.model),
+            limits: self.limits.clone(),
+            ..*self
+        };
+        let attempt = active
+            .prepare_attempt(
+                session,
+                request,
+                false,
+                transformed,
+                cancel,
+                observer,
+                inputs.as_deref_mut(),
+            )
+            .await?;
+        if active
+            .exceeds_context(attempt.reservation_request(), cancel)
+            .await?
+        {
             return Err(Error::Model(
                 "older context does not fit the summary request".into(),
             ));
         }
-        let allowance = request.max_output_tokens;
-        let reply = self
-            .reply(session, request, false, cancel, observer, inputs)
+        if matches!(reason, crate::CompactionTrigger::Overflow) {
+            commit(
+                session,
+                Event::SourceEntry {
+                    format: "pi-rs:overflow-retention-v1".into(),
+                    entry: serde_json::json!({"boundary":retention.boundary,"keepTurns":retention.keep_turns,"splitTurn":retention.split_turn}),
+                },
+                observer,
+            )?;
+        }
+        let allowance = attempt.request.max_output_tokens;
+        let reply = active
+            .reply(
+                session,
+                attempt,
+                false,
+                cancel,
+                observer,
+                inputs.as_deref_mut(),
+            )
             .await?
             .outcome?;
         if reply.truncated {
@@ -2746,18 +5671,23 @@ impl Agent<'_> {
         let billing = reply
             .usage
             .map(|usage| (usage, summary_usage_metadata(session, &reply)));
-        let from_extension = self.commit_compaction(
-            session,
-            Compaction {
-                summary: reply.content,
-                keep_turns: retention.keep_turns,
-            },
-            states,
-            billing,
-            Some(retention),
-            observer,
-        )?;
-        Ok((output as u32, from_extension))
+        let from_extension = self
+            .commit_compaction_with_host(
+                session,
+                Compaction {
+                    summary: reply.content,
+                    keep_turns: retention.keep_turns,
+                },
+                states,
+                billing,
+                Some(retention),
+                None,
+                cancel,
+                observer,
+                inputs,
+            )
+            .await?;
+        Ok(Some((output as u32, from_extension)))
     }
 
     async fn context_capacity(
@@ -2770,7 +5700,7 @@ impl Agent<'_> {
             None => tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::time::timeout(self.limits.model_timeout, self.model.context_window(&request.model)) => result.ok().flatten().filter(|window| *window > 0),
+                result = platform_time::timeout(self.limits.model_timeout, self.model.context_window(&request.model)) => result.ok().flatten().filter(|window| *window > 0),
             },
         };
         Ok(window)
@@ -2784,9 +5714,182 @@ impl Agent<'_> {
         let Some(window) = self.context_capacity(request, cancel).await? else {
             return Ok(false);
         };
-        Ok(crate::estimate_request_tokens(request)
+        Ok(self
+            .model
+            .estimate_request_tokens(request)
             .saturating_add(u64::from(request.max_output_tokens))
             > u64::from(window))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_compaction_with_host<T: Into<AgentInput> + Send>(
+        &self,
+        session: &mut Session,
+        mut compaction: Compaction,
+        states: &ExtensionStates,
+        billing: Option<(Usage, Option<Box<crate::SummaryUsageMetadata>>)>,
+        minimum_retention: Option<RetentionPlan>,
+        extension_result: Option<&crate::ExtensionCompaction>,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+        mut inputs: Option<&mut mpsc::Receiver<T>>,
+    ) -> Result<bool> {
+        let file_operations = if extension_result.is_none() {
+            minimum_retention.map(|retention| {
+                crate::compaction_files::FileOperations::collect(session, retention.boundary)
+            })
+        } else {
+            None
+        };
+        let original_summary = compaction.summary.clone();
+        for extension in &self.registry.extensions {
+            let (sender, incoming) = mpsc::channel(32);
+            let idle = session.current_run_id().is_none();
+            let host = Arc::new(LifecycleMessageHost { sender, idle });
+            let result = serve_compaction_hook(
+                session,
+                incoming,
+                extension.before_compaction_with_host(
+                    &mut compaction,
+                    states.get(extension.id()),
+                    host,
+                ),
+                idle,
+                cancel,
+                self.limits.tool_timeout,
+                observer,
+                &mut inputs,
+            )
+            .await?;
+            if let Decision::Deny(reason) = hook(extension.as_ref(), result)? {
+                return Err(Error::Extension {
+                    id: extension.id().into(),
+                    message: reason,
+                });
+            }
+        }
+        let from_extension = extension_result.is_some() || original_summary != compaction.summary;
+        if !compaction.summary.trim().is_empty()
+            && let Some(files) = &file_operations
+            && let Some(suffix) =
+                files.suffix((64 * 1024usize).saturating_sub(compaction.summary.len()))
+        {
+            compaction.summary.push_str(&suffix);
+        }
+        if compaction.summary.trim().is_empty() || compaction.summary.len() > 64 * 1024 {
+            return Err(Error::Config(
+                "summary must contain between 1 and 65536 bytes".into(),
+            ));
+        }
+        if minimum_retention.is_some_and(|minimum| compaction.keep_turns < minimum.keep_turns) {
+            return Err(Error::Config(
+                "compaction would drop turns absent from the summary".into(),
+            ));
+        }
+        let retain_from = match minimum_retention {
+            Some(retention) if retention.keep_turns == compaction.keep_turns => retention.boundary,
+            Some(retention) if extension_result.is_some() => {
+                // A legacy hook may request more turns, but cannot advance the
+                // extension's boundary and discard content it did not summarize.
+                match (
+                    retention.boundary,
+                    retain_from(&session.branch(), compaction.keep_turns),
+                ) {
+                    (Some(original), Some(recomputed)) => Some(original.min(recomputed)),
+                    (Some(original), None) => Some(original),
+                    (None, recomputed) => recomputed,
+                }
+            }
+            _ => retain_from(&session.branch(), compaction.keep_turns),
+        };
+        if extension_result.is_some()
+            && retain_from
+                .is_some_and(|boundary| !complete_compaction_boundary(&session.branch(), boundary))
+        {
+            return Err(Error::Config(
+                "compaction would split a message or tool exchange".into(),
+            ));
+        }
+        let mut changes = ExtensionStates::new();
+        for extension in &self.registry.extensions {
+            let (sender, incoming) = mpsc::channel(32);
+            let idle = session.current_run_id().is_none();
+            let host = Arc::new(LifecycleMessageHost { sender, idle });
+            let result = serve_compaction_hook(
+                session,
+                incoming,
+                extension.after_compaction_with_host(&compaction, states.get(extension.id()), host),
+                idle,
+                cancel,
+                self.limits.tool_timeout,
+                observer,
+                &mut inputs,
+            )
+            .await?;
+            if let Some(state) = hook(extension.as_ref(), result)? {
+                changes.insert(extension.id().into(), state);
+            }
+        }
+        let (usage, usage_metadata) =
+            billing.map_or((None, None), |(usage, metadata)| (Some(usage), metadata));
+        let tokens_before = extension_result.map_or_else(
+            || session.context_usage_estimate().tokens,
+            |result| result.tokens_before,
+        );
+        let persist_metadata = (from_extension && extension_result.is_some())
+            || (session.supports_record_metadata()
+                && (from_extension || file_operations.is_some()));
+        let event = Event::Compacted {
+            summary: compaction.summary,
+            system_prompt: None,
+            retain_from,
+            tokens_before: Some(tokens_before),
+            states: changes,
+            usage,
+            usage_metadata,
+        };
+        // First measure the exact envelope without a truncation marker. If
+        // entries must be dropped, account for the marker and select again.
+        let generated_details = if let Some(files) = &file_operations {
+            let budget = session.compaction_details_budget(&event, from_extension, false)?;
+            let details = files.bounded_details(budget);
+            Some(if details.1 {
+                let budget = session.compaction_details_budget(&event, from_extension, true)?;
+                files.bounded_details(budget)
+            } else {
+                details
+            })
+        } else {
+            None
+        };
+        commit_compaction_record(
+            session,
+            event,
+            persist_metadata.then(|| {
+                let mut metadata = serde_json::json!({});
+                if from_extension {
+                    metadata["fromExtension"] = true.into();
+                }
+                if from_extension && file_operations.is_some() {
+                    metadata["nativeGeneratedFileDetails"] = true.into();
+                }
+                if generated_details
+                    .as_ref()
+                    .is_some_and(|(_, truncated)| *truncated)
+                {
+                    metadata["nativeFileDetailsTruncated"] = true.into();
+                }
+                if let Some(details) = extension_result
+                    .and_then(|result| result.details.clone())
+                    .or_else(|| generated_details.map(|(details, _)| details))
+                {
+                    metadata["details"] = details;
+                }
+                metadata
+            }),
+            observer,
+        )?;
+        Ok(from_extension)
     }
 
     fn commit_compaction(
@@ -2835,9 +5938,10 @@ impl Agent<'_> {
         }
         let (usage, usage_metadata) =
             billing.map_or((None, None), |(usage, metadata)| (Some(usage), metadata));
-        let tokens_before = session.estimated_context_tokens();
+        let tokens_before = session.context_usage_estimate().tokens;
         let from_extension = original_summary != compaction.summary;
-        commit(
+        let persist_metadata = from_extension && session.supports_record_metadata();
+        commit_compaction_record(
             session,
             Event::Compacted {
                 summary: compaction.summary,
@@ -2848,6 +5952,7 @@ impl Agent<'_> {
                 usage,
                 usage_metadata,
             },
+            persist_metadata.then(|| serde_json::json!({"fromExtension": true})),
             observer,
         )?;
         Ok(from_extension)
@@ -2858,31 +5963,386 @@ fn model_conversation_entries(
     path: &[&Record],
     operations: Vec<(Invocation, OperationState)>,
 ) -> Vec<(u64, Message)> {
-    let failed: HashSet<_> = path
-        .iter()
-        .filter_map(|record| match record.event {
-            Event::ModelFinished {
-                request_id,
-                failure: Some(_),
-                ..
-            } => Some(request_id),
-            _ => None,
-        })
-        .collect();
-    let excluded: HashSet<_> = path
-        .iter()
-        .filter_map(|record| match &record.event {
-            Event::Assistant {
-                request_id: Some(id),
-                ..
-            } if failed.contains(id) => Some(record.id),
-            _ => None,
-        })
-        .collect();
+    let excluded = crate::journal::failed_assistant_records(path);
     conversation_entries(path, operations)
         .into_iter()
         .filter(|(source, _)| !excluded.contains(source))
         .collect()
+}
+
+struct OverflowRecoveryState {
+    request_id: Uuid,
+    started: bool,
+    compacted: bool,
+    summary_started: bool,
+}
+
+fn overflow_recovery_epoch<'a>(branch: &'a [&'a Record], run_id: Uuid) -> &'a [&'a Record] {
+    let start = branch
+        .iter()
+        .rposition(|record| {
+            record.run_id == Some(run_id)
+                && match &record.event {
+                    Event::User { .. } | Event::UserWithImages { .. } => true,
+                    Event::ModelFinished {
+                        metadata,
+                        failure: None,
+                        reply: Some(_),
+                        ..
+                    } => metadata.finish_reason.as_deref() != Some("length"),
+                    _ => false,
+                }
+        })
+        .map_or(0, |index| index + 1);
+    &branch[start..]
+}
+
+fn overflow_recovery_attempted(session: &Session, run_id: Uuid) -> bool {
+    let branch = session.branch();
+    overflow_recovery_epoch(&branch, run_id).iter().any(|record| record.run_id == Some(run_id)
+        && matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery"))
+}
+
+// Settlement follows durable completion, even when a summary cannot safely be
+// replayed. Do not couple accounting to retention or response validation.
+fn durable_recovery_usage(
+    session: &Session,
+    run_id: Uuid,
+) -> Vec<(Uuid, UsageReport, ModelMetadata)> {
+    let branch = session.branch();
+    let epoch = overflow_recovery_epoch(&branch, run_id);
+    let mut ids = Vec::new();
+    if let Some(recovery) =
+        overflow_recovery_state(session, run_id).filter(|state| !state.compacted)
+    {
+        ids.push((recovery.request_id, false));
+    }
+    if let Some((id, metadata, _, _)) = pending_reply(session, run_id)
+        && metadata.finish_reason.as_deref() == Some("length")
+        && !ids.iter().any(|(old, _)| *old == id)
+    {
+        ids.push((id, false));
+    }
+    if let Some(marker) = epoch.iter().rposition(|record| record.run_id == Some(run_id) && matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery" || format == "pi-rs:silent-overflow"))
+        && !epoch[marker + 1..].iter().any(|record| (matches!(&record.event, Event::Compacted { .. }) || matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")))
+        && let Some(id) = epoch[marker + 1..].iter().find_map(|record| match &record.event {
+            Event::ModelRequested { request_id: Some(id), .. } if record.run_id == Some(run_id) => Some(*id), _ => None,
+        }) && !ids.iter().any(|(old, _)| *old == id)
+    { ids.push((id, true)); }
+    ids.into_iter()
+        .filter_map(|(id, unconfirmed)| {
+            epoch
+                .iter()
+                .find_map(|record| match &record.event {
+                    Event::ModelFinished {
+                        request_id,
+                        usage,
+                        metadata,
+                        ..
+                    } if record.run_id == Some(run_id) && *request_id == id => {
+                        Some((id, usage.clone(), metadata.clone()))
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    unconfirmed.then_some((id, UsageReport::Unconfirmed, ModelMetadata::default()))
+                })
+        })
+        .collect()
+}
+
+// A completed model summary can be reused only if its response is durable and
+// no later event changed the context from which its retention plan was chosen.
+type RecoveredSummary = (
+    String,
+    u32,
+    Option<(Usage, Option<Box<crate::SummaryUsageMetadata>>)>,
+    RetentionPlan,
+    Uuid,
+    UsageReport,
+    ModelMetadata,
+);
+
+// Recover only an unfinished marker on the current branch's latest run.
+// A started request may be ambiguous even when no completed summary exists.
+pub(crate) fn resumable_compaction_run(session: &Session) -> Option<(Uuid, Option<String>, bool)> {
+    let branch = session.branch();
+    let run_id = branch.iter().rev().find_map(|record| {
+        matches!(record.event, Event::Run { .. })
+            .then_some(record.run_id)
+            .flatten()
+    })?;
+    let epoch = overflow_recovery_epoch(&branch, run_id);
+    let marker = epoch.iter().rposition(|record| {
+        record.run_id == Some(run_id) && matches!(&record.event,
+            Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery" || format == "pi-rs:silent-overflow")
+    });
+    let Some(marker) = marker else {
+        let request_id = overflow_recovery_state(session, run_id)
+            .filter(|state| !state.compacted)
+            .map(|state| state.request_id)
+            .or_else(|| {
+                pending_reply(session, run_id).and_then(|(id, metadata, _, _)| {
+                    (metadata.finish_reason.as_deref() == Some("length")).then_some(id)
+                })
+            })?;
+        let model = branch.iter().rev().find_map(|record| match &record.event {
+            Event::ModelRequested {
+                request_id: Some(id),
+                model,
+                ..
+            } if *id == request_id => Some(model.clone()),
+            _ => None,
+        });
+        return Some((run_id, model, false));
+    };
+    let following = &epoch[marker + 1..];
+    if following.iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")) {
+        return None;
+    }
+    if following.iter().any(|record| {
+        matches!(
+            record.event,
+            Event::Compacted { .. }
+                | Event::User { .. }
+                | Event::UserWithImages { .. }
+                | Event::Assistant { .. }
+                | Event::ContextEdited { .. }
+                | Event::Checkout { .. }
+        )
+    }) {
+        return None;
+    }
+    let model = following.iter().find_map(|record| match &record.event {
+        Event::ModelRequested { model, .. } if record.run_id == Some(run_id) => Some(model.clone()),
+        _ => None,
+    });
+    let completed = model.as_ref().is_some_and(|model| {
+        ["pi-rs:overflow-recovery", "pi-rs:silent-overflow"]
+            .iter()
+            .any(|marker| completed_overflow_summary(session, run_id, marker, model).is_some())
+    });
+    Some((run_id, model, completed))
+}
+
+fn completed_overflow_summary(
+    session: &Session,
+    run_id: Uuid,
+    marker_format: &str,
+    model_name: &str,
+) -> Option<RecoveredSummary> {
+    let branch = session.branch();
+    let marker = branch.iter().rposition(|record| {
+        record.run_id == Some(run_id)
+            && matches!(&record.event, Event::SourceEntry { format, .. } if format == marker_format)
+    })?;
+    let request_index = branch[marker + 1..].iter().position(|record| {
+        record.run_id == Some(run_id) && matches!(record.event, Event::ModelRequested { .. })
+    })? + marker
+        + 1;
+    let Event::ModelRequested {
+        request_id: Some(request_id),
+        max_output_tokens,
+        model,
+        ..
+    } = &branch[request_index].event
+    else {
+        return None;
+    };
+    if model != model_name {
+        return None;
+    }
+    let plan = branch.get(request_index.checked_sub(1)?)?;
+    let Event::SourceEntry { format, entry } = &plan.event else {
+        return None;
+    };
+    if format != "pi-rs:overflow-retention-v1" || plan.run_id != Some(run_id) {
+        return None;
+    }
+    let boundary = entry.get("boundary")?;
+    let retention = RetentionPlan {
+        boundary: if boundary.is_null() {
+            None
+        } else {
+            Some(boundary.as_u64()?)
+        },
+        keep_turns: usize::try_from(entry["keepTurns"].as_u64()?).ok()?,
+        split_turn: entry["splitTurn"].as_bool()?,
+    };
+    if retention
+        .boundary
+        .is_some_and(|id| !branch.iter().any(|record| record.id == id && id < plan.id))
+        || !has_summary_prefix(session, retention.boundary)
+    {
+        return None;
+    }
+    let following = &branch[request_index + 1..];
+    if following.iter().any(|record| {
+        matches!(
+            record.event,
+            Event::User { .. }
+                | Event::UserWithImages { .. }
+                | Event::UserImages { .. }
+                | Event::CustomMessage { .. }
+                | Event::CustomMessageDelivered { .. }
+                | Event::Assistant { .. }
+                | Event::ToolFinished { .. }
+                | Event::ToolReconciled { .. }
+                | Event::BashExecution { .. }
+                | Event::BranchSummary { .. }
+                | Event::CompactionSummaryMessage { .. }
+                | Event::ContextEdited { .. }
+                | Event::Compacted { .. }
+                | Event::SystemCheckpoint { .. }
+                | Event::ModelSelected { .. }
+                | Event::BranchModelSelected { .. }
+                | Event::Checkout { .. }
+                | Event::ModelRequested { .. }
+        )
+    }) {
+        return None;
+    }
+    let completed = following.iter().find(|record| record.run_id == Some(run_id)
+        && matches!(&record.event, Event::ModelFinished { request_id: id, .. } if id == request_id))?;
+    let Event::ModelFinished {
+        partial,
+        usage,
+        failure: None,
+        metadata,
+        reply: None,
+        ..
+    } = &completed.event
+    else {
+        return None;
+    };
+    if metadata.finish_reason.as_deref() == Some("length")
+        || partial.trim().is_empty()
+        || partial.len() > 64 * 1024
+    {
+        return None;
+    }
+    let (spent, billing) = match usage {
+        UsageReport::Measured { usage } if usage.output_tokens <= u64::from(*max_output_tokens) => {
+            (
+                usage.output_tokens as u32,
+                Some((
+                    *usage,
+                    crate::SummaryUsageMetadata::from_completion(&completed.event)
+                        .map(|(_, metadata)| Box::new(metadata)),
+                )),
+            )
+        }
+        UsageReport::Estimated { output_tokens }
+            if *output_tokens <= u64::from(*max_output_tokens) =>
+        {
+            (*output_tokens as u32, None)
+        }
+        _ => return None,
+    };
+    Some((
+        partial.clone(),
+        spent,
+        billing,
+        retention,
+        *request_id,
+        usage.clone(),
+        metadata.clone(),
+    ))
+}
+
+fn overflow_recovery_state(session: &Session, run_id: Uuid) -> Option<OverflowRecoveryState> {
+    let full_branch = session.branch();
+    let branch = overflow_recovery_epoch(&full_branch, run_id);
+    if let Some((marker_index, marker)) = branch.iter().enumerate().rev().find(|(_, record)| {
+        record.run_id == Some(run_id)
+            && matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery")
+    }) {
+        let Event::SourceEntry { entry, .. } = &marker.event else { unreachable!() };
+        let request_id = Uuid::parse_str(entry["requestId"].as_str()?).ok()?;
+        let following = &branch[marker_index + 1..];
+        let compacted_at = following.iter().position(|record| record.run_id == Some(run_id)
+            && matches!(record.event, Event::Compacted { .. }));
+        // Summary requests may occur before compaction; only later requests
+        // indicate that the interrupted turn has actually resumed.
+        if compacted_at.is_some_and(|index| following[index + 1..].iter().any(|record|
+            record.run_id == Some(run_id) && matches!(record.event, Event::ModelRequested { .. }))) {
+            return None;
+        }
+        let summary_started = following.iter().any(|record| record.run_id == Some(run_id)
+            && matches!(record.event, Event::ModelRequested { .. }));
+        return Some(OverflowRecoveryState { request_id, started: true, compacted: compacted_at.is_some(), summary_started });
+    }
+    let request_id = branch
+        .iter()
+        .rev()
+        .filter(|record| record.run_id == Some(run_id))
+        .find_map(|record| match &record.event {
+            Event::ModelFinished {
+                request_id,
+                metadata,
+                failure: Some(_),
+                ..
+            } if metadata.finish_reason.as_deref() == Some("pi-rs:context-overflow") => {
+                Some(Some(*request_id))
+            }
+            Event::ModelRequested { .. }
+            | Event::Assistant { .. }
+            | Event::ModelFinished { .. } => Some(None),
+            _ => None,
+        })??;
+    Some(OverflowRecoveryState {
+        request_id,
+        started: false,
+        compacted: false,
+        summary_started: false,
+    })
+}
+
+// A cut can occur on an internal record. It must not separate legacy image
+// attachments from their user message or an assistant tool call from its result.
+fn complete_compaction_boundary(branch: &[&Record], boundary: u64) -> bool {
+    let mut last_plain_user = None;
+    let mut calls = HashMap::new();
+    let mut results = HashMap::new();
+    for record in branch {
+        match &record.event {
+            Event::User { .. }
+            | Event::CustomMessage { .. }
+            | Event::CustomMessageDelivered { .. }
+            | Event::BranchSummary { .. }
+            | Event::CompactionSummaryMessage { .. } => {
+                last_plain_user = Some(record.id);
+            }
+            Event::BashExecution { execution } if !execution.exclude_from_context => {
+                last_plain_user = Some(record.id);
+            }
+            Event::UserImages { .. } => {
+                if last_plain_user
+                    .take()
+                    .is_some_and(|user| user < boundary && record.id >= boundary)
+                {
+                    return false;
+                }
+            }
+            Event::UserWithImages { .. } => last_plain_user = None,
+            Event::Assistant { invocations, .. } => {
+                last_plain_user = None;
+                for invocation in invocations {
+                    calls.insert(invocation.operation_id, record.id);
+                }
+            }
+            Event::ToolFinished { operation_id, .. }
+            | Event::ToolReconciled { operation_id, .. } => {
+                results.insert(*operation_id, record.id);
+            }
+            _ => {}
+        }
+    }
+    calls.into_iter().all(|(operation, call)| {
+        results
+            .get(&operation)
+            .is_none_or(|result| (call < boundary) == (*result < boundary))
+    })
 }
 
 fn has_summary_prefix(session: &Session, boundary: Option<u64>) -> bool {
@@ -2916,6 +6376,7 @@ fn configured_retention(
         return Ok(RetentionPlan::turns(session, fallback));
     };
     let branch = session.branch();
+    let token_index = crate::tokens::SourceTokenIndex::new(session, &branch);
     let entries = conversation_entries(&branch, session.operations());
     let candidates: Vec<_> = entries
         .iter()
@@ -2934,9 +6395,7 @@ fn configured_retention(
     let mut cut = first;
     let mut accumulated = 0_u64;
     for (index, (source, message)) in entries.iter().enumerate().rev() {
-        accumulated = accumulated.saturating_add(crate::tokens::estimate_source_tokens(
-            session, *source, message,
-        ));
+        accumulated = accumulated.saturating_add(token_index.estimate(*source, message));
         if accumulated >= target {
             cut = candidates
                 .iter()
@@ -2993,6 +6452,7 @@ fn retained_turn_count(session: &Session, target: Option<u64>) -> Result<usize> 
         return Ok(1);
     };
     let branch = session.branch();
+    let token_index = crate::tokens::SourceTokenIndex::new(session, &branch);
     let floor = retain_from(&branch, usize::MAX).unwrap_or(u64::MAX);
     let turns: Vec<_> = branch
         .iter()
@@ -3015,9 +6475,7 @@ fn retained_turn_count(session: &Session, target: Option<u64>) -> Result<usize> 
         let middle = low + (high - low) / 2;
         let messages = conversation_entries(&branch[turns[middle]..], operations.clone());
         let tokens = messages.iter().fold(0_u64, |tokens, (source, message)| {
-            tokens.saturating_add(crate::tokens::estimate_source_tokens(
-                session, *source, message,
-            ))
+            tokens.saturating_add(token_index.estimate(*source, message))
         });
         if tokens >= target {
             low = middle + 1;
@@ -3075,7 +6533,91 @@ struct SummaryScope<'a> {
     instructions: Option<&'a str>,
     output_limit: u32,
     cancellation: &'a CancellationToken,
-    reason: crate::CompactionReason,
+    reason: crate::CompactionTrigger,
+    will_retry: bool,
+    skip_without_model: bool,
+}
+
+#[derive(Default)]
+struct SummaryProgress {
+    reported: bool,
+    supplied_without_model: bool,
+}
+
+impl SummaryProgress {
+    fn start(&mut self, reason: crate::CompactionTrigger, observer: &mut Observer<'_>) {
+        if !self.reported && !matches!(reason, crate::CompactionTrigger::Manual) {
+            self.reported = true;
+            notify_auto_compaction(reason, AutoCompactionUpdate::Started, observer);
+        }
+    }
+}
+
+fn abandon_turn_request_for_summary(
+    session: &mut Session,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
+    if let Some(run_id) = session.current_run_id()
+        && let Some(id) = open_request_callback(session, run_id, RequestPurpose::Turn)
+    {
+        commit(session, Event::RequestCallbackAbandoned { id }, observer)?;
+    }
+    Ok(())
+}
+
+fn auto_compaction_update(
+    session: &Session,
+    event: crate::LifecycleEvent,
+    will_retry: bool,
+) -> AutoCompactionUpdate {
+    match event {
+        crate::LifecycleEvent::SessionCompact {
+            compaction_entry, ..
+        } => {
+            let details = session
+                .record_metadata(compaction_entry.id)
+                .and_then(|metadata| metadata.get("details"))
+                .cloned();
+            AutoCompactionUpdate::Completed {
+                compaction_entry,
+                details,
+                estimated_tokens_after: session.estimated_context_tokens(),
+                will_retry,
+            }
+        }
+        crate::LifecycleEvent::SessionCompactFailed {
+            aborted,
+            error_message,
+            ..
+        } => AutoCompactionUpdate::Failed {
+            aborted,
+            error_message,
+        },
+        _ => unreachable!("summary result must have a compaction lifecycle event"),
+    }
+}
+
+fn compaction_failed_event(
+    reason: crate::CompactionTrigger,
+    error: &Error,
+    cancellation: &CancellationToken,
+) -> crate::LifecycleEvent {
+    let aborted = cancellation.is_cancelled() || matches!(error, Error::Cancelled);
+    let error_message = (!aborted).then(|| {
+        let prefix = match reason {
+            crate::CompactionTrigger::Manual => "Compaction failed",
+            crate::CompactionTrigger::Threshold => "Auto-compaction failed",
+            crate::CompactionTrigger::Overflow => "Context overflow recovery failed",
+        };
+        format!("{prefix}: {error}")
+    });
+    crate::LifecycleEvent::SessionCompactFailed {
+        reason: reason.legacy_reason(),
+        error_message,
+        aborted,
+        will_retry: false,
+        from_extension: false,
+    }
 }
 struct DispatchScope<'a> {
     cancellation: &'a CancellationToken,
@@ -3083,6 +6625,7 @@ struct DispatchScope<'a> {
     depth: usize,
     call_count: Arc<AtomicUsize>,
 }
+type ReplySnapshot = Arc<std::sync::Mutex<Option<Outcome>>>;
 struct NestedRequest {
     name: String,
     arguments: serde_json::Value,
@@ -3091,6 +6634,7 @@ struct NestedRequest {
     depth: usize,
     call_count: Arc<AtomicUsize>,
     reply: oneshot::Sender<Outcome>,
+    snapshot: ReplySnapshot,
 }
 
 fn tool_parent_call_id(session: &Session, operation_id: Uuid) -> Option<String> {
@@ -3111,6 +6655,288 @@ fn tool_parent_call_id(session: &Session, operation_id: Uuid) -> Option<String> 
             (invocation.operation_id == parent).then_some(invocation.call.id)
         })
 }
+type CallbackMessageSender = mpsc::Sender<(
+    crate::QueuedCustomMessage,
+    oneshot::Sender<std::result::Result<(), String>>,
+)>;
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_compaction_hook<T, I: Into<AgentInput> + Send>(
+    session: &mut Session,
+    mut incoming: mpsc::Receiver<(
+        crate::QueuedCustomMessage,
+        oneshot::Sender<std::result::Result<(), String>>,
+    )>,
+    future: impl std::future::Future<Output = crate::ExtensionResult<T>>,
+    idle: bool,
+    cancel: &CancellationToken,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    inputs: &mut Option<&mut mpsc::Receiver<I>>,
+) -> Result<crate::ExtensionResult<T>> {
+    let future = platform_time::timeout(timeout, future);
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            Some((input, reply)) = incoming.recv() => {
+                let result = if !idle || matches!(input.delivery, crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn) {
+                    queue_custom_message(session, input, observer)
+                } else {
+                    session.append_custom_message(input.message).map(|()| observer(Notification::Committed(session.records().last().expect("appended custom message"))))
+                };
+                match result { Ok(()) => { let _ = reply.send(Ok(())); }, Err(error) => { let _ = reply.send(Err(error.to_string())); return Err(error); } }
+            }
+            Some(input) = receive_input(inputs) => queue_input(session, input.into(), observer)?,
+            result = &mut future => return result.map_err(|_| Error::Config("compaction hook timed out".into())),
+        }
+    }
+}
+
+fn completed_run_turns(session: &Session, run_id: Uuid) -> u32 {
+    session
+        .branch()
+        .iter()
+        .filter(|record| {
+            record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. })
+        })
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+fn has_unfinished_turn_end(session: &Session, run_id: Uuid) -> bool {
+    let branch = session.branch();
+    let Some(assistant) = branch.iter().rev().find(|record| {
+        record.run_id == Some(run_id) && matches!(record.event, Event::Assistant { .. })
+    }) else {
+        return false;
+    };
+    assistant.version >= crate::journal::TURN_END_JOURNAL_VERSION
+        && !branch.iter().any(|record| matches!(record.event,
+            Event::TurnEndCallbacksCompleted { assistant_record } if assistant_record == assistant.id))
+}
+
+fn has_trigger_message(session: &Session, run_id: Uuid) -> bool {
+    session.branch().iter().any(|record| matches!(&record.event,
+        Event::CustomMessageQueued { input } if input.id == run_id && input.delivery == crate::CustomMessageDelivery::TriggerTurn))
+        || session.records().iter().any(|record| matches!(&record.event,
+            Event::TreeMessageQueued { input } if input.id == run_id && input.delivery == crate::CustomMessageDelivery::TriggerTurn))
+}
+
+fn callback_turn_phase(phase: &str, turn_index: u32) -> String {
+    if turn_index == 0 {
+        phase.to_owned()
+    } else {
+        format!("{phase}:turn:{turn_index}")
+    }
+}
+
+fn request_purpose_name(purpose: RequestPurpose) -> &'static str {
+    match purpose {
+        RequestPurpose::Turn => "turn",
+        RequestPurpose::Summary => "summary",
+    }
+}
+
+fn open_request_callback(session: &Session, run_id: Uuid, purpose: RequestPurpose) -> Option<Uuid> {
+    let mut abandoned = HashSet::new();
+    for record in session
+        .branch()
+        .into_iter()
+        .rev()
+        .filter(|record| record.run_id == Some(run_id))
+    {
+        match &record.event {
+            Event::ModelFinished {
+                failure: None | Some(ModelFailure::Retryable),
+                ..
+            }
+            | Event::Assistant { .. } => return None,
+            Event::RequestCallbackAbandoned { id } => {
+                abandoned.insert(*id);
+            }
+            Event::RequestCallbackStarted {
+                id,
+                purpose: recorded,
+            } if recorded == request_purpose_name(purpose) && !abandoned.contains(id) => {
+                return Some(*id);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn callback_root_host(
+    _session: &Session,
+    sender: CallbackMessageSender,
+    run_id: Uuid,
+    phase: impl Into<String>,
+) -> Arc<dyn ToolHost> {
+    Arc::new(CallbackRootHost {
+        sender,
+        run_id,
+        phase: phase.into(),
+    })
+}
+
+struct CallbackRootHost {
+    sender: CallbackMessageSender,
+    run_id: Uuid,
+    phase: String,
+}
+#[async_trait::async_trait]
+impl ToolHost for CallbackRootHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+    fn for_extension(&self, extension_id: &str) -> Option<Arc<dyn ToolHost>> {
+        Some(Arc::new(ScopedCallbackHost {
+            sender: self.sender.clone(),
+            run_id: self.run_id,
+            phase: self.phase.clone(),
+            extension_id: extension_id.to_owned(),
+        }))
+    }
+    async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+        Outcome::Skipped("tool calls unavailable in callbacks".into())
+    }
+}
+
+struct ScopedCallbackHost {
+    sender: CallbackMessageSender,
+    run_id: Uuid,
+    phase: String,
+    extension_id: String,
+}
+impl ScopedCallbackHost {
+    async fn submit(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+        id: Uuid,
+    ) -> crate::ExtensionResult<()> {
+        crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
+        let delivery = if delivery == crate::CustomMessageDelivery::TriggerTurn {
+            crate::CustomMessageDelivery::Steer
+        } else {
+            delivery
+        };
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send((
+                crate::QueuedCustomMessage {
+                    id,
+                    delivery,
+                    message,
+                },
+                reply,
+            ))
+            .await
+            .map_err(|_| "callback has finished".to_owned())?;
+        response
+            .await
+            .map_err(|_| "callback message acknowledgement was lost".to_owned())?
+    }
+}
+#[async_trait::async_trait]
+impl ToolHost for ScopedCallbackHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+    fn supports_custom_messages(&self) -> bool {
+        true
+    }
+    fn supports_keyed_messages(&self) -> bool {
+        true
+    }
+    async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+        Outcome::Skipped("tool calls unavailable in callbacks".into())
+    }
+    async fn send_message(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+    ) -> crate::ExtensionResult<()> {
+        self.submit(message, delivery, Uuid::new_v4()).await
+    }
+    async fn send_message_with_key(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+        key: &str,
+    ) -> crate::ExtensionResult<()> {
+        use sha2::{Digest, Sha256};
+        if key.is_empty() || key.len() > 256 {
+            return Err("message key must contain 1 to 256 bytes".into());
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"pi-rs:callback-message:v2");
+        digest.update(self.run_id.as_bytes());
+        for value in [self.phase.as_str(), self.extension_id.as_str(), key] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        let bytes = digest.finalize();
+        self.submit(
+            message,
+            delivery,
+            Uuid::from_bytes(bytes[..16].try_into().expect("digest length")),
+        )
+        .await
+    }
+}
+
+pub(crate) struct LifecycleMessageHost {
+    pub(crate) idle: bool,
+    pub(crate) sender: mpsc::Sender<(
+        crate::QueuedCustomMessage,
+        oneshot::Sender<std::result::Result<(), String>>,
+    )>,
+}
+#[async_trait::async_trait]
+impl ToolHost for LifecycleMessageHost {
+    fn tools(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+    fn supports_custom_messages(&self) -> bool {
+        true
+    }
+    async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+        Outcome::Skipped("tool calls are unavailable in lifecycle hooks".into())
+    }
+    async fn send_message(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+    ) -> crate::ExtensionResult<()> {
+        crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
+        let delivery = if !self.idle && delivery == crate::CustomMessageDelivery::TriggerTurn {
+            crate::CustomMessageDelivery::Steer
+        } else {
+            delivery
+        };
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .send((
+                crate::QueuedCustomMessage {
+                    id: Uuid::new_v4(),
+                    delivery,
+                    message,
+                },
+                reply,
+            ))
+            .await
+            .map_err(|_| "lifecycle hook has finished".to_owned())?;
+        result
+            .await
+            .map_err(|_| "lifecycle message response was lost".to_owned())?
+    }
+}
+
+#[derive(Clone)]
 struct NestedHost {
     ui: Option<Arc<dyn crate::ExtensionUi>>,
     requests: mpsc::Sender<Vec<NestedRequest>>,
@@ -3121,15 +6947,31 @@ struct NestedHost {
     call_count: Arc<AtomicUsize>,
     progress: Option<ProgressReporter>,
 }
+#[derive(Clone)]
 struct ProgressReporter {
-    sender: mpsc::Sender<crate::LifecycleEvent>,
+    sender: ProgressSink,
     tool_call_id: String,
     tool_name: String,
     args: serde_json::Value,
     parent_tool_call_id: Option<String>,
 }
+#[derive(Clone)]
+enum ProgressSink {
+    Turn(mpsc::Sender<TurnProgress>),
+}
+enum TurnProgress {
+    Custom(
+        crate::QueuedCustomMessage,
+        oneshot::Sender<std::result::Result<(), String>>,
+    ),
+    Event(Box<crate::LifecycleEvent>),
+    Flush(oneshot::Sender<()>),
+}
 #[async_trait::async_trait]
 impl ToolHost for NestedHost {
+    fn supports_prevalidated_call_accounting(&self) -> bool {
+        true
+    }
     fn supports_progress(&self) -> bool {
         self.progress.is_some()
     }
@@ -3157,13 +6999,14 @@ impl ToolHost for NestedHost {
         if self.cancellation.is_cancelled() {
             return Err("tool progress cancelled".into());
         }
-        progress
-            .sender
-            .try_send(event)
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => "tool progress queue is full".into(),
-                mpsc::error::TrySendError::Closed(_) => "tool has finished".into(),
-            })
+        match &progress.sender {
+            ProgressSink::Turn(sender) => sender
+                .try_send(TurnProgress::Event(Box::new(event)))
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => "tool progress queue is full".into(),
+                    mpsc::error::TrySendError::Closed(_) => "tool has finished".into(),
+                }),
+        }
     }
     fn has_ui(&self) -> bool {
         self.ui.is_some()
@@ -3187,38 +7030,103 @@ impl ToolHost for NestedHost {
     fn tools(&self) -> Vec<ToolSpec> {
         self.specs.as_ref().clone()
     }
+    fn supports_custom_messages(&self) -> bool {
+        self.progress.is_some()
+    }
+    async fn send_message(
+        &self,
+        message: crate::CustomMessage,
+        delivery: crate::CustomMessageDelivery,
+    ) -> crate::ExtensionResult<()> {
+        crate::journal::validate_custom_message(&message).map_err(|error| error.to_string())?;
+        let delivery = if delivery == crate::CustomMessageDelivery::TriggerTurn {
+            crate::CustomMessageDelivery::Steer
+        } else {
+            delivery
+        };
+        let Some(progress) = &self.progress else {
+            return Err("custom message delivery is unavailable".into());
+        };
+        let (reply, result) = oneshot::channel();
+        let input = crate::QueuedCustomMessage {
+            id: Uuid::new_v4(),
+            delivery,
+            message,
+        };
+        match &progress.sender {
+            ProgressSink::Turn(sender) => tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => return Err("custom message cancelled".into()),
+                result = sender.send(TurnProgress::Custom(input, reply)) => result.map_err(|_| "tool has finished".to_owned())?,
+            },
+        }
+        tokio::select! {
+            biased;
+            result = result => result.map_err(|_| "custom message response lost".to_owned())?,
+            _ = self.cancellation.cancelled() => Err("custom message cancelled".into()),
+        }
+    }
     async fn call(&self, name: &str, arguments: serde_json::Value) -> Outcome {
         self.call_batch(vec![(name.into(), arguments)])
             .await
             .remove(0)
     }
+    async fn call_with_cancellation(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        cancellation: CancellationToken,
+    ) -> Outcome {
+        let scoped = Self {
+            cancellation,
+            ..self.clone()
+        };
+        scoped.call(name, arguments).await
+    }
     async fn call_batch(&self, calls: Vec<(String, serde_json::Value)>) -> Vec<Outcome> {
+        self.call_batch_prevalidated(
+            calls
+                .into_iter()
+                .map(|(name, value)| (name, Some(value)))
+                .collect(),
+        )
+        .await
+    }
+    async fn call_batch_prevalidated(
+        &self,
+        calls: Vec<(String, Option<serde_json::Value>)>,
+    ) -> Vec<Outcome> {
         let mut requests = Vec::new();
         let mut results = Vec::new();
         for (name, arguments) in calls {
             let error =
                 if self.depth >= 8 || self.call_count.fetch_add(1, Ordering::Relaxed) >= 4096 {
                     Some("nested tool execution limit reached")
-                } else if arguments.to_string().len() > 1024 * 1024 {
+                } else if arguments
+                    .as_ref()
+                    .is_none_or(|arguments| arguments.to_string().len() > 1024 * 1024)
+                {
                     Some("nested tool arguments exceed size limit")
                 } else {
                     None
                 };
             let (reply, result) = oneshot::channel();
+            let snapshot = Arc::new(std::sync::Mutex::new(None));
             if let Some(error) = error {
                 let _ = reply.send(Outcome::Skipped(error.into()));
             } else {
                 requests.push(NestedRequest {
                     name,
-                    arguments,
+                    arguments: arguments.expect("validated nested arguments"),
                     parent_operation: self.parent_operation,
                     cancellation: self.cancellation.clone(),
                     depth: self.depth + 1,
                     call_count: self.call_count.clone(),
                     reply,
+                    snapshot: snapshot.clone(),
                 });
             }
-            results.push(result);
+            results.push((result, snapshot));
         }
         if !requests.is_empty() {
             tokio::select! {
@@ -3229,27 +7137,38 @@ impl ToolHost for NestedHost {
                 }
             }
         }
-        futures_util::future::join_all(results.into_iter().map(|result| async move {
-            result
-                .await
-                .unwrap_or_else(|_| Outcome::Unknown("nested tool response was lost".into()))
+        futures_util::future::join_all(results.into_iter().map(|(result, snapshot)| async move {
+            tokio::select! {
+                biased;
+                result = result => result.unwrap_or_else(|_| snapshot.lock().expect("nested reply snapshot").clone()
+                    .unwrap_or_else(|| Outcome::Unknown("nested tool response was lost".into()))),
+                _ = self.cancellation.cancelled() => snapshot.lock().expect("nested reply snapshot").clone()
+                    .unwrap_or_else(|| Outcome::Unknown("cancelled while awaiting nested tool result".into())),
+            }
         }))
         .await
     }
 }
 
-enum Preparation<'a> {
-    Ready {
-        tool: &'a RegisteredTool,
-        args: serde_json::Value,
-        context: ToolContext,
-        state: Option<crate::ExtensionState>,
-        guard: tokio_util::sync::DropGuard,
-    },
-    Skipped(String),
+// Journal and accounting failures stay outside the retryable provider outcome.
+struct PreparedAttempt<'a> {
+    request: ModelRequest,
+    declarations: Vec<crate::ToolDeclaration>,
+    dispatch_context: crate::ToolDispatchContext,
+    prepared: Option<Box<dyn crate::PreparedToolDispatch + 'a>>,
+    transformed: bool,
+    known_loadout: bool,
+    configuration: Option<String>,
 }
 
-// Journal and accounting failures stay outside the retryable provider outcome.
+impl PreparedAttempt<'_> {
+    fn reservation_request(&self) -> &ModelRequest {
+        self.prepared
+            .as_ref()
+            .map_or(&self.request, |prepared| prepared.reservation_request())
+    }
+}
+
 struct ReplyAttempt {
     outcome: Result<Reply>,
 }
@@ -3294,6 +7213,9 @@ fn pending_reply(
                     .as_ref()
                     .map(|reply| (*request_id, metadata.clone(), usage.clone(), reply.clone()));
             }
+            Event::SourceEntry { format, .. } if format == "pi-rs:overflow-recovery" => {
+                return None;
+            }
             Event::Assistant { .. }
             | Event::User { .. }
             | Event::UserWithImages { .. }
@@ -3320,12 +7242,402 @@ fn branch_excerpt(entry: Message) -> String {
             excerpt
         }
         Message::System { content } => format!("System: {content}"),
-        Message::Tool { call_id, content } => format!("Tool {call_id}: {content}"),
+        Message::Tool {
+            call_id, content, ..
+        } => format!("Tool {call_id}: {content}"),
+    }
+}
+
+// The existing summary notification carries the enriched update only through
+// the synchronous adapter. Legacy observers still receive one SummaryRequest
+// at provider dispatch, with no additional notification variants.
+fn notify_auto_compaction(
+    reason: crate::CompactionTrigger,
+    update: AutoCompactionUpdate,
+    observer: &mut Observer<'_>,
+) {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            AUTO_COMPACTION_EVENT.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    AUTO_COMPACTION_EVENT.with(|stack| stack.borrow_mut().push((reason, Arc::new(update))));
+    let _guard = Pop;
+    observer(Notification::SummaryRequest);
+}
+
+thread_local! {
+    static TOOL_ATTEMPT_OPERATION_ID: std::cell::Cell<Option<Uuid>> = const { std::cell::Cell::new(None) };
+    static AUTO_COMPACTION_EVENT: std::cell::RefCell<Vec<(crate::CompactionTrigger, Arc<AutoCompactionUpdate>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TOOL_EVENT_METADATA: std::cell::RefCell<Vec<(Uuid, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static RECORD_EVENT_METADATA: std::cell::RefCell<Vec<(u64, Option<serde_json::Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TEXT_EVENT_METADATA: std::cell::RefCell<Vec<TextEventMetadata>> = const { std::cell::RefCell::new(Vec::new()) };
+    static REASONING_EVENT_METADATA: std::cell::RefCell<Vec<ReasoningEventMetadata>> = const { std::cell::RefCell::new(Vec::new()) };
+    static REDACTED_REASONING_START: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Operation identity for the tool attempt being delivered to this observer.
+#[doc(hidden)]
+pub fn tool_attempt_operation_id() -> Option<Uuid> {
+    TOOL_ATTEMPT_OPERATION_ID.get()
+}
+
+fn with_tool_attempt<T>(id: Uuid, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Uuid>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TOOL_ATTEMPT_OPERATION_ID.set(self.0);
+        }
+    }
+    let _restore = Restore(TOOL_ATTEMPT_OPERATION_ID.replace(Some(id)));
+    f()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TextEventMetadata {
+    Start { index: u64 },
+    Delta { index: u64 },
+    End { index: u64, content: String },
+}
+
+fn text_event_metadata() -> Option<TextEventMetadata> {
+    TEXT_EVENT_METADATA.with(|stack| stack.borrow().last().cloned())
+}
+
+fn with_text_event_metadata<T>(value: TextEventMetadata, f: impl FnOnce() -> T) -> T {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            TEXT_EVENT_METADATA.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    TEXT_EVENT_METADATA.with(|stack| stack.borrow_mut().push(value));
+    let _guard = Pop;
+    f()
+}
+
+/// Whether the current synchronous reasoning-start callback is redacted.
+#[doc(hidden)]
+pub fn redacted_reasoning_start() -> bool {
+    REDACTED_REASONING_START.with(|stack| stack.borrow().last().copied().unwrap_or(false))
+}
+fn with_redacted_reasoning_start<T>(value: bool, f: impl FnOnce() -> T) -> T {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            REDACTED_REASONING_START.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    REDACTED_REASONING_START.with(|stack| stack.borrow_mut().push(value));
+    let _guard = Pop;
+    f()
+}
+
+/// Optional item identity associated with the current reasoning notification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReasoningEventMetadata {
+    Start { index: u64 },
+    Delta { index: u64 },
+    End { index: u64, content: String },
+}
+
+/// Returns item metadata only during the current synchronous observer call.
+pub fn reasoning_event_metadata() -> Option<ReasoningEventMetadata> {
+    REASONING_EVENT_METADATA.with(|stack| stack.borrow().last().cloned())
+}
+
+fn with_reasoning_event_metadata<T>(value: ReasoningEventMetadata, f: impl FnOnce() -> T) -> T {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            REASONING_EVENT_METADATA.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    REASONING_EVENT_METADATA.with(|stack| stack.borrow_mut().push(value));
+    let _guard = Pop;
+    f()
+}
+
+/// Metadata associated with the committed record currently being observed.
+#[doc(hidden)]
+pub fn record_event_metadata(record_id: u64) -> Option<serde_json::Value> {
+    RECORD_EVENT_METADATA.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .filter(|(id, _)| *id == record_id)
+            .and_then(|(_, value)| value.clone())
+    })
+}
+
+fn with_record_event_metadata<T>(
+    id: u64,
+    value: Option<serde_json::Value>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            RECORD_EVENT_METADATA.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    RECORD_EVENT_METADATA.with(|stack| stack.borrow_mut().push((id, value)));
+    let _guard = Pop;
+    f()
+}
+
+/// Returns transient result metadata only while the matching committed-record
+/// observer is being called on the current thread. Never persists the value.
+#[doc(hidden)]
+pub fn tool_result_event_metadata(operation_id: Uuid) -> Option<serde_json::Value> {
+    TOOL_EVENT_METADATA.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .filter(|(id, _)| *id == operation_id)
+            .and_then(|(_, value)| value.clone())
+    })
+}
+
+fn with_tool_result_event_metadata<T>(
+    id: Uuid,
+    value: Option<serde_json::Value>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            TOOL_EVENT_METADATA.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+    TOOL_EVENT_METADATA.with(|stack| stack.borrow_mut().push((id, value)));
+    let _guard = Pop;
+    f()
+}
+
+#[cfg(test)]
+mod metadata_scope_tests {
+    use super::*;
+
+    #[test]
+    fn item_events_project_to_legacy_deltas_only() {
+        let mut legacy = Vec::new();
+        let mut observer = |event: Notification<'_>| match event {
+            Notification::Text(text) | Notification::Reasoning(text) => {
+                legacy.push(text.to_owned())
+            }
+            _ => {}
+        };
+        with_text_event_metadata(TextEventMetadata::Start { index: 0 }, || {
+            dispatch_legacy_event(Notification::Text(""), &mut observer)
+        });
+        with_text_event_metadata(TextEventMetadata::Delta { index: 0 }, || {
+            dispatch_legacy_event(Notification::Text("a"), &mut observer)
+        });
+        with_text_event_metadata(
+            TextEventMetadata::End {
+                index: 0,
+                content: "ab".into(),
+            },
+            || dispatch_legacy_event(Notification::Text(""), &mut observer),
+        );
+        with_reasoning_event_metadata(ReasoningEventMetadata::Start { index: 1 }, || {
+            dispatch_legacy_event(Notification::Reasoning(""), &mut observer)
+        });
+        with_reasoning_event_metadata(ReasoningEventMetadata::Delta { index: 1 }, || {
+            dispatch_legacy_event(Notification::Reasoning("b"), &mut observer)
+        });
+        with_reasoning_event_metadata(
+            ReasoningEventMetadata::End {
+                index: 1,
+                content: "bc".into(),
+            },
+            || dispatch_legacy_event(Notification::Reasoning(""), &mut observer),
+        );
+        assert_eq!(legacy, ["a", "b"]);
+    }
+
+    #[test]
+    fn legacy_observers_only_receive_the_dispatch_summary_request() {
+        let mut summary_requests = 0;
+        let mut observer = |event: Notification<'_>| {
+            if matches!(event, Notification::SummaryRequest) {
+                summary_requests += 1;
+            }
+        };
+        notify_auto_compaction(
+            crate::CompactionTrigger::Threshold,
+            AutoCompactionUpdate::Started,
+            &mut |event| dispatch_legacy_event(event, &mut observer),
+        );
+        dispatch_legacy_event(Notification::SummaryRequest, &mut observer);
+        assert_eq!(summary_requests, 1);
+    }
+
+    #[test]
+    fn reasoning_metadata_is_nested_and_observer_scoped() {
+        assert_eq!(reasoning_event_metadata(), None);
+        with_reasoning_event_metadata(ReasoningEventMetadata::Delta { index: 2 }, || {
+            assert_eq!(
+                reasoning_event_metadata(),
+                Some(ReasoningEventMetadata::Delta { index: 2 })
+            );
+            with_reasoning_event_metadata(
+                ReasoningEventMetadata::End {
+                    index: 3,
+                    content: "done".into(),
+                },
+                || {
+                    assert_eq!(
+                        reasoning_event_metadata(),
+                        Some(ReasoningEventMetadata::End {
+                            index: 3,
+                            content: "done".into()
+                        })
+                    );
+                },
+            );
+            assert_eq!(
+                reasoning_event_metadata(),
+                Some(ReasoningEventMetadata::Delta { index: 2 })
+            );
+        });
+        assert_eq!(reasoning_event_metadata(), None);
+    }
+
+    #[test]
+    fn committed_compaction_exposes_only_its_metadata_to_live_observer() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let expected = serde_json::json!({"fromExtension":true,"details":{"origin":"fixture"}});
+        let mut observed = None;
+        commit_compaction_record(
+            &mut session,
+            Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: None,
+                retain_from: None,
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            },
+            Some(expected.clone()),
+            &mut |event| {
+                if let Notification::Committed(record) = event {
+                    assert!(record_event_metadata(record.id + 1).is_none());
+                    observed = record_event_metadata(record.id);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(observed, Some(expected));
+        assert!(record_event_metadata(session.head()).is_none());
+    }
+
+    #[test]
+    fn metadata_scope_is_correlated_nested_and_unwind_safe() {
+        let outer = Uuid::new_v4();
+        let inner = Uuid::new_v4();
+        assert!(tool_result_event_metadata(outer).is_none());
+        with_tool_result_event_metadata(outer, Some(serde_json::json!("outer")), || {
+            assert_eq!(
+                tool_result_event_metadata(outer),
+                Some(serde_json::json!("outer"))
+            );
+            with_tool_result_event_metadata(inner, None, || {
+                assert!(tool_result_event_metadata(outer).is_none());
+                assert!(tool_result_event_metadata(inner).is_none());
+            });
+            let _ = std::panic::catch_unwind(|| {
+                with_tool_result_event_metadata(inner, Some(serde_json::json!("inner")), || {
+                    assert_eq!(
+                        tool_result_event_metadata(inner),
+                        Some(serde_json::json!("inner"))
+                    );
+                    panic!("test unwind");
+                })
+            });
+            assert_eq!(
+                tool_result_event_metadata(outer),
+                Some(serde_json::json!("outer"))
+            );
+            assert!(tool_result_event_metadata(inner).is_none());
+        });
+        assert!(tool_result_event_metadata(outer).is_none());
     }
 }
 
 fn commit(session: &mut Session, event: Event, observer: &mut Observer<'_>) -> Result<()> {
     observer(Notification::Committed(session.append(event)?));
+    Ok(())
+}
+
+fn commit_compaction_record(
+    session: &mut Session,
+    event: Event,
+    metadata: Option<serde_json::Value>,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
+    let notify_metadata = metadata.clone();
+    let record = if let Some(metadata) = metadata {
+        session.append_with_record_metadata(event, metadata)?
+    } else {
+        session.append(event)?
+    };
+    with_record_event_metadata(record.id, notify_metadata, || {
+        observer(Notification::Committed(record))
+    });
+    Ok(())
+}
+
+// Serialize cancellation's snapshot read with the durable append and publication.
+fn commit_with_reply(
+    session: &mut Session,
+    event: Event,
+    observer: &mut Observer<'_>,
+    replies: Option<&HashMap<Uuid, ReplySnapshot>>,
+    duration_ms: Option<u64>,
+) -> Result<()> {
+    let reply = match &event {
+        Event::ToolFinished {
+            operation_id,
+            outcome,
+            ..
+        } => replies
+            .and_then(|replies| replies.get(operation_id))
+            .map(|snapshot| {
+                (
+                    snapshot.lock().expect("nested reply snapshot"),
+                    outcome.clone(),
+                )
+            }),
+        _ => None,
+    };
+    let metadata = duration_ms.map(|duration| serde_json::json!({"durationMs":duration}));
+    let record = if metadata.is_some() {
+        session.append_with_advisory_metadata(event, metadata.clone())?
+    } else {
+        session.append(event)?
+    };
+    if let Some((mut snapshot, outcome)) = reply {
+        *snapshot = Some(outcome);
+    }
+    with_record_event_metadata(record.id, metadata, || {
+        observer(Notification::Committed(record));
+    });
     Ok(())
 }
 
@@ -3365,7 +7677,23 @@ fn reply_to_control<T>(result: Result<T>, reply: oneshot::Sender<Result<T>>) -> 
 impl AgentInput {
     /// Apply one message or queue control from an embedding application's event loop.
     pub fn apply(self, session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
-        queue_input(session, self, observer)
+        if let AgentInput::EnqueueCustom { message, reply } = self {
+            let result = if matches!(
+                message.delivery,
+                crate::CustomMessageDelivery::NextTurn | crate::CustomMessageDelivery::TriggerTurn
+            ) {
+                queue_custom_message(session, message, observer)
+            } else {
+                session.append_custom_message(message.message).map(|()| {
+                    observer(Notification::Committed(
+                        session.records().last().expect("appended custom message"),
+                    ))
+                })
+            };
+            reply_to_control(result, reply)
+        } else {
+            queue_input(session, self, observer)
+        }
     }
 }
 
@@ -3391,6 +7719,12 @@ fn queue_input(
         }
         AgentInput::Enqueue { message, reply } => {
             return reply_to_control(queue_message(session, message, observer), reply);
+        }
+        AgentInput::EnqueueCustom { mut message, reply } => {
+            if message.delivery == crate::CustomMessageDelivery::TriggerTurn {
+                message.delivery = crate::CustomMessageDelivery::Steer;
+            }
+            return reply_to_control(queue_custom_message(session, message, observer), reply);
         }
         AgentInput::ClearQueue { reply } => {
             let count = session.records().len();
@@ -3419,6 +7753,18 @@ fn queue_input(
             }
             let count = session.records().len();
             let result = session.set_name(&name);
+            for record in &session.records()[count..] {
+                observer(Notification::Committed(record));
+            }
+            return reply_to_control(result, reply);
+        }
+        AgentInput::SetSessionLabel {
+            target,
+            label,
+            reply,
+        } => {
+            let count = session.records().len();
+            let result = session.set_label(target, label);
             for record in &session.records()[count..] {
                 observer(Notification::Committed(record));
             }
@@ -3485,46 +7831,131 @@ fn queue_message(
     Ok(())
 }
 
+pub(crate) fn queue_custom_message(
+    session: &mut Session,
+    input: crate::QueuedCustomMessage,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
+    crate::journal::validate_custom_message(&input.message)?;
+    if let Some(existing) = session
+        .records()
+        .iter()
+        .find_map(|record| match &record.event {
+            Event::CustomMessageQueued { input: existing } if existing.id == input.id => {
+                Some(existing)
+            }
+            _ => None,
+        })
+    {
+        if serde_json::to_value(existing)? != serde_json::to_value(&input)? {
+            return Err(Error::Config(
+                "custom message ID already exists with different content".into(),
+            ));
+        }
+        if session.branch().iter().any(|record| matches!(&record.event, Event::CustomMessageQueued { input: existing } if existing.id == input.id)) {
+            return Ok(());
+        }
+    }
+    commit(session, Event::CustomMessageQueued { input }, observer)?;
+    Ok(())
+}
+
+pub(crate) fn apply_settled_after_turn(
+    session: &mut Session,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
+    for (queued_at, input) in session.queued_custom_messages() {
+        let origin = session.records()[(queued_at - 1) as usize].run_id;
+        if input.delivery == crate::CustomMessageDelivery::AfterTurn
+            && !origin.is_some_and(|run_id| has_unfinished_turn_end(session, run_id))
+        {
+            commit(
+                session,
+                Event::CustomMessageDelivered {
+                    id: input.id,
+                    message: input.message,
+                },
+                observer,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn apply_inputs(
     session: &mut Session,
     include_followups: bool,
     observer: &mut Observer<'_>,
 ) -> Result<bool> {
-    let pending: Vec<_> = session
-        .queued_inputs()
-        .into_iter()
-        .filter(|message| include_followups || message.input.kind == InputKind::Steer)
-        .collect();
+    enum Pending {
+        User(QueuedMessage),
+        Custom(crate::QueuedCustomMessage),
+    }
+    let users = session.queued_inputs();
+    let customs = session.queued_custom_messages();
+    let mut pending = Vec::new();
+    for record in session.branch() {
+        match &record.event {
+            Event::InputQueued { input } => {
+                if let Some(message) = users.iter().find(|m| m.input.id == input.id) {
+                    pending.push(Pending::User(message.clone()));
+                }
+            }
+            Event::InputQueuedWithImages { input } => {
+                if let Some(message) = users.iter().find(|m| m.input.id == input.input.id) {
+                    pending.push(Pending::User(message.clone()));
+                }
+            }
+            Event::CustomMessageQueued { input } => {
+                if let Some((_, message)) = customs.iter().find(|(_, m)| m.id == input.id) {
+                    pending.push(Pending::Custom(message.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
     let mut accepted = false;
-    let steering_mode = session.queue_mode(InputKind::Steer);
-    let follow_up_mode = session.queue_mode(InputKind::FollowUp);
     let mut seen = HashSet::new();
     for message in pending {
-        let kind = message.input.kind;
-        let seen_kind = if kind == InputKind::Steer { 0 } else { 1 };
-        let mode = if kind == InputKind::Steer {
-            steering_mode
-        } else {
-            follow_up_mode
+        let kind = match &message {
+            Pending::User(message) => message.input.kind,
+            Pending::Custom(message) => match message.delivery {
+                crate::CustomMessageDelivery::Steer => InputKind::Steer,
+                crate::CustomMessageDelivery::FollowUp => InputKind::FollowUp,
+                _ => continue,
+            },
         };
-        if mode == crate::QueueMode::OneAtATime && !seen.insert(seen_kind) {
+        if !include_followups && kind == InputKind::FollowUp {
             continue;
         }
-        accepted = true;
-        message.validate()?;
-        let event = if message.images.is_empty() {
-            Event::User {
-                content: message.input.content,
-                input_id: Some(message.input.id),
-            }
-        } else {
-            Event::UserWithImages {
-                content: message.input.content,
-                input_id: Some(message.input.id),
-                images: message.images,
+        if session.queue_mode(kind) == crate::QueueMode::OneAtATime
+            && !seen.insert(kind == InputKind::Steer)
+        {
+            continue;
+        }
+        let event = match message {
+            Pending::Custom(input) => Event::CustomMessageDelivered {
+                id: input.id,
+                message: input.message,
+            },
+            Pending::User(message) => {
+                message.validate()?;
+                if message.images.is_empty() {
+                    Event::User {
+                        content: message.input.content,
+                        input_id: Some(message.input.id),
+                    }
+                } else {
+                    Event::UserWithImages {
+                        content: message.input.content,
+                        input_id: Some(message.input.id),
+                        images: message.images,
+                    }
+                }
             }
         };
         commit(session, event, observer)?;
+        accepted = true;
     }
     if accepted {
         notify_queue(session, observer);
@@ -3569,6 +8000,321 @@ fn recover(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
     ensure_settled(session.operations())
 }
 
+// Fingerprint only stable request configuration, excluding conversation and
+// output allowance, which legitimately change between turns.
+fn bound_structured_tool_outcome(outcome: Outcome, max_bytes: usize) -> Result<Outcome> {
+    let size = if matches!(&outcome, Outcome::StructuredWithDetails { .. }) {
+        serde_json::to_vec(&outcome)?.len()
+    } else {
+        outcome.tool_content().len()
+    };
+    if size <= max_bytes {
+        return Ok(outcome);
+    }
+    if outcome.is_error() {
+        Ok(Outcome::Failed("failure detail exceeds size limit".into()))
+    } else {
+        Ok(Outcome::Truncated {
+            original_bytes: size,
+        })
+    }
+}
+
+fn prepared_configuration_hash(
+    model: &dyn Model,
+    request: &ModelRequest,
+    prepared: Option<&dyn crate::PreparedToolDispatch>,
+) -> Option<String> {
+    let base = request_configuration_hash(model, request)?;
+    match prepared {
+        None => Some(base),
+        Some(dispatch) => crate::protected_model_fingerprint(&(
+            "prepared-tool-configuration-v2",
+            base,
+            dispatch.effective_tools(),
+            request_configuration_hash(model, dispatch.dispatch_request())?,
+            request_configuration_hash(model, dispatch.reservation_request())?,
+        )),
+    }
+}
+
+fn request_configuration_hash(model: &dyn Model, request: &ModelRequest) -> Option<String> {
+    let identity = model.context_identity()?;
+    let systems: Vec<_> = request
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::System { content } => Some(content),
+            _ => None,
+        })
+        .collect();
+    serde_json::to_vec(&(
+        "effective-context-v2",
+        identity,
+        &request.model,
+        systems,
+        &request.tools,
+    ))
+    .ok()
+    .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[cfg(test)]
+mod retention_estimate_tests {
+    use super::*;
+
+    fn session_with_reasoning(reasoning: &str) -> (Session, u64) {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "x".repeat(400),
+                input_id: None,
+            })
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        let completion = session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    reasoning: Some(reasoning.into()),
+                    ..Default::default()
+                },
+                usage: crate::UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap()
+            .id;
+        session
+            .append(Event::Assistant {
+                content: "ok".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap();
+        (session, completion)
+    }
+
+    #[test]
+    fn long_history_retention_and_usage_share_indexed_reasoning() {
+        const TURNS: usize = 2500;
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        for _ in 0..TURNS {
+            session
+                .append(Event::User {
+                    content: "x".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            let request_id = Uuid::new_v4();
+            session
+                .append(Event::ModelFinished {
+                    request_id,
+                    metadata: ModelMetadata {
+                        reasoning: Some("r".repeat(8)),
+                        ..Default::default()
+                    },
+                    usage: crate::UsageReport::Unconfirmed,
+                    failure: None,
+                    partial: String::new(),
+                    reply: None,
+                })
+                .unwrap();
+            session
+                .append(Event::Assistant {
+                    content: "ok".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: Some(request_id),
+                })
+                .unwrap();
+        }
+        assert_eq!(session.context_usage_estimate().tokens, (TURNS * 4) as u64);
+        let retention = configured_retention(&session, Some(u64::MAX), 1).unwrap();
+        assert_eq!(retention.keep_turns, TURNS);
+        assert!(!retention.split_turn);
+        assert_eq!(
+            retained_turn_count(&session, Some(u64::MAX)).unwrap(),
+            TURNS
+        );
+    }
+
+    #[test]
+    fn recent_token_cut_counts_assistant_thinking() {
+        let (session, completion) = session_with_reasoning(&"r".repeat(400));
+        let retention = configured_retention(&session, Some(100), 1).unwrap();
+        assert_eq!(retention.boundary, Some(completion));
+        assert!(retention.split_turn);
+        let (without_thinking, _) = session_with_reasoning("");
+        let retention = configured_retention(&without_thinking, Some(100), 1).unwrap();
+        assert!(!retention.split_turn);
+    }
+
+    #[test]
+    fn complete_turn_retention_counts_reasoning_in_latest_turn() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "x".repeat(400),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "next".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    reasoning: Some("r".repeat(400)),
+                    ..Default::default()
+                },
+                usage: crate::UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "ok".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap();
+        assert_eq!(retained_turn_count(&session, Some(100)).unwrap(), 1);
+    }
+
+    #[test]
+    fn recent_token_cut_ignores_tool_envelope_metadata() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "x".repeat(400),
+                input_id: None,
+            })
+            .unwrap();
+        let operation_id = Uuid::new_v4();
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                usage: None,
+                request_id: None,
+                invocations: vec![crate::Invocation {
+                    operation_id,
+                    call: crate::ToolCall {
+                        id: "call".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+            })
+            .unwrap();
+        session.append(Event::ToolFinished {
+            operation_id,
+            outcome: crate::Outcome::Structured {
+                data: serde_json::json!({"content":[{"type":"text","text":"ok"}], "metadata":"z".repeat(4000)}),
+                attachments: vec![],
+            },
+            states: Default::default(),
+        }).unwrap();
+        let retention = configured_retention(&session, Some(50), 1).unwrap();
+        assert!(!retention.split_turn);
+    }
+
+    #[test]
+    fn recent_token_cut_uses_edited_thinking_not_stale_metadata() {
+        let (mut session, _) = session_with_reasoning(&"r".repeat(400));
+        let assistant = session
+            .records()
+            .iter()
+            .find(|r| matches!(r.event, Event::Assistant { .. }))
+            .unwrap()
+            .id;
+        session
+            .edit_context(
+                assistant,
+                Some(crate::ContextContent::Blocks(vec![
+                    crate::ContentBlock::Thinking {
+                        thinking: "z".repeat(800),
+                        thinking_signature: None,
+                        redacted: false,
+                    },
+                    crate::ContentBlock::Text {
+                        text: "ok".into(),
+                        text_signature: None,
+                    },
+                ])),
+            )
+            .unwrap();
+        assert!(
+            configured_retention(&session, Some(100), 1)
+                .unwrap()
+                .split_turn
+        );
+        session
+            .edit_context(
+                assistant,
+                Some(crate::ContextContent::Blocks(vec![
+                    crate::ContentBlock::Text {
+                        text: "ok".into(),
+                        text_signature: None,
+                    },
+                ])),
+            )
+            .unwrap();
+        let retention = configured_retention(&session, Some(100), 1).unwrap();
+        assert!(!retention.split_turn);
+    }
+}
+
+#[cfg(test)]
+mod request_callback_marker_tests {
+    use super::*;
+
+    #[test]
+    fn abandoned_request_and_restarted_request_keep_distinct_durable_identities() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let run_id = Uuid::new_v4();
+        session.set_run_id(Some(run_id));
+        let first = Uuid::new_v4();
+        session
+            .append(Event::RequestCallbackStarted {
+                id: first,
+                purpose: "turn".into(),
+            })
+            .unwrap();
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(
+            open_request_callback(&restored, run_id, RequestPurpose::Turn),
+            Some(first)
+        );
+        session
+            .append(Event::RequestCallbackAbandoned { id: first })
+            .unwrap();
+        let second = Uuid::new_v4();
+        session
+            .append(Event::RequestCallbackStarted {
+                id: second,
+                purpose: "turn".into(),
+            })
+            .unwrap();
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(
+            open_request_callback(&restored, run_id, RequestPurpose::Turn),
+            Some(second)
+        );
+        assert_ne!(first, second);
+    }
+}
+
 #[cfg(test)]
 mod tree_tests {
     use super::*;
@@ -3605,6 +8351,91 @@ mod tree_tests {
         let messages = model_conversation_entries(&session.branch(), session.operations());
         assert!(
             matches!(messages.as_slice(), [(_, Message::User { content })] if content == "question")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_after_failed_assistant_does_not_return_older_answer() {
+        struct Capture(std::sync::Mutex<Vec<ModelRequest>>);
+        #[async_trait::async_trait]
+        impl Model for Capture {
+            async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+                self.0.lock().unwrap().push(request);
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(ModelEvent::Text("new answer".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: Some(Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        }),
+                    }),
+                ])))
+            }
+        }
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "question".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let request_id = Uuid::new_v4();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata::default(),
+                usage: crate::UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Cancelled),
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "failed partial".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: Some(request_id),
+            })
+            .unwrap();
+        let model = Capture(std::sync::Mutex::new(Vec::new()));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let (_sender, mut inputs) = mpsc::channel(1);
+        assert_eq!(
+            agent
+                .run(
+                    &mut session,
+                    None,
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "new answer"
+        );
+        let requests = model.0.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !serde_json::to_string(&requests[0])
+                .unwrap()
+                .contains("failed partial")
         );
     }
 
@@ -3668,11 +8499,3782 @@ mod tree_tests {
 
     struct NoModel;
 
+    struct ProvidedCompaction {
+        cancel: bool,
+        invalid: bool,
+        events: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Extension for ProvidedCompaction {
+        fn id(&self) -> &str {
+            "provided-compaction"
+        }
+        fn handles_before_summary_compaction(&self) -> bool {
+            true
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn before_summary_compaction(
+            &self,
+            preparation: &crate::CompactionPreparation,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<Option<crate::BeforeSummaryCompactionResult>> {
+            assert!(preparation.branch_entries.len() >= 2);
+            Ok(Some(crate::BeforeSummaryCompactionResult {
+                cancel: self.cancel,
+                compaction: Some(crate::ExtensionCompaction {
+                    summary: "extension summary".into(),
+                    first_kept_entry: if self.invalid {
+                        Some(u64::MAX)
+                    } else {
+                        preparation.first_kept_entry
+                    },
+                    tokens_before: 123,
+                    usage: None,
+                    details: Some(serde_json::json!({"origin":"hook"})),
+                }),
+            }))
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(event).unwrap());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_summary_commits_or_rejects_before_model_for_each_reason() {
+        for reason in [
+            crate::CompactionTrigger::Manual,
+            crate::CompactionTrigger::Threshold,
+        ] {
+            for (cancel, invalid) in [(false, false), (true, false), (false, true)] {
+                let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let mut registry = Registry::default();
+                registry
+                    .register(Arc::new(ProvidedCompaction {
+                        cancel,
+                        invalid,
+                        events: events.clone(),
+                    }))
+                    .unwrap();
+                let agent = Agent {
+                    model: &NoModel,
+                    model_name: "fixture",
+                    registry: &registry,
+                    system_prompt: "",
+                    limits: Limits::default(),
+                };
+                let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+                for text in ["old", "recent"] {
+                    session
+                        .append(Event::User {
+                            content: text.into(),
+                            input_id: None,
+                        })
+                        .unwrap();
+                    if text == "old" {
+                        session
+                            .append(Event::Assistant {
+                                content: "response".into(),
+                                invocations: vec![],
+                                usage: None,
+                                request_id: None,
+                            })
+                            .unwrap();
+                    }
+                }
+                let retention = RetentionPlan::turns(&session, 1);
+                let before = session.records().len();
+                let token = CancellationToken::new();
+                let result = if matches!(reason, crate::CompactionTrigger::Manual) {
+                    agent
+                        .summarize(&mut session, 1, &token, &mut |_| {})
+                        .await
+                        .map(|()| Some((0, true)))
+                } else {
+                    agent
+                        .summarize_prefix::<AgentInput>(
+                            &mut session,
+                            &ExtensionStates::new(),
+                            SummaryScope {
+                                retention,
+                                instructions: None,
+                                output_limit: 0,
+                                cancellation: &token,
+                                reason,
+                                will_retry: false,
+                                skip_without_model: false,
+                            },
+                            &mut |_| {},
+                            None,
+                        )
+                        .await
+                };
+                if cancel || invalid {
+                    assert!(result.is_err());
+                    assert_eq!(session.records().len(), before);
+                    let events = events.lock().unwrap();
+                    assert_eq!(events.last().unwrap()["type"], "session_compact_failed");
+                    assert_eq!(events.last().unwrap()["aborted"], cancel);
+                } else {
+                    assert_eq!(result.unwrap(), Some((0, true)));
+                    assert!(
+                        matches!(&session.records().last().unwrap().event, Event::Compacted { summary, retain_from, tokens_before: Some(123), .. } if summary == "extension summary" && *retain_from == retention.boundary)
+                    );
+                    let metadata = session.record_metadata(session.head()).unwrap();
+                    assert_eq!(metadata["details"]["origin"], "hook");
+                    assert_eq!(metadata["fromExtension"], true);
+                    let events = events.lock().unwrap();
+                    assert_eq!(events.last().unwrap()["type"], "session_compact");
+                    assert_eq!(events.last().unwrap()["fromExtension"], true);
+                }
+            }
+        }
+    }
+
+    struct TurnModel(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl Model for TurnModel {
+        async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_compaction_persists_file_details_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compaction-files.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let calls: Vec<_> = [("read", "r", "read.txt"), ("write", "w", "written.txt")]
+            .into_iter()
+            .map(|(name, id, path)| Invocation {
+                operation_id: Uuid::new_v4(),
+                call: crate::ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments: serde_json::json!({"path":path}).to_string(),
+                },
+            })
+            .collect();
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: calls.clone(),
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        for invocation in calls {
+            session
+                .append(Event::ToolFinished {
+                    operation_id: invocation.operation_id,
+                    outcome: Outcome::Succeeded("ok".into()),
+                    states: ExtensionStates::new(),
+                })
+                .unwrap();
+        }
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: None,
+            })
+            .unwrap();
+        struct EmptySummary;
+        #[async_trait::async_trait]
+        impl Model for EmptySummary {
+            async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+                Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                    ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    },
+                )])))
+            }
+        }
+        let mut empty_session = Session::from_records(session.records().to_vec()).unwrap();
+        let empty_registry = Registry::default();
+        let empty_agent = Agent {
+            model: &EmptySummary,
+            model_name: "fixture",
+            registry: &empty_registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        assert!(
+            empty_agent
+                .summarize(
+                    &mut empty_session,
+                    1,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            !empty_session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
+        let mut hook_session = Session::from_records(session.records().to_vec()).unwrap();
+        let mut hook_registry = Registry::default();
+        hook_registry
+            .register(Arc::new(ProvidedCompaction {
+                cancel: false,
+                invalid: false,
+                events: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }))
+            .unwrap();
+        let hook_agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &hook_registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        hook_agent
+            .summarize(&mut hook_session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        let hook_record = hook_session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap();
+        assert!(
+            matches!(&hook_record.event, Event::Compacted { summary, .. } if summary == "extension summary")
+        );
+        assert_eq!(
+            hook_session.record_metadata(hook_record.id).unwrap()["details"],
+            serde_json::json!({"origin":"hook"})
+        );
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(LegacyCompaction(Arc::new(std::sync::Mutex::new(
+                Vec::new(),
+            )))))
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        agent
+            .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        let record = session
+            .records()
+            .iter()
+            .find(|record| matches!(&record.event, Event::Compacted { .. }))
+            .unwrap();
+        let id = record.id;
+        assert!(
+            matches!(&record.event, Event::Compacted { summary, .. } if summary == "answer [legacy]\n\n<read-files>\nread.txt\n</read-files>\n\n<modified-files>\nwritten.txt\n</modified-files>")
+        );
+        assert_eq!(
+            session.record_metadata(id).unwrap()["nativeGeneratedFileDetails"],
+            true
+        );
+        assert_eq!(
+            session.record_metadata(id).unwrap()["details"],
+            serde_json::json!({"readFiles":["read.txt"],"modifiedFiles":["written.txt"]})
+        );
+        drop(session);
+        let mut reopened = Session::open(&path).unwrap();
+        assert_eq!(
+            reopened.record_metadata(id).unwrap()["details"],
+            serde_json::json!({"readFiles":["read.txt"],"modifiedFiles":["written.txt"]})
+        );
+        let edit = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "edit".into(),
+                name: "edit".into(),
+                arguments: serde_json::json!({"path":"read.txt"}).to_string(),
+            },
+        };
+        reopened
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: vec![edit.clone()],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        reopened
+            .append(Event::ToolFinished {
+                operation_id: edit.operation_id,
+                outcome: Outcome::Succeeded("ok".into()),
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        reopened
+            .append(Event::User {
+                content: "latest".into(),
+                input_id: None,
+            })
+            .unwrap();
+        agent
+            .summarize(&mut reopened, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        let second = reopened
+            .records()
+            .iter()
+            .rev()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap();
+        assert_eq!(
+            reopened.record_metadata(second.id).unwrap()["details"],
+            serde_json::json!({"readFiles":[], "modifiedFiles":["read.txt", "written.txt"]})
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_file_suffix_does_not_fail_generated_compaction() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let path = "x".repeat(70 * 1024);
+        let read = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "read".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path":path}).to_string(),
+            },
+        };
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: vec![read.clone()],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::ToolFinished {
+                operation_id: read.operation_id,
+                outcome: Outcome::Succeeded("ok".into()),
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        agent
+            .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        let record = session
+            .records()
+            .iter()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap();
+        assert!(matches!(&record.event, Event::Compacted { summary, .. } if summary == "answer"));
+        assert_eq!(
+            session.record_metadata(record.id).unwrap()["details"]["readFiles"][0],
+            path
+        );
+    }
+
+    #[tokio::test]
+    async fn file_backed_compaction_bounds_large_metadata_and_remains_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-file-details.jsonl");
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        for index in 0..20 {
+            let name = format!("{index:02}{}", "x".repeat(850_000));
+            let call = Invocation {
+                operation_id: Uuid::new_v4(),
+                call: crate::ToolCall {
+                    id: format!("call-{index}"),
+                    name: "write".into(),
+                    arguments: serde_json::json!({"path":name}).to_string(),
+                },
+            };
+            session
+                .append(Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![call.clone()],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::ToolFinished {
+                    operation_id: call.operation_id,
+                    outcome: Outcome::Succeeded("ok".into()),
+                    states: ExtensionStates::new(),
+                })
+                .unwrap();
+        }
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        agent
+            .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        let id = session
+            .records()
+            .iter()
+            .rev()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap()
+            .id;
+        let metadata = session.record_metadata(id).unwrap();
+        assert_eq!(metadata["nativeFileDetailsTruncated"], true);
+        let retained = metadata["details"]["modifiedFiles"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert!(retained > 0 && retained < 20);
+        session
+            .append(Event::User {
+                content: "still writable".into(),
+                input_id: None,
+            })
+            .unwrap();
+        drop(session);
+        let mut reopened = Session::open(&path).unwrap();
+        assert_eq!(
+            reopened.record_metadata(id).unwrap()["nativeFileDetailsTruncated"],
+            true
+        );
+        reopened
+            .append(Event::User {
+                content: "writable after reopen".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let inherited =
+            crate::compaction_files::FileOperations::collect(&reopened, Some(reopened.head()));
+        assert!(inherited.bounded_details(4 * 1024 * 1024).1);
+    }
+
+    #[tokio::test]
+    async fn custom_store_limit_bounds_generated_file_details() {
+        struct LimitedStore(crate::MemoryStore);
+        impl crate::SessionStore for LimitedStore {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                crate::SessionStore::load(&mut self.0)
+            }
+            fn append(&mut self, record: &Record) -> Result<()> {
+                crate::SessionStore::append(&mut self.0, record)
+            }
+            fn supports_record_metadata(&self) -> bool {
+                true
+            }
+            fn encoded_record_limit(&self) -> Option<usize> {
+                Some(256 * 1024)
+            }
+            fn load_record_metadata(
+                &mut self,
+            ) -> Result<std::collections::BTreeMap<u64, serde_json::Value>> {
+                crate::SessionStore::load_record_metadata(&mut self.0)
+            }
+            fn append_with_metadata(
+                &mut self,
+                record: &Record,
+                metadata: Option<&serde_json::Value>,
+            ) -> Result<()> {
+                let mut value = serde_json::to_value(record)?;
+                if let Some(metadata) = metadata {
+                    value["piRsRecordMetadata"] = metadata.clone();
+                }
+                if serde_json::to_vec(&value)?.len() + 1 > 256 * 1024 {
+                    return Err(Error::Session("fixture record too large".into()));
+                }
+                crate::SessionStore::append_with_metadata(&mut self.0, record, metadata)
+            }
+        }
+        let mut session = Session::with_store(LimitedStore(crate::MemoryStore::default())).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        for index in 0..4 {
+            let path = format!("{index}{}", "x".repeat(80_000));
+            let call = Invocation {
+                operation_id: Uuid::new_v4(),
+                call: crate::ToolCall {
+                    id: format!("call-{index}"),
+                    name: "write".into(),
+                    arguments: serde_json::json!({"path":path}).to_string(),
+                },
+            };
+            session
+                .append(Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![call.clone()],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::ToolFinished {
+                    operation_id: call.operation_id,
+                    outcome: Outcome::Succeeded("ok".into()),
+                    states: ExtensionStates::new(),
+                })
+                .unwrap();
+        }
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        agent
+            .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        let id = session
+            .records()
+            .iter()
+            .rev()
+            .find(|record| matches!(record.event, Event::Compacted { .. }))
+            .unwrap()
+            .id;
+        let metadata = session.record_metadata(id).unwrap();
+        assert_eq!(metadata["nativeFileDetailsTruncated"], true);
+        let retained = metadata["details"]["modifiedFiles"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert!(retained > 0 && retained < 4);
+        session
+            .append(Event::User {
+                content: "still writable".into(),
+                input_id: None,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn small_store_retains_file_details_across_compactions() {
+        struct LimitedStore(crate::MemoryStore);
+        impl crate::SessionStore for LimitedStore {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                crate::SessionStore::load(&mut self.0)
+            }
+            fn append(&mut self, record: &Record) -> Result<()> {
+                crate::SessionStore::append(&mut self.0, record)
+            }
+            fn supports_record_metadata(&self) -> bool {
+                true
+            }
+            fn encoded_record_limit(&self) -> Option<usize> {
+                Some(4096)
+            }
+            fn load_record_metadata(
+                &mut self,
+            ) -> Result<std::collections::BTreeMap<u64, serde_json::Value>> {
+                crate::SessionStore::load_record_metadata(&mut self.0)
+            }
+            fn append_with_metadata(
+                &mut self,
+                record: &Record,
+                metadata: Option<&serde_json::Value>,
+            ) -> Result<()> {
+                let mut value = serde_json::to_value(record)?;
+                if let Some(metadata) = metadata {
+                    value["piRsRecordMetadata"] = metadata.clone();
+                }
+                if serde_json::to_vec(&value)?.len() + 1 > 4096 {
+                    return Err(Error::Session("fixture record too large".into()));
+                }
+                crate::SessionStore::append_with_metadata(&mut self.0, record, metadata)
+            }
+        }
+        let mut session = Session::with_store(LimitedStore(crate::MemoryStore::default())).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        for index in 0..1 {
+            let path = "small.txt";
+            let call = Invocation {
+                operation_id: Uuid::new_v4(),
+                call: crate::ToolCall {
+                    id: format!("call-{index}"),
+                    name: "write".into(),
+                    arguments: serde_json::json!({"path":path}).to_string(),
+                },
+            };
+            session
+                .append(Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![call.clone()],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::ToolFinished {
+                    operation_id: call.operation_id,
+                    outcome: Outcome::Succeeded("ok".into()),
+                    states: ExtensionStates::new(),
+                })
+                .unwrap();
+        }
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        agent
+            .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "answer".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "latest".into(),
+                input_id: None,
+            })
+            .unwrap();
+        agent
+            .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        let compacted: Vec<_> = session
+            .records()
+            .iter()
+            .filter(|record| matches!(record.event, Event::Compacted { .. }))
+            .collect();
+        assert_eq!(compacted.len(), 2);
+        for record in compacted {
+            let metadata = session.record_metadata(record.id).unwrap();
+            assert_eq!(
+                metadata["details"]["modifiedFiles"],
+                serde_json::json!(["small.txt"])
+            );
+            assert!(metadata.get("nativeFileDetailsTruncated").is_none());
+        }
+        session
+            .append(Event::User {
+                content: "still writable".into(),
+                input_id: None,
+            })
+            .unwrap();
+    }
+
+    struct RecoverySettlementModel {
+        turn: TurnModel,
+        summary_id: Uuid,
+        fail_once: std::sync::atomic::AtomicBool,
+        settlements: std::sync::Mutex<Vec<(Uuid, UsageReport, ModelMetadata)>>,
+        allowances: std::sync::Mutex<Vec<u32>>,
+    }
+    #[async_trait::async_trait]
+    impl Model for RecoverySettlementModel {
+        async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+            self.allowances
+                .lock()
+                .unwrap()
+                .push(request.max_output_tokens);
+            self.turn.stream(request).await
+        }
+        async fn record_usage_with_metadata(
+            &self,
+            request_id: Uuid,
+            usage: &UsageReport,
+            metadata: &ModelMetadata,
+        ) -> Result<()> {
+            if request_id == self.summary_id {
+                self.settlements.lock().unwrap().push((
+                    request_id,
+                    usage.clone(),
+                    metadata.clone(),
+                ));
+                if self.fail_once.swap(false, Ordering::SeqCst) {
+                    return Err(Error::RetryableModel("settlement unavailable".into()));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_uses_extension_summary_before_turn_model() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(ProvidedCompaction {
+                cancel: false,
+                invalid: false,
+                events: events.clone(),
+            }))
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(1000),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        let result = agent
+            .run(
+                &mut session,
+                Some("new".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, "answer");
+        assert_eq!(model.0.load(Ordering::SeqCst), 1);
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::Compacted { summary, .. } if summary == "extension summary") && session.record_metadata(record.id).is_some_and(|v| v["fromExtension"] == true)));
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event["type"] == "session_compact"
+                    && event["reason"] == "threshold"
+                    && event["fromExtension"] == true)
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_skips_summary_below_the_adapter_output_minimum() {
+        struct MinimumBudgetModel;
+        #[async_trait::async_trait]
+        impl Model for MinimumBudgetModel {
+            fn minimum_output_tokens(&self) -> u32 {
+                16
+            }
+
+            async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+                assert_eq!(request.max_output_tokens, 16);
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text("answer".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+        let agent = Agent {
+            model: &MinimumBudgetModel,
+            model_name: "fixture",
+            registry: &Registry::default(),
+            system_prompt: "",
+            limits: Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                output_tokens_per_run: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(1000),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        let result = agent
+            .run(
+                &mut session,
+                Some("new".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, "answer");
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
+    }
+
+    struct OverflowSummaryHook {
+        provide: bool,
+        seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::Extension for OverflowSummaryHook {
+        fn id(&self) -> &str {
+            "overflow-summary"
+        }
+        fn handles_before_summary_compaction(&self) -> bool {
+            true
+        }
+        async fn before_summary_compaction(
+            &self,
+            preparation: &crate::CompactionPreparation,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<Option<crate::BeforeSummaryCompactionResult>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(preparation).unwrap());
+            Ok(self.provide.then(|| crate::BeforeSummaryCompactionResult {
+                cancel: false,
+                compaction: Some(crate::ExtensionCompaction {
+                    summary: "safe summary".into(),
+                    first_kept_entry: preparation.first_kept_entry,
+                    tokens_before: preparation.tokens_before,
+                    usage: None,
+                    details: None,
+                }),
+            }))
+        }
+    }
+    struct OverflowModel {
+        calls: std::sync::atomic::AtomicUsize,
+        always_fail: bool,
+        minimum_output_tokens: u32,
+    }
+    #[async_trait::async_trait]
+    impl Model for OverflowModel {
+        fn minimum_output_tokens(&self) -> u32 {
+            self.minimum_output_tokens
+        }
+
+        async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+            assert!(request.max_output_tokens >= self.minimum_output_tokens);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 || self.always_fail {
+                return Err(Error::Model(
+                    "prompt is too long: private-fixture-secret".into(),
+                ));
+            }
+            let summary = request.messages.iter().any(|message| matches!(message,
+                Message::User { content } if content.starts_with("Summarize only this older conversation")));
+            let text = if summary { "model summary" } else { "answer" };
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(ModelEvent::Text(text.into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                }),
+            ])))
+        }
+    }
+    #[tokio::test]
+    async fn explicit_overflow_compacts_and_retries_once_without_exposing_failure() {
+        let default_budget = Limits::default().output_tokens_per_run;
+        for (provide, always_fail, minimum_output_tokens, run_budget) in [
+            (true, false, 1, default_budget),
+            (false, false, 1, default_budget),
+            (true, true, 1, default_budget),
+            (true, false, 16, 16),
+            (false, false, 16, 16),
+        ] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(OverflowSummaryHook {
+                    provide,
+                    seen: seen.clone(),
+                }))
+                .unwrap();
+            let model = OverflowModel {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                always_fail,
+                minimum_output_tokens,
+            };
+            let agent = Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits {
+                    model_requests: if provide { 2 } else { 3 },
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    output_tokens_per_run: run_budget,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(0),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                },
+            };
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            session
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            let (_sender, mut inputs) = mpsc::channel(1);
+            let result = agent
+                .run(
+                    &mut session,
+                    Some("new".into()),
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await;
+            if !provide && run_budget == 16 {
+                assert!(matches!(result, Err(Error::Budget)));
+                assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(seen.lock().unwrap().len(), 1);
+                continue;
+            }
+            if always_fail {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), "answer");
+            }
+            assert_eq!(
+                model.calls.load(Ordering::SeqCst),
+                if provide { 2 } else { 3 }
+            );
+            let events = seen.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["reason"], "overflow");
+            assert_eq!(events[0]["willRetry"], true);
+            if !provide {
+                assert!(!session.records().iter().any(|record| matches!(&record.event,
+                    Event::ModelFinished { partial, failure: None, reply: None, .. } if partial == "model summary")),
+                    "unredacted summaries must not bypass extension hooks");
+            }
+            assert!(
+                session
+                    .records()
+                    .iter()
+                    .any(|record| matches!(record.event, Event::Compacted { .. }))
+            );
+            assert!(
+                !serde_json::to_string(session.records())
+                    .unwrap()
+                    .contains("private-fixture-secret")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_without_older_context_preserves_provider_failure() {
+        let registry = Registry::default();
+        let model = OverflowModel {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            always_fail: true,
+            minimum_output_tokens: 1,
+        };
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                model_requests: 3,
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        let error = agent
+            .run(
+                &mut session,
+                Some("new".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("prompt is too long"), "{error}");
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
+    }
+
+    struct LengthModel {
+        calls: std::sync::atomic::AtomicUsize,
+        output: u64,
+    }
+
+    struct SilentOverflowModel(std::sync::atomic::AtomicUsize, Option<u64>);
+    struct CancelSilentSummary(CancellationToken);
+    #[async_trait::async_trait]
+    impl Model for CancelSilentSummary {
+        async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+            if request.messages.iter().any(|message| matches!(message, Message::User { content } if content.starts_with("Summarize only this older conversation"))) {
+                let cancel = self.0.clone();
+                return Ok(Box::pin(
+                    futures_util::stream::iter([Ok(ModelEvent::Text("private summary".into()))])
+                        .chain(futures_util::stream::once(async move {
+                            cancel.cancel();
+                            futures_util::future::pending::<Result<ModelEvent>>().await
+                        })),
+                ));
+            }
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(Usage {
+                        input_tokens: 1001,
+                        output_tokens: 2,
+                    }),
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_silent_summary_preserves_recoverable_marker() {
+        let cancel = CancellationToken::new();
+        let model = CancelSilentSummary(cancel.clone());
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                model_requests: 2,
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        assert!(matches!(
+            agent
+                .run(
+                    &mut session,
+                    Some("new".into()),
+                    &mut inputs,
+                    &cancel,
+                    &mut |_| {}
+                )
+                .await,
+            Err(Error::Cancelled)
+        ));
+        assert!(resumable_compaction_run(&session).is_some());
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::ModelFinished { failure: Some(ModelFailure::Cancelled), partial, .. } if partial == "private summary")));
+        assert!(!session.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:aborted-turn-partial")));
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow")));
+        assert!(!session.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")));
+        assert_eq!(
+            session
+                .records()
+                .iter()
+                .filter(|record| matches!(record.event, Event::ModelRequested { .. }))
+                .count(),
+            2
+        );
+        let run_id = session
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow" => {
+                    record.run_id
+                }
+                _ => None,
+            })
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancelled.jsonl");
+        session.export_jsonl(&path).unwrap();
+        let mut reopened = Session::open(&path).unwrap();
+        let summary_id = session
+            .records()
+            .iter()
+            .rev()
+            .find_map(|record| match record.event {
+                Event::ModelRequested {
+                    request_id: Some(id),
+                    ..
+                } => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        let resumed_model = RecoverySettlementModel {
+            turn: TurnModel(std::sync::atomic::AtomicUsize::new(0)),
+            summary_id,
+            fail_once: std::sync::atomic::AtomicBool::new(false),
+            settlements: std::sync::Mutex::new(Vec::new()),
+            allowances: std::sync::Mutex::new(Vec::new()),
+        };
+        let resumed_agent = Agent {
+            model: &resumed_model,
+            ..agent
+        };
+        assert_eq!(
+            resumed_agent
+                .run_correlated(
+                    &mut reopened,
+                    run_id,
+                    None,
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "answer"
+        );
+        assert_eq!(resumed_model.turn.0.load(Ordering::SeqCst), 0);
+        assert!(
+            resumed_model
+                .settlements
+                .lock()
+                .unwrap()
+                .iter()
+                .any(
+                    |(id, usage, _)| *id == summary_id && matches!(usage, UsageReport::Unconfirmed)
+                )
+        );
+        assert!(reopened.records().iter().any(|record| matches!(&record.event, Event::SourceEntry { format, .. } if format == "pi-rs:silent-overflow-skipped-v1")));
+    }
+    #[async_trait::async_trait]
+    impl Model for SilentOverflowModel {
+        async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(ModelEvent::Text("answer".into())),
+                Ok(ModelEvent::Metadata(ModelMetadata {
+                    cache_creation_input_tokens: self.1,
+                    ..Default::default()
+                })),
+                Ok(ModelEvent::Complete {
+                    calls: vec![],
+                    usage: Some(Usage {
+                        input_tokens: 1001,
+                        output_tokens: 2,
+                    }),
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_silent_overflow_compacts_without_resending_answer() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(OverflowSummaryHook {
+                provide: true,
+                seen: seen.clone(),
+            }))
+            .unwrap();
+        let model = SilentOverflowModel(std::sync::atomic::AtomicUsize::new(0), None);
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                model_requests: 1,
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        let answer = agent
+            .run(
+                &mut session,
+                Some("new".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "answer");
+        assert_eq!(model.0.load(Ordering::SeqCst), 1);
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["reason"], "overflow");
+        assert_eq!(events[0]["willRetry"], false);
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::Compacted { summary, .. } if summary == "safe summary")));
+        assert!(session.current_messages().iter().any(
+            |message| matches!(message, Message::Assistant { content, .. } if content == "answer")
+        ));
+    }
+
+    #[tokio::test]
+    async fn silent_overflow_excludes_cache_write_tokens() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(OverflowSummaryHook {
+                provide: true,
+                seen: seen.clone(),
+            }))
+            .unwrap();
+        let model = SilentOverflowModel(std::sync::atomic::AtomicUsize::new(0), Some(1));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                model_requests: 1,
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        assert_eq!(
+            agent
+                .run(
+                    &mut session,
+                    Some("new".into()),
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap(),
+            "answer"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_overflow_model_summary_preserves_completed_answer() {
+        struct ModelWithSummary(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl Model for ModelWithSummary {
+            async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+                let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(ModelEvent::Text(
+                        if first { "answer" } else { "summary" }.into(),
+                    )),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: Some(Usage {
+                            input_tokens: if first { 1001 } else { 10 },
+                            output_tokens: 2,
+                        }),
+                    }),
+                ])))
+            }
+        }
+        let model = ModelWithSummary(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                model_requests: 2,
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        let answer = agent
+            .run(
+                &mut session,
+                Some("new".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "answer");
+        assert_eq!(
+            model.0.load(Ordering::SeqCst),
+            2,
+            "one turn and one summary request"
+        );
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::Compacted { summary, .. } if summary == "summary")));
+        assert!(session.current_messages().iter().any(
+            |message| matches!(message, Message::Assistant { content, .. } if content == "answer")
+        ));
+    }
+    #[async_trait::async_trait]
+    impl Model for LengthModel {
+        async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            let events = if first {
+                vec![
+                    ModelEvent::Text("partial".into()),
+                    ModelEvent::Metadata(ModelMetadata {
+                        finish_reason: Some("length".into()),
+                        ..Default::default()
+                    }),
+                    ModelEvent::Complete {
+                        calls: if self.output == 1 {
+                            vec![crate::ToolCall {
+                                id: "untrusted".into(),
+                                name: "not_advertised".into(),
+                                arguments: "{}".into(),
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        usage: Some(Usage {
+                            input_tokens: 4,
+                            output_tokens: self.output,
+                        }),
+                    },
+                ]
+            } else {
+                vec![
+                    ModelEvent::Text("answer".into()),
+                    ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    },
+                ]
+            };
+            Ok(Box::pin(futures_util::stream::iter(
+                events.into_iter().map(Ok),
+            )))
+        }
+    }
+    #[tokio::test]
+    async fn recoverable_length_is_omitted_before_compaction_and_retry() {
+        for (output, expected_calls) in [(1, 2), (16, 1)] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(OverflowSummaryHook {
+                    provide: true,
+                    seen: seen.clone(),
+                }))
+                .unwrap();
+            let model = LengthModel {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                output,
+            };
+            let agent = Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits {
+                    model_requests: 2,
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(0),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                },
+            };
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            session
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            let (_sender, mut inputs) = mpsc::channel(1);
+            let answer = agent
+                .run(
+                    &mut session,
+                    Some("new".into()),
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(model.calls.load(Ordering::SeqCst), expected_calls);
+            assert_eq!(answer, if output == 1 { "answer" } else { "partial" });
+            assert_eq!(seen.lock().unwrap().len(), usize::from(output == 1));
+            if output == 1 {
+                assert!(session.operations().is_empty());
+                assert!(
+                    !session
+                        .current_messages()
+                        .iter()
+                        .any(|message| matches!(message,
+                    Message::Assistant { content, .. } if content == "partial"))
+                );
+                assert!(
+                    session
+                        .records()
+                        .iter()
+                        .any(|record| matches!(&record.event,
+                    Event::ModelFinished { reply: Some(reply), .. } if reply.content == "partial"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn length_recovery_marker_blocks_replaying_the_truncated_reply() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let run_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    finish_reason: Some("length".into()),
+                    ..Default::default()
+                },
+                usage: UsageReport::Measured {
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 1,
+                    },
+                },
+                failure: None,
+                partial: String::new(),
+                reply: Some(RecordedReply {
+                    content: "partial".into(),
+                    invocations: vec![],
+                    advertised_tools: vec![],
+                    max_output_tokens: 16,
+                }),
+            })
+            .unwrap();
+        assert!(pending_reply(&session, run_id).is_some());
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-recovery".into(),
+                entry: serde_json::json!({"requestId":request_id,"kind":"length"}),
+            })
+            .unwrap();
+        assert!(pending_reply(&session, run_id).is_none());
+        let state = overflow_recovery_state(&session, run_id).unwrap();
+        assert!(state.started && !state.compacted);
+    }
+
+    #[test]
+    fn overflow_recovery_marker_survives_reopen_and_summary_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("overflow.jsonl");
+        let run_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let mut session = Session::open(&path).unwrap();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    finish_reason: Some("pi-rs:context-overflow".into()),
+                    ..Default::default()
+                },
+                usage: UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Failed),
+                partial: "partial".into(),
+                reply: None,
+            })
+            .unwrap();
+        let pending = overflow_recovery_state(&session, run_id).unwrap();
+        assert!(!pending.started && !pending.compacted);
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-recovery".into(),
+                entry: serde_json::json!({"requestId":request_id}),
+            })
+            .unwrap();
+        let summary_request = Uuid::new_v4();
+        session
+            .append(Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 1,
+                tools: 0,
+                max_output_tokens: 16,
+                request_id: Some(summary_request),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+                tool_decision: None,
+            })
+            .unwrap();
+        session
+            .append(Event::ModelFinished {
+                request_id: summary_request,
+                metadata: Default::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        drop(session);
+        let mut session = Session::open(&path).unwrap();
+        session.set_run_id(Some(run_id));
+        let pending = overflow_recovery_state(&session, run_id).unwrap();
+        assert!(pending.started && !pending.compacted && pending.summary_started);
+        session
+            .append(Event::Compacted {
+                summary: "summary".into(),
+                system_prompt: None,
+                retain_from: None,
+                tokens_before: None,
+                states: Default::default(),
+                usage: None,
+                usage_metadata: None,
+            })
+            .unwrap();
+        assert!(overflow_recovery_state(&session, run_id).unwrap().compacted);
+        session
+            .append(Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 1,
+                tools: 0,
+                max_output_tokens: 16,
+                request_id: Some(Uuid::new_v4()),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+                tool_decision: None,
+            })
+            .unwrap();
+        assert!(overflow_recovery_state(&session, run_id).is_none());
+        assert!(overflow_recovery_attempted(&session, run_id));
+    }
+
+    #[test]
+    fn saved_summary_is_not_reused_after_context_or_model_change() {
+        for changed_model in [false, true] {
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            let run_id = Uuid::new_v4();
+            let summary_id = Uuid::new_v4();
+            session.set_run_id(Some(run_id));
+            session
+                .append(Event::User {
+                    content: "old context".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::SourceEntry {
+                    format: "pi-rs:overflow-recovery".into(),
+                    entry: serde_json::json!({"requestId":Uuid::new_v4()}),
+                })
+                .unwrap();
+            session
+                .append(Event::SourceEntry {
+                    format: "pi-rs:overflow-retention-v1".into(),
+                    entry: serde_json::json!({"boundary":null,"keepTurns":1,"splitTurn":false}),
+                })
+                .unwrap();
+            session
+                .append(Event::ModelRequested {
+                    model: if changed_model { "other" } else { "fixture" }.into(),
+                    messages: 1,
+                    tools: 0,
+                    max_output_tokens: 16,
+                    request_id: Some(summary_id),
+                    context_head: None,
+                    context_sha256: None,
+                    context_transformed: None,
+                    context_configuration_sha256: None,
+                    tool_decision: None,
+                })
+                .unwrap();
+            session
+                .append(Event::ModelFinished {
+                    request_id: summary_id,
+                    metadata: Default::default(),
+                    usage: UsageReport::Measured {
+                        usage: Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        },
+                    },
+                    failure: None,
+                    partial: "summary".into(),
+                    reply: None,
+                })
+                .unwrap();
+            if !changed_model {
+                assert!(
+                    completed_overflow_summary(
+                        &session,
+                        run_id,
+                        "pi-rs:overflow-recovery",
+                        "fixture"
+                    )
+                    .is_some()
+                );
+                session
+                    .append(Event::User {
+                        content: "new context".into(),
+                        input_id: None,
+                    })
+                    .unwrap();
+            }
+            assert!(
+                completed_overflow_summary(&session, run_id, "pi-rs:overflow-recovery", "fixture")
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_overflow_summary_is_not_resent_after_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("overflow-interrupted.jsonl");
+        let run_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let mut session = Session::open(&path).unwrap();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: Some("new".into()),
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: Some(run_id),
+            })
+            .unwrap();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    finish_reason: Some("pi-rs:context-overflow".into()),
+                    ..Default::default()
+                },
+                usage: UsageReport::Unconfirmed,
+                failure: Some(ModelFailure::Failed),
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-recovery".into(),
+                entry: serde_json::json!({"requestId":request_id}),
+            })
+            .unwrap();
+        session
+            .append(Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 1,
+                tools: 0,
+                max_output_tokens: 16,
+                request_id: Some(Uuid::new_v4()),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+                tool_decision: None,
+            })
+            .unwrap();
+        drop(session);
+
+        let mut session = Session::open(&path).unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let (_sender, mut inputs) = mpsc::channel::<String>(1);
+        let error = agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted overflow summary requires reconciliation"),
+            "{error}"
+        );
+        assert_eq!(
+            model.0.load(Ordering::SeqCst),
+            0,
+            "must not resend a potentially billable request"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_pre_summary_hook_is_not_invoked_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("interrupted-hook.jsonl");
+        let run_id = Uuid::new_v4();
+        let mut session = Session::open(&path).unwrap();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: Some("new".into()),
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: Some(run_id),
+            })
+            .unwrap();
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-recovery".into(),
+                entry: serde_json::json!({"requestId":Uuid::new_v4()}),
+            })
+            .unwrap();
+        drop(session);
+        let mut session = Session::open(&path).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(OverflowSummaryHook {
+                provide: true,
+                seen: seen.clone(),
+            }))
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let (_sender, mut inputs) = mpsc::channel::<String>(1);
+        let error = agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted overflow hook requires reconciliation")
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(model.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unhooked_successful_summary_is_saved_for_crash_recovery() {
+        let registry = Registry::default();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::User {
+                content: "summary request".into(),
+            }],
+            tools: vec![],
+            max_output_tokens: 16,
+        };
+        let attempt = agent
+            .prepare_attempt::<AgentInput>(
+                &mut session,
+                request,
+                false,
+                false,
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+        agent
+            .reply::<AgentInput>(
+                &mut session,
+                attempt,
+                false,
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap()
+            .outcome
+            .unwrap();
+        assert!(session.records().iter().any(|record| matches!(&record.event,
+            Event::ModelFinished { failure: None, reply: None, partial, .. } if partial == "answer")));
+    }
+
+    #[tokio::test]
+    async fn completed_overflow_summary_is_reused_after_reopen_without_resending() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("overflow-completed.jsonl");
+        let run_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let summary_id = Uuid::new_v4();
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: Some("new".into()),
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: Some(run_id),
+            })
+            .unwrap();
+        session
+            .append(Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 1,
+                tools: 0,
+                max_output_tokens: 100,
+                request_id: Some(request_id),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+                tool_decision: None,
+            })
+            .unwrap();
+        session
+            .append(Event::ModelFinished {
+                request_id,
+                metadata: ModelMetadata {
+                    finish_reason: Some("pi-rs:context-overflow".into()),
+                    ..Default::default()
+                },
+                usage: UsageReport::Measured {
+                    usage: Usage {
+                        input_tokens: 5,
+                        output_tokens: 80,
+                    },
+                },
+                failure: Some(ModelFailure::Failed),
+                partial: String::new(),
+                reply: None,
+            })
+            .unwrap();
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-recovery".into(),
+                entry: serde_json::json!({"requestId":request_id}),
+            })
+            .unwrap();
+        session
+            .append(Event::SourceEntry {
+                format: "pi-rs:overflow-retention-v1".into(),
+                entry: serde_json::json!({"boundary":5,"keepTurns":1,"splitTurn":false}),
+            })
+            .unwrap();
+        session
+            .append(Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 1,
+                tools: 0,
+                max_output_tokens: 16,
+                request_id: Some(summary_id),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+                tool_decision: None,
+            })
+            .unwrap();
+        session
+            .append(Event::ModelFinished {
+                request_id: summary_id,
+                metadata: ModelMetadata {
+                    finish_reason: Some("stop".into()),
+                    ..Default::default()
+                },
+                usage: UsageReport::Measured {
+                    usage: Usage {
+                        input_tokens: 9,
+                        output_tokens: 10,
+                    },
+                },
+                failure: None,
+                partial: "saved summary".into(),
+                reply: None,
+            })
+            .unwrap();
+        drop(session);
+        let mut session = Session::open(&path).unwrap();
+        for case in 0..5 {
+            let mut records = session.records().to_vec();
+            for record in &mut records {
+                if let Event::ModelFinished {
+                    request_id,
+                    metadata,
+                    failure,
+                    partial,
+                    ..
+                } = &mut record.event
+                    && *request_id == summary_id
+                {
+                    match case {
+                        0 => *failure = Some(ModelFailure::Failed),
+                        1 => *failure = Some(ModelFailure::Cancelled),
+                        2 => metadata.finish_reason = Some("length".into()),
+                        3 => partial.clear(),
+                        _ => *partial = "x".repeat(65537),
+                    }
+                }
+            }
+            let staged = Session::from_records(records).unwrap();
+            let recovery_path = directory
+                .path()
+                .join(format!("invalid-summary-{case}.jsonl"));
+            staged.export_jsonl(&recovery_path).unwrap();
+            drop(staged);
+            let recovery_model = RecoverySettlementModel {
+                turn: TurnModel(std::sync::atomic::AtomicUsize::new(0)),
+                summary_id,
+                fail_once: std::sync::atomic::AtomicBool::new(true),
+                settlements: std::sync::Mutex::new(Vec::new()),
+                allowances: std::sync::Mutex::new(Vec::new()),
+            };
+            let recovery_registry = Registry::default();
+            let recovery_agent = Agent {
+                model: &recovery_model,
+                model_name: "fixture",
+                registry: &recovery_registry,
+                system_prompt: "",
+                limits: Limits::default(),
+            };
+            let (_sender, mut recovery_inputs) = mpsc::channel::<String>(1);
+            let mut reopened = Session::open(&recovery_path).unwrap();
+            assert!(
+                recovery_agent
+                    .run_correlated(
+                        &mut reopened,
+                        run_id,
+                        None,
+                        &mut recovery_inputs,
+                        &CancellationToken::new(),
+                        &mut |_| {}
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("settlement unavailable")
+            );
+            drop(reopened);
+            let mut reopened = Session::open(&recovery_path).unwrap();
+            assert!(
+                recovery_agent
+                    .run_correlated(
+                        &mut reopened,
+                        run_id,
+                        None,
+                        &mut recovery_inputs,
+                        &CancellationToken::new(),
+                        &mut |_| {}
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(recovery_model.settlements.lock().unwrap().len(), 2);
+            assert_eq!(recovery_model.turn.0.load(Ordering::SeqCst), 0);
+        }
+        let mut limited_session = Session::from_records(session.records().to_vec()).unwrap();
+        let limited_model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let limited_registry = Registry::default();
+        let limited_agent = Agent {
+            model: &limited_model,
+            model_name: "fixture",
+            registry: &limited_registry,
+            system_prompt: "",
+            limits: Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 100,
+                output_tokens_per_run: 100,
+                model_requests: 2,
+                ..Limits::default()
+            },
+        };
+        let (_sender, mut limited_inputs) = mpsc::channel::<String>(1);
+        assert!(matches!(
+            limited_agent
+                .run_correlated(
+                    &mut limited_session,
+                    run_id,
+                    None,
+                    &mut limited_inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await,
+            Err(Error::Budget)
+        ));
+        assert_eq!(
+            limited_model.0.load(Ordering::SeqCst),
+            0,
+            "the completed summary already used the last request"
+        );
+        for disabled in [false, true] {
+            let mut blocked_session = Session::from_records(session.records().to_vec()).unwrap();
+            if disabled {
+                blocked_session.auto_compaction_control().set_enabled(false);
+            }
+            let settlement_model = RecoverySettlementModel {
+                turn: TurnModel(std::sync::atomic::AtomicUsize::new(0)),
+                summary_id,
+                fail_once: std::sync::atomic::AtomicBool::new(false),
+                settlements: std::sync::Mutex::new(Vec::new()),
+                allowances: std::sync::Mutex::new(Vec::new()),
+            };
+            let blocked_agent = Agent {
+                model: &settlement_model,
+                model_name: "fixture",
+                registry: &limited_registry,
+                system_prompt: "",
+                limits: Limits {
+                    model_requests: if disabled { 3 } else { 0 },
+                    ..limited_agent.limits.clone()
+                },
+            };
+            assert!(
+                blocked_agent
+                    .run_correlated(
+                        &mut blocked_session,
+                        run_id,
+                        None,
+                        &mut limited_inputs,
+                        &CancellationToken::new(),
+                        &mut |_| {}
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(settlement_model.settlements.lock().unwrap().len(), 1);
+            assert_eq!(settlement_model.turn.0.load(Ordering::SeqCst), 0);
+        }
+        let mut unknown_records = session.records().to_vec();
+        for record in &mut unknown_records {
+            if let Event::ModelFinished {
+                request_id: id,
+                usage,
+                ..
+            } = &mut record.event
+                && *id == request_id
+            {
+                *usage = UsageReport::Unconfirmed;
+            }
+        }
+        let mut unknown_session = Session::from_records(unknown_records).unwrap();
+        let unknown_model = RecoverySettlementModel {
+            turn: TurnModel(std::sync::atomic::AtomicUsize::new(0)),
+            summary_id,
+            fail_once: std::sync::atomic::AtomicBool::new(false),
+            settlements: std::sync::Mutex::new(Vec::new()),
+            allowances: std::sync::Mutex::new(Vec::new()),
+        };
+        let unknown_agent = Agent {
+            model: &unknown_model,
+            limits: Limits {
+                model_requests: 3,
+                ..limited_agent.limits.clone()
+            },
+            ..limited_agent
+        };
+        assert!(matches!(
+            unknown_agent
+                .run_correlated(
+                    &mut unknown_session,
+                    run_id,
+                    None,
+                    &mut limited_inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await,
+            Err(Error::Budget)
+        ));
+        assert_eq!(
+            unknown_model.settlements.lock().unwrap().len(),
+            1,
+            "incurred summary usage is settled before enforcing the remaining budget"
+        );
+        assert_eq!(
+            limited_model.0.load(Ordering::SeqCst),
+            0,
+            "unconfirmed usage reserves the full output allowance"
+        );
+        let model = RecoverySettlementModel {
+            turn: TurnModel(std::sync::atomic::AtomicUsize::new(0)),
+            summary_id,
+            fail_once: std::sync::atomic::AtomicBool::new(true),
+            settlements: std::sync::Mutex::new(Vec::new()),
+            allowances: std::sync::Mutex::new(Vec::new()),
+        };
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 100,
+                output_tokens_per_run: 100,
+                model_requests: 3,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let (_sender, mut inputs) = mpsc::channel::<String>(1);
+        let mut guarded = Session::from_records(session.records().to_vec()).unwrap();
+        let steering_id = Uuid::new_v4();
+        guarded
+            .append(Event::InputQueued {
+                input: crate::QueuedInput {
+                    id: steering_id,
+                    kind: crate::InputKind::Steer,
+                    content: "retain queued input".into(),
+                },
+            })
+            .unwrap();
+        let before = guarded.records().len();
+        assert!(
+            agent
+                .run(
+                    &mut guarded,
+                    Some("new run".into()),
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("pending compaction recovery")
+        );
+        assert!(
+            agent
+                .apply_queued_inputs(&mut guarded, &mut |_| {})
+                .unwrap_err()
+                .to_string()
+                .contains("pending compaction recovery")
+        );
+        assert_eq!(guarded.records().len(), before);
+        assert!(
+            guarded
+                .queued_inputs()
+                .iter()
+                .any(|input| input.input.id == steering_id)
+        );
+        assert!(resumable_compaction_run(&guarded).is_some());
+        assert_eq!(model.turn.0.load(Ordering::SeqCst), 0);
+        let failure = agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(failure.to_string().contains("settlement unavailable"));
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
+        let mut compaction_events = Vec::new();
+        let answer = agent
+            .run_correlated_with_events(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| match event {
+                    AgentEvent::AutoCompaction {
+                        reason: crate::CompactionTrigger::Overflow,
+                        update: AutoCompactionUpdate::Started,
+                    } => compaction_events.push(None),
+                    AgentEvent::AutoCompaction {
+                        reason: crate::CompactionTrigger::Overflow,
+                        update: AutoCompactionUpdate::Completed { will_retry, .. },
+                    } => compaction_events.push(Some(*will_retry)),
+                    _ => {}
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(compaction_events, [None, Some(true)]);
+        assert_eq!(answer, "answer");
+        assert_eq!(*model.allowances.lock().unwrap(), vec![10]);
+        let settlements = model.settlements.lock().unwrap();
+        assert_eq!(settlements.len(), 2);
+        assert!(
+            settlements
+                .iter()
+                .all(|(id, usage, metadata)| *id == summary_id
+                    && matches!(usage, UsageReport::Measured { usage } if usage.input_tokens == 9)
+                    && metadata.finish_reason.as_deref() == Some("stop"))
+        );
+        drop(settlements);
+        assert_eq!(
+            model.turn.0.load(Ordering::SeqCst),
+            1,
+            "only the retried turn may call the model"
+        );
+        assert!(session.records().iter().any(
+            |r| matches!(&r.event, Event::Compacted { summary, retain_from: Some(5), .. } if summary == "saved summary")
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_silent_overflow_summary_replays_without_another_model_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silent-recovery.jsonl");
+        let run_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let summary_id = Uuid::new_v4();
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session.set_run_id(Some(run_id));
+        session
+            .append(Event::Run {
+                state: RunState::Running,
+                initial: Some("new".into()),
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "new".into(),
+                input_id: Some(run_id),
+            })
+            .unwrap();
+        for (id, tokens) in [(turn_id, 16), (summary_id, 16)] {
+            if id == summary_id {
+                session
+                    .append(Event::Assistant {
+                        content: "answer".into(),
+                        invocations: vec![],
+                        usage: Some(Usage {
+                            input_tokens: 1001,
+                            output_tokens: 2,
+                        }),
+                        request_id: Some(turn_id),
+                    })
+                    .unwrap();
+                session
+                    .append(Event::SourceEntry {
+                        format: "pi-rs:silent-overflow".into(),
+                        entry: serde_json::json!({"requestId":turn_id}),
+                    })
+                    .unwrap();
+                session
+                    .append(Event::SourceEntry {
+                        format: "pi-rs:overflow-retention-v1".into(),
+                        entry: serde_json::json!({"boundary":5,"keepTurns":1,"splitTurn":false}),
+                    })
+                    .unwrap();
+            }
+            session
+                .append(Event::ModelRequested {
+                    model: "fixture".into(),
+                    messages: 1,
+                    tools: 0,
+                    max_output_tokens: tokens,
+                    request_id: Some(id),
+                    context_head: None,
+                    context_sha256: None,
+                    context_transformed: None,
+                    context_configuration_sha256: None,
+                    tool_decision: None,
+                })
+                .unwrap();
+            session
+                .append(Event::ModelFinished {
+                    request_id: id,
+                    metadata: ModelMetadata {
+                        finish_reason: Some("stop".into()),
+                        ..Default::default()
+                    },
+                    usage: UsageReport::Measured {
+                        usage: Usage {
+                            input_tokens: if id == turn_id { 1001 } else { 9 },
+                            output_tokens: 2,
+                        },
+                    },
+                    failure: None,
+                    partial: if id == summary_id {
+                        "saved summary".into()
+                    } else {
+                        String::new()
+                    },
+                    reply: (id == turn_id).then(|| RecordedReply {
+                        content: "answer".into(),
+                        invocations: vec![],
+                        advertised_tools: vec![],
+                        max_output_tokens: tokens,
+                    }),
+                })
+                .unwrap();
+        }
+        drop(session);
+        let mut session = Session::open(&path).unwrap();
+        session.auto_compaction_control().set_enabled(false);
+        let model = RecoverySettlementModel {
+            turn: TurnModel(std::sync::atomic::AtomicUsize::new(0)),
+            summary_id,
+            fail_once: std::sync::atomic::AtomicBool::new(true),
+            settlements: std::sync::Mutex::new(Vec::new()),
+            allowances: std::sync::Mutex::new(Vec::new()),
+        };
+        let registry = Registry::default();
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                context_window: None,
+                output_tokens_per_request: 16,
+                model_requests: 2,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let (_sender, mut inputs) = mpsc::channel::<String>(1);
+        for steering in [false, true] {
+            let mut cancelled_session = Session::from_records(session.records().to_vec()).unwrap();
+            let steering_id = Uuid::new_v4();
+            if steering {
+                cancelled_session
+                    .append(Event::InputQueued {
+                        input: crate::QueuedInput {
+                            id: steering_id,
+                            kind: crate::InputKind::Steer,
+                            content: "retain me".into(),
+                        },
+                    })
+                    .unwrap();
+            }
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            assert!(matches!(
+                agent
+                    .compact_silent_overflow(
+                        &mut cancelled_session,
+                        run_id,
+                        &ExtensionStates::new(),
+                        &cancel,
+                        &mut |_| {},
+                        &mut inputs
+                    )
+                    .await,
+                Err(Error::Cancelled)
+            ));
+            assert!(resumable_compaction_run(&cancelled_session).is_some());
+            if steering {
+                assert!(
+                    cancelled_session
+                        .queued_inputs()
+                        .iter()
+                        .any(|input| input.input.id == steering_id)
+                );
+            }
+
+            let cancel = CancellationToken::new();
+            let mut observer = |notification: Notification<'_>| {
+                if matches!(notification, Notification::Committed(record) if matches!(record.event, Event::Run { state: RunState::Running, .. }))
+                {
+                    cancel.cancel();
+                }
+            };
+            assert!(matches!(
+                agent
+                    .run_correlated(
+                        &mut cancelled_session,
+                        run_id,
+                        None,
+                        &mut inputs,
+                        &cancel,
+                        &mut observer
+                    )
+                    .await,
+                Err(Error::Cancelled)
+            ));
+            assert!(resumable_compaction_run(&cancelled_session).is_some());
+            if steering {
+                assert!(
+                    cancelled_session
+                        .queued_inputs()
+                        .iter()
+                        .any(|input| input.input.id == steering_id)
+                );
+                assert!(!cancelled_session.records().iter().any(|record| matches!(&record.event, Event::User { input_id: Some(id), .. } if *id == steering_id)));
+            }
+        }
+        let failure = agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(failure.to_string().contains("settlement unavailable"));
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
+        let mut compaction_events = Vec::new();
+        let answer = agent
+            .run_correlated_with_events(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |event| match event {
+                    AgentEvent::AutoCompaction {
+                        reason: crate::CompactionTrigger::Overflow,
+                        update: AutoCompactionUpdate::Started,
+                    } => compaction_events.push(None),
+                    AgentEvent::AutoCompaction {
+                        reason: crate::CompactionTrigger::Overflow,
+                        update: AutoCompactionUpdate::Completed { will_retry, .. },
+                    } => compaction_events.push(Some(*will_retry)),
+                    _ => {}
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(compaction_events, [None, Some(false)]);
+        assert_eq!(answer, "answer");
+        let settlements = model.settlements.lock().unwrap();
+        assert_eq!(settlements.len(), 2);
+        assert!(
+            settlements
+                .iter()
+                .all(|(id, usage, metadata)| *id == summary_id
+                    && matches!(usage, UsageReport::Measured { usage } if usage.input_tokens == 9)
+                    && metadata.finish_reason.as_deref() == Some("stop"))
+        );
+        drop(settlements);
+        assert_eq!(model.turn.0.load(Ordering::SeqCst), 0);
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::Compacted { summary, .. } if summary == "saved summary")));
+    }
+
+    struct LegacyCompaction(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    impl crate::Extension for LegacyCompaction {
+        fn id(&self) -> &str {
+            "legacy-compaction"
+        }
+        fn before_compaction(
+            &self,
+            compaction: &mut crate::Compaction,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<crate::Decision> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("before:{}", compaction.summary));
+            compaction.summary.push_str(" [legacy]");
+            Ok(crate::Decision::Allow)
+        }
+        fn after_compaction(
+            &self,
+            compaction: &crate::Compaction,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<Option<crate::ExtensionState>> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("after:{}", compaction.summary));
+            Ok(None)
+        }
+    }
+
+    struct CompactionCompletionHook(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl crate::Extension for CompactionCompletionHook {
+        fn id(&self) -> &str {
+            "compaction-completion-hook"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionCompact { .. }) {
+                tokio::task::yield_now().await;
+                self.0.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_summary_edits_still_count_model_requests_for_automatic_compaction() {
+        for reason in [
+            crate::CompactionTrigger::Threshold,
+            crate::CompactionTrigger::Overflow,
+        ] {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(LegacyCompaction(events)))
+                .unwrap();
+            let hook_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            registry
+                .register(Arc::new(CompactionCompletionHook(hook_finished.clone())))
+                .unwrap();
+            let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+            let agent = Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits::default(),
+            };
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            session
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::User {
+                    content: "recent".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            let retention = RetentionPlan::turns(&session, 1);
+            let mut updates = Vec::new();
+            let mut observe = |event: AgentEvent<'_>| match event {
+                AgentEvent::AutoCompaction {
+                    reason: observed,
+                    update,
+                } => {
+                    assert_eq!(
+                        serde_json::to_value(observed).unwrap(),
+                        serde_json::to_value(reason).unwrap()
+                    );
+                    match update {
+                        AutoCompactionUpdate::Started => updates.push("start"),
+                        AutoCompactionUpdate::Completed {
+                            compaction_entry,
+                            will_retry,
+                            ..
+                        } => {
+                            assert!(
+                                matches!(&compaction_entry.event, Event::Compacted { summary, .. } if summary == "answer [legacy]")
+                            );
+                            assert_eq!(
+                                *will_retry,
+                                matches!(reason, crate::CompactionTrigger::Overflow)
+                            );
+                            assert!(hook_finished.load(Ordering::SeqCst));
+                            updates.push("end");
+                        }
+                        _ => panic!("automatic compaction failed"),
+                    }
+                }
+                AgentEvent::Notification(Notification::SummaryRequest) => updates.push("request"),
+                _ => {}
+            };
+            let result = agent
+                .summarize_prefix::<AgentInput>(
+                    &mut session,
+                    &ExtensionStates::new(),
+                    SummaryScope {
+                        retention,
+                        instructions: None,
+                        output_limit: 16,
+                        cancellation: &CancellationToken::new(),
+                        reason,
+                        will_retry: matches!(reason, crate::CompactionTrigger::Overflow),
+                        skip_without_model: false,
+                    },
+                    &mut |event| dispatch_agent_event(event, &mut observe),
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(updates, ["start", "request", "end"]);
+            assert!(!result.1, "a legacy edit must not refund the model request");
+            assert_eq!(model.0.load(Ordering::SeqCst), 1);
+            let record = session.records().iter().find(|r| matches!(&r.event, Event::Compacted { summary, .. } if summary == "answer [legacy]")).unwrap();
+            assert_eq!(
+                session.record_metadata(record.id).unwrap()["fromExtension"],
+                true
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_edited_overflow_summary_uses_three_model_requests() {
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(LegacyCompaction(Arc::new(std::sync::Mutex::new(
+                Vec::new(),
+            )))))
+            .unwrap();
+        let model = OverflowModel {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            always_fail: false,
+            minimum_output_tokens: 1,
+        };
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                model_requests: 3,
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                compaction_tokens: Some(crate::CompactionTokens {
+                    reserve_tokens: Some(0),
+                    keep_recent_tokens: None,
+                }),
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        let (_sender, mut inputs) = mpsc::channel(1);
+        let result = agent
+            .run(
+                &mut session,
+                Some("new".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert_eq!(result.unwrap(), "answer");
+        assert_eq!(model.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn legacy_compaction_hook_still_works_with_legacy_store() {
+        struct LegacyStore(crate::MemoryStore);
+        impl crate::SessionStore for LegacyStore {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                crate::SessionStore::load(&mut self.0)
+            }
+            fn append(&mut self, record: &Record) -> Result<()> {
+                crate::SessionStore::append(&mut self.0, record)
+            }
+        }
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(LegacyCompaction(events.clone())))
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(LegacyStore(crate::MemoryStore::default())).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "recent".into(),
+                input_id: None,
+            })
+            .unwrap();
+        agent
+            .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(session.records().iter().any(|record| matches!(&record.event, Event::Compacted { summary, .. } if summary == "answer [legacy]")));
+        assert_eq!(events.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unsupported_extension_summary_keeps_legacy_store_writable() {
+        struct LegacyStore(crate::MemoryStore);
+        impl crate::SessionStore for LegacyStore {
+            fn load(&mut self) -> Result<Vec<Record>> {
+                crate::SessionStore::load(&mut self.0)
+            }
+            fn append(&mut self, record: &Record) -> Result<()> {
+                crate::SessionStore::append(&mut self.0, record)
+            }
+        }
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(ProvidedCompaction {
+                cancel: false,
+                invalid: false,
+                events: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }))
+            .unwrap();
+        let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits {
+                context_window: Some(1000),
+                output_tokens_per_request: 16,
+                ..Limits::default()
+            },
+        };
+        let mut session = Session::with_store(LegacyStore(crate::MemoryStore::default())).unwrap();
+        session
+            .append(Event::User {
+                content: "old".into(),
+                input_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: "old reply".into(),
+                invocations: vec![],
+                usage: None,
+                request_id: None,
+            })
+            .unwrap();
+        session
+            .append(Event::User {
+                content: "recent".into(),
+                input_id: None,
+            })
+            .unwrap();
+        let error = agent
+            .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support record metadata")
+        );
+        assert!(
+            !session
+                .records()
+                .iter()
+                .any(|record| matches!(record.event, Event::Compacted { .. }))
+        );
+        session
+            .append(Event::User {
+                content: "continue".into(),
+                input_id: None,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_compaction_hooks_run_after_supplied_manual_and_automatic_summaries() {
+        for automatic in [false, true] {
+            let legacy_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(ProvidedCompaction {
+                    cancel: false,
+                    invalid: false,
+                    events: Arc::new(std::sync::Mutex::new(Vec::new())),
+                }))
+                .unwrap();
+            registry
+                .register(Arc::new(LegacyCompaction(legacy_events.clone())))
+                .unwrap();
+            let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+            let agent = Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits {
+                    model_requests: 1,
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(1000),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                },
+            };
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            for text in ["old", "recent"] {
+                session
+                    .append(Event::User {
+                        content: text.into(),
+                        input_id: None,
+                    })
+                    .unwrap();
+                if text == "old" {
+                    session
+                        .append(Event::Assistant {
+                            content: "old reply".into(),
+                            invocations: vec![],
+                            usage: None,
+                            request_id: None,
+                        })
+                        .unwrap();
+                }
+            }
+            if automatic {
+                let (_sender, mut inputs) = mpsc::channel(1);
+                assert_eq!(
+                    agent
+                        .run(
+                            &mut session,
+                            None,
+                            &mut inputs,
+                            &CancellationToken::new(),
+                            &mut |_| {}
+                        )
+                        .await
+                        .unwrap(),
+                    "answer"
+                );
+                assert_eq!(model.0.load(Ordering::SeqCst), 1);
+            } else {
+                agent
+                    .summarize(&mut session, 1, &CancellationToken::new(), &mut |_| {})
+                    .await
+                    .unwrap();
+                assert_eq!(model.0.load(Ordering::SeqCst), 0);
+            }
+            assert_eq!(
+                *legacy_events.lock().unwrap(),
+                [
+                    "before:extension summary",
+                    "after:extension summary [legacy]"
+                ]
+            );
+            assert!(session.records().iter().any(|record|
+                matches!(&record.event, Event::Compacted { summary, .. } if summary == "extension summary [legacy]") && session.record_metadata(record.id).is_some_and(|v| v["fromExtension"] == true)));
+        }
+    }
+
+    struct DeclinedCompaction(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::Extension for DeclinedCompaction {
+        fn id(&self) -> &str {
+            "declined-compaction"
+        }
+        fn handles_before_summary_compaction(&self) -> bool {
+            true
+        }
+        async fn before_summary_compaction(
+            &self,
+            _: &crate::CompactionPreparation,
+            _: Option<&crate::ExtensionState>,
+            _: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<Option<crate::BeforeSummaryCompactionResult>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_extension_summary_can_use_last_model_request() {
+        for provide in [false, true] {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut registry = Registry::default();
+            let declined_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            if provide {
+                registry
+                    .register(Arc::new(ProvidedCompaction {
+                        cancel: false,
+                        invalid: false,
+                        events: events.clone(),
+                    }))
+                    .unwrap();
+            } else {
+                registry
+                    .register(Arc::new(DeclinedCompaction(declined_calls.clone())))
+                    .unwrap();
+            }
+            let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+            let agent = Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits {
+                    model_requests: 1,
+                    context_window: Some(1000),
+                    output_tokens_per_request: 16,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(1000),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                },
+            };
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            session
+                .append(Event::User {
+                    content: "old".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            let (_sender, mut inputs) = mpsc::channel(1);
+            let result = agent
+                .run(
+                    &mut session,
+                    Some("new".into()),
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(result, "answer");
+            assert_eq!(model.0.load(Ordering::SeqCst), 1);
+            if !provide {
+                assert_eq!(declined_calls.load(Ordering::SeqCst), 1);
+            }
+            assert_eq!(
+                session.records().iter().any(|record| matches!(
+                    &record.event,
+                    Event::Compacted { .. }
+                ) && session
+                    .record_metadata(record.id)
+                    .is_some_and(|v| v["fromExtension"] == true)),
+                provide
+            );
+            assert!(
+                !events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["type"] == "session_compact_failed")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_only_compaction_still_enforces_mandatory_context_fit() {
+        for provide in [false, true] {
+            let mut registry = Registry::default();
+            if provide {
+                registry
+                    .register(Arc::new(ProvidedCompaction {
+                        cancel: false,
+                        invalid: false,
+                        events: Arc::new(std::sync::Mutex::new(Vec::new())),
+                    }))
+                    .unwrap();
+            } else {
+                registry
+                    .register(Arc::new(DeclinedCompaction(Arc::new(
+                        std::sync::atomic::AtomicUsize::new(0),
+                    ))))
+                    .unwrap();
+            }
+            let model = TurnModel(std::sync::atomic::AtomicUsize::new(0));
+            let agent = Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits {
+                    model_requests: 1,
+                    context_window: Some(80),
+                    output_tokens_per_request: 16,
+                    compaction_tokens: Some(crate::CompactionTokens {
+                        reserve_tokens: Some(80),
+                        keep_recent_tokens: None,
+                    }),
+                    ..Limits::default()
+                },
+            };
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            session
+                .append(Event::User {
+                    content: "old ".repeat(300),
+                    input_id: None,
+                })
+                .unwrap();
+            session
+                .append(Event::Assistant {
+                    content: "old reply".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: None,
+                })
+                .unwrap();
+            let (_sender, mut inputs) = mpsc::channel(1);
+            let result = agent
+                .run(
+                    &mut session,
+                    Some("new".into()),
+                    &mut inputs,
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                )
+                .await;
+            if provide {
+                assert_eq!(result.unwrap(), "answer");
+                assert_eq!(model.0.load(Ordering::SeqCst), 1);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(model.0.load(Ordering::SeqCst), 0);
+                assert!(
+                    !session
+                        .records()
+                        .iter()
+                        .any(|record| matches!(record.event, Event::Compacted { .. }))
+                );
+            }
+        }
+    }
+
+    struct CompactionFailureObserver(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+    #[async_trait::async_trait]
+    impl crate::Extension for CompactionFailureObserver {
+        fn id(&self) -> &str {
+            "compaction-failure-observer"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionCompactFailed { .. }) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap());
+            }
+            Ok(())
+        }
+    }
+
+    struct FailedCompactionMigration;
+    #[async_trait::async_trait]
+    impl crate::Extension for FailedCompactionMigration {
+        fn id(&self) -> &str {
+            "failed-migration"
+        }
+        fn migrate(
+            &self,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<Option<crate::ExtensionState>> {
+            Err("migration failed".into())
+        }
+    }
+
+    struct FailAfterCreateStore {
+        records: Vec<Record>,
+    }
+    impl crate::SessionStore for FailAfterCreateStore {
+        fn load(&mut self) -> Result<Vec<Record>> {
+            Ok(self.records.clone())
+        }
+        fn append(&mut self, record: &Record) -> Result<()> {
+            if !self.records.is_empty() {
+                return Err(Error::Session("fixture journal write failure".into()));
+            }
+            self.records.push(record.clone());
+            Ok(())
+        }
+    }
+
+    struct CommandWritesState;
+    #[async_trait::async_trait]
+    impl crate::Extension for CommandWritesState {
+        fn id(&self) -> &str {
+            "command-writer"
+        }
+        fn command_names(&self) -> Vec<&str> {
+            vec!["write"]
+        }
+        fn command_effects(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<crate::ExtensionCommandEffects> {
+            Ok(crate::ExtensionCommandEffects {
+                state: Some(crate::ExtensionState {
+                    version: 1,
+                    data: serde_json::json!({}),
+                }),
+                actions: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn rpc_command_does_not_classify_journal_failure_as_callback() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(CommandWritesState)).unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(FailAfterCreateStore { records: vec![] }).unwrap();
+        let error = agent
+            .try_extension_command_rpc(&mut session, "/write", &mut |_| {})
+            .unwrap_err();
+        assert!(
+            matches!(error, CommandDispatchError::Other(Error::Session(message)) if message.contains("fixture journal write failure"))
+        );
+    }
+
+    struct CompactionFailureMessage;
+    #[async_trait::async_trait]
+    impl crate::Extension for CompactionFailureMessage {
+        fn id(&self) -> &str {
+            "failure-message"
+        }
+        fn handles_lifecycle(&self) -> bool {
+            true
+        }
+        fn handles_session_lifecycle(&self) -> bool {
+            true
+        }
+        async fn lifecycle_with_host(
+            &self,
+            event: &crate::LifecycleEvent,
+            _: Option<&crate::ExtensionState>,
+            host: Arc<dyn crate::ToolHost>,
+        ) -> crate::ExtensionResult<()> {
+            if matches!(event, crate::LifecycleEvent::SessionCompactFailed { .. }) {
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "failure".into(),
+                        content: crate::ContextContent::Text("notice".into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::NextTurn,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_keeps_original_error_when_listener_write_fails() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(FailedCompactionMigration))
+            .unwrap();
+        registry
+            .register(Arc::new(CompactionFailureMessage))
+            .unwrap();
+        registry
+            .register(Arc::new(CompactionFailureObserver(observed.clone())))
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(FailAfterCreateStore { records: vec![] }).unwrap();
+        let mut reported = Vec::new();
+        let error = agent
+            .summarize(&mut session, 0, &CancellationToken::new(), &mut |event| {
+                if let Notification::ExtensionLifecycleError {
+                    extension,
+                    event,
+                    message,
+                } = event
+                {
+                    reported.push((extension.to_owned(), event.to_owned(), message.to_owned()));
+                }
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("migration failed"));
+        assert_eq!(
+            observed.lock().unwrap().len(),
+            1,
+            "later listener must receive the event"
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|(extension, event, message)| extension == "session host"
+                    && event == "session_compact_failed"
+                    && message.contains("fixture journal write failure"))
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|(extension, event, _)| extension == "failure-message"
+                    && event == "session_compact_failed")
+        );
+        assert_eq!(session.records().len(), 1);
+        assert!(
+            session
+                .append(Event::User {
+                    content: "later".into(),
+                    input_id: None
+                })
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_reports_preparation_and_preserves_error() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(FailedCompactionMigration))
+            .unwrap();
+        registry
+            .register(Arc::new(CompactionFailureObserver(events.clone())))
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let error = agent
+            .summarize(&mut session, 0, &CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("migration failed"));
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "session_compact_failed");
+        assert_eq!(events[0]["reason"], "manual");
+        assert_eq!(events[0]["aborted"], false);
+        assert_eq!(events[0]["willRetry"], false);
+        assert_eq!(events[0]["fromExtension"], false);
+        assert!(
+            events[0]["errorMessage"]
+                .as_str()
+                .unwrap()
+                .starts_with("Compaction failed: ")
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_reports_threshold_and_cancellation() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(CompactionFailureObserver(events.clone())))
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        for cancelled in [false, true] {
+            let token = CancellationToken::new();
+            if cancelled {
+                token.cancel();
+            }
+            let retention = RetentionPlan::turns(&session, 0);
+            let result = agent
+                .summarize_prefix::<AgentInput>(
+                    &mut session,
+                    &ExtensionStates::new(),
+                    SummaryScope {
+                        retention,
+                        instructions: None,
+                        output_limit: 0,
+                        cancellation: &token,
+                        reason: crate::CompactionTrigger::Threshold,
+                        will_retry: false,
+                        skip_without_model: false,
+                    },
+                    &mut |_| {},
+                    None,
+                )
+                .await;
+            assert!(matches!(result, Err(Error::Budget)));
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["reason"], "threshold");
+        assert_eq!(events[0]["aborted"], false);
+        assert!(
+            events[0]["errorMessage"]
+                .as_str()
+                .unwrap()
+                .starts_with("Auto-compaction failed: ")
+        );
+        assert_eq!(events[1]["aborted"], true);
+        assert!(events[1].get("errorMessage").is_none());
+    }
+
     #[async_trait::async_trait]
     impl Model for NoModel {
         async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
             panic!("a veto or supplied summary must bypass the model");
         }
+    }
+
+    struct ArgumentHook(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::Extension for ArgumentHook {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            if self.0 == "first" {
+                vec![Arc::new(ArgumentTool)]
+            } else {
+                vec![]
+            }
+        }
+        async fn tool_call(
+            &self,
+            _: &str,
+            args: &mut serde_json::Value,
+            _: &ToolContext,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<Decision> {
+            if self.0 == "first" {
+                args["path"] = "changed".into();
+            } else {
+                assert_eq!(args["path"], "changed");
+                args["path"] = "final".into();
+            }
+            Ok(Decision::Allow)
+        }
+    }
+    struct ArgumentTool;
+    #[async_trait::async_trait]
+    impl crate::Tool for ArgumentTool {
+        fn spec(&self) -> crate::ToolSpec {
+            crate::ToolSpec {
+                name: "fixture".into(),
+                description: String::new(),
+                parameters: serde_json::json!({"type":"object", "required":["path"], "properties":{"path":{"const":"original"}}}),
+            }
+        }
+        async fn invoke(&self, args: serde_json::Value, _: ToolContext) -> Outcome {
+            Outcome::Succeeded(args["path"].as_str().unwrap().into())
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_mutations_chain_after_validation_and_reach_tool() {
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ArgumentHook("first"))).unwrap();
+        registry.register(Arc::new(ArgumentHook("second"))).unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "fixture".into(),
+                arguments: r#"{"path":"original"}"#.into(),
+            },
+        };
+        let prepared = Agent::turn_prepare(
+            &registry,
+            agent.limits.tool_timeout,
+            &invocation,
+            &HashSet::from(["fixture".into()]),
+            &ExtensionStates::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let turn_scheduler::TurnPreparation::Ready {
+            tool,
+            args,
+            context,
+            ..
+        } = prepared
+        else {
+            panic!("expected execution")
+        };
+        assert_eq!(
+            tool.tool.invoke(args, context).await,
+            Outcome::Succeeded("final".into())
+        );
     }
 
     struct ResultHook(&'static str);
@@ -3745,6 +12347,285 @@ mod tree_tests {
             )
             .await;
         assert_eq!(skipped.outcome, Outcome::Skipped("denied".into()));
+    }
+
+    #[tokio::test]
+    async fn result_patches_preserve_details_and_chain() {
+        struct Patch(&'static str);
+        #[async_trait::async_trait]
+        impl crate::Extension for Patch {
+            fn id(&self) -> &str {
+                self.0
+            }
+            fn handles_tool_result(&self) -> bool {
+                true
+            }
+            async fn tool_result_patch(
+                &self,
+                _: &crate::ToolCall,
+                outcome: &Outcome,
+                _: &crate::ToolContext,
+                _: Option<&crate::ExtensionState>,
+            ) -> crate::ExtensionResult<Option<crate::ToolResultPatch>> {
+                let Outcome::SucceededWithDetails { output, details } = outcome else {
+                    panic!("missing details")
+                };
+                assert_eq!(details, &serde_json::json!({"source": "tool"}));
+                Ok(Some(crate::ToolResultPatch {
+                    output: Some(format!("{output}:{}", self.0)),
+                    details: None,
+                }))
+            }
+        }
+        let mut registry = Registry::default();
+        registry.register(Arc::new(Patch("first"))).unwrap();
+        registry.register(Arc::new(Patch("second"))).unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "fixture".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut reply = ToolReply::from(Outcome::SucceededWithDetails {
+            output: "original".into(),
+            details: serde_json::json!({"source":"tool"}),
+        });
+        agent
+            .transform_tool_result(
+                &invocation,
+                &mut reply,
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert_eq!(
+            reply.outcome,
+            Outcome::SucceededWithDetails {
+                output: "original:first:second".into(),
+                details: serde_json::json!({"source":"tool"})
+            }
+        );
+        let patch = crate::ToolResultPatch {
+            output: None,
+            details: Some(serde_json::json!({"updated": true})),
+        };
+        assert_eq!(
+            patch.apply(&reply.outcome).unwrap(),
+            Outcome::SucceededWithDetails {
+                output: "original:first:second".into(),
+                details: serde_json::json!({"updated": true})
+            }
+        );
+        assert_eq!(
+            crate::ToolResultPatch::default()
+                .apply(&Outcome::Failed("error".into()))
+                .unwrap(),
+            Outcome::Failed("error".into())
+        );
+        let patched = crate::ToolResultPatch {
+            output: Some("redacted".into()),
+            details: Some(serde_json::json!({"code": 1})),
+        }
+        .apply(&Outcome::Failed("error".into()))
+        .unwrap();
+        assert_eq!(
+            patched,
+            Outcome::TextResult {
+                output: "redacted".into(),
+                details: Some(serde_json::json!({"code": 1})),
+                is_error: true
+            }
+        );
+        assert_eq!(patched.tool_content(), "redacted");
+        let metadata_only = crate::ToolResultPatch {
+            output: None,
+            details: Some(serde_json::json!({"code": 1})),
+        }
+        .apply(&Outcome::Failed("error".into()))
+        .unwrap();
+        assert_eq!(metadata_only.tool_content(), "Tool failed: error");
+        let marked_error = crate::ToolResultPatchV2 {
+            is_error: Some(true),
+            ..Default::default()
+        }
+        .apply(&Outcome::SucceededWithDetails {
+            output: "unchanged".into(),
+            details: serde_json::json!({"source":"tool"}),
+        })
+        .unwrap();
+        assert!(marked_error.is_error());
+        assert_eq!(marked_error.tool_content(), "unchanged");
+        assert!(
+            matches!(marked_error, Outcome::TextResult { details: Some(details), .. } if details["source"] == "tool")
+        );
+        let shell = Outcome::TextResultWithStructuredContent {
+            output: "original".into(),
+            details: None,
+            structured_content: serde_json::json!({"output":"original"}),
+            is_error: false,
+        };
+        let patched = crate::ToolResultPatchV2 {
+            details: Some(serde_json::json!({"updated":true})),
+            ..Default::default()
+        }
+        .apply(&shell)
+        .unwrap();
+        assert!(
+            matches!(&patched, Outcome::TextResultWithStructuredContent { structured_content, .. } if structured_content["output"] == "original")
+        );
+        let replaced = crate::ToolResultPatchV2 {
+            output: Some("redacted".into()),
+            ..Default::default()
+        }
+        .apply(&shell)
+        .unwrap();
+        assert!(matches!(replaced, Outcome::TextResult { .. }));
+        let round_trip: Outcome =
+            serde_json::from_slice(&serde_json::to_vec(&shell).unwrap()).unwrap();
+        assert_eq!(round_trip, shell);
+    }
+
+    #[test]
+    fn oversized_structured_tool_outcomes_preserve_error_status() {
+        for is_error in [false, true] {
+            let data =
+                serde_json::json!({"isError":is_error,"content":[{"type":"text","text":"result"}]});
+            for outcome in [
+                Outcome::Structured {
+                    data: data.clone(),
+                    attachments: vec![],
+                },
+                Outcome::StructuredWithDetails {
+                    data: data.clone(),
+                    attachments: vec![],
+                    details: serde_json::json!({"source":"extension"}),
+                },
+            ] {
+                assert_eq!(
+                    bound_structured_tool_outcome(outcome.clone(), 1024).unwrap(),
+                    outcome
+                );
+                let limited = bound_structured_tool_outcome(outcome, 16).unwrap();
+                assert_eq!(limited.is_error(), is_error);
+                if is_error {
+                    assert_eq!(
+                        limited,
+                        Outcome::Failed("failure detail exceeds size limit".into())
+                    );
+                } else {
+                    assert!(matches!(limited, Outcome::Truncated { .. }));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_result_patches_chain_and_preserve_failure() {
+        struct Patch(u8);
+        #[async_trait::async_trait]
+        impl crate::Extension for Patch {
+            fn id(&self) -> &str {
+                match self.0 {
+                    0 => "first",
+                    1 => "second",
+                    _ => "third",
+                }
+            }
+            fn handles_tool_result(&self) -> bool {
+                true
+            }
+            async fn tool_result_patch_v2(
+                &self,
+                _: &crate::ToolCall,
+                outcome: &Outcome,
+                _: &crate::ToolContext,
+                _: Option<&crate::ExtensionState>,
+            ) -> crate::ExtensionResult<Option<crate::ToolResultPatchV2>> {
+                let patch = match self.0 {
+                    0 => {
+                        assert!(outcome.is_error());
+                        crate::ToolResultPatchV2 {
+                            output: Some("exact".into()),
+                            details: Some(serde_json::json!({"code": 1})),
+                            is_error: None,
+                        }
+                    }
+                    1 => {
+                        assert_eq!(outcome.tool_content(), "exact");
+                        assert!(outcome.is_error());
+                        crate::ToolResultPatchV2 {
+                            is_error: Some(false),
+                            ..Default::default()
+                        }
+                    }
+                    _ => {
+                        assert!(!outcome.is_error());
+                        assert!(
+                            matches!(outcome, Outcome::TextResult { details: Some(value), .. } if value["code"] == 1)
+                        );
+                        crate::ToolResultPatchV2 {
+                            output: Some("final".into()),
+                            is_error: Some(true),
+                            ..Default::default()
+                        }
+                    }
+                };
+                Ok(Some(patch))
+            }
+        }
+        let mut registry = Registry::default();
+        for index in 0..3 {
+            registry.register(Arc::new(Patch(index))).unwrap();
+        }
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "fixture".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut reply = ToolReply::from(Outcome::Failed("original".into()));
+        agent
+            .transform_tool_result(
+                &invocation,
+                &mut reply,
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await;
+        assert_eq!(
+            reply.outcome,
+            Outcome::TextResult {
+                output: "final".into(),
+                details: Some(serde_json::json!({"code": 1})),
+                is_error: true
+            }
+        );
+        assert_eq!(reply.outcome.tool_content(), "final");
+        let serialized = serde_json::to_string(&reply.outcome).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Outcome>(&serialized).unwrap(),
+            reply.outcome
+        );
     }
 
     #[tokio::test]
@@ -3864,6 +12745,113 @@ mod nested_host_tests {
     use super::*;
 
     #[tokio::test]
+    async fn custom_host_without_cancellation_guarantee_fails_closed() {
+        struct UnsafeHost(AtomicUsize);
+        #[async_trait::async_trait]
+        impl ToolHost for UnsafeHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![]
+            }
+            async fn call(&self, _: &str, _: serde_json::Value) -> Outcome {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Outcome::Succeeded("unexpected".into())
+            }
+        }
+        let host = UnsafeHost(AtomicUsize::new(0));
+        let result = host
+            .call_with_cancellation("write", serde_json::json!({}), CancellationToken::new())
+            .await;
+        assert!(
+            matches!(result, Outcome::Skipped(message) if message.contains("cancellation-aware"))
+        );
+        assert_eq!(host.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn invocation_cancellation_reaches_queued_write_behind_active_call() {
+        let (requests, mut incoming) = mpsc::channel(4);
+        let parent = CancellationToken::new();
+        let invocation = parent.child_token();
+        let host = Arc::new(NestedHost {
+            ui: None,
+            progress: None,
+            requests,
+            specs: Arc::new(vec![]),
+            parent_operation: Uuid::new_v4(),
+            cancellation: parent.clone(),
+            depth: 0,
+            call_count: Arc::new(AtomicUsize::new(0)),
+        });
+        let first = tokio::spawn({
+            let host = host.clone();
+            let token = invocation.clone();
+            async move {
+                host.call_with_cancellation("hold", serde_json::json!({}), token)
+                    .await
+            }
+        });
+        let mut active = incoming.recv().await.unwrap();
+        let second = tokio::spawn({
+            let host = host.clone();
+            let token = invocation.clone();
+            async move {
+                host.call_with_cancellation("write", serde_json::json!({}), token)
+                    .await
+            }
+        });
+        let mut queued = incoming.recv().await.unwrap();
+        let active = active.remove(0);
+        let queued = queued.remove(0);
+        assert_eq!(active.name, "hold");
+        assert_eq!(queued.name, "write");
+        invocation.cancel();
+        assert!(!parent.is_cancelled());
+        assert!(active.cancellation.is_cancelled());
+        assert!(
+            queued.cancellation.is_cancelled(),
+            "queued write must be cancelled before it can dispatch"
+        );
+        first.await.unwrap();
+        second.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_dispatched_batch_and_preserves_ready_results() {
+        let (requests, mut incoming) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let host = NestedHost {
+            ui: None,
+            progress: None,
+            requests,
+            specs: Arc::new(vec![]),
+            parent_operation: Uuid::new_v4(),
+            cancellation: cancel.clone(),
+            depth: 0,
+            call_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let calls = vec![
+            ("first".into(), serde_json::json!({})),
+            ("second".into(), serde_json::json!({})),
+        ];
+        let call = tokio::spawn(async move { host.call_batch(calls).await });
+        let mut batch = incoming.recv().await.unwrap();
+        batch
+            .remove(0)
+            .reply
+            .send(Outcome::Succeeded("done".into()))
+            .unwrap();
+        cancel.cancel();
+        // The dispatcher still owns the other sender when cancellation occurs.
+        let outcomes = platform_time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("cancelled call remained blocked")
+            .unwrap();
+        drop(batch);
+        assert_eq!(outcomes[0], Outcome::Succeeded("done".into()));
+        assert!(matches!(outcomes[1], Outcome::Unknown(_)));
+    }
+
+    #[tokio::test]
     async fn batch_retains_invalid_argument_positions_without_dispatching_them() {
         let (requests, mut incoming) = mpsc::channel(1);
         let host = NestedHost {
@@ -3896,11 +12884,272 @@ mod nested_host_tests {
         assert!(matches!(outcomes[0], Outcome::Skipped(_)));
         assert_eq!(outcomes[1], Outcome::Succeeded("done".into()));
     }
+
+    #[tokio::test]
+    async fn prevalidated_oversized_calls_preserve_order_and_consume_call_budget() {
+        let (requests, mut incoming) = mpsc::channel(1);
+        let host = NestedHost {
+            ui: None,
+            progress: None,
+            requests,
+            specs: Arc::new(vec![]),
+            parent_operation: Uuid::new_v4(),
+            cancellation: CancellationToken::new(),
+            depth: 0,
+            call_count: Arc::new(AtomicUsize::new(4094)),
+        };
+        assert!(host.supports_prevalidated_call_accounting());
+        let calls = vec![
+            ("large".into(), None),
+            ("valid".into(), Some(serde_json::json!({}))),
+            ("over-budget".into(), Some(serde_json::json!({}))),
+        ];
+        let (outcomes, ()) = tokio::join!(host.call_batch_prevalidated(calls), async {
+            let mut batch = incoming.recv().await.unwrap();
+            assert_eq!(batch.len(), 1);
+            let request = batch.remove(0);
+            assert_eq!(request.name, "valid");
+            request
+                .reply
+                .send(Outcome::Succeeded("done".into()))
+                .unwrap();
+        });
+        assert_eq!(
+            outcomes[0],
+            Outcome::Skipped("nested tool arguments exceed size limit".into())
+        );
+        assert_eq!(outcomes[1], Outcome::Succeeded("done".into()));
+        assert_eq!(
+            outcomes[2],
+            Outcome::Skipped("nested tool execution limit reached".into())
+        );
+    }
 }
 
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+    fn custom(text: &str, delivery: crate::CustomMessageDelivery) -> crate::QueuedCustomMessage {
+        crate::QueuedCustomMessage {
+            id: Uuid::new_v4(),
+            delivery,
+            message: crate::CustomMessage {
+                custom_type: "fixture".into(),
+                content: crate::ContextContent::Text(text.into()),
+                display: false,
+                details: Some(serde_json::json!({"key":text})),
+            },
+        }
+    }
+
+    #[test]
+    fn custom_queue_is_durable_and_shares_fifo_and_mode_with_users() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .set_queue_mode(InputKind::Steer, crate::QueueMode::OneAtATime)
+            .unwrap();
+        let first = custom("custom first", crate::CustomMessageDelivery::Steer);
+        let first_id = first.id;
+        queue_custom_message(&mut session, first, &mut |_| {}).unwrap();
+        queue_message(
+            &mut session,
+            QueuedMessage::from(crate::QueuedInput {
+                id: Uuid::new_v4(),
+                kind: InputKind::Steer,
+                content: "user second".into(),
+            }),
+            &mut |_| {},
+        )
+        .unwrap();
+        let follow = custom("later", crate::CustomMessageDelivery::FollowUp);
+        queue_custom_message(&mut session, follow, &mut |_| {}).unwrap();
+        let mut session = Session::from_records(session.records().to_vec()).unwrap();
+        assert!(apply_inputs(&mut session, false, &mut |_| {}).unwrap());
+        assert_eq!(session.queued_inputs().len(), 1);
+        assert_eq!(session.queued_custom_messages().len(), 1);
+        let delivered = session
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::CustomMessageDelivered { id, message } if *id == first_id => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            delivered.details,
+            Some(serde_json::json!({"key":"custom first"}))
+        );
+        let mut restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(restored.queued_custom_messages().len(), 1);
+        assert!(apply_inputs(&mut restored, false, &mut |_| {}).unwrap());
+        assert!(apply_inputs(&mut restored, true, &mut |_| {}).unwrap());
+        assert!(restored.queued_custom_messages().is_empty());
+        assert_eq!(restored.records().iter().filter(|r| matches!(r.event, Event::CustomMessageDelivered { id, .. } if id == first_id)).count(), 1);
+        let texts: Vec<_> = restored
+            .current_messages()
+            .into_iter()
+            .filter_map(|m| {
+                if let crate::Message::User { content } = m {
+                    Some(content)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(texts, ["custom first", "user second", "later"]);
+    }
+
+    #[test]
+    fn clearing_steering_and_followups_preserves_next_turn_and_branch_history() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        queue_custom_message(
+            &mut session,
+            custom("steer", crate::CustomMessageDelivery::Steer),
+            &mut |_| {},
+        )
+        .unwrap();
+        queue_custom_message(
+            &mut session,
+            custom("follow", crate::CustomMessageDelivery::FollowUp),
+            &mut |_| {},
+        )
+        .unwrap();
+        queue_custom_message(
+            &mut session,
+            custom("next", crate::CustomMessageDelivery::NextTurn),
+            &mut |_| {},
+        )
+        .unwrap();
+        let before_clear = session.head();
+        session.clear_queued_inputs().unwrap();
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert_eq!(restored.queued_custom_messages().len(), 1);
+        let old_branch =
+            Session::from_records(restored.fork_records(before_clear).unwrap()).unwrap();
+        assert_eq!(old_branch.queued_custom_messages().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_live_selection_is_applied_before_the_queued_followup_request() {
+        use futures_util::StreamExt;
+
+        struct Route {
+            id: &'static str,
+            started: Option<Arc<tokio::sync::Notify>>,
+            release: Arc<tokio::sync::Notify>,
+            seen: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Model for Route {
+            async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+                assert_eq!(request.model, "shared-model");
+                self.seen.lock().unwrap().push(self.id.to_owned());
+                if let Some(started) = &self.started {
+                    started.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(futures_util::stream::iter([
+                    Ok(crate::ModelEvent::Text(self.id.to_owned())),
+                    Ok(crate::ModelEvent::Complete {
+                        calls: Vec::new(),
+                        usage: Some(Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        }),
+                    }),
+                ])
+                .boxed())
+            }
+        }
+
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        session
+            .record_request_identity("first-provider", "shared-model")
+            .unwrap();
+        let control = crate::LiveModelControl::default();
+        session.set_live_model_control(control.clone());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = Agent {
+            model: &Route {
+                id: "alpha",
+                started: Some(started.clone()),
+                release: release.clone(),
+                seen: seen.clone(),
+            },
+            model_name: "shared-model",
+            registry: &Registry::default(),
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let (sender, mut inputs) = mpsc::channel(2);
+        let switch = async {
+            started.notified().await;
+            control.select(Arc::new(crate::LiveModelSelection {
+                adapter: Arc::new(Route {
+                    id: "beta",
+                    started: None,
+                    release: release.clone(),
+                    seen: seen.clone(),
+                }),
+                provider: Some("second-provider".into()),
+                request_provider: "second-provider".into(),
+                model: "shared-model".into(),
+                thinking: Some("high".into()),
+                limits: Limits::default(),
+            }));
+            sender
+                .send(crate::QueuedInput {
+                    id: Uuid::new_v4(),
+                    kind: InputKind::FollowUp,
+                    content: "follow-up".into(),
+                })
+                .await
+                .unwrap();
+            release.notify_one();
+        };
+        let cancel = CancellationToken::new();
+        let mut observer = |_: Notification<'_>| {};
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(
+                agent.run_correlated(
+                    &mut session,
+                    Uuid::new_v4(),
+                    Some("initial".into()),
+                    &mut inputs,
+                    &cancel,
+                    &mut observer
+                ),
+                switch,
+            )
+        })
+        .await
+        .expect("live selection should settle");
+        assert_eq!(result.unwrap(), "beta");
+        assert_eq!(*seen.lock().unwrap(), ["alpha", "beta"]);
+        let mut provider = None;
+        let mut request_providers = Vec::new();
+        for record in session.records() {
+            match &record.event {
+                Event::SourceEntry { format, entry } if format == "pi-rs:request-identity" => {
+                    provider = entry["provider"].as_str();
+                }
+                Event::ModelRequested { .. } => request_providers.push(provider),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            request_providers,
+            [Some("first-provider"), Some("second-provider")]
+        );
+        assert_eq!(
+            session.model_selection(),
+            Some(("shared-model".into(), Some("high".into())))
+        );
+    }
+
     struct WaitingModel(Arc<tokio::sync::Notify>);
     #[async_trait::async_trait]
     impl Model for WaitingModel {
@@ -3909,6 +13158,121 @@ mod queue_tests {
             std::future::pending().await
         }
     }
+    #[test]
+    fn idle_owner_applies_custom_message_controls_at_idle_boundaries() {
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        for (text, delivery) in [
+            ("immediate", crate::CustomMessageDelivery::Steer),
+            ("next", crate::CustomMessageDelivery::NextTurn),
+            ("trigger", crate::CustomMessageDelivery::TriggerTurn),
+        ] {
+            let (reply, mut response) = oneshot::channel();
+            AgentInput::EnqueueCustom {
+                message: custom(text, delivery),
+                reply,
+            }
+            .apply(&mut session, &mut |_| {})
+            .unwrap();
+            assert!(response.try_recv().unwrap().is_ok());
+        }
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        assert!(
+            restored
+                .current_messages()
+                .iter()
+                .any(|m| matches!(m, crate::Message::User { content } if content == "immediate"))
+        );
+        assert_eq!(restored.queued_custom_messages().len(), 2);
+        assert!(restored.pending_custom_trigger().is_some());
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_lifecycle_hooks_can_send_messages() {
+        struct Hook;
+        #[async_trait::async_trait]
+        impl crate::Extension for Hook {
+            fn id(&self) -> &str {
+                "truncated-hook"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_tool_execution_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_host(
+                &self,
+                event: &crate::LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> crate::ExtensionResult<()> {
+                let text = match event {
+                    crate::LifecycleEvent::ToolExecutionStart { .. } => "start",
+                    crate::LifecycleEvent::ToolExecutionEnd { .. } => "end",
+                    _ => return Ok(()),
+                };
+                host.send_message(
+                    crate::CustomMessage {
+                        custom_type: "hook".into(),
+                        content: crate::ContextContent::Text(text.into()),
+                        display: false,
+                        details: None,
+                    },
+                    crate::CustomMessageDelivery::Steer,
+                )
+                .await
+            }
+        }
+        let model = WaitingModel(Arc::new(tokio::sync::Notify::new()));
+        let mut registry = Registry::default();
+        registry.register(Arc::new(Hook)).unwrap();
+        let agent = Agent {
+            model: &model,
+            model_name: "test",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "test".into(),
+                arguments: "{}".into(),
+            },
+        };
+        session
+            .append(Event::ToolPlanned {
+                invocation: invocation.clone(),
+                parent_operation: Uuid::nil(),
+            })
+            .unwrap();
+        platform_time::timeout(
+            Duration::from_secs(3),
+            agent.reject_truncated_tools(
+                &mut session,
+                &[invocation],
+                &ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let pending = session.queued_custom_messages();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending[0].1.message.content,
+            crate::ContextContent::Text("start".into())
+        );
+        assert_eq!(
+            pending[1].1.message.content,
+            crate::ContextContent::Text("end".into())
+        );
+    }
+
     #[tokio::test]
     async fn queue_controls_are_acknowledged_while_a_model_request_is_waiting() {
         let ready = Arc::new(tokio::sync::Notify::new());
@@ -3967,7 +13331,7 @@ mod queue_tests {
                 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(1), result)
+            platform_time::timeout(Duration::from_secs(1), result)
                 .await
                 .unwrap()
                 .unwrap()
@@ -3981,14 +13345,14 @@ mod queue_tests {
                 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(1), result)
+            platform_time::timeout(Duration::from_secs(1), result)
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
             let (reply, result) = oneshot::channel();
             sender.send(AgentInput::ClearQueue { reply }).await.unwrap();
-            let removed = tokio::time::timeout(Duration::from_secs(1), result)
+            let removed = platform_time::timeout(Duration::from_secs(1), result)
                 .await
                 .unwrap()
                 .unwrap()
@@ -4078,5 +13442,1631 @@ mod queue_tests {
             crate::QueueMode::OneAtATime
         );
         assert_eq!(fork.queue_mode(InputKind::Steer), crate::QueueMode::All);
+    }
+}
+
+#[cfg(test)]
+mod request_privacy_tests {
+    use super::*;
+    use crate::{
+        Extension, ExtensionResult, ExtensionState, MemoryStore, ModelApi, ProviderReplay,
+        ResolvedModelIdentity,
+    };
+    use std::sync::Mutex;
+
+    struct Hook {
+        seen: Arc<Mutex<Vec<String>>>,
+        rewrite_before: bool,
+        rewrite_after: bool,
+    }
+    #[async_trait::async_trait]
+    impl Extension for Hook {
+        fn id(&self) -> &str {
+            "privacy-test"
+        }
+        async fn before_request(
+            &self,
+            request: &mut crate::ContextRequest<'_>,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(serde_json::to_string(&**request).unwrap());
+            if self.rewrite_before
+                && let Some(Message::Assistant { content, .. }) = request
+                    .messages
+                    .iter_mut()
+                    .find(|m| matches!(m, Message::Assistant { .. }))
+            {
+                *content = "changed".into();
+            }
+            Ok(if self.rewrite_before {
+                crate::ContextChange::Changed
+            } else {
+                crate::ContextChange::Unchanged
+            })
+        }
+        async fn before_request_with_host(
+            &self,
+            request: &mut crate::ContextRequest<'_>,
+            purpose: RequestPurpose,
+            state: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            let change = self.before_request(request, purpose, state).await?;
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "privacy-host".into(),
+                    content: crate::ContextContent::Text("request hook".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::NextTurn,
+            )
+            .await?;
+            Ok(change)
+        }
+        fn handles_context_with_system(&self) -> bool {
+            true
+        }
+        async fn context_with_system(
+            &self,
+            messages: &mut crate::ContextMessages<'_>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(serde_json::to_string(&**messages).unwrap());
+            if self.rewrite_after
+                && let Some(Message::Assistant { content, .. }) = messages
+                    .iter_mut()
+                    .find(|m| matches!(m, Message::Assistant { .. }))
+            {
+                *content = "changed".into();
+            }
+            Ok(if self.rewrite_after {
+                crate::ContextChange::Changed
+            } else {
+                crate::ContextChange::Unchanged
+            })
+        }
+        async fn context_with_system_with_host(
+            &self,
+            messages: &mut crate::ContextMessages<'_>,
+            state: Option<&ExtensionState>,
+            host: Arc<dyn ToolHost>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            let change = self.context_with_system(messages, state).await?;
+            host.send_message(
+                crate::CustomMessage {
+                    custom_type: "privacy-host".into(),
+                    content: crate::ContextContent::Text("context hook".into()),
+                    display: false,
+                    details: None,
+                },
+                crate::CustomMessageDelivery::NextTurn,
+            )
+            .await?;
+            Ok(change)
+        }
+    }
+    struct CaptureModel(Arc<Mutex<Vec<ModelRequest>>>);
+    #[async_trait::async_trait]
+    impl Model for CaptureModel {
+        async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+            self.0.lock().unwrap().push(request);
+            Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                ModelEvent::Complete {
+                    calls: vec![],
+                    usage: None,
+                },
+            )])))
+        }
+    }
+    #[test]
+    fn mutation_tracker_survives_replacing_hook_wrapper() {
+        let mut request = ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        };
+        let mut guarded = crate::ContextRequest::new(&mut request);
+        let access = guarded.access();
+        guarded.messages.push(Message::User {
+            content: "changed".into(),
+        });
+        let alternate = Box::leak(Box::new(ModelRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: 1,
+        }));
+        guarded = crate::ContextRequest::new(alternate);
+        assert!(!guarded.access().assistant_accessed());
+        assert!(access.assistant_accessed());
+    }
+
+    struct DefaultNoop;
+    #[async_trait::async_trait]
+    impl Extension for DefaultNoop {
+        fn id(&self) -> &str {
+            "default-noop"
+        }
+    }
+
+    struct SystemNoop;
+    #[async_trait::async_trait]
+    impl Extension for SystemNoop {
+        fn id(&self) -> &str {
+            "system-noop"
+        }
+        fn handles_context_with_system(&self) -> bool {
+            true
+        }
+    }
+
+    struct ReplaceIdentical {
+        after: bool,
+        lie: bool,
+    }
+    #[async_trait::async_trait]
+    impl Extension for ReplaceIdentical {
+        fn id(&self) -> &str {
+            "replace-identical"
+        }
+        async fn before_request(
+            &self,
+            request: &mut crate::ContextRequest<'_>,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            if self.after {
+                return Ok(crate::ContextChange::Unchanged);
+            }
+            let index = request
+                .messages
+                .iter()
+                .position(|m| matches!(m, Message::Assistant { .. }))
+                .unwrap();
+            let Message::Assistant { content, calls, .. } = request.messages.remove(index) else {
+                unreachable!()
+            };
+            request.messages.insert(
+                index,
+                Message::Assistant {
+                    content,
+                    calls,
+                    replay: None,
+                },
+            );
+            Ok(if self.lie {
+                crate::ContextChange::Unchanged
+            } else {
+                crate::ContextChange::Changed
+            })
+        }
+        fn handles_context_with_system(&self) -> bool {
+            self.after
+        }
+        async fn context_with_system(
+            &self,
+            messages: &mut crate::ContextMessages<'_>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            let index = messages
+                .iter()
+                .position(|m| matches!(m, Message::Assistant { .. }))
+                .unwrap();
+            let Message::Assistant { content, calls, .. } = messages.remove(index) else {
+                unreachable!()
+            };
+            messages.insert(
+                index,
+                Message::Assistant {
+                    content,
+                    calls,
+                    replay: None,
+                },
+            );
+            Ok(if self.lie {
+                crate::ContextChange::Unchanged
+            } else {
+                crate::ContextChange::Changed
+            })
+        }
+    }
+
+    struct SafeEdits;
+    #[async_trait::async_trait]
+    impl Extension for SafeEdits {
+        fn id(&self) -> &str {
+            "safe-edits"
+        }
+        async fn before_request(
+            &self,
+            request: &mut crate::ContextRequest<'_>,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            request.tools_mut().clear();
+            request
+                .system_content_mut()
+                .unwrap()
+                .push_str(" safely modified");
+            Ok(crate::ContextChange::Changed)
+        }
+    }
+
+    struct SafeSystemHook;
+    #[async_trait::async_trait]
+    impl Extension for SafeSystemHook {
+        fn id(&self) -> &str {
+            "safe-system"
+        }
+        fn handles_context_with_system(&self) -> bool {
+            true
+        }
+        async fn context_with_system(
+            &self,
+            messages: &mut crate::ContextMessages<'_>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            messages
+                .system_content_mut()
+                .unwrap()
+                .push_str(" safe system edit");
+            Ok(crate::ContextChange::Changed)
+        }
+    }
+
+    struct SafeUserEdits {
+        after: bool,
+    }
+    #[async_trait::async_trait]
+    impl Extension for SafeUserEdits {
+        fn id(&self) -> &str {
+            "safe-user-edits"
+        }
+        async fn before_request(
+            &self,
+            request: &mut crate::ContextRequest<'_>,
+            _: RequestPurpose,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            if !self.after {
+                request.insert_user(
+                    1,
+                    Message::User {
+                        content: "inserted".into(),
+                    },
+                )?;
+                request.remove_user(2)?;
+            }
+            Ok(crate::ContextChange::Changed)
+        }
+        fn handles_context_with_system(&self) -> bool {
+            self.after
+        }
+        async fn context_with_system(
+            &self,
+            messages: &mut crate::ContextMessages<'_>,
+            _: Option<&ExtensionState>,
+        ) -> ExtensionResult<crate::ContextChange> {
+            messages.insert_user(
+                1,
+                Message::User {
+                    content: "inserted".into(),
+                },
+            )?;
+            messages.remove_user(2)?;
+            Ok(crate::ContextChange::Changed)
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_user_hooks_preserve_system_checkpoints_for_the_effective_route() {
+        struct SystemRoute {
+            supported: bool,
+            capture: CaptureModel,
+        }
+        #[async_trait::async_trait]
+        impl Model for SystemRoute {
+            fn supports_mid_conversation_system_messages(&self, _model: &str) -> bool {
+                self.supported
+            }
+
+            async fn stream(&self, request: ModelRequest) -> Result<crate::ModelStream> {
+                self.capture.stream(request).await
+            }
+        }
+        let checkpoint = |content: &str, section: &str| Event::SystemCheckpoint {
+            content: content.into(),
+            sections: vec![("rules".into(), Some(section.into()))],
+            tools_added: vec![],
+            tools_removed: vec![],
+        };
+        let user = |content: &str| Event::User {
+            content: content.into(),
+            input_id: None,
+        };
+        for supported in [true, false] {
+            for after in [true, false] {
+                let mut session = Session::with_store(MemoryStore::default()).unwrap();
+                for event in [
+                    checkpoint("base", "old"),
+                    user("replaced by hook"),
+                    checkpoint("update", "new"),
+                    user("follow-up"),
+                ] {
+                    session.append(event).unwrap();
+                }
+                let captured = Arc::new(Mutex::new(Vec::new()));
+                let model = SystemRoute {
+                    supported,
+                    capture: CaptureModel(captured.clone()),
+                };
+                let mut registry = Registry::default();
+                registry
+                    .register(Arc::new(SafeUserEdits { after }))
+                    .unwrap();
+                let agent = Agent {
+                    model: &model,
+                    model_name: "fixture",
+                    registry: &registry,
+                    system_prompt: "",
+                    limits: Limits::default(),
+                };
+                let (_sender, mut inputs) = mpsc::channel(1);
+                agent
+                    .run(
+                        &mut session,
+                        None,
+                        &mut inputs,
+                        &CancellationToken::new(),
+                        &mut |_| {},
+                    )
+                    .await
+                    .unwrap();
+                let requests = captured.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                let system = |content: &str| Message::System {
+                    content: content.into(),
+                };
+                let user = |content: &str| Message::User {
+                    content: content.into(),
+                };
+                let expected = if supported {
+                    vec![
+                        system("base\n\nold"),
+                        user("inserted"),
+                        system("update\n\nUpdated system prompt section \"rules\":\n\nnew"),
+                        user("follow-up"),
+                    ]
+                } else {
+                    vec![
+                        system("base\n\nupdate\n\nnew"),
+                        user("inserted"),
+                        user("follow-up"),
+                    ]
+                };
+                assert_eq!(requests[0].messages, expected);
+            }
+        }
+    }
+
+    fn tool_group(count: usize) -> Vec<Message> {
+        let calls: Vec<_> = (0..count)
+            .map(|i| crate::ToolCall {
+                id: format!("call-{i}"),
+                name: "tool".into(),
+                arguments: "{}".into(),
+            })
+            .collect();
+        let mut messages = vec![
+            Message::System {
+                content: "system".into(),
+            },
+            Message::Assistant {
+                content: String::new(),
+                calls,
+                replay: Some(Box::new(ProviderReplay {
+                    identity: ResolvedModelIdentity {
+                        provider: "p".into(),
+                        model: "m".into(),
+                    },
+                    blocks: vec![serde_json::json!({"private":"signature"})],
+                })),
+            },
+        ];
+        messages.extend((0..count).map(|i| Message::Tool {
+            call_id: format!("call-{i}"),
+            content: "result".into(),
+            is_error: false,
+            is_structured: Some(false),
+        }));
+        messages.push(Message::User {
+            content: "later".into(),
+        });
+        messages
+    }
+
+    #[test]
+    fn tracked_insertions_cannot_split_single_or_parallel_tool_groups() {
+        for count in [1, 3] {
+            let original = tool_group(count);
+            for index in 2..2 + count {
+                let mut request = ModelRequest {
+                    model: "m".into(),
+                    messages: original.clone(),
+                    tools: vec![],
+                    max_output_tokens: 8,
+                };
+                let mut guarded = crate::ContextRequest::new(&mut request);
+                let access = guarded.access();
+                assert!(
+                    guarded
+                        .insert_user(
+                            index,
+                            Message::User {
+                                content: "injected".into()
+                            }
+                        )
+                        .is_err()
+                );
+                assert!(access.user_edits().is_empty());
+                assert_eq!(request.messages, original);
+                let mut messages = original.clone();
+                let mut guarded = crate::ContextMessages::new(&mut messages);
+                let access = guarded.access();
+                assert!(
+                    guarded
+                        .insert_user(
+                            index,
+                            Message::User {
+                                content: "injected".into()
+                            }
+                        )
+                        .is_err()
+                );
+                assert!(access.user_edits().is_empty());
+                assert_eq!(messages, original);
+            }
+            for index in [1, 2 + count] {
+                let mut request = ModelRequest {
+                    model: "m".into(),
+                    messages: original.clone(),
+                    tools: vec![],
+                    max_output_tokens: 8,
+                };
+                let mut guarded = crate::ContextRequest::new(&mut request);
+                let access = guarded.access();
+                guarded
+                    .insert_user(
+                        index,
+                        Message::User {
+                            content: "allowed".into(),
+                        },
+                    )
+                    .unwrap();
+                assert!(!access.assistant_accessed());
+                assert_eq!(access.user_edits().len(), 1);
+                assert!(request.messages.iter().any(|m| matches!(
+                    m,
+                    Message::Assistant {
+                        replay: Some(_),
+                        ..
+                    }
+                )));
+            }
+            let mut pending = original[..2].to_vec();
+            let mut guarded = crate::ContextMessages::new(&mut pending);
+            assert!(
+                guarded
+                    .insert_user(
+                        2,
+                        Message::User {
+                            content: "early".into()
+                        }
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn pending_parallel_calls_require_each_result_before_insertion() {
+        let mut pending = tool_group(2);
+        if let Message::Assistant { calls, .. } = &mut pending[1] {
+            calls[1].id = calls[0].id.clone();
+        }
+        pending.truncate(3);
+        let mut guarded = crate::ContextMessages::new(&mut pending);
+        assert!(
+            guarded
+                .insert_user(
+                    3,
+                    Message::User {
+                        content: "early".into()
+                    }
+                )
+                .is_err()
+        );
+        guarded.push(Message::Tool {
+            call_id: "call-0".into(),
+            content: "second result".into(),
+            is_error: false,
+            is_structured: Some(false),
+        });
+        guarded
+            .insert_user(
+                4,
+                Message::User {
+                    content: "after".into(),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn tracked_user_operations_reject_assistant_insertion_and_removal() {
+        let mut request = ModelRequest {
+            model: "m".into(),
+            messages: vec![Message::Assistant {
+                content: "a".into(),
+                calls: vec![],
+                replay: None,
+            }],
+            tools: vec![],
+            max_output_tokens: 8,
+        };
+        let mut guarded = crate::ContextRequest::new(&mut request);
+        let access = guarded.access();
+        assert!(guarded.remove_user(0).is_err());
+        assert!(
+            guarded
+                .insert_user(
+                    0,
+                    Message::Assistant {
+                        content: "a".into(),
+                        calls: vec![],
+                        replay: None
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            guarded
+                .insert_user(
+                    9,
+                    Message::User {
+                        content: "bad".into()
+                    }
+                )
+                .is_err()
+        );
+        assert!(access.user_edits().is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_hook_status_preserves_default_noop_and_rejects_identical_replacement() {
+        for text in ["same visible text", ""] {
+            for mode in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] {
+                let mut session = Session::with_store(MemoryStore::default()).unwrap();
+                session
+                    .append(Event::User {
+                        content: "question".into(),
+                        input_id: None,
+                    })
+                    .unwrap();
+                for secret in ["private-a", "private-b"] {
+                    let id = Uuid::new_v4();
+                    session
+                        .append(Event::ModelFinished {
+                            request_id: id,
+                            metadata: ModelMetadata {
+                                replay: Some(Box::new(ProviderReplay {
+                                    identity: ResolvedModelIdentity {
+                                        provider: "provider".into(),
+                                        model: "m".into(),
+                                    },
+                                    blocks: vec![serde_json::json!({"private":secret})],
+                                })),
+                                ..Default::default()
+                            },
+                            usage: UsageReport::Unconfirmed,
+                            failure: None,
+                            partial: String::new(),
+                            reply: None,
+                        })
+                        .unwrap();
+                    session
+                        .append(Event::Assistant {
+                            content: text.into(),
+                            invocations: vec![],
+                            usage: None,
+                            request_id: Some(id),
+                        })
+                        .unwrap();
+                }
+                let mut registry = Registry::default();
+                if mode == 0 {
+                    registry.register(Arc::new(DefaultNoop)).unwrap();
+                } else if mode == 3 {
+                    registry.register(Arc::new(SystemNoop)).unwrap();
+                } else if mode == 6 {
+                    registry.register(Arc::new(SafeEdits)).unwrap();
+                } else if mode == 7 {
+                    registry.register(Arc::new(SafeSystemHook)).unwrap();
+                } else if mode == 8 || mode == 9 {
+                    registry
+                        .register(Arc::new(SafeUserEdits { after: mode == 9 }))
+                        .unwrap();
+                } else {
+                    registry
+                        .register(Arc::new(ReplaceIdentical {
+                            after: mode == 2 || mode == 5,
+                            lie: mode >= 4,
+                        }))
+                        .unwrap();
+                }
+                let captured = Arc::new(Mutex::new(Vec::new()));
+                let model = CaptureModel(captured);
+                let agent = Agent {
+                    model: &model,
+                    model_name: "m",
+                    registry: &registry,
+                    system_prompt: "system",
+                    limits: Limits::default(),
+                };
+                let (request, transformed, _) = agent
+                    .request(
+                        &mut session,
+                        &ExtensionStates::default(),
+                        128,
+                        None,
+                        RequestPurpose::Turn,
+                        &CancellationToken::new(),
+                        &mut |_| {},
+                    )
+                    .await
+                    .unwrap();
+                let replay: Vec<_> = request
+                    .messages
+                    .iter()
+                    .filter_map(|m| match m {
+                        Message::Assistant { replay, .. } => Some(replay.as_ref()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(replay.len(), 2);
+                if mode == 0 || mode == 3 || mode == 6 || mode == 7 || mode == 8 || mode == 9 {
+                    assert_eq!(transformed, mode >= 6);
+                    assert_eq!(replay[0].unwrap().blocks[0]["private"], "private-a");
+                    assert_eq!(replay[1].unwrap().blocks[0]["private"], "private-b");
+                } else {
+                    assert!(transformed);
+                    assert!(replay.iter().all(|value| value.is_none()));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hooks_and_notifications_hide_edited_replay_and_restore_only_unchanged() {
+        for (rewrite_before, rewrite_after) in [(false, false), (true, false), (false, true)] {
+            let rewrite = rewrite_before || rewrite_after;
+            let mut session = Session::with_store(MemoryStore::default()).unwrap();
+            session
+                .append(Event::User {
+                    content: "question".into(),
+                    input_id: None,
+                })
+                .unwrap();
+            let request_id = Uuid::new_v4();
+            session
+                .append(Event::ModelFinished {
+                    request_id,
+                    metadata: ModelMetadata {
+                        provider_api: Some(ModelApi::GoogleGenerativeAi),
+                        replay_identity: Some(ResolvedModelIdentity {
+                            provider: crate::endpoint_replay_scope("google", "https://example.com"),
+                            model: "m".into(),
+                        }),
+                        ..Default::default()
+                    },
+                    usage: UsageReport::Unconfirmed,
+                    failure: None,
+                    partial: String::new(),
+                    reply: None,
+                })
+                .unwrap();
+            let target = session
+                .append(Event::Assistant {
+                    content: "old".into(),
+                    invocations: vec![],
+                    usage: None,
+                    request_id: Some(request_id),
+                })
+                .unwrap()
+                .id;
+            let replacement = serde_json::from_value(serde_json::json!([{"type":"thinking","thinking":"private-thinking","thinkingSignature":"private-signature"},{"type":"text","text":"visible"}])).unwrap();
+            session.edit_context(target, Some(replacement)).unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(Hook {
+                    seen: seen.clone(),
+                    rewrite_before,
+                    rewrite_after,
+                }))
+                .unwrap();
+            let model = CaptureModel(captured.clone());
+            let agent = Agent {
+                model: &model,
+                model_name: "m",
+                registry: &registry,
+                system_prompt: "system",
+                limits: Limits::default(),
+            };
+            let cancel = CancellationToken::new();
+            let mut notifications = Vec::new();
+            let mut observer = |event: Notification<'_>| {
+                if let Notification::Request(request) = event {
+                    notifications.push(serde_json::to_string(request).unwrap());
+                }
+            };
+            let (request, transformed, _) = agent
+                .request(
+                    &mut session,
+                    &ExtensionStates::default(),
+                    128,
+                    None,
+                    RequestPurpose::Turn,
+                    &cancel,
+                    &mut observer,
+                )
+                .await
+                .unwrap();
+            assert_eq!(transformed, rewrite);
+            let attempt = agent
+                .prepare_attempt::<AgentInput>(
+                    &mut session,
+                    request,
+                    true,
+                    transformed,
+                    &cancel,
+                    &mut observer,
+                    None,
+                )
+                .await
+                .unwrap();
+            agent
+                .reply::<AgentInput>(&mut session, attempt, true, &cancel, &mut observer, None)
+                .await
+                .unwrap();
+            let hooks = seen.lock().unwrap();
+            assert_eq!(hooks.len(), 2);
+            for exposed in hooks.iter().chain(notifications.iter()) {
+                assert!(!exposed.contains("private-thinking"));
+                assert!(!exposed.contains("private-signature"));
+            }
+            assert_eq!(notifications.len(), 1);
+            assert_eq!(
+                session
+                    .queued_custom_messages()
+                    .iter()
+                    .filter(|(_, input)| input.message.custom_type == "privacy-host")
+                    .count(),
+                2
+            );
+            let captured = captured.lock().unwrap();
+            let Message::Assistant {
+                content, replay, ..
+            } = captured[0]
+                .messages
+                .iter()
+                .find(|m| matches!(m, Message::Assistant { .. }))
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            assert_eq!(content, if rewrite { "changed" } else { "visible" });
+            assert_eq!(replay.is_some(), !rewrite);
+            if let Some(replay) = replay {
+                assert!(
+                    serde_json::to_string(replay)
+                        .unwrap()
+                        .contains("private-signature")
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pending_decision_recovery_tests {
+    use super::*;
+
+    struct NoModel;
+    #[async_trait::async_trait]
+    impl Model for NoModel {
+        async fn stream(&self, _: ModelRequest) -> Result<crate::ModelStream> {
+            panic!("model must not run during pending recovery")
+        }
+    }
+    struct PollTool(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::Tool for PollTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "job".into(),
+                description: String::new(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn can_poll(&self) -> bool {
+            true
+        }
+        fn recovery_identity(&self) -> Option<String> {
+            Some("backend-v1".into())
+        }
+        async fn prepare_arguments(
+            &self,
+            _: serde_json::Value,
+        ) -> crate::ExtensionResult<serde_json::Value> {
+            Ok(serde_json::json!({"reprepared": true}))
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            panic!("must poll")
+        }
+        async fn poll(&self, _: &str, _: ToolContext) -> Option<Outcome> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Some(Outcome::Succeeded("done".into()))
+        }
+    }
+    struct PollExtension(Arc<AtomicUsize>);
+    impl crate::Extension for PollExtension {
+        fn id(&self) -> &str {
+            "poll"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![Arc::new(PollTool(self.0.clone()))]
+        }
+    }
+
+    struct SpoofTool(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::Tool for SpoofTool {
+        fn spec(&self) -> ToolSpec {
+            PollTool(self.0.clone()).spec()
+        }
+        fn can_poll(&self) -> bool {
+            true
+        }
+        fn recovery_identity(&self) -> Option<String> {
+            Some("pi-rs:non-pollable:v1".into())
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolContext) -> Outcome {
+            panic!("must not execute")
+        }
+        async fn poll(&self, _: &str, _: ToolContext) -> Option<Outcome> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Some(Outcome::Succeeded("unexpected".into()))
+        }
+    }
+    struct SpoofExtension(Arc<AtomicUsize>);
+    impl crate::Extension for SpoofExtension {
+        fn id(&self) -> &str {
+            "poll"
+        }
+        fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+            vec![Arc::new(SpoofTool(self.0.clone()))]
+        }
+    }
+
+    struct CaptureHook(Arc<std::sync::Mutex<Option<serde_json::Value>>>);
+    #[async_trait::async_trait]
+    impl crate::Extension for CaptureHook {
+        fn id(&self) -> &str {
+            "capture"
+        }
+        async fn before_tool(
+            &self,
+            _: &str,
+            args: &serde_json::Value,
+            _: &ToolContext,
+            _: Option<&crate::ExtensionState>,
+        ) -> crate::ExtensionResult<Decision> {
+            *self.0.lock().unwrap() = Some(args.clone());
+            Ok(Decision::Allow)
+        }
+    }
+
+    #[tokio::test]
+    async fn marked_pending_restores_exact_authorized_arguments() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(PollExtension(count.clone())))
+            .unwrap();
+        registry
+            .register(Arc::new(CaptureHook(observed.clone())))
+            .unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let spec = registry.tools.get("job").unwrap().spec.clone();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 10,
+        };
+        let context = crate::ToolDispatchContext {
+            request_id: Uuid::new_v4(),
+            session_id: session.session_id(),
+            external_id: session.external_session_id(),
+            summary: false,
+        };
+        let declaration = crate::ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(crate::ToolConstraint::JsonSchema {
+                strict: crate::StrictToolPolicy::Require,
+            }),
+        };
+        let effective = crate::EffectiveToolDeclaration {
+            spec: spec.clone(),
+            sampling: crate::EffectiveToolSampling::StrictJsonSchema {
+                original_schema: spec.parameters.clone(),
+                normalization_version: crate::STRICT_TOOL_NORMALIZATION_VERSION,
+            },
+        };
+        let decision = crate::ToolDecisionSnapshot::capture(
+            &context,
+            &request,
+            std::slice::from_ref(&declaration),
+            &[effective],
+        )
+        .unwrap();
+        let request_hash = decision.request_sha256().to_owned();
+        session
+            .append_tool_decision_request(
+                Event::ModelRequested {
+                    model: request.model.clone(),
+                    messages: 0,
+                    tools: 1,
+                    max_output_tokens: 10,
+                    request_id: Some(context.request_id),
+                    context_head: Some(session.head()),
+                    context_sha256: Some(request_hash),
+                    context_transformed: Some(false),
+                    context_configuration_sha256: None,
+                    tool_decision: None,
+                },
+                &decision,
+                &request,
+                &request,
+                &[declaration],
+            )
+            .unwrap();
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            },
+        };
+        session
+            .append(Event::ModelFinished {
+                request_id: context.request_id,
+                metadata: ModelMetadata::default(),
+                usage: UsageReport::Unconfirmed,
+                failure: None,
+                partial: String::new(),
+                reply: Some(RecordedReply {
+                    content: String::new(),
+                    invocations: vec![invocation.clone()],
+                    advertised_tools: vec!["job".into()],
+                    max_output_tokens: 10,
+                }),
+            })
+            .unwrap();
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: vec![invocation.clone()],
+                usage: None,
+                request_id: Some(context.request_id),
+            })
+            .unwrap();
+        let execution = crate::ToolExecutionSnapshot::capture(
+            context.request_id,
+            &invocation,
+            "poll",
+            &spec,
+            "backend-v1",
+            decision.binding_sha256(),
+            serde_json::json!({"authorized":true}),
+        )
+        .unwrap();
+        // A pollable replacement must not claim the identity reserved for a
+        // previously non-pollable tool, even with an otherwise matching spec.
+        let metadata = session
+            .records()
+            .iter()
+            .filter_map(|record| {
+                session
+                    .record_metadata(record.id)
+                    .cloned()
+                    .map(|value| (record.id, value))
+            })
+            .collect();
+        let mut spoofed =
+            Session::from_records_with_metadata(session.records().to_vec(), metadata).unwrap();
+        let nonpollable = crate::ToolExecutionSnapshot::capture(
+            context.request_id,
+            &invocation,
+            "poll",
+            &spec,
+            "pi-rs:non-pollable:v1",
+            decision.binding_sha256(),
+            serde_json::json!({"authorized":true}),
+        )
+        .unwrap();
+        spoofed
+            .append_tool_execution_started(
+                context.request_id,
+                invocation.operation_id,
+                &nonpollable,
+                "poll",
+                &spec,
+                "pi-rs:non-pollable:v1",
+            )
+            .unwrap();
+        spoofed
+            .append(Event::ToolFinished {
+                operation_id: invocation.operation_id,
+                outcome: Outcome::Pending {
+                    reference: "job".into(),
+                },
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        let mut spoof_registry = Registry::default();
+        spoof_registry
+            .register(Arc::new(SpoofExtension(count.clone())))
+            .unwrap();
+        spoof_registry
+            .register(Arc::new(CaptureHook(observed.clone())))
+            .unwrap();
+        let spoof_agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &spoof_registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        assert!(matches!(
+            spoof_agent
+                .poll_pending(
+                    &mut spoofed,
+                    &mut ExtensionStates::new(),
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                    None
+                )
+                .await,
+            Err(Error::PendingOperation(_))
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(observed.lock().unwrap().is_none());
+        session
+            .append_tool_execution_started(
+                context.request_id,
+                invocation.operation_id,
+                &execution,
+                "poll",
+                &spec,
+                "backend-v1",
+            )
+            .unwrap();
+        session
+            .append(Event::ToolFinished {
+                operation_id: invocation.operation_id,
+                outcome: Outcome::Pending {
+                    reference: "job".into(),
+                },
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        agent
+            .poll_pending(
+                &mut session,
+                &mut ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(serde_json::json!({"authorized":true}))
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(invocation.call.arguments, "{}");
+    }
+
+    #[tokio::test]
+    async fn imported_pending_with_no_request_record_uses_legacy_recovery() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(PollExtension(count.clone())))
+            .unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            },
+        };
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: vec![invocation.clone()],
+                usage: None,
+                request_id: Some(Uuid::new_v4()),
+            })
+            .unwrap();
+        session
+            .append(Event::ToolStarted {
+                operation_id: invocation.operation_id,
+                tool_execution: None,
+            })
+            .unwrap();
+        session
+            .append(Event::ToolFinished {
+                operation_id: invocation.operation_id,
+                outcome: Outcome::Pending {
+                    reference: "job".into(),
+                },
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        for clear_request_id in [false, true] {
+            let mut newer_records = session.records().to_vec();
+            for record in &mut newer_records {
+                record.version = crate::journal::TOOL_DECISION_JOURNAL_VERSION;
+                if clear_request_id && let Event::Assistant { request_id, .. } = &mut record.event {
+                    *request_id = None;
+                }
+            }
+            let mut suspicious = Session::from_records(newer_records).unwrap();
+            assert!(matches!(
+                agent
+                    .poll_pending(
+                        &mut suspicious,
+                        &mut ExtensionStates::new(),
+                        &CancellationToken::new(),
+                        &mut |_| {},
+                        None
+                    )
+                    .await,
+                Err(Error::PendingOperation(_))
+            ));
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        agent
+            .poll_pending(
+                &mut session,
+                &mut ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn verified_pi_conversion_allows_pending_recovery_in_newer_journal() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(PollExtension(count.clone())))
+            .unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let entry = serde_json::json!({"type":"message", "id":"m1", "parentId":null, "message":{"role":"assistant", "content":[{"type":"toolCall", "id":"call", "name":"job", "arguments":{}}], "stopReason":"toolUse"}});
+        let events = crate::pi_import::convert(
+            &entry,
+            &mut crate::pi_import::Branch::default(),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let source = session
+            .append_with_record_metadata(
+                Event::SourceEntry {
+                    format: "pi".into(),
+                    entry,
+                },
+                serde_json::json!({"pi_rs_import_conversion_count_v1":events.len()}),
+            )
+            .unwrap()
+            .id;
+        let invocation = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Assistant { invocations, .. } => invocations.first().cloned(),
+                _ => None,
+            })
+            .unwrap();
+        for event in events {
+            session.append(event).unwrap();
+        }
+        session
+            .append(Event::ToolFinished {
+                operation_id: invocation.operation_id,
+                outcome: Outcome::Pending {
+                    reference: "job".into(),
+                },
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        let metadata = [(source, session.record_metadata(source).unwrap().clone())]
+            .into_iter()
+            .collect();
+        let mut records = session.records().to_vec();
+        for record in &mut records {
+            record.version = crate::journal::TOOL_DECISION_JOURNAL_VERSION;
+            record.timestamp = None;
+        }
+        let mut imported = Session::from_records_with_metadata(records, metadata).unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        agent
+            .poll_pending(
+                &mut imported,
+                &mut ExtensionStates::new(),
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_operation_origins_cannot_select_a_fallback_decision() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(PollExtension(count.clone())))
+            .unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            },
+        };
+        for _ in 0..2 {
+            session
+                .append(Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![invocation.clone()],
+                    usage: None,
+                    request_id: Some(Uuid::new_v4()),
+                })
+                .unwrap();
+        }
+        session
+            .append(Event::ToolStarted {
+                operation_id: invocation.operation_id,
+                tool_execution: None,
+            })
+            .unwrap();
+        session
+            .append(Event::ToolFinished {
+                operation_id: invocation.operation_id,
+                outcome: Outcome::Pending {
+                    reference: "job".into(),
+                },
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        assert!(matches!(
+            agent
+                .poll_pending(
+                    &mut session,
+                    &mut ExtensionStates::new(),
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                    None
+                )
+                .await,
+            Err(Error::PendingOperation(_))
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_recovery_rejects_later_or_other_run_request() {
+        for later in [false, true] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(PollExtension(count.clone())))
+                .unwrap();
+            let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+            let request_id = Uuid::new_v4();
+            let invocation = Invocation {
+                operation_id: Uuid::new_v4(),
+                call: crate::ToolCall {
+                    id: "call".into(),
+                    name: "job".into(),
+                    arguments: "{}".into(),
+                },
+            };
+            let make_request = || Event::ModelRequested {
+                model: "fixture".into(),
+                messages: 0,
+                tools: 1,
+                max_output_tokens: 10,
+                request_id: Some(request_id),
+                context_head: None,
+                context_sha256: None,
+                context_transformed: None,
+                context_configuration_sha256: None,
+                tool_decision: None,
+            };
+            if !later {
+                session.set_run_id(Some(Uuid::new_v4()));
+                session.append(make_request()).unwrap();
+                session.set_run_id(None);
+            }
+            session
+                .append(Event::Assistant {
+                    content: String::new(),
+                    invocations: vec![invocation.clone()],
+                    usage: None,
+                    request_id: Some(request_id),
+                })
+                .unwrap();
+            session
+                .append(Event::ToolStarted {
+                    operation_id: invocation.operation_id,
+                    tool_execution: None,
+                })
+                .unwrap();
+            session
+                .append(Event::ToolFinished {
+                    operation_id: invocation.operation_id,
+                    outcome: Outcome::Pending {
+                        reference: "job".into(),
+                    },
+                    states: ExtensionStates::new(),
+                })
+                .unwrap();
+            if later {
+                session.append(make_request()).unwrap();
+            }
+            let agent = Agent {
+                model: &NoModel,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits::default(),
+            };
+            assert!(matches!(
+                agent
+                    .poll_pending(
+                        &mut session,
+                        &mut ExtensionStates::new(),
+                        &CancellationToken::new(),
+                        &mut |_| {},
+                        None
+                    )
+                    .await,
+                Err(Error::PendingOperation(_))
+            ));
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_fallback_cannot_use_superseded_request_decision() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(PollExtension(count.clone())))
+            .unwrap();
+        let mut session = Session::with_store(crate::MemoryStore::default()).unwrap();
+        let spec = registry.tools.get("job").unwrap().spec.clone();
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            tools: vec![spec.clone()],
+            max_output_tokens: 10,
+        };
+        let declaration = crate::ToolDeclaration {
+            spec: spec.clone(),
+            constrained_sampling: Some(crate::ToolConstraint::JsonSchema {
+                strict: crate::StrictToolPolicy::Prefer,
+            }),
+        };
+        let invocation = Invocation {
+            operation_id: Uuid::new_v4(),
+            call: crate::ToolCall {
+                id: "call".into(),
+                name: "job".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut first = None;
+        for strict in [false, true] {
+            let context = crate::ToolDispatchContext {
+                request_id: Uuid::new_v4(),
+                session_id: session.session_id(),
+                external_id: session.external_session_id(),
+                summary: false,
+            };
+            let sampling = if strict {
+                crate::EffectiveToolSampling::StrictJsonSchema {
+                    original_schema: spec.parameters.clone(),
+                    normalization_version: crate::STRICT_TOOL_NORMALIZATION_VERSION,
+                }
+            } else {
+                crate::EffectiveToolSampling::Unconstrained
+            };
+            let decision = crate::ToolDecisionSnapshot::capture(
+                &context,
+                &request,
+                std::slice::from_ref(&declaration),
+                &[crate::EffectiveToolDeclaration {
+                    spec: spec.clone(),
+                    sampling,
+                }],
+            )
+            .unwrap();
+            session
+                .append_tool_decision_request(
+                    Event::ModelRequested {
+                        model: request.model.clone(),
+                        messages: 0,
+                        tools: 1,
+                        max_output_tokens: 10,
+                        request_id: Some(context.request_id),
+                        context_head: Some(session.head()),
+                        context_sha256: Some(decision.request_sha256().into()),
+                        context_transformed: Some(false),
+                        context_configuration_sha256: None,
+                        tool_decision: None,
+                    },
+                    &decision,
+                    &request,
+                    &request,
+                    std::slice::from_ref(&declaration),
+                )
+                .unwrap();
+            if !strict {
+                first = Some(context.request_id);
+                session
+                    .append(Event::ModelFinished {
+                        request_id: context.request_id,
+                        metadata: ModelMetadata::default(),
+                        usage: UsageReport::Unconfirmed,
+                        failure: None,
+                        partial: String::new(),
+                        reply: Some(RecordedReply {
+                            content: String::new(),
+                            invocations: vec![invocation.clone()],
+                            advertised_tools: vec!["job".into()],
+                            max_output_tokens: 10,
+                        }),
+                    })
+                    .unwrap();
+            }
+        }
+        session
+            .append(Event::Assistant {
+                content: String::new(),
+                invocations: vec![invocation.clone()],
+                usage: None,
+                request_id: first,
+            })
+            .unwrap();
+        session
+            .append(Event::ToolStarted {
+                operation_id: invocation.operation_id,
+                tool_execution: None,
+            })
+            .unwrap();
+        session
+            .append(Event::ToolFinished {
+                operation_id: invocation.operation_id,
+                outcome: Outcome::Pending {
+                    reference: "job".into(),
+                },
+                states: ExtensionStates::new(),
+            })
+            .unwrap();
+        let agent = Agent {
+            model: &NoModel,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        assert!(
+            agent
+                .poll_pending(
+                    &mut session,
+                    &mut ExtensionStates::new(),
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                    None
+                )
+                .await
+                .is_err()
+        );
+        let (_sender, mut receiver) = mpsc::channel::<String>(1);
+        assert!(matches!(
+            agent
+                .run(
+                    &mut session,
+                    None,
+                    &mut receiver,
+                    &CancellationToken::new(),
+                    &mut |_| {}
+                )
+                .await,
+            Err(Error::PendingOperation(_))
+        ));
+        assert!(session.records().iter().rev().any(|record| matches!(
+            record.event,
+            Event::Run {
+                state: RunState::WaitingForOperation,
+                ..
+            }
+        )));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 }

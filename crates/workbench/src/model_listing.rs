@@ -2,15 +2,10 @@
 use pi_rs::Result;
 use pi_rs::ollama::ModelDetails;
 use serde_json::{Value, json};
-use unicode_width::UnicodeWidthStr;
 
 use super::{Cli, OutputMode, model_selection, output};
 
 pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
-    let terms: Vec<_> = search
-        .split(|character: char| character.is_whitespace() || character == '/')
-        .filter(|term| !term.is_empty())
-        .collect();
     let mut catalogs = if args.connection_explicit {
         vec![
             model_selection::catalog(args, args.provider.clone(), args.allow_model_probes())
@@ -21,7 +16,21 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
             .await
             .unwrap_or_default()
     };
-    catalogs.sort_by(|left, right| left.provider.id().cmp(right.provider.id()));
+    let json_mode = args.mode == Some(OutputMode::Json);
+    let collator = if json_mode {
+        None
+    } else {
+        let locale = super::locale::select(|key| std::env::var(key).ok());
+        Some(super::locale::collator(&locale).map_err(|error| {
+            pi_rs::Error::Config(format!("Cannot initialize model collation: {error}"))
+        })?)
+    };
+    let compare = |left: &str, right: &str| {
+        collator
+            .as_ref()
+            .map_or_else(|| left.cmp(right), |collator| collator.compare(left, right))
+    };
+    catalogs.sort_by(|left, right| compare(left.provider.id(), right.provider.id()));
     let catalog_empty = catalogs.iter().all(|catalog| catalog.models.is_empty());
     let mut rows = Vec::new();
     for catalog in catalogs {
@@ -29,25 +38,29 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
         let mut models: Vec<_> = catalog
             .models
             .iter()
-            .filter(|model| {
-                let candidate = format!("{provider} {model} {}", catalog.display_name(model));
-                terms
-                    .iter()
-                    .all(|term| model_selection::fuzzy(term, &candidate))
-            })
+            .filter(|model| list_matches(search, provider, model))
             .cloned()
             .collect();
-        models.sort();
+        models.sort_by(|left, right| compare(left, right));
         let mut details = catalog.details(&models, &args.model_profiles).await;
+        let radius = if json_mode {
+            catalog.client.discovered_radius_catalog().await
+        } else {
+            None
+        };
         for model in models {
             let detail = details.remove(&model);
-            if args.mode == Some(OutputMode::Json) {
+            if json_mode {
                 let mut row = json!({
                     "type":"model", "model":model, "name":catalog.display_name(&model),
                     "provider":provider,
                 });
-                if let Some(metadata) = args.model_profiles.model(&catalog.provider, &model) {
+                let configured = args.model_profiles.model(&catalog.provider, &model);
+                if let Some(metadata) = &configured {
                     metadata.apply_catalog_metadata(&mut row);
+                }
+                if let Some(metadata) = radius.as_ref().and_then(|radius| radius.metadata(&model)) {
+                    metadata.apply(configured.as_ref(), &mut row);
                 }
                 output(with_details(row, detail.as_ref()));
             } else {
@@ -55,7 +68,7 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
             }
         }
     }
-    if args.mode != Some(OutputMode::Json) {
+    if !json_mode {
         if catalog_empty {
             println!("No models available.");
         } else if rows.is_empty() {
@@ -65,6 +78,34 @@ pub(super) async fn list(args: &Cli, search: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// Pi's fuzzy filter retries ASCII letter/digit tokens in the opposite order
+// when their normal subsequence does not match. The searchable text consists
+// of the provider and model ID, not the display name.
+fn list_matches(search: &str, provider: &str, model: &str) -> bool {
+    let candidate = format!("{provider} {model}");
+    search
+        .split(|c: char| ((c.is_whitespace() && c != '\u{85}') || c == '\u{feff}') || c == '/')
+        .filter(|token| !token.is_empty())
+        .all(|token| {
+            if model_selection::fuzzy(token, &candidate) {
+                return true;
+            }
+            let token = token.to_lowercase();
+            let bytes = token.as_bytes();
+            let split = bytes.iter().position(|c| !c.is_ascii_alphabetic());
+            let split = split
+                .filter(|&i| i > 0 && i < bytes.len() && bytes[i..].iter().all(u8::is_ascii_digit))
+                .or_else(|| {
+                    let i = bytes.iter().position(|c| !c.is_ascii_digit())?;
+                    (i > 0 && i < bytes.len() && bytes[i..].iter().all(u8::is_ascii_alphabetic))
+                        .then_some(i)
+                });
+            split.is_some_and(|i| {
+                model_selection::fuzzy(&format!("{}{}", &token[i..], &token[..i]), &candidate)
+            })
+        })
 }
 
 pub(super) fn with_details(mut model: Value, details: Option<&ModelDetails>) -> Value {
@@ -88,7 +129,14 @@ fn format_tokens(tokens: u32) -> String {
     if tokens % scale == 0 {
         format!("{}{unit}", tokens / scale)
     } else {
-        format!("{:.1}{unit}", f64::from(tokens) / f64::from(scale))
+        let scaled = f64::from(tokens) / f64::from(scale);
+        // JavaScript toFixed rounds exact ties up. Rust already rounds .75 up.
+        let scaled = if scaled.fract() == 0.25 {
+            scaled.next_up()
+        } else {
+            scaled
+        };
+        format!("{scaled:.1}{unit}")
     }
 }
 
@@ -124,14 +172,16 @@ fn table(mut rows: Vec<[String; 6]>) -> String {
     let mut widths = [0; 6];
     for row in &rows {
         for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(cell.width());
+            widths[index] = widths[index].max(cell.encode_utf16().count());
         }
     }
     rows.iter()
         .map(|row| {
             row.iter()
                 .zip(widths)
-                .map(|(cell, width)| format!("{cell}{}", " ".repeat(width - cell.width())))
+                .map(|(cell, width)| {
+                    format!("{cell}{}", " ".repeat(width - cell.encode_utf16().count()))
+                })
                 .collect::<Vec<_>>()
                 .join("  ")
         })
@@ -142,6 +192,32 @@ fn table(mut rows: Vec<[String; 6]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuzzy_list_search_matches_pi_token_swaps_and_searchable_fields() {
+        assert!(list_matches("p2", "ollama", "nova-2p"));
+        assert!(list_matches("2p", "ollama", "nova-p2"));
+        assert!(list_matches("K2", "ollama", "nova-2k"));
+        assert!(list_matches("oll / p2", "ollama", "nova-2p"));
+        assert!(list_matches("OLL\u{feff}p2", "ollama", "nova-2p"));
+        assert!(!list_matches("p2", "ollama", "nova-4x"));
+        assert!(!list_matches("p-2", "ollama", "nova-2p"));
+        assert!(!list_matches("SparkName", "ollama", "nova-2p"));
+        assert!(!list_matches("oll\u{85}p2", "ollama", "nova-2p"));
+    }
+
+    #[test]
+    fn token_format_uses_pi_decimal_rounding() {
+        for (tokens, expected) in [
+            (1_250, "1.3K"),
+            (1_150, "1.1K"),
+            (1_750, "1.8K"),
+            (1_250_000, "1.3M"),
+            (131_072, "131.1K"),
+        ] {
+            assert_eq!(format_tokens(tokens), expected, "{tokens}");
+        }
+    }
 
     #[test]
     fn table_distinguishes_missing_metadata_from_reported_capabilities() {
@@ -161,6 +237,9 @@ mod tests {
         assert!(rows[1].contains("131.1K"));
         assert!(rows[1].contains("yes") && rows[1].contains("no"));
         assert_eq!(rows[2].matches('?').count(), 4);
-        assert!(rows.iter().all(|row| row.width() == rows[0].width()));
+        assert!(
+            rows.iter()
+                .all(|row| row.encode_utf16().count() == rows[0].encode_utf16().count())
+        );
     }
 }

@@ -5,15 +5,17 @@ use std::sync::Arc;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use pi_rs::{
-    Error, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream, ProviderReplay,
-    ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
+    Error, ImageContent, Message, Model, ModelEvent, ModelMetadata, ModelRequest, ModelStream,
+    ProviderReplay, ResolvedModelIdentity, Result, ToolCall, ToolCallDelta, Usage,
 };
 use reqwest::{Client, Url, header::HeaderMap};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{radius_auth::Gateway, radius_catalog};
+use pi_rs_workbench::image_profile::{ImageResizeProfile, normalize_content};
+
+use super::{Provider, model_profiles::Profiles, radius_auth::Gateway, radius_catalog};
 
 const MAX_STREAM: usize = 32 * 1024 * 1024;
 const MAX_BLOCKS: usize = 256;
@@ -43,6 +45,10 @@ pub(super) struct PiMessages {
     progress: Option<ProgressObserver>,
     radius: Option<Radius>,
     probe_catalog: bool,
+    identity_safe_transport: bool,
+    prepared_limits: Option<(Option<u32>, Option<u32>)>,
+    request_image_profiles: Option<Arc<Profiles>>,
+    prepared_image_resize: Option<ImageResizeProfile>,
 }
 
 #[derive(Clone)]
@@ -105,12 +111,36 @@ impl PiMessages {
             progress: None,
             radius: None,
             probe_catalog: true,
+            identity_safe_transport: true,
+            prepared_limits: None,
+            request_image_profiles: None,
+            prepared_image_resize: None,
         })
     }
 
     pub(super) fn with_context_probe(mut self, enabled: bool) -> Self {
         self.probe_catalog = enabled;
         self
+    }
+
+    pub(super) fn with_radius_request_profiles(mut self, profiles: Profiles) -> Self {
+        if self.radius.is_some() {
+            self.request_image_profiles = Some(Arc::new(profiles));
+        }
+        self
+    }
+
+    fn catalog_image_resize(
+        &self,
+        catalog: &radius_catalog::Catalog,
+        model: &str,
+    ) -> Option<ImageResizeProfile> {
+        let profiles = self.request_image_profiles.as_ref()?;
+        let configured = profiles.model(&Provider::Radius, model);
+        catalog
+            .metadata(model)?
+            .input_limits(configured.as_ref())?
+            .image_resize()
     }
 
     async fn access(&self) -> Result<(String, String)> {
@@ -186,6 +216,43 @@ impl PiMessages {
         Ok(value)
     }
 
+    pub(super) fn context_headers(&self) -> HeaderMap {
+        self.headers.clone()
+    }
+
+    /// Freeze credentials and the catalog-selected route for one request.
+    pub(super) async fn prepare_context(&self, model: &str) -> Result<Self> {
+        if self.radius.is_none() {
+            return Ok(self.clone());
+        }
+        let (token, binding) = self.access().await?;
+        let catalog = match self
+            .catalog_for(&binding, self.probe_catalog.then_some(token.as_str()))
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(Error::RetryableModel(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let mut prepared = self.clone();
+        let details = catalog
+            .as_ref()
+            .and_then(|catalog| catalog.models.iter().find(|item| item.id == model))
+            .map(|item| item.details());
+        if let Some(catalog) = catalog {
+            prepared.endpoint = catalog.endpoint.clone();
+            prepared.origin_hash = format!("{:x}", Sha256::digest(prepared.endpoint.as_str()));
+            prepared.prepared_image_resize = self.catalog_image_resize(&catalog, model);
+        }
+        prepared.prepared_limits = Some((
+            details.as_ref().and_then(|d| d.context_window),
+            details.as_ref().and_then(|d| d.max_output_tokens),
+        ));
+        prepared.token = Some(token);
+        prepared.radius = None;
+        Ok(prepared)
+    }
+
     pub(super) async fn models(&self) -> Result<Vec<String>> {
         Ok(self.catalog().await?.map_or_else(Vec::new, |catalog| {
             catalog
@@ -212,6 +279,11 @@ impl PiMessages {
                 )
             })
             .unwrap_or_default()
+    }
+
+    pub(super) async fn discovered_catalog(&self) -> Option<Arc<radius_catalog::Catalog>> {
+        let cache = self.radius.as_ref()?.catalog.lock().await;
+        cache.as_ref().map(|entry| entry.value.clone())
     }
 
     pub(super) async fn model_details(
@@ -246,6 +318,7 @@ impl PiMessages {
         if let Some(timeout) = timeout {
             builder = builder.read_timeout(timeout);
         }
+        self.identity_safe_transport = proxies.is_empty();
         self.client = builder
             .build()
             .map_err(|_| Error::Config("Could not initialize the Pi Messages client".into()))?;
@@ -311,6 +384,7 @@ impl PiMessages {
                         .filter(|replay| {
                             replay.identity.provider == self.identity
                                 && replay.identity.model == request.model
+                                && replay.supports_api(pi_rs::ModelApi::PiMessages)
                                 && replay.blocks.first().is_some_and(|marker| {
                                     marker["type"] == REPLAY_ORIGIN
                                         && marker["endpoint"] == self.origin_hash
@@ -325,23 +399,35 @@ impl PiMessages {
                                 blocks.extend(calls.iter().map(super::rpc_events::tool_call_value));
                                 blocks
                             },
-                            |replay| replay.blocks[1..].to_vec(),
+                            |replay| {
+                                replay.blocks[1..]
+                                    .iter()
+                                    .filter(|block| block.get("_pi_context_edit_api").is_none())
+                                    .cloned()
+                                    .collect()
+                            },
                         );
+                    if blocks.is_empty() {
+                        continue;
+                    }
                     json!({
                         "role":"assistant","content":blocks,"provider":self.identity,"api":"pi-messages","model":request.model,
                         "timestamp":0,"stopReason":if calls.is_empty() {"stop"} else {"toolUse"},
                         "usage":super::rpc_events::usage_value(Usage::default(), &ModelMetadata::default())
                     })
                 }
-                Message::Tool { call_id, content } => {
-                    let error = serde_json::from_str::<Value>(&content)
-                        .ok()
-                        .is_some_and(|value| value["data"]["isError"] == true);
-                    let mut value = super::rpc_events::tool_result_value(&content, None);
+                Message::Tool {
+                    call_id,
+                    content,
+                    is_error,
+                    is_structured,
+                } => {
+                    let mut value =
+                        super::rpc_events::tool_result_value(&content, None, is_structured);
                     value["role"] = json!("toolResult");
                     value["toolCallId"] = json!(call_id);
                     value["toolName"] = json!(tool_names.get(&call_id).map_or("", String::as_str));
-                    value["isError"] = json!(error);
+                    value["isError"] = json!(is_error);
                     value["timestamp"] = json!(0);
                     value
                 }
@@ -367,6 +453,31 @@ impl PiMessages {
 
 fn key_binding(token: &str) -> String {
     format!("key:{:x}", Sha256::digest(token.as_bytes()))
+}
+
+fn resize_request_images(payload: &mut Value, profile: ImageResizeProfile) -> Result<()> {
+    let Some(messages) = payload["context"]["messages"].as_array_mut() else {
+        return Ok(());
+    };
+    for message in messages
+        .iter_mut()
+        .filter(|message| matches!(message["role"].as_str(), Some("user" | "toolResult")))
+    {
+        for part in message["content"].as_array_mut().into_iter().flatten() {
+            if part["type"] == "image" {
+                let content = normalize_content(
+                    ImageContent {
+                        mime_type: field(part, "mimeType")?.into(),
+                        data: field(part, "data")?.into(),
+                    },
+                    profile,
+                )?;
+                part["mimeType"] = json!(content.mime_type);
+                part["data"] = json!(content.data);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -434,7 +545,57 @@ pub(super) fn is_pi_messages_replay(replay: &ProviderReplay) -> bool {
 
 #[async_trait::async_trait]
 impl Model for PiMessages {
+    fn context_identity(&self) -> Option<String> {
+        // Radius discovers its route and credentials dynamically.
+        if (self.identity == "radius" && self.prepared_limits.is_none())
+            || self.radius.is_some()
+            || !self.identity_safe_transport
+        {
+            return None;
+        }
+        let mut headers: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort();
+        let identity = pi_rs::protected_model_fingerprint(&(
+            headers,
+            "pi-messages-v1",
+            self.endpoint.as_str(),
+            &self.identity,
+            &self.token,
+            &self.thinking,
+            self.cache_disabled,
+        ))?;
+        match self.prepared_image_resize {
+            Some(profile) => pi_rs::protected_model_fingerprint(&(identity, profile)),
+            None => Some(identity),
+        }
+    }
+
+    fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
+        match message {
+            Message::Assistant {
+                replay: Some(replay),
+                ..
+            } if replay.identity.provider == self.identity
+                && replay.identity.model == request.model
+                && replay.blocks.first().is_some_and(|marker| {
+                    marker["type"] == REPLAY_ORIGIN && marker["endpoint"] == self.origin_hash
+                }) =>
+            {
+                pi_rs::estimate_replay_tokens(&replay.blocks[1..])
+                    .max(pi_rs::estimate_message_tokens(message))
+            }
+            _ => pi_rs::estimate_message_tokens(message),
+        }
+    }
+
     async fn context_window(&self, model: &str) -> Option<u32> {
+        if let Some((window, _)) = self.prepared_limits {
+            return window;
+        }
         self.model_details(&[model.into()])
             .await
             .remove(model)?
@@ -446,6 +607,9 @@ impl Model for PiMessages {
             progress(Progress::WaitingForModel);
         }
         let mut client = self.clone();
+        if let Some((_, Some(limit))) = self.prepared_limits {
+            request.max_output_tokens = request.max_output_tokens.min(limit);
+        }
         let (token, binding) = self.access().await?;
         let catalog = match self
             .catalog_for(&binding, self.probe_catalog.then_some(token.as_str()))
@@ -458,6 +622,7 @@ impl Model for PiMessages {
         if let Some(catalog) = catalog {
             client.endpoint = catalog.endpoint.clone();
             client.origin_hash = format!("{:x}", Sha256::digest(client.endpoint.as_str()));
+            client.prepared_image_resize = self.catalog_image_resize(&catalog, &request.model);
             if let Some(model) = catalog
                 .models
                 .iter()
@@ -467,8 +632,17 @@ impl Model for PiMessages {
                 request.max_output_tokens = request.max_output_tokens.min(limit);
             }
         }
+        let error_secrets = pi_rs::provider_error_secrets(
+            Some(token.as_str()),
+            self.headers.iter().filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| (name.as_str(), value))
+            }),
+        );
         let requested_model = request.model.clone();
-        let payload = client.encode(request);
+        let mut payload = client.encode(request);
+        if let Some(profile) = client.prepared_image_resize {
+            resize_request_images(&mut payload, profile)?;
+        }
         let response = self
             .client
             .post(client.endpoint.clone())
@@ -490,7 +664,26 @@ impl Model for PiMessages {
         if !response.status().is_success() {
             let status = response.status();
             let message = format!("Pi Messages request failed ({status})");
-            return Err(if status.as_u16() == 429 || status.is_server_error() {
+            if status.as_u16() == 413 {
+                return Err(Error::Model("413 request too large".into()));
+            }
+            if matches!(status.as_u16(), 400 | 422) {
+                let overflow = pi_rs::provider_context_overflow_stream(
+                    response.bytes_stream(),
+                    &error_secrets,
+                )
+                .await;
+                return Err(Error::Model(if overflow {
+                    "context window exceeded".into()
+                } else {
+                    message
+                }));
+            }
+            let permanent_quota = (status.as_u16() == 429 || status.is_server_error())
+                && pi_rs::permanent_provider_limit(response.bytes_stream(), &error_secrets).await;
+            return Err(if permanent_quota {
+                Error::Model("Pi Messages account quota or billing limit reached".into())
+            } else if status.as_u16() == 429 || status.is_server_error() {
                 Error::RetryableModel(message)
             } else {
                 Error::Model(message)
@@ -651,7 +844,7 @@ impl Model for PiMessages {
                         return;
                     }
                     "error" => {
-                        Err(if event["reason"] == "aborted" { Error::Cancelled } else { Error::Model("Pi Messages returned a stream error".into()) })?;
+                        Err(if event["reason"] == "aborted" { Error::Cancelled } else if pi_rs::permanent_provider_error(&event["errorMessage"], &error_secrets) { Error::Model("Pi Messages account quota or billing limit reached".into()) } else if pi_rs::retryable_provider_error(&event["errorMessage"], &error_secrets) { Error::RetryableModel("Pi Messages returned a transient stream error".into()) } else if pi_rs::provider_context_overflow(&event["errorMessage"], &error_secrets) { Error::Model("context window exceeded".into()) } else { Error::Model("Pi Messages returned a stream error".into()) })?;
                     }
                     _ => Err(Error::Model("Unknown Pi Messages stream event".into()))?,
                 }
@@ -687,6 +880,7 @@ fn terminal_metadata(
         cached_input_tokens: read,
         cache_creation_input_tokens: write,
         cache_write_1h_tokens: stats["cacheWrite1h"].as_u64(),
+        reasoning_output_tokens: stats["reasoning"].as_u64(),
         cost_usd: stats["cost"]["total"].as_number().cloned(),
         cost_breakdown: pi_rs::UsageCostBreakdown::from_value(&stats["cost"]),
         cost_from_provider: stats["cost"]["totalFromProvider"].as_bool(),
@@ -699,4 +893,471 @@ fn terminal_metadata(
         ..ModelMetadata::default()
     };
     (usage, metadata)
+}
+
+#[cfg(test)]
+mod tool_status_tests {
+    #[test]
+    fn request_resize_preserves_replay_and_resizes_user_and_tool_images() {
+        use base64::Engine;
+        use std::io::Cursor;
+
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(40, 20)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let encoding = base64::engine::general_purpose::STANDARD;
+        let part = json!({"type":"image", "mimeType":"image/png", "data":encoding.encode(bytes.get_ref())});
+        let mut payload = json!({"context":{"messages":[
+            {"role":"user", "content":[{"type":"text", "text":"prompt"}, part]},
+            {"role":"toolResult", "content":[part]},
+            {"role":"assistant", "content":[part]}
+        ]}});
+        super::resize_request_images(
+            &mut payload,
+            super::ImageResizeProfile {
+                max_width: Some(16),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let messages = &payload["context"]["messages"];
+        for image in [&messages[0]["content"][1], &messages[1]["content"][0]] {
+            let decoded = encoding.decode(image["data"].as_str().unwrap()).unwrap();
+            let image = image::load_from_memory(&decoded).unwrap();
+            assert_eq!((image.width(), image.height()), (16, 8));
+        }
+        assert_eq!(messages[0]["content"][0]["text"], "prompt");
+        assert_eq!(messages[2]["content"][0], part);
+    }
+
+    #[tokio::test]
+    async fn auth_header_error_literals_are_not_classified() {
+        use std::io::{Read, Write};
+        for (name, value) in [("x-api-key", "quota exceeded"), ("x-auth-token", "timeout")] {
+            for streaming in [false, true] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let event = json!({"type":"error","reason":"error","errorMessage":value});
+                let worker = std::thread::spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0; 2048];
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        let count = socket.read(&mut chunk).unwrap();
+                        assert!(
+                            count != 0 && request.len() + count <= 32 * 1024,
+                            "incomplete request headers"
+                        );
+                        request.extend_from_slice(&chunk[..count]);
+                    }
+                    let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    assert!(
+                        request.contains(&format!("{name}: {value}")),
+                        "header missing from fixture request"
+                    );
+                    let body = if streaming {
+                        format!("data: {event}\n\n")
+                    } else {
+                        json!({"error":{"message":value}}).to_string()
+                    };
+                    let status = if streaming { "200 OK" } else { "503 Fixture" };
+                    let content_type = if streaming {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    write!(socket, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                });
+                let model = PiMessages::new(
+                    "fixture",
+                    &format!("http://{address}/"),
+                    "ordinary-key".into(),
+                )
+                .unwrap()
+                .with_headers({
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    headers.insert(name, value.parse().unwrap());
+                    headers
+                });
+                let request = ModelRequest {
+                    model: "m".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                };
+                let error = match model.stream(request).await {
+                    Err(error) => error,
+                    Ok(mut stream) => loop {
+                        match stream.next().await {
+                            Some(Err(error)) => break error,
+                            Some(Ok(_)) => {}
+                            None => panic!("missing stream error"),
+                        }
+                    },
+                };
+                assert_eq!(
+                    matches!(error, Error::RetryableModel(_)),
+                    !streaming,
+                    "{name} {streaming}"
+                );
+                assert!(!error.to_string().contains(value));
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_stream_error_ignores_metadata_and_redacts() {
+        use std::io::{Read, Write};
+        for (message, permanent, retryable) in [
+            ("quota exceeded sk-billing-timeout-secret", true, false),
+            ("timeout sk-billing-timeout-secret", false, true),
+            ("sk-billing-timeout-secret", false, false),
+            ("sk-timeout-secret", false, false),
+            ("service-is-unavailable", false, true),
+            ("sk-header-billing-timeout-secret", false, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let event = json!({"type":"error","reason":"error","errorMessage":message,"request_id":"billing-sentinel-secret"});
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                let body = format!("data: {event}\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let model = PiMessages::new(
+                "fixture",
+                &format!("http://{address}/"),
+                "sk-billing-timeout-secret".into(),
+            )
+            .unwrap()
+            .with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("x-routing", "timeout".parse().unwrap());
+                headers.insert("x-secret", "sk-timeout-secret".parse().unwrap());
+                headers.insert(
+                    "x-bearer",
+                    "Bearer  sk-header-billing-timeout-secret".parse().unwrap(),
+                );
+                headers.insert("x-service", "service-is-unavailable".parse().unwrap());
+                headers
+            });
+            let request = ModelRequest {
+                model: "m".into(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: 16,
+            };
+            let mut stream = match model.stream(request).await {
+                Ok(stream) => stream,
+                Err(error) => panic!("{error}"),
+            };
+            let error = loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => {}
+                    None => panic!("stream ended without an error"),
+                }
+            };
+            assert_eq!(
+                error.to_string().contains("quota or billing limit"),
+                permanent
+            );
+            assert_eq!(matches!(error, Error::RetryableModel(_)), retryable);
+            assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(!error.to_string().contains("sk-billing-timeout-secret"));
+            assert!(!error.to_string().contains("sk-timeout-secret"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("sk-header-billing-timeout-secret")
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    use super::*;
+
+    #[tokio::test]
+    async fn quota_429_preserves_transient_retry_and_redacts_body() {
+        use std::io::{Read, Write};
+        for (status, body, permanent) in [
+            (
+                503,
+                r#"{"error":{"message":"sk-header-billing-timeout-secret"}}"#,
+                false,
+            ),
+            (503, r#"{"error":{"message":"sk-timeout-secret"}}"#, false),
+            (
+                503,
+                r#"{"error":{"message":"sk-billing-timeout-secret"}}"#,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"code":"insufficient_quota","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"quota exceeded","secret":"sentinel-secret"}}"#,
+                true,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"quota exceeded sk-billing-timeout-secret"}}"#,
+                true,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit exceeded"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (
+                503,
+                r#"{"error":{"message":"temporarily unavailable"},"request_id":"billing-sentinel-secret"}"#,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit","request_id":"billing-sentinel-secret"}}"#,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"rate limit sk-billing-timeout-secret"}}"#,
+                false,
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let credential = if body.contains("sk-timeout-secret") {
+                "sk-timeout-secret"
+            } else {
+                "sk-billing-timeout-secret"
+            };
+            let model =
+                PiMessages::new("fixture", &format!("http://{address}/"), credential.into())
+                    .unwrap();
+            let model = model.with_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    "x-bearer",
+                    "Bearer  sk-header-billing-timeout-secret".parse().unwrap(),
+                );
+                headers.insert("x-service", "service-is-unavailable".parse().unwrap());
+                headers
+            });
+            let result = model
+                .stream(ModelRequest {
+                    model: "m".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    max_output_tokens: 16,
+                })
+                .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("expected error"),
+            };
+            assert_eq!(matches!(error, Error::Model(_)), permanent);
+            assert_eq!(matches!(error, Error::RetryableModel(_)), !permanent);
+            if permanent {
+                assert!(error.to_string().contains("quota or billing limit"));
+            }
+            assert!(!error.to_string().contains("sentinel-secret"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("sk-header-billing-timeout-secret")
+            );
+            assert!(!error.to_string().contains(credential));
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn radius_estimation_matches_replay_origin_after_route_change() {
+        let client = PiMessages::radius(
+            "https://gateway.example/v1",
+            Some("token".into()),
+            Gateway::configured().unwrap(),
+        )
+        .unwrap();
+        let cache = &client.radius.as_ref().unwrap().catalog;
+        let update = |endpoint: &str| CachedCatalog {
+            binding: key_binding("token"),
+            token_hash: Some(Sha256::digest(b"token").into()),
+            value: Arc::new(radius_catalog::Catalog {
+                endpoint: Url::parse(endpoint).unwrap(),
+                models: vec![],
+            }),
+        };
+        *cache.lock().await = Some(update("https://one.example/v1"));
+        let first = client.prepare_context("fixture").await.unwrap();
+        *cache.lock().await = Some(update("https://two.example/v1"));
+        let second = client.prepare_context("fixture").await.unwrap();
+        let replay = Message::Assistant {
+            content: "ok".into(),
+            calls: vec![],
+            replay: Some(Box::new(ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: "radius".into(),
+                    model: "fixture".into(),
+                },
+                blocks: vec![
+                    json!({"type":REPLAY_ORIGIN,"endpoint":first.origin_hash}),
+                    json!({"type":"thinking","thinking":"x".repeat(8000)}),
+                ],
+            })),
+        };
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![replay.clone()],
+            tools: vec![],
+            max_output_tokens: 10,
+        };
+        assert!(first.estimate_message_tokens(&request, &replay) > 1900);
+        assert_eq!(
+            second.estimate_message_tokens(&request, &replay),
+            pi_rs::estimate_message_tokens(&replay)
+        );
+        assert_eq!(
+            first.encode(request.clone())["context"]["messages"][0]["content"][0]["type"],
+            "thinking"
+        );
+        assert_eq!(
+            second.encode(request)["context"]["messages"][0]["content"][0]["type"],
+            "text"
+        );
+        let thinking_only = Message::Assistant {
+            content: String::new(),
+            calls: vec![],
+            replay: Some(Box::new(ProviderReplay {
+                identity: ResolvedModelIdentity {
+                    provider: "radius".into(),
+                    model: "fixture".into(),
+                },
+                blocks: vec![
+                    json!({"type":REPLAY_ORIGIN,"endpoint":first.origin_hash}),
+                    json!({"type":"thinking","thinking":"private"}),
+                    json!({"_pi_context_edit_api":"pi-messages"}),
+                ],
+            })),
+        };
+        let request = ModelRequest {
+            model: "fixture".into(),
+            messages: vec![thinking_only],
+            tools: vec![],
+            max_output_tokens: 10,
+        };
+        assert_eq!(
+            first.encode(request.clone())["context"]["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            second.encode(request)["context"]["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        #[cfg(any(unix, windows))]
+        assert_ne!(first.context_identity(), second.context_identity());
+    }
+
+    #[test]
+    fn structured_tool_content_is_still_extracted_by_pi_messages() {
+        let text = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}] } }"#;
+        let client = PiMessages::new("fixture", "http://127.0.0.1/", "token".into()).unwrap();
+        let body = client.encode(ModelRequest {
+            model: "fixture".into(),
+            messages: vec![Message::Tool {
+                call_id: "call".into(),
+                content: text.into(),
+                is_error: false,
+                is_structured: Some(true),
+            }],
+            tools: vec![],
+            max_output_tokens: 10,
+        });
+        let blocks = &body["context"]["messages"][0]["content"];
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["data"], "aW1hZ2U=");
+        assert!(!blocks[0]["text"].as_str().unwrap().contains("aW1hZ2U="));
+        let legacy =
+            serde_json::from_value(json!({"role":"tool","call_id":"call","content":text})).unwrap();
+        let body = client.encode(ModelRequest {
+            model: "fixture".into(),
+            messages: vec![legacy],
+            tools: vec![],
+            max_output_tokens: 10,
+        });
+        assert_eq!(
+            body["context"]["messages"][0]["content"][1]["data"],
+            "aW1hZ2U="
+        );
+    }
+
+    #[test]
+    fn imported_tool_status_survives_journal_and_pi_messages_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pi.jsonl");
+        let plain = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}] } }"#;
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"one","name":"read","arguments":{}},{"type":"toolCall","id":"two","name":"read","arguments":{}}]}}),
+            json!({"type":"message","id":"t1","parentId":"a","message":{"role":"toolResult","toolCallId":"one","content":[{"type":"text","text":plain}],"isError":true,"details":{"private":"metadata"}}}),
+            json!({"type":"message","id":"t2","parentId":"t1","message":{"role":"toolResult","toolCallId":"two","content":[{"type":"text","text":plain}],"isError":false}}),
+        ];
+        std::fs::write(
+            &path,
+            entries
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let session = super::super::session_import::read(&path).unwrap();
+        let saved = dir.path().join("native.jsonl");
+        session.export_jsonl(&saved).unwrap();
+        let reopened = super::super::session_import::read(&saved).unwrap();
+        assert!(reopened.records().iter().any(|record| matches!(&record.event, pi_rs::Event::ToolFinished { outcome: pi_rs::Outcome::TextResult { output, details: Some(details), is_error: true }, .. } if output == plain && details["private"] == "metadata")));
+        let messages = reopened.current_messages();
+        assert!(messages.iter().any(|message| matches!(message, Message::Tool { content, is_error: true, .. } if content == plain)));
+        let client = PiMessages::new("fixture", "http://127.0.0.1/", "token".into()).unwrap();
+        let body = client.encode(ModelRequest {
+            model: "fixture".into(),
+            messages,
+            tools: vec![],
+            max_output_tokens: 256,
+        });
+        let results = body["context"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|value| value["role"] == "toolResult")
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["isError"], true);
+        assert_eq!(results[0]["content"][0]["text"], plain);
+        assert_eq!(results[1]["isError"], false);
+        assert_eq!(results[1]["content"][0]["text"], plain);
+        assert!(!body.to_string().contains("metadata"));
+    }
 }

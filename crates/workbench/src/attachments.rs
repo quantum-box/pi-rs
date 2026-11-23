@@ -2,6 +2,7 @@
 use std::path::Path;
 
 use pi_rs::{Error, ImageContent, Result};
+use pi_rs_workbench::coding::{AttachmentContent, CodingTools};
 use pi_rs_workbench::image_profile::ImageResizeProfile;
 
 pub fn expand(
@@ -10,7 +11,7 @@ pub fn expand(
     auto_resize: bool,
     profile: Option<ImageResizeProfile>,
 ) -> Result<(String, Vec<ImageContent>)> {
-    let tools = pi_rs_workbench::coding::CodingTools::local(workspace)?
+    let tools = CodingTools::local(workspace)?
         .with_image_resize(auto_resize)
         .with_image_profile(profile);
     let mut files = String::new();
@@ -21,26 +22,23 @@ pub fn expand(
             messages.push(argument.as_str());
             continue;
         };
-        let path = tools.resolve_read_path(Path::new(path))?;
-        let metadata = path.metadata()?;
-        if metadata.is_file() && metadata.len() == 0 {
+        let Some(attachment) = tools.read_cli_attachment(workspace, path)? else {
             continue;
+        };
+        let name = attachment.name.to_string_lossy();
+        match attachment.content {
+            AttachmentContent::Text(content) => {
+                let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+                files.push_str(&format!("<file name=\"{name}\">\n{content}\n</file>\n"));
+            }
+            AttachmentContent::Image {
+                note,
+                images: attached,
+            } => {
+                files.push_str(&format!("<file name=\"{name}\">{note}</file>\n"));
+                images.extend(attached);
+            }
         }
-        let (content, attached) = tools.read_attachment(&path)?;
-        let name = path
-            .to_string_lossy()
-            .replace('&', "&amp;")
-            .replace('"', "&quot;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
-        if attached.is_empty() {
-            let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-            files.push_str(&format!("<file name=\"{name}\">\n{content}\n</file>\n"));
-        } else {
-            let hints = if auto_resize { &content } else { "" };
-            files.push_str(&format!("<file name=\"{name}\">{hints}</file>\n"));
-        }
-        images.extend(attached);
         if files
             .len()
             .saturating_add(images.iter().map(|image| image.data.len()).sum::<usize>())
@@ -60,6 +58,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn attachment_tags_preserve_literal_filename_characters() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("research & notes.txt"), "text").unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(directory.path().join("picture & notes.png"))
+            .unwrap();
+        let (text, images) = expand(
+            &[
+                "@research & notes.txt".into(),
+                "@picture & notes.png".into(),
+            ],
+            directory.path(),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            text.contains("research & notes.txt\">\ntext\n</file>\n"),
+            "{text}"
+        );
+        assert!(text.contains("picture & notes.png\"></file>\n"), "{text}");
+        assert_eq!(images.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_tags_do_not_escape_quotes_or_angle_brackets() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a\"<b>.txt"), "text").unwrap();
+        let (text, _) = expand(&["@a\"<b>.txt".into()], directory.path(), false, None).unwrap();
+        assert!(text.contains("a\"<b>.txt\">\ntext\n</file>\n"), "{text}");
+    }
+
+    #[test]
+    fn attachment_tags_use_the_absolute_workspace_path() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "text").unwrap();
+        let (text, _) = expand(
+            &["@missing/../note.txt".into()],
+            directory.path(),
+            false,
+            None,
+        )
+        .unwrap();
+        let name = directory.path().join("note.txt");
+        assert_eq!(
+            text,
+            format!("<file name=\"{}\">\ntext\n</file>\n", name.display())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_tags_keep_symlink_names_for_text_and_images() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("note.txt"), "linked text").unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(source.join("target.png"))
+            .unwrap();
+        symlink("source", directory.path().join("linked")).unwrap();
+        symlink("linked/target.png", directory.path().join("image.png")).unwrap();
+
+        let (text, images) = expand(
+            &["@linked/note.txt".into(), "@image.png".into()],
+            directory.path(),
+            false,
+            None,
+        )
+        .unwrap();
+        let note = directory.path().join("linked/note.txt");
+        let image = directory.path().join("image.png");
+        assert_eq!(
+            text,
+            format!(
+                "<file name=\"{}\">\nlinked text\n</file>\n<file name=\"{}\"></file>\n",
+                note.display(),
+                image.display()
+            )
+        );
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+    }
+
+    #[test]
     fn empty_files_are_skipped_and_text_attachment_boms_are_removed() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("empty.md"), "").unwrap();
@@ -75,6 +161,180 @@ mod tests {
         assert!(!text.contains("empty.md"));
         assert!(text.ends_with("note.md\">\ntext\n</file>\nprompt"));
     }
+    #[test]
+    fn malformed_utf8_text_attachments_use_replacement_characters() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("broken.txt"),
+            b"\xef\xbb\xbfhello \xffworld\xe2\x82",
+        )
+        .unwrap();
+        let (text, images) = expand(
+            &["@broken.txt".into(), "summarize".into()],
+            directory.path(),
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(images.is_empty());
+        assert!(text.ends_with("broken.txt\">\nhello \u{fffd}world\u{fffd}\n</file>\nsummarize"));
+    }
+
+    #[test]
+    fn corrupt_detected_image_retains_image_omission() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("broken.png"),
+            b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR",
+        )
+        .unwrap();
+        let (text, images) = expand(&["@broken.png".into()], directory.path(), true, None).unwrap();
+        assert!(images.is_empty());
+        let path = directory.path().join("broken.png");
+        assert_eq!(
+            text,
+            format!(
+                "<file name=\"{}\">[Image omitted: could not be resized below the inline image size limit.]</file>\n",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn short_and_animated_png_are_decoded_as_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let short = b"\x89PNG\r\n\x1a\ncorrupt";
+        std::fs::write(directory.path().join("short.png"), short).unwrap();
+        let mut animated = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        animated.extend_from_slice(&[0; 17]); // IHDR data and CRC
+        animated.extend_from_slice(b"\0\0\0\x08acTL");
+        std::fs::write(directory.path().join("animated.png"), &animated).unwrap();
+        for (name, bytes) in [
+            ("short.png", short.as_slice()),
+            ("animated.png", animated.as_slice()),
+        ] {
+            let (text, images) =
+                expand(&[format!("@{name}")], directory.path(), true, None).unwrap();
+            assert!(images.is_empty());
+            assert!(
+                text.contains(String::from_utf8_lossy(bytes).as_ref()),
+                "{text:?}"
+            );
+            assert!(!text.contains("[Image omitted:"));
+        }
+    }
+
+    #[test]
+    fn image_extensions_do_not_make_text_or_partial_png_an_image() {
+        let directory = tempfile::tempdir().unwrap();
+        let signature = b"\x89PNG\r\n\x1a\n";
+        for size in 1..signature.len() {
+            let name = format!("partial-{size}.png");
+            let bytes = &signature[..size];
+            std::fs::write(directory.path().join(&name), bytes).unwrap();
+            let (text, images) =
+                expand(&[format!("@{name}")], directory.path(), true, None).unwrap();
+            assert!(images.is_empty());
+            assert!(
+                text.contains(String::from_utf8_lossy(bytes).as_ref()),
+                "{text:?}"
+            );
+            assert!(!text.contains("[Image omitted:"));
+        }
+        for name in ["note.png", "note.jpg", "note.webp"] {
+            std::fs::write(directory.path().join(name), "ordinary text").unwrap();
+            let (text, images) =
+                expand(&[format!("@{name}")], directory.path(), true, None).unwrap();
+            assert!(images.is_empty());
+            assert!(text.contains("ordinary text"));
+            assert!(!text.contains("[Image omitted:"));
+        }
+    }
+
+    #[test]
+    fn unsupported_signatures_and_malformed_bmp_are_cli_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut invalid_bmp = vec![0; 30];
+        invalid_bmp[..2].copy_from_slice(b"BM");
+        invalid_bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        invalid_bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        invalid_bmp[26..28].copy_from_slice(&2u16.to_le_bytes());
+        invalid_bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+        for (name, bytes) in [
+            ("jpeg-ls.jpg", b"\xff\xd8\xff\xf7binary".as_slice()),
+            ("tiff.tif", b"II*\0not-supported".as_slice()),
+            ("broken.bmp", invalid_bmp.as_slice()),
+        ] {
+            std::fs::write(directory.path().join(name), bytes).unwrap();
+            let (text, images) =
+                expand(&[format!("@{name}")], directory.path(), true, None).unwrap();
+            assert!(images.is_empty());
+            assert!(
+                text.contains(String::from_utf8_lossy(bytes).as_ref()),
+                "{name}: {text:?}"
+            );
+            assert!(!text.contains("[Image omitted:"));
+        }
+    }
+
+    #[test]
+    fn supported_signatures_are_processed_without_filename_hints() {
+        let directory = tempfile::tempdir().unwrap();
+        for format in [
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::Gif,
+            image::ImageFormat::WebP,
+            image::ImageFormat::Bmp,
+        ] {
+            let path = directory.path().join(format!("{format:?}.data"));
+            image::RgbImage::from_pixel(2, 2, image::Rgb([200, 100, 20]))
+                .save_with_format(&path, format)
+                .unwrap();
+            let (text, images) = expand(
+                &[format!("@{}", path.display())],
+                directory.path(),
+                true,
+                None,
+            )
+            .unwrap();
+            assert_eq!(images.len(), 1, "{format:?}: {text}");
+            let hint = if format == image::ImageFormat::Bmp {
+                "[Image converted from image/bmp to image/png.]"
+            } else {
+                ""
+            };
+            assert_eq!(
+                text,
+                format!("<file name=\"{}\">{hint}</file>\n", path.display())
+            );
+            if format == image::ImageFormat::Bmp {
+                let (original_text, original_images) = expand(
+                    &[format!("@{}", path.display())],
+                    directory.path(),
+                    false,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(original_text, text);
+                assert_eq!(original_images[0].mime_type, "image/png");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_text_still_obeys_aggregate_input_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut bytes = vec![b'a'; 8 * 1024 * 1024];
+        bytes.push(0xff);
+        std::fs::write(directory.path().join("large.txt"), bytes).unwrap();
+        let error = expand(&["@large.txt".into()], directory.path(), true, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("attachments exceed the 8 MiB input limit")
+        );
+    }
+
     #[test]
     fn attachments_use_reader_filename_fallbacks_and_file_urls() {
         let directory = tempfile::tempdir().unwrap();
@@ -133,7 +393,9 @@ mod tests {
             .unwrap();
         assert_eq!(bytes, std::fs::read(&path).unwrap());
 
-        let (_, resized) = expand(&input, directory.path(), true, None).unwrap();
+        let (reference, resized) = expand(&input, directory.path(), true, None).unwrap();
+        assert!(reference.contains("[Image: original 2400x12, displayed at 2000x10."));
+        assert!(!reference.contains("Read image file"));
         assert_eq!(resized[0].mime_type, "image/png");
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&resized[0].data)

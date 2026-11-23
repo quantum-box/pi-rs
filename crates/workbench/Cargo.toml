@@ -14,61 +14,92 @@ path = "src/main.rs"
 [[bin]]
 name = "pi"
 path = "src/pi.rs"
+# This alias includes main.rs, whose unit tests already run in the pi-rs target.
+test = false
 
 [features]
 evaluation-fixtures = ["dep:pi-rs-fixture-tools"]
 
 [dependencies]
+pi-rs-file-url = { path = "../file-url" }
 arboard = { version = "3.7", features = ["wayland-data-control"] }
 async-trait = "0.1"
 async-stream = "0.3"
+aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
+aws-smithy-runtime-api = "1"
 base64 = "0.22"
 eventsource-stream = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 futures-util = "0.3"
+http = "1"
 fancy-regex = "0.16"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.29", features = ["use-dev-tty"] }
+dunce = "1"
 encoding_rs = "0.8"
 globset = "0.4"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.16"
 icu_collator = "2.4"
 icu_locale_core = "2.4"
+icu_segmenter = { version = "2.4", default-features = false, features = ["compiled_data"] }
 ignore = "0.4"
+indexmap = { version = "2", features = ["serde"] }
 libc = "0.2"
 jsonschema = { version = "0.33", default-features = false }
 palette = "0.7"
 pulldown-cmark = "0.13"
+unicase = "2"
+ryu-js = "1.0.3"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 shell-words = "1"
 similar = "2.7"
-pi-rs = { path = "../..", features = ["anthropic", "google", "openai"] }
+pi-rs = { path = "../..", features = ["anthropic", "google", "openai", "bedrock"] }
 pi-rs-extensions = { path = "../extensions" }
 pi-rs-fixture-tools = { path = "../fixture-tools", optional = true }
 pi-rs-plan-mode = { path = "../plan-mode" }
 pi-rs-review = { path = "../review" }
+pi-rs-remote-find = { path = "../remote-find" }
+pi-rs-remote-grep = { path = "../remote-grep" }
+pi-rs-remote-ls = { path = "../remote-ls" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 regex = "1"
-process-wrap = { version = "10", features = ["tokio1"] }
+rquickjs = { version = "0.14.0", features = ["parallel"] }
+process-wrap = { version = "10", features = ["std", "tokio1"] }
 rmcp = { version = "3.9", default-features = false, features = ["client", "auth", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+oauth2 = { version = "5", default-features = false }
 reqwest-mcp = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
+same-file = "1"
 sha2 = "0.10"
 sse-stream = "0.2"
 tempfile = "3"
+toml = "0.8"
 unicode-normalization = "0.1"
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 tokio = { version = "1", features = ["macros", "rt", "process", "signal", "sync", "time", "fs", "io-util", "io-std", "net"] }
 uuid = { version = "1", features = ["serde"] }
+filetime = "0.2.29"
 
 [dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["socks"] }
+reqwest-mcp = { package = "reqwest", version = "0.13", default-features = false, features = ["socks"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+tower = "0.5"
+
+[target.'cfg(unix)'.dependencies]
+signal-hook-registry = "1"
 
 [target.'cfg(windows)'.dependencies]
 crossterm_winapi = "0.9.1"
 winapi = { version = "0.3.9", features = ["winuser", "winerror", "synchapi"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }

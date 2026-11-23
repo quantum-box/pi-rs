@@ -5,6 +5,38 @@ use serde_json::{Map, Value, json};
 
 use super::{Api, Entry, ImageInput};
 
+fn classifier_envelope(entry: &Entry, mut body: Value) -> Value {
+    if matches!(entry.api, Api::WorkersAiSystemOne) {
+        body.as_object_mut()
+            .expect("classifier request")
+            .remove("model");
+        json!({"model":entry.model.id,"input":body})
+    } else {
+        body
+    }
+}
+
+pub(super) fn classifier_response(body: &Value) -> Result<&Value> {
+    if body["success"] == false {
+        return Err(Error::Model("Cloudflare Workers AI request failed".into()));
+    }
+    let result = body["result"]
+        .as_object()
+        .ok_or_else(|| Error::Model("invalid Cloudflare Workers AI response".into()))?;
+    if result.contains_key("answers") {
+        return Ok(&body["result"]);
+    }
+    if result.get("state").and_then(Value::as_str) != Some("Completed") {
+        return Err(Error::Model(
+            "Cloudflare Workers AI run did not complete".into(),
+        ));
+    }
+    body["result"]["result"]
+        .as_object()
+        .map(|_| &body["result"]["result"])
+        .ok_or_else(|| Error::Model("invalid Cloudflare Workers AI response".into()))
+}
+
 fn image_parts(values: &Value) -> Result<Vec<pi_rs::ImageContent>> {
     if values.is_null() {
         return Ok(vec![]);
@@ -18,7 +50,7 @@ fn image_parts(values: &Value) -> Result<Vec<pi_rs::ImageContent>> {
     values.iter().map(parse_image).collect()
 }
 
-fn parse_image(value: &Value) -> Result<pi_rs::ImageContent> {
+pub(super) fn parse_image(value: &Value) -> Result<pi_rs::ImageContent> {
     let image: pi_rs::ImageContent = serde_json::from_value(value.clone())
         .map_err(|_| Error::Config("invalid model image block".into()))?;
     if !matches!(
@@ -43,7 +75,8 @@ fn image_url(image: &pi_rs::ImageContent) -> String {
 pub(super) fn classifier_payload(entry: &Entry, context: &Value) -> Result<(Value, bool)> {
     let state = context
         .get("state")
-        .ok_or_else(|| Error::Config("classifier context requires state".into()))?;
+        .filter(|state| state.is_object())
+        .ok_or_else(|| Error::Config("classifier context.state must be an object".into()))?;
     let questions = context["questions"]
         .as_object()
         .filter(|questions| !questions.is_empty() && questions.len() <= 256)
@@ -73,7 +106,7 @@ pub(super) fn classifier_payload(entry: &Entry, context: &Value) -> Result<(Valu
     let mut body = json!({"model":entry.model.id,"state":state,"questions":wire});
     let images = image_parts(&context["images"])?;
     if images.is_empty() {
-        return Ok((body, false));
+        return Ok((classifier_envelope(entry, body), false));
     }
     if !entry.accepts_images() {
         return Err(Error::Config(
@@ -127,8 +160,8 @@ pub(super) fn classifier_payload(entry: &Entry, context: &Value) -> Result<(Valu
         .model
         .compat
         .send_image_opt_in_header
-        .unwrap_or(matches!(mode, ImageInput::Assets));
-    Ok((body, opt_in))
+        .unwrap_or(!matches!(entry.api, Api::WorkersAiSystemOne) && !entry.openrouter_compat());
+    Ok((classifier_envelope(entry, body), opt_in))
 }
 
 pub(super) fn classifier_answers(questions: &Value, answers: &Value) -> Result<Value> {
@@ -190,20 +223,36 @@ pub(super) fn image_payload(entry: &Entry, context: &Value) -> Result<Value> {
     )
 }
 
-pub(super) fn image_output(body: &Value) -> Result<Vec<Value>> {
-    let Some(message) = body["choices"]
-        .get(0)
-        .and_then(|choice| choice.get("message"))
-    else {
+pub(super) fn image_output(body: &Value, blocks: &mut Vec<Value>) -> Result<()> {
+    let choices = body["choices"]
+        .as_array()
+        .ok_or_else(|| Error::Model("image provider response is missing its choices".into()))?;
+    let Some(choice) = choices.first() else {
+        return Ok(());
+    };
+    let Some(message) = choice.get("message").filter(|message| message.is_object()) else {
         return Err(Error::Model(
             "image provider response is missing its message".into(),
         ));
     };
-    let mut blocks = Vec::new();
     if let Some(content) = message["content"].as_str().filter(|text| !text.is_empty()) {
         blocks.push(json!({"type":"text","text":content}));
     }
-    for image in message["images"].as_array().into_iter().flatten() {
+    // Pi treats a missing or null images field as empty. Strings are iterable
+    // in JavaScript, but their characters have no image_url and are ignored.
+    let images = match message.get("images") {
+        None | Some(Value::Null | Value::String(_)) => &[][..],
+        Some(Value::Array(images)) => images.as_slice(),
+        Some(_) => {
+            return Err(Error::Model(
+                "image provider returned invalid images".into(),
+            ));
+        }
+    };
+    for image in images {
+        if image.is_null() {
+            return Err(Error::Model("image provider returned a null image".into()));
+        }
         let Some((mime_type, data)) = image["image_url"]
             .as_str()
             .or_else(|| image["image_url"]["url"].as_str())
@@ -212,11 +261,19 @@ pub(super) fn image_output(body: &Value) -> Result<Vec<Value>> {
         else {
             continue;
         };
+        // Upstream ignores data URLs that do not have a nonempty MIME type and payload.
+        if mime_type.is_empty()
+            || mime_type.contains(';')
+            || data.is_empty()
+            || data.contains(['\n', '\r'])
+        {
+            continue;
+        }
         let value = json!({"type":"image","mimeType":mime_type,"data":data});
         parse_image(&value)?;
         blocks.push(value);
     }
-    Ok(blocks)
+    Ok(())
 }
 
 pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
@@ -229,11 +286,27 @@ pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
             .min(u64::from(u32::MAX))
     };
     let (input, output, cache_read, cache_write) = match entry.api {
-        Api::SystemOne => {
+        Api::LlamaCppClassifier => return None,
+        Api::SystemOne | Api::WorkersAiSystemOne | Api::OpenAiDecisions => {
             if !value.contains_key("input_tokens") && !value.contains_key("output_tokens") {
                 return None;
             }
-            (count("input_tokens"), count("output_tokens"), 0, 0)
+            let total_input = count("input_tokens");
+            let details = value.get("input_tokens_details");
+            let cache_read = details
+                .and_then(|details| details["cached_tokens"].as_u64())
+                .unwrap_or_default()
+                .min(total_input);
+            let cache_write = details
+                .and_then(|details| details["cache_write_tokens"].as_u64())
+                .unwrap_or_default()
+                .min(total_input - cache_read);
+            (
+                total_input - cache_read - cache_write,
+                count("output_tokens"),
+                cache_read,
+                cache_write,
+            )
         }
         Api::OpenRouterImages => {
             let prompt = count("prompt_tokens");
@@ -241,11 +314,11 @@ pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
             let cached = detail
                 .and_then(|value| value["cached_tokens"].as_u64())
                 .unwrap_or_default()
-                .min(prompt);
+                .min(u64::from(u32::MAX));
             let written = detail
                 .and_then(|value| value["cache_write_tokens"].as_u64())
                 .unwrap_or_default()
-                .min(prompt);
+                .min(u64::from(u32::MAX));
             let read = cached.saturating_sub(written);
             (
                 prompt.saturating_sub(read + written),
@@ -256,14 +329,22 @@ pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
         }
     };
     let cost = &entry.model.cost;
-    let input_cost = cost.input * input as f64 / 1_000_000.0;
-    let output_cost = cost.output * output as f64 / 1_000_000.0;
-    let read_cost = cost.cache_read * cache_read as f64 / 1_000_000.0;
-    let write_cost = cost.cache_write * cache_write as f64 / 1_000_000.0;
-    Some(json!({
+    let tier = cost
+        .tiers
+        .iter()
+        .filter(|tier| input + cache_read + cache_write > tier.input_tokens_above)
+        .max_by_key(|tier| tier.input_tokens_above);
+    let input_cost = tier.map_or(cost.input, |tier| tier.input) * input as f64 / 1_000_000.0;
+    let output_cost = tier.map_or(cost.output, |tier| tier.output) * output as f64 / 1_000_000.0;
+    let read_cost =
+        tier.map_or(cost.cache_read, |tier| tier.cache_read) * cache_read as f64 / 1_000_000.0;
+    let write_cost =
+        tier.map_or(cost.cache_write, |tier| tier.cache_write) * cache_write as f64 / 1_000_000.0;
+    let result = json!({
         "input":input,"output":output,"cacheRead":cache_read,"cacheWrite":cache_write,
         "totalTokens":input+output+cache_read+cache_write,
         "cost":{"input":input_cost,"output":output_cost,"cacheRead":read_cost,"cacheWrite":write_cost,
-            "total":input_cost+output_cost+read_cost+write_cost},
-    }))
+            "total":input_cost+output_cost+read_cost+write_cost,"totalFromProvider":false},
+    });
+    Some(result)
 }

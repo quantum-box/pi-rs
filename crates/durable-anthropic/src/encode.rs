@@ -107,7 +107,9 @@ pub(crate) fn encode_request_with_blocks(
                     };
                     ("assistant", blocks)
                 }
-                Message::Tool { call_id, content } => (
+                Message::Tool {
+                    call_id, content, ..
+                } => (
                     "user",
                     vec![json!({
                         "type":"tool_result","tool_use_id":call_id,"content":content

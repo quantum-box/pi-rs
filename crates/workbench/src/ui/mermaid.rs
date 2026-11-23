@@ -20,7 +20,7 @@ pub enum Mermaid {
 
 struct Diagram {
     art: MermaidArt,
-    unreadable_tail: Option<String>,
+    warnings: Vec<String>,
 }
 
 type Cache = VecDeque<(String, Option<Arc<Diagram>>)>;
@@ -48,13 +48,16 @@ fn diagram(source: &str) -> Option<Arc<Diagram>> {
     let value = draw(&safe)
         .map(|art| Diagram {
             art,
-            unreadable_tail: None,
+            warnings: mermaid_engine::flowchart_warnings(&safe),
         })
         .or_else(|| {
             let (prefix, tail) = safe.trim_end().rsplit_once('\n')?;
             Some(Diagram {
                 art: draw(prefix)?,
-                unreadable_tail: Some(tail.trim().into()),
+                warnings: vec![format!(
+                    "dropped, unreadable final line: \"{}\"",
+                    tail.trim()
+                )],
             })
         })
         .map(Arc::new);
@@ -84,12 +87,17 @@ pub fn render(
         return (None, None);
     };
     if mode == Mermaid::Final
-        && let Some(tail) = &diagram.unreadable_tail
+        && let Some(warning) = diagram.warnings.first()
     {
         return (
             None,
             Some(format!(
-                "Mermaid diagram not rendered: dropped, unreadable final line: \"{tail}\""
+                "Mermaid diagram not rendered: {warning}{}",
+                if diagram.warnings.len() > 1 {
+                    format!(" (+{} more)", diagram.warnings.len() - 1)
+                } else {
+                    String::new()
+                }
             )),
         );
     }
@@ -141,6 +149,72 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn flowchart_partial_render_warns_only_after_streaming() {
+        let theme = Theme::system();
+        let source = "flowchart LR\nA[Foo] invalid\nB[Bar] also-invalid";
+        let (lines, warning) = render(source, &theme, 120, Mermaid::Final);
+        assert!(lines.is_none());
+        assert_eq!(
+            warning.as_deref(),
+            Some("Mermaid diagram not rendered: dropped, expected a link: \"invalid\" (+1 more)")
+        );
+        let (lines, warning) = render(source, &theme, 120, Mermaid::Streaming);
+        assert!(lines.is_some());
+        assert!(warning.is_none());
+        let (lines, warning) = render(
+            "flowchart LR\nA[Foo]:::highlight-->B[Bar]",
+            &theme,
+            120,
+            Mermaid::Final,
+        );
+        assert!(lines.is_some());
+        assert!(warning.is_none());
+        let (lines, warning) = render(
+            "flowchart LR\nA[Foo]:::dark-mode",
+            &theme,
+            120,
+            Mermaid::Final,
+        );
+        assert!(warning.is_none());
+        let text = lines
+            .unwrap()
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(text.contains("Foo"));
+        assert!(!text.contains("mode"));
+        let (lines, warning) = render(
+            "flowchart LR\nA[Foo]:::status-ok-->B[Bar]",
+            &theme,
+            120,
+            Mermaid::Final,
+        );
+        assert!(warning.is_none());
+        let text = lines
+            .unwrap()
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(text.contains("Foo") && text.contains("Bar"));
+        assert!(!text.contains("ok"));
+        let (_, warning) = render("flowchart LR\nA -->", &theme, 120, Mermaid::Final);
+        assert_eq!(
+            warning.as_deref(),
+            Some("Mermaid diagram not rendered: dropped, link has no target: \"A -->\"")
+        );
+        let source = "flowchart LR\nA[unfinished";
+        let (lines, warning) = render(source, &theme, 120, Mermaid::Final);
+        assert!(lines.is_none());
+        assert!(warning.as_deref().is_some_and(|warning| warning
+            == "Mermaid diagram not rendered: node \"A\": label is missing its closing `]`"));
+        let (lines, warning) = render(source, &theme, 120, Mermaid::Streaming);
+        assert!(lines.is_some());
+        assert!(warning.is_none());
     }
 
     #[test]

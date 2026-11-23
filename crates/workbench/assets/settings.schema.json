@@ -4,7 +4,8 @@
   "type": "object",
   "properties": {
     "httpProxy": { "type": "string" },
-    "httpIdleTimeoutMs": { "anyOf": [{ "type": "number", "minimum": 0 }, { "const": "disabled" }] },
+    "httpIdleTimeoutMs": { "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "string" }] },
+    "websocketConnectTimeoutMs": { "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "string" }] },
     "fullscreenExitOutput": { "enum": ["transcript", "resume-hint"] },
     "fullscreenScrollbar": { "enum": ["auto", "always", "hidden"] },
     "fullscreenCopyOnSelect": { "type": "boolean" },
@@ -21,7 +22,15 @@
         "enabled": { "type": "boolean" },
         "maxRetries": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
         "baseDelayMs": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-        "maxAgentDelayMs": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+        "maxAgentDelayMs": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "provider": {
+          "type": "object",
+          "properties": {
+            "maxRetries": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "maxRetryDelayMs": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            "timeoutMs": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+          }
+        }
       }
     },
     "compaction": {
@@ -74,6 +83,9 @@
     "showCacheMissNotices": {
       "type": "boolean"
     },
+    "transport": {
+      "enum": ["sse", "websocket", "websocket-cached", "auto"]
+    },
     "cacheWarming": {
       "enum": ["off", "streaming", "idle"]
     },
@@ -111,6 +123,12 @@
     "treeFilterMode": {
       "enum": ["default", "no-tools", "user-only", "labeled-only", "all"]
     },
+    "warnings": {
+      "type": "object",
+      "properties": {
+        "anthropicExtraUsage": { "type": "boolean", "default": true }
+      }
+    },
     "extensions": {
       "type": "array",
       "items": {
@@ -139,6 +157,15 @@
       "type": "array",
       "items": {
         "type": "string"
+      }
+    },
+    "thinkingBudgets": {
+      "type": "object",
+      "properties": {
+        "minimal": {},
+        "low": {},
+        "medium": {},
+        "high": {}
       }
     },
     "defaultThinkingLevel": {
@@ -198,49 +225,42 @@
     "packages": {
       "type": "array",
       "items": {
-        "anyOf": [
-          {
+        "type": ["string", "object"],
+        "required": [
+          "source"
+        ],
+        "properties": {
+          "source": {
             "type": "string"
           },
-          {
-            "type": "object",
-            "required": [
-              "source"
-            ],
-            "properties": {
-              "source": {
-                "type": "string"
-              },
-              "autoload": {
-                "type": "boolean"
-              },
-              "extensions": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "skills": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "prompts": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "themes": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              }
+          "autoload": {
+            "type": "boolean"
+          },
+          "extensions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "skills": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "prompts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "themes": {
+            "type": "array",
+            "items": {
+              "type": "string"
             }
           }
-        ]
+        }
       }
     },
     "steeringMode": {

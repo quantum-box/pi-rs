@@ -1,7 +1,7 @@
 //! Terminal presentation over the same journaled CLI used by automation.
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::ui::{
@@ -10,8 +10,11 @@ use crate::ui::{
     keys::Keys,
     mermaid::Mermaid,
     mouse_selection::MouseSelection,
-    picker::{Input, Item, Picker, Selection, ThemeSettingsAction, TreeEntryKind, TreeFilter},
-    render::{Entry, Line, SummaryKind, ToolPart, TranscriptOptions},
+    picker::{Input, Item, MouseInput, Picker, Selection, ThemeSettingsAction, TreeFilter},
+    render::{
+        CustomEntryPresentation, Entry, Line, SummaryKind, ToolPart, TranscriptMarkdown,
+        TranscriptOptions,
+    },
     theme::{Theme, ThemeWatcher},
     transcript_search::Search,
     viewport::{Viewport, Wheel},
@@ -19,11 +22,14 @@ use crate::ui::{
 use crossterm::cursor::{Hide, MoveDown, MoveTo, MoveToColumn, MoveUp, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
-    MouseEvent, MouseEventKind,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::style::{Print, ResetColor};
-use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen,
+    LeaveAlternateScreen,
+};
 use crossterm::{execute, queue};
 use pi_rs::{Error, Result, Session};
 use serde_json::{Value, json};
@@ -31,7 +37,37 @@ use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::{Cli, TuiMode, process::Worker, radius_auth, sessions};
+use super::{Cli, Provider, TuiMode, process::Worker, radius_auth, sessions};
+
+// Shell output is displayed separately from the model-facing context framing.
+fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
+    // Finish stripping the untrusted output before adding host-generated
+    // status, so an unfinished escape cannot consume the status or path.
+    let mut output = crate::ui::render::strip_shell_ansi(&execution.output);
+    let status = if execution.cancelled {
+        Some("(cancelled)".to_owned())
+    } else {
+        execution
+            .exit_code
+            .filter(|code| *code != 0)
+            .map(|code| format!("(exit {code})"))
+    };
+    if let Some(status) = status {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&status);
+    }
+    if execution.truncated
+        && let Some(path) = &execution.full_output_path
+    {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&format!("Output truncated. Full output: {path}"));
+    }
+    output
+}
 
 pub(super) fn new_session_path() -> PathBuf {
     session_path(&std::env::current_dir().unwrap_or_default(), None)
@@ -99,13 +135,61 @@ struct Terminal {
     images: Cleanup,
     progress: Option<Instant>,
     #[cfg(any(unix, windows))]
-    color_queries: std::collections::VecDeque<ColorQuery>,
+    colors: ColorQueries,
     #[cfg(any(unix, windows))]
-    color_requery: bool,
-    #[cfg(any(unix, windows))]
-    expired_color_markers: usize,
+    appearance_notifications: bool,
     #[cfg(unix)]
     keyboard: KeyboardProtocol,
+    #[cfg(unix)]
+    _suspend_signal: Option<SuspendSignal>,
+}
+
+#[cfg(unix)]
+static SUSPEND_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+static TERMINAL_SIGNAL_WRITER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(unix)]
+extern "C" fn request_terminal_suspend(_: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    SUSPEND_REQUESTED.store(true, Ordering::Relaxed);
+    let fd = TERMINAL_SIGNAL_WRITER.load(Ordering::Relaxed);
+    // The signal registry keeps the nonblocking writer alive for the process.
+    if fd >= 0 {
+        let wake = [b'S'];
+        unsafe { libc::write(fd, wake.as_ptr().cast(), wake.len()) };
+    }
+}
+
+#[cfg(unix)]
+struct SuspendSignal(libc::sigaction);
+
+#[cfg(unix)]
+impl SuspendSignal {
+    fn install() -> std::io::Result<Self> {
+        // Restore the previous disposition when relinquishing the terminal.
+        // In particular, the editor and Ctrl+Z must still stop the job.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = request_terminal_suspend as *const () as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            let mut previous = std::mem::MaybeUninit::uninit();
+            if libc::sigaction(libc::SIGTSTP, &action, previous.as_mut_ptr()) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self(previous.assume_init()))
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SuspendSignal {
+    fn drop(&mut self) {
+        unsafe { libc::sigaction(libc::SIGTSTP, &self.0, std::ptr::null_mut()) };
+        SUSPEND_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(unix)]
@@ -114,29 +198,60 @@ enum KeyboardProtocol {
     Probing,
     Kitty,
     Xterm,
+    Disabled,
 }
 
 #[cfg(any(unix, windows))]
 struct ColorQuery {
     started: Instant,
     replied: u32,
+    quarantined: bool,
+    batch: crate::ui::terminal_color_batch::ColorBatch,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppearanceProbe {
+    WaitingForColors,
+    WaitingForMarker,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Default)]
+struct ColorQueries {
+    initial_started: Option<Instant>,
+    color_queries: std::collections::VecDeque<ColorQuery>,
+    color_requery: bool,
+    disabled: bool,
+    last_appearance_report: Option<bool>,
+    refresh_after_subscription: bool,
+    appearance_probe: Option<AppearanceProbe>,
 }
 
 impl Terminal {
-    fn enter(mode: Option<TuiMode>, images: Cleanup) -> Result<Self> {
+    fn enter(
+        mode: Option<TuiMode>,
+        images: Cleanup,
+        #[cfg(any(unix, windows))] previous_colors: Option<ColorQueries>,
+        #[cfg(any(unix, windows))] auto_appearance: bool,
+    ) -> Result<Self> {
+        #[cfg(unix)]
+        let suspend_signal = SuspendSignal::install()?;
         terminal::enable_raw_mode()?;
+        #[cfg(any(unix, windows))]
+        let initial_colors = previous_colors.is_none();
         let mut guard = Self {
             alternate: mode != Some(TuiMode::Regular),
             images,
             progress: None,
             #[cfg(any(unix, windows))]
-            color_queries: std::collections::VecDeque::new(),
+            colors: previous_colors.unwrap_or_default(),
             #[cfg(any(unix, windows))]
-            color_requery: false,
-            #[cfg(any(unix, windows))]
-            expired_color_markers: 0,
+            appearance_notifications: false,
             #[cfg(unix)]
             keyboard: KeyboardProtocol::Probing,
+            #[cfg(unix)]
+            _suspend_signal: Some(suspend_signal),
         };
         if guard.alternate {
             execute!(
@@ -151,11 +266,41 @@ impl Terminal {
         execute!(std::io::stdout(), Print("\x1b[>7u\x1b[?u"))?;
         #[cfg(any(unix, windows))]
         {
-            crate::ui::theme::reset_terminal_background();
-            execute!(std::io::stdout(), Print("\x1b[?2031h\x1b[?996n"))?;
-            guard.query_terminal_colors()?;
+            if initial_colors {
+                crate::ui::theme::reset_terminal_background();
+            }
+            guard.set_appearance_notifications(auto_appearance, &mut std::io::stdout())?;
+            guard.colors.query_terminal_colors(&mut std::io::stdout())?;
+        }
+        // Reentry disables color queries, so no DA1 will trigger the usual
+        // Xterm keyboard fallback. A later Kitty reply can still upgrade it.
+        #[cfg(unix)]
+        if guard.colors.disabled {
+            guard.keyboard_reply(false)?;
         }
         Ok(guard)
+    }
+
+    #[cfg(any(unix, windows))]
+    fn set_appearance_notifications(
+        &mut self,
+        enabled: bool,
+        output: &mut dyn Write,
+    ) -> Result<bool> {
+        if self.appearance_notifications == enabled {
+            return Ok(false);
+        }
+        self.appearance_notifications = enabled;
+        self.colors.appearance_probe =
+            (enabled && !self.colors.disabled).then_some(AppearanceProbe::WaitingForColors);
+        let command = if enabled {
+            "\x1b[?2031h\x1b[?996n"
+        } else {
+            "\x1b[?2031l"
+        };
+        output.write_all(command.as_bytes())?;
+        output.flush()?;
+        Ok(true)
     }
 
     fn switch_mode(&mut self, alternate: bool, view: &mut View) -> Result<()> {
@@ -187,79 +332,6 @@ impl Terminal {
         view.scrollbar_dragging = false;
         Ok(())
     }
-    #[cfg(any(unix, windows))]
-    fn query_terminal_colors(&mut self) -> Result<()> {
-        // Serialize queries so that replies remain attributable when DA1 is absent.
-        if let Some(query) = self.color_queries.front() {
-            self.color_requery = true;
-            if query.replied == (1 << 18) - 1 {
-                self.expired_color_markers = self.expired_color_markers.saturating_add(1);
-                return self.finish_color_query();
-            }
-            return Ok(());
-        }
-        self.color_queries.push_back(ColorQuery {
-            started: Instant::now(),
-            replied: 0,
-        });
-        let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
-        for index in 0..16 {
-            query.push_str(&format!("\x1b]4;{index};?\x07"));
-        }
-        query.push_str("\x1b[c");
-        execute!(std::io::stdout(), Print(query))?;
-        Ok(())
-    }
-
-    #[cfg(any(unix, windows))]
-    fn accepts_color_reply(&mut self, target: u8) -> Result<bool> {
-        let is_latest = !self.color_requery;
-        let Some(query) = self.color_queries.front_mut() else {
-            return Ok(false);
-        };
-        let flag = 1_u32 << target;
-        let fresh = query.replied & flag == 0;
-        query.replied |= flag;
-        if query.replied == (1 << 18) - 1 && self.color_requery {
-            self.expired_color_markers = self.expired_color_markers.saturating_add(1);
-            self.finish_color_query()?;
-        }
-        Ok(is_latest && fresh)
-    }
-
-    #[cfg(any(unix, windows))]
-    fn finish_color_query(&mut self) -> Result<()> {
-        self.color_queries.pop_front();
-        if std::mem::take(&mut self.color_requery) {
-            self.query_terminal_colors()?;
-        }
-        Ok(())
-    }
-
-    #[cfg(any(unix, windows))]
-    fn receive_color_marker(&mut self) -> Result<()> {
-        if self.expired_color_markers > 0 {
-            self.expired_color_markers -= 1;
-            Ok(())
-        } else {
-            self.finish_color_query()
-        }
-    }
-
-    #[cfg(any(unix, windows))]
-    fn poll_color_timeout(&mut self) -> Result<()> {
-        if self.color_requery
-            && self
-                .color_queries
-                .front()
-                .is_some_and(|query| query.started.elapsed() >= Duration::from_secs(2))
-        {
-            self.expired_color_markers = self.expired_color_markers.saturating_add(1);
-            self.finish_color_query()?;
-        }
-        Ok(())
-    }
-
     fn update_progress(&mut self, active: bool) -> Result<()> {
         if active
             && self
@@ -288,7 +360,26 @@ impl Terminal {
         Ok(())
     }
     #[cfg(unix)]
+    fn disable_keyboard_protocol(&mut self) {
+        if self.keyboard == KeyboardProtocol::Disabled {
+            return;
+        }
+        if self.keyboard == KeyboardProtocol::Xterm {
+            let _ = execute!(std::io::stdout(), Print("\x1b[>4;0m"));
+        }
+        let _ = execute!(std::io::stdout(), Print("\x1b[<u"));
+        self.keyboard = KeyboardProtocol::Disabled;
+    }
+    #[cfg(unix)]
     fn suspend(guard: &mut Option<Self>, mode: Option<TuiMode>, images: Cleanup) -> Result<()> {
+        let auto_appearance = guard
+            .as_ref()
+            .is_some_and(|terminal| terminal.appearance_notifications);
+        let colors = guard.as_mut().map(|terminal| {
+            let mut colors = std::mem::take(&mut terminal.colors);
+            colors.disable_after_handoff();
+            colors
+        });
         drop(guard.take());
         // The foreground job owns this process group, including its frontend worker.
         let result = unsafe {
@@ -312,10 +403,169 @@ impl Terminal {
                 }
             }
         };
-        *guard = Some(Self::enter(mode, images)?);
+        *guard = Some(Self::enter(mode, images, colors, auto_appearance)?);
         result.map_err(Error::Io)
     }
 }
+#[cfg(any(unix, windows))]
+impl ColorQueries {
+    fn query_terminal_colors(&mut self, output: &mut dyn Write) -> Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+        // Only DA1 separates consecutive queries. All color replies alone do not
+        // establish whether a late marker belongs to this request or the next.
+        if let Some(query) = self.color_queries.front() {
+            if !query.quarantined {
+                self.color_requery = true;
+            }
+            return Ok(());
+        }
+        let started = Instant::now();
+        self.initial_started.get_or_insert(started);
+        self.color_queries.push_back(ColorQuery {
+            started,
+            replied: 0,
+            quarantined: false,
+            batch: crate::ui::terminal_color_batch::ColorBatch::new(started),
+        });
+        if self.appearance_probe == Some(AppearanceProbe::WaitingForColors) {
+            self.appearance_probe = Some(AppearanceProbe::WaitingForMarker);
+        }
+        let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07");
+        for index in 0..16 {
+            query.push_str(&format!("\x1b]4;{index};?\x07"));
+        }
+        query.push_str("\x1b[c");
+        output.write_all(query.as_bytes())?;
+        output.flush()?;
+        Ok(())
+    }
+
+    fn refresh_after_appearance_subscription(&mut self, output: &mut dyn Write) -> Result<()> {
+        // When OSC queries are disabled after a handoff, the first report
+        // after switching from a fixed theme is the freshest appearance we have.
+        self.refresh_after_subscription = self.disabled;
+        self.query_terminal_colors(output)
+    }
+
+    fn appearance_report(&mut self, dark: bool, output: &mut dyn Write) -> Result<bool> {
+        let previous = self.last_appearance_report.replace(dark);
+        // The first report before the matching color query's DA1 may answer
+        // the explicit appearance probe. That query already refreshes colors.
+        if self.appearance_probe.take().is_none() {
+            self.query_terminal_colors(output)?;
+        }
+        Ok(std::mem::take(&mut self.refresh_after_subscription)
+            || previous.is_some_and(|value| value != dark))
+    }
+
+    fn accepts_color_reply(&mut self, target: u8, _output: &mut dyn Write) -> Result<bool> {
+        let Some(query) = self.color_queries.front_mut() else {
+            return Ok(false);
+        };
+        let is_latest = !self.color_requery && !query.quarantined;
+        let flag = 1_u32 << target;
+        let fresh = query.replied & flag == 0;
+        query.replied |= flag;
+        Ok(is_latest && fresh)
+    }
+
+    fn record_color(
+        &mut self,
+        target: u8,
+        rgb: [u8; 3],
+        output: &mut dyn Write,
+    ) -> Result<Option<crate::ui::terminal_color_batch::ColorSnapshot>> {
+        if !self.accepts_color_reply(target, output)? {
+            return Ok(None);
+        }
+        Ok(self
+            .color_queries
+            .front_mut()
+            .and_then(|query| query.batch.record(target, Some(rgb))))
+    }
+
+    fn record_invalid_color(
+        &mut self,
+        target: u8,
+        output: &mut dyn Write,
+    ) -> Result<Option<crate::ui::terminal_color_batch::ColorSnapshot>> {
+        if !self.accepts_color_reply(target, output)? {
+            return Ok(None);
+        }
+        Ok(self
+            .color_queries
+            .front_mut()
+            .and_then(|query| query.batch.record(target, None)))
+    }
+
+    fn timeout_color_batch(
+        &mut self,
+        now: Instant,
+    ) -> Option<crate::ui::terminal_color_batch::ColorSnapshot> {
+        let query = self.color_queries.front_mut()?;
+        let snapshot = query.batch.timeout(now);
+        if self.color_requery || query.quarantined {
+            None
+        } else {
+            snapshot
+        }
+    }
+
+    fn finish_color_query(&mut self, output: &mut dyn Write) -> Result<()> {
+        self.color_queries.pop_front();
+        if self.appearance_probe == Some(AppearanceProbe::WaitingForMarker) {
+            self.appearance_probe = None;
+        }
+        if std::mem::take(&mut self.color_requery) {
+            self.query_terminal_colors(output)?;
+        }
+        Ok(())
+    }
+
+    fn receive_color_marker(
+        &mut self,
+        output: &mut dyn Write,
+    ) -> Result<Option<crate::ui::terminal_color_batch::ColorSnapshot>> {
+        if self.disabled {
+            return Ok(None);
+        }
+        let snapshot = self.color_queries.front_mut().and_then(|query| {
+            let snapshot = query.batch.finish();
+            if self.color_requery || query.quarantined {
+                None
+            } else {
+                snapshot
+            }
+        });
+        self.finish_color_query(output)?;
+        Ok(snapshot)
+    }
+
+    fn disable_after_handoff(&mut self) {
+        // Another terminal owner may consume our marker or leave its own.
+        // Neither can be attributed reliably once ownership has changed.
+        self.color_queries.clear();
+        self.color_requery = false;
+        self.appearance_probe = None;
+        self.disabled = true;
+    }
+
+    fn poll_color_timeout(&mut self) -> Result<()> {
+        if self.color_requery
+            && let Some(query) = self.color_queries.front_mut()
+            && !query.quarantined
+            && query.started.elapsed() >= Duration::from_secs(2)
+        {
+            // A timeout is not a response boundary. Keep the refresh queued
+            // until DA1, and reject stale color replies in the meantime.
+            query.quarantined = true;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for Terminal {
     fn drop(&mut self) {
         let _ = self.update_progress(false);
@@ -323,14 +573,11 @@ impl Drop for Terminal {
             self.images.clear();
         }
         #[cfg(unix)]
-        {
-            if self.keyboard == KeyboardProtocol::Xterm {
-                let _ = execute!(std::io::stdout(), Print("\x1b[>4;0m"));
-            }
-            let _ = execute!(std::io::stdout(), Print("\x1b[<u"));
-        }
+        self.disable_keyboard_protocol();
         #[cfg(any(unix, windows))]
-        let _ = execute!(std::io::stdout(), Print("\x1b[?2031l"));
+        {
+            let _ = self.set_appearance_notifications(false, &mut std::io::stdout());
+        }
         let _ = execute!(std::io::stdout(), ResetColor, Show, DisableBracketedPaste);
         if self.alternate {
             let _ = execute!(
@@ -343,6 +590,79 @@ impl Drop for Terminal {
             let _ = execute!(std::io::stdout(), Print("\r\n"));
         }
         let _ = terminal::disable_raw_mode();
+    }
+}
+
+// On Windows, Crossterm may execute commands through the console API instead of
+// writing escape sequences. Keep the writer live there so its flush before a
+// console API call also flushes all preceding text.
+struct FrameWriter<W: Write> {
+    output: W,
+    buffer: Option<Vec<u8>>,
+    armed: bool,
+}
+
+fn synchronized_updates_supported() -> bool {
+    #[cfg(windows)]
+    {
+        crossterm::ansi_support::supports_ansi()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+impl<W: Write> FrameWriter<W> {
+    fn new(output: W, buffered: bool, synchronized: bool) -> std::io::Result<Self> {
+        let mut frame = Self {
+            output,
+            buffer: buffered.then(Vec::new),
+            armed: synchronized,
+        };
+        if synchronized {
+            queue!(frame, BeginSynchronizedUpdate)?;
+        }
+        Ok(frame)
+    }
+
+    fn finish(mut self) -> std::io::Result<()> {
+        if self.armed {
+            queue!(self, EndSynchronizedUpdate)?;
+        }
+        if let Some(buffer) = self.buffer.take() {
+            self.output.write_all(&buffer)?;
+        }
+        self.output.flush()?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for FrameWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match &mut self.buffer {
+            Some(buffer) => buffer.write(bytes),
+            None => self.output.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.buffer {
+            Some(buffer) => buffer.flush(),
+            None => self.output.flush(),
+        }
+    }
+}
+
+impl<W: Write> Drop for FrameWriter<W> {
+    fn drop(&mut self) {
+        if self.armed {
+            // A partial write may already have enabled synchronized updates.
+            // Preserve the original error and make a best-effort recovery.
+            let _ = queue!(self.output, EndSynchronizedUpdate);
+            let _ = self.output.flush();
+        }
     }
 }
 
@@ -372,7 +692,41 @@ enum LocalEditor {
     Setting(String),
     BranchSummary(u64),
     ProviderKey(super::Provider),
+    VertexLogin(VertexLoginField),
+    CloudflareLogin(CloudflareLoginField),
+    CopilotEnterpriseDomain,
+    BedrockProfile,
+    BedrockChain,
     OpenRouterCode(Option<tokio::sync::oneshot::Sender<String>>),
+    AnthropicCode(Option<tokio::sync::oneshot::Sender<String>>),
+    CodexCode(Option<tokio::sync::oneshot::Sender<String>>),
+}
+
+enum VertexLoginField {
+    Project {
+        service_account: bool,
+    },
+    Location {
+        project: String,
+        service_account: bool,
+    },
+    CredentialsPath {
+        project: String,
+        location: String,
+    },
+}
+
+enum CloudflareLoginField {
+    Key(super::Provider),
+    Account {
+        provider: super::Provider,
+        key: String,
+    },
+    Gateway {
+        provider: super::Provider,
+        key: String,
+        account: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -392,9 +746,9 @@ struct ThemeSettings {
     stage: ThemeSettingsStage,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ModelListIntent {
-    Select,
+    Select { query: String },
     Cycle { reverse: bool },
     Scope,
     ThinkingSettings,
@@ -408,10 +762,13 @@ struct ModelDiscovery {
 struct ThinkingSettings {
     parent: Picker,
     models: Vec<String>,
+    // The open picker reflects live choices even when project settings win on reload.
+    overrides: serde_json::Map<String, Value>,
     model_picker: Option<Picker>,
     selected: Option<String>,
-    levels: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    levels: Option<std::sync::mpsc::Receiver<(Vec<String>, Option<bool>)>>,
     available_levels: Vec<String>,
+    available_reasoning: Option<bool>,
 }
 
 struct PendingThinking {
@@ -424,9 +781,227 @@ struct PendingThinking {
 
 enum RemoteEvent {
     Notice(String),
+    DeviceCode { url: String, code: String },
     OpenRouterCode(tokio::sync::oneshot::Sender<String>),
+    AnthropicCode(tokio::sync::oneshot::Sender<String>),
+    CodexCode(tokio::sync::oneshot::Sender<String>),
+    ForgetModelKey(&'static str),
     RefreshModelKeys,
     Finished(Result<Vec<String>>),
+}
+
+struct AuthReload {
+    revision: String,
+    receiver: std::sync::mpsc::Receiver<Result<super::model_auth::Keys>>,
+    _cancel: tokio::sync::oneshot::Sender<()>,
+}
+impl AuthReload {
+    fn start(revision: String) -> Self {
+        Self::start_path(revision, crate::config::agent_dir().join("auth.json"))
+    }
+
+    fn start_path(revision: String, path: PathBuf) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancelled => Ok(None),
+                        result = super::model_auth::Keys::load_path_async(&path) => result.map(Some),
+                    }
+                })
+            })();
+            match result {
+                Ok(Some(keys)) => {
+                    let _ = sender.send(Ok(keys));
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                }
+                Ok(None) => (),
+            }
+        });
+        Self {
+            revision,
+            receiver,
+            _cancel: cancel,
+        }
+    }
+}
+
+static EXTERNAL_EDITOR_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static TERMINAL_SIGNAL_DELIVERIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(test, unix))]
+static TERMINAL_SIGNAL_READER_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Result<()> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
+
+    let (mut reader, writer) = std::os::unix::net::UnixStream::pair()?;
+    writer.set_nonblocking(true)?;
+    let signal_fd = writer.as_raw_fd();
+    // Capture the editor state in the signal handler, not later on the reader
+    // thread. write(2) is async-signal-safe and the stream stays registered
+    // for the lifetime of the process.
+    let id = unsafe {
+        signal_hook_registry::register(libc::SIGINT, move || {
+            if !EXTERNAL_EDITOR_ACTIVE.load(Ordering::SeqCst) {
+                let byte = [b'I'];
+                libc::write(writer.as_raw_fd(), byte.as_ptr().cast(), byte.len());
+            }
+            #[cfg(test)]
+            TERMINAL_SIGNAL_DELIVERIES.fetch_add(1, Ordering::SeqCst);
+        })
+    }?;
+    if let Err(error) = std::thread::Builder::new()
+        .name("pi-terminal-signal".into())
+        .spawn(move || {
+            let mut buffer = [0_u8; 64];
+            loop {
+                #[cfg(test)]
+                while TERMINAL_SIGNAL_READER_PAUSED.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        if buffer[..count].contains(&b'I') {
+                            super::process::TERMINAL_INTERRUPTED.store(true, Ordering::SeqCst);
+                        }
+                        notify.notify_one();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+    {
+        signal_hook_registry::unregister(id);
+        return Err(error.into());
+    }
+    TERMINAL_SIGNAL_WRITER.store(signal_fd, Ordering::Relaxed);
+    super::process::TERMINAL_SIGNAL_ENABLED.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+#[cfg(windows)]
+static WINDOWS_TERMINAL_NOTIFY: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Weak<tokio::sync::Notify>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+unsafe extern "system" fn terminal_console_signal(event: u32) -> i32 {
+    use std::sync::atomic::Ordering;
+    if event != windows_sys::Win32::System::Console::CTRL_C_EVENT {
+        return 0;
+    }
+    if !EXTERNAL_EDITOR_ACTIVE.load(Ordering::SeqCst) {
+        super::process::TERMINAL_INTERRUPTED.store(true, Ordering::SeqCst);
+        if let Some(notify) = WINDOWS_TERMINAL_NOTIFY
+            .get()
+            .and_then(|slot| slot.lock().ok())
+            .and_then(|slot| slot.as_ref().and_then(std::sync::Weak::upgrade))
+        {
+            notify.notify_one();
+        }
+    }
+    #[cfg(test)]
+    TERMINAL_SIGNAL_DELIVERIES.fetch_add(1, Ordering::SeqCst);
+    1
+}
+
+#[cfg(windows)]
+fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let slot = WINDOWS_TERMINAL_NOTIFY.get_or_init(Default::default);
+    *slot.lock().expect("terminal notification lock") = Some(std::sync::Arc::downgrade(&notify));
+    // Console control callbacks run on a Windows-created thread, so the state
+    // is sampled when the event is delivered rather than by a later Tokio poll.
+    if unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(terminal_console_signal), 1)
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    super::process::TERMINAL_SIGNAL_ENABLED.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn install_terminal_signal(notify: std::sync::Arc<tokio::sync::Notify>) -> Result<()> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("pi-terminal-signal".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                #[cfg(unix)]
+                let signals =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
+                #[cfg(windows)]
+                let signals = tokio::signal::windows::ctrl_c();
+                #[cfg(any(unix, windows))]
+                {
+                    let mut signals = match signals {
+                        Ok(signals) => signals,
+                        Err(error) => {
+                            let _ = sender.send(Err(error));
+                            return;
+                        }
+                    };
+                    let _ = sender.send(Ok(()));
+                    while signals.recv().await.is_some() {
+                        if !EXTERNAL_EDITOR_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+                            super::process::TERMINAL_INTERRUPTED
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            notify.notify_one();
+                        }
+                        #[cfg(test)]
+                        TERMINAL_SIGNAL_DELIVERIES
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    let _ = sender.send(Ok(()));
+                    while tokio::signal::ctrl_c().await.is_ok() {
+                        if !EXTERNAL_EDITOR_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+                            super::process::TERMINAL_INTERRUPTED
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            notify.notify_one();
+                        }
+                    }
+                }
+            });
+        })?;
+    receiver
+        .recv()
+        .map_err(|_| Error::Config("terminal signal listener stopped".into()))??;
+    super::process::TERMINAL_SIGNAL_ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
 }
 
 struct RemoteTask {
@@ -434,7 +1009,12 @@ struct RemoteTask {
     cancelled: &'static str,
     started: Instant,
     receiver: std::sync::mpsc::Receiver<RemoteEvent>,
+    device_code: Option<(String, String)>,
+    device_copy: Option<std::sync::mpsc::Receiver<bool>>,
+    device_cancel: pi_rs::CancellationToken,
     _cancel: tokio::sync::oneshot::Sender<()>,
+    logout_control: Option<super::chatgpt_auth::LogoutControl>,
+    meta_login_control: Option<super::meta_auth::LoginControl>,
 }
 
 impl RemoteTask {
@@ -473,50 +1053,191 @@ impl RemoteTask {
             cancelled,
             started: Instant::now(),
             receiver,
+            device_code: None,
+            device_copy: None,
+            device_cancel: pi_rs::CancellationToken::new(),
             _cancel: cancel,
+            logout_control: None,
+            meta_login_control: None,
         }
     }
+
+    fn cancel_before_commit(&self) -> bool {
+        self.logout_control
+            .as_ref()
+            .is_none_or(|control| control.cancel_before_commit())
+            && self
+                .meta_login_control
+                .as_ref()
+                .is_none_or(|control| control.cancel_before_commit())
+    }
+}
+
+impl Drop for RemoteTask {
+    fn drop(&mut self) {
+        self.device_cancel.cancel();
+    }
+}
+
+async fn run_device_side_effect<T>(
+    cancel: pi_rs::CancellationToken,
+    action: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        result = action => Some(result),
+    }
+}
+
+struct PendingShare {
+    id: uuid::Uuid,
+    destination: sessions::ShareDestination,
+    path: PathBuf,
+    workspace: PathBuf,
+    started: Instant,
+}
+
+fn start_share_upload(
+    view: &mut View,
+    pending: PendingShare,
+    snapshot: Option<sessions::ShareSnapshot>,
+) {
+    let PendingShare {
+        destination,
+        path,
+        workspace,
+        ..
+    } = pending;
+    let status = destination.status();
+    view.remote_task = Some(RemoteTask::start(
+        status,
+        "Share cancelled",
+        move |_| async move {
+            let session = Session::snapshot(path)?;
+            let shared = destination.share(session, &workspace, snapshot).await?;
+            let mut lines = vec![format!("Share URL: {}", shared.url)];
+            if let Some(gist) = shared.gist {
+                lines.push(format!("Gist: {gist}"));
+            }
+            Ok(lines)
+        },
+    ));
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TranscriptPanel {
     Summary(u64),
     Skill(usize),
+    Thinking(usize),
+    StreamingThinking,
 }
 
 #[derive(Default)]
 struct StreamingTool {
     name: String,
-    arguments: crate::streaming_json::StreamingJson,
+    arguments: crate::StreamingJson,
     preview: Value,
 }
 
 type LinkRow = (u16, Vec<(std::ops::Range<usize>, String)>);
 
+struct TreeNavigationHandoff {
+    id: u64,
+    summarize: bool,
+    instructions: Option<String>,
+    clear_id: Option<uuid::Uuid>,
+}
+
+struct TranscriptExtensionRenderPending {
+    request: uuid::Uuid,
+    record: u64,
+    options: pi_rs::CustomMessageRenderOptions,
+}
+
+enum MarkdownTarget {
+    Recorded(usize),
+    StreamingAssistant,
+    StreamingThinking,
+}
+
+struct MarkdownPending {
+    request: uuid::Uuid,
+    target: MarkdownTarget,
+    context: pi_rs::MarkdownTransformContext,
+    original: String,
+}
+
+fn markdown_input(text: &str, kind: pi_rs::MarkdownMessageType) -> Option<&str> {
+    if text.len() > pi_rs::MarkdownTransformers::MAX_MARKDOWN_BYTES {
+        return None;
+    }
+    let text = match kind {
+        pi_rs::MarkdownMessageType::User => text,
+        _ => text.trim_matches(super::resources::is_prompt_space),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+struct LiveModelChoice {
+    id: uuid::Uuid,
+    selected: Cli,
+    status: String,
+    persist: Option<SelectionDefault>,
+}
+
+enum SelectionDefault {
+    Model,
+    Thinking(String),
+}
+
 #[derive(Default)]
 struct View {
+    live_model_choices: VecDeque<LiveModelChoice>,
+    live_model_applied: Option<Cli>,
+    async_transitions: bool,
+    pending_transition: Option<std::sync::mpsc::Receiver<Result<Cli>>>,
     regular: RegularState,
     graphics: Renderer,
     dialogs: std::collections::VecDeque<crate::ui::dialog::Dialog>,
+    pending_terminal_title: Option<String>,
     local_editor: Option<(LocalEditor, crate::ui::dialog::Dialog)>,
     tree_confirmation: Option<u64>,
     tree_navigation: Option<(u64, bool)>,
+    tree_handoff: Option<TreeNavigationHandoff>,
     branch_error: Option<String>,
     ui_status: std::collections::BTreeMap<String, String>,
-    widgets: std::collections::BTreeMap<String, (Vec<String>, pi_rs::WidgetPlacement)>,
+    widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
     lines: Vec<Entry>,
+    custom_entry_count: usize,
+    custom_render_options: Option<pi_rs::CustomMessageRenderOptions>,
+    custom_render_attempted: BTreeSet<u64>,
+    custom_render_pending: Option<TranscriptExtensionRenderPending>,
+    custom_render_redraw_at: Option<Instant>,
+    markdown_pending: Option<MarkdownPending>,
+    markdown_assistant: Option<TranscriptMarkdown>,
+    markdown_thinking: Option<TranscriptMarkdown>,
     picker: Option<Picker>,
     theme_settings: Option<ThemeSettings>,
+    theme_refresh_requested: bool,
     thinking_settings: Option<ThinkingSettings>,
+    warning_settings_parent: Option<Picker>,
+    anthropic_subscription_warning_shown: bool,
     pending_thinking: Option<PendingThinking>,
     session_name: Option<String>,
     resources: super::resources::Resources,
     model_list: Option<ModelDiscovery>,
     remote_task: Option<RemoteTask>,
+    pending_share: Option<PendingShare>,
     available_models: Vec<String>,
     pending_request: Option<Value>,
     pending_session_name: Option<Option<String>>,
     thinking: String,
+    thinking_expanded: Option<bool>,
+    thinking_items: std::collections::BTreeMap<u64, String>,
+    text_items: std::collections::BTreeMap<u64, String>,
+    thinking_items_consistent: bool,
+    text_items_consistent: bool,
     expand_tools: bool,
     expand_key: Option<crossterm::event::KeyEvent>,
     panel_rows: Vec<(std::ops::Range<usize>, TranscriptPanel)>,
@@ -551,8 +1272,28 @@ struct View {
     request_started: Option<Instant>,
     phase: Option<&'static str>,
     shell_running: bool,
-    restoring_queue: bool,
+    queue_restores: std::collections::HashMap<uuid::Uuid, bool>,
 }
+fn append_indexed(
+    items: &mut std::collections::BTreeMap<u64, String>,
+    combined: &mut String,
+    consistent: &mut bool,
+    index: u64,
+    delta: &str,
+) {
+    let append = *consistent
+        && items
+            .last_key_value()
+            .is_none_or(|(&last, _)| index >= last);
+    items.entry(index).or_default().push_str(delta);
+    if append {
+        combined.push_str(delta);
+    } else {
+        *combined = items.values().cloned().collect();
+        *consistent = true;
+    }
+}
+
 impl View {
     fn invalidate_model_catalog(&mut self) {
         self.available_models.clear();
@@ -578,6 +1319,7 @@ impl View {
             }
             Some(Entry::Tool {
                 id: String::new(),
+                call_id: None,
                 name: if tool.name.is_empty() {
                     "tool".into()
                 } else {
@@ -597,11 +1339,44 @@ impl View {
         })
     }
 
+    fn share_blocks_input(&self) -> bool {
+        self.pending_share.is_some() && self.dialogs.is_empty() && self.local_editor.is_none()
+    }
+
+    fn take_share_response(
+        &mut self,
+        value: &Value,
+    ) -> Option<(PendingShare, Option<sessions::ShareSnapshot>)> {
+        if value["type"] != "response"
+            || value["command"] != "get_share_context"
+            || !self
+                .pending_share
+                .as_ref()
+                .is_some_and(|pending| value["id"] == json!(pending.id))
+        {
+            return None;
+        }
+        let snapshot = (value["success"] == true)
+            .then(|| serde_json::from_value(value["data"].clone()).ok())
+            .flatten();
+        Some((self.pending_share.take().expect("matching share"), snapshot))
+    }
+
     fn dialog(&self) -> Option<&crate::ui::dialog::Dialog> {
         self.local_editor
             .as_ref()
             .map(|(_, dialog)| dialog)
             .or_else(|| self.dialogs.front())
+    }
+    fn dialog_mut(&mut self) -> Option<&mut crate::ui::dialog::Dialog> {
+        if let Some((_, dialog)) = &mut self.local_editor {
+            Some(dialog)
+        } else {
+            self.dialogs.front_mut()
+        }
+    }
+    fn cancel_extension_dialog(&mut self, id: &Value) {
+        self.dialogs.retain(|dialog| json!(dialog.id) != *id);
     }
     fn ui_request(&mut self, value: &Value) -> Result<Option<(uuid::Uuid, pi_rs::UiResponse)>> {
         let id: uuid::Uuid = serde_json::from_value(value["id"].clone())?;
@@ -628,24 +1403,21 @@ impl View {
                 lines,
                 placement,
             } => {
-                if lines.is_some() && !self.widgets.contains_key(&key) && self.widgets.len() >= 64 {
+                if lines.is_some()
+                    && !self.widgets.iter().any(|(existing, _, _)| existing == &key)
+                    && self.widgets.len() >= 64
+                {
                     return Err(Error::Config("too many extension widgets".into()));
                 }
+                self.widgets.retain(|(existing, _, _)| existing != &key);
                 if let Some(lines) = lines {
-                    self.widgets.insert(key, (lines, placement));
-                } else {
-                    self.widgets.remove(&key);
+                    self.widgets.push((key, lines, placement));
                 }
             }
-            pi_rs::UiRequest::SetTitle { title } => execute!(
-                std::io::stdout(),
-                crossterm::terminal::SetTitle(
-                    title
-                        .chars()
-                        .filter(|character| !character.is_control())
-                        .collect::<String>()
-                )
-            )?,
+            pi_rs::UiRequest::SetTitle { mut title } => {
+                title.retain(|character| !character.is_control());
+                self.pending_terminal_title = Some(title);
+            }
             pi_rs::UiRequest::SetEditorText { text } => self.editor.replace(text),
             pi_rs::UiRequest::GetEditorText => {
                 return Ok(Some((
@@ -668,11 +1440,17 @@ impl View {
         placement: pi_rs::WidgetPlacement,
     ) -> Vec<Line> {
         self.widgets
-            .values()
-            .filter(|(_, location)| *location == placement)
-            .flat_map(|(lines, _)| lines.iter())
+            .iter()
+            .filter(|(_, _, location)| *location == placement)
+            .flat_map(|(_, lines, _)| {
+                lines
+                    .iter()
+                    .take(10)
+                    .map(String::as_str)
+                    .chain((lines.len() > 10).then_some("... (widget truncated)"))
+            })
             .flat_map(|text| {
-                Entry::Notice(text.clone()).render(
+                Entry::Notice(text.to_owned()).render(
                     theme,
                     width,
                     false,
@@ -717,6 +1495,8 @@ impl View {
                 task.status,
                 task.started.elapsed().as_secs_f32()
             )
+        } else if self.pending_share.is_some() {
+            "Preparing share · Esc cancels · ".into()
         } else if self.clipboard.is_some() {
             "Reading clipboard · ".into()
         } else if !self.draft_images.is_empty() {
@@ -742,7 +1522,7 @@ impl View {
         let (sender, receiver) = std::sync::mpsc::channel();
         self.clipboard = Some(receiver);
         let auto_resize = args.settings.resize_model_images();
-        let profile = args.model_image_resize();
+        let profile = self.accepted_model(args).model_image_resize();
         std::thread::spawn(move || {
             let _ = sender.send(super::clipboard::read(auto_resize, profile));
         });
@@ -798,25 +1578,139 @@ impl View {
         true
     }
     fn append(&mut self, text: &str) {
-        self.lines.push(Entry::Notice(clean(text)));
-        if self.lines.len() > 4000 {
-            let removed = self.lines.len() - 4000;
-            self.lines.drain(..removed);
-            self.regular.committed = self.regular.committed.saturating_sub(removed);
+        // Keep U+0085 for transcript search only. Span rendering strips it
+        // before terminal output, as it does for other control characters.
+        let text = text
+            .chars()
+            .filter(|character| {
+                !character.is_control() || matches!(*character, '\n' | '\t' | '\u{85}')
+            })
+            .collect();
+        self.append_entry(Entry::Notice(text));
+    }
+    fn show_status(&mut self, mode: Option<TuiMode>, status: String) {
+        if (mode != Some(TuiMode::Regular) || self.regular.committed < self.lines.len())
+            && let Some(Entry::Status(previous)) = self.lines.last_mut()
+        {
+            *previous = status;
+        } else {
+            self.append_entry(Entry::Status(status));
         }
     }
-    fn show_custom_message(&mut self, message: &pi_rs::CustomMessage) {
+
+    fn append_entry(&mut self, entry: Entry) {
+        self.lines.push(entry);
+        let ordinary = self.lines.len() - self.custom_entry_count;
+        let excess = ordinary.saturating_sub(4000);
+        if excess == 0 {
+            return;
+        }
+        let removed = if self.custom_entry_count == 0 {
+            excess
+        } else {
+            self.lines
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| !matches!(entry, Entry::CustomRecord { .. }))
+                .nth(excess - 1)
+                .expect("ordinary transcript entries")
+                .0
+                + 1
+        };
+        for entry in self.lines.drain(..removed) {
+            match entry {
+                Entry::CustomRecord { id, .. } => {
+                    self.custom_entry_count -= 1;
+                    self.custom_render_attempted.remove(&id);
+                }
+                Entry::CustomMessage { id, .. } => {
+                    self.custom_render_attempted.remove(&id);
+                }
+                _ => {}
+            }
+        }
+        self.regular.committed = self.regular.committed.saturating_sub(removed);
+    }
+
+    fn show_custom_entry(&mut self, id: u64, entry: &pi_rs::CustomEntry) {
+        // Keep metadata-only placeholders out of the ordinary transcript limit
+        // while waiting for extensions to finish their startup discovery.
+        if self.custom_entry_count == 4000 {
+            let oldest = self
+                .lines
+                .iter()
+                .position(|line| {
+                    matches!(line, Entry::CustomRecord { presentation, .. }
+                        if *presentation != CustomEntryPresentation::Included)
+                })
+                .or_else(|| {
+                    self.lines
+                        .iter()
+                        .position(|line| matches!(line, Entry::CustomRecord { .. }))
+                })
+                .expect("retained custom entry");
+            let Entry::CustomRecord { id, rendered, .. } = self.lines.remove(oldest) else {
+                unreachable!("custom entry position")
+            };
+            self.custom_render_attempted.remove(&id);
+            if oldest < self.regular.committed {
+                self.regular.committed -= 1;
+                self.regular.redraw |= rendered.is_some();
+            }
+        } else {
+            self.custom_entry_count += 1;
+        }
+        self.lines.push(Entry::CustomRecord {
+            id,
+            custom_type: entry.custom_type.clone(),
+            presentation: CustomEntryPresentation::Pending,
+            rendered: None,
+        });
+    }
+
+    fn maybe_warn_about_anthropic_subscription(&mut self, args: &Cli) {
+        if self.anthropic_subscription_warning_shown
+            || !args.settings.warn_anthropic_extra_usage()
+            || args.provider != Provider::Anthropic
+            || args
+                .model_profiles
+                .model_adapter(&args.provider, &args.model)
+                != super::providers::Adapter::Anthropic
+        {
+            return;
+        }
+        let endpoint = args.model_endpoint_for(&args.provider, Some(&args.model));
+        if endpoint != Provider::Anthropic.default_endpoint() {
+            return;
+        }
+        let credential = args.model_credential_for(&args.provider, endpoint);
+        let uses_subscription = match credential {
+            Some(super::model_auth::Credential::AnthropicOAuth) => true,
+            Some(credential) => credential
+                .literal()
+                .is_some_and(|token| token.starts_with("sk-ant-oat")),
+            None => false,
+        };
+        if uses_subscription {
+            self.anthropic_subscription_warning_shown = true;
+            self.append_entry(Entry::Warning(
+                "Anthropic subscription auth is active. Requests may use paid extra usage. Manage extra usage at https://claude.ai/settings/usage. Disable this warning in /settings.".into(),
+            ));
+        }
+    }
+
+    fn show_custom_message(&mut self, id: u64, message: &pi_rs::CustomMessage) {
         if !message.display {
             return;
         }
-        let mut text = String::new();
+        let mut text = Vec::new();
         let mut images = Vec::new();
         match &message.content {
-            pi_rs::ContextContent::Text(value) => text.push_str(value),
+            pi_rs::ContextContent::Text(value) => text.push(value.as_str()),
             pi_rs::ContextContent::Blocks(blocks) => {
                 for block in blocks {
                     match block {
-                        pi_rs::ContentBlock::Text { text: value } => text.push_str(value),
+                        pi_rs::ContentBlock::Text { text: value, .. } => text.push(value.as_str()),
                         pi_rs::ContentBlock::Image { data, mime_type } => {
                             images.push(pi_rs::ImageContent {
                                 data: data.clone(),
@@ -828,11 +1722,347 @@ impl View {
                 }
             }
         }
-        self.append(&format!("{}: {}", message.custom_type, text));
+        self.append_entry(Entry::CustomMessage {
+            id,
+            rendered: None,
+            custom_type: message.custom_type.clone(),
+            text: text.join("\n"),
+        });
         if !images.is_empty() {
             self.add_images(&images);
         }
     }
+    fn refresh_transcript_extension_renderers(&mut self) -> bool {
+        self.custom_render_pending = None;
+        for line in &mut self.lines {
+            if let Entry::CustomRecord { presentation, .. } = line {
+                *presentation = CustomEntryPresentation::Pending;
+            }
+        }
+        self.invalidate_custom_message_renderings()
+    }
+
+    fn clear_markdown_renderings(&mut self) -> bool {
+        self.markdown_pending = None;
+        let assistant = self.markdown_assistant.take();
+        let thinking = self.markdown_thinking.take();
+        let mut changed = assistant.is_some() || thinking.is_some();
+        for (index, entry) in self.lines.iter_mut().enumerate() {
+            if let Some(markdown) = entry.markdown_mut()
+                && let Some((_, Some(_))) = markdown.rendering.take()
+            {
+                self.regular.redraw |= index < self.regular.committed;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn prepare_markdown_transform(&mut self, worker: &mut Worker, args: &Cli) {
+        if !worker.markdown_transformers || self.markdown_pending.is_some() {
+            return;
+        }
+        let Ok((columns, _)) = terminal::size() else {
+            return;
+        };
+        let columns = usize::from(columns.max(1));
+        let body_width = columns.saturating_sub(usize::from(
+            args.tui_mode != Some(TuiMode::Regular)
+                && args.settings.string("fullscreenScrollbar") == Some("always")
+                && columns > 1,
+        ));
+        let width = body_width - 2 * args.settings.output_padding().min((body_width - 1) / 2);
+        let Some((target, context, original)) = self.markdown_candidate(width) else {
+            return;
+        };
+        let markdown = markdown_input(&original, context.message_type).expect("Markdown candidate");
+        let request = uuid::Uuid::new_v4();
+        if worker
+            .send(json!({
+                "type": "transform_transcript_markdown",
+                "id": request,
+                "markdown": markdown,
+                "context": context,
+            }))
+            .is_ok()
+        {
+            self.markdown_pending = Some(MarkdownPending {
+                request,
+                target,
+                context,
+                original,
+            });
+        }
+    }
+
+    fn markdown_candidate(
+        &self,
+        width: usize,
+    ) -> Option<(MarkdownTarget, pi_rs::MarkdownTransformContext, String)> {
+        use pi_rs::MarkdownMessageType::{Assistant, AssistantThinking};
+
+        for (target, kind, original, cached, visible) in [
+            (
+                MarkdownTarget::StreamingAssistant,
+                Assistant,
+                &self.streaming,
+                &self.markdown_assistant,
+                true,
+            ),
+            (
+                MarkdownTarget::StreamingThinking,
+                AssistantThinking,
+                &self.thinking,
+                &self.markdown_thinking,
+                self.thinking_expanded.unwrap_or(!self.hide_thinking),
+            ),
+        ] {
+            if visible
+                && markdown_input(original, kind).is_some()
+                && !cached
+                    .as_ref()
+                    .is_some_and(|cached| cached.original == *original && cached.attempted(width))
+            {
+                return Some((
+                    target,
+                    pi_rs::MarkdownTransformContext {
+                        message_type: kind,
+                        available_width: width,
+                        is_streaming: true,
+                        message_id: None,
+                        timestamp: None,
+                    },
+                    original.clone(),
+                ));
+            }
+        }
+
+        self.lines
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, entry)| {
+                let (kind, markdown) = entry.markdown(!self.hide_thinking)?;
+                if markdown.attempted(width) {
+                    return None;
+                }
+                markdown_input(&markdown.original, kind)?;
+                Some((
+                    MarkdownTarget::Recorded(index),
+                    pi_rs::MarkdownTransformContext {
+                        message_type: kind,
+                        available_width: width,
+                        is_streaming: false,
+                        message_id: markdown.record.as_ref().map(|(id, _)| *id),
+                        timestamp: markdown
+                            .record
+                            .as_ref()
+                            .and_then(|(_, timestamp)| timestamp.clone()),
+                    },
+                    markdown.original.clone(),
+                ))
+            })
+    }
+
+    fn receive_markdown_transform(&mut self, event: &Value) -> bool {
+        if self
+            .markdown_pending
+            .as_ref()
+            .is_none_or(|pending| event["id"] != json!(pending.request))
+        {
+            return false;
+        }
+        let pending = self
+            .markdown_pending
+            .take()
+            .expect("matching Markdown request");
+        if event["retry"] == true {
+            return false;
+        }
+        let replacement = event["transformed"].as_str().map(str::to_owned);
+        let changed = replacement.is_some();
+        let rendering = Some((pending.context.available_width, replacement));
+        match pending.target {
+            MarkdownTarget::Recorded(index) => {
+                let Some(entry) = self.lines.get_mut(index) else {
+                    return false;
+                };
+                if entry
+                    .markdown(!self.hide_thinking)
+                    .is_none_or(|(role, markdown)| {
+                        role != pending.context.message_type
+                            || markdown.original != pending.original
+                            || markdown.record.as_ref().map(|(id, _)| *id)
+                                != pending.context.message_id
+                    })
+                {
+                    return false;
+                }
+                entry
+                    .markdown_mut()
+                    .expect("matching Markdown entry")
+                    .rendering = rendering;
+                if changed && index < self.regular.committed {
+                    self.custom_render_redraw_at
+                        .get_or_insert_with(|| Instant::now() + Duration::from_millis(150));
+                }
+            }
+            MarkdownTarget::StreamingAssistant if self.streaming == pending.original => {
+                self.markdown_assistant = Some(TranscriptMarkdown {
+                    rendering,
+                    ..pending.original.into()
+                });
+            }
+            MarkdownTarget::StreamingThinking if self.thinking == pending.original => {
+                self.markdown_thinking = Some(TranscriptMarkdown {
+                    rendering,
+                    ..pending.original.into()
+                });
+            }
+            _ => return false,
+        }
+        changed
+    }
+
+    fn streaming_markdown(&self, thinking: bool) -> TranscriptMarkdown {
+        let (text, cached) = if thinking {
+            (&self.thinking, &self.markdown_thinking)
+        } else {
+            (&self.streaming, &self.markdown_assistant)
+        };
+        cached
+            .as_ref()
+            .filter(|cached| cached.original == *text)
+            .cloned()
+            .unwrap_or_else(|| text.clone().into())
+    }
+
+    fn invalidate_custom_message_renderings(&mut self) -> bool {
+        self.custom_render_attempted.clear();
+        self.custom_render_redraw_at = None;
+        let mut redrawn = false;
+        for (index, entry) in self.lines.iter_mut().enumerate() {
+            if let Entry::CustomMessage { rendered, .. } | Entry::CustomRecord { rendered, .. } =
+                entry
+                && rendered.take().is_some()
+            {
+                self.regular.redraw |= index < self.regular.committed;
+                redrawn = true;
+            }
+        }
+        redrawn
+    }
+
+    fn prepare_transcript_extension_render(&mut self, worker: &mut Worker, args: &Cli) -> bool {
+        if worker.message_renderer_types.is_empty() && worker.entry_renderer_types.is_empty() {
+            return false;
+        }
+        let options = pi_rs::CustomMessageRenderOptions {
+            expanded: self.expand_tools,
+            output_pad: args.settings.output_padding(),
+            expand_key: self
+                .expand_key
+                .map(|key| crate::ui::keys::binding_hint(Some(key))),
+        };
+        let mut changed = false;
+        if self.custom_render_options.as_ref() != Some(&options) {
+            self.custom_render_options = Some(options.clone());
+            changed = self.invalidate_custom_message_renderings();
+        }
+        if self.custom_render_pending.is_some() {
+            return changed;
+        }
+        let candidate = self.lines.iter().rev().find_map(|entry| match entry {
+            Entry::CustomMessage {
+                id, custom_type, ..
+            } if worker.message_renderer_types.contains(custom_type)
+                && !self.custom_render_attempted.contains(id) =>
+            {
+                Some(*id)
+            }
+            Entry::CustomRecord {
+                id,
+                custom_type,
+                presentation,
+                ..
+            } if *presentation != CustomEntryPresentation::Omitted
+                && worker.entry_renderer_types.contains(custom_type)
+                && !self.custom_render_attempted.contains(id) =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        });
+        if let Some(record) = candidate {
+            self.custom_render_attempted.insert(record);
+            let request = uuid::Uuid::new_v4();
+            if worker.send(json!({
+                "type":"render_transcript_extension","id":request,"record_id":record,"options":options,
+            })).is_ok() {
+                self.custom_render_pending = Some(TranscriptExtensionRenderPending {
+                    request,
+                    record,
+                    options,
+                });
+            }
+        }
+        changed
+    }
+
+    fn receive_transcript_extension_render(&mut self, event: Value) -> bool {
+        let Some(pending) = self.custom_render_pending.as_ref() else {
+            return false;
+        };
+        if event["id"] != json!(pending.request) {
+            return false;
+        }
+        let pending = self
+            .custom_render_pending
+            .take()
+            .expect("matching render request");
+        if self.custom_render_options.as_ref() != Some(&pending.options)
+            || !self.custom_render_attempted.contains(&pending.record)
+        {
+            return false;
+        }
+        let Ok(rendering) = serde_json::from_value::<Option<pi_rs::RenderedExtensionContent>>(
+            event["rendered"].clone(),
+        ) else {
+            return false;
+        };
+        for (index, entry) in self.lines.iter_mut().enumerate().rev() {
+            let target = match entry {
+                Entry::CustomMessage { id, rendered, .. } if *id == pending.record => rendered,
+                Entry::CustomRecord {
+                    id,
+                    presentation,
+                    rendered,
+                    ..
+                } if *id == pending.record => {
+                    if *presentation == CustomEntryPresentation::Pending {
+                        *presentation = if rendering.is_some() {
+                            CustomEntryPresentation::Included
+                        } else {
+                            CustomEntryPresentation::Omitted
+                        };
+                    }
+                    rendered
+                }
+                _ => continue,
+            };
+            if rendering.is_none() {
+                return false;
+            }
+            *target = rendering;
+            if index < self.regular.committed {
+                self.custom_render_redraw_at
+                    .get_or_insert_with(|| Instant::now() + Duration::from_millis(150));
+            }
+            return true;
+        }
+        false
+    }
+
     fn observe_cache(&mut self, record: &pi_rs::Record, args: &Cli) {
         if let Some(notice) = self.cache_stats.observe(record, &args.model_profiles)
             && args.settings.boolean("showCacheMissNotices") == Some(true)
@@ -922,6 +2152,16 @@ impl View {
         }
     }
 
+    fn set_hide_thinking(&mut self, hidden: bool) {
+        self.hide_thinking = hidden;
+        self.thinking_expanded = None;
+        for entry in &mut self.lines {
+            if let Entry::Thinking { expanded, .. } = entry {
+                *expanded = None;
+            }
+        }
+    }
+
     fn panel_at(&self, row: u16) -> Option<TranscriptPanel> {
         self.panel_rows
             .iter()
@@ -929,14 +2169,21 @@ impl View {
     }
 
     fn panel_expansion(&mut self, panel: TranscriptPanel) -> Option<&mut Option<bool>> {
+        if panel == TranscriptPanel::StreamingThinking {
+            return (!self.thinking.trim().is_empty()).then_some(&mut self.thinking_expanded);
+        }
         let entry = match panel {
             TranscriptPanel::Summary(id) => self.lines.iter_mut().find(
                 |entry| matches!(entry, Entry::Summary { id: candidate, .. } if *candidate == id),
             ),
             TranscriptPanel::Skill(index) => self.lines.get_mut(index),
+            TranscriptPanel::Thinking(index) => self.lines.get_mut(index),
+            TranscriptPanel::StreamingThinking => unreachable!(),
         }?;
-        match entry {
-            Entry::Summary { expanded, .. } | Entry::Skill { expanded, .. } => Some(expanded),
+        match (panel, entry) {
+            (TranscriptPanel::Summary(_), Entry::Summary { expanded, .. })
+            | (TranscriptPanel::Skill(_), Entry::Skill { expanded, .. })
+            | (TranscriptPanel::Thinking(_), Entry::Thinking { expanded, .. }) => Some(expanded),
             _ => None,
         }
     }
@@ -971,7 +2218,217 @@ impl View {
         )));
     }
 
+    fn request_queue_restore(&mut self, worker: &mut Option<Worker>, args: &Cli, report: bool) {
+        let id = uuid::Uuid::new_v4();
+        match Worker::control(worker, args, json!({"type":"clear_queue","id":id})) {
+            Ok(()) => {
+                self.queue_restores.insert(id, report);
+            }
+            Err(error) => self.append(&error.to_string()),
+        }
+    }
+
+    fn complete_queue_restore(&mut self, mut value: Value, mode: Option<TuiMode>) {
+        let Some(report) = value["id"]
+            .as_str()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .and_then(|id| self.queue_restores.remove(&id))
+        else {
+            return;
+        };
+        if value["success"] != true {
+            self.append(value["error"].as_str().unwrap_or("Queue restore failed"));
+            return;
+        }
+
+        let mut messages: Vec<pi_rs::QueuedMessage> =
+            match serde_json::from_value(value["data"]["messages"].take()) {
+                Ok(messages) => messages,
+                Err(_) => {
+                    self.append("Queue restore failed");
+                    return;
+                }
+            };
+        let count = messages.len();
+        if count > 0 {
+            messages.sort_by_key(|message| message.input.kind == pi_rs::InputKind::FollowUp);
+            let mut text: Vec<_> = messages
+                .iter()
+                .map(|message| message.input.content.as_str())
+                .filter(|text| !text.trim().is_empty())
+                .collect();
+            if !text.is_empty() {
+                if !self.editor.text.trim().is_empty() {
+                    text.push(&self.editor.text);
+                }
+                self.editor.replace(text.join("\n\n"));
+            }
+
+            let mut images: Vec<_> = messages
+                .into_iter()
+                .flat_map(|message| message.images)
+                .collect();
+            images.append(&mut self.draft_images);
+            self.draft_images = images;
+        }
+        if report {
+            let status = match count {
+                0 => "No queued messages to restore".to_owned(),
+                1 => "Restored 1 queued message to editor".to_owned(),
+                _ => format!("Restored {count} queued messages to editor"),
+            };
+            self.show_status(mode, status);
+        }
+    }
+
+    fn accepted_model<'a>(&'a self, args: &'a Cli) -> &'a Cli {
+        self.live_model_applied.as_ref().unwrap_or(args)
+    }
+
+    fn model_display(&self, args: &Cli) -> String {
+        let selected = self.accepted_model(args);
+        format!(
+            "{} · {}",
+            selected.configured_model_name(&selected.model),
+            selected.thinking.as_deref().unwrap_or("default")
+        )
+    }
+
+    fn model_choice<'a>(&'a self, args: &'a Cli) -> &'a Cli {
+        self.live_model_choices
+            .back()
+            .map(|choice| &choice.selected)
+            .unwrap_or_else(|| self.accepted_model(args))
+    }
+
+    fn prepare_live_choice(&self, args: &Cli) -> Cli {
+        let mut selected = self.model_choice(args).clone();
+        selected.settings = args.settings.clone();
+        selected.model_scope.clone_from(&args.model_scope);
+        selected.selection_events.clear();
+        selected
+    }
+
+    fn stage_model_choice(
+        &mut self,
+        worker: &mut Worker,
+        selected: Cli,
+        status: String,
+        persist: Option<SelectionDefault>,
+    ) -> Result<()> {
+        if self.live_model_choices.len() >= 32 {
+            return Err(Error::Config("Model selection is still pending".into()));
+        }
+        let id = uuid::Uuid::new_v4();
+        worker.send(json!({
+            "type": "select_live_model",
+            "id": id,
+            "provider": selected.provider.id(),
+            "model": selected.model,
+            "thinking": selected.thinking,
+            "reported_thinking": super::thinking::reported(&selected).is_some(),
+            "reported_reasoning": super::thinking::adopted_reasoning(&selected),
+        }))?;
+        self.live_model_choices.push_back(LiveModelChoice {
+            id,
+            selected,
+            status,
+            persist,
+        });
+        Ok(())
+    }
+
+    fn accept_model_choice(&mut self, value: &Value, args: &mut Cli) {
+        let Some(index) = self
+            .live_model_choices
+            .iter()
+            .position(|choice| value["id"] == json!(choice.id))
+        else {
+            return;
+        };
+        let Some(mut choice) = self.live_model_choices.remove(index) else {
+            return;
+        };
+        if value["success"] == true {
+            if let Some(previous) = self.live_model_applied.take() {
+                choice
+                    .selected
+                    .selection_events
+                    .splice(0..0, previous.selection_events);
+            }
+            let saved = match choice.persist {
+                Some(SelectionDefault::Model) => {
+                    save_default_model(args, &choice.selected.provider, &choice.selected.model)
+                }
+                Some(SelectionDefault::Thinking(level)) => {
+                    args.settings.set_user("defaultThinkingLevel", json!(level))
+                }
+                None => Ok(()),
+            };
+            match saved {
+                Ok(()) => self.show_status(args.tui_mode, choice.status),
+                Err(error) => self.append(&error.to_string()),
+            }
+            self.live_model_applied = Some(choice.selected);
+        } else {
+            self.append(value["error"].as_str().unwrap_or("Could not switch models"));
+        }
+    }
+
+    fn finish_model_choice(&mut self, args: &mut Cli) -> bool {
+        let Some(mut selected) = self.live_model_applied.take() else {
+            return false;
+        };
+
+        args.provider = selected.provider;
+        args.model = selected.model;
+        args.endpoint = selected.endpoint;
+        args.thinking = selected.thinking;
+        args.thinking_profile = selected.thinking_profile;
+        args.selection_events.append(&mut selected.selection_events);
+        true
+    }
+
     fn receive_worker(&mut self, mut value: Value, args: &mut Cli) {
+        if value["type"] == "response" && value["command"] == "select_live_model" {
+            self.accept_model_choice(&value, args);
+            return;
+        }
+        if value["type"] == "live_model_reverted" {
+            self.live_model_applied = None;
+            self.append(
+                value["error"]
+                    .as_str()
+                    .unwrap_or("Could not save model selection"),
+            );
+            return;
+        }
+        if value["type"] == "response" && value["command"] == "set_session_label" {
+            if let Ok(request) = serde_json::from_value(value["id"].take())
+                && let Some(picker) = &mut self.picker
+                && let Some(target) = picker.take_tree_label(request)
+            {
+                if value["success"] == true {
+                    let focus = match picker.selected() {
+                        Some(Selection::Checkout(record)) => record,
+                        _ => target,
+                    };
+                    match Session::snapshot(&args.session) {
+                        Ok(session) => picker.refresh_tree(
+                            session_tree::picker(&session, TreeFilter::Default),
+                            focus,
+                        ),
+                        Err(error) => picker.show_feedback(Err(error.to_string())),
+                    }
+                } else {
+                    let message = value["error"]
+                        .as_str()
+                        .unwrap_or("Could not save the label");
+                    picker.show_feedback(Err(message.into()));
+                }
+            }
+            return;
+        }
         if value["type"] == "resources_discovered" {
             match serde_json::from_value::<pi_rs::DiscoveredResources>(value["resources"].take())
                 .map_err(Error::from)
@@ -992,6 +2449,10 @@ impl View {
             }
             return;
         }
+        if value["type"] == "response" && value["command"] == "clear_queue" {
+            self.complete_queue_restore(value, args.tui_mode);
+            return;
+        }
         self.receive(&value);
         if value["type"] == "record"
             && matches!(
@@ -1005,12 +2466,19 @@ impl View {
                         | "compacted"
                         | "branch_summary"
                         | "custom_message"
+                        | "custom_message_delivered"
+                        | "custom_entry"
                 )
             )
             && let Ok(record) = serde_json::from_value::<pi_rs::Record>(value["record"].take())
         {
-            if let pi_rs::Event::CustomMessage { message } = &record.event {
-                self.show_custom_message(message);
+            if let pi_rs::Event::CustomMessage { message }
+            | pi_rs::Event::CustomMessageDelivered { message, .. } = &record.event
+            {
+                self.show_custom_message(record.id, message);
+            }
+            if let pi_rs::Event::CustomEntry { entry } = &record.event {
+                self.show_custom_entry(record.id, entry);
             }
             if matches!(record.event, pi_rs::Event::ModelRequested { .. }) {
                 self.cache_stats.select_provider(args.provider.id());
@@ -1033,6 +2501,21 @@ impl View {
         }
     }
 
+    fn remember_prompt(&mut self, prompt: &str) {
+        const LIMIT: usize = 100;
+        let prompt = prompt
+            .trim_matches(|ch: char| ch == '\u{feff}' || (ch.is_whitespace() && ch != '\u{0085}'));
+        if prompt.is_empty() {
+            return;
+        }
+        if let Some(index) = self.history.iter().position(|entry| entry == prompt) {
+            self.history.remove(index);
+        } else if self.history.len() == LIMIT {
+            self.history.remove(0);
+        }
+        self.history.push(prompt.to_owned());
+    }
+
     fn restore(&mut self, args: &Cli) -> Result<()> {
         let session = Session::open(&args.session)?;
         if session.host_binding().is_some() {
@@ -1045,6 +2528,12 @@ impl View {
         self.regular.committed = 0;
         self.regular.redraw = true;
         self.lines.clear();
+        self.clear_markdown_renderings();
+        self.custom_entry_count = 0;
+        self.custom_render_redraw_at = None;
+        // Keep an in-flight request as the only one until its response. The
+        // cleared attempted set prevents it from updating the restored rows.
+        self.custom_render_attempted.clear();
         self.viewport.follow();
         self.search = None;
         self.mouse.clear();
@@ -1057,17 +2546,19 @@ impl View {
         self.scrollbar_activity = None;
         self.flash = None;
         self.streaming.clear();
+        self.text_items.clear();
         self.streaming_tools.clear();
         self.thinking.clear();
+        self.thinking_expanded = None;
+        self.thinking_items.clear();
         self.draft_images.clear();
         self.clipboard = None;
         self.dialogs.clear();
         self.local_editor = None;
         self.tree_confirmation = None;
-        self.restoring_queue = false;
+        self.queue_restores.clear();
         self.ui_status.clear();
         self.widgets.clear();
-        self.history.clear();
         self.history_index = None;
         self.tokens = 0;
         self.cache_stats = super::cache_stats::Tracker::default();
@@ -1095,21 +2586,64 @@ impl View {
                 }
             })
             .collect();
-        for record in session.branch() {
+        let branch = session.branch();
+        let assistant_records: std::collections::HashMap<_, _> = branch
+            .iter()
+            .filter_map(|&record| match record.event {
+                pi_rs::Event::Assistant {
+                    request_id: Some(request_id),
+                    ..
+                } => Some((request_id, record)),
+                _ => None,
+            })
+            .collect();
+        for record in branch {
             match &record.event {
-                pi_rs::Event::CustomMessage { message } => self.show_custom_message(message),
+                pi_rs::Event::CustomEntry { entry } => self.show_custom_entry(record.id, entry),
+                pi_rs::Event::CustomMessage { message }
+                | pi_rs::Event::CustomMessageDelivered { message, .. } => {
+                    self.show_custom_message(record.id, message)
+                }
                 pi_rs::Event::User { content, .. }
                 | pi_rs::Event::UserWithImages { content, .. } => {
-                    self.history.push(content.clone());
-                    self.lines.push(Entry::user(content.clone()));
+                    self.remember_prompt(content);
+                    self.lines
+                        .push(Entry::user_markdown(TranscriptMarkdown::from_record(
+                            content.clone(),
+                            record,
+                        )));
                     if let pi_rs::Event::UserWithImages { images, .. } = &record.event {
                         self.append(&format!("{} attached image(s)", images.len()));
                         self.add_images(images);
                     }
                 }
+                pi_rs::Event::ImportedUnattributedToolResult {
+                    call_id,
+                    tool_name,
+                    content,
+                    is_error,
+                    details,
+                    ..
+                } => {
+                    let outcome = sessions::unattributed_outcome(content, *is_error, details);
+                    let id = format!("unattributed-{}", record.id);
+                    self.lines.push(Entry::Tool {
+                        id: id.clone(),
+                        call_id: None,
+                        name: format!("{tool_name} (unattributed, call {call_id})"),
+                        arguments: String::new(),
+                        output: String::new(),
+                        failed: false,
+                        finished: false,
+                        parts: Vec::new(),
+                        numbered_diff: false,
+                    });
+                    self.finish_tool(&id, &outcome);
+                }
                 pi_rs::Event::BashExecution { execution } => {
                     self.lines.push(Entry::Tool {
                         id: format!("shell-{}", record.id),
+                        call_id: None,
                         name: if execution.exclude_from_context {
                             "bash (excluded)"
                         } else {
@@ -1117,7 +2651,7 @@ impl View {
                         }
                         .into(),
                         arguments: json!({"command":execution.command}).to_string(),
-                        output: execution.context_text(),
+                        output: shell_display_output(execution),
                         failed: execution.cancelled
                             || execution.exit_code.is_some_and(|code| code != 0),
                         finished: true,
@@ -1141,7 +2675,13 @@ impl View {
                     if !summary_requests.contains(request_id)
                         && let Some(reasoning) = &metadata.reasoning
                     {
-                        self.lines.push(Entry::Thinking(reasoning.clone()));
+                        self.lines.push(Entry::Thinking {
+                            text: TranscriptMarkdown::from_record(
+                                reasoning.clone(),
+                                assistant_records.get(request_id).copied().unwrap_or(record),
+                            ),
+                            expanded: None,
+                        });
                     }
                     if let pi_rs::UsageReport::Measured { usage } = usage {
                         self.tokens = self
@@ -1162,7 +2702,11 @@ impl View {
                     ..
                 } => {
                     if !content.is_empty() {
-                        self.lines.push(Entry::Assistant(content.clone()));
+                        self.lines
+                            .push(Entry::Assistant(TranscriptMarkdown::from_record(
+                                content.clone(),
+                                record,
+                            )));
                     }
                     for invocation in invocations {
                         self.add_tool(invocation);
@@ -1227,6 +2771,7 @@ impl View {
         }
         self.lines.push(Entry::Tool {
             id: invocation.operation_id.to_string(),
+            call_id: Some(invocation.call.id.clone()),
             name: invocation.call.name.clone(),
             arguments: invocation.call.arguments.clone(),
             output: String::new(),
@@ -1243,9 +2788,10 @@ impl View {
             }
             return;
         }
-        let rendered_parts = if self.graphics.enabled() {
+        let mut rendered_parts = if self.graphics.enabled() {
             match outcome {
-                pi_rs::Outcome::Structured { data, .. } => data["content"]
+                pi_rs::Outcome::Structured { data, .. }
+                | pi_rs::Outcome::StructuredWithDetails { data, .. } => data["content"]
                     .as_array()
                     .filter(|blocks| blocks.iter().any(|block| block["type"] == "image"))
                     .into_iter()
@@ -1286,11 +2832,22 @@ impl View {
             .rev()
             .find(|entry| matches!(entry, Entry::Tool { id, .. } if id == operation))
         {
+            if name == "read"
+                && let pi_rs::Outcome::StructuredWithDetails { details, .. } = outcome
+                && let Some(model) = details["imageUnsupportedByModel"].as_str()
+            {
+                rendered_parts.push(ToolPart::Warning(format!(
+                    "[{model} does not support images; it saw a placeholder instead]"
+                )));
+            }
             *parts = rendered_parts;
             let diff = match outcome {
-                pi_rs::Outcome::SucceededWithDetails { details, .. } if name == "edit" => {
-                    details["diff"].as_str().filter(|diff| !diff.is_empty())
-                }
+                pi_rs::Outcome::SucceededWithDetails { details, .. }
+                | pi_rs::Outcome::TextResult {
+                    details: Some(details),
+                    is_error: false,
+                    ..
+                } if name == "edit" => details["diff"].as_str().filter(|diff| !diff.is_empty()),
                 _ => None,
             };
             *numbered_diff = diff.is_some();
@@ -1299,30 +2856,81 @@ impl View {
                 outcome,
                 pi_rs::Outcome::Succeeded(_)
                     | pi_rs::Outcome::SucceededWithDetails { .. }
-                    | pi_rs::Outcome::Structured { .. }
-            );
+                    | pi_rs::Outcome::TextResult {
+                        is_error: false,
+                        ..
+                    }
+                    | pi_rs::Outcome::TextResultWithStructuredContent {
+                        is_error: false,
+                        ..
+                    }
+            ) && !matches!(outcome, pi_rs::Outcome::Structured { data, .. } | pi_rs::Outcome::StructuredWithDetails { data, .. } if data["isError"] != true);
             *finished = true;
         }
     }
+    fn update_tool_progress(&mut self, event: &Value) {
+        let (Some(call_id), Some(tool_name), Some(content)) = (
+            event["toolCallId"].as_str(),
+            event["toolName"].as_str(),
+            event["partialResult"]["content"].as_array(),
+        ) else {
+            return;
+        };
+        if let Some(Entry::Tool { output, .. }) = self.lines.iter_mut().rev().find(|entry| {
+            matches!(entry,
+                Entry::Tool { call_id: Some(id), name, finished: false, .. }
+                if id == call_id && name == tool_name
+            )
+        }) {
+            let text = content
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            *output = crate::ui::render::strip_shell_ansi(&text);
+        }
+    }
+
+    fn restore_queue(&mut self, response: &Value) -> Result<()> {
+        if response["success"] != true {
+            return Err(Error::Config(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("Queue restore failed")
+                    .into(),
+            ));
+        }
+        let messages: Vec<pi_rs::QueuedMessage> =
+            serde_json::from_value(response["data"]["messages"].clone())?;
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut text: Vec<_> = messages
+            .iter()
+            .map(|message| message.input.content.as_str())
+            .filter(|text| !text.is_empty())
+            .collect();
+        if !self.editor.text.is_empty() {
+            text.push(&self.editor.text);
+        }
+        self.editor.replace(text.join("\n\n"));
+        let mut images: Vec<_> = messages
+            .into_iter()
+            .flat_map(|message| message.images)
+            .collect();
+        images.append(&mut self.draft_images);
+        self.draft_images = images;
+        Ok(())
+    }
+
     fn receive(&mut self, value: &Value) {
         match value["type"].as_str() {
-            Some("response") if value["command"] == "clear_queue" && self.restoring_queue => {
-                self.restoring_queue = false;
-                if value["success"] == true {
-                    if let Ok(messages) = serde_json::from_value::<Vec<pi_rs::QueuedMessage>>(value["data"]["messages"].clone()) {
-                        let mut text: Vec<_> = messages.iter().map(|message| message.input.content.clone()).filter(|text| !text.is_empty()).collect();
-                        if !self.editor.text.is_empty() { text.push(self.editor.text.clone()); }
-                        self.editor.replace(text.join("\n\n"));
-                        let mut images: Vec<_> = messages.into_iter().flat_map(|message| message.images).collect();
-                        images.append(&mut self.draft_images);
-                        self.draft_images = images;
-                    }
-                } else { self.append(value["error"].as_str().unwrap_or("Queue restore failed")); }
-            }
             Some("bash_execution_start") => {
                 self.shell_running = true;
                 self.lines.push(Entry::Tool {
                     id: value["executionId"].as_str().unwrap_or_default().into(),
+                    call_id: None,
                     name: if value["excludeFromContext"] == true { "bash (excluded)" } else { "bash" }.into(),
                     arguments: json!({"command":value["command"]}).to_string(),
                     output: String::new(),
@@ -1345,8 +2953,8 @@ impl View {
             Some("bash_execution_end") => {
                 self.shell_running = false;
                 let outcome = match serde_json::from_value::<pi_rs::BashExecution>(value["data"].clone()) {
-                    Ok(execution) if !execution.cancelled && execution.exit_code == Some(0) => pi_rs::Outcome::Succeeded(execution.context_text()),
-                    Ok(execution) => pi_rs::Outcome::Failed(execution.context_text()),
+                    Ok(execution) if !execution.cancelled && execution.exit_code.is_none_or(|code| code == 0) => pi_rs::Outcome::Succeeded(shell_display_output(&execution)),
+                    Ok(execution) => pi_rs::Outcome::TextResult { output: shell_display_output(&execution), details: None, is_error: true },
                     Err(_) => pi_rs::Outcome::Failed(value["error"].as_str().unwrap_or("Shell execution failed").into()),
                 };
                 self.finish_tool(value["executionId"].as_str().unwrap_or_default(), &outcome);
@@ -1369,7 +2977,10 @@ impl View {
             Some("summary_request_start") => {
                 self.summarizing = true;
                 self.thinking.clear();
+                self.thinking_expanded = None;
+                self.thinking_items.clear();
                 self.streaming.clear();
+                self.text_items.clear();
                 self.streaming_tools.clear();
             }
             Some("tool_call_delta") if !self.summarizing => {
@@ -1382,12 +2993,44 @@ impl View {
                     self.phase = Some("ツール呼出し準備中");
                 }
             }
-            Some("reasoning_delta") if !self.summarizing => self
-                .thinking
-                .push_str(value["delta"].as_str().unwrap_or_default()),
-            Some("text_delta") if !self.summarizing => self
-                .streaming
-                .push_str(value["delta"].as_str().unwrap_or_default()),
+            Some("reasoning_delta") if !self.summarizing => {
+                let delta = value["delta"].as_str().unwrap_or_default();
+                if let Some(index) = value["reasoningIndex"].as_u64() {
+                    append_indexed(&mut self.thinking_items, &mut self.thinking, &mut self.thinking_items_consistent, index, delta);
+                } else { self.thinking.push_str(delta); self.thinking_items_consistent = false; }
+            }
+            Some("reasoning_item_start") if !self.summarizing => {
+                if let Some(index) = value["index"].as_u64() { self.thinking_items.entry(index).or_default(); }
+            }
+            Some("reasoning_item_end") if !self.summarizing => {
+                if let (Some(index), Some(content)) = (value["index"].as_u64(), value["content"].as_str()) {
+                    self.thinking_items.insert(index, content.to_owned());
+                    self.thinking = self.thinking_items.values().cloned().collect();
+                    self.thinking_items_consistent = true;
+                }
+            }
+            Some("text_item_start") if !self.summarizing => {
+                if let Some(index) = value["index"].as_u64() { self.text_items.entry(index).or_default(); }
+            }
+            Some("text_item_delta") if !self.summarizing => {
+                if let (Some(index), Some(delta)) = (value["index"].as_u64(), value["delta"].as_str()) {
+                    append_indexed(&mut self.text_items, &mut self.streaming, &mut self.text_items_consistent, index, delta);
+                }
+            }
+            Some("text_item_end") if !self.summarizing => {
+                if let (Some(index), Some(content)) = (value["index"].as_u64(), value["content"].as_str()) {
+                    self.text_items.insert(index, content.to_owned());
+                    self.streaming = self.text_items.values().cloned().collect();
+                    self.text_items_consistent = true;
+                }
+            }
+            Some("text_delta") if !self.summarizing => {
+                let delta = value["delta"].as_str().unwrap_or_default();
+                if let Some(index) = value["textIndex"].as_u64() {
+                    append_indexed(&mut self.text_items, &mut self.streaming, &mut self.text_items_consistent, index, delta);
+                } else { self.streaming.push_str(delta); self.text_items_consistent = false; }
+            }
+            Some("tool_execution_update") => self.update_tool_progress(value),
             Some("mcp_server") => self.append(&format!(
                 "MCP {} · {} · {}",
                 value["name"].as_str().unwrap_or(""),
@@ -1398,6 +3041,7 @@ impl View {
                 "Error › {}",
                 value["message"].as_str().unwrap_or_default()
             )),
+            Some("warning") => self.append(value["message"].as_str().unwrap_or_default()),
             Some("extension_error") => self.append(&format!(
                 "Extension {} ({}) · {}",
                 value["extension"].as_str().unwrap_or_default(),
@@ -1416,15 +3060,24 @@ impl View {
                     }
                     Some("model_requested") => {
                         self.streaming_tools.clear();
+                        self.markdown_assistant = None;
+                        self.markdown_thinking = None;
+                        if self.markdown_pending.as_ref().is_some_and(|pending| pending.context.is_streaming) {
+                            self.markdown_pending = None;
+                        }
                         self.request_started = Some(Instant::now());
                         self.phase = Some("モデル応答待ち");
                     }
                     Some("assistant") => {
                         self.streaming_tools.clear();
                         self.streaming.clear();
+                        self.text_items.clear();
                         let thinking = std::mem::take(&mut self.thinking);
+                        self.thinking_items.clear();
                         if !thinking.is_empty() {
-                            self.lines.push(Entry::Thinking(thinking));
+                            self.lines.push(Entry::Thinking { text: thinking.into(), expanded: self.thinking_expanded.take() });
+                        } else {
+                            self.thinking_expanded = None;
                         }
                         let content = event["content"].as_str().unwrap_or_default();
                         if !content.is_empty() {
@@ -1437,6 +3090,7 @@ impl View {
                             for call in calls {
                                 self.lines.push(Entry::Tool {
                                     id: call["operation_id"].as_str().unwrap_or_default().into(),
+                                    call_id: call["call"]["id"].as_str().map(str::to_owned),
                                     name: call["call"]["name"].as_str().unwrap_or("tool").into(),
                                     arguments: call["call"]["arguments"]
                                         .as_str()
@@ -1498,14 +3152,20 @@ impl View {
     }
     fn settle(&mut self) {
         self.summarizing = false;
+        self.thinking_items.clear();
+        self.text_items.clear();
         self.streaming_tools.clear();
         if !self.thinking.is_empty() {
-            self.lines
-                .push(Entry::Thinking(std::mem::take(&mut self.thinking)));
+            self.lines.push(Entry::Thinking {
+                text: std::mem::take(&mut self.thinking).into(),
+                expanded: self.thinking_expanded.take(),
+            });
+        } else {
+            self.thinking_expanded = None;
         }
         if !self.streaming.is_empty() {
             self.lines
-                .push(Entry::Assistant(std::mem::take(&mut self.streaming)));
+                .push(Entry::Assistant(std::mem::take(&mut self.streaming).into()));
         }
         self.request_started = None;
         self.phase = None;
@@ -1611,7 +3271,8 @@ impl View {
                 self.mouse.drag(event.column, event.row);
             }
             MouseEventKind::Up(MouseButton::Left) if self.search.is_none() => {
-                let default_expanded = self.expand_tools;
+                let tools_expanded = self.expand_tools;
+                let thinking_expanded = !self.hide_thinking;
                 if let Some(url) = self.released_link(event.column, event.row) {
                     self.panel_press = None;
                     self.mouse.clear_gesture();
@@ -1623,6 +3284,12 @@ impl View {
                     && self.panel_at(row) == Some(panel)
                     && let Some(expanded) = self.panel_expansion(panel)
                 {
+                    let default_expanded = match panel {
+                        TranscriptPanel::Thinking(_) | TranscriptPanel::StreamingThinking => {
+                            thinking_expanded
+                        }
+                        _ => tools_expanded,
+                    };
                     *expanded = Some(!expanded.unwrap_or(default_expanded));
                     self.mouse.clear();
                 } else if self.mouse.release(event.column, event.row)
@@ -1687,9 +3354,9 @@ impl View {
         width: usize,
         height: usize,
     ) -> (Vec<String>, usize, usize) {
-        let padding = (args.settings.value()["editorPaddingX"]
-            .as_u64()
-            .unwrap_or(0) as usize)
+        let padding = args
+            .settings
+            .editor_padding()
             .min(width.saturating_sub(1) / 2);
         self.editor_width = width - 2 * padding;
         self.editor_page = (height * 3 / 10).max(5).min(height - 5);
@@ -1706,6 +3373,7 @@ impl View {
     }
 
     fn draw(&mut self, args: &Cli, theme: &Theme, busy: bool, keys: &Keys) -> Result<()> {
+        let _strike_budget = crate::ui::strike::frame_budget();
         self.expand_key = keys.first_binding("app.tools.expand");
         if args.tui_mode == Some(TuiMode::Regular) {
             return self.draw_regular(args, theme, busy, keys);
@@ -1757,20 +3425,35 @@ impl View {
                         .count();
                     panels.push((start..start + panel_height, TranscriptPanel::Skill(index)));
                 }
+                Entry::Thinking { .. } => panels.push((
+                    start..lines.len().saturating_sub(1),
+                    TranscriptPanel::Thinking(index),
+                )),
                 _ => {}
             }
         }
         if !self.thinking.is_empty() {
-            lines.extend(Entry::Thinking(self.thinking.clone()).render(
-                theme,
-                body_width,
-                false,
-                !self.hide_thinking,
-                self.transcript_options(args, true),
+            let start = lines.len();
+            lines.extend(
+                Entry::Thinking {
+                    text: self.streaming_markdown(true),
+                    expanded: self.thinking_expanded,
+                }
+                .render(
+                    theme,
+                    body_width,
+                    false,
+                    !self.hide_thinking,
+                    self.transcript_options(args, true),
+                ),
+            );
+            panels.push((
+                start..lines.len().saturating_sub(1),
+                TranscriptPanel::StreamingThinking,
             ));
         }
         if !self.streaming.is_empty() {
-            lines.extend(Entry::Assistant(self.streaming.clone()).render(
+            lines.extend(Entry::Assistant(self.streaming_markdown(false)).render(
                 theme,
                 body_width,
                 false,
@@ -1788,21 +3471,22 @@ impl View {
             ));
         }
         if let Some(picker) = &self.picker {
-            lines = picker.render(theme, width, body_height, keys);
+            lines = picker.render_in_terminal(theme, width, body_height, height, keys);
         }
-        let dialog_cursor = self
-            .dialog()
-            .and_then(|dialog| dialog.cursor(width, body_height));
-        if let Some(dialog) = self.dialog() {
-            lines = dialog.render(theme, width, body_height);
-            if !hardware_cursor
-                && let Some((row, column)) = dialog_cursor
-                && let Some(line) = lines.get_mut(row)
-            {
-                line.mark_cursor(column);
-            }
+        let modal_cursor = if let Some(dialog) = self.dialog() {
+            lines = dialog.render(theme, width, body_height, keys);
+            dialog.cursor(width, body_height)
         } else {
             lines.extend(self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor));
+            self.picker
+                .as_ref()
+                .and_then(|picker| picker.tree_input_cursor(width, body_height))
+        };
+        if !hardware_cursor
+            && let Some((row, column)) = modal_cursor
+            && let Some(line) = lines.get_mut(row)
+        {
+            line.mark_cursor(column);
         }
         let modal = self.picker.is_some() || self.dialog().is_some();
         let start = if modal {
@@ -1840,7 +3524,29 @@ impl View {
                 self.mouse.highlight(&mut lines, start..end);
             }
         }
-        let mut out = std::io::stdout().lock();
+        let search_overlay = self.search.as_ref().filter(|_| !modal).map(|search| {
+            let search_width = (width * 2 / 5).max(32).min(width.saturating_sub(2).max(1));
+            let left = width.saturating_sub(search_width + 1);
+            let top = usize::from(body_height > 3);
+            let (mut lines, cursor_row, cursor_column) = search.overlay(theme, keys, search_width);
+            if !hardware_cursor && let Some(line) = lines.get_mut(cursor_row) {
+                line.mark_cursor(cursor_column);
+            }
+            lines.truncate(body_height);
+            (
+                top..top + lines.len(),
+                left..left + search_width,
+                lines,
+                cursor_row,
+                cursor_column,
+            )
+        });
+        let stdout = std::io::stdout();
+        let mut out = FrameWriter::new(
+            stdout.lock(),
+            !cfg!(windows),
+            synchronized_updates_supported(),
+        )?;
         let elapsed = self
             .request_started
             .map(|start| start.elapsed())
@@ -1864,8 +3570,8 @@ impl View {
                 .as_ref()
                 .map_or(String::new(), |(message, _)| format!("{message} ")),
         );
-        self.graphics.clear_placements(&mut out)?;
-        queue!(out, Hide, MoveTo(0, 0), Clear(ClearType::All))?;
+        queue!(out, Hide)?;
+        self.graphics.clear_fullscreen_frame(&mut out)?;
         if header_rows != 0 {
             Line::themed(
                 &format!(
@@ -1881,12 +3587,19 @@ impl View {
         for (row, line) in lines[start..end].iter().enumerate() {
             queue!(out, MoveTo(0, (row + header_rows) as u16))?;
             line.draw(&mut out, if modal { width } else { body_width })?;
-            self.graphics.paint(
-                line,
-                &mut out,
-                row,
-                images::visible_rows(&lines[start + row..end]),
-            )?;
+            let covered = search_overlay.as_ref().is_some_and(|(rows, columns, ..)| {
+                line.image
+                    .as_ref()
+                    .is_some_and(|image| image.intersects(row, rows, columns))
+            });
+            if !covered {
+                self.graphics.paint(
+                    line,
+                    &mut out,
+                    row,
+                    images::visible_rows(&lines[start + row..end]),
+                )?;
+            }
         }
         if !modal
             && width > 1
@@ -1944,11 +3657,7 @@ impl View {
         queue!(out, MoveTo(0, (height - 2) as u16))?;
         Line::themed(&args.workspace.display().to_string(), theme, "dim").draw(&mut out, width)?;
         queue!(out, MoveTo(0, (height - 1) as u16))?;
-        let model = format!(
-            "{} · {}",
-            args.configured_model_name(&args.model),
-            args.thinking.as_deref().unwrap_or("default")
-        );
+        let model = self.model_display(args);
         let model_width = UnicodeWidthStr::width(model.as_str());
         let usage = format!("↑↓ 確定 {} tokens", self.tokens);
         let usage = clip(&usage, width.saturating_sub(model_width + 1));
@@ -1959,18 +3668,12 @@ impl View {
             "dim",
         )
         .draw(&mut out, width)?;
-        if !modal && let Some(search) = &self.search {
-            let search_width = (width * 2 / 5).max(32).min(width.saturating_sub(2).max(1));
-            let left = width.saturating_sub(search_width + 1);
-            let top = header_rows + usize::from(body_height > 3);
-            let (mut overlay, cursor_row, cursor_column) =
-                search.overlay(theme, keys, search_width);
-            if !hardware_cursor && let Some(line) = overlay.get_mut(cursor_row) {
-                line.mark_cursor(cursor_column);
-            }
-            for (row, line) in overlay.iter().take(body_height).enumerate() {
+        if let Some((rows, columns, overlay, cursor_row, cursor_column)) = search_overlay {
+            let left = columns.start;
+            let top = header_rows + rows.start;
+            for (row, line) in overlay.iter().enumerate() {
                 queue!(out, MoveTo(left as u16, (top + row) as u16))?;
-                line.draw(&mut out, search_width)?;
+                line.draw(&mut out, columns.len())?;
             }
             if cursor_row < body_height {
                 queue!(
@@ -1981,7 +3684,7 @@ impl View {
                     queue!(out, Show)?;
                 }
             }
-        } else if let Some((row, column)) = dialog_cursor {
+        } else if let Some((row, column)) = modal_cursor {
             queue!(out, MoveTo(column as u16, (row + header_rows) as u16))?;
             if hardware_cursor {
                 queue!(out, Show)?;
@@ -1995,7 +3698,7 @@ impl View {
                 queue!(out, Show)?;
             }
         }
-        out.flush()?;
+        out.finish()?;
         Ok(())
     }
     fn finish_regular(&mut self) -> Result<()> {
@@ -2012,6 +3715,27 @@ impl View {
             )?;
             self.regular.started = false;
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn suspend_terminal(
+        &mut self,
+        terminal: &mut Option<Terminal>,
+        mode: Option<TuiMode>,
+    ) -> Result<()> {
+        if mode == Some(TuiMode::Regular) {
+            self.finish_regular()?;
+        }
+        if let Err(error) = Terminal::suspend(terminal, mode, self.graphics.cleanup()) {
+            self.append(&error.to_string());
+        }
+        if self.graphics.enabled() {
+            images::query_cell_size()?;
+        }
+        self.graphics.reset();
+        self.regular.redraw = true;
+        self.regular.started = false;
         Ok(())
     }
 
@@ -2046,16 +3770,22 @@ impl View {
             })
             .collect();
         if !self.thinking.is_empty() {
-            lines.extend(Entry::Thinking(self.thinking.clone()).render(
-                theme,
-                width,
-                false,
-                !self.hide_thinking,
-                self.transcript_options(args, true),
-            ));
+            lines.extend(
+                Entry::Thinking {
+                    text: self.streaming_markdown(true),
+                    expanded: self.thinking_expanded,
+                }
+                .render(
+                    theme,
+                    width,
+                    false,
+                    !self.hide_thinking,
+                    self.transcript_options(args, true),
+                ),
+            );
         }
         if !self.streaming.is_empty() {
-            lines.extend(Entry::Assistant(self.streaming.clone()).render(
+            lines.extend(Entry::Assistant(self.streaming_markdown(false)).render(
                 theme,
                 width,
                 false,
@@ -2082,15 +3812,7 @@ impl View {
             theme,
             "dim",
         ));
-        lines.push(Line::themed(
-            &format!(
-                "{} · {}",
-                args.configured_model_name(&args.model),
-                args.thinking.as_deref().unwrap_or("default")
-            ),
-            theme,
-            "dim",
-        ));
+        lines.push(Line::themed(&self.model_display(args), theme, "dim"));
         let session = Session::snapshot(&args.session)?;
         let (messages, _) = super::rpc_messages::snapshot(&session);
         let mut output = format!(
@@ -2133,6 +3855,13 @@ impl View {
         let mut file = options.open(&path)?;
         file.write_all(content.as_bytes())?;
         Ok(path)
+    }
+
+    fn show_debug_log(&mut self, args: &Cli, theme: &Theme) {
+        match self.write_debug_log(args, theme) {
+            Ok(path) => self.append(&format!("Debug log written\n{}", path.display())),
+            Err(error) => self.append(&format!("Debug log: {error}")),
+        }
     }
 
     fn replay_transcript(&mut self, args: &Cli, theme: &Theme) -> Result<()> {
@@ -2187,24 +3916,39 @@ impl View {
         let render_entry = |entry: &Entry| {
             entry.render(theme, width, self.expand_tools, !self.hide_thinking, output)
         };
+        let modal = self.picker.is_some() || self.dialog().is_some();
+        let committing = !busy && !modal;
+        // A trailing status can still be replaced by another status.
+        let trailing_status = matches!(self.lines.last(), Some(Entry::Status(_)));
+        let commit_end = if committing {
+            (self.lines.len() - usize::from(trailing_status)).max(self.regular.committed)
+        } else {
+            self.regular.committed
+        };
         let pending = || {
-            self.lines[self.regular.committed..]
+            self.lines[self.regular.committed..commit_end]
                 .iter()
                 .flat_map(render_entry)
         };
-        let modal = self.picker.is_some() || self.dialog().is_some();
-        let committing = !busy && !modal;
-        let mut active = Vec::new();
+        let mut active: Vec<_> = self.lines[commit_end..]
+            .iter()
+            .flat_map(render_entry)
+            .collect();
         if !committing {
-            active.extend(pending());
-            active.extend(Entry::Thinking(self.thinking.clone()).render(
-                theme,
-                width,
-                false,
-                !self.hide_thinking,
-                self.transcript_options(args, true),
-            ));
-            active.extend(Entry::Assistant(self.streaming.clone()).render(
+            active.extend(
+                Entry::Thinking {
+                    text: self.streaming_markdown(true),
+                    expanded: self.thinking_expanded,
+                }
+                .render(
+                    theme,
+                    width,
+                    false,
+                    !self.hide_thinking,
+                    self.transcript_options(args, true),
+                ),
+            );
+            active.extend(Entry::Assistant(self.streaming_markdown(false)).render(
                 theme,
                 width,
                 false,
@@ -2215,31 +3959,36 @@ impl View {
                 active.extend(render_entry(&entry));
             }
             if let Some(picker) = &self.picker {
-                active =
-                    picker.render(theme, width, height - prompt_height - 4 - below.len(), keys);
+                active = picker.render_in_terminal(
+                    theme,
+                    width,
+                    height - prompt_height - 4 - below.len(),
+                    height,
+                    keys,
+                );
             }
         }
         let dialog_height = height - prompt_height - 4 - below.len();
-        let dialog_cursor = self
-            .dialog()
-            .and_then(|dialog| dialog.cursor(width, dialog_height));
-        if let Some(dialog) = self.dialog() {
-            active = dialog.render(theme, width, dialog_height);
-            if !hardware_cursor
-                && let Some((row, column)) = dialog_cursor
-                && let Some(line) = active.get_mut(row)
-            {
-                line.mark_cursor(column);
-            }
+        let modal_cursor = if let Some(dialog) = self.dialog() {
+            active = dialog.render(theme, width, dialog_height, keys);
+            dialog.cursor(width, dialog_height)
         } else {
-            let available = height - prompt_height - 4 - below.len();
             let mut widgets = self.widget_lines(theme, width, pi_rs::WidgetPlacement::AboveEditor);
-            widgets.truncate(available);
-            let keep = available.saturating_sub(widgets.len());
-            if active.len() > keep {
-                active.drain(..active.len() - keep);
-            }
+            widgets.truncate(dialog_height);
+            let keep = dialog_height.saturating_sub(widgets.len());
+            let hidden = active.len().saturating_sub(keep);
+            active.drain(..hidden);
             active.extend(widgets);
+            self.picker
+                .as_ref()
+                .and_then(|picker| picker.tree_input_cursor(width, keep))
+                .and_then(|(row, column)| row.checked_sub(hidden).map(|row| (row, column)))
+        };
+        if !hardware_cursor
+            && let Some((row, column)) = modal_cursor
+            && let Some(line) = active.get_mut(row)
+        {
+            line.mark_cursor(column);
         }
         let region_height = active.len() + prompt_height + 4 + below.len();
         let rows_to_match = self
@@ -2251,15 +4000,14 @@ impl View {
                 && !modal
                 && rows_to_match > 0
                 && (!committing || pending().take(rows_to_match).count() < rows_to_match));
-        let mut out = std::io::stdout().lock();
+        let stdout = std::io::stdout();
+        let mut out = FrameWriter::new(
+            stdout.lock(),
+            !cfg!(windows),
+            synchronized_updates_supported(),
+        )?;
         if redraw {
-            self.graphics.clear_placements(&mut out)?;
-            queue!(
-                out,
-                Clear(ClearType::All),
-                MoveTo(0, 0),
-                Clear(ClearType::Purge)
-            )?;
+            self.graphics.purge_regular_transcript(&mut out)?;
         }
         if !redraw {
             self.graphics.clear_active(&mut out)?;
@@ -2304,7 +4052,7 @@ impl View {
                 queue!(out, Print("\r\n"))?;
                 self.regular.committed_rows += 1;
             }
-            self.regular.committed = self.lines.len();
+            self.regular.committed = commit_end;
         }
         let total_rows = self.regular.committed_rows + region_height;
         self.regular.max_rows = if redraw {
@@ -2364,24 +4112,19 @@ impl View {
             queue!(out, Print("\r\n"))?;
         }
         Line::themed(
-            &format!(
-                "↑↓ {} tokens · {} · {}",
-                self.tokens,
-                args.configured_model_name(&args.model),
-                args.thinking.as_deref().unwrap_or("default")
-            ),
+            &format!("↑↓ {} tokens · {}", self.tokens, self.model_display(args)),
             theme,
             "dim",
         )
         .draw(&mut out, width)?;
         self.regular.cursor_row = active.len() + 1 + cursor;
         self.regular.region_height = region_height;
-        let (column, show_cursor) = if self.dialog().is_some() {
-            self.regular.cursor_row = dialog_cursor.map_or(0, |(row, _)| row);
-            (
-                dialog_cursor.map_or(0, |(_, column)| column),
-                dialog_cursor.is_some(),
-            )
+        let (column, show_cursor) = if let Some((row, column)) = modal_cursor {
+            self.regular.cursor_row = row;
+            (column, true)
+        } else if self.dialog().is_some() {
+            self.regular.cursor_row = 0;
+            (0, false)
         } else {
             (column, self.picker.is_none())
         };
@@ -2396,18 +4139,24 @@ impl View {
             queue!(out, Hide)?;
         }
         self.regular.started = true;
-        out.flush()?;
+        out.finish()?;
         Ok(())
     }
 }
 
 fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
-    if let pi_rs::Outcome::SucceededWithDetails { output, details } = outcome
+    if let pi_rs::Outcome::SucceededWithDetails { output, details }
+    | pi_rs::Outcome::TextResult {
+        output,
+        details: Some(details),
+        is_error: false,
+    } = outcome
         && let Some(patch) = details["patch"].as_str().filter(|patch| !patch.is_empty())
     {
         return format!("{output}\n{patch}");
     }
-    if let pi_rs::Outcome::Structured { data, .. } = outcome
+    if let pi_rs::Outcome::Structured { data, .. }
+    | pi_rs::Outcome::StructuredWithDetails { data, .. } = outcome
         && let Some(blocks) = data["content"].as_array()
     {
         return blocks
@@ -2447,7 +4196,7 @@ fn slash(
             ))?);
             view.append(&super::cache_warming::status::describe(
                 view.cache_warming_status.as_ref(),
-                args.settings.string("cacheWarming").unwrap_or("streaming"),
+                args.settings.cache_warming_mode(),
                 session.head(),
             ));
             let stats = &view.cache_stats;
@@ -2576,6 +4325,7 @@ fn slash(
             )?;
             drop(session);
             args.session = destination;
+            args.restore_session_model(&Session::open(&args.session)?)?;
             view.restore(args)?;
             args.session_transition = Some(pi_rs::SessionStartReason::Fork);
             if let Some(input) = input {
@@ -2615,31 +4365,80 @@ fn slash(
         }
         "/share" => {
             let destination = sessions::ShareDestination::configured(&args.settings)?;
-            let status = destination.status();
-            let path = args.session.clone();
-            let workspace = args.workspace.clone();
-            view.remote_task = Some(RemoteTask::start(
-                status,
-                "Share cancelled",
-                move |_| async move {
-                    let session = Session::snapshot(path)?;
-                    let shared = destination.share(session, &workspace).await?;
-                    let mut lines = vec![format!("Share URL: {}", shared.url)];
-                    if let Some(gist) = shared.gist {
-                        lines.push(format!("Gist: {gist}"));
-                    }
-                    Ok(lines)
-                },
-            ));
+            let id = if destination.is_radius() && !args.trust_pending {
+                worker.and_then(|worker| Worker::request_share_context(worker, args).ok())
+            } else {
+                None
+            };
+            let pending = PendingShare {
+                id: id.unwrap_or_else(uuid::Uuid::nil),
+                destination,
+                path: args.session.clone(),
+                workspace: args.workspace.clone(),
+                started: Instant::now(),
+            };
+            if id.is_some() {
+                view.pending_share = Some(pending);
+            } else {
+                start_share_upload(view, pending, None);
+            }
         }
-        "/model" if rest.is_empty() => {
-            args.reload_model_profiles()?;
-            start_model_picker(args, view, ModelListIntent::Select);
+        "/model" => {
+            let active = worker
+                .and_then(|slot| slot.as_mut())
+                .filter(|worker| worker.busy);
+            if active.is_none() {
+                args.reload_model_profiles()?;
+            }
+            if super::model_selection::qualified_model(rest, &args.model_profiles).is_some()
+                || super::model_selection::thinking_suffix(rest).is_some()
+            {
+                select_model_input(args, view, active, rest, false)?;
+            } else if let Some(model) = exact_model_query(args, rest, &view.available_models) {
+                select_model_input(args, view, active, &model, false)?;
+            } else {
+                start_model_picker(args, view, ModelListIntent::Select { query: rest.into() });
+            }
         }
         "/scoped-models" => {
             args.reload_model_profiles()?;
             start_model_picker(args, view, ModelListIntent::Scope);
         }
+        "/login" if rest.eq_ignore_ascii_case("anthropic") => show_anthropic_methods(view),
+        "/login" if rest.eq_ignore_ascii_case("anthropic browser") => start_anthropic_login(
+            view,
+            &args.settings,
+            super::anthropic_auth::LoginMethod::Browser,
+        ),
+        "/login" if rest.eq_ignore_ascii_case("anthropic copy-code") => start_anthropic_login(
+            view,
+            &args.settings,
+            super::anthropic_auth::LoginMethod::CopyCode,
+        ),
+        "/login" if rest.eq_ignore_ascii_case("anthropic api-key") => {
+            edit_provider_key(super::Provider::Anthropic, view)
+        }
+        "/login" if rest.eq_ignore_ascii_case("xai") => start_xai_login(view, &args.settings),
+        "/login" if rest.eq_ignore_ascii_case("xai api-key") => {
+            edit_provider_key(super::Provider::named("xai").expect("xAI provider"), view)
+        }
+        "/login" if rest.eq_ignore_ascii_case("meta") => start_meta_login(view, &args.settings),
+        "/login" if rest.eq_ignore_ascii_case("meta api-key") => {
+            edit_provider_key(super::Provider::named("meta").expect("Meta provider"), view)
+        }
+        "/login" if rest.eq_ignore_ascii_case("google-vertex") => show_vertex_methods(view),
+        "/login" if rest.eq_ignore_ascii_case("google-vertex api-key") => edit_provider_key(
+            super::Provider::named("google-vertex").expect("Vertex provider"),
+            view,
+        ),
+        "/login" if rest.eq_ignore_ascii_case("kimi-coding") => {
+            start_kimi_login(view, &args.settings)
+        }
+        "/logout" if rest.eq_ignore_ascii_case("kimi-coding") => start_kimi_logout(view),
+        "/login" if rest.eq_ignore_ascii_case("kimi-coding api-key") => edit_provider_key(
+            super::Provider::named("kimi-coding").expect("Kimi provider"),
+            view,
+        ),
         "/login" if rest.eq_ignore_ascii_case("radius") => show_radius_methods(view),
         "/login" if rest.eq_ignore_ascii_case("radius browser") => {
             start_radius_login(view, &args.settings, radius_auth::Method::Browser)?;
@@ -2675,6 +4474,34 @@ fn slash(
             super::Provider::named("openrouter").expect("built-in OpenRouter provider"),
             view,
         ),
+        "/login"
+            if rest.eq_ignore_ascii_case("openai-codex")
+                || rest.eq_ignore_ascii_case("openai-codex browser") =>
+        {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Browser)
+        }
+        "/login" if rest.eq_ignore_ascii_case("openai-codex device") => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
+        }
+        "/login" if rest.eq_ignore_ascii_case("github-copilot api-key") => edit_provider_key(
+            super::Provider::named("github-copilot").expect("built-in Copilot provider"),
+            view,
+        ),
+        "/login"
+            if rest
+                .split_whitespace()
+                .next()
+                .is_some_and(|provider| provider.eq_ignore_ascii_case("github-copilot")) =>
+        {
+            let enterprise = rest
+                .split_once(char::is_whitespace)
+                .map(|(_, domain)| domain.trim());
+            if let Some(enterprise) = enterprise {
+                start_copilot_login(view, &args.settings, Some(enterprise))?;
+            } else {
+                edit_copilot_enterprise(view);
+            }
+        }
         "/login" | "/logout" => {
             let login = name == "/login";
             if rest.is_empty() {
@@ -2694,7 +4521,7 @@ fn slash(
                     .collect::<Vec<_>>();
                 if login
                     || radius_auth::Gateway::configured_with_settings(&args.settings)
-                        .and_then(|gateway| gateway.has_credential())
+                        .and_then(|gateway| gateway.has_stored_credential())
                         .unwrap_or(false)
                 {
                     items.push(Item {
@@ -2707,6 +4534,55 @@ fn slash(
                     });
                 }
                 if login {
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-codex · Browser authorization".into(),
+                            selection: Selection::LoginCodex,
+                        },
+                    );
+                    items.insert(
+                        0,
+                        Item {
+                            label: "openai-codex · Device authorization".into(),
+                            selection: Selection::LoginCodexDevice,
+                        },
+                    );
+                    items.insert(
+                        0,
+                        Item {
+                            label: "github-copilot · Subscription OAuth".into(),
+                            selection: Selection::LoginCopilot,
+                        },
+                    );
+                    items.insert(
+                        0,
+                        Item {
+                            label: "anthropic · Subscription OAuth".into(),
+                            selection: Selection::AnthropicMethods,
+                        },
+                    );
+                    items.insert(
+                        0,
+                        Item {
+                            label: "xai · Subscription OAuth".into(),
+                            selection: Selection::LoginXai,
+                        },
+                    );
+                    items.insert(
+                        0,
+                        Item {
+                            label: "meta · Subscription OAuth".into(),
+                            selection: Selection::LoginMeta,
+                        },
+                    );
+                    items.insert(
+                        0,
+                        Item {
+                            label: "kimi-coding · Subscription OAuth".into(),
+                            selection: Selection::LoginKimi,
+                        },
+                    );
                     items.insert(
                         0,
                         Item {
@@ -2765,16 +4641,17 @@ fn slash(
                     .provider(rest)
                     .ok_or_else(|| Error::Config("unsupported model provider".into()))?;
                 if login {
-                    edit_provider_key(provider, view);
+                    if provider.id() == "amazon-bedrock" {
+                        show_bedrock_methods(view);
+                    } else if uses_cloudflare_login(&provider, args) {
+                        edit_cloudflare_login(view, CloudflareLoginField::Key(provider));
+                    } else {
+                        edit_provider_key(provider, view);
+                    }
                 } else {
                     remove_provider_key(provider, args, view)?;
                 }
             }
-        }
-        "/model" => {
-            args.reload_model_profiles()?;
-            select_model_input(args, view, rest)?;
-            view.append(&format!("Model › {rest}"));
         }
         "/thinking" if rest.is_empty() => {
             let default = args
@@ -2782,10 +4659,11 @@ fn slash(
                 .string("defaultThinkingLevel")
                 .unwrap_or("off")
                 .to_owned();
-            let current = args.thinking.clone().unwrap_or_else(|| "off".into());
+            let mut selected = view.model_choice(args).clone();
+            let current = selected.thinking.clone().unwrap_or_else(|| "off".into());
             let mut picker = Picker::new(
                 "Thinking level",
-                super::thinking::available(args)
+                super::thinking::available(&mut selected)
                     .into_iter()
                     .map(|level| Item {
                         label: format!(
@@ -2800,7 +4678,15 @@ fn slash(
             picker.focus_thinking(&current);
             view.picker = Some(picker);
         }
-        "/thinking" => super::thinking::set(args, rest)?,
+        "/thinking" => {
+            select_thinking_input(
+                args,
+                view,
+                worker.and_then(|slot| slot.as_mut()),
+                rest,
+                false,
+            )?;
+        }
         "/new" => {
             if Worker::check_session_transition(
                 worker,
@@ -2814,6 +4700,22 @@ fn slash(
                 return Ok(None);
             }
             let mut next = args.clone();
+            if view.async_transitions {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = {
+                        next.refresh_workspace_selection();
+                        next.session = session_path(&next.workspace, next.session_dir.as_deref());
+                        next.session_transition = Some(pi_rs::SessionStartReason::New);
+                        Ok(next)
+                    };
+                    let _ = sender.send(result);
+                });
+                view.pending_transition = Some(receiver);
+                view.append("Preparing session (Esc to cancel)");
+                return Ok(None);
+            }
+            next.refresh_workspace_selection();
             next.session = session_path(&args.workspace, args.session_dir.as_deref());
             if let Some(directory) = next.session.parent() {
                 std::fs::create_dir_all(directory)?;
@@ -2868,9 +4770,8 @@ fn slash(
                         let local = std::path::Path::new(cwd)
                             .canonicalize()
                             .is_ok_and(|cwd| cwd == workspace);
-                        let mut document = super::ui::session_search::Document::new(
-                            session.name().unwrap_or_default().into(),
-                            session.session_id().to_string(),
+                        let mut document = super::ui::session_search::Document::from_session(
+                            &session,
                             cwd.into(),
                             messages,
                             local,
@@ -2924,7 +4825,7 @@ fn slash(
                 json!({"type":"compact","summary":null,"keep_turns":1,"use_token_settings":true,"instructions":rest}),
             )
         }
-        "/mcp" => view.pending_request = Some(json!({"type":"mcp_status"})),
+        "/mcp" => view.pending_request = Some(json!({"type":"mcp_status","inspect":true})),
         "/trust" => {
             view.picker = Some(Picker::new(
                 "Load project configuration?",
@@ -3015,79 +4916,10 @@ fn slash(
             );
         }
         "/tree" => {
-            let session = Session::open(&args.session)?;
-            let labels = session.labels();
-            let items = session
-                .records()
-                .iter()
-                .filter(|record| !matches!(record.event, pi_rs::Event::Checkout { .. }))
-                .map(|record| {
-                    let description = match &record.event {
-                        pi_rs::Event::User { content, .. }
-                        | pi_rs::Event::UserWithImages { content, .. }
-                        | pi_rs::Event::Assistant { content, .. } => {
-                            content.chars().take(70).collect::<String>()
-                        }
-                        pi_rs::Event::BranchSummary { summary, .. } => format!(
-                            "Branch summary: {}",
-                            summary.chars().take(56).collect::<String>()
-                        ),
-                        pi_rs::Event::CompactionSummaryMessage { summary, .. } => format!(
-                            "Compaction: {}",
-                            summary.chars().take(58).collect::<String>()
-                        ),
-                        _ => super::metadata(record)["event"]
-                            .as_str()
-                            .unwrap_or("record")
-                            .into(),
-                    };
-                    Item {
-                        label: format!(
-                            "{} {} {}",
-                            record.id,
-                            labels.get(&record.id).map(String::as_str).unwrap_or(""),
-                            description
-                        ),
-                        selection: Selection::Checkout(record.id),
-                    }
-                })
-                .collect();
-            let head = session.head();
-            let entries = session
-                .records()
-                .iter()
-                .filter(|record| !matches!(record.event, pi_rs::Event::Checkout { .. }))
-                .map(|record| {
-                    let kind = match &record.event {
-                        pi_rs::Event::User { .. } | pi_rs::Event::UserWithImages { .. } => {
-                            TreeEntryKind::User
-                        }
-                        pi_rs::Event::ToolFinished { .. } | pi_rs::Event::ToolReconciled { .. } => {
-                            TreeEntryKind::Tool
-                        }
-                        pi_rs::Event::Assistant { content, .. }
-                            if content.trim().is_empty() && record.id != head =>
-                        {
-                            TreeEntryKind::Hidden
-                        }
-                        pi_rs::Event::Assistant { .. }
-                        | pi_rs::Event::BashExecution { .. }
-                        | pi_rs::Event::Compacted { .. }
-                        | pi_rs::Event::CompactionSummaryMessage { .. }
-                        | pi_rs::Event::BranchSummary { .. } => TreeEntryKind::Message,
-                        pi_rs::Event::ModelFinished {
-                            failure: Some(_), ..
-                        } => TreeEntryKind::Message,
-                        _ => TreeEntryKind::Bookkeeping,
-                    };
-                    (record.id, (record.parent, kind))
-                })
-                .collect();
+            let session = Session::snapshot(&args.session)?;
             let filter =
                 TreeFilter::parse(args.settings.string("treeFilterMode").unwrap_or("default"));
-            let mut picker = Picker::tree(items, entries, labels, head, filter);
-            picker.set_label_timestamps(session.label_timestamps());
-            view.picker = Some(picker);
+            view.picker = Some(session_tree::picker(&session, filter));
         }
         "/checkout" => {
             let id = rest
@@ -3095,6 +4927,7 @@ fn slash(
                 .map_err(|_| Error::Config("use /checkout <record-id>".into()))?;
             let mut session = Session::open(&args.session)?;
             session.checkout(id)?;
+            args.restore_session_model(&session)?;
             drop(session);
             view.restore(args)?;
         }
@@ -3113,6 +4946,149 @@ fn slash(
         }
     }
     Ok(None)
+}
+
+// Resolve each theme independently: a malformed resource should not hide a
+// valid selected theme or prevent opening a session.
+fn load_resolved_theme(
+    name: &str,
+    paths: &[PathBuf],
+    workspace: &Path,
+    trusted: bool,
+) -> Result<Theme> {
+    let error = match Theme::load(name, &[], workspace, trusted, false) {
+        Ok(theme) => return Ok(theme),
+        Err(error) => error,
+    };
+    for path in paths {
+        if let Ok(theme) = Theme::load(name, std::slice::from_ref(path), workspace, trusted, false)
+        {
+            return Ok(theme);
+        }
+    }
+    Err(error)
+}
+
+#[cfg(any(unix, windows))]
+fn follows_terminal_appearance(selection: Option<&str>) -> bool {
+    let selection = selection.unwrap_or("system");
+    selection == "system" || crate::ui::theme::parse_auto_theme_setting(selection).is_some()
+}
+
+#[cfg(any(unix, windows))]
+fn apply_terminal_appearance(theme: &mut Theme, dark: bool) -> (bool, bool) {
+    // A reported background remains authoritative until a newer color reply arrives.
+    let changed = crate::ui::theme::set_appearance(dark);
+    let redraw_system = changed && theme.name == "system";
+    if redraw_system {
+        *theme = Theme::system();
+    }
+    (changed, redraw_system)
+}
+
+#[cfg(any(unix, windows))]
+fn handle_terminal_appearance(
+    colors: &mut ColorQueries,
+    theme: &mut Theme,
+    dark: bool,
+    output: &mut dyn Write,
+) -> Result<(bool, bool)> {
+    let changed_report = colors.appearance_report(dark, output)?;
+    let invalidate = colors.disabled && changed_report;
+    if invalidate {
+        crate::ui::theme::invalidate_terminal_default_colors();
+        crate::ui::theme::clear_terminal_palette();
+    }
+    let (changed, redraw) = apply_terminal_appearance(theme, dark);
+    if invalidate && theme.name == "system" && !redraw {
+        *theme = Theme::system();
+    }
+    Ok((
+        changed || invalidate,
+        redraw || (invalidate && theme.name == "system"),
+    ))
+}
+
+#[cfg(any(unix, windows))]
+fn apply_terminal_color_snapshot(
+    snapshot: crate::ui::terminal_color_batch::ColorSnapshot,
+    theme: &mut Theme,
+) -> (bool, bool) {
+    let mut appearance_changed = false;
+    let mut colors_reported = false;
+    if let Some([red, green, blue]) = snapshot.foreground {
+        appearance_changed |= crate::ui::theme::set_terminal_color(true, red, green, blue);
+        colors_reported = true;
+    }
+    if let Some([red, green, blue]) = snapshot.background {
+        appearance_changed |= crate::ui::theme::set_terminal_color(false, red, green, blue);
+        colors_reported = true;
+    }
+    if let Some(palette) = snapshot.palette {
+        crate::ui::theme::begin_terminal_palette_query();
+        for (index, [red, green, blue]) in palette.into_iter().enumerate() {
+            crate::ui::theme::set_terminal_palette(index as u8, red, green, blue);
+        }
+        colors_reported = true;
+    }
+    let redraw_system = colors_reported && theme.name == "system";
+    if redraw_system {
+        *theme = Theme::system();
+    }
+    (appearance_changed, redraw_system)
+}
+
+#[cfg(any(unix, windows))]
+fn refresh_terminal_theme_selection(args: &Cli, view: &mut View, theme: &mut Theme) {
+    let selection = args.theme_setting().unwrap_or("system");
+    if let (Some(settings), Some(picker)) = (&view.theme_settings, &view.picker) {
+        if let Ok(next) = settings.preview(picker, args) {
+            *theme = next;
+        }
+    } else if selection.contains('/') {
+        match load_resolved_theme(selection, &args.theme_paths, &args.workspace, args.trusted) {
+            Ok(next) => *theme = next,
+            Err(error) => view.append(&format!("Theme reload: {error}")),
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn finish_initial_terminal_colors(theme: &mut Theme) -> bool {
+    if crate::ui::theme::finish_terminal_colors_pending() && theme.name == "system" {
+        *theme = Theme::system();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn expire_initial_terminal_colors(colors: &ColorQueries, theme: &mut Theme) -> bool {
+    colors
+        .initial_started
+        .is_some_and(|started| started.elapsed() >= Duration::from_millis(100))
+        && finish_initial_terminal_colors(theme)
+}
+
+#[cfg(any(unix, windows))]
+fn settle_complete_colors(colors: &ColorQueries, theme: &mut Theme) -> bool {
+    colors.color_queries.front().is_some_and(|query| {
+        !colors.color_requery && !query.quarantined && query.replied == (1 << 18) - 1
+    }) && finish_initial_terminal_colors(theme)
+}
+
+// Like Pi's startup UI, do not install missing packages or let an absent or
+// malformed theme prevent session selection. Runtime preparation happens later.
+fn startup_picker_theme(args: &Cli) -> Result<Theme> {
+    let resources = super::resources::Resources::load_for_startup(args)?;
+    Ok(load_resolved_theme(
+        args.theme_setting().unwrap_or("system"),
+        &resources.themes,
+        &args.workspace,
+        args.trusted,
+    )
+    .unwrap_or_else(|_| Theme::system()))
 }
 
 /// Run the startup session picker on the controlling terminal, leaving stdout
@@ -3136,11 +5112,15 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
         }
         Box::new(std::io::stderr())
     };
-    struct PickerTerminal(Box<dyn Write>);
+    struct PickerTerminal {
+        output: Box<dyn Write>,
+        input: Option<crate::ui::input::Reader>,
+    }
     impl Drop for PickerTerminal {
         fn drop(&mut self) {
+            // Preserve input queued for the next terminal owner.
             let _ = execute!(
-                self.0,
+                self.output,
                 ResetColor,
                 Show,
                 DisableBracketedPaste,
@@ -3150,27 +5130,19 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
         }
     }
     terminal::enable_raw_mode()?;
-    let mut screen = PickerTerminal(output);
-    execute!(screen.0, EnterAlternateScreen, EnableBracketedPaste, Hide)?;
-    let mut input = crate::ui::input::Reader::new()?;
+    let mut screen = PickerTerminal {
+        output,
+        input: None,
+    };
+    execute!(
+        screen.output,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        Hide
+    )?;
+    screen.input = Some(crate::ui::input::Reader::new_for_handoff()?);
     let keys = Keys::load()?;
-    let mut theme = Theme::load(
-        args.use_theme.as_deref().unwrap_or("system"),
-        &args.themes,
-        &args.workspace,
-        args.trusted,
-        !args.no_themes,
-    )
-    .or_else(|error| {
-        if !super::resources::Resources::load(args)?
-            .extensions
-            .is_empty()
-        {
-            Ok(Theme::system())
-        } else {
-            Err(error)
-        }
-    })?;
+    let mut theme = startup_picker_theme(args)?;
     let mut view = View::default();
     slash("/resume", args, &mut view, None)?;
     let mut worker = None;
@@ -3178,7 +5150,7 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
     loop {
         if dirty {
             let (width, height) = terminal::size().unwrap_or((80, 24));
-            execute!(screen.0, MoveTo(0, 0), Clear(ClearType::All))?;
+            execute!(screen.output, MoveTo(0, 0), Clear(ClearType::All))?;
             if let Some(picker) = &view.picker {
                 for (row, line) in picker
                     .render(&theme, width as usize, height as usize, &keys)
@@ -3188,14 +5160,19 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
                     if row >= height as usize {
                         break;
                     }
-                    queue!(screen.0, MoveTo(0, row as u16))?;
-                    line.draw(&mut screen.0, width as usize)?;
+                    queue!(screen.output, MoveTo(0, row as u16))?;
+                    line.draw(&mut screen.output, width as usize)?;
                 }
             }
-            screen.0.flush()?;
+            screen.output.flush()?;
             dirty = false;
         }
-        match input.next(Duration::from_millis(100))? {
+        match screen
+            .input
+            .as_mut()
+            .expect("picker input")
+            .next(Duration::from_millis(40))?
+        {
             Some(crate::ui::input::InputEvent::Event(Event::Resize(..))) => dirty = true,
             Some(crate::ui::input::InputEvent::Event(Event::Paste(text))) => {
                 if let Some(picker) = &mut view.picker {
@@ -3229,7 +5206,11 @@ pub(super) fn select_startup_session(args: &mut Cli) -> Result<Option<PathBuf>> 
     }
 }
 
-pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result<()> {
+pub(super) async fn run(
+    mut args: Cli,
+    follow_up_prompts: Vec<String>,
+    mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(Error::Config(
             "interactive mode requires a terminal; use run <prompt> for automation".into(),
@@ -3248,27 +5229,35 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     {
         std::fs::create_dir_all(parent)?;
     }
-    initialize_session(&mut args)?;
-    restore_workspace(&mut args)?;
+    let reported_settings = args.settings.diagnostics().to_vec();
+    args = prepare_initial_session_async(args).await?;
+    for warning in args.settings.diagnostics() {
+        if !reported_settings.contains(warning) {
+            eprintln!("{warning}");
+        }
+    }
     super::packages::prepare(&args).await?;
     let initial_resources = super::resources::Resources::load(&args)?;
     args.theme_paths = initial_resources.themes.clone();
+    #[cfg(any(unix, windows))]
+    let _pending_colors = crate::ui::theme::PendingTerminalColors::new();
     let mut deferred_theme_error = None;
-    let mut theme = match Theme::load(
-        args.use_theme.as_deref().unwrap_or("system"),
+    let mut theme = match load_resolved_theme(
+        args.theme_setting().unwrap_or("system"),
         &args.theme_paths,
         &args.workspace,
         args.trusted,
-        false,
     ) {
         Ok(theme) => theme,
-        Err(error) if !initial_resources.extensions.is_empty() => {
-            deferred_theme_error = Some(error.to_string());
+        Err(error) => {
+            if !initial_resources.extensions.is_empty() {
+                deferred_theme_error = Some(error.to_string());
+            }
             Theme::system()
         }
-        Err(error) => return Err(error),
     };
     let mut view = View {
+        async_transitions: true,
         expand_tools: args.settings.boolean("expandTools").unwrap_or(false),
         hide_thinking: args.settings.boolean("hideThinkingBlock").unwrap_or(false),
         ..View::default()
@@ -3286,12 +5275,23 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         slash("/resume", &mut args, &mut view, None)?;
     }
     let mut keys = Keys::load()?;
-    let mut _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
+    let mut _terminal = Some(Terminal::enter(
+        args.tui_mode,
+        view.graphics.cleanup(),
+        #[cfg(any(unix, windows))]
+        None,
+        #[cfg(any(unix, windows))]
+        follows_terminal_appearance(args.theme_setting()),
+    )?);
     let mut input = crate::ui::input::Reader::new()?;
+    let terminal_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+    install_terminal_signal(terminal_signal.clone())?;
+    super::startup_ready(&mut ready);
     if view.graphics.enabled() {
         crate::ui::images::query_cell_size()?;
     }
     let mut worker: Option<Worker> = None;
+    let mut auth_reload: Option<AuthReload> = None;
     let mut startup_extensions: Option<Vec<PathBuf>> = None;
     let mut initial: VecDeque<_> = args
         .initial_prompt
@@ -3308,9 +5308,92 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
     let frame_interval = Duration::from_millis(16);
     let mut last_frame = Instant::now() - frame_interval;
     let mut last_idle_interrupt: Option<Instant> = None;
+    let mut last_clear: Option<Instant> = None;
     let mut theme_watcher = ThemeWatcher::new(&theme);
     let mut last_theme_check = Instant::now();
-    loop {
+    let mut deferred_input = VecDeque::new();
+    let mut thinking_level_input = VecDeque::new();
+    let mut interrupted = false;
+    let mut external_editor: Option<RunningExternalEditor> = None;
+    #[cfg(any(unix, windows))]
+    let mut editor_colors = None;
+    'interactive: loop {
+        if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+            interrupted = true;
+            break 'interactive;
+        }
+        #[cfg(unix)]
+        if SUSPEND_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
+            && _terminal.is_some()
+        {
+            view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+            dirty = true;
+        }
+        #[cfg(any(unix, windows))]
+        if let Some(terminal) = &mut _terminal {
+            let enabled = follows_terminal_appearance(args.theme_setting());
+            let refresh_requested = std::mem::take(&mut view.theme_refresh_requested);
+            let mut output = std::io::stdout();
+            if terminal.set_appearance_notifications(enabled, &mut output)? && enabled {
+                terminal
+                    .colors
+                    .refresh_after_appearance_subscription(&mut output)?;
+            } else if refresh_requested {
+                terminal.colors.query_terminal_colors(&mut output)?;
+            }
+        }
+        if let Some(task) = &auth_reload {
+            match task.receiver.try_recv() {
+                Ok(Ok(keys)) => {
+                    if args.model_keys.revision() == task.revision {
+                        let result = args.replace_model_keys(keys);
+                        view.invalidate_model_catalog();
+                        match result {
+                            Ok(()) => view.append("Provider credentials reloaded"),
+                            Err(error) => view.append(&format!("Model profile reload: {error}")),
+                        }
+                    } else {
+                        view.append("Provider credentials changed during reload; keeping the newer selection");
+                    }
+                    auth_reload = None;
+                    dirty = true;
+                }
+                Ok(Err(error)) => {
+                    view.append(&format!("Auth reload: {error}"));
+                    auth_reload = None;
+                    dirty = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    view.append("Auth reload stopped");
+                    auth_reload = None;
+                    dirty = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => (),
+            }
+        }
+        if let Some(receiver) = &view.pending_transition {
+            let ready = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(Error::Config(
+                    "session transition worker stopped".into(),
+                ))),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = ready {
+                if queued_transition_cancel(&mut deferred_input, |timeout| input.next(timeout))? {
+                    view.pending_transition = None;
+                    view.append("Session transition cancelled");
+                    dirty = true;
+                    continue;
+                }
+                view.pending_transition = None;
+                match result.and_then(|next| apply_session(&mut args, &mut view, next)) {
+                    Ok(()) => {}
+                    Err(error) => view.append(&error.to_string()),
+                }
+                dirty = true;
+            }
+        }
         if !is_busy(&worker) {
             for event in std::mem::take(&mut args.selection_events) {
                 if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
@@ -3363,8 +5446,21 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         if worker
             .as_ref()
             .is_some_and(|active| !active.busy && !active.bashing && !active.matches(&args))
+            && let Some(mut old) = worker.take()
         {
-            worker.take();
+            if old.markdown_transformers
+                || !old.message_renderer_types.is_empty()
+                || !old.entry_renderer_types.is_empty()
+            {
+                startup_extensions = None;
+                view.custom_render_pending = None;
+                dirty |= view.invalidate_custom_message_renderings();
+                dirty |= view.clear_markdown_renderings();
+            }
+            for warning in old.take_pending_warnings() {
+                view.append(&warning);
+                dirty = true;
+            }
         }
         if !is_busy(&worker)
             && let Some(pending) = &view.pending_thinking
@@ -3387,7 +5483,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             && view.dialog().is_none()
             && let Some(discovery) = &view.model_list
         {
-            let intent = discovery.intent;
+            let intent = discovery.intent.clone();
             match discovery.receiver.try_recv() {
                 Ok(Ok(models)) => {
                     view.model_list = None;
@@ -3408,7 +5504,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                 state.models = models;
                                 let mut picker = Picker::new(
                                     "Thinking: select model",
-                                    thinking_model_items(&state.models, &args),
+                                    thinking_model_items(&state.models, &state.overrides),
                                 );
                                 picker.focus_thinking_model(&format!(
                                     "{}/{}",
@@ -3434,13 +5530,29 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             }
                             ModelListIntent::Cycle { reverse } => {
                                 view.available_models = models;
-                                if let Err(error) = cycle_model(&mut args, &mut view, reverse) {
+                                if let Err(error) =
+                                    cycle_model(&mut args, &mut view, &mut worker, reverse)
+                                {
                                     view.append(&error.to_string());
                                 }
                             }
-                            ModelListIntent::Select => {
+                            ModelListIntent::Select { query } => {
                                 view.available_models = models.clone();
-                                view.picker = Some(Picker::new(
+                                let selection = exact_model_query(&args, &query, &models);
+                                if let Some(model) = selection {
+                                    if let Err(error) = select_model_input(
+                                        &mut args,
+                                        &mut view,
+                                        worker.as_mut(),
+                                        &model,
+                                        false,
+                                    ) {
+                                        view.append(&error.to_string());
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
+                                let mut picker = Picker::new(
                                     "Select model",
                                     models
                                         .into_iter()
@@ -3459,7 +5571,9 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                             selection: Selection::Model(model),
                                         })
                                         .collect(),
-                                ));
+                                );
+                                picker.paste(&query);
+                                view.picker = Some(picker);
                             }
                         }
                     }
@@ -3495,18 +5609,20 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             && let Some(receiver) = &state.levels
         {
             match receiver.try_recv() {
-                Ok(mut levels) => {
+                Ok((mut levels, reasoning)) => {
                     if levels.is_empty() {
                         levels.push("off".into());
                     }
                     levels.dedup();
                     state.available_levels = levels;
+                    state.available_reasoning = reasoning;
                     state.levels = None;
-                    view.picker = Some(thinking_level_picker(state, &args));
+                    view.picker = Some(thinking_level_picker(state));
                     dirty = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     state.levels = None;
+                    thinking_level_input.clear();
                     let mut picker = state.model_picker.take().expect("model picker");
                     picker.show_feedback(Err("Thinking level discovery stopped".into()));
                     view.picker = Some(picker);
@@ -3521,6 +5637,32 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             }
             let events: Vec<_> = active.drain_events();
             for value in events {
+                if value["type"] == "backend_ready" {
+                    active.message_renderer_types =
+                        serde_json::from_value(value["custom_message_renderers"].clone())
+                            .unwrap_or_default();
+                    active.entry_renderer_types =
+                        serde_json::from_value(value["custom_entry_renderers"].clone())
+                            .unwrap_or_default();
+                    active.markdown_transformers = value["markdown_transformers"] == true;
+                    dirty |= view.clear_markdown_renderings();
+                    dirty |= view.refresh_transcript_extension_renderers();
+                }
+                if value["type"] == "transcript_extension_rendered" {
+                    dirty |= view.receive_transcript_extension_render(value);
+                    continue;
+                }
+                if value["type"] == "transcript_markdown_transformed" {
+                    dirty |= view.receive_markdown_transform(&value);
+                    continue;
+                }
+                if value["type"] == "response" && value["command"] == "get_share_context" {
+                    if let Some((pending, snapshot)) = view.take_share_response(&value) {
+                        start_share_upload(&mut view, pending, snapshot);
+                        dirty = true;
+                    }
+                    continue;
+                }
                 if value["type"] == "extension_ui_request" {
                     match view.ui_request(&value) {
                         Ok(Some((id, value))) => active
@@ -3535,8 +5677,8 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                     continue;
                 }
                 if value["type"] == "extension_ui_cancelled" {
-                    view.dialogs
-                        .retain(|dialog| json!(dialog.id) != value["id"]);
+                    cancel_running_extension_editor(&mut external_editor, Some(&value));
+                    view.cancel_extension_dialog(&value["id"]);
                     dirty = true;
                     continue;
                 }
@@ -3545,11 +5687,45 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 {
                     view.append(&error);
                 }
+                if value["type"] == "response"
+                    && value["command"] == "clear_queue"
+                    && let Some(handoff) = &view.tree_handoff
+                    && handoff.clear_id.is_some_and(|id| value["id"] == json!(id))
+                {
+                    let result = view.restore_queue(&value).and_then(|()| {
+                        if active.busy && (active.compacting || view.summarizing) {
+                            return Err(tree_compaction_in_progress());
+                        }
+                        if active.busy {
+                            active.send(json!({"type":"cancel"}))?;
+                        }
+                        Ok(())
+                    });
+                    match result {
+                        Ok(()) => {
+                            view.tree_handoff.as_mut().expect("active handoff").clear_id = None
+                        }
+                        Err(error) => {
+                            view.tree_handoff = None;
+                            view.append(&error.to_string());
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
                 let settled = value["type"] == "agent_settled";
                 let success = value["success"] == true;
                 if view.tree_navigation.is_some() {
                     match value["type"].as_str() {
-                        Some("text_delta" | "reasoning_delta") => continue,
+                        Some(
+                            "text_delta"
+                            | "reasoning_delta"
+                            | "reasoning_item_start"
+                            | "reasoning_item_end"
+                            | "text_item_start"
+                            | "text_item_delta"
+                            | "text_item_end",
+                        ) => continue,
                         Some("error") => {
                             view.branch_error = value["message"].as_str().map(str::to_owned)
                         }
@@ -3567,13 +5743,12 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 }
                 let resources_changed = value["type"] == "resources_discovered";
                 view.receive_worker(value, &mut args);
-                if resources_changed && let Some(name) = args.use_theme.as_deref() {
-                    match Theme::load(
+                if resources_changed && let Some(name) = args.theme_setting() {
+                    match load_resolved_theme(
                         name,
                         &args.theme_paths,
                         &args.workspace,
                         args.trusted,
-                        false,
                     ) {
                         Ok(next) => {
                             theme = next;
@@ -3588,7 +5763,11 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                     }
                 }
                 if settled {
+                    if view.finish_model_choice(&mut args) {
+                        active.adopt_live_model(&args);
+                    }
                     active.busy = false;
+                    cancel_running_extension_editor(&mut external_editor, None);
                     view.dialogs.clear();
                     view.settle();
                     if let Some((id, _)) = view.tree_navigation.take() {
@@ -3613,17 +5792,37 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 }
                 dirty = true;
             }
+            dirty |= view.prepare_transcript_extension_render(active, &args);
+            view.prepare_markdown_transform(active, &args);
             if let Some(status) = active.child.try_wait()? {
                 let mut finished = worker.take().expect("active worker");
+                view.custom_render_pending = None;
+                view.clear_markdown_renderings();
+                view.invalidate_custom_message_renderings();
                 for reader in finished.readers.drain(..) {
                     let _ = reader.join();
                 }
                 for value in finished.drain_events() {
+                    if value["type"] == "response" && value["command"] == "get_share_context" {
+                        continue;
+                    }
                     view.receive_worker(value, &mut args);
                 }
+                if let Some(pending) = view.pending_share.take() {
+                    start_share_upload(&mut view, pending, None);
+                }
+                view.live_model_choices.clear();
+                view.live_model_applied = None;
                 view.settle();
                 view.cache_warming_status = None;
+                cancel_running_extension_editor(&mut external_editor, None);
                 view.dialogs.clear();
+                if view.tree_handoff.take().is_some() {
+                    view.append("Branch navigation stopped when the active worker exited");
+                }
+                if let Some(picker) = &mut view.picker {
+                    picker.cancel_pending_tree_label();
+                }
                 if let Some((id, _)) = view.tree_navigation.take()
                     && let Err(error) = reopen_tree(&mut args, &mut view, id)
                 {
@@ -3640,10 +5839,56 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 dirty = true;
             }
         }
+        if !is_busy(&worker)
+            && view
+                .tree_handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.clear_id.is_none())
+        {
+            let handoff = view.tree_handoff.take().expect("acknowledged tree handoff");
+            if let Err(error) = start_tree_navigation(
+                &args,
+                &mut view,
+                &mut worker,
+                handoff.id,
+                handoff.summarize,
+                handoff.instructions,
+            ) {
+                view.append(&error.to_string());
+            }
+            dirty = true;
+        }
+        if view
+            .custom_render_redraw_at
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            view.custom_render_redraw_at = None;
+            view.regular.redraw = true;
+            dirty = true;
+        }
+        if view.dialogs.is_empty()
+            && view
+                .pending_share
+                .as_ref()
+                .is_some_and(|pending| pending.started.elapsed() >= Duration::from_secs(15))
+        {
+            let pending = view.pending_share.take().expect("timed out share");
+            start_share_upload(&mut view, pending, None);
+            dirty = true;
+        }
         if let Some(task) = &view.remote_task {
             match task.receiver.try_recv() {
                 Ok(RemoteEvent::Notice(notice)) => {
                     view.append(&notice);
+                    dirty = true;
+                }
+                Ok(RemoteEvent::DeviceCode { url, code }) => {
+                    view.append(&format!(
+                        "Enter code {code} at {url} · Enter opens browser and copies code"
+                    ));
+                    if let Some(task) = &mut view.remote_task {
+                        task.device_code = Some((url, code));
+                    }
                     dirty = true;
                 }
                 Ok(RemoteEvent::OpenRouterCode(sender)) => {
@@ -3653,13 +5898,35 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                     ));
                     dirty = true;
                 }
+                Ok(RemoteEvent::CodexCode(sender)) => {
+                    view.local_editor = Some((
+                        LocalEditor::CodexCode(Some(sender)),
+                        crate::ui::dialog::Dialog::secret(
+                            "OpenAI Codex code or redirect URL".into(),
+                        ),
+                    ));
+                    dirty = true;
+                }
+                Ok(RemoteEvent::AnthropicCode(sender)) => {
+                    view.local_editor = Some((
+                        LocalEditor::AnthropicCode(Some(sender)),
+                        crate::ui::dialog::Dialog::secret("Anthropic code or redirect URL".into()),
+                    ));
+                    dirty = true;
+                }
+                Ok(RemoteEvent::ForgetModelKey(provider)) => {
+                    let mut keys = args.model_keys.clone();
+                    keys.forget(provider);
+                    if let Err(error) = args.replace_model_keys(keys) {
+                        view.append(&format!("Model profile reload: {error}"));
+                    }
+                    view.invalidate_model_catalog();
+                    dirty = true;
+                }
                 Ok(RemoteEvent::RefreshModelKeys) => {
                     view.invalidate_model_catalog();
                     args.thinking_profile = None;
-                    match super::model_auth::Keys::load() {
-                        Ok(keys) => args.model_keys = keys,
-                        Err(error) => view.append(&error.to_string()),
-                    }
+                    auth_reload = Some(AuthReload::start(args.model_keys.revision().to_owned()));
                     dirty = true;
                 }
                 Ok(RemoteEvent::Finished(result)) => {
@@ -3684,6 +5951,18 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
+        if let Some(task) = &mut view.remote_task
+            && let Some(receiver) = &task.device_copy
+            && let Ok(copied) = receiver.try_recv()
+        {
+            task.device_copy = None;
+            view.append(if copied {
+                "Code copied to clipboard"
+            } else {
+                "Copy code manually"
+            });
+            dirty = true;
+        }
         dirty |= view.poll_clipboard();
         if view
             .flash
@@ -3706,8 +5985,12 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                     && worker.as_ref().is_some_and(|worker| worker.busy),
             )?;
         }
+        if dirty {
+            view.maybe_warn_about_anthropic_subscription(&args);
+        }
         if !args.trust_pending
             && view.picker.is_none()
+            && view.pending_transition.is_none()
             && !is_busy(&worker)
             && let Some((prompt, images)) = initial.pop_front()
         {
@@ -3720,14 +6003,49 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                     };
                     view.lines
                         .push(Entry::user(display.unwrap_or_else(|| prompt.clone())));
-                    view.history.push(prompt);
+                    view.remember_prompt(&prompt);
                 }
                 Err(error) => view.append(&error.to_string()),
             }
             dirty = true;
         }
+        if let Some(editor) = &mut external_editor {
+            match editor.poll() {
+                Ok(None) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                outcome => {
+                    let editor = external_editor.take().expect("active editor");
+                    let result = if editor.cancelled {
+                        None
+                    } else {
+                        Some(match outcome {
+                            Ok(Some(status)) => editor.result(status),
+                            Err(error) => Err(error),
+                            Ok(None) => unreachable!(),
+                        })
+                    };
+                    let target = editor.target;
+                    drop(editor);
+                    finish_external_editor(
+                        &args,
+                        &mut view,
+                        &mut _terminal,
+                        #[cfg(any(unix, windows))]
+                        &mut editor_colors,
+                        target,
+                        result,
+                    )?;
+                    dirty = true;
+                }
+            }
+        }
+        if let Some(title) = view.pending_terminal_title.take() {
+            execute!(std::io::stdout(), crossterm::terminal::SetTitle(title))?;
+        }
         if (dirty && last_frame.elapsed() >= frame_interval)
-            || ((is_busy(&worker) || view.remote_task.is_some())
+            || ((is_busy(&worker) || view.remote_task.is_some() || view.pending_share.is_some())
                 && last_frame.elapsed() >= Duration::from_millis(100))
         {
             view.draw(&args, &theme, is_busy(&worker), &keys)?;
@@ -3736,14 +6054,46 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         }
         #[cfg(any(unix, windows))]
         if let Some(terminal) = &mut _terminal {
-            terminal.poll_color_timeout()?;
+            terminal.colors.poll_color_timeout()?;
+            if let Some(snapshot) = terminal.colors.timeout_color_batch(Instant::now()) {
+                let (changed, redraw) = apply_terminal_color_snapshot(snapshot, &mut theme);
+                dirty |= redraw;
+                if changed {
+                    refresh_terminal_theme_selection(&args, &mut view, &mut theme);
+                    dirty = true;
+                }
+            }
+            dirty |= expire_initial_terminal_colors(&terminal.colors, &mut theme);
         }
         let input_wait = if dirty {
             frame_interval.saturating_sub(last_frame.elapsed())
         } else {
             Duration::from_millis(40)
         };
-        let event = match input.next(input_wait)? {
+        let picker_title = view.picker.as_ref().map(|picker| picker.title.as_str());
+        let loading = picker_title == Some("Loading thinking levels");
+        let ready = picker_title.is_some_and(|title| title.starts_with("Thinking level · "));
+        let blocked =
+            view.dialog().is_some() || view.local_editor.is_some() || view.share_blocks_input();
+        let pending = if view.pending_transition.is_some() {
+            thinking_level_input.clear();
+            None
+        } else {
+            next_thinking_level_input(&mut thinking_level_input, loading, ready, blocked)
+        };
+        #[cfg(unix)]
+        input.read_for_handoff(
+            view.dialog()
+                .is_some_and(crate::ui::dialog::Dialog::supports_external_editor),
+        );
+        let next_input = if let Some(event) = pending {
+            Some(crate::ui::input::InputEvent::Event(event))
+        } else if let Some(event) = deferred_input.pop_front() {
+            Some(event)
+        } else {
+            input.next(input_wait)?
+        };
+        let event = match next_input {
             Some(crate::ui::input::InputEvent::Event(event)) => event,
             #[cfg(unix)]
             Some(crate::ui::input::InputEvent::KeyboardEnhancementFlags(flags)) => {
@@ -3755,7 +6105,20 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             #[cfg(any(unix, windows))]
             Some(crate::ui::input::InputEvent::PrimaryDeviceAttributes) => {
                 if let Some(terminal) = &mut _terminal {
-                    terminal.receive_color_marker()?;
+                    if let Some(snapshot) = terminal
+                        .colors
+                        .receive_color_marker(&mut std::io::stdout())?
+                    {
+                        let (changed, redraw) = apply_terminal_color_snapshot(snapshot, &mut theme);
+                        dirty |= redraw;
+                        if changed {
+                            refresh_terminal_theme_selection(&args, &mut view, &mut theme);
+                            dirty = true;
+                        }
+                    }
+                    if !terminal.colors.color_requery && terminal.colors.color_queries.is_empty() {
+                        dirty |= finish_initial_terminal_colors(&mut theme);
+                    }
                     #[cfg(unix)]
                     terminal.keyboard_reply(false)?;
                 }
@@ -3771,7 +6134,18 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             #[cfg(any(unix, windows))]
             Some(crate::ui::input::InputEvent::TerminalColorInvalid { target }) => {
                 if let Some(terminal) = &mut _terminal {
-                    terminal.accepts_color_reply(target)?;
+                    if let Some(snapshot) = terminal
+                        .colors
+                        .record_invalid_color(target, &mut std::io::stdout())?
+                    {
+                        let (changed, redraw) = apply_terminal_color_snapshot(snapshot, &mut theme);
+                        dirty |= redraw;
+                        if changed {
+                            refresh_terminal_theme_selection(&args, &mut view, &mut theme);
+                            dirty = true;
+                        }
+                    }
+                    dirty |= settle_complete_colors(&terminal.colors, &mut theme);
                 }
                 continue;
             }
@@ -3782,16 +6156,24 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 green,
                 blue,
             }) => {
-                let accepted = match &mut _terminal {
-                    Some(terminal) => terminal.accepts_color_reply(index)?,
-                    None => false,
+                let snapshot = match &mut _terminal {
+                    Some(terminal) => terminal.colors.record_color(
+                        index,
+                        [red, green, blue],
+                        &mut std::io::stdout(),
+                    )?,
+                    None => None,
                 };
-                if accepted
-                    && crate::ui::theme::set_terminal_palette(index, red, green, blue)
-                    && theme.name == "system"
-                {
-                    theme = Theme::system();
-                    dirty = true;
+                if let Some(snapshot) = snapshot {
+                    let (changed, redraw) = apply_terminal_color_snapshot(snapshot, &mut theme);
+                    dirty |= redraw;
+                    if changed {
+                        refresh_terminal_theme_selection(&args, &mut view, &mut theme);
+                        dirty = true;
+                    }
+                }
+                if let Some(terminal) = &mut _terminal {
+                    dirty |= settle_complete_colors(&terminal.colors, &mut theme);
                 }
                 continue;
             }
@@ -3802,15 +6184,20 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             ) => {
                 let changed = match event {
                     crate::ui::input::InputEvent::Appearance { dark } => {
-                        crate::ui::theme::reset_terminal_background();
-                        if let Some(terminal) = &mut _terminal {
-                            terminal.query_terminal_colors()?;
+                        let Some(terminal) = &mut _terminal else {
+                            continue;
+                        };
+                        if !terminal.appearance_notifications {
+                            continue;
                         }
-                        if theme.name == "system" {
-                            theme = Theme::system();
-                            dirty = true;
-                        }
-                        crate::ui::theme::set_appearance(dark)
+                        let (changed, redraw_system) = handle_terminal_appearance(
+                            &mut terminal.colors,
+                            &mut theme,
+                            dark,
+                            &mut std::io::stdout(),
+                        )?;
+                        dirty |= redraw_system;
+                        changed
                     }
                     crate::ui::input::InputEvent::TerminalColor {
                         foreground,
@@ -3818,44 +6205,120 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         green,
                         blue,
                     } => {
-                        let accepted = match &mut _terminal {
-                            Some(terminal) => {
-                                terminal.accepts_color_reply(if foreground { 16 } else { 17 })?
-                            }
-                            None => false,
+                        let snapshot = match &mut _terminal {
+                            Some(terminal) => terminal.colors.record_color(
+                                if foreground { 16 } else { 17 },
+                                [red, green, blue],
+                                &mut std::io::stdout(),
+                            )?,
+                            None => None,
                         };
-                        accepted
-                            && crate::ui::theme::set_terminal_color(foreground, red, green, blue)
+                        if let Some(snapshot) = snapshot {
+                            let (changed, redraw) =
+                                apply_terminal_color_snapshot(snapshot, &mut theme);
+                            dirty |= redraw;
+                            changed
+                        } else {
+                            false
+                        }
                     }
                     _ => unreachable!(),
                 };
+                if let Some(terminal) = &mut _terminal {
+                    dirty |= settle_complete_colors(&terminal.colors, &mut theme);
+                }
                 if changed {
-                    let selection = args.use_theme.as_deref().unwrap_or("system");
-                    if let (Some(settings), Some(picker)) = (&view.theme_settings, &view.picker) {
-                        if let Ok(next) = settings.preview(picker, &args) {
-                            theme = next;
-                        }
-                    } else if selection.contains('/') {
-                        match Theme::load(
-                            selection,
-                            &args.theme_paths,
-                            &args.workspace,
-                            args.trusted,
-                            false,
-                        ) {
-                            Ok(next) => theme = next,
-                            Err(error) => view.append(&format!("Theme reload: {error}")),
-                        }
-                    }
+                    refresh_terminal_theme_selection(&args, &mut view, &mut theme);
                     dirty = true;
                 }
                 continue;
             }
             _ => continue,
         };
+        if let Event::Key(key) = &event
+            && key.kind != KeyEventKind::Release
+            && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('d' | 'D'))
+        {
+            view.show_debug_log(&args, &theme);
+            dirty = true;
+            continue;
+        }
+        if view
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.title == "Loading thinking levels")
+            && view.dialog().is_none()
+            && view.local_editor.is_none()
+            && !view.share_blocks_input()
+            && view.pending_transition.is_none()
+            && buffer_thinking_level_input(
+                &mut thinking_level_input,
+                &event,
+                matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release && keys.matches("tui.select.cancel", *key)),
+            )
+        {
+            continue;
+        }
+        if view.pending_transition.is_some() {
+            match &event {
+                Event::Key(key) if key.code == KeyCode::Esc => {
+                    view.pending_transition = None;
+                    view.append("Session transition cancelled");
+                    dirty = true;
+                    continue;
+                }
+                Event::Key(_) | Event::Mouse(_) | Event::Paste(_) => continue,
+                _ => {}
+            }
+        }
+        let mut mouse_activate = false;
+        let event = match event {
+            Event::Mouse(mouse)
+                if args.tui_mode != Some(TuiMode::Regular)
+                    && view.dialog().is_none()
+                    && view.picker.is_some() =>
+            {
+                let mut picker = view.picker.take().expect("picker checked above");
+                let header_rows = usize::from(show_startup_header(&args));
+                let action = if usize::from(mouse.column) < view.fullscreen_width
+                    && let Some(row) = usize::from(mouse.row).checked_sub(header_rows)
+                {
+                    picker.mouse(mouse.kind, row)
+                } else {
+                    picker.clear_mouse_press();
+                    MouseInput::Ignored
+                };
+                if matches!(action, MouseInput::Changed)
+                    && let Some(settings) = &view.theme_settings
+                {
+                    match settings.preview(&picker, &args) {
+                        Ok(next) => theme = next,
+                        Err(error) => picker.show_feedback(Err(error.to_string())),
+                    }
+                }
+                view.picker = Some(picker);
+                match action {
+                    MouseInput::Activate => {
+                        mouse_activate = true;
+                        Event::Key(KeyEvent::new(KeyCode::F(255), KeyModifiers::NONE))
+                    }
+                    MouseInput::Changed => {
+                        last_idle_interrupt = None;
+                        dirty = true;
+                        continue;
+                    }
+                    MouseInput::Ignored => continue,
+                }
+            }
+            event => event,
+        };
         match event {
             Event::Resize(..) => {
                 view.mouse.clear();
+                if let Some(picker) = &mut view.picker {
+                    picker.clear_mouse_press();
+                }
                 view.scrollbar_dragging = false;
                 if view.graphics.enabled() {
                     images::query_cell_size()?;
@@ -3875,11 +6338,18 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                 view.panel_press = None;
                 view.link_press = None;
                 view.mouse.focus_lost();
+                if let Some(picker) = &mut view.picker {
+                    picker.clear_mouse_press();
+                }
                 view.scrollbar_dragging = false;
                 dirty = true;
             }
             Event::Paste(text) => {
-                if view.remote_task.is_some() && view.local_editor.is_none() {
+                if (view.remote_task.is_some()
+                    && view.local_editor.is_none()
+                    && view.dialogs.is_empty())
+                    || view.share_blocks_input()
+                {
                     continue;
                 }
                 last_idle_interrupt = None;
@@ -3898,17 +6368,64 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 dirty = true;
-                if let Some(task) = &view.remote_task {
+                if !mouse_activate && let Some(picker) = &mut view.picker {
+                    picker.clear_mouse_press();
+                }
+                if view.share_blocks_input() {
                     if keys.action(key, true) == Some("app.interrupt") {
-                        let message = task.cancelled;
-                        view.remote_task = None;
-                        clear_openrouter_editor(&mut view);
-                        view.append(message);
+                        view.pending_share = None;
+                        view.append("Share cancelled");
+                    }
+                    continue;
+                }
+                if view.remote_task.is_some() && view.dialogs.is_empty() {
+                    if keys.action(key, true) == Some("app.interrupt") {
+                        interrupt_remote_task(&mut view);
                         continue;
                     }
                     if view.local_editor.is_none() {
+                        if let Some((url, code)) = take_device_code_action(&mut view, key, &keys) {
+                            view.append("Opening browser and copying code");
+                            let (sender, receiver) = std::sync::mpsc::channel();
+                            let cancel = if let Some(task) = &mut view.remote_task {
+                                task.device_copy = Some(receiver);
+                                task.device_cancel.clone()
+                            } else {
+                                continue;
+                            };
+                            let browser_cancel = cancel.clone();
+                            tokio::spawn(async move {
+                                let _ = run_device_side_effect(browser_cancel, async move {
+                                    pi_rs_workbench::oauth_callback::open_browser(&url).await
+                                })
+                                .await;
+                            });
+                            tokio::spawn(async move {
+                                if let Some(result) = run_device_side_effect(cancel, async move {
+                                    sessions::copy_text_async(&code).await
+                                })
+                                .await
+                                {
+                                    let _ = sender.send(result.is_ok());
+                                }
+                            });
+                        }
                         continue;
                     }
+                }
+                if view
+                    .dialog()
+                    .is_some_and(|dialog| dialog.external_editor_requested(key, &keys))
+                {
+                    external_editor = open_external_editor(
+                        &args,
+                        &mut view,
+                        &mut _terminal,
+                        #[cfg(any(unix, windows))]
+                        &mut editor_colors,
+                        true,
+                    )?;
+                    continue;
                 }
                 if let Some((mut editor, mut dialog)) = view.local_editor.take() {
                     match dialog.input(key, &keys) {
@@ -3944,6 +6461,31 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                         Err(Error::Config("Enter an OpenRouter authorization code or redirect URL".into()))
                                     }
                                 }
+                                LocalEditor::AnthropicCode(sender) | LocalEditor::CodexCode(sender) => {
+                                    if let Some(sender) = sender.take() { let _ = sender.send(text); }
+                                    Ok(())
+                                }
+                                LocalEditor::BedrockChain => super::model_auth::save_bedrock_profile(None)
+                                    .and_then(|()| super::model_auth::Keys::load())
+                                    .map(|keys| { args.model_keys = keys; view.invalidate_model_catalog(); view.append("Using existing AWS credential chain for amazon-bedrock"); }),
+                                LocalEditor::BedrockProfile => {
+                                    super::model_auth::save_bedrock_profile(Some(text.trim()))
+                                        .and_then(|()| super::model_auth::Keys::load())
+                                        .map(|keys| {
+                                            args.model_keys = keys;
+                                            view.invalidate_model_catalog();
+                                            view.append("AWS profile saved for amazon-bedrock");
+                                        })
+                                }
+                                LocalEditor::VertexLogin(field) => {
+                                    advance_vertex_login(field, text.trim(), &mut args, &mut view)
+                                }
+                                LocalEditor::CloudflareLogin(field) => {
+                                    advance_cloudflare_login(field, text.trim(), &mut args, &mut view)
+                                }
+                                LocalEditor::CopilotEnterpriseDomain => {
+                                    start_copilot_login(&mut view, &args.settings, Some(&text))
+                                }
                                 LocalEditor::ProviderKey(provider) => super::model_auth::save(
                                     provider,
                                     args.model_endpoint_for(
@@ -3953,9 +6495,11 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                     &text,
                                 )
                                 .and_then(|()| super::model_auth::Keys::load())
-                                .map(|keys| {
-                                    args.model_keys = keys;
+                                .and_then(|keys| {
+                                    args.replace_model_keys(keys)?;
+                                    view.invalidate_model_catalog();
                                     view.append(&format!("API key saved for {}", provider.id()));
+                                    Ok(())
                                 }),
                             };
                             if let Err(error) = result {
@@ -3971,6 +6515,11 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         Some(_) => {
                             if let LocalEditor::BranchSummary(id) = editor {
                                 confirm_tree(&mut view, id);
+                            } else if matches!(
+                                editor,
+                                LocalEditor::AnthropicCode(_) | LocalEditor::CodexCode(_)
+                            ) {
+                                interrupt_remote_task(&mut view);
                             }
                         }
                         None => view.local_editor = Some((editor, dialog)),
@@ -3989,8 +6538,14 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                     }
                     continue;
                 }
+                let mut submit_completion = false;
                 if let Some(mut picker) = view.picker.take() {
-                    match picker.input(key, &keys) {
+                    let input = if mouse_activate {
+                        picker.activate_mouse_selection(&keys)
+                    } else {
+                        picker.input(key, &keys)
+                    };
+                    match input {
                         Input::Continue => {
                             if let Some(settings) = &view.theme_settings {
                                 match settings.preview(&picker, &args) {
@@ -4001,6 +6556,17 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             view.picker = Some(picker);
                         }
                         Input::Cancel => {
+                            if picker.title == "Warnings"
+                                && let Some(mut parent) = view.warning_settings_parent.take()
+                            {
+                                parent.refresh_settings(settings_items(
+                                    &args,
+                                    &view,
+                                    worker.as_ref(),
+                                ));
+                                view.picker = Some(parent);
+                                continue;
+                            }
                             if let Some(mut state) = view.thinking_settings.take() {
                                 if let Some(model_picker) = state.model_picker.take() {
                                     state.levels = None;
@@ -4023,12 +6589,11 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             if let Some(mut settings) = view.theme_settings.take() {
                                 match settings.stage {
                                     ThemeSettingsStage::Single => {
-                                        theme = Theme::load(
-                                            args.use_theme.as_deref().unwrap_or("system"),
+                                        theme = load_resolved_theme(
+                                            args.theme_setting().unwrap_or("system"),
                                             &args.theme_paths,
                                             &args.workspace,
                                             args.trusted,
-                                            false,
                                         )
                                         .unwrap_or(settings.original);
                                         view.picker = Some(settings.parent);
@@ -4060,12 +6625,36 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         }
                         Input::CopyTreeRecord(id) => {
                             picker.show_feedback(
-                                Session::open(&args.session)
+                                Session::snapshot(&args.session)
                                     .and_then(|session| sessions::tree_record_text(&session, id))
                                     .and_then(|text| sessions::copy_text(&text))
                                     .map(|()| "Copied entry".into())
                                     .map_err(|error| error.to_string()),
                             );
+                            view.picker = Some(picker);
+                        }
+                        Input::SetTreeLabel(id, label) => {
+                            let label = (!label.is_empty()).then_some(label);
+                            let result = if let Some(active) =
+                                worker.as_mut().filter(|worker| worker.busy)
+                            {
+                                let request = uuid::Uuid::new_v4();
+                                active.send(json!({
+                                    "type":"set_session_label","target":id,"label":label,"id":request,
+                                })).map(|()| picker.track_tree_label(request, id))
+                            } else {
+                                Session::open(&args.session).and_then(|mut session| {
+                                    session.set_label(id, label)?;
+                                    picker.refresh_tree(
+                                        session_tree::picker(&session, TreeFilter::Default),
+                                        id,
+                                    );
+                                    Ok(())
+                                })
+                            };
+                            if let Err(error) = result {
+                                picker.show_feedback(Err(error.to_string()));
+                            }
                             view.picker = Some(picker);
                         }
                         Input::UpdateModelScope { save } => {
@@ -4086,23 +6675,19 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         Input::Save(selection) => {
                             let result = match selection {
                                 Selection::Model(model) => select_model_input(
-                                    &mut args, &mut view, &model,
-                                )
-                                .and_then(|()| {
-                                    let configured =
-                                        format!("{}/{}", args.provider.id(), args.model);
-                                    save_default_model(&mut args)?;
-                                    view.append(&format!("Default model: {configured}"));
-                                    Ok(())
-                                }),
-                                Selection::Thinking(thinking) => {
-                                    super::thinking::set(&mut args, &thinking).and_then(|()| {
-                                        args.settings
-                                            .set_user("defaultThinkingLevel", json!(thinking))?;
-                                        view.append(&format!("Default thinking level: {thinking}"));
-                                        Ok(())
-                                    })
-                                }
+                                    &mut args,
+                                    &mut view,
+                                    worker.as_mut(),
+                                    &model,
+                                    true,
+                                ),
+                                Selection::Thinking(thinking) => select_thinking_input(
+                                    &mut args,
+                                    &mut view,
+                                    worker.as_mut(),
+                                    &thinking,
+                                    true,
+                                ),
                                 _ => Ok(()),
                             };
                             if let Err(error) = result {
@@ -4112,7 +6697,22 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         }
                         Input::Select(selection) => {
                             view.tree_confirmation = None;
+                            // A leading slash word opens the command-name menu.
+                            // File completions elsewhere can also start with "/".
+                            submit_completion = !mouse_activate
+                                && keys.matches("tui.select.confirm", key)
+                                && !keys.matches("tui.input.tab", key)
+                                && matches!(&selection, Selection::Completion { range, .. }
+                                    if range.start == 0 && view.editor.text.starts_with('/'));
                             let settings = picker.title == "Settings";
+                            if settings
+                                && matches!(&selection, Selection::EditSetting(name) if name == "warnings")
+                            {
+                                view.warning_settings_parent = Some(picker);
+                                view.picker =
+                                    Some(Picker::new("Warnings", warning_settings_items(&args)));
+                                continue;
+                            }
                             if settings
                                 && matches!(&selection, Selection::EditSetting(name) if name == "theme")
                             {
@@ -4133,10 +6733,15 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                     view.thinking_settings = Some(ThinkingSettings {
                                         parent: picker,
                                         models: Vec::new(),
+                                        overrides: args.settings.value()["modelThinkingLevels"]
+                                            .as_object()
+                                            .cloned()
+                                            .unwrap_or_default(),
                                         model_picker: None,
                                         selected: None,
                                         levels: None,
                                         available_levels: Vec::new(),
+                                        available_reasoning: None,
                                     });
                                     start_model_picker(
                                         &args,
@@ -4189,6 +6794,11 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                 };
                                 match result {
                                     Ok(()) => {
+                                        if let Some(level) = level {
+                                            state.overrides.insert(model.to_owned(), json!(level));
+                                        } else {
+                                            state.overrides.remove(model);
+                                        }
                                         if let Some((provider, id)) =
                                             super::model_selection::qualified_model(
                                                 model,
@@ -4197,10 +6807,11 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                             && provider == args.provider
                                             && id == args.model
                                         {
-                                            let requested = args
-                                                .settings
-                                                .thinking_for_model(provider.id(), id)
-                                                .unwrap_or("medium");
+                                            let requested = level.as_deref().unwrap_or_else(|| {
+                                                args.settings
+                                                    .thinking_without_qualified_override(id)
+                                                    .unwrap_or("medium")
+                                            });
                                             let effective = super::thinking::clamp(
                                                 requested,
                                                 &state.available_levels,
@@ -4209,6 +6820,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                             args.thinking_profile = Some((
                                                 args.model.clone(),
                                                 state.available_levels.clone(),
+                                                state.available_reasoning,
                                             ));
                                             let previous_level = view
                                                 .pending_thinking
@@ -4244,7 +6856,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                             state.model_picker.take().expect("model picker");
                                         models.refresh_thinking_models(thinking_model_items(
                                             &state.models,
-                                            &args,
+                                            &state.overrides,
                                         ));
                                         state.selected = None;
                                         view.picker = Some(models);
@@ -4331,12 +6943,13 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             }
                             let result =
                                 select(selection, &mut args, &mut view, &mut theme, &mut worker);
-                            if settings {
-                                picker.refresh_settings(settings_items(
-                                    &args,
-                                    &view,
-                                    worker.as_ref(),
-                                ));
+                            if settings || picker.title == "Warnings" {
+                                let items = if settings {
+                                    settings_items(&args, &view, worker.as_ref())
+                                } else {
+                                    warning_settings_items(&args)
+                                };
+                                picker.refresh_settings(items);
                                 if let Err(error) = result {
                                     picker.show_feedback(Err(error.to_string()));
                                 }
@@ -4346,9 +6959,11 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             }
                         }
                     }
-                    continue;
+                    if !submit_completion {
+                        continue;
+                    }
                 }
-                if args.tui_mode != Some(TuiMode::Regular) {
+                if !submit_completion && args.tui_mode != Some(TuiMode::Regular) {
                     if keys.matches("tui.altScreen.search", key) {
                         last_idle_interrupt = None;
                         view.mouse.clear();
@@ -4379,65 +6994,51 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         continue;
                     }
                 }
-                if view.keyboard_copies_selection(
-                    keys.matches("tui.input.copy", key),
-                    keys.matches("app.message.copy", key),
-                    args.settings.boolean("fullscreenCopyOnSelect") != Some(false),
-                ) && view.copy_selection()
+                if !submit_completion
+                    && view.keyboard_copies_selection(
+                        keys.matches("tui.input.copy", key),
+                        keys.matches("app.message.copy", key),
+                        args.settings.boolean("fullscreenCopyOnSelect") != Some(false),
+                    )
+                    && view.copy_selection()
                 {
                     continue;
                 }
                 view.mouse.clear();
-                let action = keys
-                    .action(
+                let action = if submit_completion {
+                    "tui.input.submit"
+                } else {
+                    keys.action(
                         key,
                         view.editor.text.is_empty() && view.draft_images.is_empty(),
                     )
-                    .unwrap_or("");
+                    .unwrap_or("")
+                };
                 if action != "app.interrupt" || is_busy(&worker) {
                     last_idle_interrupt = None;
                 }
-                if view.editor.jump_key(action, key) || view.editor.action(action) {
+                if !submit_completion
+                    && (view.editor.jump_key(action, key) || view.editor.action(action))
+                {
                     continue;
                 }
                 match action {
                     "app.suspend" => {
                         #[cfg(unix)]
-                        {
-                            if args.tui_mode == Some(TuiMode::Regular) {
-                                view.finish_regular()?;
-                            }
-                            if let Err(error) = Terminal::suspend(
-                                &mut _terminal,
-                                args.tui_mode,
-                                view.graphics.cleanup(),
-                            ) {
-                                view.append(&error.to_string());
-                            }
-                            if view.graphics.enabled() {
-                                images::query_cell_size()?;
-                            }
-                            view.graphics.reset();
-                            view.regular.redraw = true;
-                            view.regular.started = false;
-                        }
+                        view.suspend_terminal(&mut _terminal, args.tui_mode)?;
                         #[cfg(not(unix))]
                         view.append("Suspending the terminal is unavailable on this platform");
                     }
+                    "app.message.dequeue" | "app.interrupt" if view.tree_handoff.is_some() => {}
                     "app.message.dequeue" => {
-                        match Worker::control(&mut worker, &args, json!({"type":"clear_queue"})) {
-                            Ok(()) => view.restoring_queue = true,
-                            Err(error) => view.append(&error.to_string()),
-                        }
+                        view.request_queue_restore(&mut worker, &args, true);
+                    }
+                    "app.interrupt" if auth_reload.is_some() && !is_busy(&worker) => {
+                        auth_reload = None;
+                        view.append("Provider credential reload cancelled");
                     }
                     "app.interrupt" if worker.as_ref().is_some_and(|active| active.busy) => {
-                        if let Err(error) =
-                            Worker::control(&mut worker, &args, json!({"type":"clear_queue"}))
-                        {
-                            view.append(&error.to_string());
-                        } else {
-                            view.restoring_queue = true;
-                        }
+                        view.request_queue_restore(&mut worker, &args, false);
                         if let Some(active) = &mut worker {
                             let _ = active.send(json!({"type":"cancel"}));
                         }
@@ -4472,13 +7073,19 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             }
                         }
                     }
-                    "app.session.new" | "app.session.tree" | "app.session.fork"
-                    | "app.session.resume"
-                        if !is_busy(&worker) =>
+                    "app.session.tree"
+                        if view.tree_handoff.is_none() && view.tree_navigation.is_none() =>
+                    {
+                        if let Err(error) = slash("/tree", &mut args, &mut view, Some(&mut worker))
+                        {
+                            view.append(&error.to_string());
+                        }
+                    }
+                    "app.session.new" | "app.session.fork" | "app.session.resume"
+                        if !is_busy(&worker) && view.tree_handoff.is_none() =>
                     {
                         let command = match action {
                             "app.session.new" => "/new",
-                            "app.session.tree" => "/tree",
                             "app.session.fork" => "/fork",
                             _ => "/resume",
                         };
@@ -4495,61 +7102,77 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             Err(error) => view.append(&error.to_string()),
                         }
                     }
-                    "app.model.cycleForward" | "app.model.cycleBackward" if !is_busy(&worker) => {
-                        if let Err(error) =
-                            cycle_model(&mut args, &mut view, action == "app.model.cycleBackward")
-                        {
+                    "app.model.cycleForward" | "app.model.cycleBackward" => {
+                        if let Err(error) = cycle_model(
+                            &mut args,
+                            &mut view,
+                            &mut worker,
+                            action == "app.model.cycleBackward",
+                        ) {
                             view.append(&error.to_string());
                         }
                     }
-                    "app.thinking.cycle" if !is_busy(&worker) => {
-                        match super::thinking::cycle(&mut args) {
-                            Ok(Some(level)) => view.append(&format!("Thinking level: {level}")),
-                            Ok(None) => view.append("Current model does not support thinking"),
+                    "app.thinking.cycle" => {
+                        if let Err(error) = cycle_thinking(&mut args, &mut view, &mut worker) {
+                            view.append(&error.to_string());
+                        }
+                    }
+                    "app.tools.expand" => {
+                        view.set_expand_tools(!view.expand_tools);
+                        let state = if view.expand_tools {
+                            "expanded"
+                        } else {
+                            "collapsed"
+                        };
+                        view.show_status(args.tui_mode, format!("Tool output: {state}"));
+                    }
+                    "app.thinking.toggle" => {
+                        let hidden = !view.hide_thinking;
+                        view.set_hide_thinking(hidden);
+                        match args.settings.set_user("hideThinkingBlock", json!(hidden)) {
+                            Ok(()) => {
+                                let state = if hidden { "hidden" } else { "visible" };
+                                view.show_status(
+                                    args.tui_mode,
+                                    format!("Thinking blocks: {state}"),
+                                );
+                            }
                             Err(error) => view.append(&error.to_string()),
                         }
                     }
-                    "app.tools.expand" => view.set_expand_tools(!view.expand_tools),
-                    "app.thinking.toggle" => view.hide_thinking = !view.hide_thinking,
                     "app.clipboard.pasteImage" => view.paste_clipboard(&args),
                     "app.clear" => {
-                        if let Some(active) = worker.as_mut().filter(|active| active.busy) {
-                            let _ = active.send(json!({"type":"cancel"}));
-                        } else if view.editor.text.is_empty()
-                            && view.draft_images.is_empty()
-                            && view.clipboard.is_none()
-                        {
+                        if clear_editor_or_exit(&mut view, &mut last_clear, Instant::now()) {
                             break;
-                        } else {
-                            view.editor.take();
-                            view.draft_images.clear();
-                            view.clipboard = None;
                         }
                     }
                     "app.exit" => break,
                     "app.editor.external" => {
-                        if args.tui_mode == Some(TuiMode::Regular) {
-                            view.finish_regular()?;
-                        }
-                        drop(_terminal.take());
-                        let result = external_editor(&args, &mut view.editor);
-                        _terminal = Some(Terminal::enter(args.tui_mode, view.graphics.cleanup())?);
-                        if view.graphics.enabled() {
-                            images::query_cell_size()?;
-                        }
-                        view.graphics.reset();
-                        if let Err(error) = result {
-                            view.append(&error.to_string());
-                        }
-                        view.regular.redraw = true;
+                        external_editor = open_external_editor(
+                            &args,
+                            &mut view,
+                            &mut _terminal,
+                            #[cfg(any(unix, windows))]
+                            &mut editor_colors,
+                            false,
+                        )?;
                     }
                     "tui.input.tab" => complete_input(&args, &mut view),
-                    "app.model.select" if !is_busy(&worker) => {
-                        start_model_picker(&args, &mut view, ModelListIntent::Select)
+                    "app.model.select"
+                        if !is_busy(&worker)
+                            || worker.as_ref().is_some_and(|active| active.busy) =>
+                    {
+                        start_model_picker(
+                            &args,
+                            &mut view,
+                            ModelListIntent::Select {
+                                query: String::new(),
+                            },
+                        )
                     }
                     "tui.input.submit" if view.editor.continued_line() => {}
                     "tui.input.submit" | "app.message.followUp" => {
-                        if view.tree_navigation.is_some() {
+                        if view.tree_navigation.is_some() || view.tree_handoff.is_some() {
                             continue;
                         }
                         if view.clipboard.is_some() {
@@ -4572,7 +7195,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                         let auth_command =
                             matches!(input.split_whitespace().next(), Some("/login" | "/logout"));
                         if !auth_command {
-                            view.history.push(input.clone());
+                            view.remember_prompt(&input);
                         }
                         view.history_index = None;
                         if input.trim() == "/theme" {
@@ -4601,29 +7224,24 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                     .collect(),
                             ));
                         } else if let Some(name) = input.strip_prefix("/theme ") {
-                            match Theme::load(
+                            match load_resolved_theme(
                                 name.trim(),
                                 &args.theme_paths,
                                 &args.workspace,
                                 args.trusted,
-                                false,
                             ) {
                                 Ok(next) => {
                                     args.settings.set_user("theme", json!(name.trim()))?;
                                     args.use_theme = Some(name.trim().into());
                                     theme = next;
+                                    view.theme_refresh_requested = true;
                                 }
                                 Err(error) => view.append(&error.to_string()),
                             }
                         } else if input.trim() == "/hotkeys" {
                             view.append(&keys.describe());
                         } else if input.trim() == "/debug" {
-                            match view.write_debug_log(&args, &theme) {
-                                Ok(path) => {
-                                    view.append(&format!("Debug log written\n{}", path.display()))
-                                }
-                                Err(error) => view.append(&format!("Debug log: {error}")),
-                            }
+                            view.show_debug_log(&args, &theme);
                         } else if input.trim() == "/settings" {
                             view.picker = Some(Picker::new(
                                 "Settings",
@@ -4642,7 +7260,16 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                 view.append(&error.to_string());
                                 view.editor.replace(input);
                             }
-                        } else if input.trim() == "/session" && view.draft_images.is_empty() {
+                        } else if (matches!(input.trim(), "/session" | "/share" | "/tree")
+                            || (input.starts_with('/')
+                                && matches!(
+                                    input.split_whitespace().next(),
+                                    Some("/model" | "/thinking")
+                                )
+                                && (!is_busy(&worker)
+                                    || worker.as_ref().is_some_and(|active| active.busy))))
+                            && view.draft_images.is_empty()
+                        {
                             if let Err(error) =
                                 slash(&input, &mut args, &mut view, Some(&mut worker))
                             {
@@ -4656,9 +7283,10 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             } else {
                                 "steer"
                             };
-                            match Worker::control(
+                            match Worker::control_with_image_model(
                                 &mut worker,
                                 &args,
+                                view.accepted_model(&args),
                                 json!({"type":kind,"content":input,"images":view.draft_images}),
                             ) {
                                 Ok(()) => view.draft_images.clear(),
@@ -4673,26 +7301,49 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                             view.ui_status.clear();
                             view.widgets.clear();
                             args.settings =
-                                crate::config::Settings::load(&args.workspace, args.trusted)?;
-                            args.model_keys = super::model_auth::Keys::load()?;
+                                args.settings.reload_latest(&args.workspace, args.trusted)?;
+                            for warning in args.settings.diagnostics() {
+                                view.append(warning);
+                            }
+                            auth_reload =
+                                Some(AuthReload::start(args.model_keys.revision().to_owned()));
+                            view.append("Reloading provider credentials (Esc to cancel)");
                             args.reload_model_profiles()?;
-                            super::packages::prepare(&args).await?;
+                            {
+                                let preparation = super::packages::prepare(&args);
+                                tokio::pin!(preparation);
+                                loop {
+                                    tokio::select! {
+                                        result = &mut preparation => break result?,
+                                        _ = terminal_signal.notified() => {
+                                            if super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+                                                interrupted = true;
+                                                break 'interactive;
+                                            }
+                                            #[cfg(unix)]
+                                            if SUSPEND_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                                                view.suspend_terminal(&mut _terminal, args.tui_mode)?;
+                                            }
+                                        },
+                                    }
+                                }
+                            }
                             view.resources = super::resources::Resources::load(&args)?;
                             args.theme_paths = view.resources.themes.clone();
                             match Keys::load() {
                                 Ok(next) => keys = next,
                                 Err(error) => view.append(&error.to_string()),
                             }
-                            match Theme::load(
-                                args.use_theme.as_deref().unwrap_or("system"),
+                            match load_resolved_theme(
+                                args.theme_setting().unwrap_or("system"),
                                 &args.theme_paths,
                                 &args.workspace,
                                 args.trusted,
-                                false,
                             ) {
                                 Ok(next) => theme = next,
                                 Err(error) => view.append(&error.to_string()),
                             }
+                            view.theme_refresh_requested = true;
                             view.append("Reloaded settings, context, skills, prompts, native extensions, MCP, keybindings and theme");
                             args.session_transition = Some(pi_rs::SessionStartReason::Reload);
                         } else if input.starts_with('/') {
@@ -4765,7 +7416,7 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
                                 KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                             )
                         {
-                            view.editor.insert(&character.to_string());
+                            view.editor.type_character(character);
                         }
                     }
                     _ => {}
@@ -4774,6 +7425,22 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
             _ => {}
         }
     }
+    // Stop terminal input and restore the terminal before any worker teardown,
+    // which can block while a running command or extension shuts down.
+    #[cfg(unix)]
+    if let Some(terminal) = &mut _terminal {
+        terminal.disable_keyboard_protocol();
+    }
+    #[cfg(all(unix, debug_assertions))]
+    test_input_drain_barrier();
+    let _ = input.drain(Duration::from_secs(1), Duration::from_millis(50));
+    let finish = if args.tui_mode == Some(TuiMode::Regular) {
+        view.finish_regular()
+    } else {
+        Ok(())
+    };
+    drop(_terminal.take());
+    finish?;
     if is_busy(&worker) {
         drop(worker.take());
     }
@@ -4793,10 +7460,6 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         }
     }
     drop(worker);
-    if args.tui_mode == Some(TuiMode::Regular) {
-        view.finish_regular()?;
-    }
-    drop(_terminal.take());
     if args.tui_mode != Some(TuiMode::Regular)
         && args.settings.string("fullscreenExitOutput") != Some("resume-hint")
     {
@@ -4811,7 +7474,37 @@ pub(super) async fn run(mut args: Cli, follow_up_prompts: Vec<String>) -> Result
         };
         println!("Resume this session with pi --session {path}");
     }
-    Ok(())
+    if interrupted || super::process::TERMINAL_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        Err(Error::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+// Let the PTY integration test deliver a release after protocol disable and
+// before the drain starts, regardless of process scheduling.
+#[cfg(all(unix, debug_assertions))]
+fn test_input_drain_barrier() {
+    use std::io::{Read, Write};
+    let Some(address) = std::env::var_os("PI_RS_TEST_INPUT_DRAIN_BARRIER") else {
+        return;
+    };
+    let Ok(address) = address.to_string_lossy().parse::<std::net::SocketAddr>() else {
+        return;
+    };
+    if !address.ip().is_loopback() {
+        return;
+    }
+    let Ok(mut socket) = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5))
+    else {
+        return;
+    };
+    let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = socket.set_write_timeout(Some(Duration::from_secs(5)));
+    if socket.write_all(b"D").is_ok() {
+        let _ = socket.read_exact(&mut [0]);
+    }
 }
 
 fn show_startup_header(args: &Cli) -> bool {
@@ -4825,10 +7518,10 @@ fn is_busy(worker: &Option<Worker>) -> bool {
 }
 
 fn persist_pending_thinking(pending: &PendingThinking) -> Result<()> {
-    Session::open(&pending.session)?.select_provider_model(
+    Session::open(&pending.session)?.select_thinking_level(
         pending.provider.as_deref(),
         &pending.model,
-        Some(&pending.level),
+        &pending.level,
     )
 }
 
@@ -4853,9 +7546,206 @@ fn edit_provider_key(provider: super::Provider, view: &mut View) {
     view.local_editor = Some((LocalEditor::ProviderKey(provider), dialog));
 }
 
+fn show_vertex_methods(view: &mut View) {
+    view.picker = Some(Picker::new(
+        "Google Vertex AI authentication",
+        vec![
+            Item {
+                label: "Google Cloud API key".into(),
+                selection: Selection::VertexApiKey,
+            },
+            Item {
+                label: "Application Default Credentials".into(),
+                selection: Selection::VertexAdc {
+                    service_account: false,
+                },
+            },
+            Item {
+                label: "Service account credentials file".into(),
+                selection: Selection::VertexAdc {
+                    service_account: true,
+                },
+            },
+        ],
+    ));
+}
+
+fn edit_vertex_login(view: &mut View, field: VertexLoginField) {
+    let title = match field {
+        VertexLoginField::Project { .. } => "Enter Google Cloud project ID",
+        VertexLoginField::Location { .. } => "Enter Google Cloud location",
+        VertexLoginField::CredentialsPath { .. } => "Enter service account credentials file path",
+    };
+    let dialog = crate::ui::dialog::Dialog::new(
+        uuid::Uuid::new_v4(),
+        pi_rs::UiRequest::Input {
+            title: title.into(),
+            placeholder: None,
+            initial_value: None,
+            timeout: None,
+        },
+    );
+    view.local_editor = Some((LocalEditor::VertexLogin(field), dialog));
+}
+
+fn advance_vertex_login(
+    field: &VertexLoginField,
+    text: &str,
+    args: &mut Cli,
+    view: &mut View,
+) -> Result<()> {
+    use super::vertex_auth::{save_login, validate_identifier};
+    match field {
+        VertexLoginField::Project { service_account } => {
+            validate_identifier(text, "project ID")?;
+            edit_vertex_login(
+                view,
+                VertexLoginField::Location {
+                    project: text.into(),
+                    service_account: *service_account,
+                },
+            );
+            return Ok(());
+        }
+        VertexLoginField::Location {
+            project,
+            service_account: true,
+        } => {
+            validate_identifier(text, "location")?;
+            edit_vertex_login(
+                view,
+                VertexLoginField::CredentialsPath {
+                    project: project.clone(),
+                    location: text.into(),
+                },
+            );
+            return Ok(());
+        }
+        VertexLoginField::Location {
+            project,
+            service_account: false,
+        } => {
+            save_login(project, text, None)?;
+        }
+        VertexLoginField::CredentialsPath { project, location } => {
+            let path = if let Some(relative) = text.strip_prefix("~/") {
+                std::env::home_dir()
+                    .ok_or_else(|| Error::Config("Home directory is unavailable".into()))?
+                    .join(relative)
+            } else {
+                args.workspace.join(text)
+            };
+            save_login(project, location, Some(&path))?;
+        }
+    }
+    args.replace_model_keys(super::model_auth::Keys::load()?)?;
+    view.invalidate_model_catalog();
+    view.append("Google Vertex AI credentials saved");
+    if std::env::var("GOOGLE_CLOUD_API_KEY").is_ok_and(|key| !key.trim().is_empty()) {
+        view.append("GOOGLE_CLOUD_API_KEY takes precedence over ADC.");
+    }
+    Ok(())
+}
+
+fn uses_cloudflare_login(provider: &super::Provider, args: &Cli) -> bool {
+    matches!(
+        provider.id(),
+        "cloudflare-workers-ai" | "cloudflare-ai-gateway"
+    ) && args.explicit_endpoint_for(provider).is_none()
+        && !args.model_profiles.has_fixed_cloudflare_endpoint(
+            provider,
+            (provider == &args.provider).then_some(args.model.as_str()),
+        )
+}
+
+fn edit_cloudflare_login(view: &mut View, field: CloudflareLoginField) {
+    use crate::ui::dialog::Dialog;
+    let dialog = match field {
+        CloudflareLoginField::Key(_) => Dialog::secret("Enter Cloudflare API key".into()),
+        _ => Dialog::new(
+            uuid::Uuid::new_v4(),
+            pi_rs::UiRequest::Input {
+                title: match field {
+                    CloudflareLoginField::Account { .. } => "Enter Cloudflare account ID",
+                    _ => "Enter Cloudflare AI Gateway ID",
+                }
+                .into(),
+                placeholder: None,
+                initial_value: None,
+                timeout: None,
+            },
+        ),
+    };
+    view.local_editor = Some((LocalEditor::CloudflareLogin(field), dialog));
+}
+
+fn advance_cloudflare_login(
+    field: &CloudflareLoginField,
+    text: &str,
+    args: &mut Cli,
+    view: &mut View,
+) -> Result<()> {
+    let (provider, key, account, gateway) = match field {
+        CloudflareLoginField::Key(provider) => {
+            if !super::model_auth::valid_key(text) {
+                return Err(Error::Config("Enter a valid Cloudflare API key".into()));
+            }
+            edit_cloudflare_login(
+                view,
+                CloudflareLoginField::Account {
+                    provider: provider.clone(),
+                    key: text.into(),
+                },
+            );
+            return Ok(());
+        }
+        CloudflareLoginField::Account { provider, key } => {
+            if !super::operation_models::valid_cloudflare_account(text) {
+                return Err(Error::Config("Enter a valid Cloudflare account ID".into()));
+            }
+            if provider.id() == "cloudflare-ai-gateway" {
+                edit_cloudflare_login(
+                    view,
+                    CloudflareLoginField::Gateway {
+                        provider: provider.clone(),
+                        key: key.clone(),
+                        account: text.into(),
+                    },
+                );
+                return Ok(());
+            }
+            (provider, key.as_str(), text, None)
+        }
+        CloudflareLoginField::Gateway {
+            provider,
+            key,
+            account,
+        } => (provider, key.as_str(), account.as_str(), Some(text)),
+    };
+    if let Some(gateway) = gateway
+        && let Some(base) = args.model_profiles.cloudflare_configured_base(
+            provider,
+            (provider == &args.provider).then_some(args.model.as_str()),
+        )
+        && !super::cloudflare_gateway::Route::matches_configured(base, account, gateway)
+    {
+        return Err(Error::Config(
+            "Enter identifiers that match the configured Cloudflare route".into(),
+        ));
+    }
+    super::model_auth::save_cloudflare_login(provider, key, account, gateway)?;
+    args.replace_model_keys(super::model_auth::Keys::load()?)?;
+    view.invalidate_model_catalog();
+    view.append(&format!("Cloudflare API key saved for {}", provider.id()));
+    Ok(())
+}
+
 fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut View) -> Result<()> {
     let removed = super::model_auth::remove(&provider)?;
-    args.model_keys = super::model_auth::Keys::load()?;
+    let mut keys = args.model_keys.clone();
+    keys.forget(provider.id());
+    let result = args.replace_model_keys(keys);
+    view.invalidate_model_catalog();
     view.append(&format!(
         "{} for {}",
         if removed {
@@ -4865,43 +7755,99 @@ fn remove_provider_key(provider: super::Provider, args: &mut Cli, view: &mut Vie
         },
         provider.id()
     ));
-    Ok(())
+    result
 }
 
-fn select_model_input(args: &mut Cli, view: &mut View, input: &str) -> Result<()> {
-    let provider = super::model_selection::qualified_model(input, &args.model_profiles)
-        .map_or_else(|| args.provider.clone(), |(provider, _)| provider);
+fn exact_model_query(args: &Cli, query: &str, catalog: &[String]) -> Option<String> {
+    if query.is_empty() {
+        return None;
+    }
+    let scoped;
+    let models = if args.model_scope.is_empty() {
+        catalog
+    } else {
+        scoped = args
+            .model_scope
+            .iter()
+            .map(super::model_selection::ScopedChoice::qualified)
+            .collect::<Vec<_>>();
+        &scoped
+    };
+    let mut matches = models.iter().filter(|reference| {
+        super::model_selection::qualified_model(reference, &args.model_profiles)
+            .is_some_and(|(_, id)| id.eq_ignore_ascii_case(query))
+    });
+    let first = matches.next()?;
+    matches
+        .all(|reference| reference == first)
+        .then(|| first.clone())
+}
+
+fn select_model_input(
+    args: &mut Cli,
+    view: &mut View,
+    worker: Option<&mut Worker>,
+    input: &str,
+    save_default: bool,
+) -> Result<()> {
+    let current = view.model_choice(args);
+    let provider = super::model_selection::qualified_model(input, &current.model_profiles)
+        .map_or_else(|| current.provider.clone(), |(provider, _)| provider);
     let available = view
         .available_models
         .iter()
-        .filter_map(|model| super::model_selection::qualified_model(model, &args.model_profiles))
+        .filter_map(|model| super::model_selection::qualified_model(model, &current.model_profiles))
         .filter(|(candidate, _)| *candidate == provider)
         .map(|(_, model)| model.to_owned())
         .collect::<Vec<_>>();
-    let selected = super::model_selection::split_with_profiles(
+    let selection = super::model_selection::split_with_profiles(
         input,
         &available,
         &provider,
-        &args.model_profiles,
+        &current.model_profiles,
     )?;
+    let status = if save_default {
+        format!("Default model: {}/{}", provider.id(), selection.model)
+    } else {
+        format!("Model: {}", selection.model)
+    };
+    if let Some(worker) = worker.filter(|worker| worker.busy) {
+        let selected = view.prepare_live_choice(args).prepare_model_change(
+            provider,
+            selection.model,
+            selection.thinking,
+            pi_rs::ModelSelectSource::Set,
+        )?;
+        let persist = save_default.then_some(SelectionDefault::Model);
+        return view.stage_model_choice(worker, selected, status, persist);
+    }
     args.change_model(
         provider,
-        selected.model,
-        selected.thinking,
+        selection.model,
+        selection.thinking,
         pi_rs::ModelSelectSource::Set,
-    )
+    )?;
+    if save_default {
+        save_current_default_model(args)?;
+    }
+    view.show_status(args.tui_mode, status);
+    Ok(())
 }
 
-fn save_default_model(args: &mut Cli) -> Result<()> {
-    let qualified = format!("{}/{}", args.provider.id(), args.model);
+fn save_current_default_model(args: &mut Cli) -> Result<()> {
+    save_default_model(args, &args.provider.clone(), &args.model.clone())
+}
+
+fn save_default_model(args: &mut Cli, provider: &super::Provider, model: &str) -> Result<()> {
+    let qualified = format!("{}/{model}", provider.id());
     let add_to_scope = !args.model_scope.is_empty()
         && !args
             .model_scope
             .iter()
-            .any(|choice| choice.provider == args.provider && choice.model == args.model);
+            .any(|choice| &choice.provider == provider && choice.model == model);
     let mut values = vec![
-        ("defaultProvider".into(), json!(args.provider.id())),
-        ("defaultModel".into(), json!(args.model)),
+        ("defaultProvider".into(), json!(provider.id())),
+        ("defaultModel".into(), json!(model)),
     ];
     if add_to_scope {
         let mut enabled = args.settings.strings("enabledModels");
@@ -4917,16 +7863,22 @@ fn save_default_model(args: &mut Cli) -> Result<()> {
     args.settings.set_user_values(&values)?;
     if add_to_scope {
         args.model_scope.push(super::model_selection::ScopedChoice {
-            provider: args.provider.clone(),
-            model: args.model.clone(),
+            provider: provider.clone(),
+            model: model.into(),
             thinking: None,
         });
     }
     Ok(())
 }
 
-fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
+fn cycle_model(
+    args: &mut Cli,
+    view: &mut View,
+    worker: &mut Option<Worker>,
+    reverse: bool,
+) -> Result<()> {
     use super::model_selection::{ScopedChoice, next_model, qualified_model};
+    let current = view.model_choice(args);
     let discovered;
     let choices = if args.model_scope.is_empty() {
         if view.available_models.is_empty() {
@@ -4936,7 +7888,7 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
         discovered = view
             .available_models
             .iter()
-            .filter_map(|model| qualified_model(model, &args.model_profiles))
+            .filter_map(|model| qualified_model(model, &current.model_profiles))
             .map(|(provider, model)| ScopedChoice {
                 provider,
                 model: model.to_owned(),
@@ -4947,19 +7899,125 @@ fn cycle_model(args: &mut Cli, view: &mut View, reverse: bool) -> Result<()> {
     } else {
         args.model_scope.as_slice()
     };
-    if let Some(choice) = next_model(args, choices, reverse) {
-        args.change_model(
+    let Some(choice) = next_model(current, choices, reverse) else {
+        let text = if args.model_scope.is_empty() {
+            "Only one model available"
+        } else {
+            "Only one model in scope"
+        };
+        view.show_status(args.tui_mode, text.into());
+        return Ok(());
+    };
+    if let Some(worker) = worker.as_mut().filter(|worker| worker.busy) {
+        let selected = view.prepare_live_choice(args).prepare_model_change(
             choice.provider,
             choice.model,
             choice.thinking,
             pi_rs::ModelSelectSource::Cycle,
         )?;
-    } else if args.model_scope.is_empty() {
-        view.append("Only one model available");
-    } else {
-        view.append("Only one model in scope");
+        let status = model_cycle_status(&selected);
+        return view.stage_model_choice(worker, selected, status, None);
     }
+    args.change_model(
+        choice.provider,
+        choice.model,
+        choice.thinking,
+        pi_rs::ModelSelectSource::Cycle,
+    )?;
+    view.show_status(args.tui_mode, model_cycle_status(args));
     Ok(())
+}
+
+fn model_cycle_status(args: &Cli) -> String {
+    let name = args
+        .model_profiles
+        .model(&args.provider, &args.model)
+        .and_then(|model| model.name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| args.model.clone());
+    let mut status = format!("Switched to {name}");
+    if let Some(level) = args.thinking.as_deref().filter(|level| *level != "off")
+        && super::thinking::adopted_reasoning(args) == Some(true)
+    {
+        status.push_str(&format!(" (thinking: {level})"));
+    }
+    status
+}
+
+fn select_thinking_input(
+    args: &mut Cli,
+    view: &mut View,
+    worker: Option<&mut Worker>,
+    requested: &str,
+    save_default: bool,
+) -> Result<()> {
+    let status_prefix = if save_default {
+        "Default thinking level"
+    } else {
+        "Thinking level"
+    };
+    if let Some(worker) = worker.filter(|worker| worker.busy) {
+        let mut selected = view.prepare_live_choice(args);
+        let level = super::thinking::resolve(&mut selected, requested)?;
+        super::thinking::select(&mut selected, &level);
+        let status = format!("{status_prefix}: {level}");
+        let persist = save_default.then_some(SelectionDefault::Thinking(level));
+        return view.stage_model_choice(worker, selected, status, persist);
+    }
+    super::thinking::set(args, requested)?;
+    let level = args.thinking.as_deref().unwrap_or("off");
+    if save_default {
+        args.settings
+            .set_user("defaultThinkingLevel", json!(level))?;
+    }
+    view.show_status(args.tui_mode, format!("{status_prefix}: {level}"));
+    Ok(())
+}
+
+fn cycle_thinking(args: &mut Cli, view: &mut View, worker: &mut Option<Worker>) -> Result<()> {
+    let level = if let Some(worker) = worker.as_mut().filter(|worker| worker.busy) {
+        let mut selected = view.prepare_live_choice(args);
+        if let Some(level) = super::thinking::next_level(&mut selected) {
+            super::thinking::select(&mut selected, &level);
+            return view.stage_model_choice(
+                worker,
+                selected,
+                format!("Thinking level: {level}"),
+                None,
+            );
+        }
+        None
+    } else {
+        super::thinking::cycle(args)?
+    };
+    view.show_status(
+        args.tui_mode,
+        level.map_or_else(
+            || "Current model does not support thinking".into(),
+            |level| format!("Thinking level: {level}"),
+        ),
+    );
+    Ok(())
+}
+
+fn show_bedrock_methods(view: &mut View) {
+    view.picker = Some(Picker::new(
+        "Select Amazon Bedrock authentication method",
+        vec![
+            Item {
+                label: "Bearer token".into(),
+                selection: Selection::BedrockBearer,
+            },
+            Item {
+                label: "AWS profile".into(),
+                selection: Selection::BedrockProfile,
+            },
+            Item {
+                label: "Existing AWS credential chain".into(),
+                selection: Selection::BedrockChain,
+            },
+        ],
+    ));
 }
 
 fn show_radius_methods(view: &mut View) {
@@ -4975,6 +8033,221 @@ fn show_radius_methods(view: &mut View) {
                 selection: Selection::LoginRadius(radius_auth::Method::Device),
             },
         ],
+    ));
+}
+
+fn show_anthropic_methods(view: &mut View) {
+    view.picker = Some(Picker::new(
+        "Sign in to Anthropic",
+        vec![
+            Item {
+                label: "Browser login".into(),
+                selection: Selection::LoginAnthropic(super::anthropic_auth::LoginMethod::Browser),
+            },
+            Item {
+                label: "Copy code login (headless)".into(),
+                selection: Selection::LoginAnthropic(super::anthropic_auth::LoginMethod::CopyCode),
+            },
+        ],
+    ));
+}
+
+fn start_anthropic_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    method: super::anthropic_auth::LoginMethod,
+) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to Anthropic",
+        "Anthropic login cancelled",
+        move |sender| async move {
+            super::anthropic_auth::login(&settings, method, task_control, |url, manual| {
+                let _ = sender.send(RemoteEvent::Notice(format!(
+                    "Continue in your browser: {url}"
+                )));
+                let _ = sender.send(RemoteEvent::AnthropicCode(manual));
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to Anthropic".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
+fn start_kimi_logout(view: &mut View) {
+    view.remote_task = Some(RemoteTask::start(
+        "Signing out of Kimi Code",
+        "Kimi Code logout cancelled",
+        move |sender| async move {
+            let removed = super::kimi_auth::logout().await?;
+            let _ = sender.send(RemoteEvent::ForgetModelKey("kimi-coding"));
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec![
+                if removed {
+                    "Signed out of Kimi Code"
+                } else {
+                    "No saved Kimi Code credential"
+                }
+                .into(),
+            ])
+        },
+    ));
+}
+
+fn take_device_code_action(
+    view: &mut View,
+    key: KeyEvent,
+    keys: &Keys,
+) -> Option<(String, String)> {
+    if !keys.matches("tui.select.confirm", key) {
+        return None;
+    }
+    view.remote_task.as_mut()?.device_code.take()
+}
+
+fn start_codex_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    method: super::codex_auth::Method,
+) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to OpenAI Codex",
+        "OpenAI Codex login cancelled",
+        move |sender| async move {
+            super::codex_auth::login(&settings, task_control, method, |notice| match notice {
+                super::codex_auth::Notice::Device { url, code } => {
+                    let _ = sender.send(RemoteEvent::DeviceCode {
+                        url: url.to_owned(),
+                        code,
+                    });
+                }
+                super::codex_auth::Notice::Browser(url, input) => {
+                    let _ = sender.send(RemoteEvent::Notice(format!(
+                        "Continue in your browser: {url}"
+                    )));
+                    let _ = sender.send(RemoteEvent::CodexCode(input));
+                }
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to OpenAI Codex".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
+fn edit_copilot_enterprise(view: &mut View) {
+    let dialog = crate::ui::dialog::Dialog::new(
+        uuid::Uuid::new_v4(),
+        pi_rs::UiRequest::Input {
+            title: "GitHub Enterprise URL/domain (blank for github.com)".into(),
+            placeholder: Some("company.ghe.com".into()),
+            initial_value: None,
+            timeout: None,
+        },
+    );
+    view.local_editor = Some((LocalEditor::CopilotEnterpriseDomain, dialog));
+}
+
+fn start_copilot_login(
+    view: &mut View,
+    settings: &crate::config::Settings,
+    enterprise: Option<&str>,
+) -> Result<()> {
+    let settings = settings.clone();
+    let enterprise = super::copilot_auth::enterprise_domain(enterprise)?;
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to GitHub Copilot",
+        "GitHub Copilot login cancelled",
+        move |sender| async move {
+            super::copilot_auth::login(
+                &settings,
+                enterprise.as_deref(),
+                task_control,
+                |url, code| {
+                    let _ = sender.send(RemoteEvent::DeviceCode {
+                        url: url.to_string(),
+                        code: code.to_owned(),
+                    });
+                },
+            )
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to GitHub Copilot".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+    Ok(())
+}
+
+fn start_xai_login(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to xAI",
+        "xAI login cancelled",
+        move |sender| async move {
+            super::xai_auth::login(&settings, task_control, |url, code| {
+                let _ = sender.send(RemoteEvent::DeviceCode {
+                    url: url.to_string(),
+                    code: code.to_owned(),
+                });
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to xAI".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
+fn start_meta_login(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    let control = super::meta_auth::LoginControl::default();
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
+        "Signing in to Meta",
+        "Meta login cancelled",
+        move |sender| async move {
+            super::meta_auth::login(&settings, task_control, |url, code| {
+                let _ = sender.send(RemoteEvent::Notice(format!("Enter code {code} at {url}")));
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to Meta".into()])
+        },
+    );
+    task.meta_login_control = Some(control);
+    view.remote_task = Some(task);
+}
+
+fn start_kimi_login(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    view.remote_task = Some(RemoteTask::start(
+        "Signing in to Kimi Code",
+        "Kimi Code login cancelled",
+        move |sender| async move {
+            super::kimi_auth::login(&settings, |url, code| {
+                let _ = sender.send(RemoteEvent::Notice(format!("Enter code {code} at {url}")));
+            })
+            .await?;
+            let _ = sender.send(RemoteEvent::RefreshModelKeys);
+            Ok(vec!["Signed in to Kimi Code".into()])
+        },
     ));
 }
 
@@ -5020,13 +8293,18 @@ fn start_chatgpt_login(
     ));
 }
 
-fn start_chatgpt_logout(view: &mut View, settings: &crate::config::Settings) {
-    let settings = settings.clone();
-    view.remote_task = Some(RemoteTask::start(
+fn chatgpt_logout_task<F, Fut>(control: super::chatgpt_auth::LogoutControl, logout: F) -> RemoteTask
+where
+    F: FnOnce(super::chatgpt_auth::LogoutControl) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<bool>> + 'static,
+{
+    let task_control = control.clone();
+    let mut task = RemoteTask::start(
         "Signing out of ChatGPT",
         "ChatGPT sign-out cancelled",
         move |sender| async move {
-            let result = super::chatgpt_auth::logout(&settings).await;
+            let result = logout(task_control).await;
+            let _ = sender.send(RemoteEvent::ForgetModelKey("openai-chatgpt"));
             let _ = sender.send(RemoteEvent::RefreshModelKeys);
             result.map(|removed| {
                 vec![
@@ -5039,11 +8317,55 @@ fn start_chatgpt_logout(view: &mut View, settings: &crate::config::Settings) {
                 ]
             })
         },
+    );
+    task.logout_control = Some(control);
+    task
+}
+
+fn start_chatgpt_logout(view: &mut View, settings: &crate::config::Settings) {
+    let settings = settings.clone();
+    view.remote_task = Some(chatgpt_logout_task(
+        super::chatgpt_auth::LogoutControl::default(),
+        move |control| async move { super::chatgpt_auth::logout_controlled(&settings, control).await },
     ));
 }
 
+fn interrupt_remote_task(view: &mut View) {
+    let Some(task) = &view.remote_task else {
+        return;
+    };
+    if task.cancel_before_commit() {
+        let message = task.cancelled;
+        view.remote_task = None;
+        clear_openrouter_editor(view);
+        view.append(message);
+    } else if task.meta_login_control.is_some() {
+        view.append(if task.status == "Signing in to xAI" {
+            "xAI sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to OpenAI Codex" {
+            "OpenAI Codex sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to GitHub Copilot" {
+            "GitHub Copilot sign-in is completing; waiting for the result"
+        } else if task.status == "Signing in to Anthropic" {
+            "Anthropic sign-in is completing; waiting for the result"
+        } else {
+            "Meta sign-in is completing; waiting for the result"
+        });
+    } else {
+        view.append("ChatGPT sign-out is completing; waiting for the result");
+    }
+}
+
 fn clear_openrouter_editor(view: &mut View) {
-    if matches!(view.local_editor, Some((LocalEditor::OpenRouterCode(_), _))) {
+    if matches!(
+        view.local_editor,
+        Some((
+            LocalEditor::OpenRouterCode(_)
+                | LocalEditor::AnthropicCode(_)
+                | LocalEditor::CodexCode(_),
+            _
+        ))
+    ) {
         view.local_editor = None;
     }
 }
@@ -5091,6 +8413,7 @@ fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
         return;
     }
     let args = args.clone();
+    let thinking = matches!(intent, ModelListIntent::ThinkingSettings);
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| {
@@ -5099,7 +8422,7 @@ fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
                 .build()?;
             let catalogs = match runtime.block_on(super::model_selection::catalogs(&args, false)) {
                 Ok(catalogs) => catalogs,
-                Err(_) if matches!(intent, ModelListIntent::ThinkingSettings) => Vec::new(),
+                Err(_) if thinking => Vec::new(),
                 Err(error) => return Err(error),
             };
             let mut models: Vec<_> = catalogs
@@ -5111,7 +8434,7 @@ fn start_model_picker(args: &Cli, view: &mut View, intent: ModelListIntent) {
                         .map(move |model| format!("{}/{model}", catalog.provider.id()))
                 })
                 .collect();
-            if matches!(intent, ModelListIntent::ThinkingSettings) {
+            if thinking {
                 let current = format!("{}/{}", args.provider.id(), args.model);
                 models.retain(|model| model != &current);
                 models.insert(0, current);
@@ -5210,11 +8533,25 @@ fn restore_tree_position(args: &mut Cli, view: &mut View, id: u64) -> Result<()>
             _ => None,
         });
     restore_workspace(args)?;
-    view.restore(args)?;
-    if let Some(input) = input {
+    let images = std::mem::take(&mut view.draft_images);
+    let restored = view.restore(args);
+    view.draft_images = images;
+    restored?;
+    for warning in args.settings.diagnostics() {
+        view.append(warning);
+    }
+    if view.editor.text.trim().is_empty()
+        && view.draft_images.is_empty()
+        && let Some(input) = input
+    {
         view.editor.replace(input);
     }
+    view.append("Navigated to selected point");
     Ok(())
+}
+
+fn tree_compaction_in_progress() -> Error {
+    Error::Config("Wait for the current compaction or tree navigation to finish before navigating the session tree".into())
 }
 
 fn start_tree_navigation(
@@ -5225,6 +8562,28 @@ fn start_tree_navigation(
     summarize: bool,
     instructions: Option<String>,
 ) -> Result<()> {
+    if view.tree_handoff.is_some() || view.tree_navigation.is_some() {
+        return Err(tree_compaction_in_progress());
+    }
+    if let Some(active) = worker.as_mut() {
+        if active.bashing {
+            return Err(Error::Config("Wait for the shell command to finish".into()));
+        }
+        if active.busy {
+            if active.compacting || view.summarizing {
+                return Err(tree_compaction_in_progress());
+            }
+            let clear_id = uuid::Uuid::new_v4();
+            active.send(json!({"type":"clear_queue", "id": clear_id}))?;
+            view.tree_handoff = Some(TreeNavigationHandoff {
+                id,
+                summarize,
+                instructions,
+                clear_id: Some(clear_id),
+            });
+            return Ok(());
+        }
+    }
     let configured_reserve = &args.settings.value()["branchSummary"]["reserveTokens"];
     let reserve_tokens = configured_reserve
         .as_u64()
@@ -5244,7 +8603,7 @@ fn start_tree_navigation(
 
 impl ThemeSettings {
     fn new(parent: Picker, args: &Cli, theme: &Theme) -> Self {
-        let selected = args.use_theme.as_deref().unwrap_or("system");
+        let selected = args.theme_setting().unwrap_or("system");
         let pair = crate::ui::theme::parse_auto_theme_setting(selected);
         let (light, dark) = pair.unwrap_or((selected, selected));
         Self {
@@ -5332,23 +8691,18 @@ impl ThemeSettings {
             (ThemeSettingsStage::Single, _) => self.single.clone(),
             _ => format!("{}/{}", self.light, self.dark),
         };
-        Theme::load(
-            &candidate,
-            &args.theme_paths,
-            &args.workspace,
-            args.trusted,
-            false,
-        )
+        load_resolved_theme(&candidate, &args.theme_paths, &args.workspace, args.trusted)
     }
 }
 
-fn thinking_model_items(models: &[String], args: &Cli) -> Vec<Item> {
+fn thinking_model_items(
+    models: &[String],
+    overrides: &serde_json::Map<String, Value>,
+) -> Vec<Item> {
     models
         .iter()
         .map(|model| {
-            let override_level = args.settings.value()["modelThinkingLevels"]
-                .get(model)
-                .and_then(Value::as_str);
+            let override_level = overrides.get(model).and_then(Value::as_str);
             Item {
                 label: override_level
                     .map_or_else(|| model.clone(), |level| format!("{model} · {level}")),
@@ -5358,11 +8712,9 @@ fn thinking_model_items(models: &[String], args: &Cli) -> Vec<Item> {
         .collect()
 }
 
-fn thinking_level_picker(state: &ThinkingSettings, args: &Cli) -> Picker {
+fn thinking_level_picker(state: &ThinkingSettings) -> Picker {
     let model = state.selected.as_deref().expect("selected model");
-    let selected = args.settings.value()["modelThinkingLevels"]
-        .get(model)
-        .and_then(Value::as_str);
+    let selected = state.overrides.get(model).and_then(Value::as_str);
     let mut items: Vec<_> = state
         .available_levels
         .iter()
@@ -5392,7 +8744,7 @@ fn thinking_level_picker(state: &ThinkingSettings, args: &Cli) -> Picker {
 fn start_thinking_levels(
     args: &Cli,
     model: &str,
-) -> Result<std::sync::mpsc::Receiver<Vec<String>>> {
+) -> Result<std::sync::mpsc::Receiver<(Vec<String>, Option<bool>)>> {
     let (provider, id) = super::model_selection::qualified_model(model, &args.model_profiles)
         .ok_or_else(|| Error::Config("Unknown model provider".into()))?;
     let mut selected = args.clone();
@@ -5405,13 +8757,22 @@ fn start_thinking_levels(
             .into_iter()
             .filter(|level| super::thinking::LEVELS.contains(&level.as_str()))
             .collect();
-        let _ = sender.send(levels);
+        let reasoning = super::thinking::adopted_reasoning(&selected);
+        let _ = sender.send((levels, reasoning));
     });
     Ok(receiver)
 }
 
+fn warning_settings_items(args: &Cli) -> Vec<Item> {
+    let enabled = args.settings.warn_anthropic_extra_usage();
+    vec![Item {
+        label: format!("Anthropic extra usage · {enabled}"),
+        selection: Selection::Setting("warnings.anthropicExtraUsage".into(), json!(!enabled)),
+    }]
+}
+
 fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item> {
-    let cache_mode = args.settings.string("cacheWarming").unwrap_or("streaming");
+    let cache_mode = args.settings.cache_warming_mode();
     let next_cache_mode = match cache_mode {
         "streaming" => "idle",
         "idle" => "off",
@@ -5439,7 +8800,179 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
             ),
         }
     };
-    let mut items = vec![
+    let resize_images = args.settings.resize_model_images();
+    let block_images = args.settings.block_model_images();
+    let autocomplete_items = args.settings.autocomplete_max_visible();
+    let skill_commands = args.settings.enable_skill_commands();
+    let quiet = &args.settings.value()["quietStartup"];
+    let quiet_label = if quiet == true {
+        "true"
+    } else if quiet == "header" {
+        "header"
+    } else {
+        "false"
+    };
+    let share = args
+        .settings
+        .string("sessionShareDestination")
+        .unwrap_or("auto");
+    let trust = args.settings.string("defaultProjectTrust").unwrap_or("ask");
+    let wheel = &args.settings.value()["fullscreenWheelScrollLines"];
+    let wheel_lines = wheel
+        .as_f64()
+        .map(|value| value.clamp(1.0, 100.0).floor() as u64);
+    let escape = args.settings.string("doubleEscapeAction").unwrap_or("tree");
+    let next_escape = match escape {
+        "tree" => "fork",
+        "fork" => "none",
+        _ => "tree",
+    };
+    let tree_filter =
+        TreeFilter::parse(args.settings.string("treeFilterMode").unwrap_or("default"));
+    let padding = args.settings.editor_padding();
+    let exit_output = args
+        .settings
+        .string("fullscreenExitOutput")
+        .unwrap_or("transcript");
+    let scrollbar = args
+        .settings
+        .string("fullscreenScrollbar")
+        .unwrap_or("auto");
+    let copy_on_select = args
+        .settings
+        .boolean("fullscreenCopyOnSelect")
+        .unwrap_or(true);
+    let thinking_summary = match args.settings.value()["modelThinkingLevels"]
+        .as_object()
+        .map_or(0, |levels| levels.len())
+    {
+        0 => "none".into(),
+        count => format!("{count} configured"),
+    };
+    let mut items = vec![Item {
+        label: format!("Auto-compact · {}", args.settings.auto_compaction_enabled()),
+        selection: Selection::Setting(
+            "autoCompactionEnabled".into(),
+            json!(!args.settings.auto_compaction_enabled()),
+        ),
+    }];
+    if view.graphics.enabled() {
+        let show_images = args.settings.show_terminal_images();
+        let image_width = args.settings.terminal_image_width();
+        let next_width = match image_width {
+            60 => 80,
+            80 => 120,
+            _ => 60,
+        };
+        items.extend([
+            Item {
+                label: format!("Show images · {show_images}"),
+                selection: Selection::Setting("terminal.showImages".into(), json!(!show_images)),
+            },
+            Item {
+                label: format!("Image width · {image_width}"),
+                selection: Selection::Setting("terminal.imageWidthCells".into(), json!(next_width)),
+            },
+        ]);
+    }
+    items.extend([
+        Item {
+            label: format!("Auto-resize images · {resize_images}"),
+            selection: Selection::Setting("images.autoResize".into(), json!(!resize_images)),
+        },
+        Item {
+            label: format!("Block images · {block_images}"),
+            selection: Selection::Setting("images.blockImages".into(), json!(!block_images)),
+        },
+        Item {
+            label: format!("Skill commands · {skill_commands}"),
+            selection: Selection::Setting("enableSkillCommands".into(), json!(!skill_commands)),
+        },
+        Item {
+            label: format!(
+                "Show hardware cursor · {}",
+                if args.settings.show_hardware_cursor() {
+                    "true"
+                } else {
+                    "false"
+                }
+            ),
+            selection: Selection::Setting(
+                "showHardwareCursor".into(),
+                json!(!args.settings.show_hardware_cursor()),
+            ),
+        },
+        Item {
+            label: format!("Editor padding · {padding}"),
+            selection: Selection::Setting("editorPaddingX".into(), json!((padding + 1) % 4)),
+        },
+        Item {
+            label: format!("Output padding · {}", args.settings.output_padding()),
+            selection: Selection::Setting(
+                "outputPad".into(),
+                json!(1 - args.settings.output_padding()),
+            ),
+        },
+        Item {
+            label: format!("Autocomplete max items · {autocomplete_items}"),
+            selection: Selection::Setting(
+                "autocompleteMaxVisible".into(),
+                json!(
+                    [3, 5, 7, 10, 15, 20]
+                        .into_iter()
+                        .skip_while(|count| *count != autocomplete_items)
+                        .nth(1)
+                        .unwrap_or(3)
+                ),
+            ),
+        },
+        Item {
+            label: format!(
+                "Clear on shrink · {}",
+                if args.settings.clear_terminal_on_shrink() {
+                    "true"
+                } else {
+                    "false"
+                }
+            ),
+            selection: Selection::Setting(
+                "terminal.clearOnShrink".into(),
+                json!(!args.settings.clear_terminal_on_shrink()),
+            ),
+        },
+        Item {
+            label: format!("Terminal progress · {}", args.settings.terminal_progress()),
+            selection: Selection::Setting(
+                "terminal.showTerminalProgress".into(),
+                json!(!args.settings.terminal_progress()),
+            ),
+        },
+        queue_setting("steeringMode", "Steering mode", pi_rs::InputKind::Steer),
+        queue_setting("followUpMode", "Follow-up mode", pi_rs::InputKind::FollowUp),
+        {
+            let transport = args.settings.string("transport").unwrap_or("auto");
+            let next = match transport {
+                "sse" => "websocket",
+                "websocket" => "websocket-cached",
+                "websocket-cached" => "auto",
+                _ => "sse",
+            };
+            Item {
+                label: format!("Transport · {transport}"),
+                selection: Selection::Setting("transport".into(), json!(next)),
+            }
+        },
+        Item {
+            label: format!("Session share destination · {share}"),
+            selection: Selection::Setting(
+                "sessionShareDestination".into(),
+                json!(match share {
+                    "auto" => "gist",
+                    "gist" => "radius",
+                    _ => "auto",
+                }),
+            ),
+        },
         Item {
             label: format!(
                 "HTTP idle timeout · {}",
@@ -5463,50 +8996,32 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
                 }),
             ),
         },
-        queue_setting("steeringMode", "Steering mode", pi_rs::InputKind::Steer),
-        queue_setting("followUpMode", "Follow-up mode", pi_rs::InputKind::FollowUp),
         Item {
-            label: format!("Theme · {}", args.use_theme.as_deref().unwrap_or("system")),
-            selection: Selection::EditSetting("theme".into()),
+            label: format!("Cache warming · {cache_mode}"),
+            selection: Selection::Setting("cacheWarming".into(), json!(next_cache_mode)),
         },
         Item {
-            label: format!(
-                "Default thinking level per model · {} configured",
-                args.settings.value()["modelThinkingLevels"]
-                    .as_object()
-                    .map_or(0, |levels| levels.len())
-            ),
-            selection: Selection::EditSetting("modelThinkingLevels".into()),
-        },
-        Item {
-            label: format!(
-                "Tool output · {} (toggle)",
-                if view.expand_tools {
-                    "expanded"
-                } else {
-                    "collapsed"
-                }
-            ),
-            selection: Selection::Setting("expandTools".into(), json!(!view.expand_tools)),
-        },
-        Item {
-            label: format!(
-                "Thinking blocks · {} (toggle)",
-                if view.hide_thinking {
-                    "hidden"
-                } else {
-                    "shown"
-                }
-            ),
+            label: format!("Hide thinking · {}", view.hide_thinking),
             selection: Selection::Setting("hideThinkingBlock".into(), json!(!view.hide_thinking)),
         },
         Item {
+            label: format!("Mermaid diagrams · {}", args.settings.mermaid_mode()),
+            selection: Selection::Setting(
+                "markdown.mermaid".into(),
+                json!(match args.settings.mermaid_mode() {
+                    "off" => "final",
+                    "final" => "streaming",
+                    _ => "off",
+                }),
+            ),
+        },
+        Item {
             label: format!(
-                "Cache miss notices · {} (toggle)",
+                "Cache miss notices · {}",
                 if args.settings.boolean("showCacheMissNotices") == Some(true) {
-                    "on"
+                    "true"
                 } else {
-                    "off"
+                    "false"
                 }
             ),
             selection: Selection::Setting(
@@ -5515,107 +9030,53 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
             ),
         },
         Item {
-            label: format!("Save default model · {}/{}", args.provider.id(), args.model),
-            selection: Selection::SaveDefaultModel,
-        },
-        Item {
-            label: format!("Cache warming · {cache_mode} (cycle)"),
-            selection: Selection::Setting("cacheWarming".into(), json!(next_cache_mode)),
-        },
-        Item {
-            label: format!(
-                "Save default thinking · {}",
-                args.thinking.as_deref().unwrap_or("model default")
-            ),
-            selection: Selection::Setting("defaultThinkingLevel".into(), json!(args.thinking)),
-        },
-        Item {
-            label: format!(
-                "Auto-compaction · {} (toggle)",
-                if args.settings.auto_compaction_enabled() {
-                    "on"
-                } else {
-                    "off"
+            label: format!("Quiet startup · {quiet_label}"),
+            selection: Selection::Setting(
+                "quietStartup".into(),
+                match quiet_label {
+                    "true" => json!("header"),
+                    "header" => json!(false),
+                    _ => json!(true),
                 },
             ),
-            selection: Selection::Setting(
-                "autoCompactionEnabled".into(),
-                json!(!args.settings.auto_compaction_enabled()),
-            ),
         },
         Item {
             label: format!(
-                "Auto-retry · {} (toggle)",
-                if args.settings.retry_settings().enabled {
-                    "on"
-                } else {
-                    "off"
+                "Default project trust · {}",
+                match trust {
+                    "always" => "Always trust",
+                    "never" => "Never trust",
+                    _ => "Ask",
                 }
             ),
             selection: Selection::Setting(
-                "autoRetryEnabled".into(),
-                json!(!args.settings.retry_settings().enabled),
+                "defaultProjectTrust".into(),
+                json!(match trust {
+                    "ask" => "always",
+                    "always" => "never",
+                    _ => "ask",
+                }),
             ),
         },
-    ];
-    let resize_images = args.settings.resize_model_images();
-    items.push(Item {
-        label: format!(
-            "Auto-resize images · {} (toggle)",
-            if resize_images { "on" } else { "off" }
-        ),
-        selection: Selection::Setting("images.autoResize".into(), json!(!resize_images)),
-    });
-    let block_images = args.settings.block_model_images();
-    items.push(Item {
-        label: format!(
-            "Block images · {} (toggle)",
-            if block_images { "on" } else { "off" }
-        ),
-        selection: Selection::Setting("images.blockImages".into(), json!(!block_images)),
-    });
-    if view.graphics.enabled() {
-        let show_images = args.settings.show_terminal_images();
-        let image_width = args.settings.terminal_image_width();
-        let next_width = match image_width {
-            60 => 80,
-            80 => 120,
-            _ => 60,
-        };
-        items.extend([
-            Item {
-                label: format!(
-                    "Show images · {} (toggle)",
-                    if show_images { "on" } else { "off" }
-                ),
-                selection: Selection::Setting("terminal.showImages".into(), json!(!show_images)),
-            },
-            Item {
-                label: format!("Image width · {image_width} cells"),
-                selection: Selection::Setting("terminal.imageWidthCells".into(), json!(next_width)),
-            },
-        ]);
-    }
-    let autocomplete_items = args.settings.autocomplete_max_visible();
-    let skill_commands = args.settings.enable_skill_commands();
-    let quiet = &args.settings.value()["quietStartup"];
-    let quiet_label = if quiet == true {
-        "true"
-    } else if quiet == "header" {
-        "header"
-    } else {
-        "false"
-    };
-    let share = args
-        .settings
-        .string("sessionShareDestination")
-        .unwrap_or("auto");
-    let trust = args.settings.string("defaultProjectTrust").unwrap_or("ask");
-    let wheel = &args.settings.value()["fullscreenWheelScrollLines"];
-    let wheel_lines = wheel
-        .as_f64()
-        .map(|value| value.clamp(1.0, 100.0).floor() as u64);
-    items.extend([
+        Item {
+            label: format!("Double-escape action · {escape}"),
+            selection: Selection::Setting("doubleEscapeAction".into(), json!(next_escape)),
+        },
+        Item {
+            label: format!("Tree filter mode · {}", tree_filter.name()),
+            selection: Selection::Setting(
+                "treeFilterMode".into(),
+                json!(tree_filter.next().name()),
+            ),
+        },
+        Item {
+            label: "Warnings · configure".into(),
+            selection: Selection::EditSetting("warnings".into()),
+        },
+        Item {
+            label: format!("Default thinking level per model · {thinking_summary}"),
+            selection: Selection::EditSetting("modelThinkingLevels".into()),
+        },
         Item {
             label: format!(
                 "TUI mode · {}",
@@ -5632,113 +9093,6 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
                 } else {
                     "regular"
                 }),
-            ),
-        },
-        Item {
-            label: format!("Quiet startup · {quiet_label}"),
-            selection: Selection::Setting(
-                "quietStartup".into(),
-                match quiet_label {
-                    "true" => json!("header"),
-                    "header" => json!(false),
-                    _ => json!(true),
-                },
-            ),
-        },
-        Item {
-            label: format!("Session share destination · {share}"),
-            selection: Selection::Setting(
-                "sessionShareDestination".into(),
-                json!(match share {
-                    "auto" => "gist",
-                    "gist" => "radius",
-                    _ => "auto",
-                }),
-            ),
-        },
-        Item {
-            label: format!("Default project trust · {trust}"),
-            selection: Selection::Setting(
-                "defaultProjectTrust".into(),
-                json!(match trust {
-                    "ask" => "always",
-                    "always" => "never",
-                    _ => "ask",
-                }),
-            ),
-        },
-        Item {
-            label: format!(
-                "Fullscreen wheel scrolling · {}",
-                wheel_lines.map_or_else(|| "auto".into(), |n| n.to_string())
-            ),
-            selection: Selection::Setting(
-                "fullscreenWheelScrollLines".into(),
-                match wheel_lines {
-                    None => json!(1),
-                    Some(current) => [1, 2, 3, 5, 10]
-                        .into_iter()
-                        .find(|value| *value > current)
-                        .map_or_else(|| json!("auto"), |value| json!(value)),
-                },
-            ),
-        },
-        Item {
-            label: format!("Autocomplete max items · {autocomplete_items}"),
-            selection: Selection::Setting(
-                "autocompleteMaxVisible".into(),
-                json!(
-                    [3, 5, 7, 10, 15, 20]
-                        .into_iter()
-                        .find(|count| *count > autocomplete_items)
-                        .unwrap_or(3)
-                ),
-            ),
-        },
-        Item {
-            label: format!(
-                "Skill commands · {} (toggle)",
-                if skill_commands { "on" } else { "off" }
-            ),
-            selection: Selection::Setting("enableSkillCommands".into(), json!(!skill_commands)),
-        },
-    ]);
-    let escape = args.settings.string("doubleEscapeAction").unwrap_or("tree");
-    let next_escape = match escape {
-        "tree" => "fork",
-        "fork" => "none",
-        _ => "tree",
-    };
-    let tree_filter =
-        TreeFilter::parse(args.settings.string("treeFilterMode").unwrap_or("default"));
-    let padding = args.settings.value()["editorPaddingX"]
-        .as_u64()
-        .unwrap_or(0);
-    let exit_output = args
-        .settings
-        .string("fullscreenExitOutput")
-        .unwrap_or("transcript");
-    let scrollbar = args
-        .settings
-        .string("fullscreenScrollbar")
-        .unwrap_or("auto");
-    let copy_on_select = args
-        .settings
-        .boolean("fullscreenCopyOnSelect")
-        .unwrap_or(true);
-    items.extend([
-        Item {
-            label: format!(
-                "Terminal progress · {} (toggle)",
-                if args.settings.terminal_progress() {
-                    "on"
-                } else {
-                    "off"
-                },
-            ),
-            selection: Selection::Setting(
-                "terminal.showTerminalProgress".into(),
-                json!(!args.settings.terminal_progress()),
             ),
         },
         Item {
@@ -5764,71 +9118,63 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
             ),
         },
         Item {
-            label: format!(
-                "Fullscreen copy on select · {}",
-                if copy_on_select { "on" } else { "off" }
-            ),
+            label: format!("Fullscreen copy on select · {copy_on_select}"),
             selection: Selection::Setting("fullscreenCopyOnSelect".into(), json!(!copy_on_select)),
         },
         Item {
-            label: format!("Editor padding · {padding}"),
-            selection: Selection::Setting("editorPaddingX".into(), json!((padding + 1) % 4)),
-        },
-        Item {
-            label: format!("Mermaid rendering · {}", args.settings.mermaid_mode()),
+            label: format!(
+                "Fullscreen wheel scrolling · {}",
+                wheel_lines.map_or_else(|| "auto".into(), |n| n.to_string())
+            ),
             selection: Selection::Setting(
-                "markdown.mermaid".into(),
-                json!(match args.settings.mermaid_mode() {
-                    "off" => "final",
-                    "final" => "streaming",
-                    _ => "off",
-                }),
+                "fullscreenWheelScrollLines".into(),
+                match wheel_lines {
+                    None => json!(1),
+                    Some(current) => [1, 2, 3, 5, 10]
+                        .into_iter()
+                        .find(|value| *value > current)
+                        .map_or_else(|| json!("auto"), |value| json!(value)),
+                },
             ),
         },
         Item {
+            label: format!("Theme · {}", args.theme_setting().unwrap_or("system")),
+            selection: Selection::EditSetting("theme".into()),
+        },
+        Item {
             label: format!(
-                "Clear on shrink · {}",
-                if args.settings.clear_terminal_on_shrink() {
+                "Tool output · {} (toggle)",
+                if view.expand_tools {
+                    "expanded"
+                } else {
+                    "collapsed"
+                }
+            ),
+            selection: Selection::Setting("expandTools".into(), json!(!view.expand_tools)),
+        },
+        Item {
+            label: format!("Save default model · {}/{}", args.provider.id(), args.model),
+            selection: Selection::SaveDefaultModel,
+        },
+        Item {
+            label: format!(
+                "Save default thinking · {}",
+                args.thinking.as_deref().unwrap_or("model default")
+            ),
+            selection: Selection::Setting("defaultThinkingLevel".into(), json!(args.thinking)),
+        },
+        Item {
+            label: format!(
+                "Auto-retry · {} (toggle)",
+                if args.settings.retry_settings().enabled {
                     "on"
                 } else {
                     "off"
                 }
             ),
             selection: Selection::Setting(
-                "terminal.clearOnShrink".into(),
-                json!(!args.settings.clear_terminal_on_shrink()),
-            ),
-        },
-        Item {
-            label: format!(
-                "Hardware cursor · {}",
-                if args.settings.show_hardware_cursor() {
-                    "on"
-                } else {
-                    "off"
-                }
-            ),
-            selection: Selection::Setting(
-                "showHardwareCursor".into(),
-                json!(!args.settings.show_hardware_cursor()),
-            ),
-        },
-        Item {
-            label: format!("Output padding · {}", args.settings.output_padding()),
-            selection: Selection::Setting(
-                "outputPad".into(),
-                json!(1 - args.settings.output_padding()),
-            ),
-        },
-        Item {
-            label: format!("Double-escape action · {escape}"),
-            selection: Selection::Setting("doubleEscapeAction".into(), json!(next_escape)),
-        },
-        Item {
-            label: format!("Tree filter mode · {}", tree_filter.name()),
-            selection: Selection::Setting(
-                "treeFilterMode".into(),
-                json!(tree_filter.next().name()),
+                "autoRetryEnabled".into(),
+                json!(!args.settings.retry_settings().enabled),
             ),
         },
     ]);
@@ -5925,15 +9271,8 @@ fn select(
                 Some(worker),
             )?;
         }
-        Selection::Label(id, label) => {
-            Session::open(&args.session)?.set_label(id, (!label.is_empty()).then_some(label))?;
-            slash("/tree", args, view, None)?;
-            if let Some(picker) = &mut view.picker {
-                picker.focus_record(id);
-            }
-        }
         Selection::Checkout(id) => {
-            if id == Session::open(&args.session)?.head() {
+            if id == Session::snapshot(&args.session)?.head() {
                 view.append("Already at this point");
             } else if args.settings.value()["branchSummary"]["skipPrompt"] == true {
                 start_tree_navigation(args, view, worker, id, false, None)?;
@@ -5962,26 +9301,93 @@ fn select(
             slash(&format!("/fork {id}"), args, view, Some(worker))?;
         }
         Selection::Model(model) => {
-            select_model_input(args, view, &model)?;
+            select_model_input(args, view, worker.as_mut(), &model, false)?;
         }
-        Selection::Completion { range, text } => insert_completion(view, range, &text),
+        Selection::Completion { range, text, .. } => insert_completion(view, range, &text),
+        Selection::LoginProvider(provider) if provider.id() == "amazon-bedrock" => {
+            show_bedrock_methods(view)
+        }
+        Selection::LoginProvider(provider) if provider.id() == "google-vertex" => {
+            show_vertex_methods(view)
+        }
+        Selection::LoginProvider(provider) if uses_cloudflare_login(&provider, args) => {
+            edit_cloudflare_login(view, CloudflareLoginField::Key(provider));
+        }
         Selection::LoginProvider(provider) => edit_provider_key(provider, view),
+        Selection::VertexApiKey => edit_provider_key(
+            super::Provider::named("google-vertex").expect("Vertex provider"),
+            view,
+        ),
+        Selection::VertexAdc { service_account } => {
+            if !service_account {
+                if std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS")
+                    .is_some_and(|path| !path.is_empty())
+                {
+                    view.append("ADC uses the file set by GOOGLE_APPLICATION_CREDENTIALS.");
+                } else {
+                    view.append("Run gcloud auth application-default login, then enter your project and location.");
+                }
+            }
+            edit_vertex_login(view, VertexLoginField::Project { service_account });
+        }
+        Selection::BedrockBearer => edit_provider_key(super::Provider::Bedrock, view),
+        Selection::BedrockProfile => {
+            let dialog = crate::ui::dialog::Dialog::new(
+                uuid::Uuid::new_v4(),
+                pi_rs::UiRequest::Input {
+                    title: "Enter AWS profile name".into(),
+                    placeholder: None,
+                    initial_value: None,
+                    timeout: None,
+                },
+            );
+            view.local_editor = Some((LocalEditor::BedrockProfile, dialog));
+        }
+        Selection::BedrockChain => {
+            let dialog = crate::ui::dialog::Dialog::new(
+                uuid::Uuid::new_v4(),
+                pi_rs::UiRequest::Input {
+                    title: "Configure AWS credentials, then press Enter to continue".into(),
+                    placeholder: None,
+                    initial_value: None,
+                    timeout: None,
+                },
+            );
+            view.local_editor = Some((LocalEditor::BedrockChain, dialog));
+        }
+        Selection::LoginCodex => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Browser)
+        }
+        Selection::LoginCodexDevice => {
+            start_codex_login(view, &args.settings, super::codex_auth::Method::Device)
+        }
+        Selection::LoginCopilot => edit_copilot_enterprise(view),
+        Selection::LoginXai => start_xai_login(view, &args.settings),
+        Selection::LoginMeta => start_meta_login(view, &args.settings),
+        Selection::LoginKimi => start_kimi_login(view, &args.settings),
         Selection::LoginOpenRouter => start_openrouter_login(view, &args.settings),
+        Selection::AnthropicMethods => show_anthropic_methods(view),
+        Selection::LoginAnthropic(method) => start_anthropic_login(view, &args.settings, method),
         Selection::LoginChatGpt => start_chatgpt_login(view, &args.settings, false, None),
         Selection::LoginChatGptNew => start_chatgpt_login(view, &args.settings, true, None),
         Selection::LoginChatGptAccount(id) => {
             start_chatgpt_login(view, &args.settings, false, Some(id))
         }
         Selection::LogoutChatGpt => start_chatgpt_logout(view, &args.settings),
+        Selection::LogoutProvider(provider) if provider.id() == "kimi-coding" => {
+            start_kimi_logout(view)
+        }
         Selection::LogoutProvider(provider) => remove_provider_key(provider, args, view)?,
         Selection::RadiusMethods => show_radius_methods(view),
         Selection::LoginRadius(method) => start_radius_login(view, &args.settings, method)?,
         Selection::LogoutRadius => start_radius_logout(view, &args.settings)?,
-        Selection::Thinking(thinking) => super::thinking::set(args, &thinking)?,
-        Selection::SaveDefaultModel => save_default_model(args)?,
+        Selection::Thinking(thinking) => {
+            select_thinking_input(args, view, worker.as_mut(), &thinking, false)?;
+        }
+        Selection::SaveDefaultModel => save_current_default_model(args)?,
         Selection::EditSetting(key) => {
             let default = match key.as_str() {
-                "theme" => json!(args.use_theme.as_deref().unwrap_or("system")),
+                "theme" => json!(args.theme_setting().unwrap_or("system")),
                 "defaultModel" => json!(args.model),
                 "defaultThinkingLevel" => json!(args.thinking.as_deref().unwrap_or("off")),
                 "tuiMode" => json!(if args.tui_mode == Some(TuiMode::Regular) {
@@ -6079,30 +9485,35 @@ fn select(
             } else if let Some(member) = key.strip_prefix("markdown.") {
                 args.settings
                     .set_user_member("markdown", member, value.clone())?;
+            } else if let Some(member) = key.strip_prefix("warnings.") {
+                args.settings
+                    .set_user_member("warnings", member, value.clone())?;
             } else if key == "theme" {
-                let next = Theme::load(
+                let next = load_resolved_theme(
                     value
                         .as_str()
                         .ok_or_else(|| Error::Config("theme must be a string".into()))?,
                     &args.theme_paths,
                     &args.workspace,
                     args.trusted,
-                    false,
                 )?;
                 args.settings.set_user(&key, value.clone())?;
                 args.use_theme = value.as_str().map(str::to_owned);
                 *theme = next;
+                view.theme_refresh_requested = true;
             } else {
                 args.settings.set_user(&key, value.clone())?;
             }
-            if key == "cacheWarming"
-                && let Some(worker) = worker
-            {
-                worker.send(json!({"type":"cache_warming_changed"}))?;
+            if let Some(worker) = worker {
+                match key.as_str() {
+                    "cacheWarming" => worker.send(json!({"type":"cache_warming_changed"}))?,
+                    "transport" => worker.send(json!({"type":"transport_changed"}))?,
+                    _ => {}
+                }
             }
             match key.as_str() {
                 "expandTools" => view.set_expand_tools(value.as_bool().unwrap_or(false)),
-                "hideThinkingBlock" => view.hide_thinking = value.as_bool().unwrap_or(false),
+                "hideThinkingBlock" => view.set_hide_thinking(value.as_bool().unwrap_or(false)),
                 "tuiMode" => {
                     args.tui_mode = Some(if value == "regular" {
                         TuiMode::Regular
@@ -6117,7 +9528,10 @@ fn select(
             crate::config::save_trust(&args.workspace, decision)?;
             args.trusted = decision;
             args.trust_pending = false;
-            args.settings = crate::config::Settings::load(&args.workspace, decision)?;
+            args.settings = args.settings.reload_latest(&args.workspace, decision)?;
+            for warning in args.settings.diagnostics() {
+                view.append(warning);
+            }
             view.resources = super::resources::Resources::load(args)?;
             view.append(if decision {
                 "Project configuration trusted"
@@ -6126,16 +9540,12 @@ fn select(
             });
         }
         Selection::Theme(name) => {
-            let next = Theme::load(
-                &name,
-                &args.theme_paths,
-                &args.workspace,
-                args.trusted,
-                false,
-            )?;
+            let next =
+                load_resolved_theme(&name, &args.theme_paths, &args.workspace, args.trusted)?;
             args.settings.set_user("theme", json!(name))?;
             args.use_theme = Some(name);
             *theme = next;
+            view.theme_refresh_requested = true;
         }
         Selection::ThemeSettings(_) => {
             return Err(Error::Config(
@@ -6151,22 +9561,153 @@ fn select(
     Ok(())
 }
 
+// Keep typeahead in order until model-level discovery finishes. A configured
+// picker cancellation discards input intended for the abandoned picker.
+fn buffer_thinking_level_input(pending: &mut VecDeque<Event>, event: &Event, cancel: bool) -> bool {
+    match event {
+        Event::Key(_) if cancel => {
+            pending.clear();
+            false
+        }
+        Event::Key(_) | Event::Paste(_) => {
+            if pending.len() < 1024 {
+                pending.push_back(event.clone());
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn next_thinking_level_input(
+    pending: &mut VecDeque<Event>,
+    loading: bool,
+    ready: bool,
+    blocked: bool,
+) -> Option<Event> {
+    if !loading && !ready {
+        pending.clear();
+    }
+    if ready && !blocked {
+        pending.pop_front()
+    } else {
+        None
+    }
+}
+
+// A bare Escape may need the input decoder's 25 ms disambiguation window.
+// Give already-arrived input priority over committing a prepared session.
+fn queued_transition_cancel(
+    deferred: &mut VecDeque<crate::ui::input::InputEvent>,
+    mut next: impl FnMut(Duration) -> std::io::Result<Option<crate::ui::input::InputEvent>>,
+) -> Result<bool> {
+    let deadline = Instant::now() + Duration::from_millis(30);
+    while Instant::now() < deadline {
+        match next(deadline.saturating_duration_since(Instant::now()))? {
+            Some(crate::ui::input::InputEvent::Event(Event::Key(key)))
+                if key.code == KeyCode::Esc && key.kind != KeyEventKind::Release =>
+            {
+                return Ok(true);
+            }
+            Some(crate::ui::input::InputEvent::Event(
+                Event::Key(_) | Event::Mouse(_) | Event::Paste(_),
+            )) => {}
+            Some(event) => deferred.push_back(event),
+            None => {}
+        }
+    }
+    Ok(false)
+}
+
 fn switch_session(args: &mut Cli, view: &mut View, path: PathBuf) -> Result<()> {
     let mut next = args.clone();
-    next.model_explicit = false;
-    next.thinking_explicit = false;
+    next.settings.fork_worker_history();
     next.session = path;
     next.session_transition = Some(pi_rs::SessionStartReason::Resume);
+    if view.async_transitions {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = restore_workspace(&mut next).map(|()| next);
+            let _ = sender.send(result);
+        });
+        view.pending_transition = Some(receiver);
+        view.append("Preparing session (Esc to cancel)");
+        return Ok(());
+    }
     restore_workspace(&mut next)?;
+    apply_session(args, view, next)
+}
+
+fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
     let resources = super::resources::Resources::load(&next)?;
     next.theme_paths = resources.themes.clone();
+    if matches!(
+        next.session_transition,
+        Some(pi_rs::SessionStartReason::New)
+    ) {
+        if let Some(directory) = next.session.parent() {
+            std::fs::create_dir_all(directory)?;
+        }
+        initialize_session(&mut next)?;
+    }
     view.restore(&next)?;
+    for warning in next.settings.diagnostics() {
+        view.append(warning);
+    }
     view.resources = resources;
     *args = next;
     if args.trust_pending {
         slash("/trust", args, view, None)?;
     }
     Ok(())
+}
+
+async fn prepare_initial_session_async(args: Cli) -> Result<Cli> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut args = args;
+        let result = restore_workspace(&mut args).map(|()| args);
+        let _ = sender.send(result);
+    });
+    let mut args = receiver
+        .await
+        .map_err(|_| Error::Config("workspace discovery stopped".into()))??;
+    initialize_session(&mut args)?;
+    Ok(args)
+}
+
+pub(super) fn restore_workspace_cancellable(
+    args: &mut Cli,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut next = args.clone();
+    next.settings.fork_worker_history();
+    std::thread::spawn(move || {
+        let result = restore_workspace(&mut next).map(|()| next);
+        let _ = sender.send(result);
+    });
+    loop {
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Cancelled);
+        }
+        match receiver.recv_timeout(Duration::from_millis(50)) {
+            Ok(result) => {
+                *args = result?;
+                return Ok(());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Error::Config("workspace discovery stopped".into()));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn prepare_initial_session(args: &mut Cli) -> Result<()> {
+    restore_workspace(args)?;
+    initialize_session(args)
 }
 
 fn initialize_session(args: &mut Cli) -> Result<()> {
@@ -6182,18 +9723,13 @@ fn initialize_session(args: &mut Cli) -> Result<()> {
     if let Some(name) = &args.name {
         session.set_name(name)?;
     }
-    if let Some((model, thinking)) = session.model_selection() {
-        args.restore_model_selection(model, thinking, session.model_provider());
-    }
+    args.restore_session_model(&session)?;
     super::thinking::adjust(args);
-    args.record_model_selection(&mut session)?;
+    args.record_automatic_model_selection(&mut session)?;
     Ok(())
 }
 pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     let session = Session::open(&args.session)?;
-    if let Some((model, thinking)) = session.model_selection() {
-        args.restore_model_selection(model, thinking, session.model_provider());
-    }
     if let Some(cwd) = session.working_directory() {
         let path = PathBuf::from(cwd);
         if !path.is_dir() {
@@ -6215,35 +9751,458 @@ pub(super) fn restore_workspace(args: &mut Cli) -> Result<()> {
     )?;
     args.trusted = decision.unwrap_or(false);
     args.trust_pending = decision.is_none();
-    args.settings = crate::config::Settings::load(&args.workspace, args.trusted)?;
+    args.settings = args.settings.reload_latest(&args.workspace, args.trusted)?;
+    args.refresh_workspace_selection();
+    args.restore_session_model(&session)?;
     drop(session);
     super::thinking::adjust(args);
     Ok(())
 }
 
-fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
-    let command = args
-        .settings
-        .string("externalEditor")
-        .map(str::to_owned)
-        .or_else(|| std::env::var("VISUAL").ok())
-        .or_else(|| std::env::var("EDITOR").ok())
-        .unwrap_or_else(|| {
-            if cfg!(windows) {
-                "notepad".into()
-            } else {
-                "nano".into()
+#[cfg(unix)]
+mod editor_pty;
+mod session_tree;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalEditorTarget {
+    Main,
+    Local(uuid::Uuid),
+    Extension(uuid::Uuid),
+}
+
+#[cfg(windows)]
+type ExternalEditorChild = Box<dyn process_wrap::std::ChildWrapper>;
+#[cfg(not(windows))]
+type ExternalEditorChild = std::process::Child;
+
+struct ExternalEditorFile {
+    _directory: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+impl ExternalEditorFile {
+    fn new(text: &str) -> std::io::Result<Self> {
+        let directory = external_editor_directory()?;
+        let path = directory.path().join("prompt.md");
+        // Close the file before launching the editor. Windows applications may
+        // open it without sharing access with an existing writable handle.
+        std::fs::write(&path, text)?;
+        Ok(Self {
+            _directory: directory,
+            path,
+        })
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+struct RunningExternalEditor {
+    child: ExternalEditorChild,
+    file: ExternalEditorFile,
+    target: ExternalEditorTarget,
+    cancelled: bool,
+    #[cfg(unix)]
+    terminal_state: Option<EditorTerminalState>,
+    #[cfg(unix)]
+    pty: Option<editor_pty::EditorPty>,
+    #[cfg(unix)]
+    drain_deadline: Option<Instant>,
+}
+
+// The editor shares Pi's foreground process group. Capture terminal settings
+// before launch so an interrupted editor cannot leave the TUI in its raw mode.
+#[cfg(unix)]
+struct EditorTerminalState {
+    tty: std::fs::File,
+    baseline: libc::termios,
+    relaying: bool,
+}
+
+#[cfg(unix)]
+impl EditorTerminalState {
+    fn capture() -> std::io::Result<Option<Self>> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let tty = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open("/dev/tty")
+        {
+            Ok(tty) => tty,
+            Err(_) => return Ok(None),
+        };
+        let mut baseline = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut baseline) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Some(Self {
+            tty,
+            baseline,
+            relaying: false,
+        }))
+    }
+
+    fn enter_relay_mode(&mut self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        if !self.foreground()? {
+            return Err(std::io::Error::other(
+                "Pi must be foregrounded to open an extension editor",
+            ));
+        }
+        let mut raw = self.baseline;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        if unsafe { libc::tcsetattr(self.tty.as_raw_fd(), libc::TCSANOW, &raw) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.relaying = true;
+        Ok(())
+    }
+
+    fn foreground(&self) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let group = unsafe { libc::tcgetpgrp(self.tty.as_raw_fd()) };
+        if group < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(group == unsafe { libc::getpgrp() })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EditorTerminalState {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        if self.foreground().unwrap_or(false) {
+            let fd = self.tty.as_raw_fd();
+            unsafe {
+                if self.relaying {
+                    libc::tcflush(fd, libc::TCIFLUSH);
+                }
+                libc::tcsetattr(fd, libc::TCSANOW, &self.baseline);
             }
+        }
+    }
+}
+
+impl RunningExternalEditor {
+    fn cancelled_by(&self, event: &Value) -> bool {
+        event["type"] == "extension_ui_cancelled"
+            && matches!(self.target, ExternalEditorTarget::Extension(id) if json!(id) == event["id"])
+    }
+    fn start(command: &str, text: &str, target: ExternalEditorTarget) -> Result<Self> {
+        #[cfg(unix)]
+        let terminal_state = EditorTerminalState::capture()?;
+        #[cfg(unix)]
+        if matches!(target, ExternalEditorTarget::Extension(_)) && terminal_state.is_none() {
+            return Err(Error::Config(
+                "External editing of an extension dialog requires a controlling terminal".into(),
+            ));
+        }
+        Self::start_with_terminal(
+            command,
+            text,
+            target,
+            #[cfg(unix)]
+            terminal_state,
+        )
+    }
+
+    fn start_with_terminal(
+        command: &str,
+        text: &str,
+        target: ExternalEditorTarget,
+        #[cfg(unix)] mut terminal_state: Option<EditorTerminalState>,
+    ) -> Result<Self> {
+        let parts =
+            shell_words::split(command).map_err(|error| Error::Config(error.to_string()))?;
+        let Some((program, arguments)) = parts.split_first() else {
+            return Err(Error::Config("external editor is empty".into()));
+        };
+        let file = ExternalEditorFile::new(text)?;
+        let mut process = std::process::Command::new(program);
+        process.args(arguments).arg(file.path());
+        #[cfg(unix)]
+        let pty = if matches!(target, ExternalEditorTarget::Extension(_)) {
+            let pty = editor_pty::EditorPty::attach(
+                &mut process,
+                terminal_state.as_ref().map(|tty| (&tty.tty, &tty.baseline)),
+            )?;
+            if let Some(tty) = &mut terminal_state {
+                tty.enter_relay_mode()?;
+            }
+            Some(pty)
+        } else {
+            None
+        };
+        #[cfg(windows)]
+        let child = {
+            let mut wrapped = process_wrap::std::CommandWrap::from(process);
+            wrapped.wrap(process_wrap::std::JobObject);
+            wrapped.spawn()
+        };
+        #[cfg(not(windows))]
+        let child = process.spawn();
+        let child = child
+            .map_err(|_| Error::Config(format!("Failed to launch external editor: {command}")))?;
+        Ok(Self {
+            child,
+            file,
+            target,
+            cancelled: false,
+            #[cfg(unix)]
+            terminal_state,
+            #[cfg(unix)]
+            pty,
+            #[cfg(unix)]
+            drain_deadline: None,
+        })
+    }
+
+    fn poll(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        // Do not redraw over the shell if an editor exits while the job is
+        // backgrounded. The shell will foreground this shared group again.
+        #[cfg(unix)]
+        if let Some(tty) = &self.terminal_state
+            && !tty.foreground()?
+        {
+            return Ok(None);
+        }
+        #[cfg(not(windows))]
+        let status = self.child.try_wait()?;
+        #[cfg(windows)]
+        let status = self.child.inner_mut().try_wait()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.pty.is_some() && status.is_none() && editor_pty::child_stopped(self.child.id())? {
+            // A session-local stop cannot suspend Pi's job in the outer
+            // shell. Release the dialog instead of relaying to a stopped editor.
+            return Err(Error::Config(
+                "External editor suspended. Draft unchanged".into(),
+            ));
+        }
+        #[cfg(unix)]
+        if let (Some(tty), Some(pty)) = (&self.terminal_state, &mut self.pty) {
+            let drained = pty.relay(&tty.tty, status.is_none())?;
+            if status.is_some() && !drained {
+                // Preserve final editor output when possible. A live
+                // descendant or stalled terminal must not hold the TUI.
+                let deadline = self
+                    .drain_deadline
+                    .get_or_insert_with(|| Instant::now() + Duration::from_millis(100));
+                if Instant::now() < *deadline {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(status)
+    }
+
+    fn cancel(&mut self) {
+        // Disconnect the private terminal even if the child already exited.
+        // Descendants may be alive but have no route to Pi's terminal.
+        #[cfg(unix)]
+        drop(self.pty.take());
+        #[cfg(not(windows))]
+        {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        #[cfg(windows)]
+        {
+            // Polling can already have consumed the final job notification.
+            // Terminate via the job and wait on the editor process handle.
+            let _ = self.child.start_kill();
+            let _ = self.child.inner_mut().wait();
+        }
+    }
+
+    fn result(&self, status: std::process::ExitStatus) -> Result<String> {
+        if !status.success() {
+            let exit = status
+                .code()
+                .map_or_else(|| status.to_string(), |code| format!("code {code}"));
+            return Err(Error::Config(format!(
+                "External editor exited with {exit}; prompt unchanged"
+            )));
+        }
+        if self.target == ExternalEditorTarget::Main {
+            return Ok(external_editor_text(&std::fs::read(self.file.path())?));
+        }
+        use std::io::Read;
+        // The decoder can remove a three-byte BOM and one final newline.
+        const MAX_DRAFT_BYTES: usize = 1024 * 1024 + 4;
+        let mut bytes = Vec::new();
+        std::fs::File::open(self.file.path())?
+            .take((MAX_DRAFT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_DRAFT_BYTES {
+            return Err(Error::Config(
+                "External editor result exceeds 1 MiB; draft unchanged".into(),
+            ));
+        }
+        Ok(external_editor_text(&bytes))
+    }
+}
+
+impl Drop for RunningExternalEditor {
+    fn drop(&mut self) {
+        // A wrapper can exit while its descendants keep running. The Windows
+        // job must be terminated even after the wrapper has been reaped.
+        #[cfg(windows)]
+        self.cancel();
+        #[cfg(unix)]
+        drop(self.pty.take());
+        #[cfg(not(windows))]
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            self.cancel();
+        }
+    }
+}
+
+// Cancel only an extension-owned editor. A worker exit invalidates all its
+// dialogs; an explicit cancellation is correlated to a single request.
+fn cancel_running_extension_editor(
+    running: &mut Option<RunningExternalEditor>,
+    event: Option<&Value>,
+) {
+    if let Some(editor) = running.as_mut()
+        && !editor.cancelled
+        && matches!(editor.target, ExternalEditorTarget::Extension(_))
+        && event.is_none_or(|event| editor.cancelled_by(event))
+    {
+        editor.cancel();
+        editor.cancelled = true;
+    }
+}
+
+fn open_external_editor(
+    args: &Cli,
+    view: &mut View,
+    terminal: &mut Option<Terminal>,
+    #[cfg(any(unix, windows))] editor_colors: &mut Option<ColorQueries>,
+    dialog: bool,
+) -> Result<Option<RunningExternalEditor>> {
+    if args.tui_mode == Some(TuiMode::Regular) {
+        view.finish_regular()?;
+    }
+    #[cfg(any(unix, windows))]
+    {
+        *editor_colors = terminal.as_mut().map(|terminal| {
+            let mut colors = std::mem::take(&mut terminal.colors);
+            colors.disable_after_handoff();
+            colors
         });
-    let parts = shell_words::split(&command).map_err(|error| Error::Config(error.to_string()))?;
+    }
+    drop(terminal.take());
+    EXTERNAL_EDITOR_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (target, text) = if dialog {
+        let local = view.local_editor.is_some();
+        let dialog = view.dialog().expect("active editor dialog");
+        (
+            if local {
+                ExternalEditorTarget::Local(dialog.id)
+            } else {
+                ExternalEditorTarget::Extension(dialog.id)
+            },
+            dialog.external_editor_text().to_owned(),
+        )
+    } else {
+        (ExternalEditorTarget::Main, view.editor.text.clone())
+    };
+    let command = external_editor_command(
+        args.settings.string("externalEditor"),
+        std::env::var("VISUAL").ok().as_deref(),
+        std::env::var("EDITOR").ok().as_deref(),
+    );
+    match RunningExternalEditor::start(&command, &text, target) {
+        Ok(editor) => Ok(Some(editor)),
+        Err(error) => {
+            finish_external_editor(
+                args,
+                view,
+                terminal,
+                #[cfg(any(unix, windows))]
+                editor_colors,
+                target,
+                Some(Err(error)),
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+fn finish_external_editor(
+    args: &Cli,
+    view: &mut View,
+    terminal: &mut Option<Terminal>,
+    #[cfg(any(unix, windows))] editor_colors: &mut Option<ColorQueries>,
+    target: ExternalEditorTarget,
+    result: Option<Result<String>>,
+) -> Result<()> {
+    if let Some(result) = result {
+        match target {
+            ExternalEditorTarget::Main => match result {
+                Ok(text) => view.editor.replace(text),
+                Err(error) => view.append(&error.to_string()),
+            },
+            ExternalEditorTarget::Local(id) | ExternalEditorTarget::Extension(id) => {
+                if let Some(dialog) = view.dialog_mut().filter(|dialog| dialog.id == id) {
+                    dialog.external_edit(|draft| {
+                        draft.replace(result?);
+                        Ok(())
+                    });
+                }
+            }
+        }
+    }
+    *terminal = Some(Terminal::enter(
+        args.tui_mode,
+        view.graphics.cleanup(),
+        #[cfg(any(unix, windows))]
+        editor_colors.take(),
+        #[cfg(any(unix, windows))]
+        follows_terminal_appearance(args.theme_setting()),
+    )?);
+    EXTERNAL_EDITOR_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    if view.graphics.enabled() {
+        images::query_cell_size()?;
+    }
+    view.graphics.reset();
+    view.regular.redraw = true;
+    Ok(())
+}
+
+fn external_editor_command(
+    configured: Option<&str>,
+    visual: Option<&str>,
+    editor: Option<&str>,
+) -> String {
+    configured
+        .filter(|command| {
+            !command
+                .trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}')
+                .is_empty()
+        })
+        .or_else(|| visual.filter(|command| !command.is_empty()))
+        .or_else(|| editor.filter(|command| !command.is_empty()))
+        .unwrap_or(if cfg!(windows) { "notepad" } else { "nano" })
+        .to_owned()
+}
+
+#[cfg(test)]
+fn run_external_editor(command: &str, editor: &mut Editor) -> Result<()> {
+    let parts = shell_words::split(command).map_err(|error| Error::Config(error.to_string()))?;
     let Some((program, arguments)) = parts.split_first() else {
         return Err(Error::Config("external editor is empty".into()));
     };
-    let mut file = tempfile::Builder::new().suffix(".md").tempfile()?;
-    file.write_all(editor.text.as_bytes())?;
+    // Keep the directory, rather than an open file handle, alive while the
+    // editor runs. Editors on Windows may require exclusive access to the file.
+    let directory = external_editor_directory()?;
+    let path = directory.path().join("prompt.md");
+    std::fs::write(&path, editor.text.as_bytes())?;
     if !std::process::Command::new(program)
         .args(arguments)
-        .arg(file.path())
+        .arg(&path)
         .status()?
         .success()
     {
@@ -6251,11 +10210,35 @@ fn external_editor(args: &Cli, editor: &mut Editor) -> Result<()> {
             "external editor exited unsuccessfully".into(),
         ));
     }
-    editor.replace(std::fs::read_to_string(file.path())?);
+    let bytes = std::fs::read(&path)?;
+    editor.replace(external_editor_text(&bytes));
     Ok(())
 }
 
+fn external_editor_directory() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("pi-editor-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir()
+}
+
+fn external_editor_text(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    text.strip_suffix('\n').unwrap_or(text).to_owned()
+}
+
 fn complete_input(args: &Cli, view: &mut View) {
+    enum CompletionSource {
+        Builtin,
+        Skill,
+        Prompt(Option<String>),
+        Other,
+    }
     let prefix = &view.editor.text[..view.editor.cursor];
     let start = prefix
         .char_indices()
@@ -6291,7 +10274,7 @@ fn complete_input(args: &Cli, view: &mut View) {
         ]
         .into_iter()
         .filter(|name| name.starts_with(word))
-        .map(str::to_owned)
+        .map(|name| (name.to_owned(), CompletionSource::Builtin))
         .collect::<Vec<_>>()
     } else {
         let file_word = word.strip_prefix('@').unwrap_or(word);
@@ -6322,40 +10305,71 @@ fn complete_input(args: &Cli, view: &mut View) {
                 } else {
                     ""
                 };
-                Some(format!(
-                    "{}{}{suffix}",
-                    if word.starts_with('@') { "@" } else { "" },
-                    parent.join(file_name).display()
+                Some((
+                    format!(
+                        "{}{}{suffix}",
+                        if word.starts_with('@') { "@" } else { "" },
+                        parent.join(file_name).display()
+                    ),
+                    CompletionSource::Other,
                 ))
             })
             .take(100)
             .collect::<Vec<_>>()
     };
     if start == 0 && word.starts_with('/') {
-        candidates.extend(
-            view.resources
-                .prompts
-                .keys()
-                .map(|name| format!("/{name}"))
-                .filter(|name| name.starts_with(word)),
-        );
+        for (name, prompt) in &view.resources.prompts {
+            let text = format!("/{name}");
+            if text.starts_with(word) && !candidates.iter().any(|(candidate, _)| candidate == &text)
+            {
+                if name
+                    .strip_prefix("skill:")
+                    .is_some_and(|skill| view.resources.skills.contains_key(skill))
+                {
+                    candidates.push((text, CompletionSource::Skill));
+                    continue;
+                }
+                let description = match (&prompt.argument_hint, prompt.description.is_empty()) {
+                    (Some(hint), false) => format!("{hint} — {}", prompt.description),
+                    (Some(hint), true) => hint.clone(),
+                    (None, _) => prompt.description.clone(),
+                };
+                candidates.push((
+                    text,
+                    CompletionSource::Prompt((!description.is_empty()).then_some(description)),
+                ));
+            }
+        }
         if args.settings.enable_skill_commands() {
-            candidates.extend(
-                view.resources
-                    .skills
-                    .keys()
-                    .map(|name| format!("/skill:{name}"))
-                    .filter(|name| name.starts_with(word)),
-            );
+            for name in view.resources.skills.keys() {
+                let text = format!("/skill:{name}");
+                if text.starts_with(word)
+                    && !candidates.iter().any(|(candidate, _)| candidate == &text)
+                {
+                    candidates.push((text, CompletionSource::Skill));
+                }
+            }
         }
     }
-    candidates.sort();
-    candidates.dedup();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates.dedup_by(|a, b| a.0 == b.0);
     let range = start..view.editor.cursor;
     match candidates.as_slice() {
-        [candidate] => insert_completion(view, range, candidate),
+        [(candidate, _)] => insert_completion(view, range, candidate),
         [] => {}
         _ => {
+            let candidates = candidates
+                .into_iter()
+                .map(|(text, source)| {
+                    let description = match source {
+                        CompletionSource::Prompt(description) => description,
+                        CompletionSource::Builtin
+                        | CompletionSource::Skill
+                        | CompletionSource::Other => None,
+                    };
+                    (text, description)
+                })
+                .collect();
             view.picker = Some(Picker::completion(
                 candidates,
                 range,
@@ -6404,8 +10418,2815 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+// Pi treats Ctrl+C as a timed pair, independent of agent activity and editor contents.
+fn clear_editor_or_exit(view: &mut View, last_clear: &mut Option<Instant>, now: Instant) -> bool {
+    if last_clear
+        .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_millis(500))
+    {
+        return true;
+    }
+    view.editor.take();
+    view.draft_images.clear();
+    *last_clear = Some(now);
+    false
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_model_changes_use_the_latest_thinking_default() {
+        use clap::Parser;
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = workspace.path().join(".pi");
+        std::fs::create_dir(&directory).unwrap();
+        let settings = |level: &str| {
+            std::fs::write(
+                directory.join("settings.json"),
+                serde_json::json!({"defaultThinkingLevel":level}).to_string(),
+            )
+            .unwrap();
+            super::super::config::Settings::load(workspace.path(), true).unwrap()
+        };
+        let mut args = super::Cli::parse_from(["pi", "--offline", "--model", "before"]);
+        args.settings = settings("medium");
+        let view = super::View {
+            live_model_applied: Some(args.clone()),
+            ..Default::default()
+        };
+        args.settings = settings("high");
+        let selected = view
+            .prepare_live_choice(&args)
+            .prepare_model_change(
+                args.provider.clone(),
+                "after".into(),
+                None,
+                pi_rs::ModelSelectSource::Cycle,
+            )
+            .unwrap();
+        assert_eq!(selected.thinking.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn bare_model_queries_require_an_exact_unambiguous_id() {
+        use clap::Parser;
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        let models = [
+            "ollama/chat-model",
+            "openai/chat-model",
+            "openai/other-model",
+        ]
+        .map(str::to_owned);
+        assert_eq!(super::exact_model_query(&args, "chat", &models), None);
+        assert_eq!(super::exact_model_query(&args, "chat-model", &models), None);
+        assert_eq!(
+            super::exact_model_query(&args, "OTHER-MODEL", &models).as_deref(),
+            Some("openai/other-model")
+        );
+        args.model_scope
+            .push(super::super::model_selection::ScopedChoice {
+                provider: super::super::Provider::Ollama,
+                model: "chat-model".into(),
+                thinking: Some("low".into()),
+            });
+        assert_eq!(
+            super::exact_model_query(&args, "chat-model", &models).as_deref(),
+            Some("ollama/chat-model")
+        );
+    }
+
+    #[test]
+    fn model_picker_waits_for_the_worker_before_adopting_a_selection() {
+        use clap::Parser;
+        let mut args = super::Cli::parse_from(["pi", "--model", "before"]);
+        let mut view = super::View::default();
+        let failed = uuid::Uuid::new_v4();
+        let accepted = uuid::Uuid::new_v4();
+        let mut selected = args.clone();
+        selected.model = "after".into();
+        for (id, persist) in [
+            (failed, Some(super::SelectionDefault::Model)),
+            (accepted, None),
+        ] {
+            view.live_model_choices.push_back(super::LiveModelChoice {
+                id,
+                selected: selected.clone(),
+                status: "Model: after".into(),
+                persist,
+            });
+        }
+        assert_eq!(view.accepted_model(&args).model, "before");
+        view.accept_model_choice(
+            &serde_json::json!({"id":failed,"success":false,"error":"rejected"}),
+            &mut args,
+        );
+        assert_eq!(view.accepted_model(&args).model, "before");
+        view.accept_model_choice(
+            &serde_json::json!({"id":accepted,"success":true}),
+            &mut args,
+        );
+        assert_eq!(view.accepted_model(&args).model, "after");
+        assert_eq!(args.model, "before");
+        assert!(view.finish_model_choice(&mut args));
+        assert_eq!(args.model, "after");
+        assert!(view.live_model_choices.is_empty());
+    }
+    #[test]
+    fn copilot_login_prompts_before_starting_device_authorization() {
+        use super::{Cli, KeyCode, KeyEvent, KeyModifiers, Keys, LocalEditor, View};
+        use clap::Parser;
+
+        let mut args = Cli::parse_from(["pi", "--offline"]);
+        let mut view = View::default();
+        super::slash("/login github-copilot", &mut args, &mut view, None).unwrap();
+        assert!(view.remote_task.is_none());
+        let (editor, mut dialog) = view.local_editor.take().unwrap();
+        assert!(matches!(editor, LocalEditor::CopilotEnterpriseDomain));
+        assert!(matches!(
+            dialog.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &Keys::default()),
+            Some(pi_rs::UiResponse::Text(value)) if value.is_empty()
+        ));
+    }
+
+    #[test]
+    fn subscription_warning_respects_settings_and_only_appears_once() {
+        use clap::Parser;
+
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.provider = super::Provider::Anthropic;
+        args.model = "claude-sonnet-4-6".into();
+        args.endpoint = args.provider.default_endpoint().into();
+        args.settings = super::super::config::Settings::default();
+        args.model_keys = super::super::model_auth::Keys::parse(&serde_json::json!({
+            "anthropic": {"type": "api_key", "key": "sk-ant-api-fixture"}
+        }));
+        let mut view = super::View::default();
+        view.maybe_warn_about_anthropic_subscription(&args);
+        assert!(view.lines.is_empty());
+
+        args.model_keys = super::super::model_auth::Keys::parse(&serde_json::json!({
+            "anthropic": {"type": "oauth", "access": "sk-ant-oat-fixture", "refresh": "fixture", "expires": 123}
+        }));
+        view.maybe_warn_about_anthropic_subscription(&args);
+        view.maybe_warn_about_anthropic_subscription(&args);
+        assert!(matches!(&view.lines[..], [super::Entry::Warning(text)]
+            if text.contains("paid extra usage") && !text.contains("sk-ant-oat")));
+
+        let workspace = tempfile::tempdir().unwrap();
+        let settings_dir = workspace.path().join(".pi");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        std::fs::write(
+            settings_dir.join("settings.json"),
+            r#"{"warnings":{"anthropicExtraUsage":false}}"#,
+        )
+        .unwrap();
+        args.settings = super::super::config::Settings::load(workspace.path(), true).unwrap();
+        let mut view = super::View::default();
+        view.maybe_warn_about_anthropic_subscription(&args);
+        assert!(view.lines.is_empty());
+    }
+
+    #[test]
+    fn cloudflare_login_preserves_key_entry_for_fixed_routes() {
+        use clap::Parser;
+        let mut args = Cli::try_parse_from(["pi", "--offline"]).unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(uses_cloudflare_login(&provider, &args));
+        }
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{
+                "cloudflare-workers-ai":{"baseUrl":"http://127.0.0.1:31415/v1"},
+                "cloudflare-ai-gateway":{"baseUrl":"http://127.0.0.1:31416/v1"},
+            }}))
+            .unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(!uses_cloudflare_login(&provider, &args));
+        }
+        args.model_profiles = super::super::model_profiles::Profiles::parse(
+            &serde_json::json!({"providers":{
+                "cloudflare-workers-ai":{"baseUrl":"https://api.cloudflare.com/client/v4/accounts/fixture/ai/v1"},
+                "cloudflare-ai-gateway":{"baseUrl":"https://gateway.ai.cloudflare.com/v1/fixture/gateway/compat"},
+            }}),
+        ).unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(!uses_cloudflare_login(&provider, &args));
+        }
+        args.model_profiles = super::super::model_profiles::Profiles::parse_with_cloudflare_routes(
+            &serde_json::json!({}),
+            Some("storedworker"),
+            super::super::cloudflare_gateway::Route::new("storedaccount", "storedgateway"),
+        )
+        .unwrap();
+        for id in ["cloudflare-workers-ai", "cloudflare-ai-gateway"] {
+            let provider = super::super::Provider::named(id).unwrap();
+            assert!(!args.model_profiles.endpoint(&provider).is_empty());
+            assert!(uses_cloudflare_login(&provider, &args));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_listener_survives_interrupt_during_editor() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "PI_RS_EDITOR_SIGNAL_REARM_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::signal_listener_survives_interrupt_during_editor",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        super::EXTERNAL_EDITOR_ACTIVE.store(true, Ordering::SeqCst);
+        super::TERMINAL_SIGNAL_READER_PAUSED.store(true, Ordering::SeqCst);
+        super::install_terminal_signal(std::sync::Arc::new(tokio::sync::Notify::new())).unwrap();
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGINT);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while super::TERMINAL_SIGNAL_DELIVERIES.load(Ordering::SeqCst) < 1 {
+            assert!(Instant::now() < deadline, "editor signal was not received");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!crate::process::TERMINAL_INTERRUPTED.load(Ordering::SeqCst));
+        super::EXTERNAL_EDITOR_ACTIVE.store(false, Ordering::SeqCst);
+        super::TERMINAL_SIGNAL_READER_PAUSED.store(false, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !crate::process::TERMINAL_INTERRUPTED.load(Ordering::SeqCst),
+            "editor SIGINT was processed after the editor closed"
+        );
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGINT);
+        }
+        while !crate::process::TERMINAL_INTERRUPTED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "signal listener did not survive editor interrupt"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn console_signal_uses_editor_state_at_delivery() {
+        use std::sync::atomic::Ordering;
+        const CHILD: &str = "PI_RS_EDITOR_CONSOLE_SIGNAL_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::console_signal_uses_editor_state_at_delivery",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        super::EXTERNAL_EDITOR_ACTIVE.store(true, Ordering::SeqCst);
+        assert_eq!(
+            unsafe {
+                super::terminal_console_signal(windows_sys::Win32::System::Console::CTRL_C_EVENT)
+            },
+            1
+        );
+        super::EXTERNAL_EDITOR_ACTIVE.store(false, Ordering::SeqCst);
+        assert!(!crate::process::TERMINAL_INTERRUPTED.load(Ordering::SeqCst));
+        assert_eq!(
+            unsafe {
+                super::terminal_console_signal(windows_sys::Win32::System::Console::CTRL_C_EVENT)
+            },
+            1
+        );
+        assert!(crate::process::TERMINAL_INTERRUPTED.load(Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_editor_follows_shell_job_control() {
+        inherited_editor_shell_case(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_editor_follows_wrapped_shell_job_control() {
+        inherited_editor_shell_case(true);
+    }
+
+    #[cfg(unix)]
+    fn inherited_editor_shell_case(wrapped: bool) {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+        let name = if wrapped {
+            "interactive::tests::inherited_editor_follows_wrapped_shell_job_control"
+        } else {
+            "interactive::tests::inherited_editor_follows_shell_job_control"
+        };
+        const CHILD: &str = "PI_RS_INHERITED_EDITOR_SHELL";
+        if let Some(program) = std::env::var_os(CHILD) {
+            let mut editor = super::RunningExternalEditor::start(
+                program.to_str().unwrap(),
+                "draft",
+                super::ExternalEditorTarget::Main,
+            )
+            .unwrap();
+            assert_eq!(
+                unsafe { libc::getpgid(editor.child.id() as libc::pid_t) },
+                unsafe { libc::getpgrp() }
+            );
+            while editor.poll().unwrap().is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            drop(editor);
+            println!("RUNNER_FINISHED");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("editor");
+        std::fs::write(&program, "#!/bin/sh\nprintf 'EDITOR_READY\\n'\ntrap 'printf x >> \"${0}.signals\"' CONT\nwhile :; do IFS= read -r line; [ \"$line\" = finish ] && break; done\nprintf done > \"$1\"\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut command = std::process::Command::new("/bin/bash");
+        command
+            .args(["--noprofile", "--norc", "-i"])
+            .env("PS1", "PI_TEST_PROMPT> ")
+            .env("TERM", "dumb")
+            .env("HISTFILE", "/dev/null")
+            .env(CHILD, &program)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut shell = command.spawn().unwrap();
+        unsafe {
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        fn wait_for(master: &mut std::fs::File, expected: &str) -> String {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut output = Vec::new();
+            loop {
+                let mut bytes = [0; 2048];
+                if let Ok(n) = master.read(&mut bytes) {
+                    output.extend_from_slice(&bytes[..n]);
+                }
+                if output
+                    .windows(expected.len())
+                    .any(|part| part == expected.as_bytes())
+                {
+                    return String::from_utf8_lossy(&output).into_owned();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "waiting for {expected}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        wait_for(&mut master, "PI_TEST_PROMPT> ");
+        let invocation = format!(
+            "{} --exact {} --nocapture",
+            shell_words::quote(&std::env::current_exe().unwrap().to_string_lossy()),
+            name
+        );
+        if wrapped {
+            writeln!(master, "sh -c {}", shell_words::quote(&invocation)).unwrap();
+        } else {
+            writeln!(master, "{invocation}").unwrap();
+        }
+        wait_for(&mut master, "EDITOR_READY");
+        master.write_all(&[26]).unwrap();
+        let stopped = wait_for(&mut master, "PI_TEST_PROMPT> ");
+        assert!(stopped.contains("Stopped"), "{stopped}");
+        for count in 1..=2 {
+            master.write_all(b"bg\n").unwrap();
+            wait_for(&mut master, "PI_TEST_PROMPT> ");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while std::fs::read(program.with_extension("signals")).map_or(0, |v| v.len()) < count {
+                assert!(
+                    Instant::now() < deadline,
+                    "editor did not resume after bg {count}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(150));
+            master.write_all(b"jobs\n").unwrap();
+            let jobs = wait_for(&mut master, "PI_TEST_PROMPT> ");
+            assert!(jobs.contains("Stopped"), "{jobs}");
+        }
+        master.write_all(b"fg\n").unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        master.write_all(b"finish\n").unwrap();
+        let finished = wait_for(&mut master, "PI_TEST_PROMPT> ");
+        assert!(finished.contains("RUNNER_FINISHED"), "{finished}");
+        master.write_all(b"exit\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut bytes = [0; 1024];
+            let _ = master.read(&mut bytes);
+            if let Some(status) = shell.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = shell.kill();
+                let _ = shell.wait();
+                panic!("interactive shell did not exit");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_editor_orphan_group_ignores_terminal_stop() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        use std::process::Stdio;
+        const CHILD: &str = "PI_RS_INHERITED_EDITOR_ORPHAN";
+        if let Some(program) = std::env::var_os(CHILD) {
+            let mut editor = super::RunningExternalEditor::start(
+                program.to_str().unwrap(),
+                "draft",
+                super::ExternalEditorTarget::Main,
+            )
+            .unwrap();
+            assert_eq!(
+                unsafe { libc::getpgid(editor.child.id() as libc::pid_t) },
+                unsafe { libc::getpgrp() }
+            );
+            while editor.poll().unwrap().is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            drop(editor);
+            println!("RUNNER_FINISHED");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("editor");
+        std::fs::write(&program, "#!/bin/sh\ntrap '' TSTP\nprintf 'EDITOR_READY\\n'\nIFS= read -r line\nprintf done > \"$1\"\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "interactive::tests::inherited_editor_orphan_group_ignores_terminal_stop",
+                "--nocapture",
+            ])
+            .env(CHILD, &program)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        unsafe {
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut output = Vec::new();
+        let mut sent = false;
+        let status = loop {
+            let mut bytes = [0; 1024];
+            if let Ok(n) = master.read(&mut bytes) {
+                output.extend_from_slice(&bytes[..n]);
+            }
+            if !sent
+                && output
+                    .windows(b"EDITOR_READY".len())
+                    .any(|part| part == b"EDITOR_READY")
+            {
+                master.write_all(&[26]).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                master.write_all(b"finish\n").unwrap();
+                sent = true;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                // The child is the unreaped session/group leader, so its PID
+                // remains reserved while cleaning up its editor on timeout.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "orphan editor test timed out: {}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let mut bytes = [0; 1024];
+        if let Ok(n) = master.read(&mut bytes) {
+            output.extend_from_slice(&bytes[..n]);
+        }
+        assert!(
+            sent && status.success(),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(String::from_utf8_lossy(&output).contains("RUNNER_FINISHED"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_editor_receives_interrupt_without_killing_parent() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        use std::process::Stdio;
+        const CHILD: &str = "PI_RS_FOREGROUND_EDITOR_TEST";
+        if let Some(program) = std::env::var_os(CHILD) {
+            let mut baseline: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(0, &mut baseline) }, 0);
+            super::EXTERNAL_EDITOR_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+            super::install_terminal_signal(std::sync::Arc::new(tokio::sync::Notify::new()))
+                .unwrap();
+            let mut editor = super::RunningExternalEditor::start(
+                program.to_str().unwrap(),
+                "draft",
+                super::ExternalEditorTarget::Main,
+            )
+            .unwrap();
+            assert_eq!(
+                unsafe { libc::getpgid(editor.child.id() as libc::pid_t) },
+                unsafe { libc::getpgrp() }
+            );
+            let status = editor.child.wait().unwrap();
+            assert!(!status.success());
+            drop(editor);
+            let mut restored: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(0, &mut restored) }, 0);
+            assert_eq!(
+                restored.c_lflag & (libc::ECHO | libc::ICANON),
+                baseline.c_lflag & (libc::ECHO | libc::ICANON)
+            );
+            println!("PARENT_SURVIVED");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("editor");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nstty -echo -icanon\ntrap 'exit 130' INT\nprintf 'EDITOR_READY\\n'\nwhile :; do sleep 1; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "interactive::tests::foreground_editor_receives_interrupt_without_killing_parent",
+                "--nocapture",
+            ])
+            .env(CHILD, &program)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        unsafe {
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut output = Vec::new();
+        let mut sent = false;
+        let status = loop {
+            let mut bytes = [0; 1024];
+            if let Ok(n) = master.read(&mut bytes) {
+                output.extend_from_slice(&bytes[..n]);
+            }
+            if !sent
+                && output
+                    .windows(b"EDITOR_READY".len())
+                    .any(|part| part == b"EDITOR_READY")
+            {
+                master.write_all(&[3]).unwrap();
+                sent = true;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                // The child is the unreaped session/group leader, so its PID
+                // remains reserved while cleaning up its editor on timeout.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "editor test timed out: {}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let mut bytes = [0; 1024];
+        if let Ok(n) = master.read(&mut bytes) {
+            output.extend_from_slice(&bytes[..n]);
+        }
+        assert!(
+            sent && status.success(),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(String::from_utf8_lossy(&output).contains("PARENT_SURVIVED"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn running_external_editor_is_cancelled_only_by_its_request() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("editor");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf started > \"$1\"\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let mut editor = super::RunningExternalEditor::start_with_terminal(
+            program.to_str().unwrap(),
+            "draft",
+            super::ExternalEditorTarget::Extension(id),
+            None,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read(editor.file.path()).unwrap() != b"started" {
+            assert!(std::time::Instant::now() < deadline, "editor did not start");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!editor.cancelled_by(
+            &serde_json::json!({"type":"extension_ui_cancelled", "id":uuid::Uuid::new_v4()})
+        ));
+        assert!(editor.child.try_wait().unwrap().is_none());
+        assert!(
+            editor.cancelled_by(&serde_json::json!({"type":"extension_ui_cancelled", "id":id}))
+        );
+        let started = std::time::Instant::now();
+        editor.cancel();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(editor.child.try_wait().unwrap().is_some());
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn suspended_extension_editor_returns_to_dialog() {
+        let mut editor = super::RunningExternalEditor::start_with_terminal(
+            "/bin/sh -c 'kill -STOP $$'",
+            "draft",
+            super::ExternalEditorTarget::Extension(uuid::Uuid::new_v4()),
+            None,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let error = loop {
+            match editor.poll() {
+                Err(error) => break error,
+                Ok(None) => {}
+                Ok(Some(status)) => panic!("editor exited before stopping: {status}"),
+            }
+            assert!(std::time::Instant::now() < deadline, "editor did not stop");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(error.to_string().contains("External editor suspended"));
+        assert_eq!(std::fs::read(editor.file.path()).unwrap(), b"draft");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_exit_cancels_only_extension_editor_and_removes_tempfile() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("editor");
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let editor = super::RunningExternalEditor::start_with_terminal(
+            program.to_str().unwrap(),
+            "draft",
+            super::ExternalEditorTarget::Extension(id),
+            None,
+        )
+        .unwrap();
+        let pid = editor.child.id() as libc::pid_t;
+        let path = editor.file.path().to_owned();
+        let mut running = Some(editor);
+        super::cancel_running_extension_editor(
+            &mut running,
+            Some(&json!({"type":"extension_ui_cancelled", "id":uuid::Uuid::new_v4()})),
+        );
+        assert!(!running.as_ref().unwrap().cancelled);
+        super::cancel_running_extension_editor(&mut running, None);
+        assert!(running.as_ref().unwrap().cancelled);
+        assert!(running.as_mut().unwrap().poll().unwrap().is_some());
+        drop(running.take());
+        assert!(!path.exists());
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+
+        let main = super::RunningExternalEditor::start(
+            program.to_str().unwrap(),
+            "draft",
+            super::ExternalEditorTarget::Main,
+        )
+        .unwrap();
+        let mut running = Some(main);
+        super::cancel_running_extension_editor(&mut running, None);
+        assert!(!running.as_ref().unwrap().cancelled);
+    }
+
+    #[test]
+    fn external_editor_dialog_cancellation_removes_only_correlated_request() {
+        let id = uuid::Uuid::new_v4();
+        let next = uuid::Uuid::new_v4();
+        let mut view = super::View::default();
+        view.ui_request(&json!({"type":"extension_ui_request","id":id,"method":"editor","title":"Edit","prefill":"original"})).unwrap();
+        view.ui_request(
+            &json!({"type":"extension_ui_request","id":next,"method":"editor","title":"Next"}),
+        )
+        .unwrap();
+        view.dialog_mut().unwrap().external_edit(|draft| {
+            draft.replace("edited".into());
+            Ok(())
+        });
+        view.cancel_extension_dialog(&json!(id));
+        assert_eq!(view.dialogs.len(), 1);
+        assert_eq!(view.dialogs.front().unwrap().id, next);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_editor_round_trip_from_extension_dialog() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("editor");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '\\357\\273\\277dialog\\n' > \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut dialog = super::super::ui::dialog::Dialog::new(
+            uuid::Uuid::new_v4(),
+            pi_rs::UiRequest::Editor {
+                title: "Edit".into(),
+                initial_value: Some("initial".into()),
+                timeout: None,
+            },
+        );
+        dialog
+            .external_edit(|editor| super::run_external_editor(program.to_str().unwrap(), editor));
+        std::fs::write(&program, "#!/bin/sh\nprintf bad > \"$1\"\nexit 1\n").unwrap();
+        dialog
+            .external_edit(|editor| super::run_external_editor(program.to_str().unwrap(), editor));
+        let keys = super::Keys::default();
+        assert_eq!(
+            dialog.input(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                &keys
+            ),
+            Some(pi_rs::UiResponse::Text("dialog".into()))
+        );
+        assert_eq!(
+            dialog.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &keys),
+            Some(pi_rs::UiResponse::Cancelled)
+        );
+    }
+
+    #[test]
+    fn read_image_model_warning_renders_when_collapsed_or_expanded() {
+        use super::{Theme, View, json};
+        let operation_id = uuid::Uuid::new_v4();
+        let mut view = View::default();
+        view.add_tool(&pi_rs::Invocation {
+            operation_id,
+            call: pi_rs::ToolCall {
+                id: "fixture".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"image.png"}"#.into(),
+            },
+        });
+        view.finish_tool(
+            &operation_id.to_string(),
+            &pi_rs::Outcome::StructuredWithDetails {
+                attachments: vec![],
+                data: json!({"content":[{"type":"text", "text":"Read image file [image/png]"}]}),
+                details: json!({"imageUnsupportedByModel":"text-only"}),
+            },
+        );
+        let theme = Theme::system();
+        let entry = view.lines.last().unwrap();
+        for expanded in [false, true] {
+            let lines = entry.render(&theme, 96, expanded, true, Default::default());
+            assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+                span.text == "[text-only does not support images; it saw a placeholder instead]"
+                    && span.color == theme.color("warning")
+            }));
+            assert_eq!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.text.contains("Read image file")),
+                expanded
+            );
+        }
+    }
+
+    #[test]
+    fn restored_unattributed_result_renders_image_parts_when_graphics_enabled() {
+        use super::*;
+        use base64::Engine;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let initial = Session::with_store(pi_rs::MemoryStore::default()).unwrap();
+        let mut records = initial.records().to_vec();
+        records.push(pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: records[0].version,
+            id: 2,
+            parent: Some(1),
+            event: pi_rs::Event::ImportedUnattributedToolResult {
+                call_id: "reused".into(),
+                tool_name: "read".into(),
+                is_error: false,
+                details: None,
+                content: pi_rs::ContextContent::Blocks(vec![
+                    pi_rs::ContentBlock::Text {
+                        text: "before".into(),
+                        text_signature: None,
+                    },
+                    pi_rs::ContentBlock::Image {
+                        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        mime_type: "image/png".into(),
+                    },
+                    pi_rs::ContentBlock::Text {
+                        text: "after".into(),
+                        text_signature: None,
+                    },
+                ]),
+            },
+        });
+        Session::from_records(records)
+            .unwrap()
+            .export_jsonl(&path)
+            .unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = path;
+        for enabled in [true, false] {
+            let mut view = View {
+                graphics: Renderer::test_with_protocol(enabled.then_some(images::Protocol::Kitty)),
+                ..View::default()
+            };
+            view.restore(&args).unwrap();
+            let entry = view.lines.iter().find(|entry| matches!(entry, Entry::Tool { name, .. } if name.contains("unattributed"))).unwrap();
+            let Entry::Tool {
+                parts,
+                output,
+                finished,
+                ..
+            } = entry
+            else {
+                unreachable!()
+            };
+            assert!(*finished);
+            if enabled {
+                assert!(
+                    matches!(parts.as_slice(), [ToolPart::Text(a), ToolPart::Image(_), ToolPart::Text(b)] if a == "before" && b == "after")
+                );
+            } else {
+                assert!(parts.is_empty());
+                assert!(output.contains("[image · image/png]"));
+            }
+        }
+    }
+
+    #[test]
+    fn unattributed_text_block_result_displays_patch_details() {
+        let content = pi_rs::ContextContent::Blocks(vec![pi_rs::ContentBlock::Text {
+            text: "applied".into(),
+            text_signature: None,
+        }]);
+        let outcome = super::sessions::unattributed_outcome(
+            &content,
+            false,
+            &Some(serde_json::json!({"patch":"+new line"})),
+        );
+        assert_eq!(super::display_tool_result(&outcome), "applied\n+new line");
+    }
+
+    #[test]
+    fn indexed_delta_append_handles_interleaving_and_legacy_text() {
+        let mut items = std::collections::BTreeMap::new();
+        let mut combined = String::new();
+        let mut consistent = false;
+        for (index, delta, expected) in [
+            (0, "a", "a"),
+            (1, "b", "ab"),
+            (0, "c", "acb"),
+            (1, "d", "acbd"),
+        ] {
+            super::append_indexed(&mut items, &mut combined, &mut consistent, index, delta);
+            assert_eq!(combined, expected);
+        }
+        combined.push_str("legacy");
+        consistent = false;
+        super::append_indexed(&mut items, &mut combined, &mut consistent, 1, "e");
+        assert_eq!(combined, "acbde");
+    }
+    #[test]
+    fn indexed_text_finalization_keeps_item_order() {
+        let mut view = super::View::default();
+        for event in [
+            serde_json::json!({"type":"text_item_start","index":0}),
+            serde_json::json!({"type":"text_item_delta","index":0,"delta":"a"}),
+            serde_json::json!({"type":"text_item_start","index":2}),
+            serde_json::json!({"type":"text_item_delta","index":2,"delta":"b"}),
+            serde_json::json!({"type":"text_item_end","index":0,"content":"A"}),
+        ] {
+            view.receive(&event);
+        }
+        assert_eq!(view.streaming, "Ab");
+        view.settle();
+        assert!(view.text_items.is_empty());
+    }
+
+    #[test]
+    fn indexed_reasoning_finalization_replaces_streamed_text() {
+        let mut view = super::View::default();
+        for event in [
+            serde_json::json!({"type":"reasoning_item_start","index":0}),
+            serde_json::json!({"type":"reasoning_delta","reasoningIndex":0,"delta":"raw"}),
+            serde_json::json!({"type":"reasoning_delta","reasoningIndex":0,"delta":"summary"}),
+            serde_json::json!({"type":"reasoning_item_end","index":0,"content":"summary"}),
+            serde_json::json!({"type":"reasoning_item_start","index":2}),
+            serde_json::json!({"type":"reasoning_item_end","index":2,"content":"other"}),
+        ] {
+            view.receive(&event);
+        }
+        assert_eq!(view.thinking, "summaryother");
+        view.settle();
+        assert!(view.thinking_items.is_empty());
+    }
+
+    #[test]
+    fn markdown_rendering_uses_restored_metadata_and_rejects_stale_stream_chunks() {
+        use crate::ui::render::{Entry, TranscriptMarkdown};
+
+        assert_eq!(
+            super::markdown_input("\u{feff}", pi_rs::MarkdownMessageType::Assistant),
+            None
+        );
+        assert_eq!(
+            super::markdown_input("\u{0085}", pi_rs::MarkdownMessageType::Assistant),
+            Some("\u{0085}")
+        );
+        assert_eq!(
+            super::markdown_input("  ", pi_rs::MarkdownMessageType::User),
+            Some("  ")
+        );
+        let mut view = super::View::default();
+        view.lines.push(Entry::user_markdown(TranscriptMarkdown {
+            record: Some((24, Some("2026-11-21T07:00:00Z".into()))),
+            .."<skill name=\"tool\" location=\"SKILL.md\">\ninstructions\n</skill>\n\nOriginal prompt".into()
+        }));
+        let (target, context, original) = view.markdown_candidate(32).unwrap();
+        assert_eq!(original, "Original prompt");
+        assert_eq!(context.message_type, pi_rs::MarkdownMessageType::User);
+        assert!(!context.is_streaming);
+        assert_eq!(context.message_id, Some(24));
+        assert_eq!(context.timestamp.as_deref(), Some("2026-11-21T07:00:00Z"));
+        let request = uuid::Uuid::new_v4();
+        view.markdown_pending = Some(super::MarkdownPending {
+            request,
+            target,
+            context,
+            original,
+        });
+        assert!(view.receive_markdown_transform(&serde_json::json!({
+            "id": request, "transformed": "Display text"
+        })));
+        let (_, markdown) = view.lines[0].markdown(false).unwrap();
+        assert_eq!(markdown.original, "Original prompt");
+        assert_eq!(markdown.rendering, Some((32, Some("Display text".into()))));
+        assert!(view.markdown_candidate(32).is_none());
+        assert_eq!(view.markdown_candidate(80).unwrap().1.available_width, 80);
+
+        view.streaming = "partial".into();
+        let (target, context, original) = view.markdown_candidate(32).unwrap();
+        assert_eq!(context.message_type, pi_rs::MarkdownMessageType::Assistant);
+        assert!(context.is_streaming);
+        assert_eq!(context.message_id, None);
+        assert_eq!(context.timestamp, None);
+        view.markdown_pending = Some(super::MarkdownPending {
+            request,
+            target,
+            context,
+            original,
+        });
+        view.streaming.push_str(" text");
+        assert!(!view.receive_markdown_transform(&serde_json::json!({
+            "id": request, "transformed": "Stale"
+        })));
+        assert_eq!(view.markdown_candidate(32).unwrap().2, "partial text");
+    }
+
+    #[test]
+    fn thinking_visibility_overrides_survive_settle_and_reset_globally() {
+        use crate::ui::render::Entry;
+        let mut view = super::View::default();
+        view.lines.push(Entry::Thinking {
+            text: "first".into(),
+            expanded: None,
+        });
+        view.lines.push(Entry::Thinking {
+            text: "second".into(),
+            expanded: None,
+        });
+        *view
+            .panel_expansion(super::TranscriptPanel::Thinking(0))
+            .unwrap() = Some(false);
+        assert!(matches!(
+            &view.lines[0],
+            Entry::Thinking {
+                expanded: Some(false),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &view.lines[1],
+            Entry::Thinking { expanded: None, .. }
+        ));
+        view.thinking = "streamed".into();
+        *view
+            .panel_expansion(super::TranscriptPanel::StreamingThinking)
+            .unwrap() = Some(false);
+        view.settle();
+        assert!(
+            matches!(&view.lines[2], Entry::Thinking { text, expanded: Some(false) } if text.original == "streamed")
+        );
+        assert!(
+            view.panel_expansion(super::TranscriptPanel::StreamingThinking)
+                .is_none()
+        );
+        view.set_hide_thinking(true);
+        assert!(view.hide_thinking);
+        assert!(
+            view.lines
+                .iter()
+                .all(|e| matches!(e, Entry::Thinking { expanded: None, .. }))
+        );
+        assert!(view.thinking_expanded.is_none());
+    }
+
+    #[test]
+    fn thinking_mouse_click_toggles_only_the_pressed_panel() {
+        use crate::ui::render::Entry;
+        use clap::Parser;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let args = super::Cli::parse_from(["pi"]);
+        let mut view = super::View::default();
+        view.lines.push(Entry::Thinking {
+            text: "first".into(),
+            expanded: None,
+        });
+        view.lines.push(Entry::Thinking {
+            text: "second".into(),
+            expanded: None,
+        });
+        view.panel_rows
+            .push((2..3, super::TranscriptPanel::Thinking(0)));
+        view.panel_rows
+            .push((4..5, super::TranscriptPanel::Thinking(1)));
+        let event = |kind, row| MouseEvent {
+            kind,
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        view.fullscreen_mouse(event(MouseEventKind::Down(MouseButton::Left), 2), &args);
+        view.fullscreen_mouse(event(MouseEventKind::Up(MouseButton::Left), 2), &args);
+        assert!(matches!(
+            &view.lines[0],
+            Entry::Thinking {
+                expanded: Some(false),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &view.lines[1],
+            Entry::Thinking { expanded: None, .. }
+        ));
+        view.fullscreen_mouse(event(MouseEventKind::Down(MouseButton::Left), 4), &args);
+        view.fullscreen_mouse(event(MouseEventKind::Drag(MouseButton::Left), 5), &args);
+        view.fullscreen_mouse(event(MouseEventKind::Up(MouseButton::Left), 5), &args);
+        assert!(matches!(
+            &view.lines[1],
+            Entry::Thinking { expanded: None, .. }
+        ));
+        view.set_hide_thinking(true);
+        view.fullscreen_mouse(event(MouseEventKind::Down(MouseButton::Left), 4), &args);
+        view.fullscreen_mouse(event(MouseEventKind::Up(MouseButton::Left), 4), &args);
+        assert!(matches!(
+            &view.lines[1],
+            Entry::Thinking {
+                expanded: Some(true),
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn external_editor_selects_first_nonempty_command() {
+        assert_eq!(
+            super::external_editor_command(
+                Some("  \u{feff}"),
+                Some("visual --wait"),
+                Some("editor")
+            ),
+            "visual --wait"
+        );
+        assert_eq!(
+            super::external_editor_command(
+                Some("configured --wait"),
+                Some("visual"),
+                Some("editor")
+            ),
+            "configured --wait"
+        );
+        assert_eq!(
+            super::external_editor_command(None, Some(""), Some("editor")),
+            "editor"
+        );
+        assert_eq!(
+            super::external_editor_command(None, Some(""), Some("")),
+            if cfg!(windows) { "notepad" } else { "nano" }
+        );
+        assert_eq!(
+            super::external_editor_command(Some("\u{0085}"), None, None),
+            "\u{0085}"
+        );
+    }
+
+    #[test]
+    fn external_editor_strips_one_bom_and_one_final_lf() {
+        assert_eq!(
+            super::external_editor_text(b"\xef\xbb\xbfprompt\n\n"),
+            "prompt\n"
+        );
+        assert_eq!(super::external_editor_text(b"prompt\r\n"), "prompt\r");
+        assert_eq!(
+            super::external_editor_text(b"\xef\xbb\xbf\xef\xbb\xbftext"),
+            "\u{feff}text"
+        );
+        assert_eq!(super::external_editor_text(b"bad\xff\n"), "bad\u{fffd}");
+        assert_eq!(super::external_editor_text(b""), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_editor_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = super::external_editor_directory().unwrap();
+        let mode = std::fs::metadata(directory.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_editor_round_trip_updates_only_after_success() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("editor");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '\\357\\273\\277edited\\n\\n' > \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut editor = super::Editor::default();
+        editor.replace("original".into());
+        super::run_external_editor(program.to_str().unwrap(), &mut editor).unwrap();
+        assert_eq!(editor.text, "edited\n");
+        assert_eq!(editor.cursor, editor.text.len());
+        std::fs::write(&program, "#!/bin/sh\nprintf corrupted > \"$1\"\nexit 1\n").unwrap();
+        assert!(super::run_external_editor(program.to_str().unwrap(), &mut editor).is_err());
+        assert_eq!(editor.text, "edited\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn external_editor_allows_exclusive_open_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("editor test.ps1");
+        let marker = dir.path().join("draft-path.txt");
+        let command = format!(
+            "powershell.exe -NoProfile -NonInteractive -File \"{}\" \"{}\"",
+            script.display(),
+            marker.display()
+        );
+        let mut editor = super::Editor::default();
+        editor.replace("original".into());
+        for (exit, replacement) in [(0, "edited"), (1, "corrupted")] {
+            std::fs::write(
+                &script,
+                format!(
+                    r#"param([string]$marker, [string]$draft)
+$ErrorActionPreference = 'Stop'
+[System.IO.File]::WriteAllText($marker, $draft)
+$file = [System.IO.File]::Open($draft, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+try {{
+    $file.SetLength(0)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes("{replacement}`n")
+    $file.Write($bytes, 0, $bytes.Length)
+}} finally {{ $file.Dispose() }}
+exit {exit}
+"#
+                ),
+            )
+            .unwrap();
+            let result = super::run_external_editor(&command, &mut editor);
+            assert_eq!(result.is_ok(), exit == 0);
+            assert_eq!(editor.text, "edited");
+            let path = std::path::PathBuf::from(std::fs::read_to_string(&marker).unwrap());
+            assert!(!path.exists(), "temporary draft survived editor exit");
+            assert!(
+                !path.parent().unwrap().exists(),
+                "temporary directory survived editor exit"
+            );
+        }
+    }
+
+    #[test]
+    fn live_frame_flushes_text_before_console_side_effects() {
+        use std::io::Write;
+        let output = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        struct Sink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut frame = super::FrameWriter::new(Sink(output.clone()), false, true).unwrap();
+        write!(frame, "preceding text").unwrap();
+        // Crossterm flushes the writer immediately before a WinAPI command.
+        frame.flush().unwrap();
+        assert!(output.borrow().ends_with(b"preceding text"));
+        frame.finish().unwrap();
+        assert!(output.borrow().ends_with(b"\x1b[?2026l"));
+    }
+
+    #[test]
+    fn frame_without_ansi_never_emits_synchronization_sequences() {
+        use std::io::Write;
+        let mut output = Vec::new();
+        {
+            let mut frame = super::FrameWriter::new(&mut output, false, false).unwrap();
+            write!(frame, "first").unwrap();
+            frame.flush().unwrap();
+            write!(frame, "second").unwrap();
+            frame.finish().unwrap();
+        }
+        assert_eq!(output, b"firstsecond");
+        {
+            let mut frame = super::FrameWriter::new(&mut output, false, false).unwrap();
+            write!(frame, "aborted").unwrap();
+        }
+        assert_eq!(output, b"firstsecondaborted");
+    }
+
+    #[test]
+    fn failed_frame_write_attempts_to_end_synchronized_update() {
+        use std::io::Write;
+        for buffered in [false, true] {
+            let output = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            struct FailOnce {
+                output: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+                remaining: usize,
+                failed: bool,
+            }
+            impl Write for FailOnce {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    if self.remaining == 0 && !self.failed {
+                        self.failed = true;
+                        return Err(std::io::Error::other("injected write failure"));
+                    }
+                    let count = if self.failed {
+                        bytes.len()
+                    } else {
+                        bytes.len().min(self.remaining)
+                    };
+                    self.output.borrow_mut().extend_from_slice(&bytes[..count]);
+                    self.remaining = self.remaining.saturating_sub(count);
+                    Ok(count)
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut frame = super::FrameWriter::new(
+                FailOnce {
+                    output: output.clone(),
+                    remaining: 10,
+                    failed: false,
+                },
+                buffered,
+                true,
+            )
+            .unwrap();
+            let result = write!(frame, "some frame content").and_then(|()| frame.finish());
+            assert!(result.is_err());
+            let bytes = output.borrow();
+            assert!(bytes.starts_with(b"\x1b[?2026h"));
+            assert!(bytes.ends_with(b"\x1b[?2026l"));
+        }
+    }
+
+    #[test]
+    fn cancelled_logout_reload_keeps_removed_key_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        let held = super::super::auth_lock::acquire(&path).unwrap();
+        let endpoint = super::super::Provider::named("openrouter")
+            .unwrap()
+            .default_endpoint();
+        let mut keys = super::super::model_auth::Keys::parse(&serde_json::json!({
+            "openrouter": {"type":"oauth", "access":"old", "endpoint":endpoint}
+        }));
+        assert!(
+            keys.operation_credential("openrouter", endpoint, true)
+                .is_some()
+        );
+        keys.forget("openrouter");
+        let reload = super::AuthReload::start_path(keys.revision().to_owned(), path);
+        assert!(
+            reload
+                .receiver
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_err()
+        );
+        drop(reload);
+        drop(held);
+        assert!(
+            keys.operation_credential("openrouter", endpoint, true)
+                .is_none()
+        );
+    }
+
+    fn chatgpt_logout_fixture(directory: &std::path::Path) {
+        let credential = pi_rs::openai::oauth::Credential {
+            client_id: "client".into(),
+            subject: "subject".into(),
+            email: None,
+            id_token: "id".into(),
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: 4_000_000_000,
+            scopes: vec!["chatgpt.tokens.use.direct".into()],
+        };
+        std::fs::write(
+            directory.join("auth.json"),
+            serde_json::json!({"openai-chatgpt":{"type":"oauth","credential":credential}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("chatgpt-sessions.json"),
+            serde_json::json!({"client":credential}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn device_code_action_is_one_shot_and_cancelled_with_its_task() {
+        let keys = super::Keys::default();
+        let enter = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let other = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let make_task = || {
+            super::RemoteTask::start("Signing in to xAI", "xAI login cancelled", |_| async {
+                std::future::pending::<pi_rs::Result<Vec<String>>>().await
+            })
+        };
+        let mut task = make_task();
+        task.device_code = Some(("https://auth.x.ai/activate".into(), "CODE".into()));
+        let mut view = super::View {
+            remote_task: Some(task),
+            ..Default::default()
+        };
+        assert!(super::take_device_code_action(&mut view, other, &keys).is_none());
+        let (url, code) = super::take_device_code_action(&mut view, enter, &keys).unwrap();
+        assert_eq!(url, "https://auth.x.ai/activate");
+        assert_eq!(code, "CODE");
+        assert!(super::take_device_code_action(&mut view, enter, &keys).is_none());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        view.remote_task.as_mut().unwrap().device_copy = Some(receiver);
+        super::interrupt_remote_task(&mut view);
+        assert!(view.remote_task.is_none());
+        assert!(
+            sender.send(true).is_err(),
+            "late clipboard results must not reach another login"
+        );
+        assert!(super::take_device_code_action(&mut view, enter, &keys).is_none());
+
+        let mut task = make_task();
+        task.device_code = Some(("https://auth.x.ai/activate".into(), "OTHER".into()));
+        view.remote_task = Some(task);
+        super::interrupt_remote_task(&mut view);
+        assert!(
+            super::take_device_code_action(&mut view, enter, &keys).is_none(),
+            "cancellation discards an unused action"
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_device_side_effects_stop_on_cancel_and_login_replacement() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let make_task = || {
+            super::RemoteTask::start("Signing in to xAI", "xAI login cancelled", |_| async {
+                std::future::pending::<pi_rs::Result<Vec<String>>>().await
+            })
+        };
+        for replace in [false, true] {
+            let mut view = super::View {
+                remote_task: Some(make_task()),
+                ..Default::default()
+            };
+            let cancel = view.remote_task.as_ref().unwrap().device_cancel.clone();
+            let effects = Arc::new(AtomicUsize::new(0));
+            let mut releases = Vec::new();
+            let mut started = Vec::new();
+            let mut jobs = Vec::new();
+            for _ in 0..2 {
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                releases.push(release_tx);
+                started.push(started_rx);
+                let effects = effects.clone();
+                jobs.push(tokio::spawn(super::run_device_side_effect(
+                    cancel.clone(),
+                    async move {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                        effects.fetch_add(1, Ordering::SeqCst);
+                    },
+                )));
+            }
+            for ready in started {
+                ready.await.unwrap();
+            }
+            if replace {
+                view.remote_task = Some(make_task());
+            } else {
+                super::interrupt_remote_task(&mut view);
+            }
+            for release in releases {
+                let _ = release.send(());
+            }
+            for job in jobs {
+                assert!(job.await.unwrap().is_none());
+            }
+            assert_eq!(effects.load(Ordering::SeqCst), 0);
+            if replace {
+                assert!(view.remote_task.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_meta_login_commit_remains_observed_after_escape() {
+        use super::super::meta_auth::{Credential, LoginControl};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let control = LoginControl::default();
+        let worker_control = control.clone();
+        let worker_path = path.clone();
+        let mut task = super::RemoteTask::start(
+            "Signing in to Meta",
+            "Meta login cancelled",
+            move |_| async move {
+                super::super::meta_auth::save_login(
+                    &worker_path,
+                    None,
+                    Credential {
+                        kind: "oauth".into(),
+                        access: "key".into(),
+                        refresh: "identity".into(),
+                        expires: 1,
+                    },
+                    worker_control,
+                )
+                .await?;
+                Ok(vec!["Signed in to Meta".into()])
+            },
+        );
+        task.meta_login_control = Some(control.clone());
+        let mut view = super::View {
+            remote_task: Some(task),
+            ..Default::default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !control.is_committing() {
+            assert!(std::time::Instant::now() < deadline, "commit never started");
+            std::thread::yield_now();
+        }
+        super::interrupt_remote_task(&mut view);
+        let task = view
+            .remote_task
+            .take()
+            .expect("commit must remain observed");
+        assert!(
+            task.receiver.try_recv().is_err(),
+            "save must still be blocked"
+        );
+        lock.unlock().unwrap();
+        assert!(matches!(
+            task.receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            super::RemoteEvent::Finished(Ok(_))
+        ));
+        let auth: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(auth["meta"]["access"], "key");
+    }
+
+    #[test]
+    fn committed_chatgpt_logout_remains_observed_after_escape() {
+        for success in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            chatgpt_logout_fixture(directory.path());
+            let path = directory.path().to_owned();
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path.join("chatgpt-refresh.lock"))
+                .unwrap();
+            lock.lock().unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let session_lock_path = path.join("chatgpt-sessions.lock");
+            let control = super::super::chatgpt_auth::LogoutControl::default();
+            let task = super::chatgpt_logout_task(control, move |control| async move {
+                super::super::chatgpt_auth::logout_with_cleanup_hook(
+                    path,
+                    lock,
+                    control,
+                    move |_| async move {
+                        started_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        if success {
+                            Ok(())
+                        } else {
+                            Err(pi_rs::Error::Config("fixture failure".into()))
+                        }
+                    },
+                    move || {
+                        let probe = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(session_lock_path)
+                            .unwrap();
+                        let blocked =
+                            matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+                        cleanup_tx.send(blocked).unwrap();
+                    },
+                )
+                .await
+            });
+            let mut view = super::View {
+                remote_task: Some(task),
+                ..Default::default()
+            };
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            super::interrupt_remote_task(&mut view);
+            assert!(
+                view.remote_task.is_some(),
+                "committed logout must remain observed"
+            );
+            // Hold the session-store lock so the post-revocation cleanup is
+            // deterministically still in progress when the gate is released.
+            let session_lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(directory.path().join("chatgpt-sessions.lock"))
+                .unwrap();
+            session_lock.lock().unwrap();
+            release_tx.send(()).unwrap();
+            assert!(
+                cleanup_rx
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap(),
+                "cleanup did not encounter the held session-store lock"
+            );
+            // `started_rx` means logout already owns the auth lock. Reading
+            // through that lock waits for durable local removal, keeping slow
+            // filesystem syncs outside the event-delivery deadline below.
+            assert!(matches!(
+                view.remote_task.as_ref().unwrap().receiver.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            drop(session_lock);
+            let auth =
+                super::super::config::read_object(&directory.path().join("auth.json")).unwrap();
+            assert!(auth.get("openai-chatgpt").is_none());
+            let task = view.remote_task.take().unwrap();
+            assert!(matches!(
+                task.receiver
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap(),
+                super::RemoteEvent::ForgetModelKey("openai-chatgpt")
+            ));
+            assert!(matches!(
+                task.receiver
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap(),
+                super::RemoteEvent::RefreshModelKeys
+            ));
+            match task
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap()
+            {
+                super::RemoteEvent::Finished(Ok(lines)) if success => {
+                    assert!(lines.iter().any(|line| line.contains("Signed out")))
+                }
+                super::RemoteEvent::Finished(Err(error)) if !success => assert!(
+                    error
+                        .to_string()
+                        .contains("remote revocation was not confirmed")
+                ),
+                _ => panic!("logout did not report its final result"),
+            }
+            let auth =
+                super::super::config::read_object(&directory.path().join("auth.json")).unwrap();
+            assert!(auth.get("openai-chatgpt").is_none());
+        }
+    }
+
+    #[test]
+    fn uncommitted_chatgpt_logout_is_cancelled_by_escape() {
+        let directory = tempfile::tempdir().unwrap();
+        chatgpt_logout_fixture(directory.path());
+        let path = directory.path().to_owned();
+        let shared = super::super::auth_lock::acquire(&path.join("auth.json")).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.join("chatgpt-refresh.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let control = super::super::chatgpt_auth::LogoutControl::default();
+        let task = super::chatgpt_logout_task(control, move |control| async move {
+            super::super::chatgpt_auth::logout_with(path, lock, control, move |_| async move {
+                let _ = started_tx.send(());
+                Ok(())
+            })
+            .await
+        });
+        let mut view = super::View {
+            remote_task: Some(task),
+            ..Default::default()
+        };
+        super::interrupt_remote_task(&mut view);
+        assert!(view.remote_task.is_none());
+        drop(shared);
+        assert!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_err()
+        );
+        let auth = super::super::config::read_object(&directory.path().join("auth.json")).unwrap();
+        assert!(auth.get("openai-chatgpt").is_some());
+    }
+
+    #[test]
+    fn pending_share_keeps_extension_dialog_and_response_correlated() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let share_id = uuid::Uuid::new_v4();
+        let ui_id = uuid::Uuid::new_v4();
+        let mut view = super::View {
+            pending_share: Some(super::PendingShare {
+                id: share_id,
+                destination: super::sessions::ShareDestination::Gist,
+                path: Default::default(),
+                workspace: Default::default(),
+                started: std::time::Instant::now(),
+            }),
+            ..Default::default()
+        };
+        assert!(view.share_blocks_input());
+        assert!(view.take_share_response(&json!({"type":"response","command":"get_share_context","id":uuid::Uuid::new_v4(),"success":true})).is_none());
+        assert!(view.ui_request(&json!({"type":"extension_ui_request","id":ui_id,"method":"input","title":"Startup question"})).unwrap().is_none());
+        assert!(!view.share_blocks_input());
+        let dialog = view.dialogs.front_mut().unwrap();
+        assert_eq!(dialog.id, ui_id);
+        dialog.paste("answer");
+        let response = dialog.input(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &super::Keys::default(),
+        );
+        assert!(matches!(response, Some(pi_rs::UiResponse::Text(value)) if value == "answer"));
+        view.dialogs.pop_front();
+        assert!(view.share_blocks_input());
+        let (pending, snapshot) = view.take_share_response(&json!({"type":"response","command":"get_share_context","id":share_id,"success":false})).unwrap();
+        assert_eq!(pending.id, share_id);
+        assert!(snapshot.is_none());
+        assert!(view.pending_share.is_none());
+    }
+
+    #[test]
+    fn thinking_level_typeahead_waits_for_discovery_and_escape_discards_it() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use std::collections::VecDeque;
+        let mut pending = VecDeque::new();
+        let typed = [
+            Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE)),
+            Event::Paste("lear".into()),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ];
+        for event in &typed {
+            assert!(super::buffer_thinking_level_input(
+                &mut pending,
+                event,
+                false
+            ));
+        }
+        assert_eq!(pending.iter().cloned().collect::<Vec<_>>(), typed);
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, true, false, false),
+            None
+        );
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, true, true),
+            None
+        );
+        for event in &typed {
+            assert_eq!(
+                super::next_thinking_level_input(&mut pending, false, true, false),
+                Some(event.clone())
+            );
+        }
+        assert!(super::buffer_thinking_level_input(
+            &mut pending,
+            &typed[0],
+            false
+        ));
+        let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!super::buffer_thinking_level_input(
+            &mut pending,
+            &escape,
+            true
+        ));
+        assert!(pending.is_empty());
+        assert!(super::buffer_thinking_level_input(
+            &mut pending,
+            &typed[0],
+            false
+        ));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(super::Keys::default().matches("tui.select.cancel", ctrl_c));
+        assert!(!super::buffer_thinking_level_input(
+            &mut pending,
+            &Event::Key(ctrl_c),
+            true
+        ));
+        assert!(pending.is_empty());
+        assert!(!super::buffer_thinking_level_input(
+            &mut pending,
+            &Event::Resize(80, 24),
+            false
+        ));
+    }
+
+    #[test]
+    fn thinking_typeahead_does_not_escape_an_abandoned_picker() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use std::collections::VecDeque;
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let extra = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let mut pending = VecDeque::from([enter.clone(), extra.clone()]);
+        // Enter selects a level and closes the level picker.
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, true, false),
+            Some(enter)
+        );
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, false, false),
+            None
+        );
+        assert!(pending.is_empty());
+        // A new picker must never receive input left by a cancelled discovery.
+        pending.push_back(extra);
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, false, false),
+            None
+        );
+        assert_eq!(
+            super::next_thinking_level_input(&mut pending, false, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_dequeue_reports_empty_and_restored_queues_without_losing_draft() {
+        let mut view = View::default();
+        view.editor.replace("draft".to_owned());
+        view.editor.cursor = 2;
+
+        let empty = uuid::Uuid::new_v4();
+        let restored = uuid::Uuid::new_v4();
+        view.queue_restores.insert(empty, true);
+        view.queue_restores.insert(restored, true);
+        view.complete_queue_restore(
+            json!({"id":empty,"success":true,"data":{"messages":[]}}),
+            Some(TuiMode::Fullscreen),
+        );
+
+        assert_eq!(view.editor.text, "draft");
+        assert_eq!(view.editor.cursor, 2);
+        assert!(matches!(
+            view.lines.last(),
+            Some(Entry::Status(text)) if text == "No queued messages to restore"
+        ));
+
+        let image = pi_rs::ImageContent {
+            data: "AA==".into(),
+            mime_type: "image/png".into(),
+        };
+        let message = |kind, content: &str, images| pi_rs::QueuedMessage {
+            input: pi_rs::QueuedInput {
+                id: uuid::Uuid::new_v4(),
+                kind,
+                content: content.to_owned(),
+            },
+            images,
+        };
+        let messages = [
+            message(pi_rs::InputKind::FollowUp, "follow-up", vec![]),
+            message(pi_rs::InputKind::Steer, "steer", vec![image.clone()]),
+        ];
+        view.complete_queue_restore(
+            json!({"id":restored,"success":true,"data":{"messages":messages}}),
+            Some(TuiMode::Fullscreen),
+        );
+        assert_eq!(view.editor.text, "steer\n\nfollow-up\n\ndraft");
+        assert_eq!(view.draft_images, [image]);
+        assert!(view.queue_restores.is_empty());
+        assert!(matches!(
+            view.lines.as_slice(),
+            [Entry::Status(text)] if text == "Restored 2 queued messages to editor"
+        ));
+    }
+
+    #[test]
+    fn queued_escape_wins_over_ready_new_session() {
+        use clap::Parser;
+        use std::collections::VecDeque;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new.jsonl");
+        let mut next = super::Cli::parse_from(["pi"]);
+        next.session = path.clone();
+        next.session_transition = Some(pi_rs::SessionStartReason::New);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(Ok::<_, pi_rs::Error>(next)).unwrap();
+        let ready = receiver.try_recv().unwrap().unwrap();
+        let mut input = VecDeque::from([crate::ui::input::InputEvent::Event(
+            crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+        )]);
+        let mut preserved = VecDeque::new();
+        let cancelled =
+            super::queued_transition_cancel(&mut preserved, |_| Ok(input.pop_front())).unwrap();
+        if !cancelled {
+            super::apply_session(
+                &mut super::Cli::parse_from(["pi"]),
+                &mut super::View::default(),
+                ready,
+            )
+            .unwrap();
+        }
+        assert!(cancelled);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cancelled_new_session_does_not_create_a_journal_after_discovery() {
+        use clap::Parser;
+        use std::io::{Read, Write};
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("work");
+        std::fs::create_dir_all(workspace.join(".pi")).unwrap();
+        std::fs::write(
+            workspace.join(".pi/settings.json"),
+            r#"{"enabledModels":["ollama/dynamic"]}"#,
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (accepted, ready) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0; 2048];
+            let _ = socket.read(&mut buf).unwrap();
+            accepted.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(5)).unwrap();
+            let body = r#"{"data":[{"id":"dynamic"}]}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.workspace = workspace.clone();
+        args.session = root.path().join("current.jsonl");
+        args.session_dir = Some(root.path().join("sessions"));
+        args.trust = true;
+        args.settings = super::super::config::Settings::load(&workspace, true).unwrap();
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{"ollama":{"baseUrl":endpoint,"models":[{"id":"alpha"}]}}})).unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        args.selection_discovery_pending = true;
+        let mut view = super::View {
+            async_transitions: true,
+            ..Default::default()
+        };
+        super::slash("/new", &mut args, &mut view, None).unwrap();
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        let cancelled = view.pending_transition.take().unwrap();
+        release.send(()).unwrap();
+        let prepared = cancelled
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert!(!prepared.session.exists());
+        assert!(!root.path().join("sessions").exists());
+        assert_eq!(args.session, root.path().join("current.jsonl"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn interactive_workspace_switch_prepares_in_background_before_applying_scope() {
+        use clap::Parser;
+        use std::io::{Read, Write};
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let launch = root.path().join("launch");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(target.join(".pi")).unwrap();
+        std::fs::write(
+            target.join(".pi/settings.json"),
+            r#"{"enabledModels":["ollama/dynamic"]}"#,
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (accepted, ready) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0; 2048];
+            let _ = socket.read(&mut buf).unwrap();
+            accepted.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(10)).unwrap();
+            let body = r#"{"data":[{"id":"dynamic"}]}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let path = root.path().join("target.jsonl");
+        pi_rs::Session::open(&path)
+            .unwrap()
+            .set_working_directory(&target)
+            .unwrap();
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.workspace = launch;
+        args.session = root.path().join("launch.jsonl");
+        args.trust = true;
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&serde_json::json!({"providers":{"ollama":{"baseUrl":endpoint,"models":[{"id":"alpha"}]}}})).unwrap();
+        args.endpoint = args
+            .model_profiles
+            .endpoint(&super::super::Provider::Ollama)
+            .into();
+        args.model = "alpha".into();
+        args.remember_initial_selection();
+        let mut view = super::View {
+            async_transitions: true,
+            ..Default::default()
+        };
+        super::switch_session(&mut args, &mut view, path.clone()).unwrap();
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(args.model, "alpha");
+        assert_ne!(args.session, path);
+        assert!(matches!(
+            view.pending_transition.as_ref().unwrap().try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        let next = view
+            .pending_transition
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        super::apply_session(&mut args, &mut view, next).unwrap();
+        assert_eq!(args.session, path);
+        assert_eq!(args.model, "dynamic");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn startup_loads_saved_workspace_settings_before_recording_selection() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let launch = directory.path().join("launch");
+        let target = directory.path().join("target");
+        for (path, level) in [(&launch, "low"), (&target, "high")] {
+            std::fs::create_dir_all(path.join(".pi")).unwrap();
+            std::fs::write(
+                path.join(".pi/settings.json"),
+                format!(r#"{{"defaultThinkingLevel":"{level}"}}"#),
+            )
+            .unwrap();
+        }
+        let session_path = directory.path().join("session.jsonl");
+        let mut session = pi_rs::Session::open(&session_path).unwrap();
+        session.set_working_directory(&target).unwrap();
+        drop(session);
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.session = session_path.clone();
+        args.workspace = launch.clone();
+        args.settings = super::super::config::Settings::load(&launch, true).unwrap();
+        args.trust = true;
+        args.model = "fixture".into();
+        args.thinking = Some("low".into());
+        args.remember_initial_selection();
+        super::prepare_initial_session(&mut args).unwrap();
+        assert_eq!(
+            args.workspace.canonicalize().unwrap(),
+            target.canonicalize().unwrap()
+        );
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+        let session = pi_rs::Session::open(&session_path).unwrap();
+        assert_eq!(
+            session.model_selection(),
+            Some(("fixture".into(), Some("high".into())))
+        );
+    }
+    #[test]
+    fn imported_branch_checkout_fork_and_switch_restore_selection() {
+        use clap::Parser;
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("pi.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"model_change","id":"a","parentId":null,"provider":"ollama","modelId":"model-a"}),
+            json!({"type":"message","id":"u1","parentId":"a","message":{"role":"user","content":"first"}}),
+            json!({"type":"message","id":"b","parentId":"u1","message":{"role":"assistant","provider":"ollama","model":"model-b","content":[]}}),
+            json!({"type":"message","id":"u2","parentId":"b","message":{"role":"user","content":"second"}}),
+        ];
+        std::fs::write(
+            &source,
+            entries.iter().map(|e| format!("{e}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let first = imported
+            .records()
+            .iter()
+            .find(|r| matches!(&r.event, pi_rs::Event::User { content, .. } if content == "first"))
+            .unwrap()
+            .id;
+        let second = imported
+            .records()
+            .iter()
+            .find(|r| matches!(&r.event, pi_rs::Event::User { content, .. } if content == "second"))
+            .unwrap()
+            .id;
+        let session_path = directory.path().join("native.jsonl");
+        imported.export_jsonl(&session_path).unwrap();
+
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.workspace = directory.path().into();
+        args.session_dir = Some(directory.path().into());
+        args.session = session_path;
+        args.model = "initial".into();
+        args.discovered_models = vec![
+            ("ollama".into(), "model-a".into()),
+            ("ollama".into(), "model-b".into()),
+        ];
+        args.no_trust = true;
+        args.remember_initial_selection();
+        let mut view = super::View::default();
+        super::slash(&format!("/checkout {second}"), &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "model-b");
+        super::slash(&format!("/checkout {first}"), &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "model-a");
+        super::slash(&format!("/checkout {second}"), &mut args, &mut view, None).unwrap();
+        super::slash(&format!("/fork {first}"), &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "model-a");
+
+        let invalid_source = directory.path().join("invalid-pi.jsonl");
+        let invalid = [
+            json!({"type":"session","version":3}),
+            json!({"type":"thinking_level_change","id":"t","parentId":null,"thinkingLevel":"high"}),
+            json!({"type":"message","id":"m","parentId":"t","message":{"role":"assistant","model":"missing-provider","content":[]}}),
+        ];
+        std::fs::write(
+            &invalid_source,
+            invalid.iter().map(|e| format!("{e}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let invalid_session = directory.path().join("invalid-native.jsonl");
+        super::super::session_import::read(&invalid_source)
+            .unwrap()
+            .export_jsonl(&invalid_session)
+            .unwrap();
+        super::switch_session(&mut args, &mut view, invalid_session).unwrap();
+        assert_eq!(args.model, "initial");
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+    }
+    #[test]
+    fn prompt_completion_displays_argument_hint_without_inserting_it() {
+        use super::*;
+        use clap::Parser;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let directory = tempfile::tempdir().unwrap();
+        let prompts = directory.path().join("prompts");
+        std::fs::create_dir(&prompts).unwrap();
+        std::fs::write(
+            prompts.join("audit.md"),
+            "---\ndescription: Inspect changes\nargument-hint: |-\n  <path>\n  [focus]\n---\nReview $1",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("author.md"), "Write text").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-prompt-templates",
+            "--prompt-template",
+            prompts.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let mut view = View {
+            resources: super::super::resources::Resources::load(&args).unwrap(),
+            ..View::default()
+        };
+        view.editor.replace("/au".into());
+        complete_input(&args, &mut view);
+        let picker = view.picker.as_mut().expect("multiple matching commands");
+        let keys = crate::ui::keys::Keys::default();
+        let lines = picker.render(&crate::ui::theme::Theme::system(), 100, 20, &keys);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+        assert!(
+            rendered.contains("<path> [focus] — Inspect changes"),
+            "{rendered}"
+        );
+        let input = picker.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys);
+        assert!(
+            matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, .. }) if text == "/audit")
+        );
+    }
+
+    #[test]
+    fn builtin_completion_never_uses_same_named_template_metadata() {
+        use super::*;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let prompts = directory.path().join("prompts");
+        std::fs::create_dir(&prompts).unwrap();
+        std::fs::write(
+            prompts.join("model.md"),
+            "---\ndescription: Wrong template\nargument-hint: '<wrong>'\n---\nText",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("models.md"), "Other").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-prompt-templates",
+            "--prompt-template",
+            prompts.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let mut view = View {
+            resources: super::super::resources::Resources::load(&args).unwrap(),
+            ..View::default()
+        };
+        view.editor.replace("/mo".into());
+        complete_input(&args, &mut view);
+        let picker = view.picker.as_mut().unwrap();
+        let keys = crate::ui::keys::Keys::default();
+        let lines = picker.render(&crate::ui::theme::Theme::system(), 100, 20, &keys);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+        assert!(rendered.contains("/model"));
+        assert!(!rendered.contains("<wrong>"));
+        assert!(!rendered.contains("Wrong template"));
+        let input = picker.input(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &keys,
+        );
+        assert!(
+            matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, description: None, .. }) if text == "/model")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_completion_wins_over_same_named_template_metadata() {
+        use super::*;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let prompts = directory.path().join("prompts");
+        let skill = directory.path().join("skills/review");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: review\ndescription: Review skill\n---\nSkill body",
+        )
+        .unwrap();
+        std::fs::write(
+            prompts.join("skill:review.md"),
+            "---\ndescription: Wrong template\nargument-hint: '<wrong>'\n---\nWrong body",
+        )
+        .unwrap();
+        std::fs::write(prompts.join("skill:reviewer.md"), "Other").unwrap();
+        let mut args = Cli::parse_from([
+            "pi",
+            "--no-prompt-templates",
+            "--no-skills",
+            "--prompt-template",
+            prompts.to_str().unwrap(),
+            "--skill",
+            skill.to_str().unwrap(),
+        ]);
+        args.workspace = directory.path().to_owned();
+        let mut view = View {
+            resources: super::super::resources::Resources::load(&args).unwrap(),
+            ..View::default()
+        };
+        assert!(
+            view.resources
+                .expand("/skill:review")
+                .unwrap()
+                .contains("Skill body")
+        );
+        view.editor.replace("/skill:rev".into());
+        complete_input(&args, &mut view);
+        let picker = view.picker.as_mut().unwrap();
+        let keys = crate::ui::keys::Keys::default();
+        let lines = picker.render(&crate::ui::theme::Theme::system(), 100, 20, &keys);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+        assert!(rendered.contains("/skill:review"));
+        assert!(!rendered.contains("<wrong>"));
+        assert!(!rendered.contains("Wrong template"));
+        let input = picker.input(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &keys,
+        );
+        assert!(
+            matches!(input, crate::ui::picker::Input::Select(crate::ui::picker::Selection::Completion { text, description: None, .. }) if text == "/skill:review")
+        );
+    }
+
+    #[test]
+    fn mcp_tool_progress_renders_in_pending_row_until_final_result() {
+        use super::*;
+
+        let mut view = View::default();
+        view.receive(&json!({"type":"record","record":{"event":{"type":"assistant","content":"","invocations":[
+            {"operation_id":"run","call":{"id":"call","name":"mcp__fixture__work","arguments":"{}"}},
+            {"operation_id":"other","call":{"id":"other","name":"mcp__fixture__work","arguments":"{}"}}
+        ]}}}));
+        let update = json!({
+            "type": "tool_execution_update",
+            "toolCallId": "call",
+            "toolName": "mcp__fixture__work",
+            "partialResult": {"content": [{"type":"text","text":"working\u{1b}[31m"}]},
+        });
+        view.receive(&update);
+        let theme = crate::ui::theme::Theme::system();
+        let pending = view.lines[0].render(&theme, 80, false, true, Default::default());
+        assert!(
+            pending
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text == "working")
+        );
+        assert!(matches!(view.lines[1], Entry::Tool { ref output, .. } if output.is_empty()));
+        view.receive(&json!({"type":"record","record":{"event":{
+            "type":"tool_finished","operation_id":"run","outcome":{"status":"succeeded","detail":"done"}
+        }}}));
+        view.receive(&update);
+        assert!(
+            matches!(view.lines[0], Entry::Tool { ref output, finished: true, .. } if output == "done")
+        );
+    }
+
+    #[test]
+    fn patched_results_render_status_and_details_from_record_events() {
+        use super::*;
+        let mut view = View::default();
+        for (id, is_error) in [("one", false), ("two", true)] {
+            view.receive(&json!({"type":"record","record":{"event":{"type":"assistant","content":"","invocations":[{"operation_id":id,"call":{"name":"edit","arguments":"{}"}}]}}}));
+            view.receive(&json!({"type":"record","record":{"event":{"type":"tool_finished","operation_id":id,"outcome":{"status":"text_result","detail":{"output":"exact", "details":{"diff":"diff output"}, "is_error":is_error}}}}}));
+        }
+        assert!(
+            matches!(&view.lines[0], Entry::Tool { failed: false, finished: true, output, numbered_diff: true, .. } if output == "diff output")
+        );
+        assert!(
+            matches!(&view.lines[1], Entry::Tool { failed: true, finished: true, output, numbered_diff: false, .. } if output == "exact")
+        );
+    }
+
+    #[test]
+    fn imported_and_live_shell_display_output_without_context_framing() {
+        use super::*;
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("pi.jsonl");
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"bashExecution","command":"echo hi","output":"hi\n","exitCode":0,"cancelled":false,"truncated":false}}),
+            json!({"type":"message","id":"b","parentId":"a","message":{"role":"bashExecution","command":"false","output":"bad","exitCode":1,"cancelled":false,"truncated":true,"fullOutputPath":"/tmp/output","excludeFromContext":true}}),
+            json!({"type":"message","id":"c","parentId":"b","message":{"role":"bashExecution","command":"sleep","output":"","exitCode":null,"cancelled":true,"truncated":false}}),
+        ];
+        std::fs::write(
+            &source,
+            entries.iter().map(|e| format!("{e}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let journal = directory.path().join("native.jsonl");
+        imported.export_jsonl(&journal).unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = journal;
+        let mut view = View::default();
+        view.restore(&args).unwrap();
+        let shells: Vec<_> = view
+            .lines
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Tool {
+                    name,
+                    output,
+                    failed,
+                    ..
+                } => Some((name.as_str(), output.as_str(), *failed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shells,
+            [
+                ("bash", "hi\n", false),
+                (
+                    "bash (excluded)",
+                    "bad\n(exit 1)\nOutput truncated. Full output: /tmp/output",
+                    true
+                ),
+                ("bash", "(cancelled)", true)
+            ]
+        );
+        let rendered = view
+            .lines
+            .iter()
+            .flat_map(|entry| {
+                entry.render(
+                    &Theme::system(),
+                    100,
+                    true,
+                    true,
+                    TranscriptOptions::default(),
+                )
+            })
+            .flat_map(|line| line.spans.into_iter().map(|span| span.text))
+            .collect::<String>();
+        assert!(rendered.contains("echo hi") && rendered.contains("hi"));
+        assert!(!rendered.contains("Ran `") && !rendered.contains("```"));
+        let original = imported
+            .records()
+            .iter()
+            .find_map(|record| match &record.event {
+                pi_rs::Event::BashExecution { execution } if execution.command == "echo hi" => {
+                    Some(execution)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(original.context_text(), "Ran `echo hi`\n```\nhi\n\n```");
+        view.receive(
+            &json!({"type":"bash_execution_start","executionId":"live","command":"echo hi"}),
+        );
+        view.receive(&json!({"type":"bash_execution_end","executionId":"live","data":{"command":"echo hi","output":"hi\n","exitCode":0,"cancelled":false,"truncated":false}}));
+        assert!(
+            matches!(view.lines.last(), Some(Entry::Tool { output, failed: false, finished: true, .. }) if output == "hi\n")
+        );
+        view.receive(
+            &json!({"type":"bash_execution_start","executionId":"failed","command":"false"}),
+        );
+        view.receive(&json!({"type":"bash_execution_end","executionId":"failed","data":{"command":"false","output":"bad","exitCode":1,"cancelled":false,"truncated":false}}));
+        assert!(
+            matches!(view.lines.last(), Some(Entry::Tool { output, failed: true, finished: true, .. }) if output == "bad\n(exit 1)")
+        );
+    }
+
+    #[test]
+    fn shell_ansi_is_removed_only_from_themed_display() {
+        use super::*;
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("pi.jsonl");
+        let raw_imported = "\u{1b}[31mIMPORTED\u{1b}[0m\r\nend";
+        let raw_extension = "\u{1b}]8;;https://example.invalid\u{7}EXTENSION\u{1b}]8;;\u{7}";
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"bashExecution","command":"imported","output":raw_imported,"exitCode":0,"cancelled":false,"truncated":false}}),
+        ];
+        std::fs::write(
+            &source,
+            entries.iter().map(|e| format!("{e}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let path = dir.path().join("native.jsonl");
+        imported.export_jsonl(&path).unwrap();
+        let mut session = Session::open(&path).unwrap();
+        session
+            .append_bash_execution(pi_rs::BashExecution {
+                command: "extension".into(),
+                output: raw_extension.into(),
+                exit_code: Some(0),
+                cancelled: false,
+                truncated: false,
+                full_output_path: None,
+                exclude_from_context: false,
+            })
+            .unwrap();
+        drop(session);
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = path.clone();
+        let mut view = View::default();
+        view.restore(&args).unwrap();
+        let theme = Theme::system();
+        let spans: Vec<_> = view
+            .lines
+            .iter()
+            .flat_map(|entry| entry.render(&theme, 100, true, true, TranscriptOptions::default()))
+            .flat_map(|line| line.spans)
+            .collect();
+        let text = spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(text.contains("IMPORTED") && text.contains("EXTENSION") && text.contains("end"));
+        assert!(
+            !text.contains("[31m") && !text.contains("]8;") && !text.contains("example.invalid")
+        );
+        for word in ["IMPORTED", "EXTENSION"] {
+            assert!(spans.iter().any(|span| span.text.contains(word) && span.color == theme.color("toolOutput")));
+        }
+        let reopened = Session::open(&path).unwrap();
+        let executions: Vec<_> = reopened
+            .records()
+            .iter()
+            .filter_map(|record| match &record.event {
+                pi_rs::Event::BashExecution { execution } => Some(execution),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            executions
+                .iter()
+                .map(|e| e.output.as_str())
+                .collect::<Vec<_>>(),
+            [raw_imported, raw_extension]
+        );
+        assert!(executions[0].context_text().contains(raw_imported));
+        assert!(executions[1].context_text().contains(raw_extension));
+        view.receive(
+            &json!({"type":"bash_execution_start","executionId":"stream","command":"stream"}),
+        );
+        view.receive(
+            &json!({"type":"bash_execution_update","executionId":"stream","output":"\u{1b}[3"}),
+        );
+        let rendered = view.lines.last().unwrap().render(
+            &theme,
+            100,
+            true,
+            true,
+            TranscriptOptions::default(),
+        );
+        assert!(
+            !rendered
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.text.contains("[3"))
+        );
+        view.receive(&json!({"type":"bash_execution_update","executionId":"stream","output":"1mSTREAM\u{1b}[0m"}));
+        let rendered = view.lines.last().unwrap().render(
+            &theme,
+            100,
+            true,
+            true,
+            TranscriptOptions::default(),
+        );
+        assert!(rendered.iter().flat_map(|line| &line.spans).any(|span| span.text.contains("STREAM") && span.color == theme.color("toolOutput")));
+    }
+
+    #[test]
+    fn incomplete_shell_escapes_cannot_hide_completion_status() {
+        use super::*;
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("pi.jsonl");
+        let imported_output = "imported\u{1b}]8;;unterminated";
+        let entries = [
+            json!({"type":"session","version":3}),
+            json!({"type":"message","id":"a","parentId":null,"message":{"role":"bashExecution","command":"imported","output":imported_output,"exitCode":1,"cancelled":false,"truncated":true,"fullOutputPath":"/tmp/imported-output"}}),
+        ];
+        std::fs::write(
+            &source,
+            entries
+                .iter()
+                .map(|entry| format!("{entry}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let imported = super::super::session_import::read(&source).unwrap();
+        let path = dir.path().join("native.jsonl");
+        imported.export_jsonl(&path).unwrap();
+        let mut session = Session::open(&path).unwrap();
+        let extension_output = "extension\u{1b}[31";
+        session
+            .append_bash_execution(pi_rs::BashExecution {
+                command: "extension".into(),
+                output: extension_output.into(),
+                exit_code: None,
+                cancelled: true,
+                truncated: true,
+                full_output_path: Some("/tmp/extension-output".into()),
+                exclude_from_context: false,
+            })
+            .unwrap();
+        drop(session);
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = path.clone();
+        let mut view = View::default();
+        view.restore(&args).unwrap();
+        let theme = Theme::system();
+        let text = view
+            .lines
+            .iter()
+            .flat_map(|entry| entry.render(&theme, 100, true, true, TranscriptOptions::default()))
+            .flat_map(|line| line.spans.into_iter().map(|span| span.text))
+            .collect::<String>();
+        for expected in [
+            "imported",
+            "(exit 1)",
+            "/tmp/imported-output",
+            "extension",
+            "(cancelled)",
+            "/tmp/extension-output",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text:?}");
+        }
+        assert!(!text.contains("unterminated") && !text.contains("[31"));
+        let reopened = Session::open(&path).unwrap();
+        let executions: Vec<_> = reopened
+            .records()
+            .iter()
+            .filter_map(|record| match &record.event {
+                pi_rs::Event::BashExecution { execution } => Some(execution),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(executions[0].output, imported_output);
+        assert_eq!(executions[1].output, extension_output);
+        assert!(executions[0].context_text().contains(imported_output));
+        assert!(executions[1].context_text().contains(extension_output));
+    }
+
+    #[test]
+    fn clear_requires_two_presses_within_500_ms_even_when_empty() {
+        let mut view = super::View::default();
+        let mut last = None;
+        let now = std::time::Instant::now();
+        assert!(!super::clear_editor_or_exit(&mut view, &mut last, now));
+        assert!(super::clear_editor_or_exit(
+            &mut view,
+            &mut last,
+            now + std::time::Duration::from_millis(499)
+        ));
+        assert!(!super::clear_editor_or_exit(
+            &mut view,
+            &mut last,
+            now + std::time::Duration::from_millis(500)
+        ));
+        assert!(super::clear_editor_or_exit(
+            &mut view,
+            &mut last,
+            now + std::time::Duration::from_millis(999)
+        ));
+    }
+
+    #[test]
+    fn clear_removes_draft_before_a_second_press() {
+        let mut view = super::View::default();
+        view.editor.insert("unsent draft");
+        view.draft_images.push(pi_rs::ImageContent {
+            data: "aGVsbG8=".into(),
+            mime_type: "image/png".into(),
+        });
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        view.clipboard = Some(receiver);
+        let mut last = None;
+        let now = std::time::Instant::now();
+        assert!(!super::clear_editor_or_exit(&mut view, &mut last, now));
+        assert!(view.editor.text.is_empty());
+        assert!(view.draft_images.is_empty());
+        assert!(view.clipboard.is_some());
+        _sender
+            .send(Ok(super::super::clipboard::Content::Text("pasted".into())))
+            .unwrap();
+        assert!(view.poll_clipboard());
+        assert_eq!(view.editor.text, "pasted");
+        view.editor.take();
+        view.editor.insert("new draft");
+        assert!(super::clear_editor_or_exit(
+            &mut view,
+            &mut last,
+            now + std::time::Duration::from_millis(1)
+        ));
+        assert_eq!(view.editor.text, "new draft");
+    }
+
     #[test]
     fn link_clicks_use_visible_cells_and_require_the_original_target() {
         let mut view = super::View::default();
@@ -6457,7 +13278,9 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         view.model_list = Some(super::ModelDiscovery {
             receiver,
-            intent: super::ModelListIntent::Select,
+            intent: super::ModelListIntent::Select {
+                query: String::new(),
+            },
         });
         view.picker = Some(super::Picker::new("Select model", vec![]));
         view.invalidate_model_catalog();
@@ -6493,6 +13316,242 @@ mod tests {
     }
 
     #[test]
+    fn extension_widgets_truncate_each_string_array_after_ten_lines() {
+        let mut view = super::View::default();
+        let set = |view: &mut super::View, key: &str, count: usize, placement: &str| {
+            let lines: Vec<_> = (0..count).map(|index| format!("{key}-{index}")).collect();
+            assert!(
+                view.ui_request(&json!({
+                    "id": uuid::Uuid::new_v4(), "method":"setWidget", "widgetKey":key,
+                    "widgetLines":lines, "widgetPlacement":placement,
+                }))
+                .unwrap()
+                .is_none()
+            );
+        };
+        let theme =
+            super::Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let rendered = |view: &super::View, placement| {
+            view.widget_lines(&theme, 80, placement)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        set(&mut view, "ten", 10, "aboveEditor");
+        set(&mut view, "eleven", 11, "aboveEditor");
+        set(&mut view, "below", 11, "belowEditor");
+        let above = rendered(&view, pi_rs::WidgetPlacement::AboveEditor);
+        assert_eq!(above.len(), 21);
+        assert_eq!(above[9], "ten-9");
+        assert_eq!(above[10], "eleven-0");
+        assert_eq!(above[19], "eleven-9");
+        assert_eq!(above[20], "... (widget truncated)");
+        let below = rendered(&view, pi_rs::WidgetPlacement::BelowEditor);
+        assert_eq!(below.len(), 11);
+        assert_eq!(below[10], "... (widget truncated)");
+        set(&mut view, "eleven", 1, "aboveEditor");
+        let updated = rendered(&view, pi_rs::WidgetPlacement::AboveEditor);
+        assert_eq!(updated.len(), 11);
+        assert_eq!(updated[10], "eleven-0");
+    }
+
+    #[test]
+    fn extension_widgets_follow_registration_and_replacement_order() {
+        let mut view = super::View::default();
+        let set = |view: &mut super::View, key: &str, lines: Option<Vec<&str>>, placement: &str| {
+            assert!(
+                view.ui_request(&json!({
+                    "id": uuid::Uuid::new_v4(), "method": "setWidget", "widgetKey": key,
+                    "widgetLines": lines, "widgetPlacement": placement,
+                }))
+                .unwrap()
+                .is_none()
+            );
+        };
+        let theme =
+            super::Theme::load("dark", &[], std::path::Path::new("."), false, false).unwrap();
+        let rendered = |view: &super::View, placement| {
+            view.widget_lines(&theme, 80, placement)
+                .iter()
+                .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+                .collect::<String>()
+        };
+        set(&mut view, "z", Some(vec!["first"]), "aboveEditor");
+        set(&mut view, "a", Some(vec!["second"]), "aboveEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::AboveEditor),
+            "firstsecond"
+        );
+        set(&mut view, "z", Some(vec!["updated"]), "aboveEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::AboveEditor),
+            "secondupdated"
+        );
+        set(&mut view, "a", Some(vec!["moved"]), "belowEditor");
+        set(&mut view, "z", Some(vec!["later"]), "belowEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::BelowEditor),
+            "movedlater"
+        );
+        set(&mut view, "a", None, "aboveEditor");
+        set(&mut view, "a", Some(vec!["readded"]), "belowEditor");
+        assert_eq!(
+            rendered(&view, pi_rs::WidgetPlacement::BelowEditor),
+            "laterreadded"
+        );
+        assert!(rendered(&view, pi_rs::WidgetPlacement::AboveEditor).is_empty());
+
+        let mut full = super::View::default();
+        for index in 0..64 {
+            set(
+                &mut full,
+                &format!("widget-{index}"),
+                Some(vec!["x"]),
+                "aboveEditor",
+            );
+        }
+        let rejected = full.ui_request(&json!({
+            "id": uuid::Uuid::new_v4(), "method": "setWidget", "widgetKey": "overflow",
+            "widgetLines": ["x"], "widgetPlacement": "aboveEditor",
+        }));
+        assert!(rejected.is_err());
+        assert_eq!(full.widgets.len(), 64);
+        assert_eq!(full.widgets.first().unwrap().0, "widget-0");
+        set(
+            &mut full,
+            "widget-0",
+            Some(vec!["replacement"]),
+            "belowEditor",
+        );
+        assert_eq!(full.widgets.len(), 64);
+        assert_eq!(full.widgets.last().unwrap().0, "widget-0");
+        set(&mut full, "widget-0", None, "aboveEditor");
+        assert_eq!(full.widgets.len(), 63);
+    }
+
+    #[test]
+    fn custom_entry_renderer_absence_omits_the_initial_row() {
+        use super::Entry;
+
+        let mut view = super::View::default();
+        view.append("ordinary history");
+        let entry = pi_rs::CustomEntry {
+            custom_type: "card".into(),
+            data: Some(serde_json::json!({"ignored":"private"})),
+        };
+        for id in 1..=4001 {
+            view.show_custom_entry(id, &entry);
+        }
+        assert_eq!(view.custom_entry_count, 4000);
+        assert!(matches!(view.lines[0], Entry::Notice(_)));
+        assert!(matches!(view.lines[1], Entry::CustomRecord { id: 2, .. }));
+        let Entry::CustomRecord { presentation, .. } = &mut view.lines[1] else {
+            unreachable!()
+        };
+        *presentation = super::CustomEntryPresentation::Included;
+        view.show_custom_entry(4002, &entry);
+        assert!(matches!(view.lines[1], Entry::CustomRecord { id: 2, .. }));
+        assert!(matches!(view.lines[2], Entry::CustomRecord { id: 4, .. }));
+        let options = pi_rs::CustomMessageRenderOptions::default();
+        view.custom_render_options = Some(options.clone());
+        let request = uuid::Uuid::new_v4();
+        view.custom_render_attempted.insert(4002);
+        view.custom_render_pending = Some(super::TranscriptExtensionRenderPending {
+            request,
+            record: 4002,
+            options,
+        });
+        assert!(
+            !view.receive_transcript_extension_render(serde_json::json!({
+                "id":request,"rendered":null,
+            }))
+        );
+        assert!(matches!(
+            view.lines.last(),
+            Some(Entry::CustomRecord {
+                presentation: super::CustomEntryPresentation::Omitted,
+                rendered: None,
+                ..
+            })
+        ));
+        view.invalidate_custom_message_renderings();
+        assert!(matches!(
+            view.lines.last(),
+            Some(Entry::CustomRecord {
+                presentation: super::CustomEntryPresentation::Omitted,
+                ..
+            })
+        ));
+        view.refresh_transcript_extension_renderers();
+        assert!(matches!(
+            view.lines.last(),
+            Some(Entry::CustomRecord {
+                presentation: super::CustomEntryPresentation::Pending,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn custom_message_render_responses_follow_transcript_and_expansion_state() {
+        let mut view = super::View::default();
+        let message = pi_rs::CustomMessage {
+            custom_type: "card".into(),
+            content: pi_rs::ContextContent::Text("fallback".into()),
+            display: true,
+            details: None,
+        };
+        view.show_custom_message(14, &message);
+        view.regular.committed = 1;
+        let collapsed = pi_rs::CustomMessageRenderOptions::default();
+        let expanded = pi_rs::CustomMessageRenderOptions {
+            expanded: true,
+            ..Default::default()
+        };
+        let old_request = uuid::Uuid::new_v4();
+        view.custom_render_options = Some(expanded.clone());
+        view.custom_render_attempted.insert(14);
+        view.custom_render_pending = Some(super::TranscriptExtensionRenderPending {
+            request: old_request,
+            record: 14,
+            options: collapsed,
+        });
+        let rendered = serde_json::json!({"lines":[[{"text":"details"}]]});
+        assert!(
+            !view.receive_transcript_extension_render(serde_json::json!({
+                "id":old_request,"rendered":rendered
+            }))
+        );
+        assert!(matches!(
+            &view.lines[0],
+            super::Entry::CustomMessage { rendered: None, .. }
+        ));
+
+        let active_request = uuid::Uuid::new_v4();
+        view.custom_render_pending = Some(super::TranscriptExtensionRenderPending {
+            request: active_request,
+            record: 14,
+            options: expanded,
+        });
+        assert!(view.receive_transcript_extension_render(serde_json::json!({
+            "id":active_request,"rendered":rendered
+        })));
+        assert!(matches!(
+            &view.lines[0],
+            super::Entry::CustomMessage {
+                rendered: Some(_),
+                ..
+            }
+        ));
+        assert!(view.custom_render_redraw_at.is_some());
+    }
+
+    #[test]
     fn custom_message_display_flag_controls_terminal_visibility() {
         let mut view = super::View::default();
         let mut message = pi_rs::CustomMessage {
@@ -6501,12 +13560,100 @@ mod tests {
             display: false,
             details: Some(serde_json::json!({"private": "metadata"})),
         };
-        view.show_custom_message(&message);
+        view.show_custom_message(1, &message);
         assert!(view.lines.is_empty());
         message.display = true;
-        view.show_custom_message(&message);
+        view.show_custom_message(1, &message);
         assert!(
-            matches!(&view.lines[..], [super::Entry::Notice(text)] if text == "example: visible content")
+            matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "example" && text == "visible content")
+        );
+    }
+
+    #[test]
+    fn custom_message_blocks_are_joined_like_pi_without_rendering_details() {
+        let mut view = super::View::default();
+        let message = pi_rs::CustomMessage {
+            custom_type: "fixture".into(),
+            content: pi_rs::ContextContent::Blocks(vec![
+                pi_rs::ContentBlock::Text {
+                    text: "**first**".into(),
+                    text_signature: None,
+                },
+                pi_rs::ContentBlock::Image {
+                    data: String::new(),
+                    mime_type: "image/png".into(),
+                },
+                pi_rs::ContentBlock::Text {
+                    text: "second".into(),
+                    text_signature: None,
+                },
+            ]),
+            display: true,
+            details: Some(serde_json::json!({"secret": "not displayed"})),
+        };
+        view.show_custom_message(1, &message);
+        assert!(
+            matches!(&view.lines[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "fixture" && text == "**first**\nsecond")
+        );
+    }
+
+    #[test]
+    fn delivered_custom_messages_are_visible_live_and_on_reopen() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.session = directory.path().join("session.jsonl");
+        let message = pi_rs::CustomMessage {
+            custom_type: "fixture".into(),
+            content: pi_rs::ContextContent::Text("**live**".into()),
+            display: true,
+            details: None,
+        };
+        let record = pi_rs::Record {
+            timestamp: None,
+            run_id: None,
+            version: 3,
+            id: 1,
+            parent: None,
+            event: pi_rs::Event::CustomMessageDelivered {
+                id: uuid::Uuid::new_v4(),
+                message: message.clone(),
+            },
+        };
+        let delivered_event = serde_json::to_value(&record.event).unwrap();
+        let mut live = super::View::default();
+        live.receive_worker(
+            serde_json::json!({"type": "record", "record": record}),
+            &mut args,
+        );
+        assert!(
+            matches!(&live.lines[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "fixture" && text == "**live**")
+        );
+        let mut session = pi_rs::Session::open(&args.session).unwrap();
+        session.append_custom_message(message).unwrap();
+        drop(session);
+        let journal = std::fs::read_to_string(&args.session).unwrap();
+        let mut replaced = false;
+        let mut records = Vec::new();
+        for line in journal.lines() {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if value["event"]["type"] == "custom_message" {
+                value["event"] = delivered_event.clone();
+                replaced = true;
+            }
+            records.push(serde_json::to_string(&value).unwrap());
+        }
+        assert!(replaced);
+        std::fs::write(&args.session, format!("{}\n", records.join("\n"))).unwrap();
+        let mut restored = super::View::default();
+        restored.restore(&args).unwrap();
+        let shown: Vec<_> = restored
+            .lines
+            .iter()
+            .filter(|entry| matches!(entry, super::Entry::CustomMessage { .. }))
+            .collect();
+        assert!(
+            matches!(&shown[..], [super::Entry::CustomMessage { custom_type, text, .. }] if custom_type == "fixture" && text == "**live**")
         );
     }
 
@@ -6532,6 +13679,860 @@ mod tests {
             Some("ollama/offline-fixture")
         );
     }
+    #[test]
+    fn startup_picker_uses_resolved_themes_and_skips_malformed_ignored_files() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let themes = workspace.join(".pi/themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        std::fs::write(themes.join(".fdignore"), "ignored.json\n").unwrap();
+        std::fs::write(themes.join("ignored.json"), "not valid JSON").unwrap();
+        let mut selected: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+        selected["name"] = serde_json::json!("selected");
+        std::fs::write(themes.join("selected.json"), selected.to_string()).unwrap();
+        let mut args = super::Cli::parse_from([
+            "pi",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+        ]);
+        args.workspace = workspace;
+        args.trusted = true;
+        args.settings = super::super::config::Settings::default();
+        args.use_theme = Some("ignored".into());
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        args.use_theme = Some("selected".into());
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "selected");
+        args.no_themes = true;
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        args.themes.push(themes.join("selected.json"));
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "selected");
+    }
+
+    #[test]
+    fn resume_picker_loads_unprepared_local_package_without_installing() {
+        const CHILD: &str = "PI_RS_TEST_RESUME_PACKAGE_THEME_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "interactive::tests::resume_picker_loads_unprepared_local_package_without_installing", "--nocapture"])
+                .env("PI_RS_HOME", home.path())
+                .env("CARGO_NET_OFFLINE", "true")
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+            while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if child.try_wait().unwrap().is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("package preparation blocked past the deadline");
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        use clap::Parser;
+        let home = super::super::config::agent_dir();
+        let source = home.join("local-package");
+        let themes = source.join("themes");
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&themes).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut selected: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+        selected["name"] = serde_json::json!("package-theme");
+        std::fs::write(themes.join("theme.json"), selected.to_string()).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[source]}).to_string(),
+        )
+        .unwrap();
+        let mut args = super::Cli::parse_from([
+            "pi",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+        ]);
+        args.workspace = workspace;
+        args.settings = super::super::config::Settings::default();
+        args.use_theme = Some("package-theme".into());
+        let index = home.join("packages/index.json");
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
+        assert!(!index.exists(), "picker must not prepare packages");
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":["cargo:never-install-this-package"]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        assert!(
+            !index.exists(),
+            "missing remote packages must not be installed"
+        );
+
+        // A directly selected local package remains explicit with auto-discovery off.
+        std::fs::write(home.join("settings.json"), "{}").unwrap();
+        args.no_themes = true;
+        args.extensions.push(source.to_string_lossy().into_owned());
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
+        args.extensions.clear();
+        args.no_themes = false;
+
+        // Global declarations work without project trust, but package filters
+        // still apply before any local theme enters the picker.
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[{"source":source,"autoload":false}]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        std::fs::write(home.join("settings.json"), serde_json::json!({"packages":[{"source":source,"autoload":false,"themes":["+themes/theme.json"]},"cargo:never-install-this-package"]}).to_string()).unwrap();
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
+        assert!(!index.exists());
+
+        // A project package is visible only after project trust is granted.
+        std::fs::write(home.join("settings.json"), "{}").unwrap();
+        let project = args.workspace.join(".pi");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("settings.json"),
+            serde_json::json!({"packages":[source]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        args.trusted = true;
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
+        args.trusted = false;
+
+        // Cargo metadata is parsed as data: even a build script is never run.
+        let cargo_source = home.join("cargo-package");
+        std::fs::create_dir_all(cargo_source.join("palette")).unwrap();
+        std::fs::write(cargo_source.join("Cargo.toml"), "[package]\nname='fixture'\nversion='0.1.0'\n[package.metadata.pi]\nthemes=['palette/theme.json']\n").unwrap();
+        let sentinel = home.join("build-ran");
+        std::fs::write(
+            cargo_source.join("build.rs"),
+            format!(
+                "fn main() {{ std::fs::write({:?}, \"bad\").unwrap(); }}",
+                sentinel
+            ),
+        )
+        .unwrap();
+        selected["name"] = serde_json::json!("cargo-theme");
+        std::fs::write(
+            cargo_source.join("palette/theme.json"),
+            selected.to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[cargo_source]}).to_string(),
+        )
+        .unwrap();
+        args.use_theme = Some("cargo-theme".into());
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "cargo-theme"
+        );
+        assert!(!sentinel.exists());
+        assert!(!index.exists());
+
+        args.use_theme = Some("package-theme".into());
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[source]}).to_string(),
+        )
+        .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert!(index.exists());
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
+        let broken = home.join("broken.json");
+        std::fs::write(&broken, "not JSON").unwrap();
+        args.themes.push(broken);
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "package-theme"
+        );
+
+        // Pi package.json manifests work before and after normal preparation,
+        // including a BOM; scripts are data and are never executed.
+        let pi_source = home.join("pi-package");
+        std::fs::create_dir_all(pi_source.join("assets")).unwrap();
+        selected["name"] = serde_json::json!("pi-theme");
+        std::fs::write(pi_source.join("assets/visual.json"), selected.to_string()).unwrap();
+        std::fs::create_dir_all(pi_source.join("extensions")).unwrap();
+        let extension = pi_source.join("extensions/unexpected");
+        std::fs::write(
+            &extension,
+            format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&extension, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let pi_manifest = serde_json::json!({"version":"1.0.0", "pi":{"themes":["assets/visual.json"]},
+            "scripts":{"prepare":"must-not-run"}});
+        std::fs::write(
+            pi_source.join("package.json"),
+            format!("\u{feff}{pi_manifest}"),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[pi_source]}).to_string(),
+        )
+        .unwrap();
+        args.use_theme = Some("pi-theme".into());
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "pi-theme");
+        assert!(
+            !sentinel.exists(),
+            "picker must not execute package extensions"
+        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "pi-theme");
+        assert!(
+            !sentinel.exists(),
+            "preparation must not execute undeclared extensions"
+        );
+        let index_text = std::fs::read_to_string(&index).unwrap();
+        assert!(
+            index_text.contains("pi-package"),
+            "package must actually be prepared"
+        );
+
+        // Simulate an index written before package.json themes were supported.
+        // It may also contain native resources that the Pi manifest excludes.
+        let mut old_index: serde_json::Value = serde_json::from_str(&index_text).unwrap();
+        let cached = old_index
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .find(|entry| {
+                entry["source"]
+                    .as_str()
+                    .and_then(|source| std::fs::canonicalize(source).ok())
+                    == std::fs::canonicalize(&pi_source).ok()
+            })
+            .unwrap();
+        cached["resources"]["themes"] = serde_json::json!([]);
+        let canonical_source = pi_source.canonicalize().unwrap();
+        cached["resources"]["extensions"] =
+            serde_json::json!([canonical_source.join("extensions/unexpected")]);
+        cached["resources"]["skills"] =
+            serde_json::json!([canonical_source.join("skills/old/SKILL.md")]);
+        cached["resources"]["prompts"] =
+            serde_json::json!([canonical_source.join("prompts/old.md")]);
+        let old_index = old_index.to_string();
+        std::fs::write(&index, &old_index).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "pi-theme");
+        let resources = super::super::packages::resources(&args).unwrap();
+        assert_eq!(
+            resources.themes,
+            vec![pi_source.join("assets/visual.json").canonicalize().unwrap()]
+        );
+        assert!(resources.extensions.is_empty());
+        assert_eq!(std::fs::read_to_string(&index).unwrap(), old_index);
+        assert!(!sentinel.exists());
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[{"source":pi_source,"autoload":false}]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        assert!(
+            super::super::packages::resources(&args)
+                .unwrap()
+                .themes
+                .is_empty()
+        );
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[pi_source]}).to_string(),
+        )
+        .unwrap();
+
+        // The higher-priority Pi manifest must not hide an unusable Cargo file.
+        std::fs::write(
+            pi_source.join("pi-package.json"),
+            r#"{"pi":{"themes":["assets/visual.json"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(pi_source.join("Cargo.toml"), "[invalid").unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "system");
+        let resources = super::super::packages::resources(&args).unwrap();
+        assert!(resources.themes.is_empty() && resources.extensions.is_empty());
+        assert!(!sentinel.exists());
+        std::fs::remove_file(pi_source.join("Cargo.toml")).unwrap();
+        std::fs::remove_file(pi_source.join("pi-package.json")).unwrap();
+
+        // A cached pre-upgrade package must obey each current manifest format.
+        // Force preparation through a transient declaration as well as checking
+        // the cached resolution path used by normal startup.
+        std::fs::create_dir_all(pi_source.join("src")).unwrap();
+        std::fs::write(pi_source.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        for format in ["pi-package", "cargo", "package"] {
+            std::fs::write(&index, &old_index).unwrap();
+            match format {
+                "pi-package" => std::fs::write(pi_source.join("pi-package.json"), r#"{"pi":{"themes":["assets/visual.json"]}}"#).unwrap(),
+                "cargo" => std::fs::write(pi_source.join("Cargo.toml"), "[package]\nname='upgrade-fixture'\nversion='0.1.0'\nedition='2021'\n[package.metadata.pi]\nthemes=['assets/visual.json']\n").unwrap(),
+                _ => {}
+            }
+            assert_eq!(
+                super::startup_picker_theme(&args).unwrap().name,
+                "pi-theme",
+                "{format}"
+            );
+            let resources = super::super::packages::resources(&args).unwrap();
+            assert_eq!(resources.themes.len(), 1, "{format}");
+            assert!(
+                resources.extensions.is_empty()
+                    && resources.skills.is_empty()
+                    && resources.prompts.is_empty(),
+                "{format}"
+            );
+            args.extensions
+                .push(pi_source.to_string_lossy().into_owned());
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(super::super::packages::prepare(&args))
+                .unwrap();
+            assert_ne!(
+                std::fs::read_to_string(&index).unwrap(),
+                old_index,
+                "{format} was not prepared"
+            );
+            let prepared = super::super::packages::transient_resources(&args).unwrap();
+            assert!(
+                prepared.extensions.is_empty()
+                    && prepared.skills.is_empty()
+                    && prepared.prompts.is_empty(),
+                "{format}"
+            );
+            assert!(
+                !sentinel.exists(),
+                "{format} executed an undeclared extension"
+            );
+            args.extensions.clear();
+            if format == "pi-package" {
+                std::fs::remove_file(pi_source.join("pi-package.json")).unwrap();
+            }
+            if format == "cargo" {
+                std::fs::remove_file(pi_source.join("Cargo.toml")).unwrap();
+            }
+        }
+
+        // Still-declared cached resources remain available after filtering.
+        std::fs::create_dir_all(pi_source.join("skills/old")).unwrap();
+        std::fs::create_dir_all(pi_source.join("prompts")).unwrap();
+        std::fs::write(
+            pi_source.join("skills/old/SKILL.md"),
+            "---\nname: old\n---\n",
+        )
+        .unwrap();
+        std::fs::write(pi_source.join("prompts/old.md"), "prompt").unwrap();
+        std::fs::write(&index, &old_index).unwrap();
+        std::fs::write(pi_source.join("pi-package.json"), r#"{"pi":{"extensions":["extensions/unexpected"],"skills":["skills/old"],"prompts":["prompts/old.md"],"themes":["assets/visual.json"]}}"#).unwrap();
+        let declared = super::super::packages::resources(&args).unwrap();
+        assert_eq!(declared.extensions.len(), 1);
+        assert_eq!(declared.skills.len(), 1);
+        assert_eq!(declared.prompts.len(), 1);
+        assert!(!sentinel.exists());
+        std::fs::remove_file(pi_source.join("pi-package.json")).unwrap();
+
+        // Old indexes for local, Git and registry packages all carry a package
+        // root. Revalidate that root and apply exclusions to the whole list.
+        use sha2::Digest;
+        let manifest_path = pi_source.join("pi-package.json");
+        let manifest_with_exclusion = r#"{"pi":{"extensions":["extensions","!extensions/unexpected"],"themes":["assets/visual.json"]}}"#;
+        for source in [
+            pi_source
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "git:https://example.invalid/example/pkg".into(),
+            "cargo:example-pkg@1.0.0".into(),
+        ] {
+            std::fs::write(&manifest_path, manifest_with_exclusion).unwrap();
+            let mut entries: serde_json::Value = serde_json::from_str(&old_index).unwrap();
+            let old_key = entries
+                .as_object()
+                .unwrap()
+                .iter()
+                .find(|(_, entry)| {
+                    entry["source"]
+                        .as_str()
+                        .and_then(|s| std::fs::canonicalize(s).ok())
+                        == Some(canonical_source.clone())
+                })
+                .map(|(key, _)| key.clone())
+                .unwrap();
+            let mut cached = entries.as_object_mut().unwrap().remove(&old_key).unwrap();
+            cached["source"] = serde_json::json!(source);
+            let key = format!("{:x}", sha2::Sha256::digest(source.as_bytes()));
+            entries.as_object_mut().unwrap().insert(key, cached);
+            std::fs::write(&index, entries.to_string()).unwrap();
+            std::fs::write(
+                home.join("settings.json"),
+                serde_json::json!({"packages":[source]}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                super::startup_picker_theme(&args).unwrap().name,
+                "pi-theme",
+                "{source}"
+            );
+            let resources = super::super::packages::resources(&args).unwrap();
+            assert!(
+                resources.extensions.is_empty()
+                    && resources.skills.is_empty()
+                    && resources.prompts.is_empty(),
+                "{source}"
+            );
+            assert_eq!(resources.themes.len(), 1, "{source}");
+            std::fs::write(&manifest_path, r#"{"pi":null}"#).unwrap();
+            assert_eq!(
+                super::startup_picker_theme(&args).unwrap().name,
+                "system",
+                "{source}"
+            );
+            let invalid = super::super::packages::resources(&args).unwrap();
+            assert!(
+                invalid.extensions.is_empty()
+                    && invalid.skills.is_empty()
+                    && invalid.prompts.is_empty()
+                    && invalid.themes.is_empty(),
+                "{source}"
+            );
+            assert!(!sentinel.exists(), "{source} executed a cached extension");
+        }
+        // Fresh local preparation must not launch the excluded executable.
+        std::fs::write(&manifest_path, manifest_with_exclusion).unwrap();
+        std::fs::write(&index, &old_index).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[pi_source]}).to_string(),
+        )
+        .unwrap();
+        args.extensions
+            .push(pi_source.to_string_lossy().into_owned());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert_ne!(std::fs::read_to_string(&index).unwrap(), old_index);
+        assert!(
+            super::super::packages::transient_resources(&args)
+                .unwrap()
+                .extensions
+                .is_empty()
+        );
+        assert!(
+            !sentinel.exists(),
+            "preparation executed an excluded extension"
+        );
+        args.extensions.clear();
+        std::fs::remove_file(&manifest_path).unwrap();
+
+        // Cargo without Pi metadata must honor package.json during both
+        // cached resolution and a fresh preparation of the package.
+        let cargo_manifest = pi_source.join("Cargo.toml");
+        let package_manifest = pi_source.join("package.json");
+        let cargo_plain =
+            "[package]\nname='mixed-upgrade-fixture'\nversion='0.1.0'\nedition='2021'\n";
+        std::fs::write(&cargo_manifest, cargo_plain).unwrap();
+        std::fs::write(&package_manifest, format!("\u{feff}{pi_manifest}")).unwrap();
+        std::fs::write(&index, &old_index).unwrap();
+        assert_eq!(super::startup_picker_theme(&args).unwrap().name, "pi-theme");
+        let cached = super::super::packages::resources(&args).unwrap();
+        assert_eq!(cached.themes.len(), 1);
+        assert!(
+            cached.extensions.is_empty() && cached.skills.is_empty() && cached.prompts.is_empty()
+        );
+        args.extensions
+            .push(pi_source.to_string_lossy().into_owned());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert_ne!(
+            std::fs::read_to_string(&index).unwrap(),
+            old_index,
+            "mixed package not prepared"
+        );
+        let prepared = super::super::packages::transient_resources(&args).unwrap();
+        assert_eq!(prepared.themes.len(), 1);
+        assert!(
+            prepared.extensions.is_empty()
+                && prepared.skills.is_empty()
+                && prepared.prompts.is_empty()
+        );
+        assert!(
+            !sentinel.exists(),
+            "mixed package executed undeclared extension"
+        );
+        args.extensions.clear();
+
+        // Even when Cargo or pi-package.json has higher precedence, a present
+        // malformed package.json must fail before Cargo runs its build script.
+        for higher in ["none", "cargo", "native"] {
+            let cargo = if higher == "cargo" {
+                format!("{cargo_plain}[package.metadata.pi]\nthemes=['assets/visual.json']\n")
+            } else {
+                cargo_plain.to_owned()
+            };
+            std::fs::write(&cargo_manifest, cargo).unwrap();
+            if higher == "native" {
+                std::fs::write(
+                    &manifest_path,
+                    r#"{"pi":{"themes":["assets/visual.json"]}}"#,
+                )
+                .unwrap();
+            }
+            std::fs::write(&package_manifest, r#"{"pi":{"extensions":42}}"#).unwrap();
+            std::fs::write(
+                pi_source.join("build.rs"),
+                format!(
+                    "fn main() {{ std::fs::write({:?}, \"bad\").unwrap(); }}",
+                    sentinel
+                ),
+            )
+            .unwrap();
+            std::fs::write(&index, &old_index).unwrap();
+            assert_eq!(
+                super::startup_picker_theme(&args).unwrap().name,
+                "system",
+                "{higher}"
+            );
+            let invalid = super::super::packages::resources(&args).unwrap();
+            assert!(
+                invalid.extensions.is_empty()
+                    && invalid.skills.is_empty()
+                    && invalid.prompts.is_empty()
+                    && invalid.themes.is_empty(),
+                "{higher}"
+            );
+            let mut empty_index: serde_json::Value = serde_json::from_str(&old_index).unwrap();
+            empty_index.as_object_mut().unwrap().retain(|_, entry| {
+                entry["source"]
+                    .as_str()
+                    .and_then(|s| std::fs::canonicalize(s).ok())
+                    != Some(canonical_source.clone())
+            });
+            let empty_index = empty_index.to_string();
+            std::fs::write(&index, &empty_index).unwrap();
+            args.extensions
+                .push(pi_source.to_string_lossy().into_owned());
+            assert!(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(super::super::packages::prepare(&args))
+                    .is_err(),
+                "{higher}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&index).unwrap(),
+                empty_index,
+                "{higher}"
+            );
+            assert!(!sentinel.exists(), "{higher} ran build script or extension");
+            args.extensions.clear();
+            std::fs::remove_file(pi_source.join("build.rs")).unwrap();
+            if higher == "native" {
+                std::fs::remove_file(&manifest_path).unwrap();
+            }
+        }
+        std::fs::remove_file(&cargo_manifest).unwrap();
+        std::fs::write(&package_manifest, format!("\u{feff}{pi_manifest}")).unwrap();
+
+        // Invalid resource fields and invalid pi values must be rejected both
+        // for cached startup and before preparation can run any build script.
+        for case in [
+            "native-null",
+            "native-string",
+            "native-array",
+            "native-extensions",
+            "cargo-scalar",
+            "cargo-extensions",
+            "package-extensions",
+            "package-skills",
+            "package-prompts",
+            "package-themes",
+        ] {
+            std::fs::write(&index, &old_index).unwrap();
+            let (name, body) = match case {
+                "native-null" => ("pi-package.json", r#"{"pi":null}"#.to_owned()),
+                "native-string" => ("pi-package.json", r#"{"pi":"bad"}"#.to_owned()),
+                "native-array" => ("pi-package.json", r#"{"pi":[]}"#.to_owned()),
+                "native-extensions" => ("pi-package.json", r#"{"pi":{"extensions":42}}"#.to_owned()),
+                "cargo-scalar" => ("Cargo.toml", "[package]\nname='invalid-fixture'\nversion='0.1.0'\n[package.metadata]\npi=42\n".to_owned()),
+                "cargo-extensions" => ("Cargo.toml", "[package]\nname='invalid-fixture'\nversion='0.1.0'\n[package.metadata.pi]\nextensions=42\n".to_owned()),
+                _ => ("package.json", format!(r#"{{"pi":{{"{}":42,"themes":[]}}}}"#, case.strip_prefix("package-").unwrap())),
+            };
+            // Avoid duplicate JSON keys for the invalid themes case.
+            let body = if case == "package-themes" {
+                r#"{"pi":{"themes":42}}"#.to_owned()
+            } else {
+                body
+            };
+            std::fs::write(pi_source.join(name), body).unwrap();
+            if case.starts_with("cargo-") {
+                std::fs::write(
+                    pi_source.join("build.rs"),
+                    format!(
+                        "fn main() {{ std::fs::write({:?}, \"bad\").unwrap(); }}",
+                        sentinel
+                    ),
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                super::startup_picker_theme(&args).unwrap().name,
+                "system",
+                "{case}"
+            );
+            let resources = super::super::packages::resources(&args).unwrap();
+            assert!(
+                resources.extensions.is_empty()
+                    && resources.skills.is_empty()
+                    && resources.prompts.is_empty()
+                    && resources.themes.is_empty(),
+                "{case}"
+            );
+            args.extensions
+                .push(pi_source.to_string_lossy().into_owned());
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(super::super::packages::prepare(&args))
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&index).unwrap(),
+                old_index,
+                "{case}"
+            );
+            assert!(!sentinel.exists(), "{case} executed an extension");
+            args.extensions.clear();
+            if name != "package.json" {
+                std::fs::remove_file(pi_source.join(name)).unwrap();
+            }
+            if case.starts_with("cargo-") {
+                std::fs::remove_file(pi_source.join("build.rs")).unwrap();
+            }
+            std::fs::write(
+                pi_source.join("package.json"),
+                format!("\u{feff}{pi_manifest}"),
+            )
+            .unwrap();
+        }
+
+        // Present but malformed or unreadable manifests must never be treated
+        // as absent and trigger conventional executable discovery.
+        for case in ["malformed", "unreadable", "invalid-pi", "invalid-root"] {
+            let invalid_source = home.join(format!("invalid-{case}"));
+            std::fs::create_dir_all(invalid_source.join("extensions")).unwrap();
+            let unexpected = invalid_source.join("extensions/unexpected");
+            std::fs::write(
+                &unexpected,
+                format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&unexpected, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+            match case {
+                "malformed" => {
+                    std::fs::write(invalid_source.join("package.json"), "{not valid JSON").unwrap()
+                }
+                "invalid-pi" => {
+                    std::fs::write(invalid_source.join("package.json"), r#"{"pi":"invalid"}"#)
+                        .unwrap()
+                }
+                "invalid-root" => {
+                    std::fs::write(invalid_source.join("package.json"), "[]").unwrap()
+                }
+                _ => {
+                    // Reading a directory as a file fails on all supported platforms.
+                    std::fs::create_dir(invalid_source.join("package.json")).unwrap();
+                }
+            }
+            std::fs::write(
+                home.join("settings.json"),
+                serde_json::json!({"packages":[invalid_source]}).to_string(),
+            )
+            .unwrap();
+            let before = std::fs::read(&index).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(super::super::packages::prepare(&args))
+                .unwrap();
+            assert!(!sentinel.exists(), "{case} manifest executed an extension");
+            assert_eq!(
+                std::fs::read(&index).unwrap(),
+                before,
+                "{case} package was indexed"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            for name in ["pi-package.json", "Cargo.toml"] {
+                for kind in ["fifo", "broken-link"] {
+                    let invalid = home.join(format!("invalid-{name}-{kind}"));
+                    std::fs::create_dir_all(invalid.join("extensions")).unwrap();
+                    let unexpected = invalid.join("extensions/unexpected");
+                    std::fs::write(
+                        &unexpected,
+                        format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+                    )
+                    .unwrap();
+                    std::fs::set_permissions(&unexpected, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    let path = invalid.join(name);
+                    if kind == "fifo" {
+                        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                    } else {
+                        symlink(invalid.join("missing"), &path).unwrap();
+                    }
+                    std::fs::write(
+                        home.join("settings.json"),
+                        serde_json::json!({"packages":[invalid]}).to_string(),
+                    )
+                    .unwrap();
+                    let before = std::fs::read(&index).unwrap();
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(super::super::packages::prepare(&args))
+                        .unwrap();
+                    assert!(!sentinel.exists(), "{name} {kind} executed an extension");
+                    assert_eq!(
+                        std::fs::read(&index).unwrap(),
+                        before,
+                        "{name} {kind} was indexed"
+                    );
+                }
+            }
+        }
+
+        // A regular Cargo manifest still follows the normal offline build path.
+        let valid_cargo = home.join("valid-cargo");
+        std::fs::create_dir_all(valid_cargo.join("src")).unwrap();
+        std::fs::create_dir_all(valid_cargo.join("palette")).unwrap();
+        std::fs::write(valid_cargo.join("Cargo.toml"), "[package]\nname='local-theme-fixture'\nversion='0.1.0'\nedition='2021'\n[package.metadata.pi]\nthemes=['palette/theme.json']\n").unwrap();
+        std::fs::write(valid_cargo.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        selected["name"] = serde_json::json!("prepared-cargo-theme");
+        std::fs::write(valid_cargo.join("palette/theme.json"), selected.to_string()).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            serde_json::json!({"packages":[valid_cargo]}).to_string(),
+        )
+        .unwrap();
+        args.offline = true;
+        args.use_theme = Some("prepared-cargo-theme".into());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::packages::prepare(&args))
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(&index)
+                .unwrap()
+                .contains("valid-cargo")
+        );
+        assert_eq!(
+            super::startup_picker_theme(&args).unwrap().name,
+            "prepared-cargo-theme"
+        );
+        assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn theme_settings_preview_skips_unrelated_invalid_theme() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let broken = directory.path().join("broken.json");
+        let selected = directory.path().join("selected.json");
+        std::fs::write(&broken, "not JSON").unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/themes/dark.json")).unwrap();
+        value["name"] = serde_json::json!("fixture-theme");
+        std::fs::write(&selected, value.to_string()).unwrap();
+        let mut args = super::Cli::parse_from(["pi"]);
+        args.theme_paths = vec![broken, selected];
+        let original = super::Theme::system();
+        let state =
+            super::ThemeSettings::new(super::Picker::new("Settings", vec![]), &args, &original);
+        let mut picker = state.picker(&args);
+        picker.paste("fixture-theme");
+        assert_eq!(state.preview(&picker, &args).unwrap().name, "fixture-theme");
+    }
+
     #[test]
     fn theme_settings_previews_selection_without_changing_original() {
         use clap::Parser;
@@ -6566,49 +14567,550 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn complete_color_replies_release_queued_query_before_marker() {
-        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
+    fn initial_theme_query_settles_on_timeout_or_marker() {
+        const CHILD: &str = "PI_RS_INITIAL_THEME_QUERY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::initial_theme_query_settles_on_timeout_or_marker",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::ui::theme::{
+            mark_terminal_colors_pending, reset_terminal_background, set_terminal_color,
+        };
+        use crossterm::style::Color;
+        reset_terminal_background();
+        mark_terminal_colors_pending();
+        set_terminal_color(false, 0, 0, 0);
+        let mut theme = super::Theme::system();
+        let mut terminal = super::ColorQueries {
+            initial_started: Some(std::time::Instant::now()),
+            color_queries: std::collections::VecDeque::from([super::ColorQuery {
+                started: std::time::Instant::now(),
+                replied: 0,
+                quarantined: false,
+                batch: crate::ui::terminal_color_batch::ColorBatch::new(std::time::Instant::now()),
+            }]),
+            ..Default::default()
+        };
+        assert!(!super::expire_initial_terminal_colors(
+            &terminal, &mut theme
+        ));
+        assert_eq!(theme.color("accent"), Color::Reset);
+        *terminal.initial_started.as_mut().unwrap() -= std::time::Duration::from_millis(101);
+        assert!(super::expire_initial_terminal_colors(&terminal, &mut theme));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+        mark_terminal_colors_pending();
+        theme = super::Theme::system();
+        assert!(super::finish_initial_terminal_colors(&mut theme));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+        assert!(!super::finish_initial_terminal_colors(&mut theme));
+
+        // An early error drops the owner even before Terminal::enter succeeds.
+        let failed_start = || -> pi_rs::Result<()> {
+            let _pending = crate::ui::theme::PendingTerminalColors::new();
+            Err(pi_rs::Error::Config("startup failed".into()))
+        };
+        assert!(failed_start().is_err());
+        assert!(matches!(
+            super::Theme::system().color("accent"),
+            Color::Rgb { .. }
+        ));
+
+        // Suspending or launching an external editor drops the terminal, not the
+        // pending owner. The replacement query can still settle normally.
+        let _pending = crate::ui::theme::PendingTerminalColors::new();
+        let guard = super::Terminal {
             alternate: false,
             images: Default::default(),
             progress: None,
-            color_queries: std::collections::VecDeque::from([super::ColorQuery {
-                started: std::time::Instant::now(),
-                replied: ((1 << 18) - 1) & !1,
-            }]),
-            color_requery: true,
-            expired_color_markers: 0,
+            colors: super::ColorQueries::default(),
+            appearance_notifications: false,
             #[cfg(unix)]
-            keyboard: super::KeyboardProtocol::Kitty,
-        });
-        assert!(!terminal.accepts_color_reply(0).unwrap());
-        assert_eq!(terminal.color_queries.len(), 1);
-        assert_eq!(terminal.color_queries[0].replied, 0);
-        assert_eq!(terminal.expired_color_markers, 1);
-        terminal.receive_color_marker().unwrap();
-        assert!(terminal.accepts_color_reply(0).unwrap());
+            keyboard: super::KeyboardProtocol::Disabled,
+            #[cfg(unix)]
+            _suspend_signal: None,
+        };
+        drop(guard);
+        theme = super::Theme::system();
+        assert_eq!(theme.color("accent"), Color::Reset);
+        let resumed = super::ColorQueries {
+            initial_started: Some(
+                std::time::Instant::now() - std::time::Duration::from_millis(101),
+            ),
+            ..Default::default()
+        };
+        assert!(super::expire_initial_terminal_colors(&resumed, &mut theme));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+
+        // The final target, including an invalid response, settles without DA1.
+        mark_terminal_colors_pending();
+        theme = super::Theme::system();
+        let mut colors = super::ColorQueries::default();
+        colors.query_terminal_colors(&mut std::io::sink()).unwrap();
+        for target in 0..18 {
+            assert!(
+                colors
+                    .accepts_color_reply(target, &mut std::io::sink())
+                    .unwrap()
+            );
+            if target < 17 {
+                assert!(!super::settle_complete_colors(&colors, &mut theme));
+            }
+        }
+        assert!(super::settle_complete_colors(&colors, &mut theme));
+        assert!(matches!(theme.color("accent"), Color::Rgb { .. }));
+        assert!(!super::settle_complete_colors(&colors, &mut theme));
     }
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn late_color_marker_does_not_complete_the_new_query() {
-        let mut terminal = std::mem::ManuallyDrop::new(super::Terminal {
-            alternate: false,
-            images: Default::default(),
-            progress: None,
-            color_queries: std::collections::VecDeque::from([super::ColorQuery {
-                started: std::time::Instant::now(),
-                replied: 0,
-            }]),
-            color_requery: false,
-            expired_color_markers: 1,
-            #[cfg(unix)]
-            keyboard: super::KeyboardProtocol::Kitty,
-        });
-        terminal.receive_color_marker().unwrap();
-        assert_eq!(terminal.color_queries.len(), 1);
-        assert!(terminal.accepts_color_reply(5).unwrap());
-        terminal.receive_color_marker().unwrap();
-        assert!(terminal.color_queries.is_empty());
+    fn appearance_event_retains_colors_during_partial_requery() {
+        const CHILD: &str = "PI_RS_SYSTEM_APPEARANCE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::appearance_event_retains_colors_during_partial_requery",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::ui::theme::{
+            begin_terminal_palette_query, reset_terminal_background, set_terminal_color,
+            set_terminal_palette,
+        };
+        use crossterm::style::Color;
+        reset_terminal_background();
+        set_terminal_color(false, 0, 0, 0);
+        begin_terminal_palette_query();
+        for index in 0..16 {
+            set_terminal_palette(index, index, 10, 20);
+        }
+        let mut theme = super::Theme::system();
+        let original_accent = theme.color("accent");
+        assert!(matches!(original_accent, Color::Rgb { .. }));
+        let (_, redraw) = super::apply_terminal_appearance(&mut theme, false);
+        assert!(!redraw);
+        assert_eq!(theme.color("accent"), original_accent);
+        begin_terminal_palette_query();
+        for index in 0..8 {
+            set_terminal_palette(index, index, 30, 40);
+        }
+        assert_eq!(theme.color("accent"), original_accent);
+        set_terminal_color(false, 255, 255, 255);
+        let refreshed = super::Theme::system();
+        assert!(matches!(refreshed.color("accent"), Color::Rgb { .. }));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn initial_appearance_report_does_not_discard_initial_colors() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.appearance_probe = Some(super::AppearanceProbe::WaitingForColors);
+        colors.query_terminal_colors(&mut output).unwrap();
+        let initial_len = output.len();
+        // A late initial appearance response may follow an OSC reply.
+        assert!(colors.accepts_color_reply(16, &mut output).unwrap());
+        colors.color_queries.front_mut().unwrap().started -= std::time::Duration::from_secs(2);
+        colors.initial_started = Some(colors.color_queries.front().unwrap().started);
+        assert!(!colors.appearance_report(true, &mut output).unwrap());
+        assert!(!colors.color_requery);
+        assert!(colors.accepts_color_reply(17, &mut output).unwrap());
+        assert!(colors.accepts_color_reply(0, &mut output).unwrap());
+        assert_eq!(output.len(), initial_len);
+        // A subsequent appearance report must still schedule a refresh.
+        assert!(colors.appearance_report(false, &mut output).unwrap());
+        assert!(colors.color_requery);
+        assert!(!colors.accepts_color_reply(1, &mut output).unwrap());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn appearance_subscription_probe_does_not_repeat_the_color_query() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+
+        // The old color query is still in flight when notifications turn on.
+        // Its marker cannot expire the probe for the next query.
+        colors.appearance_probe = Some(super::AppearanceProbe::WaitingForColors);
+        colors
+            .refresh_after_appearance_subscription(&mut output)
+            .unwrap();
+        assert!(colors.color_requery);
+        colors.receive_color_marker(&mut output).unwrap();
+        assert!(!colors.color_requery);
+        let subscription_len = output.len();
+        assert!(!colors.appearance_report(false, &mut output).unwrap());
+        assert_eq!(output.len(), subscription_len);
+        assert!(!colors.color_requery);
+        colors.receive_color_marker(&mut output).unwrap();
+
+        // A terminal can ignore the explicit probe and still notify later.
+        colors.appearance_probe = Some(super::AppearanceProbe::WaitingForColors);
+        colors
+            .refresh_after_appearance_subscription(&mut output)
+            .unwrap();
+        colors.receive_color_marker(&mut output).unwrap();
+        let before_change = output.len();
+        assert!(colors.appearance_report(true, &mut output).unwrap());
+        assert!(output.len() > before_change);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn handoff_appearance_change_invalidates_only_on_new_report() {
+        const CHILD: &str = "PI_RS_HANDOFF_APPEARANCE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::handoff_appearance_change_invalidates_only_on_new_report",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::ui::theme::{reset_terminal_background, set_terminal_color};
+        use crossterm::style::Color;
+        reset_terminal_background();
+        set_terminal_color(false, 0, 0, 0);
+        let mut theme = super::Theme::system();
+        let original = theme.color("accent");
+        assert!(matches!(original, Color::Rgb { .. }));
+        // The terminal's dark background can differ from its light OS appearance.
+        let mut colors = super::ColorQueries {
+            last_appearance_report: Some(false),
+            ..Default::default()
+        };
+        colors.disable_after_handoff();
+        let (_, redraw) =
+            super::handle_terminal_appearance(&mut colors, &mut theme, false, &mut std::io::sink())
+                .unwrap();
+        assert!(!redraw);
+        assert_eq!(theme.color("accent"), original);
+        // A changed report invalidates the stale background even when the new
+        // report happens to match the old background's inferred appearance.
+        let (changed, redraw) =
+            super::handle_terminal_appearance(&mut colors, &mut theme, true, &mut std::io::sink())
+                .unwrap();
+        assert!(changed && redraw);
+        assert!(matches!(theme.color("accent"), Color::AnsiValue(_)));
+
+        // Starting with a fixed theme leaves no initial appearance report.
+        // Re-enabling automatic mode must still replace stale OSC colors.
+        set_terminal_color(false, 0, 0, 0);
+        theme = super::Theme::system();
+        let mut colors = super::ColorQueries::default();
+        colors.disable_after_handoff();
+        let mut output = Vec::new();
+        colors
+            .refresh_after_appearance_subscription(&mut output)
+            .unwrap();
+        let (changed, redraw) =
+            super::handle_terminal_appearance(&mut colors, &mut theme, false, &mut output).unwrap();
+        assert!(changed && redraw);
+        assert!(matches!(theme.color("accent"), Color::AnsiValue(_)));
+        assert_eq!(
+            super::Theme::load("light/dark", &[], std::path::Path::new("."), false, false)
+                .unwrap()
+                .name,
+            "light"
+        );
+        assert!(output.is_empty());
+        assert!(
+            !super::handle_terminal_appearance(&mut colors, &mut theme, false, &mut output)
+                .unwrap()
+                .1
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn color_snapshot_applies_foreground_and_background_together() {
+        const CHILD: &str = "PI_RS_COLOR_BATCH_ATOMIC_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "interactive::tests::color_snapshot_applies_foreground_and_background_together",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        crate::ui::theme::reset_terminal_background();
+        crate::ui::theme::set_terminal_color(true, 255, 255, 255);
+        crate::ui::theme::set_terminal_color(false, 0, 0, 0);
+        let mut theme = super::Theme::system();
+        let original = theme.color("accent");
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert!(
+            colors
+                .record_color(17, [255, 255, 255], &mut output)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(super::Theme::system().color("accent"), original);
+        assert!(
+            colors
+                .record_color(16, [0, 0, 0], &mut output)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(super::Theme::system().color("accent"), original);
+        let snapshot = colors.receive_color_marker(&mut output).unwrap().unwrap();
+        super::apply_terminal_color_snapshot(snapshot, &mut theme);
+        assert_ne!(theme.color("accent"), original);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn invalid_color_response_completes_and_delivers_valid_colors() {
+        for invalid_first in [true, false] {
+            for after_timeout in [true, false] {
+                let mut colors = super::ColorQueries::default();
+                let mut output = Vec::new();
+                colors.query_terminal_colors(&mut output).unwrap();
+                if invalid_first {
+                    assert!(
+                        colors
+                            .record_invalid_color(2, &mut output)
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+                let mut completed = None;
+                for target in 0..18 {
+                    if target == 2 {
+                        continue;
+                    }
+                    if after_timeout && target == 8 {
+                        let deadline =
+                            colors.initial_started.unwrap() + std::time::Duration::from_millis(101);
+                        assert!(colors.timeout_color_batch(deadline).is_some());
+                    }
+                    let snapshot = colors
+                        .record_color(target, [target, 1, 2], &mut output)
+                        .unwrap();
+                    if snapshot.is_some() {
+                        completed = snapshot;
+                    }
+                }
+                if !invalid_first {
+                    completed = colors.record_invalid_color(2, &mut output).unwrap();
+                }
+                let snapshot = completed.expect("all responses should complete the query");
+                assert_eq!(snapshot.foreground, Some([16, 1, 2]));
+                assert_eq!(snapshot.background, Some([17, 1, 2]));
+                assert!(snapshot.palette.is_none());
+                assert!(
+                    colors
+                        .record_color(2, [2, 3, 4], &mut output)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(colors.receive_color_marker(&mut output).unwrap().is_none());
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn invalid_partial_batch_preserves_previous_colors_and_finishes_pending() {
+        const CHILD: &str = "PI_RS_INVALID_PARTIAL_BATCH_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "interactive::tests::invalid_partial_batch_preserves_previous_colors_and_finishes_pending"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::ui::theme::{
+            begin_terminal_palette_query, mark_terminal_colors_pending, reset_terminal_background,
+            set_terminal_color, set_terminal_palette,
+        };
+        reset_terminal_background();
+        set_terminal_color(true, 255, 255, 255);
+        set_terminal_color(false, 0, 0, 0);
+        begin_terminal_palette_query();
+        for index in 0..16 {
+            set_terminal_palette(index, index * 10, 20, 30);
+        }
+        let original = super::Theme::system().color("accent");
+        mark_terminal_colors_pending();
+        let mut theme = super::Theme::system();
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert!(
+            colors
+                .record_invalid_color(16, &mut output)
+                .unwrap()
+                .is_none()
+        );
+        // A duplicate valid reply cannot replace the invalid response.
+        assert!(
+            colors
+                .record_color(16, [0, 0, 0], &mut output)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            colors
+                .record_color(17, [0, 0, 0], &mut output)
+                .unwrap()
+                .is_none()
+        );
+        let snapshot = colors.receive_color_marker(&mut output).unwrap().unwrap();
+        assert!(snapshot.foreground.is_none() && snapshot.palette.is_none());
+        super::apply_terminal_color_snapshot(snapshot, &mut theme);
+        assert!(super::finish_initial_terminal_colors(&mut theme));
+        assert_eq!(theme.color("accent"), original);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn superseded_partial_snapshot_is_not_delivered() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert!(
+            colors
+                .record_color(17, [255, 255, 255], &mut output)
+                .unwrap()
+                .is_none()
+        );
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert!(
+            colors
+                .record_color(16, [0, 0, 0], &mut output)
+                .unwrap()
+                .is_none()
+        );
+        assert!(colors.receive_color_marker(&mut output).unwrap().is_none());
+        assert!(
+            colors
+                .record_color(17, [0, 0, 0], &mut output)
+                .unwrap()
+                .is_none()
+        );
+        let fresh = colors.receive_color_marker(&mut output).unwrap().unwrap();
+        assert_eq!(fresh.background, Some([0, 0, 0]));
+        assert_eq!(fresh.foreground, None);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn color_requery_waits_for_marker_even_after_all_replies() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        for target in 0..18 {
+            assert!(colors.accepts_color_reply(target, &mut output).unwrap());
+        }
+        let first_len = output.len();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert_eq!(output.len(), first_len);
+        assert!(!colors.accepts_color_reply(0, &mut output).unwrap());
+        let _ = colors.receive_color_marker(&mut output).unwrap();
+        assert!(output.len() > first_len);
+        assert!(colors.accepts_color_reply(0, &mut output).unwrap());
+        let _ = colors.receive_color_marker(&mut output).unwrap();
+        assert!(colors.color_queries.is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn terminal_handoff_rejects_unattributable_markers_and_replies() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        colors.disable_after_handoff();
+        let before = output.len();
+        // The marker may be ours or the external owner's; neither may reopen
+        // queries. Old or external colors must not be applied on return.
+        let _ = colors.receive_color_marker(&mut output).unwrap();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert_eq!(output.len(), before);
+        assert!(!colors.accepts_color_reply(17, &mut output).unwrap());
+        assert!(colors.disabled);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn missing_marker_preserves_queued_retry_until_boundary_returns() {
+        let mut colors = super::ColorQueries::default();
+        let mut output = Vec::new();
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert!(colors.accepts_color_reply(17, &mut output).unwrap());
+        colors.query_terminal_colors(&mut output).unwrap();
+        colors.color_queries.front_mut().unwrap().started -= std::time::Duration::from_secs(3);
+        colors.poll_color_timeout().unwrap();
+        let first_len = output.len();
+        assert!(colors.color_queries[0].quarantined);
+        assert!(colors.color_requery);
+        colors.query_terminal_colors(&mut output).unwrap();
+        assert_eq!(output.len(), first_len);
+        assert!(!colors.accepts_color_reply(0, &mut output).unwrap());
+        // The late boundary releases the queued refresh exactly once.
+        let _ = colors.receive_color_marker(&mut output).unwrap();
+        assert!(output.len() > first_len);
+        assert!(!colors.color_requery);
+        assert!(colors.accepts_color_reply(17, &mut output).unwrap());
+    }
+
+    #[test]
+    fn tree_navigation_preserves_an_existing_editor_draft() {
+        use clap::Parser;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = pi_rs::Session::open(&path).unwrap();
+        session
+            .append_user_with_images("previous user message".into(), vec![], None)
+            .unwrap();
+        let selected = session.head();
+        drop(session);
+        let mut args = super::Cli::parse_from(["pi", "--offline", "--no-trust"]);
+        args.workspace = directory.path().into();
+        args.session = path;
+        let mut view = super::View::default();
+
+        view.editor.replace("unsent draft".into());
+        super::restore_tree_position(&mut args, &mut view, selected).unwrap();
+        assert_eq!(view.editor.text, "unsent draft");
+
+        let image = pi_rs::ImageContent {
+            mime_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        };
+        view.editor.replace(String::new());
+        view.draft_images.push(image.clone());
+        super::restore_tree_position(&mut args, &mut view, selected).unwrap();
+        assert!(view.editor.text.is_empty());
+        assert_eq!(view.draft_images, [image]);
+
+        view.draft_images.clear();
+        super::restore_tree_position(&mut args, &mut view, selected).unwrap();
+        assert_eq!(view.editor.text, "previous user message");
     }
 
     #[test]
@@ -6630,6 +15132,120 @@ mod tests {
             args.session_transition,
             Some(pi_rs::SessionStartReason::New)
         ));
+    }
+
+    #[test]
+    fn new_and_empty_saved_sessions_use_initial_model_and_default_thinking() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.workspace = directory.path().to_owned();
+        args.session_dir = Some(directory.path().to_owned());
+        args.session = directory.path().join("current.jsonl");
+        args.endpoint = "https://example.invalid/v1/chat/completions".into();
+        args.endpoint_explicit = true;
+        args.initial_connection = Some((super::super::Provider::Ollama, args.endpoint.clone()));
+        std::fs::create_dir_all(directory.path().join(".pi")).unwrap();
+        std::fs::write(
+            directory.path().join(".pi/settings.json"),
+            r#"{"defaultThinkingLevel":"low"}"#,
+        )
+        .unwrap();
+        args.settings = super::super::config::Settings::load(directory.path(), true).unwrap();
+        args.model = "alpha".into();
+        args.thinking = Some("low".into());
+        args.no_trust = true;
+        args.remember_initial_selection();
+        let empty_path = directory.path().join("saved-empty.jsonl");
+        drop(pi_rs::Session::open(&empty_path).unwrap());
+        let mut view = super::View {
+            available_models: vec!["ollama/alpha".into(), "ollama/beta".into()],
+            ..Default::default()
+        };
+        super::slash("/model beta:high", &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "beta");
+        assert_eq!(args.thinking.as_deref(), Some("high"));
+        super::slash("/new", &mut args, &mut view, None).unwrap();
+        assert_eq!(args.model, "alpha");
+        assert_eq!(args.thinking.as_deref(), Some("low"));
+        let session = pi_rs::Session::open(&args.session).unwrap();
+        assert_eq!(
+            session.model_selection(),
+            Some(("alpha".into(), Some("low".into())))
+        );
+        assert_eq!(session.model_provider(), None);
+        drop(session);
+        super::switch_session(&mut args, &mut view, empty_path).unwrap();
+        assert_eq!(args.model, "alpha");
+    }
+
+    #[test]
+    fn new_session_restores_original_cli_model_and_thinking_overrides() {
+        use clap::Parser;
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = super::Cli::parse_from(["pi", "--offline"]);
+        args.workspace = directory.path().into();
+        args.session_dir = Some(directory.path().into());
+        args.session = directory.path().join("current.jsonl");
+        args.endpoint = "https://example.invalid/v1/chat/completions".into();
+        args.endpoint_explicit = true;
+        args.initial_connection = Some((super::super::Provider::Ollama, args.endpoint.clone()));
+        args.model = "alpha".into();
+        args.thinking = Some("low".into());
+        args.model_explicit = true;
+        args.thinking_explicit = true;
+        args.remember_initial_selection();
+        let mut view = super::View {
+            available_models: vec!["ollama/alpha".into(), "ollama/beta".into()],
+            ..Default::default()
+        };
+        super::slash("/model beta:high", &mut args, &mut view, None).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("beta", Some("high"))
+        );
+        super::slash("/new", &mut args, &mut view, None).unwrap();
+        assert_eq!(
+            (args.model.as_str(), args.thinking.as_deref()),
+            ("alpha", Some("low"))
+        );
+        let session = pi_rs::Session::open(&args.session).unwrap();
+        assert_eq!(
+            session.model_selection(),
+            Some(("alpha".into(), Some("low".into())))
+        );
+    }
+
+    #[test]
+    fn new_session_restores_individual_cli_overrides() {
+        use clap::Parser;
+        for (model_explicit, thinking_explicit, expected_thinking) in
+            [(true, false, "medium"), (false, true, "low")]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let mut args = super::Cli::parse_from(["pi", "--offline"]);
+            args.workspace = directory.path().into();
+            args.session_dir = Some(directory.path().into());
+            args.session = directory.path().join("current.jsonl");
+            args.endpoint = "https://example.invalid/v1/chat/completions".into();
+            args.endpoint_explicit = true;
+            args.initial_connection = Some((super::super::Provider::Ollama, args.endpoint.clone()));
+            args.model = "alpha".into();
+            args.thinking = Some("low".into());
+            args.model_explicit = model_explicit;
+            args.thinking_explicit = thinking_explicit;
+            args.remember_initial_selection();
+            let mut view = super::View {
+                available_models: vec!["ollama/alpha".into(), "ollama/beta".into()],
+                ..Default::default()
+            };
+            super::slash("/model beta:high", &mut args, &mut view, None).unwrap();
+            super::slash("/new", &mut args, &mut view, None).unwrap();
+            assert_eq!(
+                (args.model.as_str(), args.thinking.as_deref()),
+                ("alpha", Some(expected_thinking))
+            );
+        }
     }
 
     #[test]
@@ -6762,6 +15378,50 @@ mod tests {
         assert_eq!(wrap("日本abc", 4), vec!["日本", "abc"]);
         assert!(!clean("hello\x1b[31m\x07").contains('\x1b'));
     }
+    #[test]
+    fn prompt_history_moves_repeated_prompts_to_the_most_recent_position() {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = dir.path().join("session.jsonl");
+        let mut session = Session::open(&args.session).unwrap();
+        for prompt in ["p1", "p2", "p3", "p4", "p5"] {
+            session
+                .append_user_with_images(prompt.to_owned(), Vec::new(), None)
+                .unwrap();
+        }
+        let third = session
+            .records()
+            .iter()
+            .find(|record| matches!(&record.event, pi_rs::Event::User { content, .. } if content == "p3"))
+            .unwrap()
+            .id;
+        drop(session);
+
+        let mut view = View::default();
+        view.restore(&args).unwrap();
+        assert_eq!(view.history, ["p1", "p2", "p3", "p4", "p5"]);
+        view.remember_prompt(" \u{feff}p1 ");
+        view.remember_prompt("  ");
+        assert_eq!(view.history, ["p2", "p3", "p4", "p5", "p1"]);
+
+        let mut session = Session::open(&args.session).unwrap();
+        session.checkout(third).unwrap();
+        drop(session);
+        view.restore(&args).unwrap();
+        assert_eq!(view.history, ["p4", "p5", "p1", "p2", "p3"]);
+        view.restore(&args).unwrap();
+        assert_eq!(view.history, ["p4", "p5", "p1", "p2", "p3"]);
+        for id in 0..100 {
+            view.remember_prompt(&format!("entry {id}"));
+        }
+        view.remember_prompt("entry 0");
+        assert_eq!(view.history.len(), 100);
+        assert_eq!(view.history.first().unwrap(), "entry 1");
+        assert_eq!(view.history.last().unwrap(), "entry 0");
+    }
+
     #[test]
     fn regular_history_eviction_preserves_the_uncommitted_entry_boundary() {
         let mut view = View::default();

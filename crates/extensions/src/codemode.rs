@@ -1,12 +1,17 @@
 //! A bounded QuickJS runner that reaches external effects only through ToolHost.
+#[cfg(test)]
+use pi_rs_core::ModelRequest;
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::{Future, poll_fn};
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use pi_rs_core::{
-    Extension, ExtensionResult, ExtensionState, ModelRequest, Outcome, RequestPurpose, Tool,
-    ToolContext, ToolHost, ToolReply, ToolSpec,
+    Extension, ExtensionResult, ExtensionState, Outcome, RequestPurpose, Tool, ToolContext,
+    ToolHost, ToolReply, ToolSpec,
 };
 use rquickjs::{
     AsyncContext, AsyncRuntime, Promise,
@@ -21,10 +26,187 @@ const ID: &str = "codemode";
 const MODEL_OPERATION: &str = "pi_model_operation";
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_ITEMS: usize = 100_000;
+const MAX_PREVIEW_UNITS: usize = 100 * 1024;
+const MAX_INLINE_BYTES: usize = 7 * 1024 * 1024;
+// A code unit uses at most six bytes in a JSON string. Reserve space for
+// the preview and its warning before adding image metadata.
+const MAX_INLINE_IMAGE_LABEL_BYTES: usize = MAX_INLINE_BYTES - 6 * MAX_PREVIEW_UNITS - 4096;
+const WORKER_WAIT_LIMIT: Duration = Duration::from_secs(60);
+
+// Resizing never revokes a running worker. Excess permits are retired when
+// they become available, including when a running worker releases its slot.
+struct WorkerPool {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    admission: tokio::sync::Mutex<()>,
+    capacity: Mutex<usize>,
+    limit: Box<dyn Fn() -> usize + Send + Sync>,
+}
+
+impl WorkerPool {
+    fn new(limit: impl Fn() -> usize + Send + Sync + 'static) -> Arc<Self> {
+        let capacity = limit();
+        Arc::new(Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(capacity)),
+            admission: tokio::sync::Mutex::new(()),
+            capacity: Mutex::new(capacity),
+            limit: Box::new(limit),
+        })
+    }
+
+    fn resize(&self) {
+        let mut capacity = self.capacity.lock().expect("worker capacity");
+        let limit = (self.limit)();
+        if limit > *capacity {
+            self.semaphore.add_permits(limit - *capacity);
+            *capacity = limit;
+        } else {
+            while *capacity > limit {
+                let Ok(permit) = self.semaphore.clone().try_acquire_owned() else {
+                    break;
+                };
+                permit.forget();
+                *capacity -= 1;
+            }
+        }
+    }
+}
+
+struct WorkerPermit {
+    pool: Arc<WorkerPool>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for WorkerPermit {
+    fn drop(&mut self) {
+        let mut capacity = self.pool.capacity.lock().expect("worker capacity");
+        let limit = (self.pool.limit)();
+        if *capacity > limit {
+            self.permit.take().expect("worker permit").forget();
+            *capacity -= 1;
+        } else {
+            drop(self.permit.take());
+        }
+        drop(capacity);
+        self.pool.resize();
+    }
+}
+
+fn worker_limit() -> usize {
+    std::env::var("PI_CODEMODE_MAX_WORKERS")
+        .ok()
+        .and_then(|value| parse_worker_limit(&value))
+        .unwrap_or(2)
+}
+
+fn parse_worker_limit(value: &str) -> Option<usize> {
+    let value =
+        value.trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}');
+    let radix_number = |digits: &str, radix| {
+        (!digits.is_empty() && digits.chars().all(|c| c.is_ascii() && c.is_digit(radix)))
+            .then(|| u64::from_str_radix(digits, radix).ok().map(|n| n as f64))
+            .flatten()
+    };
+    // Pi uses JavaScript Number(), which also accepts unsigned radix prefixes.
+    let number = if let Some(digits) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        radix_number(digits, 16)?
+    } else if let Some(digits) = value
+        .strip_prefix("0o")
+        .or_else(|| value.strip_prefix("0O"))
+    {
+        radix_number(digits, 8)?
+    } else if let Some(digits) = value
+        .strip_prefix("0b")
+        .or_else(|| value.strip_prefix("0B"))
+    {
+        radix_number(digits, 2)?
+    } else {
+        value.parse::<f64>().ok()?
+    };
+    (number.is_finite() && number.fract() == 0.0 && number > 0.0 && number <= 1024.0)
+        .then_some(number as usize)
+}
+
+#[derive(Debug)]
+enum WorkerAdmissionError {
+    Cancelled,
+    Deadline,
+    Busy,
+    Closed,
+}
+
+impl WorkerAdmissionError {
+    fn reply(self, elapsed: Duration, timeout: Option<Duration>, worker_count: usize) -> ToolReply {
+        let reason = match self {
+            Self::Cancelled => "Script aborted: Execution aborted".into(),
+            Self::Deadline => format!(
+                "Script timed out: Execution timed out after {} ms while waiting for a free codemode worker",
+                timeout
+                    .expect("admission deadline requires a timeout")
+                    .as_millis()
+            ),
+            Self::Busy => format!(
+                "No codemode worker became free within {} seconds. All {worker_count} workers, shared by every session in this process, are held by other scripts. Retry after they finish.",
+                WORKER_WAIT_LIMIT.as_secs()
+            ),
+            Self::Closed => "Codemode worker pool closed".into(),
+        };
+        Outcome::Failed(format!(
+            "Script failed\nWall time {:.1} seconds\nOutput:\n\nScript error:\n{reason}\n\nThe script did not start.",
+            elapsed.as_secs_f64()
+        ))
+        .into()
+    }
+}
+
+async fn acquire_worker(
+    workers: &Arc<WorkerPool>,
+    cancellation: &pi_rs_core::CancellationToken,
+    deadline: Option<Duration>,
+    wait_limit: Duration,
+) -> Result<WorkerPermit, WorkerAdmissionError> {
+    if cancellation.is_cancelled() {
+        return Err(WorkerAdmissionError::Cancelled);
+    }
+    workers.resize();
+    let wait = deadline.map_or(wait_limit, |limit| limit.min(wait_limit));
+    let acquire = async {
+        // Keep the first waiter in front even when it must retire an excess
+        // permit returned after a concurrent cancellation.
+        let _turn = workers.admission.lock().await;
+        loop {
+            let permit = workers.semaphore.clone().acquire_owned().await?;
+            let permit = WorkerPermit {
+                pool: workers.clone(),
+                permit: Some(permit),
+            };
+            // A cancelled waiter can return a granted semaphore permit after a
+            // shrink. Retire that excess before it starts another worker.
+            let excess = *workers.capacity.lock().expect("worker capacity") > (workers.limit)();
+            if !excess {
+                return Ok::<_, tokio::sync::AcquireError>(permit);
+            }
+            drop(permit);
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(WorkerAdmissionError::Cancelled),
+        result = tokio::time::timeout(wait, acquire) => match result {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err(WorkerAdmissionError::Closed),
+            Err(_) if deadline.is_some_and(|limit| limit <= wait_limit) => Err(WorkerAdmissionError::Deadline),
+            Err(_) => Err(WorkerAdmissionError::Busy),
+        },
+    }
+}
 
 pub struct Codemode {
     pub only: bool,
     pub inline_budget: usize,
+    /// Maximum script duration; `Duration::MAX` means no deadline.
     pub timeout: Duration,
 }
 impl Default for Codemode {
@@ -32,7 +214,7 @@ impl Default for Codemode {
         Self {
             only: false,
             inline_budget: 3000,
-            timeout: Duration::from_secs(30),
+            timeout: Duration::MAX,
         }
     }
 }
@@ -43,7 +225,7 @@ impl Extension for Codemode {
     }
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
         vec![Arc::new(ScriptTool {
-            timeout: self.timeout,
+            timeout: (self.timeout != Duration::MAX).then_some(self.timeout),
         })]
     }
     fn migrate(
@@ -60,26 +242,14 @@ impl Extension for Codemode {
     }
     async fn before_request(
         &self,
-        request: &mut ModelRequest,
+        request: &mut pi_rs_core::ContextRequest<'_>,
         _: RequestPurpose,
         _: Option<&ExtensionState>,
-    ) -> ExtensionResult<()> {
-        let mut declarations = String::new();
-        for tool in request.tools.iter().filter(|tool| {
-            !matches!(
-                tool.name.as_str(),
-                "codemode" | "tool_search" | MODEL_OPERATION
-            )
-        }) {
-            let entry = describe(tool);
-            if declarations.len() + entry.len() > self.inline_budget.saturating_mul(4) {
-                break;
-            }
-            declarations.push_str(&entry);
-            declarations.push('\n');
-        }
+    ) -> ExtensionResult<pi_rs_core::ContextChange> {
+        let original_tools = request.tools.clone();
+        let declarations = inline_declarations(&request.tools, self.inline_budget);
         if let Some(tool) = request
-            .tools
+            .tools_mut()
             .iter_mut()
             .find(|tool| tool.name == "codemode")
         {
@@ -88,18 +258,25 @@ impl Extension for Codemode {
             tool.description.push_str(&declarations);
             if self.only {
                 request
-                    .tools
+                    .tools_mut()
                     .retain(|tool| matches!(tool.name.as_str(), "codemode" | "tool_search"));
             }
         }
-        Ok(())
+        Ok(if request.tools == original_tools {
+            pi_rs_core::ContextChange::Unchanged
+        } else {
+            pi_rs_core::ContextChange::Changed
+        })
     }
 }
 struct ScriptTool {
-    timeout: Duration,
+    timeout: Option<Duration>,
 }
 #[async_trait::async_trait]
 impl Tool for ScriptTool {
+    fn use_default_timeout(&self) -> bool {
+        false
+    }
     fn output_limit(&self) -> usize {
         8 * 1024 * 1024
     }
@@ -120,55 +297,159 @@ impl Tool for ScriptTool {
         previous: Option<&ExtensionState>,
         host: Arc<dyn ToolHost>,
     ) -> ToolReply {
+        self.invoke_transaction_with_timeout(arguments, context, previous, host, None)
+            .await
+    }
+    async fn invoke_transaction_with_timeout(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        previous: Option<&ExtensionState>,
+        host: Arc<dyn ToolHost>,
+        host_timeout: Option<Duration>,
+    ) -> ToolReply {
         let started = Instant::now();
         let Some(code) = arguments["code"].as_str() else {
             return Outcome::Failed("code must be a string".into()).into();
         };
-        let (options, source) = match options(code, self.timeout) {
+        let maximum = match (self.timeout, host_timeout) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let (options, source) = match options(code, maximum) {
             Ok(value) => value,
             Err(error) => return Outcome::Failed(error).into(),
         };
         if previous.is_some_and(|state| state.version != 1 || !state.data.is_object()) {
             return Outcome::Failed("invalid codemode store state".into()).into();
         }
-        static WORKERS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-        let workers = WORKERS.get_or_init(|| {
-            let maximum = std::env::var("PI_CODEMODE_MAX_WORKERS")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| *value > 0 && *value <= 1024)
-                .unwrap_or(2);
-            tokio::sync::Semaphore::new(maximum)
-        });
-        let _permit = tokio::select! {
-            _ = context.cancellation.cancelled() => return Outcome::Failed("Script cancelled while waiting for a worker".into()).into(),
-            permit = tokio::time::timeout(options.timeout.min(Duration::from_secs(60)), workers.acquire()) => match permit {
-                Ok(Ok(permit)) => permit,
-                _ => return Outcome::Failed("Timed out waiting for a codemode worker".into()).into(),
-            }
+        static WORKERS: OnceLock<Arc<WorkerPool>> = OnceLock::new();
+        let workers = WORKERS.get_or_init(|| WorkerPool::new(worker_limit));
+        let admission_deadline = match options.timeout {
+            Some(timeout) => match timeout
+                .checked_sub(started.elapsed())
+                .filter(|time| !time.is_zero())
+            {
+                Some(remaining) => Some(remaining),
+                None => {
+                    return WorkerAdmissionError::Deadline.reply(
+                        started.elapsed(),
+                        options.timeout,
+                        (workers.limit)(),
+                    );
+                }
+            },
+            None => None,
         };
-        let Some(remaining) = options
-            .timeout
-            .checked_sub(started.elapsed())
-            .filter(|time| !time.is_zero())
-        else {
-            return Outcome::Failed("Script deadline elapsed before execution".into()).into();
+        let permit = match acquire_worker(
+            workers,
+            &context.cancellation,
+            admission_deadline,
+            WORKER_WAIT_LIMIT,
+        )
+        .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                return error.reply(started.elapsed(), options.timeout, (workers.limit)());
+            }
         };
         let store = previous
             .map(|state| state.data.clone())
             .unwrap_or_else(|| json!({}));
         let sink = Arc::new(Mutex::new(Output::default()));
-        let result = evaluate(source, store, host, context, remaining, sink.clone()).await;
-        let (success, changed, store, error) = match result {
+        let worker_sink = sink.clone();
+        let worker_cancel = context.cancellation.child_token();
+        let format_cancel = context.cancellation.child_token();
+        let _cancel_format_on_drop = format_cancel.clone().drop_guard();
+        // The caller may drop this future on timeout or cancellation. Keep the
+        // permit in the worker until QuickJS has actually stopped, and wake its
+        // interrupt handler even when nobody remains to await the join handle.
+        let _cancel_on_drop = worker_cancel.clone().drop_guard();
+        let worker_context = ToolContext {
+            operation_id: context.operation_id,
+            cancellation: worker_cancel,
+        };
+        let source = source.to_owned();
+        let handle = tokio::runtime::Handle::current();
+        let timeout = options.timeout;
+        let worker = tokio::task::spawn_blocking(move || {
+            let remaining = match timeout {
+                Some(timeout) => {
+                    match timeout
+                        .checked_sub(started.elapsed())
+                        .filter(|time| !time.is_zero())
+                    {
+                        Some(remaining) => Some(remaining),
+                        None => {
+                            return (
+                                Err("Script deadline elapsed before execution".into()),
+                                permit,
+                            );
+                        }
+                    }
+                }
+                None => None,
+            };
+            let result = handle.block_on(evaluate(
+                &source,
+                store,
+                host,
+                worker_context,
+                remaining,
+                worker_sink,
+            ));
+            (result, permit)
+        })
+        .await;
+        let (result, permit) = match worker {
+            Ok(result) => result,
+            Err(error) => {
+                return Outcome::Failed(format!("Codemode worker failed: {error}")).into();
+            }
+        };
+        let limit_exceeded = sink.lock().expect("codemode output").limit_exceeded;
+        let (mut success, changed, store, error) = match result {
+            _ if limit_exceeded => (
+                false,
+                false,
+                json!({}),
+                Some("Script output limit exceeded".into()),
+            ),
             Ok(result) => (result.ok, result.changed, result.store, result.error),
             Err(error) => (false, false, json!({}), Some(error)),
         };
-        let output = sink.lock().expect("codemode output").finish(
-            success,
-            started.elapsed(),
-            error.as_deref(),
-            options.max_output_tokens,
-        );
+        let elapsed = started.elapsed();
+        let formatter_cancel = format_cancel.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            with_worker_permit(permit, || {
+                sink.lock().expect("codemode output").finish(
+                    success,
+                    elapsed,
+                    error.as_deref(),
+                    options.max_output_tokens,
+                    &formatter_cancel,
+                )
+            })
+        })
+        .await;
+        if format_cancel.is_cancelled() {
+            return Outcome::Failed("Script cancelled while formatting output".into()).into();
+        }
+        let mut publication = match output {
+            Ok(Some(output)) => output.publish(),
+            Ok(None) => {
+                return Outcome::Failed("Script cancelled while formatting output".into()).into();
+            }
+            Err(error) => {
+                success = false;
+                Publication {
+                    value: json!({"content":[{"type":"text","text":format!("Codemode output formatting failed: {error}")}],"isError":true}),
+                    transcript: None,
+                }
+            }
+        };
+        let output = std::mem::take(&mut publication.value);
         let outcome = if success {
             Outcome::Structured {
                 data: output,
@@ -185,58 +466,102 @@ impl Tool for ScriptTool {
                     .join("\n"),
             )
         };
-        ToolReply {
+        let reply = ToolReply {
             outcome,
             state: (success && changed).then_some(ExtensionState {
                 version: 1,
                 data: store,
             }),
+        };
+        // This final cancellation observation is the publication commit point.
+        // There is no await between it and returning the reply. Until then the
+        // guard removes even a transcript that has already been persisted.
+        if !publication.commit_if_active(&format_cancel) {
+            return Outcome::Failed("Script cancelled while formatting output".into()).into();
         }
+        reply
     }
 }
 struct Options {
     max_output_tokens: usize,
-    timeout: Duration,
+    timeout: Option<Duration>,
 }
-#[derive(Deserialize)]
-struct WireOptions {
-    max_output_tokens: Option<usize>,
-    timeout_ms: Option<u64>,
-}
-fn options(code: &str, maximum: Duration) -> Result<(Options, &str), String> {
-    let first = code.lines().next().unwrap_or_default();
-    let parsed = first
-        .strip_prefix("// @options:")
-        .map(|value| serde_json::from_str::<WireOptions>(value).map_err(|error| error.to_string()))
-        .transpose()?;
-    if code
-        .lines()
-        .skip(1)
-        .any(|line| line.trim_start().starts_with("// @options:"))
-    {
-        return Err("options must be on the first line".into());
+fn options(code: &str, maximum: Option<Duration>) -> Result<(Options, &str), String> {
+    const PREFIX: &str = "// @options:";
+    const FIELDS: &str = "`max_output_tokens` and `timeout_ms`";
+    if code.trim().is_empty() {
+        return Err("Expected JavaScript source text (non-empty)".into());
     }
-    let tokens = parsed
-        .as_ref()
-        .and_then(|options| options.max_output_tokens)
-        .unwrap_or(10_000);
-    let timeout = parsed
-        .and_then(|options| options.timeout_ms)
-        .map(Duration::from_millis)
-        .unwrap_or(maximum)
-        .min(maximum);
-    if tokens == 0 || timeout.is_zero() {
-        return Err("output and timeout limits must be positive".into());
+    for (index, line) in code.split('\n').enumerate().skip(1) {
+        if line.trim_start().starts_with(PREFIX) {
+            return Err(format!(
+                "The {PREFIX} line must be the first line of the input; found one on line {}",
+                index + 1
+            ));
+        }
     }
-    let source = if first.starts_with("// @options:") {
-        code.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
-    } else {
-        code
+    let first = code.split('\n').next().unwrap_or_default().trim_start();
+    let Some(directive) = first.strip_prefix(PREFIX) else {
+        return Ok((
+            Options {
+                max_output_tokens: 10_000,
+                timeout: maximum,
+            },
+            code,
+        ));
     };
+    // Keep the newline so errors point at the original source line.
+    let source = code.find('\n').map(|index| &code[index..]).unwrap_or("");
+    if source.trim().is_empty() {
+        return Err(
+            "The @options line must be followed by JavaScript source on subsequent lines".into(),
+        );
+    }
+    let directive = directive.trim();
+    if directive.is_empty() {
+        return Err(format!(
+            "@options must be a JSON object with supported fields {FIELDS}"
+        ));
+    }
+    let value: Value = serde_json::from_str(directive).map_err(|error| {
+        format!("@options must be valid JSON with supported fields {FIELDS}: {error}")
+    })?;
+    let fields = value
+        .as_object()
+        .ok_or_else(|| format!("@options must be a JSON object with supported fields {FIELDS}"))?;
+    for key in fields.keys() {
+        if key != "max_output_tokens" && key != "timeout_ms" {
+            return Err(format!("@options only supports {FIELDS}; got `{key}`"));
+        }
+    }
+    let integer = |name: &str, limit: u64| -> Result<Option<u64>, String> {
+        let Some(value) = fields.get(name) else {
+            return Ok(None);
+        };
+        let number = value
+            .as_f64()
+            .filter(|n| *n >= 0.0 && *n <= limit as f64 && n.fract() == 0.0);
+        number.map(|n| Some(n as u64)).ok_or_else(|| match name {
+            "timeout_ms" => {
+                "@options field `timeout_ms` must be a positive integer up to 2147483647".into()
+            }
+            _ => "@options field `max_output_tokens` must be a non-negative safe integer".into(),
+        })
+    };
+    let tokens = integer("max_output_tokens", 9_007_199_254_740_991)?.unwrap_or(10_000);
+    let timeout = integer("timeout_ms", 2_147_483_647)?;
+    if timeout == Some(0) {
+        return Err(
+            "@options field `timeout_ms` must be a positive integer up to 2147483647".into(),
+        );
+    }
     Ok((
         Options {
-            max_output_tokens: tokens,
-            timeout,
+            max_output_tokens: usize::try_from(tokens).unwrap_or(usize::MAX),
+            timeout: match (timeout.map(Duration::from_millis), maximum) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
         },
         source,
     ))
@@ -254,19 +579,24 @@ async fn evaluate(
     store: Value,
     host: Arc<dyn ToolHost>,
     context: ToolContext,
-    timeout: Duration,
+    timeout: Option<Duration>,
     sink: Arc<Mutex<Output>>,
 ) -> Result<Completion, String> {
     let runtime = AsyncRuntime::new().map_err(|error| error.to_string())?;
     runtime.set_memory_limit(256 * 1024 * 1024).await;
     runtime.set_max_stack_size(512 * 1024).await;
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or("Invalid script deadline")?;
+    let deadline = timeout
+        .map(|timeout| {
+            Instant::now()
+                .checked_add(timeout)
+                .ok_or("Invalid script deadline")
+        })
+        .transpose()?;
     let cancellation = context.cancellation.clone();
     runtime
         .set_interrupt_handler(Some(Box::new(move || {
-            cancellation.is_cancelled() || Instant::now() >= deadline
+            cancellation.is_cancelled()
+                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
         })))
         .await;
     let javascript = AsyncContext::full(&runtime)
@@ -288,9 +618,10 @@ async fn evaluate(
             .collect(),
     );
     let code = format!("__run(async () => {{\n{source}\n}})");
+    let output_cancellation = context.cancellation.clone();
     let operation = javascript.async_with(async move |ctx| {
         let result: rquickjs::Result<String> = async {
-            install_globals(&ctx, documents, host, store, sink)?;
+            install_globals(&ctx, documents, host, store, sink, output_cancellation)?;
             match ctx.eval::<Promise, _>(code) {
                 Ok(promise) => promise.into_future::<String>().await,
                 Err(error) => Err(error),
@@ -312,10 +643,34 @@ async fn evaluate(
             format!("{error} {detail}")
         })
     });
+    let mut operation = std::pin::pin!(operation);
+    let operation = poll_fn(|cx| match operation.as_mut().poll(cx) {
+        Poll::Ready(result) => Poll::Ready(result),
+        Poll::Pending => {
+            // async_with polls host futures and drains QuickJS jobs before it
+            // yields. This runtime belongs to this script, and a pending host
+            // future keeps the scheduler nonempty even between I/O wakeups.
+            let mut pending_jobs = std::pin::pin!(runtime.is_job_pending());
+            if pending_jobs.as_mut().poll(cx) == Poll::Ready(false) {
+                Poll::Ready(Err("The script is waiting on a promise that can never settle: no tool call is pending, and timers do not exist here.".into()))
+            } else {
+                Poll::Pending
+            }
+        }
+    });
     let result = tokio::select! {
         _ = context.cancellation.cancelled() => return Err("Script cancelled".into()),
-        result = tokio::time::timeout(timeout, operation) => result.map_err(|_| "Script timed out".to_owned())?,
-    }?;
+        result = async {
+            match timeout {
+                Some(timeout) => tokio::time::timeout(timeout, operation).await.map_err(|_| "Script timed out".to_owned())?,
+                None => operation.await,
+            }
+        } => result,
+    };
+    if context.cancellation.is_cancelled() {
+        return Err("Script cancelled".into());
+    }
+    let result = result?;
     serde_json::from_str(&result).map_err(|error| error.to_string())
 }
 fn install_globals(
@@ -324,6 +679,7 @@ fn install_globals(
     host: Arc<dyn ToolHost>,
     store: Value,
     sink: Arc<Mutex<Output>>,
+    cancellation: pi_rs_core::CancellationToken,
 ) -> rquickjs::Result<()> {
     let globals = ctx.globals();
     let catalogue: Vec<_> = documents
@@ -335,15 +691,19 @@ fn install_globals(
         ctx.json_parse(serde_json::to_string(&catalogue).unwrap())?,
     )?;
     globals.set("__initial_store", ctx.json_parse(store.to_string())?)?;
-    let model_usage = sink.clone();
+    let model_output = sink.clone();
+    let tool_output = sink.clone();
+    let output_cancel = cancellation.clone();
+    let model_cancel = cancellation.clone();
     globals.set(
         "__emit",
-        Func::from(move |kind: String, value: String| {
-            sink.lock()
-                .expect("codemode output")
-                .emit(&kind, value)
-                .err()
-                .unwrap_or_default()
+        Func::from(move |kind: String, value: String, mime: String| {
+            let mut output = sink.lock().expect("codemode output");
+            let error = output.emit(&kind, value, &mime).err().unwrap_or_default();
+            if output.limit_exceeded {
+                output_cancel.cancel();
+            }
+            error
         }),
     )?;
     let model_host = host.clone();
@@ -357,20 +717,53 @@ fn install_globals(
         Func::from(Async(move |arguments: String| {
             let model_host = model_host.clone();
             let slots = model_slots.clone();
-            let model_usage = model_usage.clone();
+            let model_output = model_output.clone();
+            let cancellation = model_cancel.clone();
             async move {
                 let result = match serde_json::from_str::<Value>(&arguments) {
                     Ok(args) if has_operations => {
-                        let _permit = slots.acquire().await.expect("model operation slots");
-                        let outcome = model_host.call(MODEL_OPERATION, args).await;
-                        if let Some(usage) = ModelUsage::from_outcome(&outcome) {
-                            model_usage
-                                .lock()
-                                .expect("codemode output")
-                                .model_usage
-                                .add(&usage);
+                        // Only inference consumes Pi's four model-call slots.
+                        // Discovery and model resolution must remain available
+                        // while slow classifier or image requests are in flight.
+                        let generates_images = args["action"] == "generateImages";
+                        let _permit = if matches!(
+                            args["action"].as_str(),
+                            Some("classify" | "generateImages")
+                        ) {
+                            Some(slots.acquire().await.expect("model operation slots"))
+                        } else {
+                            None
+                        };
+                        if model_output.lock().expect("codemode output").limit_exceeded {
+                            return Ok::<_, rquickjs::Error>(
+                                json!({"ok":false,"error":"Script output limit exceeded"})
+                                    .to_string(),
+                            );
                         }
-                        tool_value(outcome)
+                        let outcome = model_host
+                            .call_with_cancellation(MODEL_OPERATION, args, cancellation)
+                            .await;
+                        let usage = ModelUsage::from_outcome(&outcome);
+                        let value = tool_value(outcome);
+                        let generated_images = if generates_images {
+                            value["value"]["output"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter(|block| block["type"] == "image")
+                                .count()
+                        } else {
+                            0
+                        };
+                        if usage.is_some() || generated_images != 0 {
+                            let mut output = model_output.lock().expect("codemode output");
+                            output.generated_images =
+                                output.generated_images.saturating_add(generated_images);
+                            if let Some(usage) = usage {
+                                output.model_usage.add(&usage);
+                            }
+                        }
+                        value
                     }
                     Ok(args) if args["action"] == "list" => json!({"ok":true,"value":[]}),
                     Ok(_) => json!({"ok":false,"error":"native model operations are unavailable"}),
@@ -384,7 +777,14 @@ fn install_globals(
         "__call_tool",
         Func::from(Async(move |name: String, arguments: String| {
             let host = host.clone();
+            let output = tool_output.clone();
+            let cancellation = cancellation.clone();
             async move {
+                if output.lock().expect("codemode output").limit_exceeded {
+                    return Ok::<_, rquickjs::Error>(
+                        json!({"ok":false,"error":"Script output limit exceeded"}).to_string(),
+                    );
+                }
                 let result = match serde_json::from_str(&arguments) {
                     Ok(_)
                         if matches!(
@@ -394,7 +794,11 @@ fn install_globals(
                     {
                         json!({"ok":false,"error":"This tool is not callable from a script"})
                     }
-                    Ok(arguments) => tool_value(host.call(&name, arguments).await),
+                    Ok(arguments) => nested_tool_value(
+                        &name,
+                        host.call_with_cancellation(&name, arguments, cancellation)
+                            .await,
+                    ),
                     Err(error) => json!({"ok":false,"error":error.to_string()}),
                 };
                 Ok::<_, rquickjs::Error>(result.to_string())
@@ -402,10 +806,10 @@ fn install_globals(
         })),
     )?;
     let searchable = documents.clone();
-    globals.set("__search_tools", Func::from(move |query: String, options: String| {
-        let options: Value = serde_json::from_str(&options).unwrap_or_default();
-        let limit = options["limit"].as_u64().unwrap_or(8).min(1000) as usize;
-        let wanted = options["namespace"].as_str().map(normalize_namespace);
+    globals.set("__search_tools", Func::from(move |query: String, limit: f64, namespace: Option<String>| {
+        // The cast saturates for values larger than usize; ranking takes at most the catalogue size.
+        let limit = limit as usize;
+        let wanted = namespace.as_deref().map(normalize_namespace);
         let documents: Vec<_> = searchable.iter().filter(|document| wanted.as_ref().is_none_or(|wanted| tool_namespace(&document.tool.name) == *wanted)).cloned().collect();
         let matches: Vec<_> = rank(&query, &documents, limit).into_iter().map(|(index, _)| json!({"name":documents[index].tool.name,"description":documents[index].tool.description})).collect();
         serde_json::to_string(&matches).unwrap()
@@ -422,12 +826,42 @@ fn install_globals(
     ctx.eval::<(), _>(include_str!("codemode-bootstrap.js"))?;
     Ok(())
 }
+fn nested_tool_value(name: &str, outcome: Outcome) -> Value {
+    // MCP call errors can carry recovery data. Transport errors and native
+    // tool errors still reject their promises through the standard path.
+    if name.starts_with("mcp__")
+        && let Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } =
+            &outcome
+        && data["content"].is_array()
+        && data["isError"] == true
+    {
+        return json!({"ok":true,"value":data});
+    }
+    tool_value(outcome)
+}
+
 fn tool_value(outcome: Outcome) -> Value {
+    if outcome.is_error() {
+        return json!({"ok":false,"error":outcome.tool_content()});
+    }
     match outcome {
-        Outcome::Succeeded(value) | Outcome::SucceededWithDetails { output: value, .. } => {
+        Outcome::Succeeded(value)
+        | Outcome::SucceededWithDetails { output: value, .. }
+        | Outcome::TextResult {
+            output: value,
+            is_error: false,
+            ..
+        }
+        | Outcome::TextResultWithStructuredContent {
+            output: value,
+            is_error: false,
+            ..
+        } => {
             json!({"ok":true,"value":value})
         }
-        Outcome::Structured { data, .. } => json!({"ok":true,"value":data}),
+        Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } => {
+            json!({"ok":true,"value":data})
+        }
         outcome => json!({"ok":false,"error":outcome.tool_content()}),
     }
 }
@@ -446,6 +880,52 @@ fn normalize_namespace(name: &str) -> String {
     let name = name.strip_prefix("mcp__").unwrap_or(&name);
     format!("mcp__{}", name.split("__").next().unwrap_or(name))
 }
+fn inline_declarations(tools: &[ToolSpec], mut budget: usize) -> String {
+    let mut groups = BTreeMap::<String, Vec<(usize, usize)>>::new();
+    let mut sections = Vec::new();
+    for tool in tools
+        .iter()
+        .filter(|tool| !matches!(tool.name.as_str(), ID | "tool_search" | MODEL_OPERATION))
+    {
+        let section = describe(tool);
+        let cost = section.encode_utf16().count().div_ceil(4);
+        groups
+            .entry(tool_namespace(&tool.name))
+            .or_default()
+            .push((sections.len(), cost));
+        sections.push(section);
+    }
+
+    let mut queues = groups
+        .values()
+        .map(|entries| {
+            let mut ordered = entries.clone();
+            ordered.sort_by_key(|&(_, cost)| cost);
+            ordered.into_iter().peekable()
+        })
+        .collect::<Vec<_>>();
+    let mut selected = vec![false; sections.len()];
+    while !queues.is_empty() {
+        queues.retain_mut(|queue| {
+            let Some((index, cost)) = queue.next().filter(|&(_, cost)| cost <= budget) else {
+                return false;
+            };
+            budget -= cost;
+            selected[index] = true;
+            queue.peek().is_some()
+        });
+    }
+
+    let mut result = String::new();
+    for &(index, _) in groups.values().flatten() {
+        if selected[index] {
+            result.push_str(&sections[index]);
+            result.push('\n');
+        }
+    }
+    result
+}
+
 fn describe(tool: &ToolSpec) -> String {
     format!(
         "{}\n{}(args: {}): Promise<unknown>;",
@@ -455,35 +935,103 @@ fn describe(tool: &ToolSpec) -> String {
     )
 }
 fn typescript(schema: &Value) -> String {
-    match schema["type"].as_str() {
-        Some("string") => "string".into(),
-        Some("number" | "integer") => "number".into(),
-        Some("boolean") => "boolean".into(),
-        Some("array") => format!("{}[]", typescript(&schema["items"])),
-        Some("object") => {
-            let fields = schema["properties"]
-                .as_object()
-                .map(|properties| {
-                    properties
-                        .iter()
-                        .map(|(name, value)| {
-                            let required = schema["required"]
-                                .as_array()
-                                .is_some_and(|names| names.iter().any(|value| value == name));
-                            format!(
-                                "{}{}: {}",
-                                serde_json::to_string(name).unwrap(),
-                                if required { "" } else { "?" },
-                                typescript(value)
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })
-                .unwrap_or_default();
-            format!("{{ {fields} }}")
+    let mut renderer = SchemaRenderer {
+        root: schema,
+        resolving: BTreeSet::new(),
+        text: String::new(),
+        units: 0,
+    };
+    match renderer.write_type(schema) {
+        Some(()) => renderer.text,
+        None => "unknown".into(),
+    }
+}
+
+struct SchemaRenderer<'a> {
+    root: &'a Value,
+    resolving: BTreeSet<*const Value>,
+    text: String,
+    units: usize,
+}
+
+impl SchemaRenderer<'_> {
+    fn write(&mut self, text: &str) -> Option<()> {
+        self.units += text.encode_utf16().count();
+        if self.units > 16_000 {
+            return None;
         }
-        _ => "unknown".into(),
+        self.text.push_str(text);
+        Some(())
+    }
+
+    fn write_type(&mut self, schema: &Value) -> Option<()> {
+        if let Some(reference) = schema["$ref"].as_str() {
+            let Some(target) = crate::schema_ref::resolve(self.root, reference) else {
+                return self.write_type_without_ref(schema);
+            };
+            let pointer = std::ptr::from_ref(target);
+            if self.resolving.len() >= 32 || !self.resolving.insert(pointer) {
+                return self.write_type_without_ref(schema);
+            }
+            let has_sibling_type = matches!(
+                schema["type"].as_str(),
+                Some("string" | "number" | "integer" | "boolean" | "array" | "object")
+            );
+            let initial_bytes = self.text.len();
+            let initial_units = self.units;
+            if has_sibling_type {
+                self.write("(")?;
+            }
+            let target_start = self.text.len();
+            let result = self.write_type(target);
+            self.resolving.remove(&pointer);
+            result?;
+            if has_sibling_type {
+                if &self.text[target_start..] == "unknown" {
+                    self.text.truncate(initial_bytes);
+                    self.units = initial_units;
+                    return self.write_type_without_ref(schema);
+                }
+                self.write(" & ")?;
+                self.write_type_without_ref(schema)?;
+                self.write(")")?;
+            }
+            return Some(());
+        }
+        self.write_type_without_ref(schema)
+    }
+
+    fn write_type_without_ref(&mut self, schema: &Value) -> Option<()> {
+        match schema["type"].as_str() {
+            Some("string") => self.write("string"),
+            Some("number" | "integer") => self.write("number"),
+            Some("boolean") => self.write("boolean"),
+            Some("array") => {
+                self.write_type(&schema["items"])?;
+                self.write("[]")
+            }
+            Some("object") => self.write_object(schema),
+            _ if schema == &Value::Bool(false) => self.write("never"),
+            _ => self.write("unknown"),
+        }
+    }
+
+    fn write_object(&mut self, schema: &Value) -> Option<()> {
+        self.write("{ ")?;
+        if let Some(properties) = schema["properties"].as_object() {
+            let required = schema["required"].as_array();
+            for (index, (name, field)) in properties.iter().enumerate() {
+                if index != 0 {
+                    self.write("; ")?;
+                }
+                self.write(&serde_json::to_string(name).unwrap())?;
+                let name_is_required =
+                    required.is_some_and(|names| names.iter().any(|value| value == name));
+                self.write(if name_is_required { ": " } else { "?: " })?;
+                self.write_type(field)?;
+            }
+        }
+        self.write(" }")
     }
 }
 
@@ -539,9 +1087,11 @@ impl ModelUsage {
 struct Output {
     items: Vec<Item>,
     console: Vec<String>,
-    bytes: usize,
+    utf16_units: usize,
     calls: usize,
+    limit_exceeded: bool,
     model_usage: ModelUsage,
+    generated_images: usize,
     saved_images: std::collections::BTreeMap<String, std::result::Result<String, String>>,
 }
 enum Item {
@@ -552,20 +1102,366 @@ enum Item {
         path: std::result::Result<String, String>,
     },
 }
+struct FormattedOutput {
+    value: Value,
+    transcript: Option<tempfile::NamedTempFile>,
+}
+struct Publication {
+    value: Value,
+    transcript: Option<std::path::PathBuf>,
+}
+impl Publication {
+    fn commit_if_active(&mut self, cancellation: &pi_rs_core::CancellationToken) -> bool {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        self.transcript.take();
+        true
+    }
+}
+impl Drop for Publication {
+    fn drop(&mut self) {
+        if let Some(path) = self.transcript.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+fn with_worker_permit<P, T>(permit: P, format: impl FnOnce() -> T) -> T {
+    let _permit = permit;
+    format()
+}
+impl FormattedOutput {
+    #[cfg(test)]
+    fn deliver(self) -> Value {
+        let mut publication = self.publish();
+        assert!(publication.commit_if_active(&pi_rs_core::CancellationToken::new()));
+        std::mem::take(&mut publication.value)
+    }
+    fn publish(mut self) -> Publication {
+        let mut transcript = None;
+        if let Some(file) = self.transcript.take() {
+            match file.keep() {
+                Ok((file, path)) => {
+                    drop(file);
+                    transcript = Some(path);
+                }
+                Err(error) => {
+                    let old = self.value["full_output_path"].as_str().unwrap_or_default();
+                    let replacement = format!("Could not save the full output: {}", error.error);
+                    if let Some(text) = self.value["content"][0]["text"].as_str() {
+                        self.value["content"][0]["text"] =
+                            json!(text.replace(&format!("Full output: {old}"), &replacement));
+                    }
+                    self.value["full_output_path"] = Value::Null;
+                }
+            }
+        }
+        Publication {
+            value: self.value,
+            transcript,
+        }
+    }
+}
+
+fn visit_chunks(
+    mut value: &str,
+    cancellation: &pi_rs_core::CancellationToken,
+    mut visit: impl FnMut(&str),
+) {
+    while !value.is_empty() && !cancellation.is_cancelled() {
+        let mut end = value.len().min(64 * 1024);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        visit(&value[..end]);
+        value = &value[end..];
+    }
+}
+fn utf16_prefix_bytes(chars: impl Iterator<Item = char>, mut units: usize) -> usize {
+    chars
+        .take_while(|character| {
+            let Some(remaining) = units.checked_sub(character.len_utf16()) else {
+                return false;
+            };
+            units = remaining;
+            true
+        })
+        .map(char::len_utf8)
+        .sum()
+}
+
 impl Output {
-    fn emit(&mut self, kind: &str, value: String) -> Result<(), String> {
+    fn unshown_images_note(&self) -> Option<String> {
+        let count = self.generated_images;
+        if count == 0
+            || self
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Image { .. }))
+        {
+            return None;
+        }
+        let suffix = if count == 1 { "" } else { "s" };
+        Some(format!(
+            "Note: models.generateImages() returned {count} image{suffix} that the script did not show. Show each image block of result.output with image(block)."
+        ))
+    }
+
+    fn header(success: bool, elapsed: Duration) -> String {
+        format!(
+            "Script {}\nWall time: {:.3}s\n",
+            if success { "completed" } else { "failed" },
+            elapsed.as_secs_f64()
+        )
+    }
+
+    fn image_label(path: &Result<String, String>) -> String {
+        match path {
+            Ok(path) => format!("Image saved to {path}"),
+            Err(error) => format!("Image could not be saved: {error}"),
+        }
+    }
+
+    fn inline_image_label(path: &Result<String, String>, budget: &mut usize) -> Option<Value> {
+        let label = json!({"type":"text","text":Self::image_label(path)});
+        *budget = budget.checked_sub(label.to_string().len() + 1)?;
+        Some(label)
+    }
+
+    fn append_image_omissions(content: &mut Vec<Value>, omitted: usize, omitted_locations: usize) {
+        if omitted != 0 {
+            content.push(json!({"type":"text","text":format!("{omitted} image(s) omitted from inline output because of the result size limit. Image locations and save errors are included in the text output.")}));
+        }
+        if omitted_locations != 0 {
+            content.push(json!({"type":"text","text":format!("{omitted_locations} image(s) and their locations omitted from inline output because of the result size limit.")}));
+        }
+    }
+
+    // With a header, visit the native transcript. Without one, visit the text
+    // charged to the preview budget, joining text groups across images once.
+    fn visit_report(&self, header: Option<&str>, error: Option<&str>, mut visit: impl FnMut(&str)) {
+        struct State {
+            has_text: bool,
+            after_image: bool,
+            ends_newline: bool,
+            transcript: bool,
+        }
+        fn block(state: &mut State, visit: &mut impl FnMut(&str), parts: &[&str]) {
+            let first = parts.iter().find(|s| !s.is_empty()).copied().unwrap_or("");
+            if state.has_text
+                && (state.after_image
+                    || (!state.ends_newline && (!state.transcript || !first.starts_with('\n'))))
+            {
+                visit("\n");
+                if !state.after_image {
+                    state.ends_newline = true;
+                }
+            }
+            for part in parts {
+                visit(part);
+            }
+            if let Some(last) = parts.iter().rev().find(|s| !s.is_empty()) {
+                state.ends_newline = last.ends_with('\n');
+            } else if state.after_image || !state.has_text {
+                state.ends_newline = !state.transcript;
+            }
+            state.has_text = true;
+            state.after_image = false;
+        }
+        let mut state = State {
+            has_text: false,
+            after_image: false,
+            ends_newline: false,
+            transcript: header.is_some(),
+        };
+        if let Some(header) = header {
+            block(&mut state, &mut visit, &[header]);
+        }
+        let count = self
+            .items
+            .iter()
+            .filter(|item| matches!(item, Item::Text(_)))
+            .count();
+        let mut index = 0;
+        for item in &self.items {
+            match item {
+                Item::Text(text) => {
+                    index += 1;
+                    let label = if count > 1 {
+                        format!("==> text {index}/{count} <==\n")
+                    } else {
+                        String::new()
+                    };
+                    block(&mut state, &mut visit, &[&label, text]);
+                }
+                Item::Image { path, .. } => {
+                    if state.transcript {
+                        block(&mut state, &mut visit, &[&Self::image_label(path)]);
+                    }
+                    state.after_image = true;
+                }
+            }
+        }
+        if !self.console.is_empty() {
+            let mut parts = Vec::with_capacity(self.console.len().saturating_mul(2) + 1);
+            parts.push("<console_output>\n");
+            for (index, line) in self.console.iter().enumerate() {
+                if index != 0 {
+                    parts.push("\n");
+                }
+                parts.push(line);
+            }
+            parts.push("\n</console_output>");
+            block(&mut state, &mut visit, &parts);
+        }
+        if let Some(error) = error {
+            block(&mut state, &mut visit, &["Script error: ", error]);
+        }
+        if let Some(note) = self.unshown_images_note() {
+            block(&mut state, &mut visit, &[&note]);
+        }
+    }
+
+    fn spill_report(
+        &self,
+        header: &str,
+        error: Option<&str>,
+        cancellation: &pi_rs_core::CancellationToken,
+    ) -> (String, Option<String>, Option<tempfile::NamedTempFile>) {
+        let mut file = tempfile::Builder::new()
+            .prefix("pi-output-")
+            .suffix(".txt")
+            .tempfile();
+        if file.is_ok() {
+            self.visit_report(Some(header), error, |part| {
+                visit_chunks(part, cancellation, |part| {
+                    if let Ok(output) = &mut file
+                        && let Err(error) = output.write_all(part.as_bytes())
+                    {
+                        file = Err(error);
+                    }
+                });
+            });
+        }
+        match file {
+            Ok(file) => {
+                let path = file.path().to_string_lossy().into_owned();
+                (format!("Full output: {path}"), Some(path), Some(file))
+            }
+            Err(error) => (
+                format!("Could not save the full output: {error}"),
+                None,
+                None,
+            ),
+        }
+    }
+
+    fn finish_truncated(
+        &self,
+        success: bool,
+        elapsed: Duration,
+        error: Option<&str>,
+        maximum: usize,
+        units: usize,
+        cancellation: &pi_rs_core::CancellationToken,
+    ) -> Option<FormattedOutput> {
+        let mut head = String::new();
+        let mut tail = String::new();
+        let mut offset = 0usize;
+        let mut newlines = 0usize;
+        let head_limit = maximum / 2;
+        let tail_start = units - (maximum - head_limit);
+        self.visit_report(None, error, |part| {
+            visit_chunks(part, cancellation, |part| {
+                let part_units = part.encode_utf16().count();
+                let end = offset + part_units;
+                if end <= head_limit {
+                    head.push_str(part);
+                } else if offset < head_limit {
+                    let bytes = utf16_prefix_bytes(part.chars(), head_limit - offset);
+                    head.push_str(&part[..bytes]);
+                }
+                if offset >= tail_start {
+                    tail.push_str(part);
+                } else if end > tail_start {
+                    let bytes = utf16_prefix_bytes(part.chars().rev(), end - tail_start);
+                    tail.push_str(&part[part.len() - bytes..]);
+                }
+                offset = end;
+                newlines += part.bytes().filter(|byte| *byte == b'\n').count();
+            })
+        });
+        let header = Self::header(success, elapsed);
+        let (location, path, transcript) = self.spill_report(&header, error, cancellation);
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let lines = newlines + 1;
+        let report = format!(
+            "{header}Warning: truncated output (original token count: {})\nTotal output lines: {lines}\n\n{head}…{} tokens truncated…{tail}\n\n[{location}]",
+            units.div_ceil(4),
+            (units - maximum).div_ceil(4)
+        );
+        let text_block = json!({"type":"text","text":report});
+        let mut omitted_locations = 0;
+        let mut label_budget = MAX_INLINE_IMAGE_LABEL_BYTES;
+        let images = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                let Item::Image { mime, data, path } = item else {
+                    return None;
+                };
+                let label = Self::inline_image_label(path, &mut label_budget);
+                omitted_locations += usize::from(label.is_none());
+                label.map(|label| (mime, data, label))
+            })
+            .collect::<Vec<_>>();
+        let label_size = MAX_INLINE_IMAGE_LABEL_BYTES - label_budget;
+        let mut budget = MAX_INLINE_BYTES
+            .saturating_sub(text_block.to_string().len())
+            .saturating_sub(label_size);
+        let mut content = vec![text_block];
+        let mut omitted = 0;
+        for (mime, data, label) in images {
+            content.push(label);
+            // Image data is validated base64 (ASCII), so JSON adds no escaping.
+            let size = json!({"type":"image","mimeType":mime,"data":""})
+                .to_string()
+                .len()
+                .saturating_add(data.len() + 1);
+            if size > budget {
+                omitted += 1;
+            } else {
+                budget -= size;
+                content.push(json!({"type":"image","mimeType":mime,"data":data}));
+            }
+        }
+        Self::append_image_omissions(&mut content, omitted, omitted_locations);
+        let mut result = json!({"content":content,"isError":!success,"full_output_path":path,"wall_time_seconds":elapsed.as_secs_f64()});
+        if self.model_usage.measured() {
+            result["usage"] = json!(self.model_usage);
+        }
+        Some(FormattedOutput {
+            value: result,
+            transcript,
+        })
+    }
+    fn emit(&mut self, kind: &str, value: String, mime: &str) -> Result<(), String> {
         self.calls += 1;
-        self.bytes = self.bytes.saturating_add(value.len());
-        if self.calls > MAX_ITEMS || self.bytes > MAX_OUTPUT {
+        // UTF-8 needs at most three bytes per UTF-16 code unit, so the
+        // character cap still bounds retained output even for non-ASCII text.
+        self.utf16_units = self
+            .utf16_units
+            .saturating_add(value.encode_utf16().count());
+        if self.calls > MAX_ITEMS || self.utf16_units > MAX_OUTPUT {
+            self.limit_exceeded = true;
             return Err("Script output limit exceeded".into());
         }
         match kind {
             "text" => self.items.push(Item::Text(value)),
             "console" => self.console.push(value),
             "image" => {
-                let block: Value =
-                    serde_json::from_str(&value).map_err(|error| error.to_string())?;
-                let mime = block["mimeType"].as_str().unwrap_or_default();
                 let suffix = match mime {
                     "image/png" => ".png",
                     "image/jpeg" => ".jpg",
@@ -573,7 +1469,7 @@ impl Output {
                     "image/webp" => ".webp",
                     _ => return Err("Unsupported image type".into()),
                 };
-                let data = block["data"].as_str().ok_or("Missing image data")?;
+                let data = value.as_str();
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(data)
                     .map_err(|_| "Invalid image data".to_owned())?;
@@ -610,16 +1506,30 @@ impl Output {
         elapsed: Duration,
         error: Option<&str>,
         tokens: usize,
-    ) -> Value {
-        let mut content = vec![json!({"type":"text","text":format!(
-            "Script {}\nWall time: {:.3}s\n",
-            if success { "completed" } else { "failed" }, elapsed.as_secs_f64()
-        )})];
+        cancellation: &pi_rs_core::CancellationToken,
+    ) -> Option<FormattedOutput> {
+        let maximum = tokens.saturating_mul(4).min(MAX_PREVIEW_UNITS);
+        let mut units = 0usize;
+        self.visit_report(None, error, |part| {
+            visit_chunks(part, cancellation, |chunk| {
+                units = units.saturating_add(chunk.encode_utf16().count())
+            })
+        });
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        if units > maximum {
+            return self.finish_truncated(success, elapsed, error, maximum, units, cancellation);
+        }
+        let header = Self::header(success, elapsed);
+        let mut content = vec![json!({"type":"text","text":header})];
         let text_count = self
             .items
             .iter()
             .filter(|item| matches!(item, Item::Text(_)))
             .count();
+        let mut label_budget = MAX_INLINE_IMAGE_LABEL_BYTES;
+        let mut omitted_locations = 0;
         let mut index = 0;
         for item in &self.items {
             match item {
@@ -633,12 +1543,12 @@ impl Output {
                     content.push(json!({"type":"text","text":text}));
                 }
                 Item::Image { mime, data, path } => {
-                    let label = match path {
-                        Ok(path) => format!("Image saved to {path}"),
-                        Err(error) => format!("Image could not be saved: {error}"),
-                    };
-                    content.push(json!({"type":"text","text":label}));
-                    content.push(json!({"type":"image","mimeType":mime,"data":data}));
+                    if let Some(label) = Self::inline_image_label(path, &mut label_budget) {
+                        content.push(label);
+                        content.push(json!({"type":"image","mimeType":mime,"data":data}));
+                    } else {
+                        omitted_locations += 1;
+                    }
                 }
             }
         }
@@ -647,6 +1557,9 @@ impl Output {
         }
         if let Some(error) = error {
             content.push(json!({"type":"text","text":format!("Script error: {error}")}));
+        }
+        if let Some(note) = self.unshown_images_note() {
+            content.push(json!({"type":"text","text":note}));
         }
         let mut merged: Vec<Value> = Vec::new();
         for block in content {
@@ -664,47 +1577,18 @@ impl Output {
             }
         }
         let mut content = merged;
-        let report = content
-            .iter()
-            .filter_map(|block| block["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let maximum = tokens.saturating_mul(4).min(100 * 1024);
-        let characters: Vec<_> = report.chars().collect();
-        let mut full_output_path = None;
-        if characters.len() > maximum {
-            let (location, path) = match save_output("pi-output-", ".txt", report.as_bytes()) {
-                Ok(path) => (format!("Full output: {path}"), Some(path)),
-                Err(error) => (format!("Could not save the full output: {error}"), None),
-            };
-            full_output_path = path;
-            let head = maximum / 2;
-            let tail = maximum - head;
-            let report = format!(
-                "Warning: truncated output (original token count: {})\nTotal output lines: {}\n\n{}…{} tokens truncated…{}\n\n[{location}]",
-                characters.len().div_ceil(4),
-                report.lines().count(),
-                characters[..head].iter().collect::<String>(),
-                (characters.len() - maximum).div_ceil(4),
-                characters[characters.len() - tail..]
-                    .iter()
-                    .collect::<String>()
-            );
-            content.retain(|block| block["type"] == "image");
-            content.insert(0, json!({"type":"text","text":report}));
-        }
         let text_size = content
             .iter()
             .filter(|block| block["type"] == "text")
-            .map(|block| block.to_string().len())
+            .map(|block| block.to_string().len() + 1)
             .sum::<usize>();
-        let mut image_budget = (7 * 1024 * 1024_usize).saturating_sub(text_size);
+        let mut image_budget = MAX_INLINE_BYTES.saturating_sub(text_size);
         let mut omitted = 0;
         content.retain(|block| {
             if block["type"] != "image" {
                 return true;
             }
-            let size = block.to_string().len();
+            let size = block.to_string().len() + 1;
             if size > image_budget {
                 omitted += 1;
                 return false;
@@ -712,14 +1596,28 @@ impl Output {
             image_budget -= size;
             true
         });
-        if omitted != 0 {
-            content.push(json!({"type":"text","text":format!("{omitted} image(s) omitted from inline output because of the result size limit. Image locations and save errors are included in the text output.")}));
+        Self::append_image_omissions(&mut content, omitted, omitted_locations);
+        let (path, transcript) = if omitted_locations == 0 {
+            (None, None)
+        } else {
+            let (location, path, transcript) = self.spill_report(&header, error, cancellation);
+            // Publication updates the spill location in the first text block
+            // if keeping the temporary file fails.
+            let report = content[0]["text"].as_str().unwrap_or_default();
+            content[0]["text"] = json!(format!("{report}\n\n[{location}]"));
+            (path, transcript)
+        };
+        if cancellation.is_cancelled() {
+            return None;
         }
-        let mut result = json!({"content":content,"isError":!success,"full_output_path":full_output_path,"wall_time_seconds":elapsed.as_secs_f64()});
+        let mut result = json!({"content":content,"isError":!success,"full_output_path":path,"wall_time_seconds":elapsed.as_secs_f64()});
         if self.model_usage.measured() {
             result["usage"] = json!(self.model_usage);
         }
-        result
+        Some(FormattedOutput {
+            value: result,
+            transcript,
+        })
     }
 }
 
@@ -736,14 +1634,805 @@ fn save_output(prefix: &str, suffix: &str, bytes: &[u8]) -> std::io::Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_declarations_expand_local_refs_without_recursing_forever() {
+        let tool = ToolSpec {
+            name: "read-record".into(),
+            description: "Read a record".into(),
+            parameters: json!({
+                "$ref": "#/$defs/a~1b~0%20c",
+                "$defs": {
+                    "a/b~ c": {
+                        "type": "object",
+                        "required": ["amount"],
+                        "properties": {
+                            "amount": {"$ref": "#/$defs/cost"},
+                            "cycle": {"$ref": "#/$defs/a~1b~0%20c"},
+                            "denied": {"$ref": "#/$defs/never"},
+                            "mystery": {"$ref": "https://example.com/schema"}
+                        }
+                    },
+                    "cost": {"type": "number"},
+                    "never": false
+                }
+            }),
+        };
+        let declaration = describe(&tool);
+        assert!(declaration.contains("read_record(args: {"));
+        for field in [
+            "\"amount\": number",
+            "\"cycle\"?: unknown",
+            "\"denied\"?: never",
+            "\"mystery\"?: unknown",
+        ] {
+            assert!(declaration.contains(field), "{declaration}");
+        }
+        let property_name = "x".repeat(16_000);
+        let oversized = json!({"type":"object","properties": {(property_name):{"type":"string"}}});
+        assert_eq!(typescript(&oversized), "unknown");
+    }
+
+    #[test]
+    fn tool_declarations_retain_argument_types_alongside_references() {
+        let generic = json!({"$ref": "#/$defs/base", "type": "string", "$defs": {"base": true}});
+        assert_eq!(typescript(&generic), "string");
+        let missing = json!({"$ref": "#/$defs/absent", "type": "number"});
+        assert_eq!(typescript(&missing), "number");
+        let array = json!({
+            "type": "array",
+            "items": {
+                "$ref": "#/$defs/base",
+                "type": "object",
+                "properties": {"label": {"type": "string"}}
+            },
+            "$defs": {"base": {"type": "object", "properties": {"count": {"type": "number"}}}}
+        });
+        assert_eq!(
+            typescript(&array),
+            "({ \"count\"?: number } & { \"label\"?: string })[]"
+        );
+    }
+
+    #[test]
+    fn tool_declarations_bound_reference_depth_without_dropping_siblings() {
+        let properties: serde_json::Map<_, _> = (0..40)
+            .map(|index| (format!("field{index}"), json!({"$ref": "#/$defs/shared"})))
+            .collect();
+        let wide = json!({
+            "type": "object",
+            "$defs": {"shared": {"type": "string"}},
+            "properties": properties
+        });
+        assert_eq!(typescript(&wide).matches(": string").count(), 40);
+        let mut chain: serde_json::Map<_, _> = (0..40)
+            .map(|index| {
+                (
+                    index.to_string(),
+                    json!({"$ref": format!("#/$defs/{}", index + 1)}),
+                )
+            })
+            .collect();
+        chain.insert("40".into(), json!({"type": "string"}));
+        assert_eq!(
+            typescript(&json!({"$ref": "#/$defs/0", "$defs": chain})),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn worker_limit_accepts_pi_numeric_forms_with_native_ceiling() {
+        for value in [
+            "3",
+            " 3 ",
+            "\u{feff}3\u{00a0}",
+            "3.0",
+            "3e0",
+            "+3",
+            "0x3",
+            "0o3",
+            "0b11",
+        ] {
+            assert_eq!(parse_worker_limit(value), Some(3), "{value:?}");
+        }
+        for value in [
+            "",
+            "0",
+            "-1",
+            "1.5",
+            "NaN",
+            "Infinity",
+            "1025",
+            "3workers",
+            "+0x3",
+            "0x+3",
+            "\u{0085}3",
+        ] {
+            assert_eq!(parse_worker_limit(value), None, "{value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_admission_is_bounded_and_cancellable_without_leaking_permits() {
+        assert_eq!(WORKER_WAIT_LIMIT, Duration::from_secs(60));
+        let workers = WorkerPool::new(|| 1);
+        let held = workers.semaphore.clone().acquire_owned().await.unwrap();
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let short = Duration::from_millis(10);
+        let overall = Duration::from_secs(5);
+
+        let result = tokio::time::timeout(
+            overall,
+            acquire_worker(&workers, &cancellation, None, short),
+        )
+        .await
+        .unwrap();
+        let Err(error @ WorkerAdmissionError::Busy) = result else {
+            panic!("expected the worker wait limit");
+        };
+        let elapsed = WORKER_WAIT_LIMIT;
+        let reply = error.reply(elapsed, None, 1);
+        assert!(matches!(reply.outcome, Outcome::Failed(message) if message
+                == "Script failed\nWall time 60.0 seconds\nOutput:\n\nScript error:\nNo codemode worker became free within 60 seconds. All 1 workers, shared by every session in this process, are held by other scripts. Retry after they finish.\n\nThe script did not start."));
+        assert!(reply.state.is_none());
+        let result = tokio::time::timeout(
+            overall,
+            acquire_worker(&workers, &cancellation, Some(short), Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        let Err(error @ WorkerAdmissionError::Deadline) = result else {
+            panic!("expected the script deadline");
+        };
+        let timeout = Duration::from_millis(37);
+        let reply = error.reply(timeout, Some(timeout), 1);
+        assert!(matches!(reply.outcome, Outcome::Failed(message) if message
+                == "Script failed\nWall time 0.0 seconds\nOutput:\n\nScript error:\nScript timed out: Execution timed out after 37 ms while waiting for a free codemode worker\n\nThe script did not start."));
+        assert!(reply.state.is_none());
+
+        let waiting = acquire_worker(&workers, &cancellation, None, overall);
+        tokio::pin!(waiting);
+        assert!(tokio::time::timeout(short, &mut waiting).await.is_err());
+        cancellation.cancel();
+        let result = tokio::time::timeout(overall, waiting).await.unwrap();
+        let Err(error @ WorkerAdmissionError::Cancelled) = result else {
+            panic!("expected cancellation");
+        };
+        let reply = error.reply(short, None, 1);
+        assert!(matches!(reply.outcome, Outcome::Failed(message) if message
+                == "Script failed\nWall time 0.0 seconds\nOutput:\n\nScript error:\nScript aborted: Execution aborted\n\nThe script did not start."));
+        assert!(reply.state.is_none());
+        drop(held);
+        assert_eq!(workers.semaphore.available_permits(), 1);
+        let fresh = pi_rs_core::CancellationToken::new();
+        assert!(
+            acquire_worker(&workers, &fresh, None, overall)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_limit_changes_apply_without_revoking_running_workers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limit = Arc::new(AtomicUsize::new(1));
+        let setting = limit.clone();
+        let workers = WorkerPool::new(move || setting.load(Ordering::SeqCst));
+        let cancel = pi_rs_core::CancellationToken::new();
+        let wait = Duration::from_secs(1);
+        let first = acquire_worker(&workers, &cancel, None, wait).await.unwrap();
+        limit.store(2, Ordering::SeqCst);
+        let second = acquire_worker(&workers, &cancel, None, wait).await.unwrap();
+        limit.store(1, Ordering::SeqCst);
+        let third = acquire_worker(&workers, &cancel, None, wait);
+        tokio::pin!(third);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut third)
+                .await
+                .is_err()
+        );
+        drop(first);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut third)
+                .await
+                .is_err()
+        );
+        drop(second);
+        let third = third.await.unwrap();
+        drop(third);
+        assert_eq!(workers.semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn resized_workers_preserve_waiter_order_and_cancellation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limit = Arc::new(AtomicUsize::new(1));
+        let setting = limit.clone();
+        let workers = WorkerPool::new(move || setting.load(Ordering::SeqCst));
+        let cancel = pi_rs_core::CancellationToken::new();
+        let cancelled = pi_rs_core::CancellationToken::new();
+        let wait = Duration::from_secs(2);
+        let held = acquire_worker(&workers, &cancel, None, wait).await.unwrap();
+        let first = acquire_worker(&workers, &cancelled, None, wait);
+        let second = acquire_worker(&workers, &cancel, None, wait);
+        tokio::pin!(first, second);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut first)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut second)
+                .await
+                .is_err()
+        );
+        cancelled.cancel();
+        assert!(first.await.is_err());
+        limit.store(2, Ordering::SeqCst);
+        // A later admission triggers resizing and must not overtake the queued waiter.
+        let third = acquire_worker(&workers, &cancel, None, wait);
+        tokio::pin!(third);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut third)
+                .await
+                .is_err()
+        );
+        let second = second.await.unwrap();
+        drop(held);
+        let third = third.await.unwrap();
+        drop((second, third));
+        assert_eq!(workers.semaphore.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_does_not_resize_or_wake_waiters() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limit = Arc::new(AtomicUsize::new(1));
+        let setting = limit.clone();
+        let workers = WorkerPool::new(move || setting.load(Ordering::SeqCst));
+        let cancel = pi_rs_core::CancellationToken::new();
+        let wait = Duration::from_secs(2);
+        let held = acquire_worker(&workers, &cancel, None, wait).await.unwrap();
+        let waiting = acquire_worker(&workers, &cancel, None, wait);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        limit.store(2, Ordering::SeqCst);
+        let already_cancelled = pi_rs_core::CancellationToken::new();
+        already_cancelled.cancel();
+        assert!(
+            acquire_worker(&workers, &already_cancelled, None, wait)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert_eq!(*workers.capacity.lock().unwrap(), 1);
+        drop(held);
+        drop(waiting.await.unwrap());
+    }
+
+    #[test]
+    fn structured_tool_error_flags_propagate_without_exposing_details() {
+        for with_details in [false, true] {
+            for flag in [Some(true), Some(false), None] {
+                let mut data = json!({"content":[{"type":"text","text":"tool output"}]});
+                if let Some(flag) = flag {
+                    data["isError"] = json!(flag);
+                }
+                let outcome = if with_details {
+                    Outcome::StructuredWithDetails {
+                        data: data.clone(),
+                        attachments: vec![],
+                        details: json!({"secret":"private metadata"}),
+                    }
+                } else {
+                    Outcome::Structured {
+                        data: data.clone(),
+                        attachments: vec![],
+                    }
+                };
+                let result = tool_value(outcome);
+                if flag == Some(true) {
+                    assert_eq!(result["ok"], false);
+                    assert!(result["error"].as_str().unwrap().contains("tool output"));
+                    assert!(!result.to_string().contains("private metadata"));
+                } else {
+                    assert_eq!(result, json!({"ok":true,"value":data}));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_tool_errors_throw_in_scripts() {
+        struct ErrorHost(bool);
+        #[async_trait::async_trait]
+        impl ToolHost for ErrorHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: "broken".into(),
+                    description: "Fail".into(),
+                    parameters: json!({"type":"object"}),
+                }]
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                let data = json!({"isError":true,"content":[{"type":"text","text":"tool failed"}]});
+                if self.0 {
+                    Outcome::StructuredWithDetails {
+                        data,
+                        attachments: vec![],
+                        details: json!({"secret":"private metadata"}),
+                    }
+                } else {
+                    Outcome::Structured {
+                        data,
+                        attachments: vec![],
+                    }
+                }
+            }
+        }
+        for with_details in [false, true] {
+            let reply = ScriptTool {
+                timeout: Some(Duration::from_secs(2)),
+            }
+            .invoke_transaction(
+                json!({"code":"await tools.broken({}); text('unexpected success')"}),
+                ToolContext {
+                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                    cancellation: Default::default(),
+                },
+                None,
+                Arc::new(ErrorHost(with_details)),
+            )
+            .await;
+            let Outcome::Failed(error) = reply.outcome else {
+                panic!("expected script failure")
+            };
+            assert!(error.contains("tool failed"));
+            assert!(!error.contains("unexpected success"));
+            assert!(!error.contains("private metadata"));
+        }
+    }
+    #[tokio::test]
+    async fn codemode_resolves_mcp_tool_errors_but_rejects_transport_errors() {
+        struct McpHost;
+        #[async_trait::async_trait]
+        impl ToolHost for McpHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn tools(&self) -> Vec<ToolSpec> {
+                [
+                    "mcp__fixture__check",
+                    "mcp__fixture__offline",
+                    "mcp__fixture__recovered",
+                ]
+                .into_iter()
+                .map(|name| ToolSpec {
+                    name: name.into(),
+                    description: "fixture".into(),
+                    parameters: json!({"type":"object"}),
+                })
+                .collect()
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                if name.ends_with("offline") {
+                    return Outcome::Unknown("connection closed".into());
+                }
+                if name.ends_with("recovered") {
+                    return Outcome::TextResult {
+                        output: "recovered by extension".into(),
+                        details: None,
+                        is_error: false,
+                    };
+                }
+                Outcome::Structured {
+                    data: json!({
+                        "isError":true,
+                        "content":[{"type":"text","text":"not ready"}],
+                        "structuredContent":{"retryable":true}
+                    }),
+                    attachments: vec![],
+                }
+            }
+        }
+        let reply = ScriptTool {
+            timeout: Some(Duration::from_secs(3)),
+        }
+        .invoke_transaction(
+            json!({"code":r#"
+                const result = await tools.mcp__fixture__check({});
+                if (!result.isError || !result.structuredContent.retryable) {
+                    throw new Error("missing MCP error data");
+                }
+                text(result.content[0].text);
+                if (await tools.mcp__fixture__recovered({}) !== "recovered by extension") {
+                    throw new Error("MCP result ignored the extension's status override");
+                }
+                try {
+                    await tools.mcp__fixture__offline({});
+                    text("unexpected transport success");
+                } catch (error) {
+                    text(error.message);
+                }
+            "#}),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            None,
+            Arc::new(McpHost),
+        )
+        .await;
+        let Outcome::Structured { data, .. } = reply.outcome else {
+            panic!(
+                "script should handle both MCP outcomes: {:?}",
+                reply.outcome
+            );
+        };
+        assert_eq!(data["isError"], false);
+        let report = data["content"].to_string();
+        assert!(report.contains("not ready"), "{report}");
+        assert!(report.contains("connection closed"), "{report}");
+        assert!(!report.contains("unexpected transport success"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn patched_text_results_reach_scripts_with_independent_status() {
+        struct PatchedHost;
+        #[async_trait::async_trait]
+        impl ToolHost for PatchedHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn tools(&self) -> Vec<ToolSpec> {
+                ["recovered", "failed", "structured"]
+                    .into_iter()
+                    .map(|name| ToolSpec {
+                        name: name.into(),
+                        description: "patched".into(),
+                        parameters: json!({"type":"object"}),
+                    })
+                    .collect()
+            }
+            async fn call(&self, name: &str, _: Value) -> Outcome {
+                if name == "structured" {
+                    return Outcome::TextResultWithStructuredContent {
+                        output: "structured success".into(),
+                        details: None,
+                        structured_content: json!({"private":"secret"}),
+                        is_error: false,
+                    };
+                }
+                Outcome::TextResult {
+                    output: if name == "recovered" {
+                        "exact success"
+                    } else {
+                        "exact failure"
+                    }
+                    .into(),
+                    details: Some(json!({"secret":"private"})),
+                    is_error: name == "failed",
+                }
+            }
+        }
+        let reply = ScriptTool { timeout: Some(Duration::from_secs(2)) }.invoke_transaction(
+            json!({"code":"text(await tools.recovered({})); text(await tools.structured({})); try { await tools.failed({}); } catch (e) { text(e.message); }"}),
+            ToolContext { operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(), cancellation: Default::default() }, None, Arc::new(PatchedHost)).await;
+        let Outcome::Structured { data, .. } = reply.outcome else {
+            panic!("script should succeed")
+        };
+        assert_eq!(data["isError"], false);
+        let output = data["content"].to_string();
+        assert!(output.contains("exact success"));
+        assert!(output.contains("structured success"));
+        assert!(output.contains("exact failure"));
+        assert!(!output.contains("Tool failed:"));
+        assert!(!output.contains("private"));
+    }
+
     struct Host;
+    #[tokio::test]
+    async fn model_discovery_remains_available_when_inference_slots_are_full() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ModelHost {
+            started: AtomicUsize,
+            changed: tokio::sync::Notify,
+            release: tokio::sync::Semaphore,
+        }
+        #[async_trait::async_trait]
+        impl ToolHost for ModelHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: MODEL_OPERATION.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }]
+            }
+            async fn call(&self, _: &str, args: Value) -> Outcome {
+                match args["action"].as_str() {
+                    Some("resolve") => Outcome::Structured {
+                        data: json!(true),
+                        attachments: vec![],
+                    },
+                    Some("classify") => {
+                        self.started.fetch_add(1, Ordering::SeqCst);
+                        self.changed.notify_one();
+                        let _permit = self.release.acquire().await.unwrap();
+                        Outcome::Structured {
+                            data: json!({"stopReason":"stop","answers":{}}),
+                            attachments: vec![],
+                        }
+                    }
+                    Some("list") => {
+                        while self.started.load(Ordering::SeqCst) < 4 {
+                            self.changed.notified().await;
+                        }
+                        self.release.add_permits(4);
+                        Outcome::Structured {
+                            data: json!([]),
+                            attachments: vec![],
+                        }
+                    }
+                    _ => Outcome::Failed("unexpected action".into()),
+                }
+            }
+        }
+        let host = Arc::new(ModelHost {
+            started: AtomicUsize::new(0),
+            changed: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let code = r#"
+            const model = {provider:'fixture', id:'fixture'};
+            const context = {state:{}, questions:{x:{type:'bool', instructions:'test', criteria:{true:'yes', false:'no'}}}};
+            const calls = Array.from({length:4}, () => models.classify(model, context));
+            await models.getModelsOfType('classifier');
+            await Promise.all(calls);
+            text('discovery completed');
+        "#;
+        let reply = ScriptTool {
+            timeout: Some(Duration::from_secs(3)),
+        }
+        .invoke_transaction(
+            json!({"code":code}),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            None,
+            host,
+        )
+        .await;
+        let Outcome::Structured { data, .. } = reply.outcome else {
+            panic!("expected completed script")
+        };
+        assert_eq!(data["isError"], false, "{data}");
+        assert!(data["content"].to_string().contains("discovery completed"));
+    }
+
+    #[tokio::test]
+    async fn reports_generated_images_when_script_emits_none() {
+        struct ImageModelHost;
+
+        #[async_trait::async_trait]
+        impl ToolHost for ImageModelHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: MODEL_OPERATION.into(),
+                    description: String::new(),
+                    parameters: json!({"type": "object"}),
+                }]
+            }
+
+            async fn call(&self, _: &str, args: Value) -> Outcome {
+                let data = match args["action"].as_str() {
+                    Some("resolve") => json!(true),
+                    Some("generateImages") => json!({
+                        "stopReason": "stop",
+                        "output": [
+                            {"type": "text", "text": "two images"},
+                            {"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo="},
+                            {"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo="}
+                        ]
+                    }),
+                    _ => panic!("unexpected model operation"),
+                };
+                Outcome::Structured {
+                    data,
+                    attachments: vec![],
+                }
+            }
+        }
+
+        let generate = r#"
+            const result = await models.generateImages({provider:'fixture', id:'fixture'},
+                {input:[{type:'text', text:'draw two images'}]});
+        "#;
+        let note = "returned 2 images that the script did not show";
+        for (prefix, suffix) in [
+            ("", "text(result.output[0].text);"),
+            ("", "image(result.output[1]);"),
+            ("", "throw new Error('failed after generation');"),
+            (concat!(r#"// @options: {"max_output_tokens":0}"#, "\n"), ""),
+        ] {
+            let reply = ScriptTool {
+                timeout: Some(Duration::from_secs(3)),
+            }
+            .invoke_transaction(
+                json!({"code":format!("{prefix}{generate}{suffix}")}),
+                ToolContext {
+                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                    cancellation: Default::default(),
+                },
+                None,
+                Arc::new(ImageModelHost),
+            )
+            .await;
+            match reply.outcome {
+                Outcome::Structured { data, .. } if !prefix.is_empty() => {
+                    let path = data["full_output_path"]
+                        .as_str()
+                        .expect("truncated output path");
+                    assert!(!data["content"].to_string().contains(note));
+                    let report = std::fs::read_to_string(path).unwrap();
+                    std::fs::remove_file(path).unwrap();
+                    assert!(report.contains(note), "{report}");
+                }
+                Outcome::Structured { data, .. } => {
+                    let content = data["content"].as_array().unwrap();
+                    let has_image = content.iter().any(|item| item["type"] == "image");
+                    assert_eq!(has_image, suffix.starts_with("image("), "{data}");
+                    assert_eq!(
+                        data["content"].to_string().contains(note),
+                        !has_image,
+                        "{data}"
+                    );
+                    if let Some(path) = content
+                        .iter()
+                        .find_map(|item| item["text"].as_str()?.strip_prefix("Image saved to "))
+                    {
+                        std::fs::remove_file(path).unwrap();
+                    }
+                }
+                Outcome::Failed(error) if suffix.starts_with("throw ") => {
+                    assert!(
+                        error.contains("failed after generation") && error.contains(note),
+                        "{error}"
+                    );
+                }
+                result => panic!("unexpected script result: {result:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn model_calls_validate_before_host_and_preserve_provider_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ModelHost(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl ToolHost for ModelHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: MODEL_OPERATION.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }]
+            }
+            async fn call(&self, _: &str, args: Value) -> Outcome {
+                if args["id"] == "missing" {
+                    Outcome::Failed("unknown model".into())
+                } else if args["action"] == "resolve" {
+                    Outcome::Structured {
+                        data: json!(true),
+                        attachments: vec![],
+                    }
+                } else {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Outcome::Structured {
+                        data: json!({"stopReason":"error","errorMessage":"provider failed","answers":{}}),
+                        attachments: vec![],
+                    }
+                }
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let code = r#"
+            const model = {provider: 'fixture', id: 'fixture'};
+            const q = {x:{type:'bool', instructions:'test', criteria:{true:'yes', false:'no'}}};
+            const invalid = [
+                () => models.classify(null, {state:{}, questions:q}),
+                () => models.classify(model, {state:null, questions:q}),
+                () => models.classify(model, {state:[], questions:q}),
+                () => models.classify(model, {state:{}, questions:{}}),
+                () => models.classify(model, {state:{}, questions:q, images:null}),
+                () => models.classify(model, {state:{}, questions:{x:{type:'score', instructions:'x', criteria:[1]}}}),
+                () => models.classify(model, {state:{}, questions:q, images:Array(1)}),
+                () => models.classify(model, {state:{}, questions:{x:{type:'score', instructions:'x', criteria:Array(1)}}}),
+                () => models.generateImages(model, {input:[]}),
+                () => models.generateImages(model, {input:Array(1)}),
+                () => models.generateImages(model, {input:[{type:'image', data:1, mimeType:'image/png'}]}),
+            ];
+            for (const call of invalid) {
+                let rejected = false;
+                try { await call(); } catch (_) { rejected = true; }
+                if (!rejected) throw new Error('invalid call succeeded');
+            }
+            for (const call of [
+                () => models.classify({provider:'fixture', id:'missing'}, null),
+                () => models.generateImages({provider:'fixture', id:'missing'}, {input:[]}),
+            ]) {
+                try { await call(); throw new Error('missing model succeeded'); }
+                catch (error) { if (!String(error).includes('unknown model')) throw error; }
+            }
+            for (const [call, message] of [
+                [() => models.classify(model, null), 'expects a context object'],
+                [() => models.generateImages(model, {input:[]}), 'context.input'],
+            ]) {
+                try { await call(); throw new Error('invalid context succeeded'); }
+                catch (error) { if (!String(error).includes(message)) throw error; }
+            }
+            try { await models.classify({provider:'fixture', id:'missing'}, {state:{}, questions:q}); throw new Error('missing model succeeded'); }
+            catch (error) { if (!String(error).includes('unknown model')) throw error; }
+            const result = await models.classify(model, {state:{}, questions:q});
+            if (result.stopReason !== 'error' || result.errorMessage !== 'provider failed') throw new Error('provider result lost');
+            text('ok');
+        "#;
+        let reply = ScriptTool {
+            timeout: Some(Duration::from_secs(2)),
+        }
+        .invoke_transaction(
+            json!({"code":code}),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            None,
+            Arc::new(ModelHost(calls.clone())),
+        )
+        .await;
+        let Outcome::Structured { data, .. } = reply.outcome else {
+            panic!("script failed")
+        };
+        assert_eq!(data["isError"], false);
+        assert!(data["content"].to_string().contains("ok"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
     #[async_trait::async_trait]
     impl ToolHost for Host {
+        fn cancellation_safe_calls(&self) -> bool {
+            true
+        }
         fn tools(&self) -> Vec<ToolSpec> {
             vec![ToolSpec {
                 name: "echo".into(),
                 description: "Echo a value".into(),
-                parameters: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"text": {"$ref": "#/$defs/echoText"}},
+                    "required": ["text"],
+                    "$defs": {"echoText": {"type": "string", "description": "Reconciliation"}}
+                }),
             }]
         }
         async fn call(&self, name: &str, arguments: Value) -> Outcome {
@@ -761,7 +2450,7 @@ mod tests {
             .unwrap()
             .block_on(
                 ScriptTool {
-                    timeout: Duration::from_secs(2),
+                    timeout: Some(Duration::from_secs(2)),
                 }
                 .invoke_transaction(
                     json!({"code":code}),
@@ -773,6 +2462,223 @@ mod tests {
                     Arc::new(Host),
                 ),
             )
+    }
+    #[test]
+    fn options_match_reference_source_validation() {
+        let maximum = Some(Duration::from_secs(2));
+        let (parsed, source) = options(
+            "  // @options: {\"max_output_tokens\":0,\"timeout_ms\":25}\r\ntext(1)",
+            maximum,
+        )
+        .unwrap();
+        assert_eq!(parsed.max_output_tokens, 0);
+        assert_eq!(parsed.timeout, Some(Duration::from_millis(25)));
+        assert_eq!(source, "\ntext(1)");
+        for invalid in [
+            "",
+            "// @options: {}",
+            "// @options: {}\n  ",
+            "// @options: {\"yield\":1}\ntext(1)",
+            "// @options: {\"timeout_ms\":null}\ntext(1)",
+            "// @options: {\"timeout_ms\":2147483648}\ntext(1)",
+            "// @options: {\"max_output_tokens\":1.5}\ntext(1)",
+            "text(1)\n // @options: {}",
+        ] {
+            assert!(options(invalid, maximum).is_err(), "accepted {invalid:?}");
+        }
+        let reply = run("  // @options: {\"timeout_ms\":20}\nwhile (true) {}", None);
+        assert!(matches!(reply.outcome, Outcome::Failed(_)));
+        assert!(matches!(
+            run("// @options: {\"yield\":1}\nstore('x', 1)", None).outcome,
+            Outcome::Failed(_)
+        ));
+    }
+    #[test]
+    fn deadlines_are_optional_and_explicit_limits_are_combined() {
+        assert_eq!(options("text(1)", None).unwrap().0.timeout, None);
+        assert_eq!(
+            options("// @options: {\"timeout_ms\":40}\ntext(1)", None)
+                .unwrap()
+                .0
+                .timeout,
+            Some(Duration::from_millis(40))
+        );
+        assert_eq!(
+            options(
+                "// @options: {\"timeout_ms\":40}\ntext(1)",
+                Some(Duration::from_millis(20))
+            )
+            .unwrap()
+            .0
+            .timeout,
+            Some(Duration::from_millis(20))
+        );
+    }
+    #[tokio::test]
+    async fn unbounded_script_honors_cancellation_during_host_call() {
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let host = Arc::new(StartedHost {
+            started: started.clone(),
+            wait_for_cancellation: true,
+        });
+        let run = ScriptTool { timeout: None };
+        let (reply, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                run.invoke_transaction(
+                    json!({"code":"await tools.started({})"}),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation: cancellation.clone(),
+                    },
+                    None,
+                    host,
+                ),
+                async {
+                    started.notified().await;
+                    cancellation.cancel();
+                }
+            )
+        })
+        .await
+        .expect("expected pending host call to be cancelled");
+        assert!(matches!(reply.outcome, Outcome::Failed(message) if message.contains("cancelled")));
+    }
+
+    struct StartedHost {
+        started: Arc<tokio::sync::Notify>,
+        wait_for_cancellation: bool,
+    }
+    #[async_trait::async_trait]
+    impl ToolHost for StartedHost {
+        fn cancellation_safe_calls(&self) -> bool {
+            true
+        }
+        fn tools(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "started".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }]
+        }
+        async fn call(&self, _: &str, _: Value) -> Outcome {
+            self.started.notify_one();
+            if self.wait_for_cancellation {
+                std::future::pending::<()>().await;
+            }
+            Outcome::Succeeded("ready".into())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_thread_cancels_unbounded_cpu_loop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (stop_watchdog, watchdog_stopped) = std::sync::mpsc::channel::<()>();
+        let watchdog_fired = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let cancellation = cancellation.clone();
+            let watchdog_fired = watchdog_fired.clone();
+            std::thread::spawn(move || {
+                if watchdog_stopped
+                    .recv_timeout(Duration::from_secs(3))
+                    .is_err()
+                {
+                    watchdog_fired.store(true, Ordering::SeqCst);
+                    cancellation.cancel();
+                }
+            })
+        };
+        let script_cancel = cancellation.clone();
+        let host = Arc::new(StartedHost {
+            started: started.clone(),
+            wait_for_cancellation: false,
+        });
+        let script = tokio::spawn(async move {
+            ScriptTool { timeout: None }.invoke_transaction(
+                json!({"code":"await tools.started({}); store('uncommitted', true); while (true) {}"}),
+                ToolContext { operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(), cancellation: script_cancel },
+                None, host,
+            ).await
+        });
+        started.notified().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancellation.cancel();
+        let reply = tokio::time::timeout(Duration::from_secs(1), script)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = stop_watchdog.send(());
+        watchdog.join().unwrap();
+        assert!(
+            !watchdog_fired.load(Ordering::SeqCst),
+            "current-thread executor was blocked"
+        );
+        assert!(matches!(reply.outcome, Outcome::Failed(message) if message.contains("cancelled")));
+        assert!(reply.state.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_invocation_stops_busy_worker() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let host = Arc::new(StartedHost {
+            started: started.clone(),
+            wait_for_cancellation: false,
+        });
+        let weak_host = Arc::downgrade(&host);
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let watchdog_cancel = cancellation.clone();
+        let (stop_watchdog, watchdog_stopped) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if watchdog_stopped
+                .recv_timeout(Duration::from_secs(3))
+                .is_err()
+            {
+                watchdog_cancel.cancel();
+            }
+        });
+        let script = tokio::spawn(async move {
+            ScriptTool { timeout: None }
+                .invoke_transaction(
+                    json!({"code":"await tools.started({}); while (true) {}"}),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation,
+                    },
+                    None,
+                    host,
+                )
+                .await
+        });
+        started.notified().await;
+        script.abort();
+        let _ = script.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak_host.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("worker kept running after invocation was dropped");
+        let _ = stop_watchdog.send(());
+        watchdog.join().unwrap();
+    }
+    #[tokio::test]
+    async fn explicit_host_deadline_interrupts_busy_script() {
+        let reply = ScriptTool { timeout: None }
+            .invoke_transaction_with_timeout(
+                json!({"code":"while (true) {}"}),
+                ToolContext {
+                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                    cancellation: Default::default(),
+                },
+                None,
+                Arc::new(Host),
+                Some(Duration::from_millis(20)),
+            )
+            .await;
+        assert!(matches!(reply.outcome, Outcome::Failed(_)));
     }
     #[test]
     fn scripts_call_tools_and_commit_private_store_without_io_globals() {
@@ -809,6 +2715,288 @@ mod tests {
         assert_eq!(state.data["value"], 1);
     }
     #[test]
+    fn store_requires_string_keys_and_enforces_value_boundaries() {
+        let reply = run(
+            r#"
+            const attempt = f => { try { f(); return 'ok'; } catch (error) { return error.name; } };
+            const longKey = 'k'.repeat(1100);
+            text([
+                attempt(() => store(1, 'bad')),
+                attempt(() => load({})),
+                attempt(() => store('function', () => 1)),
+                attempt(() => store('maximum', 'x'.repeat(262142))),
+                attempt(() => store('too-big', 'x'.repeat(262143))),
+                attempt(() => store(longKey, 7)),
+                load(longKey)
+            ]);
+        "#,
+            None,
+        );
+        let Outcome::Structured { data, .. } = &reply.outcome else {
+            panic!("{:?}", reply.outcome)
+        };
+        assert!(
+            data["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(r#"["TypeError","TypeError","TypeError","ok","RangeError","ok",7]"#),
+            "{data}"
+        );
+        let state = reply.state.unwrap();
+        assert_eq!(state.data["k".repeat(1100)], 7);
+        assert!(state.data.get("1").is_none());
+        assert!(state.data.get("too-big").is_none());
+    }
+
+    #[test]
+    fn store_counts_special_keys_and_rolls_back_rejected_replacements() {
+        let reply = run(
+            r#"
+            const attempt = f => { try { f(); return 'ok'; } catch (error) { return error.name; } };
+            for (const key of ['a', 'b', 'c']) store(key, 'x'.repeat(262142));
+            text([
+                attempt(() => store('__proto__', 'y'.repeat(262131))),
+                attempt(() => store('__proto__', 'y'.repeat(262130))),
+                attempt(() => store('z', 0)),
+                load('__proto__').length
+            ]);
+        "#,
+            None,
+        );
+        let Outcome::Structured { data, .. } = &reply.outcome else {
+            panic!("{:?}", reply.outcome)
+        };
+        assert!(
+            data["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(r#"["RangeError","ok","RangeError",262130]"#),
+            "{data}"
+        );
+        let state = reply.state.unwrap();
+        assert_eq!(state.data["__proto__"].as_str().unwrap().len(), 262130);
+        assert!(state.data.get("z").is_none());
+        let next = run(
+            "text(load('__proto__').length); store('a', 'small'); store('z', 0); store('__proto__', undefined);",
+            Some(&state),
+        );
+        assert!(next.outcome.tool_content().contains("262130"));
+        let next_state = next.state.unwrap();
+        assert_eq!(next_state.data["z"], 0);
+        assert!(next_state.data.get("__proto__").is_none());
+    }
+
+    #[test]
+    fn oversized_restored_store_can_be_reduced_one_key_at_a_time() {
+        let state = ExtensionState {
+            version: 1,
+            data: json!({
+                "a":"x".repeat(210000), "b":"x".repeat(210000), "c":"x".repeat(210000),
+                "d":"x".repeat(210000), "e":"x".repeat(210000), "f":"x".repeat(210000)
+            }),
+        };
+        let reply = run(
+            "store('a', undefined); store('b', undefined); return load('c').length",
+            Some(&state),
+        );
+        assert!(matches!(&reply.outcome, Outcome::Structured { .. }));
+        let next = reply.state.unwrap();
+        assert!(next.data.get("a").is_none());
+        assert!(next.data.get("b").is_none());
+        assert_eq!(next.data["c"].as_str().unwrap().len(), 210000);
+    }
+    #[test]
+    fn reentrant_store_serialization_uses_current_entry_size() {
+        let replacement = run(
+            r#"
+            const attempt = f => { try { f(); return 'ok'; } catch (error) { return error.name; } };
+            for (const key of ['a', 'b', 'c']) store(key, 'x'.repeat(262142));
+            store('target', 'small');
+            text(attempt(() => store('target', {toJSON() {
+                store('target', 'y'.repeat(262130));
+                return 'z'.repeat(100);
+            }})));
+        "#,
+            None,
+        );
+        let Outcome::Structured { data, .. } = &replacement.outcome else {
+            panic!("{:?}", replacement.outcome)
+        };
+        assert!(data["content"][0]["text"].as_str().unwrap().ends_with("ok"));
+        assert_eq!(
+            replacement.state.unwrap().data["target"]
+                .as_str()
+                .unwrap()
+                .len(),
+            100
+        );
+
+        let deletion = run(
+            r#"
+            const attempt = f => { try { f(); return 'ok'; } catch (error) { return error.name; } };
+            for (const key of ['a', 'b', 'c']) store(key, 'x'.repeat(262142));
+            store('target', 'y'.repeat(262130));
+            store('target', {toJSON() { store('target', undefined); return 'n'; }});
+            text(attempt(() => store('overflow', 'z'.repeat(262140))));
+        "#,
+            None,
+        );
+        let Outcome::Structured { data, .. } = &deletion.outcome else {
+            panic!("{:?}", deletion.outcome)
+        };
+        assert!(
+            data["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("RangeError")
+        );
+        let state = deletion.state.unwrap();
+        assert_eq!(state.data["target"], "n");
+        assert!(state.data.get("overflow").is_none());
+    }
+    #[tokio::test]
+    async fn output_limits_terminate_even_when_caught() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingHost(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl ToolHost for CountingHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn tools(&self) -> Vec<ToolSpec> {
+                ["side_effect", MODEL_OPERATION]
+                    .into_iter()
+                    .map(|name| ToolSpec {
+                        name: name.into(),
+                        description: String::new(),
+                        parameters: json!({"type":"object"}),
+                    })
+                    .collect()
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Outcome::Succeeded(String::new())
+            }
+        }
+        for (overflow, after, calls_before) in [
+            (
+                "text('x'.repeat(16 * 1024 * 1024 + 1))",
+                "await tools.side_effect({})",
+                0,
+            ),
+            (
+                "text('')",
+                "await models.getModelsOfType('image')",
+                MAX_ITEMS,
+            ),
+            (
+                "text('x'.repeat(16 * 1024 * 1024 + 1))",
+                "while (true) {}",
+                0,
+            ),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let code = format!(
+                "store('uncommitted', true); try {{ {overflow}; }} catch (_) {{}} {after}; store('later', true);"
+            );
+            let sink = Arc::new(Mutex::new(Output {
+                calls: calls_before,
+                ..Output::default()
+            }));
+            let result = tokio::time::timeout(
+                Duration::from_secs(15),
+                evaluate(
+                    &code,
+                    json!({}),
+                    Arc::new(CountingHost(calls.clone())),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation: Default::default(),
+                    },
+                    None,
+                    sink.clone(),
+                ),
+            )
+            .await
+            .expect("output limit must stop the worker");
+            assert!(result.is_err());
+            assert!(sink.lock().unwrap().limit_exceeded);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+        let reply = ScriptTool { timeout: None }
+            .invoke_transaction(
+                json!({"code":"store('uncommitted', true); try { text('x'.repeat(16 * 1024 * 1024 + 1)); } catch (_) { exit(); }"}),
+                ToolContext { operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(), cancellation: Default::default() },
+                None,
+                Arc::new(Host),
+            )
+            .await;
+        assert!(
+            matches!(reply.outcome, Outcome::Failed(message) if message.contains("Script output limit exceeded"))
+        );
+        assert!(reply.state.is_none());
+    }
+    #[tokio::test]
+    async fn output_breach_cancels_tokens_of_already_queued_calls() {
+        struct QueuedHost {
+            tokens: Mutex<Vec<pi_rs_core::CancellationToken>>,
+            changed: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl ToolHost for QueuedHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                ["hold", "write", "ready"]
+                    .into_iter()
+                    .map(|name| ToolSpec {
+                        name: name.into(),
+                        description: String::new(),
+                        parameters: json!({"type":"object"}),
+                    })
+                    .collect()
+            }
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                panic!("codemode must pass its invocation cancellation token")
+            }
+            async fn call_with_cancellation(
+                &self,
+                name: &str,
+                _: Value,
+                cancellation: pi_rs_core::CancellationToken,
+            ) -> Outcome {
+                if name == "ready" {
+                    loop {
+                        let notified = self.changed.notified();
+                        if self.tokens.lock().unwrap().len() == 2 {
+                            break;
+                        }
+                        notified.await;
+                    }
+                    return Outcome::Succeeded("queued".into());
+                }
+                self.tokens.lock().unwrap().push(cancellation.clone());
+                self.changed.notify_one();
+                cancellation.cancelled().await;
+                Outcome::Skipped("cancelled".into())
+            }
+        }
+        let host = Arc::new(QueuedHost {
+            tokens: Mutex::new(vec![]),
+            changed: tokio::sync::Notify::new(),
+        });
+        let parent = pi_rs_core::CancellationToken::new();
+        let reply = tokio::time::timeout(Duration::from_secs(10), ScriptTool { timeout: None }.invoke_transaction(
+            json!({"code":"tools.hold({}); tools.write({}); await tools.ready({}); try { text('x'.repeat(16 * 1024 * 1024 + 1)); } catch (_) {}"}),
+            ToolContext { operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(), cancellation: parent.clone() }, None, host.clone(),
+        )).await.expect("script stalled before output breach");
+        assert!(
+            matches!(reply.outcome, Outcome::Failed(message) if message.contains("Script output limit exceeded"))
+        );
+        assert!(!parent.is_cancelled());
+        let tokens = host.tokens.lock().unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.iter().all(|token| token.is_cancelled()));
+    }
+    #[test]
     fn deadline_interrupts_busy_loops_and_unresolved_promises() {
         for source in ["while (true) {}", "await new Promise(() => {})"] {
             let started = Instant::now();
@@ -820,10 +3008,128 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(1));
         }
     }
+    #[tokio::test]
+    async fn unresolved_promise_fails_without_a_deadline() {
+        struct DelayedHost;
+
+        #[async_trait::async_trait]
+        impl ToolHost for DelayedHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: "fixture".into(),
+                    description: "Wait for a fixture response".into(),
+                    parameters: json!({"type": "object"}),
+                }]
+            }
+
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Outcome::Succeeded("fixture returned".into())
+            }
+        }
+
+        for source in [
+            "text('before stall'); await new Promise(() => {});",
+            "text(await tools.fixture({})); await new Promise(() => {});",
+        ] {
+            let reply = tokio::time::timeout(
+                Duration::from_secs(5),
+                ScriptTool { timeout: None }.invoke_transaction(
+                    json!({"code":source}),
+                    ToolContext {
+                        operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                        cancellation: Default::default(),
+                    },
+                    None,
+                    Arc::new(DelayedHost),
+                ),
+            )
+            .await
+            .expect("an idle script must release its worker with no configured deadline");
+            let Outcome::Failed(error) = reply.outcome else {
+                panic!("unresolved script unexpectedly completed");
+            };
+            let output = if source.contains("tools.fixture") {
+                "fixture returned"
+            } else {
+                "before stall"
+            };
+            assert!(
+                error.contains(output) && error.contains("promise that can never settle"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_validates_arguments_and_preserves_requested_limit() {
+        struct Catalogue;
+        #[async_trait::async_trait]
+        impl ToolHost for Catalogue {
+            fn tools(&self) -> Vec<ToolSpec> {
+                (0..1001)
+                    .map(|index| ToolSpec {
+                        name: format!("fixture_{index}"),
+                        description: "Fixture matching search".into(),
+                        parameters: json!({"type":"object"}),
+                    })
+                    .collect()
+            }
+
+            async fn call(&self, _name: &str, _arguments: Value) -> Outcome {
+                panic!("discovery must not invoke tools")
+            }
+        }
+        let script = r#"
+            for (const [invoke, expected] of [
+                [() => searchTools(undefined), "searchTools() expects a query string"],
+                [() => searchTools(3), "searchTools() expects a query string"],
+                ...[0, -1, 1.5, "2", true].map(limit => [
+                    () => searchTools("fixture", {limit}), "searchTools() limit must be a positive integer",
+                ]),
+                [() => searchTools("fixture", {namespace: 3}), "searchTools() namespace must be a string"],
+                [() => describeTool(42), "describeTool() expects a tool name"],
+                [() => describeNamespace(undefined), "describeNamespace() expects a namespace name"],
+            ]) {
+                let error;
+                try { await invoke(); } catch (caught) { error = caught; }
+                if (!error?.message.includes(expected)) throw new Error("Missing validation: " + expected);
+            }
+            const counts = [];
+            for (const limit of [undefined, null, NaN, Infinity, 1, 1001, 1e100]) {
+                counts.push((await searchTools("fixture", {limit})).length);
+            }
+            counts.push((await searchTools("fixture", {namespace: "", limit: 2})).length);
+            counts.push((await searchTools("fixture", {namespace: "pi", limit: 2})).length);
+            counts.push((await searchTools("fixture", {namespace: "missing", limit: 2})).length);
+            text(JSON.stringify(counts));
+        "#;
+        let reply = ScriptTool {
+            timeout: Some(Duration::from_secs(10)),
+        }
+        .invoke_transaction(
+            json!({"code":script}),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            None,
+            Arc::new(Catalogue),
+        )
+        .await;
+        let output = reply.outcome.tool_content();
+        assert!(!reply.outcome.is_error(), "{output}");
+        assert!(output.contains("[8,8,8,8,1,1001,1001,2,2,0]"), "{output}");
+    }
+
     #[test]
     fn metadata_helpers_and_output_truncation_are_available() {
         let reply = run(
-            "const found = await searchTools('echo'); text(found[0].name); text((await describeTool('echo')).declaration); return (await describeNamespace('builtin')).tools.length;",
+            "const found = await searchTools('reconciliation'); if (found[0]?.name !== 'echo') throw new Error('missing referenced tool'); const declaration = (await describeTool('echo')).declaration; if (!declaration.includes('string')) throw new Error('missing referenced type'); text(declaration); return (await describeNamespace('builtin')).tools.length;",
             None,
         );
         assert!(reply.outcome.tool_content().contains("Echo a value"));
@@ -864,14 +3170,22 @@ mod tests {
     #[test]
     fn images_preserve_output_order_and_reuse_saved_files() {
         let data = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n\0");
-        let image = json!({"type":"image","mimeType":"image/png","data":data}).to_string();
         let mut output = Output::default();
-        output.emit("text", "before".into()).unwrap();
-        output.emit("image", image.clone()).unwrap();
-        output.emit("text", "between".into()).unwrap();
-        output.emit("image", image).unwrap();
-        output.emit("text", "after".into()).unwrap();
-        let value = output.finish(true, Duration::ZERO, None, 10000);
+        output.emit("text", "before".into(), "").unwrap();
+        output.emit("image", data.clone(), "image/png").unwrap();
+        output.emit("text", "between".into(), "").unwrap();
+        output.emit("image", data, "image/png").unwrap();
+        output.emit("text", "after".into(), "").unwrap();
+        let value = output
+            .finish(
+                true,
+                Duration::ZERO,
+                None,
+                10000,
+                &pi_rs_core::CancellationToken::new(),
+            )
+            .unwrap()
+            .deliver();
         let blocks = value["content"].as_array().unwrap();
         assert_eq!(
             blocks
@@ -906,7 +3220,16 @@ mod tests {
             }],
             ..Output::default()
         };
-        let value = output.finish(true, Duration::ZERO, None, 10000);
+        let value = output
+            .finish(
+                true,
+                Duration::ZERO,
+                None,
+                10000,
+                &pi_rs_core::CancellationToken::new(),
+            )
+            .unwrap()
+            .deliver();
         assert_eq!(value["isError"], false);
         assert!(
             value["content"][0]["text"]
@@ -915,6 +3238,520 @@ mod tests {
                 .contains("could not be saved")
         );
         assert_eq!(value["content"][1]["type"], "image");
+    }
+    #[test]
+    fn incremental_report_matches_untruncated_content() {
+        let output = Output {
+            items: vec![
+                Item::Text("first\n".into()),
+                Item::Text("".into()),
+                Item::Image {
+                    mime: "image/png".into(),
+                    data: "image".into(),
+                    path: Err("unavailable".into()),
+                },
+                Item::Text("\nlast".into()),
+            ],
+            console: vec!["界".into(), "😀\nnext".into()],
+            ..Output::default()
+        };
+        let mut streamed = String::new();
+        output.visit_report(
+            Some(&Output::header(false, Duration::ZERO)),
+            Some("failure"),
+            |part| streamed.push_str(part),
+        );
+        let result = output
+            .finish(
+                false,
+                Duration::ZERO,
+                Some("failure"),
+                10000,
+                &pi_rs_core::CancellationToken::new(),
+            )
+            .unwrap()
+            .deliver();
+        let expected = result["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(streamed, expected);
+        let truncated = output
+            .finish(
+                false,
+                Duration::ZERO,
+                Some("failure"),
+                5,
+                &pi_rs_core::CancellationToken::new(),
+            )
+            .unwrap()
+            .deliver();
+        let path = truncated["full_output_path"].as_str().unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn preview_budget_excludes_status_and_image_locations() {
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let mut output = Output::default();
+        let preview = |output: &Output, tokens| {
+            output
+                .finish(true, Duration::ZERO, None, tokens, &cancellation)
+                .unwrap()
+                .deliver()
+        };
+        let silent = preview(&output, 0);
+        assert!(silent["full_output_path"].is_null());
+        assert_eq!(
+            silent["content"][0]["text"],
+            Output::header(true, Duration::ZERO)
+        );
+
+        let label = "Image saved to /tmp/a-lengthy-image-path.png";
+        output.items.push(Item::Image {
+            mime: "image/png".into(),
+            data: "image".into(),
+            path: Ok("/tmp/a-lengthy-image-path.png".into()),
+        });
+        let image_only = preview(&output, 0);
+        assert!(image_only["full_output_path"].is_null());
+        assert!(
+            image_only["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with(label)
+        );
+        assert_eq!(image_only["content"][1]["type"], "image");
+
+        output.items.insert(0, Item::Text("abcd".into()));
+        assert!(preview(&output, 1)["full_output_path"].is_null());
+        let Item::Text(text) = &mut output.items[0] else {
+            unreachable!()
+        };
+        text.push('\n');
+        let truncated = preview(&output, 1);
+        let content = truncated["content"].as_array().unwrap();
+        let report = content[0]["text"].as_str().unwrap();
+        assert!(report.starts_with(&Output::header(true, Duration::ZERO)));
+        assert!(report.contains("original token count: 2"));
+        assert!(report.contains("Total output lines: 2\n\nab…1 tokens truncated…d\n"));
+        assert_eq!(content[1]["text"], label);
+        assert_eq!(content[2]["type"], "image");
+        let path = truncated["full_output_path"].as_str().unwrap();
+        let transcript = std::fs::read_to_string(path).unwrap();
+        assert!(transcript.ends_with(&format!("abcd\n{label}")));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn repeated_image_locations_respect_the_native_result_limit() {
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let path = format!("/tmp/{}/image.png", "folder/".repeat(130));
+        let mut output = Output::default();
+        let images = MAX_INLINE_IMAGE_LABEL_BYTES / path.len() + 1;
+        for _ in 0..images {
+            output.items.push(Item::Image {
+                mime: "image/png".into(),
+                data: "iVBORw0KGgo=".into(),
+                path: Ok(path.clone()),
+            });
+        }
+
+        for text in [None, Some("text exceeds a one-token budget")] {
+            if let Some(text) = text {
+                output.items.push(Item::Text(text.into()));
+            }
+            let result = output
+                .finish(true, Duration::ZERO, None, 1, &cancellation)
+                .unwrap()
+                .deliver();
+            assert!(result.to_string().len() <= MAX_INLINE_BYTES);
+            let content = result["content"].as_array().unwrap();
+            assert!(content.iter().any(|block| {
+                block["text"]
+                    .as_str()
+                    .is_some_and(|line| line.contains("and their locations omitted"))
+            }));
+            let transcript_path = result["full_output_path"].as_str().unwrap();
+            assert!(
+                content[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("[Full output: {transcript_path}]"))
+            );
+            let transcript = std::fs::read_to_string(transcript_path).unwrap();
+            assert_eq!(transcript.matches(&path).count(), images);
+            std::fs::remove_file(transcript_path).unwrap();
+        }
+    }
+
+    #[test]
+    fn output_budget_counts_utf16_and_keeps_supplementary_characters_intact() {
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let header = "Script completed\nWall time: 0.000s\n";
+        let budget = 40;
+        let fits = "😀".repeat(budget / 2);
+        let output = |text| Output {
+            items: vec![Item::Text(text)],
+            ..Output::default()
+        };
+        let fitting = output(fits.clone())
+            .finish(true, Duration::ZERO, None, budget / 4, &cancellation)
+            .unwrap()
+            .deliver();
+        assert!(fitting["full_output_path"].is_null());
+        let overflowing = format!("{fits}😀");
+        assert!(overflowing.chars().count() <= budget);
+        let truncated = output(overflowing)
+            .finish(true, Duration::ZERO, None, budget / 4, &cancellation)
+            .unwrap()
+            .deliver();
+        let path = truncated["full_output_path"].as_str().unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        let budget = 80;
+        let prefix = "x".repeat(budget / 2 - 1);
+        let suffix = "z".repeat(budget / 2 - 1);
+        let text = format!("{prefix}😀{}😀{suffix}", "mid".repeat(20));
+        let units = text.encode_utf16().count();
+        let result = output(text.clone())
+            .finish(true, Duration::ZERO, None, budget / 4, &cancellation)
+            .unwrap()
+            .deliver();
+        let report = result["content"][0]["text"].as_str().unwrap();
+        let omitted = (units - budget).div_ceil(4);
+        assert!(report.contains(&format!("original token count: {}", units.div_ceil(4))));
+        assert!(report.contains(&format!("{prefix}…{omitted} tokens truncated…{suffix}")));
+        assert!(!report.contains('😀'));
+        let path = result["full_output_path"].as_str().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            format!("{header}{text}")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn output_counts_utf16_units_across_text_console_and_image() {
+        let data = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n\0");
+        let mut output = Output {
+            utf16_units: MAX_OUTPUT - data.len() - 3,
+            ..Output::default()
+        };
+        output.emit("text", "界".into(), "").unwrap();
+        output.emit("console", "😀".into(), "").unwrap();
+        output.emit("image", data, "image/png").unwrap();
+        assert_eq!(output.utf16_units, MAX_OUTPUT);
+        assert!(!output.limit_exceeded);
+        assert!(output.emit("text", "a".into(), "").is_err());
+        assert!(output.limit_exceeded);
+        for path in output.saved_images.values().flatten() {
+            std::fs::remove_file(path).unwrap();
+        }
+        let mut output = Output {
+            utf16_units: MAX_OUTPUT - 1,
+            ..Output::default()
+        };
+        assert!(output.emit("text", "😀".into(), "").is_err());
+        assert_eq!(output.utf16_units, MAX_OUTPUT + 1);
+    }
+
+    #[tokio::test]
+    async fn unicode_output_boundary_is_enforced_by_script_runtime() {
+        for (code, expected_success) in [
+            ("text('界'); console.log('😀')", true),
+            ("text('界'); console.log('😀'); text('a')", false),
+        ] {
+            let sink = Arc::new(Mutex::new(Output {
+                utf16_units: MAX_OUTPUT - 3,
+                ..Output::default()
+            }));
+            let result = evaluate(
+                code,
+                json!({}),
+                Arc::new(Host),
+                ToolContext {
+                    operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                    cancellation: Default::default(),
+                },
+                Some(Duration::from_secs(10)),
+                sink.clone(),
+            )
+            .await;
+            assert_eq!(result.is_ok(), expected_success);
+            assert_eq!(sink.lock().unwrap().limit_exceeded, !expected_success);
+        }
+    }
+
+    #[tokio::test]
+    async fn image_limit_counts_base64_payload_not_wrapper() {
+        let data = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n\0");
+        let sink = Arc::new(Mutex::new(Output {
+            utf16_units: MAX_OUTPUT - data.len(),
+            ..Output::default()
+        }));
+        let code =
+            format!("image({{type:'image', mimeType:'image/png', data:'{data}', extra:'界😀'}})");
+        let result = evaluate(
+            &code,
+            json!({}),
+            Arc::new(Host),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            Some(Duration::from_secs(10)),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(result.ok);
+        let output = sink.lock().unwrap();
+        assert_eq!(output.utf16_units, MAX_OUTPUT);
+        for path in output.saved_images.values().flatten() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn maximum_size_multibyte_output_is_accepted() {
+        let sink = Arc::new(Mutex::new(Output::default()));
+        let result = evaluate(
+            "text('界'.repeat(16 * 1024 * 1024))",
+            json!({}),
+            Arc::new(Host),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            Some(Duration::from_secs(30)),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(result.ok);
+        let output = sink.lock().unwrap();
+        assert_eq!(output.utf16_units, MAX_OUTPUT);
+        assert!(matches!(&output.items[..], [Item::Text(text)] if text.len() == 3 * MAX_OUTPUT));
+    }
+
+    #[tokio::test]
+    async fn full_invocation_streams_maximum_multibyte_output() {
+        let reply = tokio::time::timeout(Duration::from_secs(30), ScriptTool { timeout: None }.invoke_transaction(
+            json!({"code":"// @options: {\"max_output_tokens\":10}\ntext('界'.repeat(16 * 1024 * 1024));"}),
+            ToolContext { operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(), cancellation: Default::default() },
+            None, Arc::new(Host),
+        )).await.expect("large output stalled");
+        let Outcome::Structured { data, .. } = reply.outcome else {
+            panic!("expected success")
+        };
+        let report = data["content"][0]["text"].as_str().unwrap();
+        assert!(report.contains("Warning: truncated output"));
+        assert!(report.contains("界"));
+        assert!(report.len() < 4096);
+        let path = data["full_output_path"].as_str().unwrap();
+        assert!(std::fs::metadata(path).unwrap().len() >= (3 * MAX_OUTPUT) as u64);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[tokio::test]
+    async fn dropped_formatting_keeps_worker_bounded_and_removes_transcript() {
+        let workers = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = workers.clone().acquire_owned().await.unwrap();
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let (created, path) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                let _cancel_on_drop = cancellation.clone().drop_guard();
+                let output = tokio::task::spawn_blocking(move || {
+                    with_worker_permit(permit, || {
+                        let mut output = Output::default();
+                        output.emit("text", "界".repeat(1000), "").unwrap();
+                        let formatted = output
+                            .finish(true, Duration::ZERO, None, 1, &cancellation)
+                            .unwrap();
+                        created
+                            .send(
+                                formatted.value["full_output_path"]
+                                    .as_str()
+                                    .unwrap()
+                                    .to_owned(),
+                            )
+                            .unwrap();
+                        blocked.recv().unwrap();
+                        formatted
+                    })
+                })
+                .await
+                .unwrap();
+                output.deliver()
+            }
+        });
+        let path = path.await.unwrap();
+        assert!(std::path::Path::new(&path).exists());
+        assert!(workers.clone().try_acquire_owned().is_err());
+        task.abort();
+        let _ = task.await;
+        assert!(cancellation.is_cancelled());
+        assert!(workers.clone().try_acquire_owned().is_err());
+        release.send(()).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(5), workers.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while std::path::Path::new(&path).exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("undelivered transcript was retained");
+    }
+
+    #[test]
+    fn formatting_checks_cancellation_between_utf8_safe_chunks() {
+        let cancellation = pi_rs_core::CancellationToken::new();
+        let mut chunks = 0;
+        visit_chunks(&"界".repeat(100_000), &cancellation, |chunk| {
+            assert!(chunk.len() <= 64 * 1024);
+            chunks += 1;
+            cancellation.cancel();
+        });
+        assert_eq!(chunks, 1);
+    }
+    #[test]
+    fn cancellation_after_keep_before_commit_removes_transcript() {
+        let token = pi_rs_core::CancellationToken::new();
+        let mut output = Output::default();
+        output.emit("text", "界".repeat(1000), "").unwrap();
+        let formatted = output
+            .finish(true, Duration::ZERO, None, 1, &token)
+            .unwrap();
+        let path = formatted.value["full_output_path"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut publication = formatted.publish();
+        assert!(std::path::Path::new(&path).exists());
+        token.cancel();
+        assert!(!publication.commit_if_active(&token));
+        drop(publication);
+        assert!(!std::path::Path::new(&path).exists());
+
+        let token = pi_rs_core::CancellationToken::new();
+        let formatted = output
+            .finish(true, Duration::ZERO, None, 1, &token)
+            .unwrap();
+        let path = formatted.value["full_output_path"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut publication = formatted.publish();
+        assert!(publication.commit_if_active(&token));
+        token.cancel();
+        drop(publication);
+        assert!(std::path::Path::new(&path).exists());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    struct DeadlineModel;
+    #[async_trait::async_trait]
+    impl pi_rs_core::Model for DeadlineModel {
+        async fn stream(
+            &self,
+            request: ModelRequest,
+        ) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+            use pi_rs_core::{Message, ModelEvent, ToolCall};
+            let events = if let Some(content) = request.messages.iter().find_map(|message| {
+                if let Message::Tool { content, .. } = message {
+                    Some(content)
+                } else {
+                    None
+                }
+            }) {
+                assert!(
+                    content.contains("error")
+                        || content.contains("timed out")
+                        || content.contains("interrupt"),
+                    "{content}"
+                );
+                vec![
+                    Ok(ModelEvent::Text("done".into())),
+                    Ok(ModelEvent::Complete {
+                        calls: vec![],
+                        usage: None,
+                    }),
+                ]
+            } else {
+                vec![Ok(ModelEvent::Complete {
+                    calls: vec![ToolCall {
+                        id: "deadline".into(),
+                        name: "codemode".into(),
+                        arguments: json!({"code":"while (true) {}"}).to_string(),
+                    }],
+                    usage: None,
+                })]
+            };
+            Ok(Box::pin(futures_util::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn public_sdk_explicit_timeouts_interrupt_busy_scripts() {
+        for explicit_limits in [false, true] {
+            // Keep the original public struct literal and Duration field usable.
+            let extension = Codemode {
+                only: false,
+                inline_budget: 3000,
+                timeout: if explicit_limits {
+                    Duration::MAX
+                } else {
+                    Duration::from_millis(20)
+                },
+            };
+            let mut builder = pi_rs_core::SessionBuilder::new(Arc::new(DeadlineModel), "fixture")
+                .extension(Arc::new(extension))
+                .unwrap();
+            if explicit_limits {
+                builder = builder.limits(pi_rs_core::Limits {
+                    tool_timeout: Duration::from_millis(20),
+                    ..Default::default()
+                });
+            }
+            let mut session = builder.in_memory().unwrap();
+            match session.prompt("test").await {
+                Ok(answer) => assert_eq!(answer, "done"),
+                // The host deadline can win the race with the worker's interrupt.
+                // Until the worker reports back, its outcome is safely unknown.
+                Err(pi_rs_core::Error::Reconciliation(operation_id)) if explicit_limits => {
+                    assert!(
+                        session
+                            .journal().unwrap()
+                            .operations()
+                            .iter()
+                            .any(|(invocation, state)| {
+                                invocation.operation_id == operation_id
+                                    && matches!(
+                                        state,
+                                        pi_rs_core::OperationState::Finished(Outcome::Unknown(reason)) if reason == "tool timed out"
+                                    )
+                            })
+                    );
+                    assert!(matches!(
+                        session.resume().await,
+                        Err(pi_rs_core::Error::Reconciliation(_))
+                    ));
+                }
+                result => panic!("unexpected timeout result: {result:?}"),
+            }
+            session.close().await.unwrap();
+        }
     }
 
     struct LargeImageModel;
@@ -978,7 +3815,10 @@ mod tests {
             .in_memory()
             .unwrap();
         assert_eq!(session.prompt("image").await.unwrap(), "done");
-        assert_eq!(session.journal().extension_states()[ID].data["saved"], true);
+        assert_eq!(
+            session.journal().unwrap().extension_states()[ID].data["saved"],
+            true
+        );
         session.close().await.unwrap();
     }
 
@@ -1060,9 +3900,357 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result, "done");
-        assert_eq!(session.journal().operations().len(), 3);
+        assert_eq!(session.journal().unwrap().operations().len(), 3);
         session.close().await.unwrap();
     }
+    #[tokio::test]
+    async fn output_breach_skips_queued_write_and_returns_tool_failure_to_model() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct QueueTool {
+            name: &'static str,
+            writes: Arc<AtomicUsize>,
+            prepared: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Tool for QueueTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.name.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+            async fn prepare_arguments(&self, arguments: Value) -> ExtensionResult<Value> {
+                if self.name == "hold" {
+                    self.prepared.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+                Ok(arguments)
+            }
+            async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                Outcome::Succeeded("done".into())
+            }
+        }
+        struct QueueExtension(Arc<AtomicUsize>, Arc<AtomicUsize>);
+        impl Extension for QueueExtension {
+            fn id(&self) -> &str {
+                "queue-test"
+            }
+            fn tools(&self) -> Vec<Arc<dyn Tool>> {
+                ["hold", "write"]
+                    .into_iter()
+                    .map(|name| {
+                        Arc::new(QueueTool {
+                            name,
+                            writes: self.0.clone(),
+                            prepared: self.1.clone(),
+                        }) as Arc<dyn Tool>
+                    })
+                    .collect()
+            }
+        }
+        struct QueueModel;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Model for QueueModel {
+            async fn stream(
+                &self,
+                request: ModelRequest,
+            ) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+                use pi_rs_core::{Message, ModelEvent, ToolCall};
+                let events = if let Some(content) =
+                    request.messages.iter().find_map(|message| match message {
+                        Message::Tool { content, .. } => Some(content),
+                        _ => None,
+                    }) {
+                    assert!(
+                        content.contains("Script output limit exceeded"),
+                        "{content}"
+                    );
+                    vec![
+                        Ok(ModelEvent::Text("done".into())),
+                        Ok(ModelEvent::Complete {
+                            calls: vec![],
+                            usage: None,
+                        }),
+                    ]
+                } else {
+                    vec![Ok(ModelEvent::Complete { calls: vec![ToolCall {
+                        id:"script".into(), name:"codemode".into(),
+                        arguments: json!({"code":"tools.hold({}); tools.write({}); await Promise.resolve(); text('x'.repeat(16 * 1024 * 1024 + 1));"}).to_string(),
+                    }], usage: None })]
+                };
+                Ok(Box::pin(futures_util::stream::iter(events)))
+            }
+        }
+        let writes = Arc::new(AtomicUsize::new(0));
+        let prepared = Arc::new(AtomicUsize::new(0));
+        let mut session = pi_rs_core::SessionBuilder::new(Arc::new(QueueModel), "fixture")
+            .extension(Arc::new(Codemode::default()))
+            .unwrap()
+            .extension(Arc::new(QueueExtension(writes.clone(), prepared.clone())))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(10), session.prompt("test"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer, "done");
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(prepared.load(Ordering::SeqCst), 1);
+        let operations = session.journal().unwrap().operations();
+        assert!(
+            operations
+                .iter()
+                .any(|(invocation, state)| invocation.call.name == "write"
+                    && matches!(
+                        state,
+                        pi_rs_core::OperationState::Finished(Outcome::Skipped(_))
+                    ))
+        );
+        session.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn cancelled_nested_read_batch_retires_prepared_peers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct BatchTool {
+            name: &'static str,
+            slow_started: Arc<tokio::sync::Notify>,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Tool for BatchTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.name.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+            fn execution(&self) -> pi_rs_core::ToolExecution {
+                if self.name == "batch" {
+                    pi_rs_core::ToolExecution::Sequential
+                } else {
+                    pi_rs_core::ToolExecution::ParallelRead
+                }
+            }
+            async fn prepare_arguments(&self, args: Value) -> ExtensionResult<Value> {
+                if self.name == "slow_read" {
+                    self.slow_started.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                Ok(args)
+            }
+            async fn invoke(&self, _: Value, _: ToolContext) -> Outcome {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Outcome::Succeeded("unexpected".into())
+            }
+            async fn invoke_with_host(
+                &self,
+                _: Value,
+                context: ToolContext,
+                _: Option<&ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> Outcome {
+                if self.name != "batch" {
+                    return self.invoke(json!({}), context).await;
+                }
+                let pending = tokio::spawn(async move {
+                    host.call_batch(vec![
+                        ("fast_read".into(), json!({})),
+                        ("slow_read".into(), json!({})),
+                    ])
+                    .await
+                });
+                self.slow_started.notified().await;
+                context.cancellation.cancel();
+                let _ = pending.await;
+                Outcome::Failed("batch cancelled".into())
+            }
+        }
+        struct BatchExtension {
+            slow_started: Arc<tokio::sync::Notify>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Extension for BatchExtension {
+            fn id(&self) -> &str {
+                "batch-test"
+            }
+            fn tools(&self) -> Vec<Arc<dyn Tool>> {
+                ["batch", "fast_read", "slow_read"]
+                    .into_iter()
+                    .map(|name| {
+                        Arc::new(BatchTool {
+                            name,
+                            slow_started: self.slow_started.clone(),
+                            calls: self.calls.clone(),
+                        }) as Arc<dyn Tool>
+                    })
+                    .collect()
+            }
+        }
+        struct BatchModel;
+        #[async_trait::async_trait]
+        impl pi_rs_core::Model for BatchModel {
+            async fn stream(
+                &self,
+                request: ModelRequest,
+            ) -> pi_rs_core::Result<pi_rs_core::ModelStream> {
+                use pi_rs_core::{Message, ModelEvent, ToolCall};
+                let events = if let Some(content) =
+                    request.messages.iter().find_map(|message| match message {
+                        Message::Tool { content, .. } => Some(content),
+                        _ => None,
+                    }) {
+                    assert!(content.contains("batch cancelled"), "{content}");
+                    vec![
+                        Ok(ModelEvent::Text("done".into())),
+                        Ok(ModelEvent::Complete {
+                            calls: vec![],
+                            usage: None,
+                        }),
+                    ]
+                } else {
+                    vec![Ok(ModelEvent::Complete {
+                        calls: vec![ToolCall {
+                            id: "batch".into(),
+                            name: "batch".into(),
+                            arguments: "{}".into(),
+                        }],
+                        usage: None,
+                    })]
+                };
+                Ok(Box::pin(futures_util::stream::iter(events)))
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut session = pi_rs_core::SessionBuilder::new(Arc::new(BatchModel), "fixture")
+            .extension(Arc::new(BatchExtension {
+                slow_started: Arc::new(tokio::sync::Notify::new()),
+                calls: calls.clone(),
+            }))
+            .unwrap()
+            .in_memory()
+            .unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(5), session.prompt("test"))
+            .await
+            .expect("cancelled batch stranded scheduler")
+            .unwrap();
+        assert_eq!(answer, "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let operations = session.journal().unwrap().operations();
+        for name in ["fast_read", "slow_read"] {
+            assert!(
+                operations
+                    .iter()
+                    .any(|(invocation, state)| invocation.call.name == name
+                        && matches!(
+                            state,
+                            pi_rs_core::OperationState::Finished(Outcome::Skipped(_))
+                        ))
+            );
+        }
+        session.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn model_catalogue_validates_search_arguments_before_dispatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CatalogHost(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl ToolHost for CatalogHost {
+            fn cancellation_safe_calls(&self) -> bool {
+                true
+            }
+            fn tools(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: MODEL_OPERATION.into(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                }]
+            }
+            async fn call(&self, _: &str, args: Value) -> Outcome {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                assert!(args["id"].is_null() || args["id"] == "fixture");
+                Outcome::Structured {
+                    data: json!([{"id":"fixture"}]),
+                    attachments: vec![],
+                }
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let code = r#"
+            for (const call of [
+                () => models.getModelsOfType('chat', 12),
+                () => models.getAvailableOfType('image', {}),
+                () => models.getModelOfType('classifier', 'fixture'),
+                () => models.getModelOfType('chat', null, 'fixture'),
+                () => models.getModelOfType('chat', 'fixture', 42),
+                () => models.getModelsOfType('invalid'),
+            ]) {
+                let rejected = false;
+                try { await call(); } catch (_) { rejected = true; }
+                if (!rejected) throw new Error('invalid search accepted');
+            }
+            await models.getModelsOfType('chat', null);
+            await models.getModelsOfType('chat', 'fixture', 'ignored');
+            await models.getAvailableOfType('chat', NaN);
+            const model = await models.getModelOfType('chat', new String('fixture'), 'fixture');
+            if (model.id !== 'fixture') throw new Error('valid search failed');
+            text('ok');
+        "#;
+        let reply = ScriptTool {
+            timeout: Some(Duration::from_secs(2)),
+        }
+        .invoke_transaction(
+            json!({"code":code}),
+            ToolContext {
+                operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                cancellation: Default::default(),
+            },
+            None,
+            Arc::new(CatalogHost(calls.clone())),
+        )
+        .await;
+        let Outcome::Structured { data, .. } = reply.outcome else {
+            panic!("expected completed script")
+        };
+        assert_eq!(data["isError"], false, "{data}");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn inline_declarations_select_by_utf16_cost_and_share_the_budget_between_namespaces() {
+        let tool = |name: &str, description: String| ToolSpec {
+            name: name.into(),
+            description,
+            parameters: json!({"type":"object"}),
+        };
+        let tools = [
+            tool("mcp__a__expensive", "expensive".repeat(20)),
+            tool("mcp__a__unicode", "猫😀".repeat(10)),
+            tool("mcp__a__small", "a".into()),
+            tool("mcp__b__other", "b".into()),
+            tool("read", "native".into()),
+        ];
+        let cost = |index: usize| describe(&tools[index]).encode_utf16().count().div_ceil(4);
+        let unicode_budget = cost(4) + cost(2) + cost(3) + cost(1);
+        assert_eq!(
+            inline_declarations(&tools, unicode_budget),
+            [4, 1, 2, 3]
+                .map(|index| describe(&tools[index]) + "\n")
+                .concat()
+        );
+        let first_round = cost(4) + cost(2) + cost(3);
+        assert_eq!(
+            inline_declarations(&tools, first_round),
+            [4, 2, 3]
+                .map(|index| describe(&tools[index]) + "\n")
+                .concat()
+        );
+        assert!(inline_declarations(&tools, 0).is_empty());
+    }
+
     #[test]
     fn options_are_restricted_to_the_first_line() {
         let reply = run("text('first');\n// @options: {}", None);

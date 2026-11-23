@@ -27,6 +27,224 @@ pub struct UiComponentSpan {
     pub inverse: bool,
 }
 
+/// Layout options for an extension's custom transcript message.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomMessageRenderOptions {
+    pub expanded: bool,
+    pub output_pad: usize,
+    pub expand_key: Option<String>,
+}
+
+/// The extension supplies semantic theme roles. The host applies its palette
+/// and wraps the rows to fit.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderedCustomMessage {
+    pub lines: Vec<Vec<UiComponentSpan>>,
+    #[serde(default)]
+    pub padding: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+}
+
+/// Styled rows returned by a custom-entry renderer.
+pub type RenderedExtensionContent = RenderedCustomMessage;
+
+/// Styled rows shared by the native extension renderers.
+pub type RenderedExtensionRows = RenderedCustomMessage;
+
+impl RenderedCustomMessage {
+    pub(crate) fn within_limits(&self) -> bool {
+        component_lines_within_limits(&self.lines)
+            && self
+                .background
+                .as_ref()
+                .is_none_or(|role| role.len() <= 128)
+            && self
+                .lines
+                .iter()
+                .flatten()
+                .all(|span| span.color.as_ref().is_none_or(|color| color.len() <= 128))
+    }
+}
+
+fn component_lines_within_limits(lines: &[Vec<UiComponentSpan>]) -> bool {
+    lines.len() <= 256
+        && lines.iter().map(Vec::len).sum::<usize>() <= 1024
+        && lines
+            .iter()
+            .flatten()
+            .map(|span| span.text.len())
+            .sum::<usize>()
+            <= 64 * 1024
+}
+
+/// Resolved custom-message renderers in extension load order. Hosts can use the
+/// snapshot while a session runs, independently of its journal and model context.
+#[derive(Clone, Default)]
+pub struct CustomMessageRenderers {
+    pub(crate) renderers: std::collections::BTreeMap<String, std::sync::Arc<dyn crate::Extension>>,
+}
+
+impl CustomMessageRenderers {
+    pub fn types(&self) -> impl Iterator<Item = &str> {
+        self.renderers.keys().map(String::as_str)
+    }
+
+    pub fn contains(&self, custom_type: &str) -> bool {
+        self.renderers.contains_key(custom_type)
+    }
+
+    /// Invoke the first registered renderer for a visible message. An absent,
+    /// failed, oversized or timed-out response leaves fallback rendering to
+    /// the host.
+    pub async fn render(
+        &self,
+        message: &crate::CustomMessage,
+        options: &CustomMessageRenderOptions,
+        timeout: std::time::Duration,
+    ) -> Option<RenderedCustomMessage> {
+        use futures_util::FutureExt;
+
+        if !message.display {
+            return None;
+        }
+        let renderer = self.renderers.get(&message.custom_type)?;
+        let callback = std::panic::AssertUnwindSafe(async {
+            renderer.render_custom_message(message, options).await
+        })
+        .catch_unwind();
+        crate::runtime::time::timeout(timeout, callback)
+            .await
+            .ok()?
+            .ok()?
+            .ok()?
+            .filter(RenderedCustomMessage::within_limits)
+    }
+}
+
+/// Presentation state for a branch-local entry.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomEntryRenderOptions {
+    pub expanded: bool,
+    pub expand_key: Option<String>,
+}
+
+/// First-registered renderers of branch-local entries. They are independent
+/// of the active session and request context.
+#[derive(Clone, Default)]
+pub struct CustomEntryRenderers {
+    pub(crate) renderers: std::collections::BTreeMap<String, std::sync::Arc<dyn crate::Extension>>,
+}
+
+impl CustomEntryRenderers {
+    pub fn types(&self) -> impl Iterator<Item = &str> {
+        self.renderers.keys().map(String::as_str)
+    }
+
+    pub fn contains(&self, custom_type: &str) -> bool {
+        self.renderers.contains_key(custom_type)
+    }
+
+    /// Produce presentation rows for an entry. No registered renderer or an
+    /// intentionally hidden entry returns `None`. Failures are returned so
+    /// the host can decide whether to display a local error row.
+    pub async fn render(
+        &self,
+        entry: &crate::CustomEntryRecord,
+        options: &CustomEntryRenderOptions,
+        timeout: std::time::Duration,
+    ) -> ExtensionResult<Option<RenderedExtensionContent>> {
+        use futures_util::FutureExt;
+        let Some(renderer) = self.renderers.get(&entry.entry.custom_type) else {
+            return Ok(None);
+        };
+        let callback = std::panic::AssertUnwindSafe(async {
+            renderer.render_custom_entry(entry, options).await
+        })
+        .catch_unwind();
+        let rendering = crate::runtime::time::timeout(timeout, callback)
+            .await
+            .map_err(|_| "custom entry renderer timed out")?
+            .map_err(|_| "custom entry renderer panicked")??;
+        if rendering
+            .as_ref()
+            .is_some_and(|content| !content.within_limits())
+        {
+            return Err("custom entry exceeds rendering limits".into());
+        }
+        Ok(rendering)
+    }
+}
+
+/// The normal message content being rendered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MarkdownMessageType {
+    User,
+    Assistant,
+    AssistantThinking,
+}
+
+/// Layout and message identity available to a display-only Markdown hook.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkdownTransformContext {
+    pub message_type: MarkdownMessageType,
+    pub is_streaming: bool,
+    pub available_width: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+}
+
+/// Markdown transformers in extension load order.
+#[derive(Clone, Default)]
+pub struct MarkdownTransformers {
+    pub(crate) extensions: Vec<std::sync::Arc<dyn crate::Extension>>,
+}
+
+impl MarkdownTransformers {
+    pub const MAX_MARKDOWN_BYTES: usize = 256 * 1024;
+
+    pub fn is_empty(&self) -> bool {
+        self.extensions.is_empty()
+    }
+
+    /// Transform Markdown for display. A failed or oversized result leaves the
+    /// preceding Markdown available to the next transformer. A missing result
+    /// means the host can render the original Markdown.
+    pub async fn transform(
+        &self,
+        markdown: &str,
+        context: &MarkdownTransformContext,
+        timeout: std::time::Duration,
+    ) -> Option<String> {
+        use futures_util::FutureExt;
+
+        if markdown.len() > Self::MAX_MARKDOWN_BYTES {
+            return None;
+        }
+        let mut transformed: Option<String> = None;
+        for extension in &self.extensions {
+            let current = transformed.as_deref().unwrap_or(markdown);
+            let callback = std::panic::AssertUnwindSafe(async {
+                extension.transform_markdown(current, context).await
+            })
+            .catch_unwind();
+            if let Ok(Ok(Ok(Some(next)))) = crate::runtime::time::timeout(timeout, callback).await
+                && next.len() <= Self::MAX_MARKDOWN_BYTES
+            {
+                transformed = Some(next);
+            }
+        }
+        transformed.filter(|text| text != markdown)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiComponentAction {
     pub key: String,
@@ -143,15 +361,7 @@ impl UiRequest {
             return Err("extension widgets support at most 128 lines".into());
         }
         if let Self::Custom { lines, actions, .. } = self {
-            if lines.len() > 256
-                || lines.iter().map(Vec::len).sum::<usize>() > 1024
-                || lines
-                    .iter()
-                    .flatten()
-                    .map(|span| span.text.len())
-                    .sum::<usize>()
-                    > 64 * 1024
-            {
+            if !component_lines_within_limits(lines) {
                 return Err("extension component exceeds its rendering limits".into());
             }
             let mut keys = std::collections::BTreeSet::new();
@@ -219,6 +429,229 @@ pub trait ExtensionUi: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn markdown_transformers_chain_display_results_in_load_order() {
+        struct Transformer(&'static str);
+
+        #[async_trait::async_trait]
+        impl crate::Extension for Transformer {
+            fn id(&self) -> &str {
+                self.0
+            }
+
+            fn handles_markdown_transform(&self) -> bool {
+                true
+            }
+
+            async fn transform_markdown(
+                &self,
+                markdown: &str,
+                context: &MarkdownTransformContext,
+            ) -> ExtensionResult<Option<String>> {
+                match self.0 {
+                    "prefix" => Ok(Some(format!("prefix {markdown}"))),
+                    "failure" => Err("expected error".into()),
+                    "large" => Ok(Some("x".repeat(256 * 1024 + 1))),
+                    _ => {
+                        assert_eq!(context.message_type, MarkdownMessageType::AssistantThinking);
+                        assert!(context.is_streaming);
+                        assert_eq!(context.message_id, Some(12));
+                        assert_eq!(context.timestamp.as_deref(), Some("2026-11-21T07:00:00Z"));
+                        Ok(Some(format!("{markdown} [{}]", context.available_width)))
+                    }
+                }
+            }
+        }
+
+        let mut registry = crate::Registry::default();
+        assert!(registry.markdown_transformers().is_empty());
+        for name in ["prefix", "failure", "large", "suffix"] {
+            registry
+                .register(std::sync::Arc::new(Transformer(name)))
+                .unwrap();
+        }
+        let context = MarkdownTransformContext {
+            message_type: MarkdownMessageType::AssistantThinking,
+            is_streaming: true,
+            available_width: 42,
+            message_id: Some(12),
+            timestamp: Some("2026-11-21T07:00:00Z".into()),
+        };
+        let rendered = registry
+            .markdown_transformers()
+            .transform("original", &context, std::time::Duration::from_secs(1))
+            .await;
+        assert_eq!(rendered.as_deref(), Some("prefix original [42]"));
+    }
+
+    #[tokio::test]
+    async fn custom_entry_renderers_select_the_first_registration_and_distinguish_failure() {
+        struct Renderer(&'static str);
+        #[async_trait::async_trait]
+        impl crate::Extension for Renderer {
+            fn id(&self) -> &str {
+                self.0
+            }
+            fn custom_entry_renderer_types(&self) -> Vec<&str> {
+                vec!["card"]
+            }
+            async fn render_custom_entry(
+                &self,
+                entry: &crate::CustomEntryRecord,
+                options: &CustomEntryRenderOptions,
+            ) -> ExtensionResult<Option<RenderedExtensionContent>> {
+                if !options.expanded {
+                    return Ok(None);
+                }
+                let label = entry
+                    .entry
+                    .data
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("card is missing its label")?;
+                Ok(Some(RenderedExtensionContent {
+                    lines: vec![vec![UiComponentSpan {
+                        text: format!("{} {} {label}", self.0, entry.id),
+                        ..Default::default()
+                    }]],
+                    ..Default::default()
+                }))
+            }
+        }
+
+        let mut registry = crate::Registry::default();
+        registry
+            .register(std::sync::Arc::new(Renderer("first")))
+            .unwrap();
+        registry
+            .register(std::sync::Arc::new(Renderer("second")))
+            .unwrap();
+        let renderers = registry.custom_entry_renderers();
+        let mut entry = crate::CustomEntryRecord {
+            id: 19,
+            entry: crate::CustomEntry {
+                custom_type: "card".into(),
+                data: Some(serde_json::json!("label")),
+            },
+        };
+        let deadline = std::time::Duration::from_secs(1);
+        let mut options = CustomEntryRenderOptions::default();
+        assert!(
+            renderers
+                .render(&entry, &options, deadline)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        options.expanded = true;
+        assert_eq!(
+            renderers
+                .render(&entry, &options, deadline)
+                .await
+                .unwrap()
+                .unwrap()
+                .lines[0][0]
+                .text,
+            "first 19 label"
+        );
+        entry.entry.data = None;
+        assert_eq!(
+            renderers
+                .render(&entry, &options, deadline)
+                .await
+                .unwrap_err(),
+            "card is missing its label"
+        );
+        entry.entry.custom_type = "unknown".into();
+        assert!(
+            renderers
+                .render(&entry, &options, deadline)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn first_custom_message_renderer_wins_and_hidden_messages_do_not_run() {
+        struct Renderer(&'static str);
+        #[async_trait::async_trait]
+        impl crate::Extension for Renderer {
+            fn id(&self) -> &str {
+                self.0
+            }
+            fn custom_message_renderer_types(&self) -> Vec<&str> {
+                vec!["card"]
+            }
+            async fn render_custom_message(
+                &self,
+                message: &crate::CustomMessage,
+                options: &CustomMessageRenderOptions,
+            ) -> ExtensionResult<Option<RenderedCustomMessage>> {
+                assert!(message.display);
+                let label = match message.details.as_ref().and_then(serde_json::Value::as_str) {
+                    Some("fail") => return Err("renderer failure".into()),
+                    Some("oversize") => "x".repeat(64 * 1024 + 1),
+                    Some(value) if options.expanded => format!("{} {value}", self.0),
+                    _ => self.0.into(),
+                };
+                Ok(Some(RenderedCustomMessage {
+                    lines: vec![vec![UiComponentSpan {
+                        text: label,
+                        color: Some("accent".into()),
+                        ..Default::default()
+                    }]],
+                    padding: options.output_pad,
+                    background: None,
+                }))
+            }
+        }
+
+        let mut registry = crate::Registry::default();
+        registry
+            .register(std::sync::Arc::new(Renderer("first")))
+            .unwrap();
+        registry
+            .register(std::sync::Arc::new(Renderer("second")))
+            .unwrap();
+        let renderers = registry.custom_message_renderers();
+        assert!(renderers.contains("card"));
+        assert!(!renderers.contains("unregistered"));
+        let mut message = crate::CustomMessage {
+            custom_type: "card".into(),
+            content: crate::ContextContent::Text("model context".into()),
+            display: true,
+            details: Some(serde_json::json!("details")),
+        };
+        let options = CustomMessageRenderOptions {
+            expanded: true,
+            output_pad: 2,
+            expand_key: Some("Ctrl+O".into()),
+        };
+        let timeout = std::time::Duration::from_secs(1);
+        let rendered = renderers.render(&message, &options, timeout).await.unwrap();
+        assert_eq!(rendered.lines[0][0].text, "first details");
+        assert_eq!(rendered.lines[0][0].color.as_deref(), Some("accent"));
+        assert_eq!(rendered.padding, 2);
+        for details in ["fail", "oversize"] {
+            message.details = Some(serde_json::json!(details));
+            assert!(
+                renderers
+                    .render(&message, &options, timeout)
+                    .await
+                    .is_none()
+            );
+        }
+        message.display = false;
+        assert!(
+            renderers
+                .render(&message, &options, timeout)
+                .await
+                .is_none()
+        );
+    }
+
     #[test]
     fn rpc_fields_and_typed_responses_match_dialog_kinds() {
         let widget: UiRequest = serde_json::from_value(serde_json::json!({

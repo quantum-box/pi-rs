@@ -811,6 +811,8 @@ mod model_profile_tests {
                     }],
                 },
                 Message::Tool {
+                    is_error: false,
+                    is_structured: None,
                     call_id: "1".into(),
                     content: json!({"data":{"content":[image.clone()]}}).to_string(),
                 },

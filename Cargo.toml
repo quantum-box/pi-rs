@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/anthropic", "crates/fixture-tools", "crates/aip-host", "crates/core", "crates/durable", "crates/durable-store", "crates/google", "crates/ollama", "crates/openai", "crates/plan-mode", "crates/review", "crates/extensions", "crates/workbench"]
+members = ["crates/bedrock", "crates/anthropic", "crates/fixture-tools", "crates/aip-host", "crates/core", "crates/durable", "crates/durable-store", "crates/google", "crates/ollama", "crates/openai", "crates/plan-mode", "crates/review", "crates/file-url", "crates/remote-find", "crates/remote-grep", "crates/remote-ls", "crates/extensions", "crates/tool-arguments", "crates/workbench"]
 exclude = ["crates/durable-task-schema"]
 resolver = "3"
 
@@ -14,11 +14,13 @@ description = "Embeddable agent harness with recoverable sessions and Rust exten
 [features]
 default = ["ollama"]
 ollama = ["dep:pi-rs-ollama"]
+bedrock = ["dep:pi-rs-bedrock"]
 anthropic = ["dep:pi-rs-anthropic"]
 google = ["dep:pi-rs-google"]
 openai = ["dep:pi-rs-openai"]
 
 [dependencies]
+pi-rs-bedrock = { path = "crates/bedrock", version = "0.1.0", optional = true }
 pi-rs-core = { path = "crates/core", version = "0.1.0" }
 pi-rs-anthropic = { path = "crates/anthropic", version = "0.1.0", optional = true }
 pi-rs-google = { path = "crates/google", version = "0.1.0", optional = true }
@@ -33,3 +35,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 uuid = "1"
 pi-rs-review = { path = "crates/review" }
+
+[patch.crates-io]
+reqwest-012 = { package = "reqwest", path = "vendor/reqwest-0.12.28" }
+reqwest-013 = { package = "reqwest", path = "vendor/reqwest-0.13.5" }

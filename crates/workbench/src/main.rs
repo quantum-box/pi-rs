@@ -13,8 +13,12 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod anthropic_auth;
+mod anthropic_federation;
 mod attachments;
 mod auth_cli;
+mod auth_lock;
+mod auth_login;
 mod backend;
 mod builtin_chat;
 mod cache_stats;
@@ -22,12 +26,18 @@ mod cache_warming;
 mod chatgpt_auth;
 mod cli_compat;
 mod clipboard;
+mod cloudflare_gateway;
+mod codex_auth;
 mod config;
+mod copilot_auth;
 mod extension_ui;
 mod http_proxy;
 mod image_policy;
 mod interactive;
+mod kimi_auth;
+mod locale;
 mod mcp_config;
+mod meta_auth;
 mod model_auth;
 mod model_listing;
 mod model_profiles;
@@ -38,6 +48,8 @@ mod packages;
 mod pi_messages;
 mod process;
 mod providers;
+mod vertex_auth;
+mod xai_auth;
 use providers::Provider;
 mod radius_auth;
 mod radius_catalog;
@@ -50,7 +62,8 @@ mod rpc_messages;
 mod runtime;
 mod session_import;
 mod sessions;
-mod streaming_json;
+mod share_refresh;
+use pi_rs::StreamingJson;
 mod thinking;
 mod tool_selection;
 mod ui;
@@ -59,14 +72,33 @@ static TEXT_OUTPUT: AtomicBool = AtomicBool::new(false);
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
 
+type RpcModelImages = std::sync::Arc<std::sync::Mutex<rpc::ModelImageCache>>;
+
 #[derive(Parser, Clone)]
 #[command(
     name = "pi-rs",
     version,
     about,
+    args_override_self = true,
     after_help = "Pi aliases: -v (--version), -nt (--no-tools), -nbt (--no-builtin-tools), -xt (--exclude-tools), -ne (--no-extensions), -ns (--no-skills), -np (--no-prompt-templates), -nc (--no-context-files), -na (--no-approve)."
 )]
 struct Cli {
+    #[arg(skip)]
+    initial_selection: Option<InitialSelection>,
+    #[arg(skip)]
+    cli_selection: Option<InitialSelection>,
+    #[arg(skip)]
+    cli_thinking: Option<String>,
+    #[arg(skip)]
+    selection_workspace: Option<PathBuf>,
+    #[arg(skip)]
+    selection_discovery_pending: bool,
+    #[arg(skip)]
+    discovered_models: Vec<(String, String)>,
+    #[arg(skip)]
+    rpc_model_images: RpcModelImages,
+    #[arg(skip)]
+    complete_catalogs: Vec<(String, String)>,
     #[arg(skip)]
     session_transition: Option<pi_rs::SessionStartReason>,
     #[arg(skip)]
@@ -78,6 +110,8 @@ struct Cli {
     #[arg(skip)]
     extension_flags: cli_compat::ExtensionFlags,
     #[arg(skip)]
+    extension_flag_order: Vec<String>,
+    #[arg(skip)]
     initial_connection: Option<(Provider, String)>,
     #[arg(skip)]
     initial_model_endpoint: Option<String>,
@@ -88,11 +122,11 @@ struct Cli {
     #[arg(skip)]
     model_explicit: bool,
     #[arg(skip)]
-    model_from_settings: bool,
+    model_is_literal: bool,
     #[arg(skip)]
     thinking_explicit: bool,
     #[arg(skip)]
-    thinking_profile: Option<(String, Vec<String>)>,
+    thinking_profile: Option<(String, Vec<String>, Option<bool>)>,
     #[arg(skip)]
     initial_images: Vec<pi_rs::ImageContent>,
     #[arg(skip)]
@@ -105,6 +139,8 @@ struct Cli {
     selection_events: Vec<pi_rs::LifecycleEvent>,
     #[arg(skip)]
     trusted: bool,
+    #[arg(skip)]
+    command_cancel: CancellationToken,
     #[arg(skip)]
     trust_pending: bool,
     /// Load this project's executable configuration.
@@ -145,6 +181,9 @@ struct Cli {
     no_session: bool,
     #[arg(long, hide = true)]
     ephemeral_worker_session: bool,
+    /// Internal frontend worker: terminal interrupts are handled by the parent.
+    #[arg(long, hide = true)]
+    terminal_managed_worker: bool,
     /// Print the final answer and exit.
     #[arg(short = 'p', long)]
     print: bool,
@@ -285,6 +324,8 @@ struct Cli {
     /// Read follow-up and cancellation messages as JSON lines on stdin.
     #[arg(long, global = true)]
     stdin_control: bool,
+    #[arg(long, global = true, hide = true)]
+    worker_settings_stdin: bool,
     /// Correlation key for retrying or explicitly resuming a host run.
     #[arg(long, global = true)]
     run_id: Option<Uuid>,
@@ -298,7 +339,33 @@ struct Cli {
     prompt: Vec<String>,
 }
 
+#[derive(Clone)]
+struct InitialSelection {
+    provider: Provider,
+    endpoint: String,
+    model: String,
+}
+
 impl Cli {
+    fn theme_setting(&self) -> Option<&str> {
+        self.use_theme
+            .as_deref()
+            .or_else(|| self.settings.string("theme"))
+    }
+
+    fn ordered_extension_flags(
+        &self,
+    ) -> impl Iterator<Item = (&String, &pi_rs::ExtensionFlagValue)> {
+        self.extension_flag_order
+            .iter()
+            .filter_map(|name| self.extension_flags.get_key_value(name))
+            .chain(
+                self.extension_flags
+                    .iter()
+                    .filter(|_| self.extension_flag_order.is_empty()),
+            )
+    }
+
     fn effective_context_window(&self) -> Option<u32> {
         self.context_window.or_else(|| {
             self.model_profiles
@@ -381,7 +448,7 @@ impl Cli {
             .as_ref()
             .is_some_and(|(provider, _)| provider == &self.provider)
         {
-            let qualified = if self.model_from_settings {
+            let qualified = if self.model_is_literal {
                 self.model.as_str()
             } else {
                 model_selection::qualified_model(&self.model, &self.model_profiles)
@@ -412,6 +479,10 @@ impl Cli {
     ) -> Option<model_auth::Credential> {
         self.model_keys
             .credential(provider, endpoint)
+            .or_else(|| {
+                self.model_keys
+                    .custom_credential(provider, endpoint, &self.model_profiles)
+            })
             .cloned()
             .or_else(|| self.model_profiles.credential(provider, endpoint))
             .or_else(|| {
@@ -425,26 +496,68 @@ impl Cli {
                     }
                     return None;
                 }
-                if let Some(builtin) = builtin_chat::find(provider.id()) {
-                    return builtin
-                        .is_official_endpoint(endpoint)
-                        .then(|| std::env::var(builtin.env()).ok())
+                if provider.id() == "google-vertex" && endpoint == provider.default_endpoint() {
+                    return std::env::var("GOOGLE_CLOUD_API_KEY")
+                        .ok()
+                        .filter(|key| !key.trim().is_empty())
+                        .map(model_auth::Credential::Literal)
+                        .or_else(|| {
+                            vertex_auth::Adc::configured(self.model_keys.environment(
+                                provider,
+                                endpoint,
+                                &self.model_profiles,
+                            ))
+                            .map(model_auth::Credential::VertexAdc)
+                        });
+                }
+                if provider.id() == "cloudflare-ai-gateway" {
+                    return cloudflare_gateway::Route::is_endpoint(endpoint)
+                        .then(|| std::env::var("CLOUDFLARE_API_KEY").ok())
                         .flatten()
                         .filter(|key| !key.trim().is_empty())
+                        .map(model_auth::Credential::Literal);
+                }
+                if provider.id() == "openai-codex" {
+                    return None;
+                }
+                if let Some(builtin) = builtin_chat::find(provider.id()) {
+                    let eligible = match provider.id() {
+                        "azure" => {
+                            !endpoint.is_empty()
+                                && self
+                                    .model_profiles
+                                    .has_provider_endpoint(provider, endpoint)
+                        }
+                        "cloudflare-workers-ai" => {
+                            model_profiles::cloudflare_workers_chat_account(endpoint).is_some()
+                                && self
+                                    .model_profiles
+                                    .has_provider_endpoint(provider, endpoint)
+                        }
+                        _ => builtin.is_official_endpoint(endpoint),
+                    };
+                    return eligible
+                        .then(|| {
+                            builtin.env_names().find_map(|name| {
+                                std::env::var(name)
+                                    .ok()
+                                    .filter(|key| !key.trim().is_empty())
+                            })
+                        })
+                        .flatten()
                         .map(model_auth::Credential::Literal);
                 }
                 if endpoint != provider.default_endpoint() {
                     return None;
                 }
-                if provider == &Provider::Anthropic
-                    && let Some(token) = std::env::var("ANTHROPIC_AUTH_TOKEN")
-                        .ok()
-                        .filter(|token| !token.trim().is_empty())
-                {
-                    return Some(model_auth::Credential::Bearer(token));
+                if provider == &Provider::Anthropic {
+                    let env = |name: &str| std::env::var(name).ok();
+                    return model_auth::anthropic_env_credential(env).or_else(|| {
+                        anthropic_federation::Federation::from_env(env)
+                            .map(model_auth::Credential::AnthropicFederation)
+                    });
                 }
                 let variable = match provider {
-                    Provider::Anthropic => "ANTHROPIC_API_KEY",
                     Provider::Google => "GEMINI_API_KEY",
                     _ => return None,
                 };
@@ -468,7 +581,16 @@ impl Cli {
         let credential = self.model_credential_for(provider, endpoint);
         let settings = self
             .model_profiles
-            .header_settings(provider, endpoint, model);
+            .header_settings(provider, endpoint, model)
+            .with_environment(
+                self.model_override_token(provider, endpoint)
+                    .is_none()
+                    .then(|| {
+                        self.model_keys
+                            .environment(provider, endpoint, &self.model_profiles)
+                    })
+                    .flatten(),
+            );
         if model.is_some_and(str::is_empty)
             || settings.has_command()
             || credential
@@ -489,13 +611,10 @@ impl Cli {
             .and_then(model_auth::Credential::literal)
             .map(str::to_owned);
         let headers = settings.static_headers(provider, token.as_deref())?;
-        let bearer = credential
-            .as_ref()
-            .is_some_and(model_auth::Credential::is_bearer);
         provider
-            .connect(adapter, endpoint, token, bearer)?
+            .connect_for_credential(adapter, endpoint, token, credential.as_ref())?
             .with_headers(headers)
-            .with_http_settings(&self.settings)
+            .with_http_settings_and_env(&self.settings, settings.environment())
     }
 
     fn activate_provider(&mut self, provider: Provider, model: Option<&str>) -> Result<()> {
@@ -535,8 +654,24 @@ impl Cli {
             .unwrap_or_else(|| self.model_profiles.endpoint(provider))
     }
 
+    fn replace_model_keys(&mut self, keys: model_auth::Keys) -> Result<()> {
+        self.model_keys = keys;
+        if self.model_profiles.cloudflare_gateway_route()
+            != self.model_keys.cloudflare_gateway_route().as_ref()
+        {
+            self.reload_model_profiles()?;
+            return Ok(());
+        }
+        if self.model_profiles.cloudflare_saved_account()
+            != self.model_keys.cloudflare_chat_account()
+        {
+            self.reload_model_profiles()?;
+        }
+        Ok(())
+    }
+
     fn reload_model_profiles(&mut self) -> Result<()> {
-        let profiles = model_profiles::Profiles::load()?;
+        let profiles = model_profiles::Profiles::load(&self.model_keys)?;
         let provider = profiles.provider(self.provider.id()).ok_or_else(|| {
             Error::Config(format!(
                 "model provider {} is no longer configured",
@@ -564,6 +699,19 @@ impl Cli {
         thinking: Option<String>,
         source: pi_rs::ModelSelectSource,
     ) -> Result<()> {
+        let selected = self.prepare_model_change(provider, model, thinking, source)?;
+        selected.record_model_selection(&mut Session::open(&selected.session)?)?;
+        *self = selected;
+        Ok(())
+    }
+
+    fn prepare_model_change(
+        &self,
+        provider: Provider,
+        model: String,
+        thinking: Option<String>,
+        source: pi_rs::ModelSelectSource,
+    ) -> Result<Self> {
         let previous_model = rpc::model_value(self, &self.provider, &self.model);
         let previous_level = self.thinking.as_deref().unwrap_or("off").to_owned();
         let mut selected = self.clone();
@@ -573,10 +721,19 @@ impl Cli {
         if thinking.is_some() {
             selected.thinking = thinking;
         } else {
+            if matches!(
+                source,
+                pi_rs::ModelSelectSource::Set | pi_rs::ModelSelectSource::Cycle
+            ) {
+                selected.thinking = selected
+                    .settings
+                    .string("defaultThinkingLevel")
+                    .map(str::to_owned)
+                    .or_else(|| self.thinking.clone());
+            }
             selected.apply_model_thinking_defaults();
         }
         thinking::adjust(&mut selected);
-        selected.record_model_selection(&mut Session::open(&selected.session)?)?;
         let level = selected.thinking.as_deref().unwrap_or("off");
         if previous_level != level {
             selected
@@ -595,8 +752,7 @@ impl Cli {
                     source,
                 });
         }
-        *self = selected;
-        Ok(())
+        Ok(selected)
     }
     fn configured_model_name(&self, model: &str) -> String {
         match &self.provider {
@@ -630,16 +786,42 @@ impl Cli {
         )
     }
 
+    fn record_automatic_model_selection(&self, session: &mut Session) -> Result<()> {
+        let has_context = rpc_entries::Entries::new(session).has_session_context()?;
+        session.record_request_identity(self.provider.id(), &self.model)?;
+        if !has_context {
+            return self.record_model_selection(session);
+        }
+        if !self.model_explicit
+            && self.thinking_explicit
+            && let Some(thinking) = self.thinking.as_deref()
+        {
+            return session.select_thinking_level(self.recorded_provider(), &self.model, thinking);
+        }
+        if !self.model_explicit
+            && !self.thinking_explicit
+            && !matches!(
+                session_import::branch_selection(session, |_, _| None),
+                session_import::BranchSelection::Native
+            )
+        {
+            return Ok(());
+        }
+        self.record_model_selection(session)
+    }
+
     fn restore_model_selection(
         &mut self,
         model: String,
         thinking: Option<String>,
         provider: Option<&str>,
-    ) {
+        continuing: bool,
+    ) -> bool {
         let Some(provider) = self.model_profiles.provider(provider.unwrap_or("ollama")) else {
-            return;
+            return false;
         };
-        let in_scope = self.model_scope.is_empty()
+        let in_scope = continuing
+            || self.model_scope.is_empty()
             || self
                 .model_scope
                 .iter()
@@ -650,7 +832,19 @@ impl Cli {
                 || !in_scope
                 || self.activate_provider(provider, Some(&model)).is_err())
         {
-            return;
+            return false;
+        }
+        if !in_scope && !self.model_explicit {
+            if !self.thinking_explicit
+                && let Some(thinking) = self
+                    .model_scope
+                    .iter()
+                    .find(|choice| choice.provider == self.provider && choice.model == self.model)
+                    .and_then(|choice| choice.thinking.clone())
+            {
+                self.thinking = Some(thinking);
+            }
+            return false;
         }
         if !self.model_explicit && in_scope {
             self.model = model.clone();
@@ -667,7 +861,368 @@ impl Cli {
                         .thinking_for_model(self.provider.id(), &self.model)
                         .map(str::to_owned)
                 })
-                .or_else(|| self.thinking.clone());
+                .or_else(|| Some("medium".into()));
+        }
+        true
+    }
+
+    fn restore_initial_selection(&mut self, thinking: Option<String>) {
+        if let Some(initial) = &self.initial_selection
+            && !self.model_explicit
+        {
+            self.provider = initial.provider.clone();
+            self.endpoint = initial.endpoint.clone();
+            self.model = initial.model.clone();
+            self.thinking_profile = None;
+        }
+        if !self.thinking_explicit {
+            self.thinking = Some(
+                self.model_scope
+                    .iter()
+                    .find(|choice| choice.provider == self.provider && choice.model == self.model)
+                    .and_then(|choice| choice.thinking.clone())
+                    .or(thinking)
+                    .unwrap_or_else(|| self.default_branch_thinking()),
+            );
+        }
+    }
+
+    fn default_branch_thinking(&self) -> String {
+        self.model_scope
+            .iter()
+            .find(|choice| choice.provider == self.provider && choice.model == self.model)
+            .and_then(|choice| choice.thinking.clone())
+            .or_else(|| {
+                self.settings
+                    .thinking_for_model(self.provider.id(), &self.model)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "medium".into())
+    }
+
+    fn restore_branch_selection(
+        &mut self,
+        model: String,
+        thinking: Option<String>,
+        provider: Option<&str>,
+    ) {
+        let availability = self
+            .model_profiles
+            .provider(provider.unwrap_or("ollama"))
+            .map(|provider| {
+                let endpoint = self.endpoint_for(&provider);
+                let known = self
+                    .model_profiles
+                    .model_ids(&provider)
+                    .iter()
+                    .any(|id| id == &model)
+                    || self
+                        .discovered_models
+                        .iter()
+                        .any(|(p, id)| p == provider.id() && id == &model)
+                    || self
+                        .model_scope
+                        .iter()
+                        .any(|choice| choice.provider == provider && choice.model == model)
+                    || self.initial_selection.as_ref().is_some_and(|initial| {
+                        initial.provider == provider && initial.model == model
+                    });
+                let official_catalog = !self.model_profiles.model_ids(&provider).is_empty()
+                    && endpoint == provider.default_endpoint()
+                    && matches!(provider, Provider::Anthropic | Provider::Google);
+                let complete = official_catalog
+                    || self
+                        .complete_catalogs
+                        .iter()
+                        .any(|(p, e)| p == provider.id() && e == endpoint);
+                (known, complete)
+            });
+        let unavailable = availability.is_none_or(|(known, complete)| !known && complete);
+        if unavailable || !self.restore_model_selection(model, thinking.clone(), provider, true) {
+            self.restore_initial_selection(thinking);
+        }
+    }
+
+    fn restore_session_model(&mut self, session: &Session) -> Result<()> {
+        // Pi treats a journal with no projected messages as a new session,
+        // even if it already contains model or thinking bookkeeping.
+        if !rpc_entries::Entries::new(session).has_session_context()? {
+            if !self.model_explicit
+                && let Some(initial) = &self.initial_selection
+            {
+                self.provider = initial.provider.clone();
+                self.endpoint = initial.endpoint.clone();
+                self.model = initial.model.clone();
+                self.thinking_profile = None;
+            }
+            if !self.thinking_explicit {
+                self.thinking = Some(if self.model_explicit {
+                    self.settings
+                        .thinking_for_model(self.provider.id(), &self.model)
+                        .unwrap_or("medium")
+                        .to_owned()
+                } else {
+                    self.default_branch_thinking()
+                });
+            }
+            return Ok(());
+        }
+        // Extension-registered Pi virtual models are absent from this catalog.
+        // Pi treats absent catalog entries as nonvirtual.
+        let selection = session_import::branch_selection(session, |_, _| None);
+        let branch_thinking = match &selection {
+            session_import::BranchSelection::Native => {
+                session.model_selection().and_then(|(_, thinking)| thinking)
+            }
+            session_import::BranchSelection::Selected { thinking, .. }
+            | session_import::BranchSelection::Unresolved { thinking } => thinking.clone(),
+        };
+        match selection {
+            session_import::BranchSelection::Native => {
+                if let Some((model, thinking)) = session.model_selection() {
+                    self.restore_branch_selection(model, thinking, session.model_provider());
+                } else if !self.thinking_explicit {
+                    self.thinking = Some(self.default_branch_thinking());
+                }
+            }
+            session_import::BranchSelection::Selected {
+                provider,
+                model,
+                thinking,
+            } => {
+                self.restore_branch_selection(model, thinking, Some(&provider));
+            }
+            session_import::BranchSelection::Unresolved { thinking } => {
+                self.restore_initial_selection(thinking);
+            }
+        }
+        if !self.thinking_explicit {
+            self.thinking = Some(branch_thinking.unwrap_or_else(|| {
+                self.settings
+                    .string("defaultThinkingLevel")
+                    .unwrap_or("medium")
+                    .to_owned()
+            }));
+        }
+        Ok(())
+    }
+
+    fn remember_initial_selection(&mut self) {
+        self.selection_workspace = Some(self.workspace.clone());
+        self.initial_selection = Some(InitialSelection {
+            provider: self.provider.clone(),
+            endpoint: self.endpoint.clone(),
+            model: self.model.clone(),
+        });
+        self.cli_selection = self
+            .model_explicit
+            .then(|| self.initial_selection.clone())
+            .flatten();
+        self.cli_thinking = self
+            .thinking_explicit
+            .then(|| self.thinking.clone())
+            .flatten();
+    }
+
+    /// Recreate the new-session defaults from the current workspace while
+    /// retaining the original command-line overrides across session changes.
+    fn refresh_workspace_selection(&mut self) {
+        self.refresh_workspace_selection_with_timeout(Duration::from_secs(15));
+    }
+
+    fn refresh_workspace_selection_with_timeout(&mut self, timeout: Duration) {
+        let patterns: Vec<String> = self
+            .models
+            .as_deref()
+            .map(|value| value.split(',').map(str::to_owned).collect())
+            .unwrap_or_else(|| self.settings.strings("enabledModels"));
+        let mut catalogs = model_selection::cached_catalogs(self);
+        if self.selection_discovery_pending
+            || self
+                .selection_workspace
+                .as_ref()
+                .is_some_and(|cwd| cwd != &self.workspace)
+        {
+            // A previous runtime's negative catalog is not authoritative for
+            // this workspace, especially when rediscovery is unavailable.
+            self.complete_catalogs.clear();
+            let args = self.clone();
+            let patterns = patterns.clone();
+            let discovered = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    let providers = std::iter::once(args.provider.clone())
+                        .chain(args.model_profiles.providers());
+                    let mut selected = Vec::new();
+                    for provider in providers {
+                        let in_scope =
+                            patterns
+                                .iter()
+                                .any(|pattern| match pattern.split_once('/') {
+                                    Some((prefix, _))
+                                        if args.model_profiles.provider(prefix).is_some() =>
+                                    {
+                                        prefix.eq_ignore_ascii_case(provider.id())
+                                    }
+                                    _ => true,
+                                });
+                        let needs_default = args.settings.string("defaultModel").is_none()
+                            && args
+                                .settings
+                                .string("defaultProvider")
+                                .is_some_and(|id| id.eq_ignore_ascii_case(provider.id()));
+                        if (in_scope || needs_default)
+                            && !selected.contains(&provider)
+                            && args.allow_endpoint_probes(args.endpoint_for(&provider))
+                        {
+                            selected.push(provider);
+                        }
+                    }
+                    Ok::<_, Error>(
+                        futures_util::future::join_all(selected.into_iter().map(
+                            |provider| async {
+                                tokio::time::timeout(
+                                    timeout,
+                                    model_selection::catalog(&args, provider, true),
+                                )
+                                .await
+                            },
+                        ))
+                        .await,
+                    )
+                })
+            })
+            .join()
+            .unwrap_or_else(|_| Err(Error::Config("model discovery worker stopped".into())));
+            self.selection_discovery_pending = discovered.as_ref().map_or(true, |results| {
+                results
+                    .iter()
+                    .any(|result| !matches!(result, Ok(Ok(catalog)) if catalog.complete))
+            });
+            if let Ok(results) = discovered {
+                for catalog in results
+                    .into_iter()
+                    .filter_map(|result| result.ok().and_then(Result::ok))
+                {
+                    if catalog.complete {
+                        self.complete_catalogs.push((
+                            catalog.provider.id().to_owned(),
+                            self.endpoint_for(&catalog.provider).to_owned(),
+                        ));
+                        catalogs.retain(|cached| cached.provider != catalog.provider);
+                    } else if catalogs
+                        .iter()
+                        .any(|cached| cached.provider == catalog.provider)
+                    {
+                        continue;
+                    }
+                    catalogs.push(catalog);
+                }
+            }
+        }
+        self.selection_workspace = Some(self.workspace.clone());
+        self.discovered_models = catalogs
+            .iter()
+            .flat_map(|catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .map(|model| (catalog.provider.id().to_owned(), model.clone()))
+            })
+            .collect();
+        self.model_scope =
+            model_selection::scoped_choices(patterns.iter().map(String::as_str), &catalogs).0;
+
+        let fallback = self
+            .initial_selection
+            .clone()
+            .unwrap_or_else(|| InitialSelection {
+                provider: self.provider.clone(),
+                endpoint: self.endpoint.clone(),
+                model: self.model.clone(),
+            });
+        let configured = self.settings.string("defaultModel");
+        let configured_provider = self.settings.string("defaultProvider");
+        let qualified = configured
+            .filter(|_| configured_provider.is_none())
+            .and_then(|model| model_selection::qualified_model(model, &self.model_profiles));
+        let provider = self
+            .provider_argument
+            .as_deref()
+            .and_then(|name| self.model_profiles.provider(name))
+            .or_else(|| {
+                self.endpoint_explicit
+                    .then(|| {
+                        self.initial_connection
+                            .as_ref()
+                            .map(|(provider, _)| provider.clone())
+                    })
+                    .flatten()
+            })
+            .or_else(|| configured_provider.and_then(|name| self.model_profiles.provider(name)))
+            .or_else(|| qualified.as_ref().map(|(provider, _)| provider.clone()))
+            .unwrap_or_else(|| fallback.provider.clone());
+        let configured_for_provider = configured.filter(|_| {
+            (self.provider_argument.is_none() && !self.endpoint_explicit)
+                || configured_provider
+                    .and_then(|name| self.model_profiles.provider(name))
+                    .or_else(|| qualified.as_ref().map(|(candidate, _)| candidate.clone()))
+                    .unwrap_or_default()
+                    == provider
+        });
+        let model = configured_for_provider
+            .map(|value| {
+                qualified
+                    .as_ref()
+                    .filter(|(candidate, _)| *candidate == provider)
+                    .map_or(value, |(_, id)| *id)
+                    .to_owned()
+            })
+            .or_else(|| (provider == fallback.provider).then(|| fallback.model.clone()))
+            .or_else(|| {
+                catalogs
+                    .iter()
+                    .find(|catalog| catalog.provider == provider)
+                    .and_then(|catalog| {
+                        model_selection::default_for_provider(&provider, &catalog.models)
+                    })
+                    .cloned()
+            });
+        let (provider, model) = model.map_or_else(
+            || (fallback.provider.clone(), fallback.model.clone()),
+            |model| (provider, model),
+        );
+        let chosen = self
+            .model_scope
+            .iter()
+            .find(|choice| choice.provider == provider && choice.model == model)
+            .or_else(|| {
+                self.model_scope
+                    .iter()
+                    .find(|choice| !self.connection_explicit || choice.provider == provider)
+            });
+        let (provider, model) = chosen.map_or((provider, model), |choice| {
+            (choice.provider.clone(), choice.model.clone())
+        });
+        let endpoint = self
+            .explicit_endpoint_for(&provider)
+            .unwrap_or_else(|| self.model_profiles.endpoint(&provider))
+            .to_owned();
+        let initial = InitialSelection {
+            provider,
+            model,
+            endpoint,
+        };
+        self.initial_selection = Some(initial.clone());
+        let effective = self.cli_selection.as_ref().unwrap_or(&initial);
+        self.provider = effective.provider.clone();
+        self.endpoint = effective.endpoint.clone();
+        self.model = effective.model.clone();
+        self.thinking_profile = None;
+        if self.thinking_explicit {
+            self.thinking = self.cli_thinking.clone();
         }
     }
 }
@@ -695,19 +1250,25 @@ enum Command {
     Package(packages::PackageCommand),
     Mcp {
         #[command(subcommand)]
-        command: mcp_config::McpCommand,
+        command: Box<mcp_config::McpCommand>,
     },
-    /// Check or print a configured provider credential.
+    /// Manage configured provider credentials.
     Auth {
         #[command(subcommand)]
         command: auth_cli::AuthCommand,
     },
     /// Sign in with OAuth and save an endpoint-bound credential.
     Login {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "openai-codex", "github-copilot", "kimi-coding", "xai", "anthropic"])]
         provider: String,
         #[arg(long)]
         device_code: bool,
+        /// Use Anthropic's headless copy-code authorization.
+        #[arg(long, conflicts_with = "device_code")]
+        copy_code: bool,
+        /// GitHub Enterprise domain or HTTPS URL for Copilot.
+        #[arg(long)]
+        enterprise_url: Option<String>,
         /// Register a different ChatGPT account or workspace.
         #[arg(long, conflicts_with_all = ["account", "list_accounts"])]
         new_account: bool,
@@ -720,7 +1281,7 @@ enum Command {
     },
     /// Remove a saved provider credential.
     Logout {
-        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt"])]
+        #[arg(value_parser = ["radius", "openrouter", "openai-chatgpt", "openai-codex", "github-copilot", "kimi-coding", "xai", "anthropic"])]
         provider: String,
     },
     Run {
@@ -810,9 +1371,37 @@ enum Control {
     Cancel,
 }
 
+// Return only after Tokio has polled and registered the signal listener.
+async fn install_ctrl_c(callback: impl FnOnce() + Send + 'static) {
+    use std::future::Future;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut signal = Box::pin(tokio::signal::ctrl_c());
+        let mut ready = Some(ready_tx);
+        let result = std::future::poll_fn(|context| {
+            let result = signal.as_mut().poll(context);
+            if let Some(sender) = ready.take() {
+                let _ = sender.send(());
+            }
+            result
+        })
+        .await;
+        if result.is_ok() {
+            callback();
+        }
+    });
+    let _ = ready_rx.await;
+}
+
+fn startup_ready(ready: &mut Option<tokio::sync::oneshot::Sender<()>>) {
+    if let Some(sender) = ready.take() {
+        let _ = sender.send(());
+    }
+}
+
 fn main() {
     #[cfg(windows)]
-    {
+    let code = {
         // Windows executables start with a smaller stack than Unix binaries.
         std::thread::Builder::new()
             .name("pi".into())
@@ -820,33 +1409,122 @@ fn main() {
             .spawn(run_cli)
             .expect("start Pi runtime thread")
             .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    }
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    };
     #[cfg(not(windows))]
-    run_cli();
+    let code = run_cli();
+    // Detached discovery threads may still be finishing. Wait for any token
+    // rotation and prevent another one from starting before process exit.
+    let _refreshes = process::stop_new_refreshes();
+    pi_rs_workbench::mcp_refresh::finish_refreshes();
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(code);
 }
 
+const RPC_FILE_ARGUMENT_ERROR: &str = "Error: @file arguments are not supported in RPC mode";
+
 #[tokio::main(flavor = "current_thread")]
-async fn run_cli() {
-    let argv: Vec<_> = std::env::args_os().collect();
-    let (matches, extension_flags) = match cli_compat::parse(argv.iter().cloned()) {
-        Ok(parsed) => parsed,
-        Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
-            let _ = error.print();
-            if let Some(help) = cli_compat::extension_help(&argv) {
+async fn run_cli() -> i32 {
+    // Terminal-owned workers receive the same foreground-group SIGINT as the
+    // frontend and editor. Their parent handles terminal interrupts and sends
+    // explicit cancel/shutdown commands; do not independently stop the worker.
+    // Worker::start places its internal flag first, before user arguments.
+    let terminal_managed = std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--terminal-managed-worker");
+    let (signal_tx, mut signal_rx) = tokio::sync::oneshot::channel();
+    let command_cancel = CancellationToken::new();
+    let signal_cancel = command_cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                break;
+            }
+            if !terminal_managed {
+                signal_cancel.cancel();
+                let _ = signal_tx.send(());
+                break;
+            }
+        }
+    });
+    tokio::task::yield_now().await;
+    let mut argv: Vec<_> = std::env::args_os().collect();
+    let export_plan = cli_compat::export_plan(&argv);
+    if let Some(plan) = &export_plan {
+        argv = plan.validation_args.clone();
+    }
+    let mut literal_export = None;
+    if let Some(metadata) = cli_compat::metadata(&argv) {
+        for (error, message) in &metadata.diagnostics {
+            eprintln!("{}: {message}", if *error { "Error" } else { "Warning" });
+        }
+        if metadata.diagnostics.iter().any(|(error, _)| *error) {
+            return 1;
+        }
+        if (metadata.export || export_plan.is_some()) && !metadata.version {
+            literal_export = metadata.literal_export;
+            argv = metadata.args_without_help;
+        } else {
+            if !metadata.version && metadata.rpc_has_attachments {
+                eprintln!("{RPC_FILE_ARGUMENT_ERROR}");
+                return 1;
+            }
+            let flag = if metadata.version {
+                "--version"
+            } else if metadata.short_help {
+                "-h"
+            } else {
+                "--help"
+            };
+            if let Err(error) = cli_compat::parse([std::ffi::OsString::from("pi"), flag.into()]) {
+                let _ = error.print();
+            }
+            if !metadata.version
+                && let Some(help) =
+                    cli_compat::extension_help_from_args(&metadata.args_without_help)
+            {
                 print!("{help}");
             }
-            return;
+            return 0;
         }
-        Err(error) => error.exit(),
-    };
+    }
+    // Export can write a file before extension flags are resolved. Require
+    // complete built-in options on that path as part of parse validation.
+    let defer_missing_pi_options = export_plan.is_none() && literal_export.is_none();
+    let (matches, extension_flags, extension_flag_order) =
+        match cli_compat::parse_ordered(argv.iter().cloned(), defer_missing_pi_options) {
+            Ok(parsed) => parsed,
+            Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
+                let _ = error.print();
+                if let Some(help) = cli_compat::extension_help(&argv) {
+                    print!("{help}");
+                }
+                return 0;
+            }
+            Err(error) => error.exit(),
+        };
     let mut output_truncated = false;
+    let mut cli_exit_code = 0;
     let result = async {
         let mut args =
             Cli::from_arg_matches(&matches).map_err(|error| Error::Config(error.to_string()))?;
+        if let Some(plan) = export_plan {
+            if plan.input.as_os_str().is_empty() {
+                return Err(Error::Config("export input is required".into()));
+            }
+            let mut paths = vec![plan.input];
+            paths.extend(plan.output);
+            return export_from_file(&paths, &plan.inputs);
+        }
+        if let Some(paths) = literal_export {
+            return export_from_file(&paths, &paths[..1]);
+        }
+        args.command_cancel = command_cancel;
         args.extension_flags = extension_flags;
+        args.extension_flag_order = extension_flag_order;
         if let Some(paths) = &args.export_session {
-            return export_from_file(paths);
+            return export_from_file(paths, &paths[..1]);
         }
         if let Some(flag) = args.extension_flags.keys().next()
             && !matches!(
@@ -882,6 +1560,14 @@ async fn run_cli() {
             }
         }
         args.thinking_explicit = args.thinking.is_some();
+        if args.command.is_none()
+            && args.mode == Some(OutputMode::Rpc)
+            && args.prompt.iter().any(|argument| argument.starts_with('@'))
+        {
+            eprintln!("{RPC_FILE_ARGUMENT_ERROR}");
+            cli_exit_code = 1;
+            return Ok(());
+        }
         if let Some(Command::Auth { command }) = args.command.as_ref() {
             if matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine) {
                 return Err(Error::Config(
@@ -889,7 +1575,10 @@ async fn run_cli() {
                 ));
             }
             let command = command.clone();
-            return auth_cli::run(args, command).await;
+            return tokio::select! {
+                result = auth_cli::run(args, command) => result.map(|code| { cli_exit_code = code; }),
+                _ = &mut signal_rx => Err(Error::Cancelled),
+            };
         }
         let decision = config::project_trust(
             &args.workspace,
@@ -903,9 +1592,58 @@ async fn run_cli() {
         )?;
         args.trusted = decision.unwrap_or(false);
         args.trust_pending = decision.is_none();
-        args.settings = config::Settings::load(&args.workspace, args.trusted)?;
-        args.model_profiles = model_profiles::Profiles::load()?;
-        args.model_keys = model_auth::Keys::load()?;
+        args.settings = if matches!(args.command, Some(Command::Serve))
+            && args.stdin_control
+            && args.worker_settings_stdin
+        {
+            let mut settings = process::read_settings_bootstrap()?;
+            settings.validate_worker_snapshot(&args.workspace, args.trusted)?;
+            settings
+        } else {
+            config::Settings::load(&args.workspace, args.trusted)?
+        };
+        if !matches!(args.command, Some(Command::Serve)) || !args.worker_settings_stdin {
+            for warning in args.settings.diagnostics() {
+                eprintln!("{warning}");
+            }
+        }
+        if args.command.is_none() && !args.extension_flags.is_empty() {
+            let reserved = cli_compat::reserved_flag_names();
+            let deferred_builtin = args
+                .extension_flags
+                .keys()
+                .any(|name| reserved.contains(name));
+            if args.list_models.is_some() || deferred_builtin {
+                let registered = cli_compat::discovered_extension_flags(&args);
+                let unknown: Vec<_> = args
+                    .ordered_extension_flags()
+                    .filter(|(name, _)| {
+                        registered.as_ref().map_or_else(
+                            |_| reserved.contains(*name),
+                            |flags| !flags.iter().any(|flag| flag.name == **name),
+                        )
+                    })
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                if !unknown.is_empty() {
+                    let message = cli_compat::unknown_extension_options(&unknown);
+                    if args.list_models.is_none() {
+                        return Err(Error::Config(message));
+                    }
+                    eprintln!("Error: {message}");
+                }
+                // Preserve the discovery error even when a malformed built-in flag
+                // could be diagnosed without the registration list.
+                if args.list_models.is_some() {
+                    registered?;
+                }
+            }
+        }
+        args.model_keys = tokio::select! {
+            result = model_auth::Keys::load_async() => result?,
+            _ = &mut signal_rx => return Err(Error::Cancelled),
+        };
+        args.model_profiles = model_profiles::Profiles::load(&args.model_keys)?;
         let configured_model = args.settings.string("defaultModel");
         let provider_prefix = |model: &str| {
             model
@@ -920,27 +1658,46 @@ async fn run_cli() {
             .clone()
             .or_else(|| configured_model.and_then(provider_prefix))
             .unwrap_or_default();
+        let explicit_endpoint =
+            matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine);
+        let resolved = if args.model_explicit
+            && args.provider_argument.is_none()
+            && !explicit_endpoint
+            && !matches!(args.command, Some(Command::Serve))
+        {
+            let inline = args.api_key.is_some() || std::env::var_os("PI_RS_MODEL_TOKEN").is_some();
+            model_selection::cli_catalog_model(&args, &args.model, inline)?
+        } else {
+            None
+        };
         args.provider = if let Some(name) = args.provider_argument.as_deref() {
             args.model_profiles
                 .provider(name)
                 .ok_or_else(|| Error::Config(format!("unknown model provider {name:?}")))?
+        } else if let Some(model) = &resolved {
+            model.provider.clone()
         } else if args.model_explicit {
             provider_prefix(&args.model).unwrap_or_else(|| configured_provider.clone())
         } else {
             configured_provider.clone()
         };
-        let explicit_endpoint =
-            matches.value_source("endpoint") == Some(clap::parser::ValueSource::CommandLine);
         args.endpoint_explicit = explicit_endpoint;
         args.connection_explicit = explicit_endpoint || args.provider_argument.is_some();
         if !explicit_endpoint {
             args.endpoint = args.model_profiles.endpoint(&args.provider).into();
         }
         args.initial_connection = Some((args.provider.clone(), args.endpoint.clone()));
-        if !args.model_explicit {
+        if let Some(model) = resolved {
+            args.model = model.model;
+            args.model_is_literal = true;
+            if !args.thinking_explicit && model.thinking.is_some() {
+                args.thinking = model.thinking;
+                args.thinking_explicit = true;
+            }
+        } else if !args.model_explicit {
             if let Some(model) = configured_model.filter(|_| args.provider == configured_provider) {
                 args.model = model.into();
-                args.model_from_settings = explicit_default_provider.is_some();
+                args.model_is_literal = explicit_default_provider.is_some();
             } else if args.provider != Provider::Ollama {
                 args.model.clear();
             }
@@ -959,9 +1716,6 @@ async fn run_cli() {
                 .string("defaultThinkingLevel")
                 .map(str::to_owned);
         }
-        if args.use_theme.is_none() {
-            args.use_theme = args.settings.string("theme").map(str::to_owned);
-        }
         if args.session_dir.is_none() {
             args.session_dir = std::env::var_os("PI_CODING_AGENT_SESSION_DIR")
                 .map(PathBuf::from)
@@ -970,24 +1724,56 @@ async fn run_cli() {
         if matches.value_source("session") != Some(clap::parser::ValueSource::CommandLine) {
             args.session = interactive::session_path(&args.workspace, args.session_dir.as_deref());
         }
-        Box::pin(execute(args, &mut output_truncated)).await
+        let managed = args.list_models.is_none() && matches!(&args.command,
+            None | Some(Command::Interactive | Command::Serve | Command::Run { .. } | Command::Resume | Command::Compact { .. } | Command::Review { .. })
+        );
+        let mcp_login = args.list_models.is_none() && matches!(&args.command, Some(Command::Mcp { command }) if matches!(command.as_ref(), mcp_config::McpCommand::Login { .. }));
+        let standalone_share = args.list_models.is_none() && matches!(&args.command, Some(Command::Share));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let mut execution = Box::pin(execute(args, &mut output_truncated, Some(ready_tx)));
+        if managed {
+            tokio::select! {
+                biased;
+                _ = &mut signal_rx => Err(Error::Cancelled),
+                result = &mut execution => result,
+                _ = ready_rx => execution.await,
+            }
+        } else if mcp_login || standalone_share {
+            // These commands own cancellation so an admitted credential commit
+            // can finish and its result can be reported.
+            execution.await
+        } else {
+            tokio::select! {
+                result = &mut execution => result,
+                _ = &mut signal_rx => Err(Error::Cancelled),
+            }
+        }
     }
     .await;
     if let Err(err) = result {
-        eprintln!("{err}");
-        std::process::exit(if matches!(err, Error::Cancelled) {
+        match &err {
+            Error::Config(message)
+                if message.starts_with("Unknown option: --")
+                    || message.starts_with("Unknown options: --") =>
+            {
+                eprintln!("Error: {message}");
+            }
+            _ => eprintln!("{err}"),
+        }
+        return if matches!(err, Error::Cancelled) {
             130
         } else {
             1
-        });
+        };
     }
     if output_truncated {
         eprintln!("Response was truncated: the model reached its output token limit.");
-        std::process::exit(1);
+        return 1;
     }
+    cli_exit_code
 }
 
-fn export_from_file(paths: &[PathBuf]) -> Result<()> {
+fn export_from_file(paths: &[PathBuf], protected_inputs: &[PathBuf]) -> Result<()> {
     let normalize = |path: &Path| {
         path.to_str()
             .map_or_else(|| Ok(path.to_path_buf()), pi_rs_workbench::normalize_path)
@@ -1006,6 +1792,32 @@ fn export_from_file(paths: &[PathBuf]) -> Result<()> {
             input.display()
         )));
     }
+    // `persist` replaces an existing destination. Protect every supplied input,
+    // including those superseded by a later --export, before writing anything.
+    let resolved_output = match output_path.canonicalize() {
+        Ok(path) => Some(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(output) = resolved_output {
+        for path in protected_inputs {
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            let path = std::path::absolute(normalize(path)?)?;
+            match path.canonicalize() {
+                Ok(input) => {
+                    if same_export_file(&input, &output)? {
+                        return Err(Error::Config(
+                            "Cannot export HTML over an input session file".into(),
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     let session = session_import::read(&input)?;
     if session.host_binding().is_some() {
         return Err(Error::Session(
@@ -1021,7 +1833,48 @@ fn export_from_file(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
+fn same_export_file(input: &Path, output: &Path) -> std::io::Result<bool> {
+    if input == output {
+        return Ok(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let input = input.metadata()?;
+        let output = output.metadata()?;
+        Ok(input.dev() == output.dev() && input.ino() == output.ino())
+    }
+    #[cfg(not(unix))]
+    Ok(false)
+}
+
+async fn read_piped_stdin() -> Result<Vec<u8>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = std::io::stdin().read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    receiver
+        .await
+        .map_err(|_| Error::Config("stdin reader stopped".into()))?
+        .map_err(Error::Io)
+}
+
+struct RpcCancellation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for RpcCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+        process::RPC_INTERRUPTED.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn execute(
+    mut args: Cli,
+    output_truncated: &mut bool,
+    mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
+    let pi_style_invocation = args.command.is_none();
     let patterns: Vec<_> = if let Some(patterns) = &args.models {
         patterns.split(',').collect()
     } else if matches!(
@@ -1046,20 +1899,28 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     if let Some(search) = &args.list_models {
         return model_listing::list(&args, search).await;
     }
-    let needs_default_model = args.model.is_empty()
-        && matches!(
-            args.command,
-            None | Some(
-                Command::Run { .. }
-                    | Command::Resume
-                    | Command::Interactive
-                    | Command::Compact { .. }
-                    | Command::Review { .. }
-            )
-        );
+    let starts_model_session = matches!(
+        args.command,
+        None | Some(
+            Command::Run { .. }
+                | Command::Resume
+                | Command::Interactive
+                | Command::Compact { .. }
+                | Command::Review { .. }
+        )
+    );
+    let needs_default_model = args.model.is_empty() && starts_model_session;
     let has_patterns = patterns.iter().any(|pattern| !pattern.trim().is_empty());
     let catalogs = if has_patterns {
-        model_selection::catalogs(&args, true).await?
+        if matches!(&args.command, Some(Command::Mcp { command }) if matches!(command.as_ref(), mcp_config::McpCommand::Login { .. }))
+        {
+            tokio::select! {
+                result = model_selection::catalogs(&args, true) => result?,
+                _ = args.command_cancel.cancelled() => return Err(Error::Cancelled),
+            }
+        } else {
+            model_selection::catalogs(&args, true).await?
+        }
     } else if needs_default_model {
         vec![
             model_selection::catalog(&args, args.provider.clone(), args.allow_model_probes())
@@ -1072,9 +1933,28 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         .iter()
         .find(|catalog| catalog.provider == args.provider)
         .map_or(&[][..], |catalog| catalog.models.as_slice());
+    args.discovered_models = catalogs
+        .iter()
+        .flat_map(|catalog| {
+            catalog
+                .models
+                .iter()
+                .map(|model| (catalog.provider.id().to_owned(), model.clone()))
+        })
+        .collect();
+    args.complete_catalogs = catalogs
+        .iter()
+        .filter(|catalog| catalog.complete)
+        .map(|catalog| {
+            (
+                catalog.provider.id().to_owned(),
+                args.endpoint_for(&catalog.provider).to_owned(),
+            )
+        })
+        .collect();
     // The hidden worker command receives an already-resolved, literal model ID.
     if !args.model.is_empty()
-        && !args.model_from_settings
+        && !args.model_is_literal
         && !matches!(args.command, Some(Command::Serve))
     {
         let selected = model_selection::split_with_profiles(
@@ -1105,10 +1985,23 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                     .find(|choice| !args.connection_explicit || choice.provider == args.provider)
             })
             .cloned();
+        let selected = if selected.is_none()
+            && starts_model_session
+            && !args.connection_explicit
+            && args.settings.string("defaultProvider").is_none()
+            && args.settings.string("defaultModel").is_none()
+            && args.api_key.is_none()
+            && std::env::var_os("PI_RS_MODEL_TOKEN").is_none()
+        {
+            model_selection::automatic_startup_model(&args).await
+        } else {
+            selected
+        };
         if let Some(choice) = selected {
             let previous_thinking = args.thinking.clone();
             args.activate_provider(choice.provider, Some(&choice.model))?;
             args.model = choice.model;
+            args.model_is_literal = true;
             if args.thinking_explicit {
                 args.thinking = previous_thinking;
             } else if choice.thinking.is_some() {
@@ -1117,29 +2010,43 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         }
     }
     if needs_default_model && args.model.is_empty() {
-        args.model = available.first().cloned().ok_or_else(|| {
-            Error::Config("no model is available for the selected provider; pass --model".into())
-        })?;
+        args.model = model_selection::default_for_provider(&args.provider, available)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Config(
+                    "no model is available for the selected provider; pass --model".into(),
+                )
+            })?;
     }
 
     args.bind_initial_model_endpoint();
     if !args.thinking_explicit {
         args.apply_model_thinking_defaults();
     }
+    args.remember_initial_selection();
 
     if let Some(Command::Package(command)) = args.command.as_ref() {
         return packages::command(&args, command.clone()).await;
     }
     if matches!(args.command, Some(Command::Serve)) {
-        return backend::run(args).await;
+        if let Ok(provenance) = std::env::var(process::SELECTION_PROVENANCE_ENV) {
+            let (model_explicit, thinking_explicit): (bool, bool) =
+                serde_json::from_str(&provenance)
+                    .map_err(|_| Error::Config("invalid worker selection provenance".into()))?;
+            args.model_explicit = model_explicit;
+            args.thinking_explicit = thinking_explicit;
+        }
+        return backend::run(args, ready).await;
     }
     if let Some(Command::Mcp { command }) = args.command.as_ref() {
-        return mcp_config::command(&args, command.clone()).await;
+        return mcp_config::command(&args, command.as_ref().clone()).await;
     }
     match args.command.as_ref() {
         Some(Command::Login {
             provider,
             device_code,
+            copy_code,
+            enterprise_url,
             new_account,
             account,
             list_accounts,
@@ -1162,39 +2069,25 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                     "--new-account and --account require openai-chatgpt".into(),
                 ));
             }
-            let login = async {
-                if provider == "openai-chatgpt" {
-                    if *device_code {
-                        return Err(Error::Config("ChatGPT uses browser authorization".into()));
-                    }
-                    chatgpt_auth::login(&args.settings, *new_account, account.as_deref(), |url| {
-                        eprintln!("Continue with ChatGPT in your browser: {url}")
-                    })
-                    .await
-                } else if provider == "openrouter" {
-                    if *device_code {
-                        return Err(Error::Config(
-                            "OpenRouter uses browser authorization".into(),
-                        ));
-                    }
-                    let mut manual_input = None;
-                    let result = openrouter_auth::login(&args.settings, |url, sender| {
-                        eprintln!("Continue in your browser: {url}");
-                        manual_input = Some(sender);
-                    })
-                    .await;
-                    drop(manual_input);
-                    result
-                } else {
-                    let gateway = radius_auth::Gateway::configured_with_settings(&args.settings)?;
-                    let method = if *device_code {
-                        radius_auth::Method::Device
-                    } else {
-                        radius_auth::Method::Browser
-                    };
-                    gateway.login(method, |notice| eprintln!("{notice}")).await
-                }
-            };
+            if *copy_code && provider != "anthropic" {
+                return Err(Error::Config("--copy-code requires anthropic".into()));
+            }
+            if enterprise_url.is_some() && provider != "github-copilot" {
+                return Err(Error::Config(
+                    "--enterprise-url requires github-copilot".into(),
+                ));
+            }
+            let login = auth_login::oauth(
+                &args.settings,
+                provider,
+                auth_login::OAuthOptions::legacy(
+                    *device_code,
+                    *copy_code,
+                    *new_account,
+                    account.as_deref(),
+                    enterprise_url.as_deref(),
+                ),
+            );
             tokio::select! {
                 biased;
                 _ = tokio::signal::ctrl_c() => return Err(Error::Cancelled),
@@ -1206,10 +2099,15 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         Some(Command::Logout { provider }) => {
             let removed = if provider == "openai-chatgpt" {
                 chatgpt_auth::logout(&args.settings).await?
-            } else if provider == "openrouter" {
-                model_auth::remove(
-                    &Provider::named(provider).expect("built-in OpenRouter provider"),
-                )?
+            } else if provider == "xai" {
+                xai_auth::logout().await?
+            } else if provider == "kimi-coding" {
+                kimi_auth::logout().await?
+            } else if matches!(
+                provider.as_str(),
+                "openrouter" | "anthropic" | "github-copilot" | "openai-codex"
+            ) {
+                model_auth::remove(&Provider::named(provider).expect("built-in login provider"))?
             } else {
                 radius_auth::Gateway::configured_with_settings(&args.settings)?
                     .logout()
@@ -1250,10 +2148,9 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     if let Some(source) = &args.fork_session {
         let source = sessions::resolve_reference(source, &directory)?;
         let source_session = session_import::read(&source)?;
-        sessions::fork(
+        sessions::fork_full_history_when_inert(
             &source_session,
             &source,
-            source_session.head(),
             &args.session,
             &args.workspace,
         )?;
@@ -1270,7 +2167,12 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                 "RPC mode accepts images in prompt requests, not @file arguments".into(),
             ));
         }
-        return rpc::run(args);
+        process::RPC_INTERRUPTED.store(false, Ordering::SeqCst);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _guard = RpcCancellation(cancelled.clone());
+        return tokio::task::spawn_blocking(move || rpc::run(args, cancelled))
+            .await
+            .map_err(|_| Error::Config("RPC worker stopped".into()))?;
     }
     let mut follow_up_prompts = Vec::new();
     let mut skip_initial_prompt = false;
@@ -1299,8 +2201,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         )?;
         args.initial_images = images;
         if !std::io::stdin().is_terminal() && !args.stdin_control {
-            let mut input = Vec::new();
-            std::io::stdin().read_to_end(&mut input)?;
+            let input = read_piped_stdin().await?;
             let input = String::from_utf8_lossy(&input);
             let input = input
                 .trim_matches(|c: char| (c.is_whitespace() && c != '\u{0085}') || c == '\u{feff}');
@@ -1330,12 +2231,13 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     );
     let mut command = args.command.take().unwrap_or(Command::Interactive);
     if matches!(command, Command::Interactive) {
-        return interactive::run(args, follow_up_prompts).await;
+        return interactive::run(args, follow_up_prompts, ready).await;
     }
-    if let Some(parent) = args
-        .session
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
+    if !matches!(&command, Command::Share)
+        && let Some(parent) = args
+            .session
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
     {
         std::fs::create_dir_all(parent)?;
     }
@@ -1344,10 +2246,20 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         output(json!({"type":"imported","path":args.session}));
         return Ok(());
     }
-    let mut session = Session::open(&args.session)?;
+    let mut session = if matches!(&command, Command::Share) {
+        Session::open_for_share(&args.session)?
+    } else {
+        Session::open(&args.session)?
+    };
     if session.host_binding().is_some() {
         return Err(Error::Session(
             "a managed session must be opened by its host".into(),
+        ));
+    }
+    if matches!(&command, Command::Run { .. }) && session.pending_extension_boundary_run().is_some()
+    {
+        return Err(Error::Session(
+            "resume the pending extension boundary before submitting a prompt".into(),
         ));
     }
     let requested_workspace = args.workspace.clone();
@@ -1383,6 +2295,11 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         args.trusted = decision.unwrap_or(false);
         args.trust_pending = decision.is_none();
         args.settings = config::Settings::load(&args.workspace, args.trusted)?;
+        if !matches!(args.command, Some(Command::Serve)) || !args.worker_settings_stdin {
+            for warning in args.settings.diagnostics() {
+                eprintln!("{warning}");
+            }
+        }
     }
     if let Some(name) = &args.name {
         session.set_name(name)?;
@@ -1437,7 +2354,28 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         }
         Command::Share => {
             let destination = sessions::ShareDestination::configured(&args.settings)?;
-            let shared = destination.share(session, &args.workspace).await?;
+            let workspace = args.workspace.clone();
+            let shared = if destination.is_radius() {
+                let prepare = share_refresh::Broker::new();
+                let snapshot = runtime::standalone_share_snapshot(&args, &session, &prepare).await;
+                prepare.finish().await?;
+                let snapshot = snapshot?;
+
+                let upload = share_refresh::Broker::new();
+                let shared = tokio::select! {
+                    biased;
+                    _ = args.command_cancel.cancelled() => Err(Error::Cancelled),
+                    result = destination.share_with_broker(session, &workspace, Some(snapshot), Some(&upload)) => result,
+                };
+                upload.finish().await?;
+                shared?
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = args.command_cancel.cancelled() => Err(Error::Cancelled),
+                    result = destination.share(session, &workspace, None) => result,
+                }?
+            };
             let mut event = serde_json::to_value(shared)?;
             event["type"] = json!("shared");
             output(event);
@@ -1501,12 +2439,10 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         }
         _ => {}
     }
-    if let Some((model, thinking)) = session.model_selection() {
-        args.restore_model_selection(model, thinking, session.model_provider());
-    }
+    args.restore_session_model(&session)?;
     if !args.model.is_empty() {
         thinking::adjust(&mut args);
-        args.record_model_selection(&mut session)?;
+        args.record_automatic_model_selection(&mut session)?;
     }
     if args.mode == Some(OutputMode::Json)
         && matches!(
@@ -1523,56 +2459,54 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     let mut runtime = runtime::configure(&args, false).await?;
     session.set_auto_compaction_control(runtime.auto_compaction.clone());
     session.set_retry_control(runtime.retry.clone());
-    runtime
-        .session_lifecycle(
+    let result = async {
+    runtime.session_lifecycle_owned(
             &args,
-            &session,
+            &mut session,
             pi_rs::LifecycleEvent::SessionStart {
                 reason: pi_rs::SessionStartReason::Startup,
                 previous_session_file: None,
             },
         )
-        .await;
-    runtime
-        .discover_resources(&args, &session, pi_rs::ResourceDiscoveryReason::Startup)
         .await?;
-    let result = async {
+    runtime
+        .discover_resources(&args, &mut session, pi_rs::ResourceDiscoveryReason::Startup)
+        .await?;
+    run_pending_custom_trigger(&args, &runtime, &mut session).await?;
         if let Command::Extension { extension_id, command: extension_command, arguments } = &command {
             if let Some(run_id) = args.run_id
                 && session.records().iter().any(|record| record.run_id == Some(run_id))
             {
                 return Err(Error::DuplicateRun(run_id));
             }
-            let trigger = runtime.agent(&args, session.session_id()).extension_command_with_trigger(
+            let trigger = runtime.agent(&args, &session).extension_command_with_trigger(
                 &mut session, extension_id, extension_command, arguments,
                 &mut |event| observe(event, args.trace),
             )?;
             if !trigger { return Ok(()); }
             if args.model.is_empty() {
                 let catalog = model_selection::catalog(&args, args.provider.clone(), args.allow_model_probes()).await?;
-                args.model = catalog.models.first().cloned().ok_or_else(|| Error::Config("no model is available for the selected provider; pass --model".into()))?;
+                args.model = model_selection::default_for_provider(&args.provider, &catalog.models).cloned().ok_or_else(|| Error::Config("no model is available for the selected provider; pass --model".into()))?;
                 args.bind_initial_model_endpoint();
                 if !args.thinking_explicit { args.apply_model_thinking_defaults(); }
                 thinking::adjust(&mut args);
-                args.record_model_selection(&mut session)?;
+                args.record_automatic_model_selection(&mut session)?;
                 runtime.close().await?;
                 runtime = runtime::configure(&args, false).await?;
                 session.set_auto_compaction_control(runtime.auto_compaction.clone());
                 session.set_retry_control(runtime.retry.clone());
-                runtime.discover_resources(&args, &session, pi_rs::ResourceDiscoveryReason::Startup).await?;
+                runtime.discover_resources(&args, &mut session, pi_rs::ResourceDiscoveryReason::Startup).await?;
+                run_pending_custom_trigger(&args, &runtime, &mut session).await?;
             }
             command = Command::Resume;
         }
         let registry = &runtime.registry;
-        let agent = runtime.agent(&args, session.session_id());
+        let agent = runtime.agent(&args, &session);
         let mut observer = |event: Notification<'_>| observe(event, args.trace);
     let cancel = CancellationToken::new();
     let signal = cancel.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal.cancel();
-        }
-    });
+    install_ctrl_c(move || signal.cancel()).await;
+    startup_ready(&mut ready);
     let (sender, mut receiver) = mpsc::channel(32);
     if args.stdin_control {
         read_controls(sender, cancel.clone());
@@ -1632,17 +2566,19 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             keep_turns,
             ..
         } => {
-            return match keep_turns {
-                Some(keep_turns) => agent.compact(
-                    &mut session, Compaction { summary, keep_turns }, &mut observer,
-                ),
-                None => agent.compact_configured(&mut session, summary, &mut observer),
+            let compacted = match keep_turns {
+                Some(keep_turns) => agent.compact_with_host(
+                    &mut session, Compaction { summary, keep_turns }, &cancel, &mut observer,
+                ).await,
+                None => agent.compact_configured_with_host(&mut session, summary, &cancel, &mut observer).await,
             };
+            let triggered = run_pending_custom_trigger(&args, &runtime, &mut session).await;
+            return compacted.and(triggered);
         }
         Command::Compact {
             summary: None, keep_turns, instructions,
         } => {
-            return match keep_turns {
+            let compacted = match keep_turns {
                 Some(keep_turns) => agent.summarize_with_instructions::<pi_rs::AgentInput>(
                     &mut session, keep_turns, &cancel, &mut observer, None, instructions.as_deref(),
                 ).await,
@@ -1650,6 +2586,8 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                     &mut session, &cancel, &mut observer, None, instructions.as_deref(),
                 ).await,
             };
+            let triggered = run_pending_custom_trigger(&args, &runtime, &mut session).await;
+            return compacted.and(triggered);
         }
         Command::Run { prompt } => Some(prompt),
         Command::Resume => None,
@@ -1663,19 +2601,33 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         let mut stream = (args.mode == Some(OutputMode::Json))
             .then(rpc_events::Stream::default);
         let mut truncated = false;
-        let mut observer = |event: Notification<'_>| {
-            if let Notification::Committed(record) = &event
-                && let Event::ModelFinished { metadata, .. } = &record.event
-            {
-                truncated = metadata.finish_reason.as_deref() == Some("length");
-            }
-            if let Some(stream) = &mut stream {
-                for event in stream.notify(&event, &args) {
-                    output(event);
+        let mut event_observer = |event: pi_rs::AgentEvent<'_>| {
+            match event {
+                pi_rs::AgentEvent::Notification(event) => {
+                    if let Notification::Committed(record) = &event
+                        && let Event::ModelFinished { metadata, .. } = &record.event
+                    {
+                        truncated = metadata.finish_reason.as_deref() == Some("length");
+                    }
+                    if let Some(stream) = &mut stream {
+                        for event in stream.notify(&event, &args) { output(event); }
+                    }
+                    observe_with_stream(event, args.trace, stream.is_some());
+                }
+                event => {
+                    let event = agent_stream_event_json(event);
+                    if let Some(stream) = &mut stream {
+                        let mut rpc_event = event.clone();
+                        attach_redacted_reasoning(&mut rpc_event);
+                        for output_event in stream.observe(&rpc_event, &args) { output(output_event); }
+                    }
+                    if args.trace || (stream.is_some() && matches!(event["type"].as_str(), Some("compaction_start" | "compaction_end"))) {
+                        output(trace_agent_event_json(event));
+                    }
                 }
             }
-            observe(event, args.trace);
         };
+        let mut observer = |event: Notification<'_>| event_observer(pi_rs::AgentEvent::Notification(event));
         if let Some(prompt) = &mut input {
             if index == 0 && skip_initial_prompt {
                 continue;
@@ -1694,7 +2646,7 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
                 let event = pi_rs::InputEvent {
                     text: std::mem::take(prompt),
                     images,
-                    source: pi_rs::InputSource::Extension,
+                    source: pi_rs::InputSource::Interactive,
                     streaming_behavior: None,
                 };
                 let states = session.extension_states();
@@ -1712,7 +2664,11 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
             }
             }
         }
-        let run_id = if index == 0 { args.run_id } else { None }.unwrap_or_else(Uuid::new_v4);
+        let run_id = if index == 0 {
+            args.run_id.or_else(|| input.is_none().then(|| session.pending_extension_boundary_run()).flatten())
+        } else {
+            None
+        }.unwrap_or_else(Uuid::new_v4);
         let image_record = if images.is_empty() {
             None
         } else {
@@ -1728,21 +2684,20 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
         if let Some(record) = image_record {
             observer(Notification::Committed(record));
         }
-        let answer = agent.run_correlated(
-            &mut session, run_id, input, &mut receiver, &cancel, &mut observer,
+        let answer = agent.run_correlated_with_events(
+            &mut session, run_id, input, &mut receiver, &cancel, &mut event_observer,
         ).await;
         if let Some(stream) = &mut stream {
             let aborted = matches!(&answer, Err(Error::Cancelled));
-            for event in stream.settle(aborted) {
+            for event in stream.settle(aborted, answer.is_ok()) {
                 output(event);
             }
-            output(json!({"type":"agent_end","success":answer.is_ok(),"messages":stream.messages,"willRetry":false}));
             output(json!({"type":"agent_settled","aborted":stream.aborted()}));
         }
         let answer = answer?;
         if TEXT_OUTPUT.load(Ordering::Relaxed) {
             last_answer = Some((answer, truncated));
-        } else {
+        } else if !pi_style_invocation || args.mode != Some(OutputMode::Json) {
             output(json!({"type":"answer","content":answer}));
         }
     }
@@ -1768,23 +2723,104 @@ async fn execute(mut args: Cli, output_truncated: &mut bool) -> Result<()> {
     }
     Ok(())
     }.await;
-    runtime
-        .session_lifecycle(
+    finish_session_run(
+        result,
+        runtime.session_lifecycle_owned(
             &args,
-            &session,
+            &mut session,
             pi_rs::LifecycleEvent::SessionShutdown {
                 reason: pi_rs::SessionShutdownReason::Quit,
                 target_session_file: None,
             },
-        )
-        .await;
-    let cleanup = runtime.close().await;
-    result.and(cleanup)
+        ),
+        runtime.close(),
+    )
+    .await
+}
+
+async fn finish_session_run(
+    result: Result<()>,
+    lifecycle: impl std::future::Future<Output = Result<()>>,
+    cleanup: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let lifecycle = lifecycle.await;
+    let cleanup = cleanup.await;
+    result.and(lifecycle).and(cleanup)
+}
+
+fn trace_tool_progress(
+    event: &pi_rs::LifecycleEvent,
+    trace: bool,
+    json_stream: bool,
+) -> Option<Value> {
+    if json_stream {
+        return None;
+    }
+    if let Some(id) = pi_rs::tool_attempt_operation_id() {
+        return Some(json!({"type":"internal_tool_attempt","operationId":id}));
+    }
+    trace.then(|| serde_json::to_value(event).expect("tool progress"))
 }
 
 fn observe(event: Notification<'_>, trace: bool) {
+    observe_with_stream(event, trace, false);
+}
+
+fn agent_stream_event_json(event: pi_rs::AgentEvent<'_>) -> serde_json::Value {
     match event {
-        Notification::Retry(event) => output(serde_json::to_value(event).expect("retry event")),
+        pi_rs::AgentEvent::AutoCompaction { reason, update } => {
+            rpc_events::auto_compaction_value(reason, update)
+        }
+        pi_rs::AgentEvent::TextStart { index } => json!({"type":"text_item_start","index":index}),
+        pi_rs::AgentEvent::TextDelta { index, delta } => {
+            json!({"type":"text_item_delta","index":index,"delta":delta})
+        }
+        pi_rs::AgentEvent::TextEnd { index, content } => {
+            json!({"type":"text_item_end","index":index,"content":content})
+        }
+        pi_rs::AgentEvent::ReasoningStart { index } => {
+            json!({"type":"reasoning_item_start","index":index})
+        }
+        pi_rs::AgentEvent::ReasoningDelta { index, delta } => {
+            json!({"type":"reasoning_item_delta","index":index,"delta":delta})
+        }
+        pi_rs::AgentEvent::ReasoningEnd { index, content } => {
+            json!({"type":"reasoning_item_end","index":index,"content":content})
+        }
+        pi_rs::AgentEvent::Notification(_) => unreachable!("expected an enriched agent event"),
+    }
+}
+
+fn attach_redacted_reasoning(event: &mut serde_json::Value) {
+    if event["type"] == "reasoning_item_start" && pi_rs::redacted_reasoning_start() {
+        event["redacted"] = json!(true);
+    }
+}
+
+// Trace is also the backend transport. rpc_events::Stream::observe must map
+// text_delta.textIndex and reasoning_delta.reasoningIndex to indexed blocks.
+fn trace_agent_event_json(mut event: serde_json::Value) -> serde_json::Value {
+    match event["type"].as_str() {
+        Some("text_item_delta") => {
+            event["type"] = json!("text_delta");
+            event["textIndex"] = event["index"].take();
+            event.as_object_mut().expect("event object").remove("index");
+        }
+        Some("reasoning_item_delta") => {
+            event["type"] = json!("reasoning_delta");
+            event["reasoningIndex"] = event["index"].take();
+            event.as_object_mut().expect("event object").remove("index");
+        }
+        _ => {}
+    }
+    event
+}
+
+fn observe_with_stream(event: Notification<'_>, trace: bool, json_stream: bool) {
+    match event {
+        Notification::Retry(event) if !json_stream => {
+            output(serde_json::to_value(event).expect("retry event"))
+        }
         Notification::SummaryRequest if trace => output(json!({"type":"summary_request_start"})),
         Notification::QueueUpdated {
             steering,
@@ -1800,8 +2836,22 @@ fn observe(event: Notification<'_>, trace: bool) {
             output(json!({"type": "request", "request": request}))
         }
         Notification::Text(delta) if trace => output(json!({"type": "text_delta", "delta": delta})),
-        Notification::Reasoning(delta) if trace => {
-            output(json!({"type":"reasoning_delta","delta":delta}))
+        Notification::Reasoning(delta) if trace => match pi_rs::reasoning_event_metadata() {
+            Some(pi_rs::ReasoningEventMetadata::Start { index }) => {
+                output(json!({"type":"reasoning_item_start","index":index}))
+            }
+            Some(pi_rs::ReasoningEventMetadata::Delta { index }) => {
+                output(json!({"type":"reasoning_delta","reasoningIndex":index,"delta":delta}))
+            }
+            Some(pi_rs::ReasoningEventMetadata::End { index, content }) => {
+                output(json!({"type":"reasoning_item_end","index":index,"content":content}))
+            }
+            None => output(json!({"type":"reasoning_delta","delta":delta})),
+        },
+        Notification::ToolProgress(event) => {
+            if let Some(event) = trace_tool_progress(event, trace, json_stream) {
+                output(event);
+            }
         }
         Notification::ToolCallDelta(delta) if trace => {
             output(json!({"type":"tool_call_delta","toolCallDelta":delta}))
@@ -1821,6 +2871,36 @@ fn observe(event: Notification<'_>, trace: bool) {
         }
         _ => {}
     }
+}
+
+async fn run_pending_custom_trigger(
+    args: &Cli,
+    runtime: &runtime::Runtime,
+    session: &mut Session,
+) -> Result<()> {
+    if session.pending_extension_boundary_run().is_some() {
+        return Ok(());
+    }
+    let Some(run_id) = session.pending_custom_trigger() else {
+        return Ok(());
+    };
+    if args.run_id == Some(run_id) {
+        return Ok(());
+    }
+    let agent = runtime.agent(args, session);
+    let (_sender, mut inputs) = mpsc::channel::<pi_rs::AgentInput>(32);
+    let answer = agent
+        .run_correlated(
+            session,
+            run_id,
+            None,
+            &mut inputs,
+            &CancellationToken::new(),
+            &mut |event| observe(event, args.trace),
+        )
+        .await?;
+    output(json!({"type":"answer", "content":answer}));
+    Ok(())
 }
 
 fn read_controls(sender: mpsc::Sender<QueuedInput>, cancel: CancellationToken) {
@@ -1871,6 +2951,18 @@ fn output(event: Value) {
 
 fn metadata(record: &pi_rs::Record) -> Value {
     let mut value = match &record.event {
+        Event::RequestCallbackStarted { id, purpose } => {
+            json!({"event":"request_callback_started","invocation_id":id,"purpose":purpose})
+        }
+        Event::RequestCallbackAbandoned { id } => {
+            json!({"event":"request_callback_abandoned","invocation_id":id})
+        }
+        Event::TurnEndCallbacksCompleted { assistant_record } => {
+            json!({"event":"turn_end_callbacks_completed","assistant_record":assistant_record})
+        }
+        Event::TurnEndBoundaryApplied { assistant_record } => {
+            json!({"event":"turn_end_boundary_applied","assistant_record":assistant_record})
+        }
         Event::InputQueueCleared { ids } => json!({"event":"input_queue_cleared","ids":ids}),
         Event::QueueModeSelected { kind, mode } => {
             json!({"event":"queue_mode_selected","kind":kind,"mode":mode})
@@ -1878,10 +2970,16 @@ fn metadata(record: &pi_rs::Record) -> Value {
         Event::BashExecution { execution } => {
             json!({"event":"bash_execution","exitCode":execution.exit_code,"cancelled":execution.cancelled,"truncated":execution.truncated})
         }
+        Event::CustomMessageQueued { input } | Event::TreeMessageQueued { input } => {
+            json!({"event":"custom_message_queued","id":input.id,"delivery":input.delivery})
+        }
+        Event::TreeTriggerHandoff { run_id, return_to } => {
+            json!({"event":"tree_trigger_handoff","run_id":run_id,"return_to":return_to})
+        }
         Event::CustomEntry { entry } => {
             json!({"event":"custom_entry","customType":entry.custom_type})
         }
-        Event::CustomMessage { message } => {
+        Event::CustomMessage { message } | Event::CustomMessageDelivered { message, .. } => {
             json!({"event":"custom_message","customType":message.custom_type,"display":message.display})
         }
         Event::Created { session_id } => json!({"event": "created", "session_id": session_id}),
@@ -1897,6 +2995,13 @@ fn metadata(record: &pi_rs::Record) -> Value {
                 value["provider"] = json!(provider);
             }
             value
+        }
+        Event::BranchModelSelected {
+            target,
+            provider,
+            model,
+        } => {
+            json!({"event":"branch_model_selected", "target":target, "provider":provider, "model":model, "thinking":null})
         }
         Event::ContextEdited { target, .. } => json!({"event":"context_edited","target":target}),
         Event::Label { target, label } => json!({"event":"label","target":target,"label":label}),
@@ -1924,6 +3029,7 @@ fn metadata(record: &pi_rs::Record) -> Value {
             request_id,
             context_head,
             context_sha256,
+            ..
         } => {
             json!({"event": "model_requested", "request_id": request_id, "context_head": context_head, "context_sha256": context_sha256, "model": model, "messages": messages, "tools": tools, "max_output_tokens": max_output_tokens})
         }
@@ -1967,7 +3073,7 @@ fn metadata(record: &pi_rs::Record) -> Value {
         } => {
             json!({"event":"tool_planned","operation_id":invocation.operation_id,"name":invocation.call.name,"parent_operation":parent_operation})
         }
-        Event::ToolStarted { operation_id } => {
+        Event::ToolStarted { operation_id, .. } => {
             json!({"event": "tool_started", "operation_id": operation_id})
         }
         Event::ToolFinished {
@@ -2000,6 +3106,11 @@ fn metadata(record: &pi_rs::Record) -> Value {
             json!({"event":"branch_summary", "from":from, "target":target, "usage":usage})
         }
         Event::UserImages { images } => json!({"event":"user_images","images":images.len()}),
+        Event::ImportedUnattributedToolResult {
+            call_id, tool_name, ..
+        } => {
+            json!({"event":"imported_unattributed_tool_result","call_id":call_id,"tool_name":tool_name})
+        }
         Event::SourceEntry { format, .. } => json!({"event":"source_entry","format":format}),
         Event::SystemCheckpoint {
             sections,
@@ -2028,17 +3139,131 @@ fn outcome_status(outcome: &Outcome) -> &'static str {
     match outcome {
         Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. } => "succeeded",
         Outcome::Failed(_) => "failed",
+        Outcome::TextResult { is_error, .. }
+        | Outcome::TextResultWithStructuredContent { is_error, .. } => {
+            if *is_error {
+                "failed"
+            } else {
+                "succeeded"
+            }
+        }
         Outcome::Skipped(_) => "skipped",
         Outcome::Unknown(_) => "unknown",
         Outcome::Pending { .. } => "pending",
         Outcome::Truncated { .. } => "truncated",
-        Outcome::Structured { .. } => "succeeded",
+        Outcome::Structured { data, .. } | Outcome::StructuredWithDetails { data, .. } => {
+            if data["isError"] == true {
+                "failed"
+            } else {
+                "succeeded"
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod cli_timeout_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_entry_failure_still_runs_shutdown_and_cleanup() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct FailingStore(pi_rs::MemoryStore);
+        impl pi_rs::SessionStore for FailingStore {
+            fn load(&mut self) -> Result<Vec<pi_rs::Record>> {
+                self.0.load()
+            }
+            fn append(&mut self, record: &pi_rs::Record) -> Result<()> {
+                if matches!(record.event, pi_rs::Event::CustomEntry { .. }) {
+                    return Err(Error::Session("startup write failed".into()));
+                }
+                self.0.append(record)
+            }
+        }
+        struct Hook(Arc<AtomicBool>, Arc<AtomicBool>);
+        #[async_trait::async_trait]
+        impl pi_rs::Extension for Hook {
+            fn id(&self) -> &str {
+                "lifecycle-fixture"
+            }
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+            fn handles_session_lifecycle(&self) -> bool {
+                true
+            }
+            async fn lifecycle_with_host(
+                &self,
+                event: &pi_rs::LifecycleEvent,
+                _: Option<&pi_rs::ExtensionState>,
+                host: Arc<dyn pi_rs::ToolHost>,
+            ) -> pi_rs::ExtensionResult<()> {
+                match event {
+                    pi_rs::LifecycleEvent::SessionStart { .. } => {
+                        host.append_entry(pi_rs::CustomEntry {
+                            custom_type: "failure".into(),
+                            data: None,
+                        })
+                        .await
+                    }
+                    pi_rs::LifecycleEvent::SessionShutdown { .. } => {
+                        self.0.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            }
+            async fn shutdown(&self) -> pi_rs::ExtensionResult<()> {
+                self.1.store(true, Ordering::SeqCst);
+                Err("cleanup failed".into())
+            }
+        }
+        let shutdown_seen = Arc::new(AtomicBool::new(false));
+        let cleanup_seen = Arc::new(AtomicBool::new(false));
+        let mut registry = pi_rs::Registry::default();
+        registry
+            .register(Arc::new(Hook(shutdown_seen.clone(), cleanup_seen.clone())))
+            .unwrap();
+        let mut session =
+            pi_rs::Session::with_store(FailingStore(pi_rs::MemoryStore::default())).unwrap();
+        let start = pi_rs::notify_extension_lifecycle_in_session(
+            &registry,
+            &mut session,
+            pi_rs::LifecycleEvent::SessionStart {
+                reason: pi_rs::SessionStartReason::Startup,
+                previous_session_file: None,
+            },
+            Duration::from_secs(2),
+            &mut |_| {},
+        )
+        .await;
+        let shutdown = async {
+            pi_rs::notify_extension_lifecycle_in_session(
+                &registry,
+                &mut session,
+                pi_rs::LifecycleEvent::SessionShutdown {
+                    reason: pi_rs::SessionShutdownReason::Quit,
+                    target_session_file: None,
+                },
+                Duration::from_secs(2),
+                &mut |_| {},
+            )
+            .await?;
+            Err(Error::Session("shutdown failed".into()))
+        };
+        let result = finish_session_run(start, shutdown, registry.shutdown()).await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("startup write failed")
+        );
+        assert!(shutdown_seen.load(Ordering::SeqCst));
+        assert!(cleanup_seen.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn session_names_reject_empty_input_and_trim_surrounding_whitespace() {

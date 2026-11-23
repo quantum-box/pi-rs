@@ -100,7 +100,9 @@ fn payload(request: &ModelRequest, provider: &str) -> Value {
                     }));
                 }
             }
-            Message::Tool { call_id, content } => {
+            Message::Tool {
+                call_id, content, ..
+            } => {
                 let (text, images) = pi_rs_core::extract_tool_images(content.clone());
                 let output = if images.is_empty() {
                     json!(text)

@@ -14,11 +14,20 @@ use super::{
     model_auth::{Credential, Keys},
 };
 
+mod decisions;
+mod llama_cpp;
+mod llama_discovery;
 mod wire;
-use wire::{classifier_answers, classifier_payload, image_output, image_payload, usage};
+use wire::{
+    classifier_answers, classifier_payload, classifier_response, image_output, image_payload, usage,
+};
 
 pub(super) const TOOL: &str = "pi_model_operation";
 const RESPONSE_LIMIT: usize = 7 * 1024 * 1024;
+const CLASSIFIER_MAX_RETRIES: usize = 2;
+const MAX_SERVER_RETRY_DELAY: Duration = Duration::from_secs(60);
+const CLOUDFLARE_TEMPLATE: &str =
+    "https://api.cloudflare.com/client/v4/accounts/piaccountplaceholder/ai";
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -30,29 +39,310 @@ enum Kind {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 enum Api {
+    #[serde(rename = "openai-decisions")]
+    OpenAiDecisions,
     #[serde(rename = "typesafe-system-one")]
     SystemOne,
+    #[serde(rename = "cloudflare-workers-ai-system-one")]
+    WorkersAiSystemOne,
     #[serde(rename = "openrouter-images")]
     OpenRouterImages,
+    #[serde(rename = "llama-cpp-classify")]
+    LlamaCppClassifier,
 }
 
 impl Api {
     fn kind(self) -> Kind {
         match self {
-            Self::SystemOne => Kind::Classifier,
+            Self::SystemOne
+            | Self::WorkersAiSystemOne
+            | Self::OpenAiDecisions
+            | Self::LlamaCppClassifier => Kind::Classifier,
             Self::OpenRouterImages => Kind::Image,
         }
     }
 
     fn route(self) -> &'static str {
         match self {
+            Self::OpenAiDecisions => "decisions",
             Self::SystemOne => "systemone",
+            Self::WorkersAiSystemOne => "run",
             Self::OpenRouterImages => "chat/completions",
+            Self::LlamaCppClassifier => "completion",
         }
     }
 }
 
-#[derive(Clone, Copy, Deserialize)]
+fn retryable_classifier_response(response: &reqwest::Response) -> bool {
+    let mut hints = response.headers().get_all("x-should-retry").iter();
+    // Fetch combines repeated fields with commas, so only a single field can
+    // equal "true" or "false" in Pi's retry policy.
+    if let (Some(hint), None) = (hints.next(), hints.next()) {
+        match hint.to_str().ok() {
+            Some("true") => return true,
+            Some("false") => return false,
+            _ => {}
+        }
+    }
+    matches!(response.status().as_u16(), 408 | 409 | 429 | 500..)
+}
+
+// JavaScript's parseFloat consumes the longest valid numeric prefix, including
+// an incomplete exponent only up to the preceding mantissa.
+fn retry_number(value: &str) -> Option<f64> {
+    let value = value.trim_start();
+    let bytes = value.as_bytes();
+    let mut i = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let mut digits = 0;
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+        digits += 1;
+    }
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return None;
+    }
+    let mantissa_end = i;
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let exponent_start = i;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        if i == exponent_start {
+            i = mantissa_end;
+        }
+    }
+    value[..i].parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
+fn classifier_retry_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(date) = chrono::DateTime::parse_from_rfc2822(value) {
+        return Some(date.to_utc());
+    }
+    let value = value.trim();
+    let Some((weekday, rest)) = value.split_once(',') else {
+        return classifier_retry_asctime(value);
+    };
+    // Date.parse also accepts the obsolete RFC 850 HTTP-date form. Use
+    // JavaScript's 1950/2049 pivot for its two-digit year.
+    if ![
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ]
+    .iter()
+    .any(|day| weekday.eq_ignore_ascii_case(day))
+    {
+        return None;
+    }
+    let mut parts = rest.split_ascii_whitespace();
+    let date = parts.next()?;
+    let time = parts.next()?;
+    if !parts.next()?.eq_ignore_ascii_case("GMT") || parts.next().is_some() {
+        return None;
+    }
+    let mut date = date.split('-');
+    let day = date.next()?;
+    let month = date.next()?;
+    let year = date.next()?;
+    if year.len() != 2 || !year.bytes().all(|b| b.is_ascii_digit()) || date.next().is_some() {
+        return None;
+    }
+    let year: u32 = year.parse().ok()?;
+    let year = if year < 50 { year + 2000 } else { year + 1900 };
+    chrono::NaiveDateTime::parse_from_str(
+        &format!("{day} {month} {year} {time}"),
+        "%d %b %Y %H:%M:%S",
+    )
+    .ok()
+    .map(|date| date.and_utc())
+}
+
+fn classifier_retry_asctime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{Local, LocalResult, TimeZone};
+
+    let explicit_zone = value
+        .rsplit_once(char::is_whitespace)
+        .filter(|(_, zone)| zone.eq_ignore_ascii_case("GMT") || zone.eq_ignore_ascii_case("UTC"));
+    let date = explicit_zone.map_or(value, |(date, _)| date);
+    let (weekday, date) = date.split_once(char::is_whitespace)?;
+    // Date.parse recognizes the weekday but does not use it to check the date.
+    weekday.parse::<chrono::Weekday>().ok()?;
+    let date =
+        chrono::NaiveDateTime::parse_from_str(date.trim_start(), "%b %d %H:%M:%S %Y").ok()?;
+    if explicit_zone.is_some() {
+        Some(date.and_utc())
+    } else {
+        // Pi's Date.parse treats an asctime value with no zone as local time.
+        let offset = match Local.offset_from_local_datetime(&date) {
+            LocalResult::Single(offset) => offset,
+            LocalResult::Ambiguous(first, second) => {
+                // The larger offset maps the repeated wall time to its first instant.
+                std::cmp::max_by_key(first, second, |offset| offset.local_minus_utc())
+            }
+            LocalResult::None => {
+                // JavaScript moves through forward clock changes using the
+                // offset from before the gap. Look up that offset the day before.
+                let previous = date.checked_sub_days(chrono::Days::new(1))?;
+                Local.offset_from_local_datetime(&previous).earliest()?
+            }
+        };
+        offset
+            .from_local_datetime(&date)
+            .single()
+            .map(|date| date.to_utc())
+    }
+}
+
+fn classifier_retry_delay(
+    headers: &HeaderMap,
+    retry_index: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Duration> {
+    let numeric = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(retry_number)
+    };
+    let delay_ms = numeric("retry-after-ms")
+        .or_else(|| {
+            numeric("retry-after")
+                .map(|seconds| seconds * 1000.0)
+                .or_else(|| {
+                    headers
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(classifier_retry_date)
+                        .map(|date| date.signed_duration_since(now).num_milliseconds() as f64)
+                })
+        })
+        .filter(|delay| delay.is_finite());
+    if let Some(delay_ms) = delay_ms {
+        if delay_ms > MAX_SERVER_RETRY_DELAY.as_millis() as f64 {
+            return Err(Error::Model(
+                "model operation requested a retry delay over 60 seconds".into(),
+            ));
+        }
+        return Ok(Duration::from_secs_f64(delay_ms.max(0.0) / 1000.0));
+    }
+    let base_ms = 500 * (1u64 << retry_index.min(4));
+    let jitter = (uuid::Uuid::new_v4().as_u128() % u128::from(base_ms / 4 + 1)) as u64;
+    Ok(Duration::from_millis(base_ms - jitter))
+}
+
+async fn send_model_request(
+    client: &reqwest::Client,
+    request: reqwest::Request,
+    api: Api,
+) -> Result<Vec<u8>> {
+    let retries = if api.kind() == Kind::Classifier {
+        CLASSIFIER_MAX_RETRIES
+    } else {
+        0
+    };
+    'attempt: for attempt in 0..=retries {
+        let request = request
+            .try_clone()
+            .ok_or_else(|| Error::Config("model operation request cannot be retried".into()))?;
+        let mut response = match client.execute(request).await {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() && attempt < retries => {
+                tokio::time::sleep(classifier_retry_delay(
+                    &HeaderMap::new(),
+                    attempt,
+                    chrono::Utc::now(),
+                )?)
+                .await;
+                continue;
+            }
+            Err(error) => {
+                return Err(Error::Model(
+                    if error.is_timeout() {
+                        "model operation timed out"
+                    } else {
+                        "model operation could not connect"
+                    }
+                    .into(),
+                ));
+            }
+        };
+        if response.status().is_success() {
+            if response
+                .content_length()
+                .is_some_and(|length| length > RESPONSE_LIMIT as u64)
+            {
+                return Err(Error::Model(
+                    "model operation response exceeds the size limit".into(),
+                ));
+            }
+            let mut body = Vec::new();
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if body.len() + chunk.len() > RESPONSE_LIMIT {
+                            return Err(Error::Model(
+                                "model operation response exceeds the size limit".into(),
+                            ));
+                        }
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => return Ok(body),
+                    Err(error) if error.is_timeout() && attempt < retries => {
+                        drop(response);
+                        tokio::time::sleep(classifier_retry_delay(
+                            &HeaderMap::new(),
+                            attempt,
+                            chrono::Utc::now(),
+                        )?)
+                        .await;
+                        continue 'attempt;
+                    }
+                    Err(error) => {
+                        return Err(Error::Model(
+                            if error.is_timeout() {
+                                "model operation timed out"
+                            } else {
+                                "could not read model operation response"
+                            }
+                            .into(),
+                        ));
+                    }
+                }
+            }
+        }
+        if matches!(api, Api::OpenAiDecisions) && response.status().as_u16() == 504 {
+            return Err(Error::Model("OpenAI Decisions error (504): the request timed out at the gateway. Very large inputs (above roughly 600K tokens) currently exceed its time limit.".into()));
+        }
+        if attempt == retries || !retryable_classifier_response(&response) {
+            return Err(Error::Model(format!(
+                "model operation returned HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        let delay = classifier_retry_delay(response.headers(), attempt, chrono::Utc::now())?;
+        drop(response);
+        // Dropping this future on operation cancellation also drops the sleep.
+        tokio::time::sleep(delay).await;
+    }
+    unreachable!("retry loop returns on its last attempt")
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum ImageInput {
     Assets,
@@ -60,16 +350,30 @@ enum ImageInput {
     Images,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Compat {
+    #[serde(skip_serializing_if = "Option::is_none")]
     image_input: Option<ImageInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     send_image_opt_in_header: Option<bool>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Cost {
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_write: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tiers: Vec<CostTier>,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+struct CostTier {
+    input_tokens_above: u64,
     input: f64,
     output: f64,
     cache_read: f64,
@@ -85,6 +389,7 @@ struct Configured {
     base_url: Option<String>,
     input: Option<Vec<String>>,
     output: Option<Vec<String>>,
+    input_limits: Option<Value>,
     context_window: Option<u32>,
     #[serde(default)]
     cost: Cost,
@@ -102,6 +407,8 @@ struct Entry {
     base: Url,
     endpoint: Url,
     api_key: Option<String>,
+    cloudflare_default: bool,
+    llama_root: Option<Url>,
 }
 
 #[derive(Clone, Default)]
@@ -110,7 +417,7 @@ pub(super) struct Catalogue(Vec<Entry>);
 impl Catalogue {
     pub fn parse(providers: &Map<String, Value>) -> Result<Self> {
         let mut combined: Map<String, Value> =
-            serde_json::from_str(include_str!("../assets/operation-models-v1.5.0.json"))
+            serde_json::from_str(include_str!("../assets/operation-models-v1.6.0.json"))
                 .expect("pinned Pi model operation catalogue");
         for (provider, configured) in providers {
             let name = provider.to_ascii_lowercase();
@@ -155,6 +462,40 @@ impl Catalogue {
         let mut seen = BTreeSet::new();
         for (name, provider) in &combined {
             let name = name.to_ascii_lowercase();
+            // Bind configured credentials only to an unambiguous user-declared base.
+            let configured_binding = if matches!(
+                name.as_str(),
+                "vercel-ai-gateway" | "cloudflare-workers-ai" | "github-copilot"
+            ) && provider["baseUrl"].as_str().is_none()
+            {
+                providers
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+                    .and_then(|(_, configured)| {
+                        if name == "cloudflare-workers-ai" {
+                            configured["models"]
+                                .as_array()
+                                .and_then(|models| cloudflare_model_binding(models))
+                        } else {
+                            configured["models"]
+                                .as_array()
+                                .filter(|models| {
+                                    models
+                                        .iter()
+                                        .any(|model| model["baseUrl"].as_str().is_some())
+                                })
+                                .map(|_| unambiguous_model_base(configured))
+                        }
+                    })
+            } else {
+                None
+            };
+            let inferred_base =
+                if provider["baseUrl"].as_str().is_none() && official_base(&name).is_none() {
+                    unambiguous_model_base(provider)
+                } else {
+                    None
+                };
             for model in provider["models"].as_array().into_iter().flatten() {
                 let kind = match model["type"].as_str() {
                     Some("classifier") => Kind::Classifier,
@@ -172,7 +513,10 @@ impl Catalogue {
                     .api
                     .or_else(|| serde_json::from_value(provider["api"].clone()).ok())
                     .or(match (name.as_str(), kind) {
-                        ("typesafe" | "openrouter", Kind::Classifier) => Some(Api::SystemOne),
+                        ("typesafe" | "openrouter" | "github-copilot", Kind::Classifier) => {
+                            Some(Api::SystemOne)
+                        }
+                        ("openai", Kind::Classifier) => Some(Api::OpenAiDecisions),
                         ("openrouter", Kind::Image) => Some(Api::OpenRouterImages),
                         _ => None,
                     })
@@ -201,6 +545,11 @@ impl Catalogue {
                 ]
                 .iter()
                 .any(|cost| !cost.is_finite() || *cost < 0.0 || *cost > 1_000_000.0)
+                    || configured.cost.tiers.iter().any(|tier| {
+                        [tier.input, tier.output, tier.cache_read, tier.cache_write]
+                            .iter()
+                            .any(|cost| !cost.is_finite() || *cost < 0.0 || *cost > 1_000_000.0)
+                    })
                 {
                     return Err(Error::Config(format!(
                         "invalid operation model cost for {name}/{}",
@@ -215,7 +564,36 @@ impl Catalogue {
                     .ok_or_else(|| {
                         Error::Config(format!("operation provider {name} requires baseUrl"))
                     })?;
-                let (base, endpoint) = endpoints(base, api.route())?;
+                let cloudflare =
+                    name == "cloudflare-workers-ai" && matches!(api, Api::WorkersAiSystemOne);
+                let cloudflare_default = cloudflare
+                    && (base.contains("{CLOUDFLARE_ACCOUNT_ID}")
+                        || (configured.base_url.is_none() && provider["baseUrl"].is_null()));
+                let endpoint_for = |base: &str| {
+                    let (base, endpoint) = operation_endpoints(base, api, cloudflare)?;
+                    if name == "github-copilot"
+                        && matches!(api, Api::SystemOne)
+                        && !base.path().ends_with("/v1")
+                        && base != endpoint
+                    {
+                        let versioned = format!("{}/v1", base.as_str().trim_end_matches('/'));
+                        operation_endpoints(&versioned, api, cloudflare)
+                    } else {
+                        Ok((base, endpoint))
+                    }
+                };
+                let (base, endpoint) = endpoint_for(base)?;
+                let key_base = match &configured_binding {
+                    Some(binding) => binding.as_deref(),
+                    None => provider["baseUrl"]
+                        .as_str()
+                        .or_else(|| official_base(&name))
+                        .or(inferred_base.as_deref()),
+                };
+                let key_endpoint = key_base
+                    .map(endpoint_for)
+                    .transpose()?
+                    .map(|(_, endpoint)| endpoint);
                 let inherited: BTreeMap<String, String> = if provider["headers"].is_null() {
                     BTreeMap::new()
                 } else {
@@ -223,12 +601,25 @@ impl Catalogue {
                         Error::Config(format!("invalid operation provider headers for {name}"))
                     })?
                 };
-                let mut headers = inherited;
-                headers.append(&mut configured.headers);
-                for header in headers.keys() {
-                    HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
+                let mut headers = BTreeMap::new();
+                // Provider headers can carry credentials under arbitrary names. Bind
+                // all of them to the provider's resolved endpoint, just like its key.
+                let inherit_headers = key_endpoint.as_ref() == Some(&endpoint);
+                for (inherited, header, value) in inherited
+                    .into_iter()
+                    .map(|(header, value)| (true, header, value))
+                    .chain(
+                        std::mem::take(&mut configured.headers)
+                            .into_iter()
+                            .map(|(header, value)| (false, header, value)),
+                    )
+                {
+                    let header = HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
                         Error::Config(format!("invalid operation provider header name for {name}"))
                     })?;
+                    if !inherited || inherit_headers {
+                        headers.insert(header.as_str().to_owned(), value);
+                    }
                 }
                 configured.headers = headers;
                 let inherited: Compat = if provider["compat"].is_null() {
@@ -244,13 +635,18 @@ impl Catalogue {
                     .compat
                     .send_image_opt_in_header
                     .or(inherited.send_image_opt_in_header);
+                let api_key = (key_endpoint.as_ref() == Some(&endpoint))
+                    .then(|| provider["apiKey"].as_str().map(str::to_owned))
+                    .flatten();
                 result.push(Entry {
                     provider: name.clone(),
                     model: configured,
                     api,
                     base,
                     endpoint,
-                    api_key: provider["apiKey"].as_str().map(str::to_owned),
+                    api_key,
+                    cloudflare_default,
+                    llama_root: None,
                 });
             }
         }
@@ -274,13 +670,26 @@ impl Catalogue {
                 continue;
             }
             if available {
-                let key = (model.provider.as_str(), model.endpoint.as_str());
+                let allows_keyless = model.allows_keyless(keys);
+                let key = (
+                    model.provider.as_str(),
+                    model.endpoint.as_str(),
+                    allows_keyless,
+                    model.llama_root.is_some(),
+                );
                 let usable = match resolved.get(&key) {
                     Some(usable) => *usable,
                     None => {
-                        let usable = match model.credential(keys) {
+                        let usable = match model
+                            .resolved_cloudflare(keys)
+                            .ok()
+                            .and_then(|model| model.credential(keys))
+                        {
+                            // Pi considers a saved Copilot subscription authenticated
+                            // for discovery without refreshing it or applying its chat-only model filter.
+                            Some(Credential::Copilot) => true,
                             Some(credential) => credential.resolve().await.is_ok(),
-                            None => false,
+                            None => allows_keyless,
                         };
                         resolved.insert(key, usable);
                         usable
@@ -296,16 +705,65 @@ impl Catalogue {
     }
 }
 
+// None means no model-level endpoint was configured. Some(None) means that
+// endpoints were configured but cannot be bound unambiguously.
+pub(super) fn cloudflare_model_binding(models: &[Value]) -> Option<Option<String>> {
+    if !models
+        .iter()
+        .any(|model| model["baseUrl"].as_str().is_some())
+    {
+        return None;
+    }
+    let binding = (|| {
+        let first = models.first()?["baseUrl"].as_str()?;
+        let expected = operation_endpoints(first, Api::WorkersAiSystemOne, true)
+            .ok()?
+            .1;
+        for model in models {
+            let base = model["baseUrl"].as_str()?;
+            if operation_endpoints(base, Api::WorkersAiSystemOne, true)
+                .ok()?
+                .1
+                != expected
+            {
+                return None;
+            }
+        }
+        Some(first.to_owned())
+    })();
+    Some(binding)
+}
+
+fn unambiguous_model_base(provider: &Value) -> Option<String> {
+    let models = provider["models"].as_array()?;
+    let mut bases = BTreeSet::new();
+    for model in models {
+        let raw = model["baseUrl"].as_str()?;
+        let mut base = Url::parse(raw).ok()?;
+        let path = base.path().trim_end_matches('/').to_owned();
+        base.set_path(&path);
+        bases.insert(base.to_string());
+    }
+    (bases.len() == 1)
+        .then(|| bases.into_iter().next())
+        .flatten()
+}
+
 pub(super) fn official_base(provider: &str) -> Option<&'static str> {
     match provider {
+        "openai" => Some("https://api.openai.com/v1"),
         "typesafe" => Some("https://api.typesafe.ai/v1"),
         "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "vercel-ai-gateway" => Some("https://ai-gateway.vercel.sh/typesafe/v1"),
+        "cloudflare-workers-ai" => Some(CLOUDFLARE_TEMPLATE),
+        "opencode" => Some("https://opencode.ai/inference/systemone/v1"),
+        "github-copilot" => Some("https://api.individual.githubcopilot.com/v1"),
         _ => None,
     }
 }
 
 fn endpoints(value: &str, route: &str) -> Result<(Url, Url)> {
-    let base =
+    let mut base =
         Url::parse(value).map_err(|_| Error::Config("invalid operation model baseUrl".into()))?;
     let loopback = matches!(base.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     if !(base.scheme() == "https" || (base.scheme() == "http" && loopback))
@@ -317,6 +775,8 @@ fn endpoints(value: &str, route: &str) -> Result<(Url, Url)> {
     {
         return Err(Error::Config("invalid operation model baseUrl".into()));
     }
+    let path = base.path().trim_end_matches('/').to_owned();
+    base.set_path(&path);
     let endpoint = if base
         .path()
         .trim_end_matches('/')
@@ -330,7 +790,123 @@ fn endpoints(value: &str, route: &str) -> Result<(Url, Url)> {
     Ok((base, endpoint))
 }
 
+fn official_cloudflare_endpoint(endpoint: &Url) -> bool {
+    if endpoint.scheme() != "https"
+        || endpoint.host_str() != Some("api.cloudflare.com")
+        || endpoint.port().is_some()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return false;
+    }
+    let parts: Vec<_> = endpoint.path().split('/').collect();
+    matches!(parts.as_slice(), ["", "client", "v4", "accounts", account, "ai", "run"]
+        if valid_cloudflare_account(account))
+}
+
+pub(super) fn valid_cloudflare_account(account: &str) -> bool {
+    !account.is_empty()
+        && account.len() <= 128
+        && account.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn operation_endpoints(value: &str, api: Api, cloudflare: bool) -> Result<(Url, Url)> {
+    let route = api.route();
+    if matches!(api, Api::LlamaCppClassifier) {
+        let value = value.trim_end_matches('/');
+        let root = value.strip_suffix("/v1").unwrap_or(value);
+        let (base, _) = endpoints(root, route)?;
+        let endpoint = llama_cpp::endpoint(&base, route);
+        return Ok((base, endpoint));
+    }
+    const PLACEHOLDER: &str = "{CLOUDFLARE_ACCOUNT_ID}";
+    if value.contains(PLACEHOLDER) {
+        if !cloudflare || value.matches(PLACEHOLDER).count() != 1 {
+            return Err(Error::Config(
+                "invalid Cloudflare account placeholder".into(),
+            ));
+        }
+        let replaced = value.replace(PLACEHOLDER, "piaccountplaceholder");
+        let (base, endpoint) = endpoints(&replaced, route)?;
+        if endpoint != endpoints(CLOUDFLARE_TEMPLATE, route)?.1 {
+            return Err(Error::Config(
+                "invalid Cloudflare account placeholder endpoint".into(),
+            ));
+        }
+        return Ok((base, endpoint));
+    }
+    endpoints(value, route)
+}
+
+async fn resolve_header(value: &str, env: Option<&Map<String, Value>>) -> Option<String> {
+    if value.starts_with('!') {
+        pi_rs_workbench::mcp::resolve_value(value).await.ok()
+    } else {
+        super::model_profiles::expand_value_with_env(value, env)
+    }
+}
+
 impl Entry {
+    fn allows_keyless(&self, keys: &Keys) -> bool {
+        self.llama_root.is_some()
+            || matches!(self.api, Api::LlamaCppClassifier)
+            || matches!(
+                self.router_credential(keys, |name| std::env::var(name).ok()),
+                Some(None)
+            )
+    }
+
+    fn router_credential(
+        &self,
+        keys: &Keys,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Option<Option<Credential>> {
+        if self.provider != "llama.cpp" {
+            return None;
+        }
+        let (root, key) = llama_discovery::configured_server(keys, env)?;
+        let (_, endpoint) = llama_discovery::classifier_endpoints(&root, self.api)?;
+        (endpoint == self.endpoint).then_some(key)
+    }
+
+    fn is_official(&self) -> bool {
+        if self.provider == "github-copilot" {
+            return matches!(self.api, Api::SystemOne)
+                && self.endpoint.as_str() == super::copilot_auth::CLASSIFIER_ENDPOINT;
+        }
+        self.cloudflare_default
+            || (self.provider == "cloudflare-workers-ai"
+                && matches!(self.api, Api::WorkersAiSystemOne)
+                && official_cloudflare_endpoint(&self.endpoint))
+            || official_base(&self.provider)
+                .and_then(|base| endpoints(base, self.api.route()).ok())
+                .is_some_and(|(_, endpoint)| endpoint == self.endpoint)
+    }
+
+    fn resolved_cloudflare(&self, keys: &Keys) -> Result<Self> {
+        self.resolved_cloudflare_with_env(keys, |name| std::env::var(name).ok())
+    }
+
+    fn resolved_cloudflare_with_env(
+        &self,
+        keys: &Keys,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let mut entry = self.clone();
+        if self.cloudflare_default {
+            let stored = keys.cloudflare_operation_account().map(str::to_owned);
+            let account = stored
+                .or_else(|| env("CLOUDFLARE_ACCOUNT_ID"))
+                .filter(|account| valid_cloudflare_account(account))
+                .ok_or_else(|| Error::Config("missing or invalid Cloudflare account ID".into()))?;
+            let base = format!("https://api.cloudflare.com/client/v4/accounts/{account}/ai");
+            (entry.base, entry.endpoint) = endpoints(&base, self.api.route())?;
+        }
+        Ok(entry)
+    }
+
     fn descriptor(&self) -> Value {
         let mut value = json!({
             "type": self.api.kind(),
@@ -344,6 +920,14 @@ impl Entry {
         if let Some(window) = self.model.context_window {
             value["contextWindow"] = json!(window);
         }
+        if let Some(limits) = &self.model.input_limits {
+            value["inputLimits"] = limits.clone();
+        }
+        if self.model.compat.image_input.is_some()
+            || self.model.compat.send_image_opt_in_header.is_some()
+        {
+            value["compat"] = json!(self.model.compat);
+        }
         if self.api.kind() == Kind::Image {
             value["output"] = json!(
                 self.model
@@ -356,23 +940,53 @@ impl Entry {
     }
 
     fn credential(&self, keys: &Keys) -> Option<Credential> {
-        let official = official_base(&self.provider)
-            .and_then(|base| endpoints(base, self.api.route()).ok())
-            .is_some_and(|(_, endpoint)| endpoint == self.endpoint);
-        keys.operation_credential(&self.provider, self.endpoint.as_str(), official)
-            .cloned()
-            .or_else(|| {
-                let key = match (self.provider.as_str(), official) {
-                    ("typesafe", true) => "TYPESAFE_API_KEY",
-                    ("openrouter", true) => "OPENROUTER_API_KEY",
-                    _ => return None,
-                };
-                std::env::var(key)
-                    .ok()
-                    .filter(|key| super::model_auth::valid_key(key))
-                    .map(Credential::Literal)
-            })
-            .or_else(|| self.api_key.as_deref().and_then(Credential::configured))
+        self.credential_with_env(keys, |name| std::env::var(name).ok())
+    }
+
+    fn credential_with_env(
+        &self,
+        keys: &Keys,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Option<Credential> {
+        if let Some(root) = &self.llama_root {
+            return match llama_discovery::configured_server(keys, env) {
+                Some((configured, key)) if configured == *root => key,
+                _ => Some(Credential::Invalid),
+            };
+        }
+        let official = self.is_official();
+        if let Some(key) =
+            keys.operation_credential(&self.provider, self.endpoint.as_str(), official)
+        {
+            return Some(key.clone());
+        }
+        if let Some(key) = self.api_key.as_deref() {
+            return Some(match Credential::configured(key) {
+                Some(Credential::Literal(value)) if super::model_auth::valid_key(&value) => {
+                    Credential::Literal(value)
+                }
+                Some(credential @ Credential::Command(_)) => credential,
+                _ => Credential::Invalid,
+            });
+        }
+        if let Some(key) = self.router_credential(keys, &env) {
+            return key;
+        }
+        {
+            let key = match (self.provider.as_str(), official) {
+                ("typesafe", true) => "TYPESAFE_API_KEY",
+                ("openai", true) => "OPENAI_API_KEY",
+                ("openrouter", true) => "OPENROUTER_API_KEY",
+                ("vercel-ai-gateway", true) => "AI_GATEWAY_API_KEY",
+                ("cloudflare-workers-ai", true) => "CLOUDFLARE_API_KEY",
+                ("opencode", true) => "OPENCODE_API_KEY",
+                ("github-copilot", true) => "COPILOT_GITHUB_TOKEN",
+                _ => return None,
+            };
+            env(key)
+                .filter(|key| super::model_auth::valid_key(key))
+                .map(Credential::Literal)
+        }
     }
 
     fn accepts_images(&self) -> bool {
@@ -382,14 +996,23 @@ impl Entry {
             .is_some_and(|input| input.iter().any(|kind| kind == "image"))
     }
 
+    fn openrouter_compat(&self) -> bool {
+        self.provider == "openrouter"
+            || self
+                .base
+                .host_str()
+                .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+    }
+
     fn image_input(&self) -> ImageInput {
         self.model.compat.image_input.unwrap_or_else(|| {
-            if self.provider == "openrouter"
-                || self
-                    .base
-                    .host_str()
-                    .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
-            {
+            if matches!(self.api, Api::WorkersAiSystemOne) {
+                if self.model.id.starts_with("@cf/cloudflare/clef") {
+                    ImageInput::Images
+                } else {
+                    ImageInput::Assets
+                }
+            } else if self.openrouter_compat() {
                 ImageInput::StateImageUrls
             } else {
                 ImageInput::Assets
@@ -423,6 +1046,39 @@ impl Operations {
             })?,
         })
     }
+
+    pub async fn discover_llama(&mut self) {
+        let keys = Keys::load_async().await.unwrap_or_default();
+        let Some((root, key)) =
+            llama_discovery::configured_server(&keys, |name| std::env::var(name).ok())
+        else {
+            return;
+        };
+        let key = match key {
+            Some(key) if self.args.offline => match key.literal() {
+                Some(secret) => Some(secret.to_owned()),
+                None => return,
+            },
+            Some(key) => match tokio::time::timeout(Duration::from_secs(2), key.resolve()).await {
+                Ok(Ok(secret)) => Some(secret),
+                _ => return,
+            },
+            None => None,
+        };
+        let cache = super::config::agent_dir().join("llama-classifier-models.json");
+        let client = (!self.args.offline).then_some(&self.client);
+        let discovered = llama_discovery::catalogue(client, &root, key.as_deref(), cache).await;
+        let configured = &mut self.args.model_profiles.operations_mut().0;
+        for entry in discovered {
+            if !configured.iter().any(|model| {
+                model.provider == entry.provider
+                    && model.api.kind() == entry.api.kind()
+                    && model.model.id == entry.model.id
+            }) {
+                configured.push(entry);
+            }
+        }
+    }
 }
 
 impl Extension for Operations {
@@ -444,7 +1100,7 @@ impl Tool for Operations {
                 "Private native model catalogue and classifier or image invocation for codemode"
                     .into(),
             parameters: json!({"type":"object","properties":{
-                "action":{"enum":["list","classify","generateImages"]},
+                "action":{"enum":["list","resolve","classify","generateImages"]},
                 "type":{"enum":["chat","classifier","image"]},
                 "provider":{"type":"string"},"id":{"type":"string"},
                 "available":{"type":"boolean"},"context":{"type":"object"}
@@ -457,12 +1113,81 @@ impl Tool for Operations {
     }
 
     async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
-        let keys = match Keys::load() {
-            Ok(keys) => keys,
-            Err(error) => return Outcome::Failed(error.to_string()),
-        };
         let catalogue = self.args.model_profiles.operations();
         let provider = args["provider"].as_str();
+        if args["action"] == "resolve" {
+            let kind = serde_json::from_value::<Kind>(args["type"].clone()).ok();
+            let found = catalogue.0.iter().any(|model| {
+                Some(model.api.kind()) == kind
+                    && Some(model.provider.as_str()) == provider
+                    && Some(model.model.id.as_str()) == args["id"].as_str()
+            });
+            return if found {
+                Outcome::Structured {
+                    data: json!(true),
+                    attachments: vec![],
+                }
+            } else {
+                let requested = match kind {
+                    Some(Kind::Classifier) => "classifier",
+                    Some(Kind::Image) => "image",
+                    _ => return Outcome::Failed("invalid model operation type".into()),
+                };
+                let id = args["id"].as_str().unwrap_or_default();
+                let provider = provider.unwrap_or_default();
+                let actual = if !self.chat_models(Some(provider), Some(id), false).is_empty() {
+                    Some("chat")
+                } else {
+                    [Kind::Image, Kind::Classifier]
+                        .into_iter()
+                        .find_map(|other| {
+                            (Some(other) != kind
+                                && catalogue.0.iter().any(|model| {
+                                    model.api.kind() == other
+                                        && model.provider == provider
+                                        && model.model.id == id
+                                }))
+                            .then_some(if other == Kind::Image {
+                                "image"
+                            } else {
+                                "classifier"
+                            })
+                        })
+                };
+                let article = |value| {
+                    if value == "image" {
+                        "an image"
+                    } else if value == "chat" {
+                        "a chat"
+                    } else {
+                        "a classifier"
+                    }
+                };
+                let hint = format!(
+                    "List the {requested} models you can use with models.getAvailableOfType(\"{requested}\")."
+                );
+                let message = if let Some(actual) = actual {
+                    format!(
+                        "\"{provider}/{id}\" is {} model, not {} model. {hint}",
+                        article(actual),
+                        article(requested)
+                    )
+                } else {
+                    format!("Unknown {requested} model \"{provider}/{id}\". {hint}")
+                };
+                Outcome::Failed(message)
+            };
+        }
+        // Unfiltered catalogue lookups do not consult credentials in Pi.
+        // Preserve discovery even when auth.json is unreadable or malformed.
+        let keys = if args["action"] == "list" && args["available"] != true {
+            Keys::default()
+        } else {
+            match Keys::load_async().await {
+                Ok(keys) => keys,
+                Err(error) => return Outcome::Failed(error.to_string()),
+            }
+        };
         if args["action"] == "list" {
             let kind = serde_json::from_value::<Kind>(args["type"].clone()).unwrap_or(Kind::Chat);
             let entries = if kind == Kind::Chat {
@@ -488,6 +1213,13 @@ impl Tool for Operations {
         } else {
             Kind::Image
         };
+        let Some(model) = catalogue.0.iter().find(|model| {
+            model.api.kind() == kind
+                && Some(model.provider.as_str()) == provider
+                && Some(model.model.id.as_str()) == args["id"].as_str()
+        }) else {
+            return Outcome::Failed("unknown model for this operation".into());
+        };
         let mut data = json!({
             "provider": provider.unwrap_or_default(),
             "model": args["id"].as_str().unwrap_or_default(),
@@ -512,21 +1244,16 @@ impl Tool for Operations {
                 .as_array()
                 .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
         };
+        initialize_result(model, &mut data);
         let result = if has_images && self.args.settings.block_model_images() {
             Err(Error::Config(super::image_policy::BLOCKED_IMAGE.into()))
-        } else if let Some(model) = catalogue.0.iter().find(|model| {
-            model.api.kind() == kind
-                && Some(model.provider.as_str()) == provider
-                && Some(model.model.id.as_str()) == args["id"].as_str()
-        }) {
+        } else {
             let operation = self.perform(model, &args["context"], &keys, &mut data);
             tokio::select! {
                 biased;
                 _ = context.cancellation.cancelled() => Err(Error::Cancelled),
                 result = operation => result,
             }
-        } else {
-            Err(Error::Config("unknown model for this operation".into()))
         };
         if let Err(error) = result {
             data["stopReason"] = json!(if matches!(error, Error::Cancelled) {
@@ -540,6 +1267,18 @@ impl Tool for Operations {
             data,
             attachments: vec![],
         }
+    }
+}
+
+fn initialize_result(entry: &Entry, data: &mut Value) {
+    if data.get("timestamp").is_none() {
+        data["api"] = json!(entry.api);
+        data["timestamp"] = json!(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        );
     }
 }
 
@@ -582,9 +1321,16 @@ impl Operations {
                     "id":id,
                     "name":metadata.as_ref().and_then(|metadata| metadata.name.as_deref()).unwrap_or(&id),
                     "api":adapter.api(),
-                    "input":if detail.images == Some(true) { vec!["text", "image"] } else { vec!["text"] },
+                    "input":metadata.as_ref().and_then(|model| model.input_modalities())
+                        .unwrap_or_else(|| if detail.images == Some(true) { vec!["text", "image"] } else { vec!["text"] }),
                 });
                 if let Some(metadata) = metadata {
+                    if let Some(reasoning) = metadata.reasoning {
+                        model["reasoning"] = json!(reasoning);
+                    }
+                    if let Some(max_tokens) = metadata.max_tokens {
+                        model["maxTokens"] = json!(max_tokens);
+                    }
                     metadata.apply_catalog_metadata(&mut model);
                 }
                 if let Some(window) = detail.context_window {
@@ -603,32 +1349,92 @@ impl Operations {
         keys: &Keys,
         data: &mut Value,
     ) -> Result<()> {
+        let resolved = entry.resolved_cloudflare(keys)?;
+        let entry = &resolved;
+        initialize_result(entry, data);
         let (payload, image_opt_in) = match entry.api {
-            Api::SystemOne => classifier_payload(entry, context)?,
+            Api::LlamaCppClassifier => {
+                let questions = llama_cpp::prepare(context)?;
+                let (_, headers) = self.request_target(entry, keys).await?;
+                data["answers"] =
+                    llama_cpp::classify(&self.client, entry, &headers, questions).await?;
+                return Ok(());
+            }
+            Api::SystemOne | Api::WorkersAiSystemOne => classifier_payload(entry, context)?,
+            Api::OpenAiDecisions => (decisions::payload(entry, context)?, false),
             Api::OpenRouterImages => (image_payload(entry, context)?, false),
         };
-        let credential = entry
-            .credential(keys)
-            .ok_or_else(|| Error::Config(format!("No API key for provider: {}", entry.provider)))?;
-        let key = credential.resolve().await?;
-        let mut headers = HeaderMap::new();
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {key}"))
-            .map_err(|_| Error::Config("invalid model operation credential".into()))?;
-        authorization.set_sensitive(true);
-        headers.insert(reqwest::header::AUTHORIZATION, authorization);
+        let (endpoint, mut headers) = self.request_target(entry, keys).await?;
+        // Pi adds the automatic classifier image opt-in as request options,
+        // after provider and model headers have been combined.
         if image_opt_in {
             headers.insert(
                 "typesafe-danger-zone-images",
                 HeaderValue::from_static("true"),
             );
         }
-        for (name, value) in &entry.model.headers {
-            let value = if value.starts_with('!') {
-                pi_rs_workbench::mcp::resolve_value(value).await.ok()
-            } else {
-                super::model_profiles::expand_value(value)
+        let body = send_model_json(&self.client, endpoint, &headers, &payload, entry.api).await?;
+        let result_body = if matches!(entry.api, Api::WorkersAiSystemOne) {
+            classifier_response(&body)?
+        } else {
+            &body
+        };
+        if let Some(usage) = usage(entry, &result_body["usage"]) {
+            data["usage"] = usage;
+        }
+        match entry.api {
+            Api::SystemOne | Api::WorkersAiSystemOne => {
+                data["answers"] =
+                    classifier_answers(&context["questions"], &result_body["answers"])?
             }
-            .ok_or_else(|| {
+            Api::OpenAiDecisions => {
+                data["answers"] =
+                    decisions::answers(&context["questions"], &result_body["answers"])?;
+            }
+            Api::OpenRouterImages => {
+                if let Some(id) = body["id"].as_str() {
+                    data["responseId"] = json!(id);
+                }
+                // Keep accepted blocks if a later image fails native validation.
+                let output = data["output"]
+                    .as_array_mut()
+                    .expect("image operation output is initialized as an array");
+                image_output(&body, output)?;
+            }
+            Api::LlamaCppClassifier => unreachable!("handled before the single request"),
+        }
+        Ok(())
+    }
+
+    async fn request_target(&self, entry: &Entry, keys: &Keys) -> Result<(Url, HeaderMap)> {
+        let credential_env = keys.operation_environment(
+            &entry.provider,
+            entry.endpoint.as_str(),
+            entry.is_official(),
+        );
+        let mut endpoint = entry.endpoint.clone();
+        let mut headers = HeaderMap::new();
+        if let Some(credential) = entry.credential(keys) {
+            let key = if matches!(credential, Credential::Copilot) {
+                let credential =
+                    super::copilot_auth::credential(&self.args.settings, None, false).await?;
+                endpoint = super::copilot_auth::routed_classifier_endpoint(&endpoint, &credential)?;
+                credential.access
+            } else {
+                credential.resolve().await?
+            };
+            let mut authorization = HeaderValue::from_str(&format!("Bearer {key}"))
+                .map_err(|_| Error::Config("invalid model operation credential".into()))?;
+            authorization.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, authorization);
+        } else if !entry.allows_keyless(keys) {
+            return Err(Error::Config(format!(
+                "No API key for provider: {}",
+                entry.provider
+            )));
+        }
+        for (name, value) in &entry.model.headers {
+            let value = resolve_header(value, credential_env).await.ok_or_else(|| {
                 Error::Config(format!("could not resolve operation model header {name}"))
             })?;
             let mut value = HeaderValue::from_str(&value)
@@ -639,81 +1445,2919 @@ impl Operations {
                 value,
             );
         }
-        let mut response = self
-            .client
-            .post(entry.endpoint.clone())
-            .headers(headers)
-            .header("content-type", "application/json")
-            .body(serde_json::to_vec(&payload)?)
-            .send()
-            .await
-            .map_err(|error| {
-                Error::Model(
-                    if error.is_timeout() {
-                        "model operation timed out"
-                    } else {
-                        "model operation could not connect"
-                    }
-                    .into(),
-                )
-            })?;
-        if !response.status().is_success() {
-            return Err(Error::Model(format!(
-                "model operation returned HTTP {}",
-                response.status().as_u16()
-            )));
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > RESPONSE_LIMIT as u64)
-        {
-            return Err(Error::Model(
-                "model operation response exceeds the size limit".into(),
-            ));
-        }
-        let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| Error::Model("could not read model operation response".into()))?
-        {
-            if body.len() + chunk.len() > RESPONSE_LIMIT {
-                return Err(Error::Model(
-                    "model operation response exceeds the size limit".into(),
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        let body: Value = serde_json::from_slice(&body)
-            .map_err(|_| Error::Model("model operation response is not valid JSON".into()))?;
-        data["api"] = json!(entry.api);
-        data["timestamp"] = json!(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64
-        );
-        if let Some(usage) = usage(entry, &body["usage"]) {
-            data["usage"] = usage;
-        }
-        match entry.api {
-            Api::SystemOne => {
-                data["answers"] = classifier_answers(&context["questions"], &body["answers"])?
-            }
-            Api::OpenRouterImages => {
-                data["output"] = json!(image_output(&body)?);
-                if let Some(id) = body["id"].as_str() {
-                    data["responseId"] = json!(id);
-                }
-            }
-        }
-        Ok(())
+        Ok((endpoint, headers))
     }
+}
+
+async fn send_model_json(
+    client: &reqwest::Client,
+    endpoint: Url,
+    headers: &HeaderMap,
+    payload: &Value,
+    api: Api,
+) -> Result<Value> {
+    let request = client
+        .post(endpoint)
+        .headers(headers.clone())
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(payload)?)
+        .build()
+        .map_err(|_| Error::Config("invalid model operation request".into()))?;
+    let body = send_model_request(client, request, api).await?;
+    serde_json::from_slice(&body)
+        .map_err(|_| Error::Model("model operation response is not valid JSON".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_llama_classifiers_inherit_keys_only_for_the_matching_router() {
+        let providers = json!({
+            "llama.cpp": {
+                "models": [
+                    {"id":"chat","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://router.example/prefix/v1/v1"},
+                    {"id":"decisions","type":"classifier","api":"typesafe-system-one",
+                     "baseUrl":"https://router.example/prefix/v1/v1"},
+                    {"id":"other-path","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://router.example/prefix/v1"},
+                    {"id":"other-host","type":"classifier","api":"llama-cpp-classify",
+                     "baseUrl":"https://other.example/prefix/v1/v1"}
+                ]
+            }
+        });
+        let catalogue = Catalogue::parse(providers.as_object().unwrap()).unwrap();
+        let keys = Keys::default();
+        let env = |name: &str| match name {
+            "LLAMA_BASE_URL" => Some("https://router.example/prefix/v1/v1/".into()),
+            "LLAMA_API_KEY" => Some("router-key".into()),
+            _ => None,
+        };
+        for entry in catalogue
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "llama.cpp")
+        {
+            let credential = entry.credential_with_env(&keys, env);
+            match entry.model.id.as_str() {
+                "chat" | "decisions" => {
+                    assert_eq!(credential.unwrap().literal(), Some("router-key"));
+                }
+                "other-path" | "other-host" => assert!(credential.is_none()),
+                id => panic!("unexpected fixture model {id}"),
+            }
+        }
+        assert_eq!(
+            catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == "llama.cpp")
+                .count(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_system_one_classifier_can_use_only_the_matching_keyless_router() {
+        use clap::Parser;
+
+        let providers = json!({"llama.cpp":{"models":[
+            {"id":"decision","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://router.example/prefix/v1"},
+            {"id":"other-path","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://router.example/other/v1"},
+            {"id":"other-host","type":"classifier","api":"typesafe-system-one",
+             "baseUrl":"https://other.example/prefix/v1"}
+        ]}});
+        let catalogue = Catalogue::parse(providers.as_object().unwrap()).unwrap();
+        let keys = Keys::parse(&json!({"llama.cpp":{
+            "type":"api_key","env":{"LLAMA_BASE_URL":"https://router.example/prefix"}
+        }}));
+        let available = catalogue
+            .list(Kind::Classifier, Some("llama.cpp"), None, true, &keys)
+            .await;
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0]["id"], "decision");
+        let operations = Operations::new(&Cli::parse_from(["pi"])).unwrap();
+        for entry in catalogue
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "llama.cpp")
+        {
+            let target = operations.request_target(entry, &keys).await;
+            if entry.model.id == "decision" {
+                let (endpoint, headers) = target.unwrap();
+                assert_eq!(endpoint, entry.endpoint);
+                assert!(!headers.contains_key(reqwest::header::AUTHORIZATION));
+            } else {
+                assert!(target.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unfiltered_catalogue_does_not_read_auth_file() {
+        use clap::Parser;
+        const CHILD: &str = "PI_RS_CATALOG_AUTH_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("auth.json"), "{").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "operation_models::tests::unfiltered_catalogue_does_not_read_auth_file",
+                ])
+                .env(CHILD, "1")
+                .env("PI_RS_HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":{}})).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let context = || ToolContext {
+            operation_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+            cancellation: Default::default(),
+        };
+        let args =
+            json!({"action":"list","type":"classifier","provider":"typesafe","available":false});
+        let Outcome::Structured { data, .. } = operation.invoke(args, context()).await else {
+            panic!("unfiltered discovery should succeed")
+        };
+        assert!(
+            data.as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["id"] == "jev-latest")
+        );
+        let chat = json!({"action":"list","type":"chat","provider":"openai","available":false});
+        let Outcome::Structured { data, .. } = operation.invoke(chat, context()).await else {
+            panic!("unfiltered chat discovery should succeed")
+        };
+        assert!(!data.as_array().unwrap().is_empty());
+        let args =
+            json!({"action":"list","type":"classifier","provider":"typesafe","available":true});
+        assert!(matches!(
+            operation.invoke(args, context()).await,
+            Outcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn opencode_classifier_catalogue_uses_endpoint_bound_credentials() {
+        let catalog = Catalogue::parse(&Map::new()).unwrap();
+        let models: Vec<_> = catalog
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "opencode")
+            .collect();
+        assert_eq!(models.len(), 2);
+        let paid = models
+            .iter()
+            .find(|entry| entry.model.id == "jev-1.13")
+            .unwrap();
+        let free = models
+            .iter()
+            .find(|entry| entry.model.id == "jev-1.13-free")
+            .unwrap();
+        assert_eq!(
+            paid.endpoint.as_str(),
+            "https://opencode.ai/inference/systemone/v1/systemone"
+        );
+        assert_eq!(paid.descriptor()["contextWindow"], 32000);
+        assert_eq!(paid.descriptor()["input"], json!(["text"]));
+        assert_eq!(paid.descriptor()["cost"]["input"], 0.042);
+        assert_eq!(free.descriptor()["cost"]["input"].as_f64(), Some(0.0));
+        let empty = Keys::parse(&json!({}));
+        let env = |name: &str| (name == "OPENCODE_API_KEY").then(|| "fixture-key".to_owned());
+        assert_eq!(
+            paid.credential_with_env(&empty, env).unwrap().literal(),
+            Some("fixture-key")
+        );
+        let saved = Keys::parse(&json!({"opencode":{"type":"api_key","key":"saved-key"}}));
+        assert_eq!(
+            paid.credential_with_env(&saved, |_| None)
+                .unwrap()
+                .literal(),
+            Some("saved-key")
+        );
+        let config = json!({"opencode":{"baseUrl":"http://127.0.0.1:1"}});
+        let custom = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let model = custom
+            .0
+            .iter()
+            .find(|entry| entry.provider == "opencode")
+            .unwrap();
+        assert!(model.credential_with_env(&saved, env).is_none());
+    }
+
+    #[tokio::test]
+    async fn copilot_classifier_availability_and_credentials_are_scoped() {
+        let provider = "github-copilot";
+        let catalogue = Catalogue::parse(&Map::new()).unwrap();
+        let model = catalogue
+            .0
+            .iter()
+            .find(|model| model.provider == provider)
+            .unwrap();
+        let id = "microsoft-decision-1";
+        assert_eq!(model.model.id, id);
+        assert_eq!(
+            model.endpoint.as_str(),
+            super::super::copilot_auth::CLASSIFIER_ENDPOINT
+        );
+        assert_eq!(model.descriptor()["input"], json!(["text"]));
+        assert!(model.descriptor().get("headers").is_none());
+        // A stale access token and an empty chat catalogue do not prevent discovery.
+        let oauth = Keys::parse(&json!({provider:{
+            "type":"oauth","access":"fixture","refresh":"fixture","expires":1,
+            "availableModelIds":[]
+        }}));
+        assert!(matches!(
+            model.credential_with_env(&oauth, |_| None),
+            Some(Credential::Copilot)
+        ));
+        let available = catalogue
+            .list(Kind::Classifier, Some(provider), Some(id), true, &oauth)
+            .await;
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0]["id"], id);
+        let api_key = |name: &str| (name == "COPILOT_GITHUB_TOKEN").then(|| "fixture-env".into());
+        assert!(
+            matches!(model.credential_with_env(&Keys::default(), api_key),
+            Some(Credential::Literal(token)) if token == "fixture-env")
+        );
+        for base in [
+            "http://127.0.0.1:1/proxy/",
+            "http://127.0.0.1:1/proxy/v1",
+            "http://127.0.0.1:1/proxy/v1/systemone",
+        ] {
+            let custom = json!({provider:{"baseUrl":base}});
+            let custom = Catalogue::parse(custom.as_object().unwrap()).unwrap();
+            let custom = custom
+                .0
+                .iter()
+                .find(|model| model.provider == provider)
+                .unwrap();
+            assert_eq!(custom.endpoint.path(), "/proxy/v1/systemone");
+            assert!(!custom.is_official());
+            assert!(custom.credential_with_env(&oauth, api_key).is_none());
+        }
+        let canonical = json!({provider:{"baseUrl":"https://api.individual.githubcopilot.com/"}});
+        let canonical = Catalogue::parse(canonical.as_object().unwrap()).unwrap();
+        assert!(
+            canonical
+                .0
+                .iter()
+                .find(|model| model.provider == provider)
+                .unwrap()
+                .is_official()
+        );
+    }
+
+    #[tokio::test]
+    async fn copilot_classifier_sends_system_one_request_with_model_headers() {
+        use clap::Parser;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/proxy", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "POST /proxy/v1/systemone HTTP/1.1\r\n");
+            let mut headers = BTreeMap::new();
+            loop {
+                line.clear();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.split_once(':').unwrap();
+                headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
+            }
+            assert_eq!(headers["authorization"], "Bearer loopback-key");
+            assert_eq!(headers["user-agent"], "GitHubCopilotChat/0.35.0");
+            assert_eq!(headers["copilot-integration-id"], "vscode-chat");
+            let mut body = vec![0; headers["content-length"].parse().unwrap()];
+            stream.read_exact(&mut body).await.unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["model"], "microsoft-decision-1");
+            assert_eq!(request["questions"]["ok"]["type"], "noul");
+            let body = r#"{"answers":{"ok":{"type":"noul","noul":0.75}}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let config = json!({"github-copilot":{"baseUrl":base,"apiKey":"loopback-key"}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let model = catalogue
+            .0
+            .iter()
+            .find(|model| model.provider == "github-copilot")
+            .unwrap();
+        let operations = Operations::new(&Cli::parse_from(["pi"])).unwrap();
+        let context = json!({
+            "state":{},"questions":{"ok":{"type":"bool","instructions":"Decide",
+            "criteria":{"true":"yes","false":"no"}}},
+        });
+        let mut data = json!({});
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            operations.perform(model, &context, &Keys::default(), &mut data),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            data["answers"]["ok"],
+            json!({"type":"bool","probability":0.75})
+        );
+    }
+
+    #[test]
+    fn vercel_builtin_classifier_catalogue_is_endpoint_bound() {
+        let catalogue = Catalogue::parse(&Map::new()).unwrap();
+        let models: Vec<_> = catalogue
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "vercel-ai-gateway")
+            .collect();
+        assert_eq!(models.len(), 27);
+        let ids: BTreeSet<_> = models.iter().map(|entry| entry.model.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            BTreeSet::from([
+                "baseten/elephant-1",
+                "baseten/joey-1",
+                "baseten/mammoth-1",
+                "convaiinnovations/laya",
+                "google/gemini-decision-1",
+                "heygen/heygen-decision-1",
+                "heygen/heygen-decision-1-turbo",
+                "liquid/d1",
+                "liquid/d1-ultra",
+                "liquid/d1.2",
+                "liquid/d1.2-ultra",
+                "microsoft/decision-1.1",
+                "microsoft/microsoft-decision-1",
+                "modaic/mo",
+                "nace-ai/drex-max-finance",
+                "nace-ai/drex-max-v1.1",
+                "nace-ai/drex-v2.0",
+                "openai/gpt-6-luna-decisions",
+                "parallel/parallel-decisions-fast",
+                "perplexity/pplx-decider-flash-v1.2",
+                "perplexity/pplx-decider-flash-v1.3",
+                "perplexity/pplx-decider-v1.2",
+                "perplexity/pplx-decider-v1.3",
+                "scaledown/scaledown-classify-1",
+                "typesafe-ai/jev",
+                "typesafe-ai/jev-1.13.0",
+                "typesafe-ai/jev-1.14.0",
+            ])
+        );
+        let entry = models
+            .iter()
+            .find(|entry| entry.model.id == "typesafe-ai/jev")
+            .unwrap();
+        assert_eq!(
+            entry.endpoint.as_str(),
+            "https://ai-gateway.vercel.sh/typesafe/v1/systemone"
+        );
+        assert_eq!(entry.descriptor()["type"], "classifier");
+        assert!(models.iter().all(|entry| {
+            entry
+                .model
+                .input
+                .as_ref()
+                .is_some_and(|input| input == &["text"])
+        }));
+        let empty = Keys::parse(&json!({}));
+        let ambient = |name: &str| (name == "AI_GATEWAY_API_KEY").then(|| "ambient-key".to_owned());
+        assert_eq!(
+            entry
+                .credential_with_env(&empty, ambient)
+                .unwrap()
+                .literal(),
+            Some("ambient-key")
+        );
+        let saved =
+            Keys::parse(&json!({"vercel-ai-gateway":{"type":"api_key","key":"stored-key"}}));
+        assert_eq!(
+            entry
+                .credential_with_env(&saved, ambient)
+                .unwrap()
+                .literal(),
+            Some("stored-key")
+        );
+        let scoped = Keys::parse(
+            &json!({"vercel-ai-gateway":{"type":"api_key","key":"other-key","endpoint":"https://example.org/v1"}}),
+        );
+        assert_eq!(
+            entry
+                .credential_with_env(&scoped, ambient)
+                .unwrap()
+                .literal(),
+            Some("ambient-key")
+        );
+        let mut custom = (*entry).clone();
+        custom.endpoint = Url::parse("https://example.org/v1/systemone").unwrap();
+        assert!(custom.credential_with_env(&saved, ambient).is_none());
+    }
+
+    #[tokio::test]
+    async fn vercel_saved_key_enables_all_classifiers_without_network() {
+        let catalogue = Catalogue::parse(&Map::new()).unwrap();
+        let keys = Keys::parse(
+            &json!({"vercel-ai-gateway":{"type":"api_key","key":"stored-key","endpoint":"https://ai-gateway.vercel.sh/v1/messages","literal":true}}),
+        );
+        let available = catalogue
+            .list(
+                Kind::Classifier,
+                Some("vercel-ai-gateway"),
+                None,
+                true,
+                &keys,
+            )
+            .await;
+        assert_eq!(available.len(), 27);
+        assert!(available.iter().all(|entry| entry["type"] == "classifier"));
+    }
+
+    #[test]
+    fn model_only_endpoint_keeps_custom_binding_without_leaking_to_builtins() {
+        for (provider, builtin_id) in [
+            ("vercel-ai-gateway", "typesafe-ai/jev"),
+            ("github-copilot", "microsoft-decision-1"),
+        ] {
+            let config = json!({provider:{"apiKey":"custom-key", "headers":{"x-secret":"value"}, "models":[
+                {"type":"classifier","id":"custom","api":"typesafe-system-one","baseUrl":"http://127.0.0.1:1234/v1"}
+            ]}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let custom = catalogue
+                .0
+                .iter()
+                .find(|entry| entry.provider == provider && entry.model.id == "custom")
+                .unwrap();
+            let builtin = catalogue
+                .0
+                .iter()
+                .find(|entry| entry.provider == provider && entry.model.id == builtin_id)
+                .unwrap();
+            assert_eq!(custom.api_key.as_deref(), Some("custom-key"));
+            assert_eq!(
+                custom.model.headers.get("x-secret").map(String::as_str),
+                Some("value")
+            );
+            assert!(builtin.api_key.is_none());
+            assert!(!builtin.model.headers.contains_key("x-secret"));
+            let mut ambiguous = config;
+            ambiguous[provider]["models"].as_array_mut().unwrap().push(json!({"type":"classifier","id":"other","api":"typesafe-system-one","baseUrl":"http://127.0.0.1:1235/v1"}));
+            let catalogue = Catalogue::parse(ambiguous.as_object().unwrap()).unwrap();
+            assert!(
+                catalogue
+                    .0
+                    .iter()
+                    .filter(|entry| entry.provider == provider)
+                    .all(|entry| entry.api_key.is_none()
+                        && !entry.model.headers.contains_key("x-secret"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vercel_classifier_uses_system_one_on_configured_endpoint() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/typesafe/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let (end, length) = loop {
+                let mut bytes = [0; 2048];
+                let count = stream.read(&mut bytes).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&bytes[..count]);
+                if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let end = pos + 4;
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    break (end, length);
+                }
+            };
+            while request.len() < end + length {
+                let mut bytes = [0; 2048];
+                let count = stream.read(&mut bytes).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&bytes[..count]);
+            }
+            let body = r#"{"answers":{"ok":{"type":"noul","noul":0.8}}}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            request
+        });
+        let config = json!({"vercel-ai-gateway":{"baseUrl":base,"apiKey":"fixture-key"}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| {
+                entry.provider == "vercel-ai-gateway" && entry.model.id == "typesafe-ai/jev"
+            })
+            .unwrap();
+        let keys = Keys::parse(&json!({}));
+        assert_eq!(
+            catalogue
+                .list(
+                    Kind::Classifier,
+                    Some("vercel-ai-gateway"),
+                    Some("typesafe-ai/jev"),
+                    true,
+                    &keys
+                )
+                .await
+                .len(),
+            1
+        );
+        let operation = Operations {
+            args: Cli::parse_from(["pi"]),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let context = json!({"state":{"text":"fixture"},"questions":{"ok":{"type":"bool","instructions":"classify","criteria":{"true":"yes","false":"no"}}}});
+        let mut result = json!({});
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            operation.perform(entry, &context, &keys, &mut result),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let end = request
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let headers = std::str::from_utf8(&request[..end])
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(headers.starts_with("post /typesafe/v1/systemone "));
+        assert!(headers.contains("authorization: bearer fixture-key"));
+        let body: Value = serde_json::from_slice(&request[end..]).unwrap();
+        assert_eq!(body["model"], "typesafe-ai/jev");
+        assert_eq!(body["questions"]["ok"]["type"], "noul");
+        assert_eq!(result["answers"]["ok"]["probability"], 0.8);
+    }
+
+    #[test]
+    fn builtin_cloudflare_catalogue_resolves_only_safe_official_accounts() {
+        let catalogue = Catalogue::parse(&Map::new()).unwrap();
+        let entries: Vec<_> = catalogue
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "cloudflare-workers-ai")
+            .collect();
+        assert_eq!(entries.len(), 5);
+        let entry = entries
+            .iter()
+            .find(|entry| entry.model.id == "typesafe/jev")
+            .unwrap();
+        let keys = Keys::parse(
+            &json!({"cloudflare-workers-ai":{"type":"api_key","key":"saved-key","env":{"CLOUDFLARE_ACCOUNT_ID":"account123"}}}),
+        );
+        let resolved = entry
+            .resolved_cloudflare_with_env(&keys, |_| Some("fallback".into()))
+            .unwrap();
+        assert_eq!(
+            resolved.endpoint.as_str(),
+            "https://api.cloudflare.com/client/v4/accounts/account123/ai/run"
+        );
+        assert!(resolved.credential_with_env(&keys, |_| None).is_some());
+        let empty = Keys::parse(&json!({}));
+        assert!(
+            entry
+                .resolved_cloudflare_with_env(&empty, |_| None)
+                .is_err()
+        );
+        for invalid in ["../escape", "account/other", "account?token=x", ""] {
+            assert!(
+                entry
+                    .resolved_cloudflare_with_env(&empty, |_| Some(invalid.into()))
+                    .is_err()
+            );
+        }
+        let ambient = entry
+            .resolved_cloudflare_with_env(&empty, |_| Some("ambient123".into()))
+            .unwrap();
+        assert!(
+            ambient
+                .credential_with_env(&empty, |name| (name == "CLOUDFLARE_API_KEY")
+                    .then(|| "ambient-key".into()))
+                .is_some()
+        );
+        let scoped = Keys::parse(
+            &json!({"cloudflare-workers-ai":{"type":"api_key","key":"secret", "endpoint":"https://example.com/v1", "env":{"CLOUDFLARE_ACCOUNT_ID":"wrong"}}}),
+        );
+        let resolved = entry
+            .resolved_cloudflare_with_env(&scoped, |_| Some("ambient123".into()))
+            .unwrap();
+        assert!(resolved.endpoint.as_str().contains("ambient123"));
+        assert!(resolved.credential_with_env(&scoped, |_| None).is_none());
+    }
+
+    #[test]
+    fn scoped_cloudflare_account_must_reconstruct_the_bound_official_endpoint() {
+        let catalogue = Catalogue::parse(&Map::new()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| {
+                entry.provider == "cloudflare-workers-ai" && entry.model.id == "typesafe/jev"
+            })
+            .unwrap();
+        let make_keys = |endpoint: &str, account: &str| {
+            Keys::parse(&json!({"cloudflare-workers-ai":{
+                "type":"api_key", "key":"scoped-secret", "endpoint":endpoint,
+                "env":{"CLOUDFLARE_ACCOUNT_ID":account}
+            }}))
+        };
+        let matching = make_keys(
+            "https://api.cloudflare.com/client/v4/accounts/account123/ai/run",
+            "account123",
+        );
+        let resolved = entry
+            .resolved_cloudflare_with_env(&matching, |_| None)
+            .unwrap();
+        assert_eq!(
+            resolved.endpoint.as_str(),
+            "https://api.cloudflare.com/client/v4/accounts/account123/ai/run"
+        );
+        assert_eq!(
+            resolved
+                .credential_with_env(&matching, |_| None)
+                .unwrap()
+                .literal(),
+            Some("scoped-secret")
+        );
+        for endpoint in [
+            "https://api.cloudflare.com/client/v4/accounts/other/ai/run",
+            "https://example.org/client/v4/accounts/account123/ai/run",
+            "https://api.cloudflare.com:444/client/v4/accounts/account123/ai/run",
+            "https://api.cloudflare.com/client/v4/accounts/account123/ai/run?secret=1",
+        ] {
+            let keys = make_keys(endpoint, "account123");
+            assert!(
+                entry.resolved_cloudflare_with_env(&keys, |_| None).is_err(),
+                "{endpoint}"
+            );
+            let fallback = entry
+                .resolved_cloudflare_with_env(&keys, |_| Some("fallback123".into()))
+                .unwrap();
+            assert!(
+                fallback.credential_with_env(&keys, |_| None).is_none(),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_cloudflare_official_endpoints_validate_account_and_scope() {
+        let keys = Keys::parse(
+            &json!({"cloudflare-workers-ai":{"type":"api_key","key":"saved-key","env":{"CLOUDFLARE_ACCOUNT_ID":"stored123"}}}),
+        );
+        let empty = Keys::parse(&json!({}));
+        for base in [
+            "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai",
+            "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/",
+        ] {
+            let config = json!({"cloudflare-workers-ai":{"baseUrl":base}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| {
+                    entry.provider == "cloudflare-workers-ai" && entry.model.id == "typesafe/jev"
+                })
+                .unwrap();
+            let resolved = entry.resolved_cloudflare_with_env(&keys, |_| None).unwrap();
+            assert_eq!(
+                resolved.endpoint.as_str(),
+                "https://api.cloudflare.com/client/v4/accounts/stored123/ai/run"
+            );
+            assert!(resolved.credential_with_env(&keys, |_| None).is_some());
+        }
+        let config = json!({"cloudflare-workers-ai":{"baseUrl":"https://api.cloudflare.com/client/v4/accounts/explicit123/ai"}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| {
+                entry.provider == "cloudflare-workers-ai" && entry.model.id == "typesafe/jev"
+            })
+            .unwrap();
+        assert!(entry.is_official());
+        assert!(!entry.cloudflare_default);
+        assert!(entry.credential_with_env(&keys, |_| None).is_some());
+        assert!(
+            entry
+                .credential_with_env(&empty, |name| (name == "CLOUDFLARE_API_KEY")
+                    .then(|| "ambient-key".into()))
+                .is_some()
+        );
+        for url in [
+            "https://evil.example/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai",
+            "https://api.cloudflare.com.evil.example/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai",
+            "https://api.cloudflare.com:8443/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai",
+            "https://api.cloudflare.com/client/v4/accounts/x{CLOUDFLARE_ACCOUNT_ID}/ai",
+            "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/other",
+        ] {
+            assert!(
+                operation_endpoints(url, Api::WorkersAiSystemOne, true).is_err(),
+                "{url}"
+            );
+        }
+        for url in [
+            "https://evil.example/client/v4/accounts/explicit123/ai",
+            "https://api.cloudflare.com:8443/client/v4/accounts/explicit123/ai",
+            "https://api.cloudflare.com/client/v4/accounts/explicit123/other",
+        ] {
+            let config = json!({"cloudflare-workers-ai":{"baseUrl":url}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| {
+                    entry.provider == "cloudflare-workers-ai" && entry.model.id == "typesafe/jev"
+                })
+                .unwrap();
+            assert!(!entry.is_official(), "{url}");
+            assert!(
+                entry.credential_with_env(&keys, |_| None).is_none(),
+                "{url}"
+            );
+            assert!(
+                entry
+                    .credential_with_env(&empty, |_| Some("ambient-key".into()))
+                    .is_none(),
+                "{url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn builtin_cloudflare_catalogue_is_available_with_stored_account() {
+        let catalogue = Catalogue::parse(&Map::new()).unwrap();
+        let keys = Keys::parse(
+            &json!({"cloudflare-workers-ai":{"type":"api_key","key":"fixture-key","env":{"CLOUDFLARE_ACCOUNT_ID":"account123"}}}),
+        );
+        let entries = catalogue
+            .list(
+                Kind::Classifier,
+                Some("cloudflare-workers-ai"),
+                None,
+                true,
+                &keys,
+            )
+            .await;
+        assert_eq!(entries.len(), 5);
+        let scoped = Keys::parse(
+            &json!({"cloudflare-workers-ai":{"type":"api_key","key":"fixture-key","endpoint":"https://api.cloudflare.com/client/v4/accounts/account123/ai/run","env":{"CLOUDFLARE_ACCOUNT_ID":"account123"}}}),
+        );
+        assert_eq!(
+            catalogue
+                .list(
+                    Kind::Classifier,
+                    Some("cloudflare-workers-ai"),
+                    None,
+                    true,
+                    &scoped
+                )
+                .await
+                .len(),
+            5
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["id"] == "typesafe/jev" && entry["contextWindow"] == 32000)
+        );
+        assert!(entries.iter().any(|entry| entry["id"] == "@cf/cloudflare/clef" && entry["cost"]["input"] == 0.24));
+    }
+
+    #[tokio::test]
+    async fn cloudflare_model_only_base_binds_provider_credentials_without_leaking_to_builtins() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/ai", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0; 4096];
+                let n = stream.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = r#"{"success":true,"result":{"answers":{"ok":{"type":"noul","noul":0.8}}}}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap().to_ascii_lowercase()
+        });
+        let config = json!({"cloudflare-workers-ai":{"apiKey":"provider-key", "headers":{"x-provider-secret":"provider-value"}, "models":[
+            {"type":"classifier","id":"custom-a","api":"cloudflare-workers-ai-system-one","baseUrl":base},
+            {"type":"classifier","id":"custom-b","api":"cloudflare-workers-ai-system-one","baseUrl":format!("{base}/")}
+        ]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let custom = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "cloudflare-workers-ai" && entry.model.id == "custom-a")
+            .unwrap();
+        let builtin = catalogue
+            .0
+            .iter()
+            .find(|entry| {
+                entry.provider == "cloudflare-workers-ai" && entry.model.id == "typesafe/jev"
+            })
+            .unwrap();
+        assert_eq!(custom.api_key.as_deref(), Some("provider-key"));
+        assert!(!builtin.model.headers.contains_key("x-provider-secret"));
+        assert!(builtin.api_key.is_none());
+        let keys = Keys::parse(&json!({}));
+        let available = catalogue
+            .list(
+                Kind::Classifier,
+                Some("cloudflare-workers-ai"),
+                Some("custom-a"),
+                true,
+                &keys,
+            )
+            .await;
+        assert_eq!(available.len(), 1);
+        let operation = Operations {
+            args: Cli::parse_from(["pi"]),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let context = json!({"state":{}, "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}}});
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            operation.perform(custom, &context, &keys, &mut json!({})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request.contains("authorization: bearer provider-key"));
+        assert!(request.contains("x-provider-secret: provider-value"));
+
+        for other in [
+            json!({"type":"classifier","id":"other","api":"cloudflare-workers-ai-system-one","baseUrl":"http://127.0.0.1:2/ai"}),
+            json!({"type":"classifier","id":"other","api":"cloudflare-workers-ai-system-one"}),
+        ] {
+            let mut ambiguous = config.clone();
+            ambiguous["cloudflare-workers-ai"]["models"]
+                .as_array_mut()
+                .unwrap()
+                .push(other);
+            let catalogue = Catalogue::parse(ambiguous.as_object().unwrap()).unwrap();
+            for entry in catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == "cloudflare-workers-ai")
+            {
+                assert!(entry.api_key.is_none(), "{}", entry.model.id);
+                assert!(
+                    !entry.model.headers.contains_key("x-provider-secret"),
+                    "{}",
+                    entry.model.id
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_uses_catalogue_without_provider_request() {
+        use clap::Parser;
+        let config = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1", "models":[
+            {"type":"image", "id":"fixture", "api":"openrouter-images", "input":["text"], "output":["image"]}
+        ]}});
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::new(),
+        };
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::new_v4(),
+            cancellation: Default::default(),
+        };
+        let resolve =
+            |kind, id| json!({"action":"resolve", "type":kind, "provider":"relay", "id":id});
+        assert!(matches!(
+            operation
+                .invoke(resolve("image", "fixture"), context())
+                .await,
+            Outcome::Structured { .. }
+        ));
+        let Outcome::Failed(wrong_type) = operation
+            .invoke(resolve("classifier", "fixture"), context())
+            .await
+        else {
+            panic!("wrong type accepted")
+        };
+        assert_eq!(
+            wrong_type,
+            "\"relay/fixture\" is an image model, not a classifier model. List the classifier models you can use with models.getAvailableOfType(\"classifier\")."
+        );
+        let Outcome::Failed(unknown) = operation
+            .invoke(resolve("image", "missing"), context())
+            .await
+        else {
+            panic!("unknown accepted")
+        };
+        assert_eq!(
+            unknown,
+            "Unknown image model \"relay/missing\". List the image models you can use with models.getAvailableOfType(\"image\")."
+        );
+        let chat = operation
+            .chat_models(None, None, false)
+            .into_iter()
+            .next()
+            .unwrap();
+        let request = json!({"action":"resolve", "type":"image", "provider":chat["provider"], "id":chat["id"]});
+        let Outcome::Failed(wrong_type) = operation.invoke(request, context()).await else {
+            panic!("chat model accepted")
+        };
+        assert!(wrong_type.contains("is a chat model, not an image model"));
+    }
+
+    #[test]
+    fn chat_catalogue_preserves_declared_capabilities() {
+        use clap::Parser;
+        let config = json!({"providers":{"relay":{"baseUrl":"http://127.0.0.1:1/v1", "api":"openai-completions", "models":[
+            {"id":"fixture", "name":"Fixture", "reasoning":true, "input":["image"], "contextWindow":4096, "maxTokens":1024, "thinkingLevelMap":{"low":"lite","high":"deep","xhigh":null}},
+            {"id":"plain", "reasoning":false, "input":["text"], "contextWindow":2048, "maxTokens":512}
+        ]}}});
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles = super::super::model_profiles::Profiles::parse(&config).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let fixture = operation
+            .chat_models(Some("relay"), Some("fixture"), false)
+            .pop()
+            .unwrap();
+        assert_eq!(fixture["input"], json!(["image"]));
+        assert_eq!(fixture["reasoning"], true);
+        assert_eq!(fixture["maxTokens"], 1024);
+        assert_eq!(fixture["contextWindow"], 4096);
+        assert_eq!(
+            fixture["thinkingLevelMap"],
+            json!({"low":"lite","high":"deep","xhigh":null})
+        );
+        let plain = operation
+            .chat_models(Some("relay"), Some("plain"), false)
+            .pop()
+            .unwrap();
+        assert_eq!(plain["input"], json!(["text"]));
+        assert_eq!(plain["reasoning"], false);
+        assert_eq!(plain["maxTokens"], 512);
+        let built_in = operation
+            .chat_models(Some("openai"), Some("chat-latest"), false)
+            .pop()
+            .unwrap();
+        assert_eq!(built_in["input"], json!(["text", "image"]));
+        assert_eq!(built_in["reasoning"], true);
+        assert_eq!(built_in["maxTokens"], 128000);
+        let mapped = operation
+            .chat_models(Some("openai"), Some("gpt-5"), false)
+            .pop()
+            .unwrap();
+        assert_eq!(mapped["thinkingLevelMap"]["high"], "high");
+        assert!(mapped["thinkingLevelMap"]["xhigh"].is_null());
+    }
+
+    #[tokio::test]
+    async fn openrouter_image_empty_choice_preserves_result_and_usage() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let (end, length) = loop {
+                let mut chunk = [0; 2048];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let end = pos + 4;
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    break (end, length);
+                }
+            };
+            while request.len() < end + length {
+                let mut chunk = [0; 2048];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body = json!({"id":"fixture-response", "choices":[], "usage":{
+                "prompt_tokens":100, "completion_tokens":10,
+                "prompt_tokens_details":{"cached_tokens":120,"cache_write_tokens":20}
+            }})
+            .to_string();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            request
+        });
+        let config = json!({"relay":{"baseUrl":format!("http://{address}/v1"),"apiKey":"fixture-key", "models":[{
+            "type":"image", "id":"fixture", "api":"openrouter-images", "input":["text"], "output":["image"],
+            "cost":{"input":1.0,"output":2.0,"cacheRead":3.0,"cacheWrite":4.0}
+        }]}});
+        let profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
+        let entry = profiles
+            .operations()
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay" && entry.model.id == "fixture")
+            .unwrap();
+        let operation = Operations {
+            args: Cli::parse_from(["pi"]),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let mut data = json!({"stopReason":"stop", "output":[]});
+        let context = json!({"input":[{"type":"text","text":"draw"}]});
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            operation.perform(entry, &context, &Keys::parse(&json!({})), &mut data),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(data["stopReason"], "stop");
+        assert_eq!(data["responseId"], "fixture-response");
+        assert_eq!(data["output"], json!([]));
+        assert_eq!(data["usage"]["input"], 0);
+        assert_eq!(data["usage"]["output"], 10);
+        assert_eq!(data["usage"]["cacheRead"], 100);
+        assert_eq!(data["usage"]["cacheWrite"], 20);
+        assert_eq!(data["usage"]["totalTokens"], 130);
+        assert!((data["usage"]["cost"]["total"].as_f64().unwrap() - 0.0004).abs() < 1e-12);
+        let request = server.await.unwrap();
+        assert!(request.starts_with(b"POST /v1/chat/completions "));
+    }
+
+    #[tokio::test]
+    async fn openrouter_image_partial_results_keep_response_metadata() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const CHILD: &str = "PI_RS_IMAGE_RESULT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "operation_models::tests::openrouter_image_partial_results_keep_response_metadata"])
+                .env(CHILD, "1")
+                .env("PI_RS_HOME", home.path())
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let valid_image = json!({"type":"image","mimeType":"image/png","data":"aW1hZ2U="});
+        let cases = [
+            (json!({"choices":[{}]}), vec![], true),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":{"image_url":"data:image/png;base64,YQ=="}}}]}),
+                vec![json!({"type":"text","text":"caption"})],
+                true,
+            ),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":[{"image_url":"data:image/png;base64,aW1hZ2U="},null]}}]}),
+                vec![json!({"type":"text","text":"caption"}), valid_image.clone()],
+                true,
+            ),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":null}}]}),
+                vec![json!({"type":"text","text":"caption"})],
+                false,
+            ),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":"invalid"}}]}),
+                vec![json!({"type":"text","text":"caption"})],
+                false,
+            ),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":[
+                    {"image_url":{"url":"data:image/png;base64,aW1hZ2U="}},
+                    {"image_url":"data:image/png;base64,%%%"}
+                ]}}]}),
+                vec![json!({"type":"text","text":"caption"}), valid_image.clone()],
+                true,
+            ),
+            (
+                json!({"choices":[{"message":{"content":"caption","images":[
+                    {"image_url":"https://example.org/image.png"},
+                    {"image_url":"data:;base64,YQ=="},
+                    {"image_url":"data:image/png;base64,"},
+                    {"image_url":"data:image/png;base64,aW1hZ2U="},
+                    {"image_url":{"url":"data:image/png;base64,aW1hZ2U="}}
+                ]}}]}),
+                vec![
+                    json!({"type":"text","text":"caption"}),
+                    valid_image.clone(),
+                    valid_image,
+                ],
+                false,
+            ),
+        ];
+        for (mut body, expected_output, fails) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            body["id"] = json!("image-response");
+            body["usage"] = json!({"prompt_tokens":12, "completion_tokens":34});
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                assert_ne!(stream.read(&mut bytes).await.unwrap(), 0);
+                let body = body.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let config = json!({"relay":{"baseUrl":format!("http://{address}/v1"),"apiKey":"fixture-key", "models":[{
+                "type":"image", "id":"fixture", "api":"openrouter-images", "input":["text"], "output":["image"]
+            }]}});
+            let profiles =
+                super::super::model_profiles::Profiles::parse(&json!({"providers":config}))
+                    .unwrap();
+            let mut args = Cli::parse_from(["pi"]);
+            args.model_profiles = profiles;
+            let operation = Operations {
+                args,
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            };
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                operation.invoke(json!({"action":"generateImages", "provider":"relay", "id":"fixture", "context":{"input":[{"type":"text","text":"draw"}]}}), ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                }),
+            ).await.unwrap();
+            let Outcome::Structured { data, .. } = outcome else {
+                panic!("expected structured result")
+            };
+            assert_eq!(data["stopReason"], if fails { "error" } else { "stop" });
+            assert_eq!(data.get("errorMessage").is_some(), fails);
+            assert_eq!(data["api"], "openrouter-images");
+            assert!(data["timestamp"].as_u64().unwrap() > 0);
+            assert_eq!(data["responseId"], "image-response");
+            assert_eq!(data["usage"]["totalTokens"], 46);
+            assert_eq!(data["usage"]["cost"]["totalFromProvider"], false);
+            assert_eq!(data["output"], json!(expected_output));
+            server.await.unwrap();
+        }
+        let config = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1","apiKey":"fixture", "models":[{
+            "type":"image", "id":"fixture", "api":"openrouter-images", "input":["text"], "output":["image"]
+        }]}});
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        cancellation.cancel();
+        let outcome = operation.invoke(json!({"action":"generateImages", "provider":"relay", "id":"fixture", "context":{"input":[{"type":"text","text":"draw"}]}}), ToolContext {
+            operation_id: uuid::Uuid::new_v4(), cancellation,
+        }).await;
+        let Outcome::Structured { data, .. } = outcome else {
+            panic!("expected structured result")
+        };
+        assert_eq!(data["stopReason"], "aborted");
+        assert_eq!(data["api"], "openrouter-images");
+        assert!(data["timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(data["output"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn openrouter_image_early_error_retains_result_identity() {
+        use clap::Parser;
+        let config = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1", "models":[{
+            "type":"image", "id":"fixture", "api":"openrouter-images", "input":["text"], "output":["image"]
+        }]}});
+        let profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
+        let entry = profiles
+            .operations()
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let operation = Operations {
+            args: Cli::parse_from(["pi"]),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let mut data = json!({"stopReason":"stop", "output":[]});
+        assert!(
+            operation
+                .perform(
+                    entry,
+                    &json!({"input":[]}),
+                    &Keys::parse(&json!({})),
+                    &mut data
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(data["api"], "openrouter-images");
+        assert!(data["timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(data["output"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn classifier_early_failure_and_cancellation_keep_result_identity() {
+        use clap::Parser;
+        let config = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1", "models":[{
+            "type":"classifier", "id":"fixture", "api":"typesafe-system-one", "input":["text"]
+        }]}});
+        let mut args = Cli::parse_from(["pi"]);
+        args.model_profiles =
+            super::super::model_profiles::Profiles::parse(&json!({"providers":config})).unwrap();
+        let operation = Operations {
+            args,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let entry = operation
+            .args
+            .model_profiles
+            .operations()
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let mut data = json!({"answers":{}});
+        assert!(operation.perform(entry, &json!({"state":{},"questions":{"q":{"type":"bool","instructions":"test","criteria":{"true":"yes","false":"no"}}}}), &Keys::parse(&json!({})), &mut data).await.is_err());
+        assert_eq!(data["api"], "typesafe-system-one");
+        assert!(data["timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(data["answers"], json!({}));
+        let cancellation = pi_rs::CancellationToken::new();
+        cancellation.cancel();
+        let outcome = operation
+            .invoke(
+                json!({"action":"classify","provider":"relay","id":"fixture","context":{}}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation,
+                },
+            )
+            .await;
+        let Outcome::Structured { data, .. } = outcome else {
+            panic!("expected structured result")
+        };
+        assert_eq!(data["stopReason"], "aborted");
+        assert_eq!(data["api"], "typesafe-system-one");
+        assert!(data["timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(data["answers"], json!({}));
+    }
+
+    #[test]
+    fn openrouter_image_choices_validate_nonempty_responses() {
+        let mut output = Vec::new();
+        image_output(&json!({"choices":[]}), &mut output).unwrap();
+        assert!(output.is_empty());
+        assert!(image_output(&json!({}), &mut output).is_err());
+        assert!(image_output(&json!({"choices":[{}]}), &mut output).is_err());
+        image_output(
+            &json!({"choices":[{"message":{"content":"description"}}]}),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(output, vec![json!({"type":"text","text":"description"})]);
+    }
+    #[test]
+    fn openrouter_image_usage_keeps_reported_cache_counts() {
+        let config = json!({"relay":{"baseUrl":"https://relay.example/v1", "models":[{
+            "type":"image", "id":"fixture", "api":"openrouter-images"
+        }]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        for (
+            prompt,
+            cached,
+            written,
+            expected_input,
+            expected_read,
+            expected_write,
+            expected_total,
+        ) in [
+            (100, 30, 10, 70, 20, 10, 110),
+            (100, 120, 0, 0, 120, 0, 130),
+            (100, 30, 120, 0, 0, 120, 130),
+        ] {
+            let result = usage(
+                entry,
+                &json!({"prompt_tokens":prompt, "completion_tokens":10,
+                "prompt_tokens_details":{"cached_tokens":cached, "cache_write_tokens":written}}),
+            )
+            .unwrap();
+            assert_eq!(result["input"], expected_input);
+            assert_eq!(result["cacheRead"], expected_read);
+            assert_eq!(result["cacheWrite"], expected_write);
+            assert_eq!(result["totalTokens"], expected_total);
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_workers_ai_classifiers_use_cloudflare_protocol() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let direct = json!({"success":true,"result":{"answers":{"ok":{"type":"noul","noul":0.8}},"usage":{"input_tokens":8,"output_tokens":3}}});
+        let nested = json!({"success":true,"result":{"state":"Completed","result":{"answers":{"ok":{"type":"noul","noul":0.7}},"usage":{"input_tokens":4,"output_tokens":2}}}});
+        for (id, body, opt_in, expected_probability, expected_error) in [
+            ("@cf/cloudflare/clef-1", direct, false, Some(0.8), None),
+            ("@cf/typesafe/jev", nested.clone(), false, Some(0.7), None),
+            ("@cf/typesafe/jev", nested, true, Some(0.7), None),
+            (
+                "@cf/typesafe/jev",
+                json!({"success":true,"result":{"state":"Running"}}),
+                false,
+                None,
+                Some("did not complete"),
+            ),
+            (
+                "@cf/typesafe/jev",
+                json!({"success":false,"errors":[{"message":"private provider detail"}]}),
+                false,
+                None,
+                Some("request failed"),
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (end, length) = loop {
+                    let mut chunk = [0; 2048];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let end = pos + 4;
+                        let headers = std::str::from_utf8(&request[..end]).unwrap();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end, length);
+                    }
+                };
+                while request.len() < end + length {
+                    let mut chunk = [0; 2048];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let body = body.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                request
+            });
+            let compat = if opt_in {
+                json!({"sendImageOptInHeader":true})
+            } else {
+                json!({})
+            };
+            let config = json!({"cloudflare-workers-ai":{"baseUrl":format!("http://{address}/ai"),"apiKey":"test-key","models":[{
+                "type":"classifier","id":id,"api":"cloudflare-workers-ai-system-one", "input":["text","image"],
+                "compat":compat, "cost":{"input":1.0,"output":2.0}
+            }]}});
+            let profiles =
+                super::super::model_profiles::Profiles::parse(&json!({"providers":config}))
+                    .unwrap();
+            let entry = profiles
+                .operations()
+                .0
+                .iter()
+                .find(|entry| entry.provider == "cloudflare-workers-ai" && entry.model.id == id)
+                .unwrap();
+            assert_eq!(entry.endpoint.path(), "/ai/run");
+            assert_eq!(
+                entry.descriptor()["api"],
+                "cloudflare-workers-ai-system-one"
+            );
+            let context = json!({"state":{"text":"test"}, "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}},
+                "images":[{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}]});
+            let operation = Operations {
+                args: Cli::parse_from(["pi"]),
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            };
+            let mut data = json!({});
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                operation.perform(entry, &context, &Keys::parse(&json!({})), &mut data),
+            )
+            .await
+            .unwrap();
+            if let Some(message) = expected_error {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(message), "{error}");
+                assert!(!error.contains("private provider detail"));
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    data["answers"]["ok"]["probability"],
+                    expected_probability.unwrap()
+                );
+                assert!(data["usage"]["totalTokens"].as_u64().unwrap() > 0);
+            }
+            let request = server.await.unwrap();
+            let end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = std::str::from_utf8(&request[..end])
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(headers.starts_with("post /ai/run "));
+            assert!(headers.contains("authorization: bearer test-key"));
+            assert_eq!(
+                headers.contains("typesafe-danger-zone-images: true"),
+                opt_in
+            );
+            let request: Value = serde_json::from_slice(&request[end..]).unwrap();
+            assert_eq!(request["model"], id);
+            assert_eq!(request["input"]["questions"]["ok"]["type"], "noul");
+            if id.starts_with("@cf/cloudflare/clef") {
+                assert!(
+                    request["input"]["images"][0]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("data:image/png;base64,")
+                );
+            } else {
+                assert!(request["input"]["assets"]["<image-1>"].is_object());
+                assert_eq!(request["input"]["state"][0], "<image-1>");
+            }
+        }
+    }
+
+    #[test]
+    fn workers_ai_classifier_credentials_remain_endpoint_bound() {
+        let config = json!({"cloudflare-workers-ai":{
+            "baseUrl":"http://127.0.0.1:1111/ai", "apiKey":"provider-secret", "models":[{
+                "type":"classifier", "id":"fixture", "api":"cloudflare-workers-ai-system-one", "baseUrl":"http://127.0.0.1:2222/ai"
+            }]
+        }});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "cloudflare-workers-ai" && entry.model.id == "fixture")
+            .unwrap();
+        assert!(entry.api_key.is_none());
+        let keys = Keys::parse(
+            &json!({"cloudflare-workers-ai":{"type":"api_key", "key":"saved-secret", "endpoint":"http://127.0.0.1:1111/ai"}}),
+        );
+        assert!(
+            entry
+                .credential_with_env(&keys, |_| Some("ambient-secret".into()))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_ai_model_endpoint_override_does_not_receive_provider_headers() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for overridden in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (end, length) = loop {
+                    let mut chunk = [0; 2048];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let end = pos + 4;
+                        let headers = std::str::from_utf8(&request[..end]).unwrap();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end, length);
+                    }
+                };
+                while request.len() < end + length {
+                    let mut chunk = [0; 2048];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let body =
+                    r#"{"success":true,"result":{"answers":{"ok":{"type":"noul","noul":0.8}}}}"#;
+                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                request
+            });
+            let provider_base = format!("http://{address}/provider");
+            let model_base = if overridden {
+                format!("http://{address}/model")
+            } else {
+                format!("{provider_base}/")
+            };
+            let config = json!({"cloudflare-workers-ai":{
+                "baseUrl":provider_base, "apiKey":"provider-key",
+                "headers":{"X-Provider-Secret":"provider-value", "Authorization":"Bearer provider-secret", "x-shared":"provider"},
+                "models":[{"type":"classifier", "id":"fixture", "api":"cloudflare-workers-ai-system-one", "baseUrl":model_base,
+                    "headers":{"X-Model-Secret":"model-value", "X-Shared":"model"}}]
+            }});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| {
+                    entry.provider == "cloudflare-workers-ai" && entry.model.id == "fixture"
+                })
+                .unwrap();
+            let keys = Keys::parse(
+                &json!({"cloudflare-workers-ai":{"type":"api_key", "key":"destination-key", "endpoint":entry.endpoint.as_str()}}),
+            );
+            let context = json!({"state":{"text":"test"}, "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}}});
+            let operation = Operations {
+                args: Cli::parse_from(["pi"]),
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            };
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                operation.perform(entry, &context, &keys, &mut json!({})),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let request = tokio::time::timeout(Duration::from_secs(10), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = std::str::from_utf8(&request[..end])
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(headers.contains("x-model-secret: model-value"));
+            assert!(headers.contains("x-shared: model"));
+            assert!(!headers.contains("x-shared: provider"));
+            assert_eq!(
+                headers.contains("x-provider-secret: provider-value"),
+                !overridden
+            );
+            if overridden {
+                assert!(headers.contains("authorization: bearer destination-key"));
+                assert!(!headers.contains("provider-secret"));
+                assert!(!headers.contains("provider-key"));
+            } else {
+                assert!(headers.contains("authorization: bearer provider-secret"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn operation_provider_headers_never_cross_model_endpoints() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn fixture(listener: tokio::net::TcpListener, response: &'static str) -> String {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let (end, length) = loop {
+                let mut chunk = [0; 2048];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let end = pos + 4;
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    break (end, length);
+                }
+            };
+            while request.len() < end + length {
+                let mut chunk = [0; 2048];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            std::str::from_utf8(&request[..end])
+                .unwrap()
+                .to_ascii_lowercase()
+        }
+
+        for (kind, api, route, response, context) in [
+            (
+                "image",
+                "openrouter-images",
+                "chat/completions",
+                r#"{"choices":[]}"#,
+                json!({"input":[{"type":"text","text":"draw"}]}),
+            ),
+            (
+                "classifier",
+                "typesafe-system-one",
+                "systemone",
+                r#"{"answers":{"ok":{"type":"noul","noul":0.8}}}"#,
+                json!({"state":{"text":"test"},"questions":{"ok":{"type":"bool","instructions":"decide","criteria":{"true":"yes","false":"no"}}}}),
+            ),
+        ] {
+            let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let alternate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let primary_base = format!("http://{}/v1", primary.local_addr().unwrap());
+            let alternate_base = format!("http://{}/v1", alternate.local_addr().unwrap());
+            let primary_server = tokio::spawn(fixture(primary, response));
+            let alternate_server = tokio::spawn(fixture(alternate, response));
+            let config = json!({"relay":{"baseUrl":primary_base, "apiKey":"provider-key", "headers":{"Authorization":"Bearer provider-secret", "X-Provider-Secret":"secret-value", "X-Shared":"provider-value"}, "models":[
+                {"type":kind,"id":"primary","api":api,"baseUrl":format!("{primary_base}/"),"input":["text"]},
+                {"type":kind,"id":"alternate","api":api,"baseUrl":alternate_base,"input":["text"],"headers":{"X-Model-Secret":"model-value","X-Shared":"model-value"}}
+            ]}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let operation = Operations {
+                args: Cli::parse_from(["pi"]),
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            };
+            for id in ["primary", "alternate"] {
+                let entry = catalogue
+                    .0
+                    .iter()
+                    .find(|entry| entry.provider == "relay" && entry.model.id == id)
+                    .unwrap();
+                assert!(entry.endpoint.path().ends_with(route));
+                let keys = if id == "alternate" {
+                    Keys::parse(
+                        &json!({"relay":{"type":"api_key","key":"destination-key","endpoint":entry.endpoint.as_str()}}),
+                    )
+                } else {
+                    Keys::parse(&json!({}))
+                };
+                let mut data = json!({"output":[]});
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    operation.perform(entry, &context, &keys, &mut data),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            }
+            let primary = tokio::time::timeout(Duration::from_secs(5), primary_server)
+                .await
+                .unwrap()
+                .unwrap();
+            let alternate = tokio::time::timeout(Duration::from_secs(5), alternate_server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(primary.contains("authorization: bearer provider-secret"));
+            assert!(primary.contains("x-provider-secret: secret-value"));
+            assert!(primary.contains("x-shared: provider-value"));
+            assert!(alternate.contains("authorization: bearer destination-key"));
+            assert!(alternate.contains("x-model-secret: model-value"));
+            assert!(alternate.contains("x-shared: model-value"));
+            assert!(!alternate.contains("provider-secret"));
+            assert!(!alternate.contains("secret-value"));
+            assert!(!alternate.contains("provider-value"));
+            assert!(!alternate.contains("provider-key"));
+        }
+    }
+
+    #[test]
+    fn operation_provider_headers_are_scoped_for_every_api() {
+        let config = json!({"relay":{"baseUrl":"https://provider.example/ai", "headers":{"X-Provider":"value"}, "models":[
+            {"type":"classifier", "id":"workers", "api":"cloudflare-workers-ai-system-one", "baseUrl":"https://other.example/ai", "headers":{"X-Model":"kept"}},
+            {"type":"classifier", "id":"system", "api":"typesafe-system-one", "baseUrl":"https://other.example/ai"}
+        ]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let workers = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay" && entry.model.id == "workers")
+            .unwrap();
+        assert!(!workers.model.headers.contains_key("x-provider"));
+        assert_eq!(workers.model.headers["x-model"], "kept");
+        let system = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay" && entry.model.id == "system")
+            .unwrap();
+        assert!(!system.model.headers.contains_key("x-provider"));
+    }
+    #[test]
+    fn workers_ai_classifier_honors_image_format_override() {
+        let config = json!({"relay": {"baseUrl":"http://127.0.0.1:1234/ai", "models":[{
+            "type":"classifier", "id":"@cf/typesafe/jev", "api":"cloudflare-workers-ai-system-one", "input":["text","image"],
+            "compat":{"imageInput":"state-image-urls"}
+        }]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let context = json!({"state":{"text":"test"}, "questions":{"ok":{"type":"bool", "instructions":"test", "criteria":{"true":"yes", "false":"no"}}},
+            "images":[{"type":"image","mimeType":"image/png","data":"aGVsbG8="}]});
+        let (body, opt_in) = classifier_payload(entry, &context).unwrap();
+        assert_eq!(body["input"]["state"][0]["type"], "image_url");
+        assert!(!opt_in);
+        let mut without_image = context;
+        without_image["images"] = json!([]);
+        let (body, opt_in) = classifier_payload(entry, &without_image).unwrap();
+        assert_eq!(body["input"]["state"], json!({"text":"test"}));
+        assert!(!opt_in);
+    }
+
+    #[test]
+    fn pinned_openrouter_and_vercel_catalogues_match_pi_v160() {
+        let catalogue = Catalogue::parse(&Map::new()).unwrap();
+        for (provider, kind, expected) in [
+            ("openrouter", Kind::Classifier, 44),
+            ("openrouter", Kind::Image, 74),
+        ] {
+            let entries = catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == provider && entry.api.kind() == kind);
+            assert_eq!(entries.count(), expected);
+        }
+        for (provider, id, api) in [
+            (
+                "openrouter",
+                "google/gemini-decision-1",
+                "typesafe-system-one",
+            ),
+            (
+                "openrouter",
+                "openai/gpt-image-2.6-sunburst",
+                "openrouter-images",
+            ),
+            (
+                "vercel-ai-gateway",
+                "liquid/d1.2-ultra",
+                "typesafe-system-one",
+            ),
+        ] {
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| entry.provider == provider && entry.model.id == id)
+                .expect("model from Pi's catalog");
+            assert_eq!(entry.descriptor()["api"], api);
+            assert!(entry.is_official());
+        }
+        assert!(
+            !catalogue
+                .0
+                .iter()
+                .any(|entry| entry.provider == "openrouter"
+                    && matches!(
+                        entry.model.id.as_str(),
+                        "inception/mercury-decide" | "x-ai/grok-imagine-image-quality"
+                    ))
+        );
+    }
+
+    #[test]
+    fn operation_catalogue_exposes_image_limits_and_classifier_compatibility() {
+        let catalog = Catalogue::parse(&Map::new()).unwrap();
+        let images: Vec<_> = catalog
+            .0
+            .iter()
+            .filter(|entry| entry.provider == "openrouter" && entry.api.kind() == Kind::Image)
+            .collect();
+        assert_eq!(
+            images
+                .iter()
+                .filter(|entry| entry.descriptor().get("inputLimits").is_some())
+                .count(),
+            70
+        );
+        let flux = images
+            .iter()
+            .find(|entry| entry.model.id == "black-forest-labs/flux-3-image")
+            .unwrap()
+            .descriptor();
+        assert_eq!(
+            flux["inputLimits"]["images"]["resize"],
+            json!({"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80})
+        );
+        assert!(flux.get("headers").is_none());
+        assert!(flux.get("baseUrl").is_none());
+        let recraft = images
+            .iter()
+            .find(|entry| entry.model.id == "recraft/recraft-v4.1-flash")
+            .unwrap()
+            .descriptor();
+        assert!(recraft.get("inputLimits").is_none());
+        let classifier = catalog
+            .0
+            .iter()
+            .find(|entry| entry.provider == "openrouter" && entry.model.id == "~liquid/d1-latest")
+            .unwrap()
+            .descriptor();
+        assert_eq!(
+            classifier["compat"],
+            json!({"imageInput":"state-image-urls","sendImageOptInHeader":false})
+        );
+        let configured = json!({"relay":{"baseUrl":"http://127.0.0.1:1/v1","models":[{"type":"image","id":"custom","api":"openrouter-images","headers":{"x-secret":"hidden"},"inputLimits":{"images":{"maxPerRequest":2}}}]}});
+        let custom = Catalogue::parse(configured.as_object().unwrap()).unwrap();
+        let value = custom
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap()
+            .descriptor();
+        assert_eq!(value["inputLimits"]["images"]["maxPerRequest"], 2);
+        assert!(value.get("headers").is_none());
+        assert!(value.get("baseUrl").is_none());
+    }
+
+    #[test]
+    fn classifier_rejects_non_object_state_before_request() {
+        let config = json!({"relay":{"baseUrl":"http://127.0.0.1:1234", "models":[{
+            "type":"classifier", "id":"fixture", "api":"typesafe-system-one"
+        }]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let questions = json!({"ok":{"type":"bool","instructions":"test","criteria":{"true":"yes","false":"no"}}});
+        for state in [json!(null), json!([]), json!("text"), json!(42)] {
+            let error = classifier_payload(entry, &json!({"state":state,"questions":questions}))
+                .unwrap_err();
+            assert!(error.to_string().contains("state must be an object"));
+        }
+        assert!(classifier_payload(entry, &json!({"state":{},"questions":questions})).is_ok());
+    }
+
+    #[tokio::test]
+    async fn classifier_retries_transient_http_failures_with_server_controls() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (api, responses, expected_success, expected_error) in [
+            (
+                Api::OpenAiDecisions,
+                vec![(504, "x-should-retry: true\r\nretry-after-ms: 0\r\n")],
+                false,
+                "OpenAI Decisions error (504)",
+            ),
+            (
+                Api::OpenAiDecisions,
+                vec![(503, "retry-after-ms: 0\r\n"), (200, "")],
+                true,
+                "",
+            ),
+            (
+                Api::SystemOne,
+                vec![(429, "retry-after-ms: 0\r\n"), (200, "")],
+                true,
+                "",
+            ),
+            (
+                Api::SystemOne,
+                vec![
+                    (400, "x-should-retry: true\r\nretry-after-ms: 0\r\n"),
+                    (200, ""),
+                ],
+                true,
+                "",
+            ),
+            (
+                Api::SystemOne,
+                vec![(503, "x-should-retry: false\r\n")],
+                false,
+                "HTTP 503",
+            ),
+            (Api::SystemOne, vec![(400, "")], false, "HTTP 400"),
+            (
+                Api::SystemOne,
+                vec![(400, "x-should-retry: true\r\nx-should-retry: false\r\n")],
+                false,
+                "HTTP 400",
+            ),
+            (
+                Api::SystemOne,
+                vec![
+                    (
+                        503,
+                        "x-should-retry: false\r\nx-should-retry: true\r\nretry-after-ms: 0\r\n",
+                    ),
+                    (200, ""),
+                ],
+                true,
+                "",
+            ),
+            (
+                Api::SystemOne,
+                vec![(601, "retry-after-ms: 0\r\n"), (200, "")],
+                true,
+                "",
+            ),
+            (
+                Api::SystemOne,
+                vec![
+                    (429, "retry-after-ms: 0\r\n"),
+                    (429, "retry-after-ms: 0\r\n"),
+                    (429, "retry-after-ms: 0\r\n"),
+                ],
+                false,
+                "HTTP 429",
+            ),
+            (
+                Api::SystemOne,
+                vec![(429, "retry-after-ms: 60001\r\n")],
+                false,
+                "over 60 seconds",
+            ),
+            (
+                Api::SystemOne,
+                vec![(429, "retry-after: Mon Nov  6 08:51:00 2095\r\n")],
+                false,
+                "over 60 seconds",
+            ),
+            (
+                Api::OpenRouterImages,
+                vec![(429, "retry-after-ms: 0\r\n")],
+                false,
+                "HTTP 429",
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for (status, headers) in responses {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let (end, length) = loop {
+                        let mut chunk = [0u8; 1024];
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert_ne!(read, 0);
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(position) =
+                            request.windows(4).position(|part| part == b"\r\n\r\n")
+                        {
+                            let end = position + 4;
+                            let header = std::str::from_utf8(&request[..end]).unwrap();
+                            let length = header
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap();
+                            break (end, length);
+                        }
+                    };
+                    while request.len() < end + length {
+                        let mut chunk = [0u8; 1024];
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert_ne!(read, 0);
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    requests.push(request[end..end + length].to_vec());
+                    stream.write_all(format!("HTTP/1.1 {status} Fixture\r\n{headers}content-length: 0\r\nconnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                }
+                requests
+            });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let request = client
+                .post(format!("http://{address}/test"))
+                .header("authorization", "Bearer fixture")
+                .body("fixture-body")
+                .build()
+                .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                send_model_request(&client, request, api),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), expected_success);
+            if let Err(error) = result {
+                assert!(error.to_string().contains(expected_error), "{error}");
+            }
+            let requests = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(requests.iter().all(|request| request == b"fixture-body"));
+        }
+    }
+
+    #[test]
+    fn classifier_retry_delays_honor_server_limit_and_dates() {
+        let now = chrono::DateTime::parse_from_rfc2822("Wed, 21 Oct 2015 07:28:00 GMT")
+            .unwrap()
+            .to_utc();
+        let mut headers = HeaderMap::new();
+        assert!(
+            (Duration::from_millis(375)..=Duration::from_millis(500))
+                .contains(&classifier_retry_delay(&headers, 0, now).unwrap())
+        );
+        assert!(
+            (Duration::from_millis(750)..=Duration::from_secs(1))
+                .contains(&classifier_retry_delay(&headers, 1, now).unwrap())
+        );
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:05 GMT"),
+        );
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, now).unwrap(),
+            Duration::from_secs(5)
+        );
+        headers.insert("retry-after-ms", HeaderValue::from_static("12.5"));
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, now).unwrap(),
+            Duration::from_micros(12500)
+        );
+        headers.insert("retry-after-ms", HeaderValue::from_static("60001"));
+        assert!(classifier_retry_delay(&headers, 0, now).is_err());
+        headers.insert("retry-after-ms", HeaderValue::from_static("60001ms"));
+        assert!(classifier_retry_delay(&headers, 0, now).is_err());
+        headers.insert("retry-after-ms", HeaderValue::from_static(" 12.5ms"));
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, now).unwrap(),
+            Duration::from_micros(12500)
+        );
+        headers.remove("retry-after-ms");
+        headers.insert("retry-after", HeaderValue::from_static("1.5, 1.5"));
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, now).unwrap(),
+            Duration::from_millis(1500)
+        );
+        headers.insert("retry-after", HeaderValue::from_static("61"));
+        assert!(classifier_retry_delay(&headers, 0, now).is_err());
+        for value in ["1e308", "-1e308"] {
+            headers.insert("retry-after", HeaderValue::from_static(value));
+            assert!(
+                (Duration::from_millis(375)..=Duration::from_millis(500))
+                    .contains(&classifier_retry_delay(&headers, 0, now).unwrap())
+            );
+        }
+        assert_eq!(retry_number("1e+seconds"), Some(1.0));
+        assert_eq!(retry_number(".25e2 seconds"), Some(25.0));
+        assert_eq!(retry_number("Wed, 21 Oct 2015 07:28:05 GMT"), None);
+        let old_now = chrono::DateTime::parse_from_rfc2822("Sun, 06 Nov 1994 08:49:32 GMT")
+            .unwrap()
+            .to_utc();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sunday, 06-Nov-94 08:49:37 GMT"),
+        );
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, old_now).unwrap(),
+            Duration::from_secs(5)
+        );
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sunday, 06-Nov-94 08:51:00 GMT"),
+        );
+        assert!(classifier_retry_delay(&headers, 0, old_now).is_err());
+        for zone in ["GMT", "UTC"] {
+            headers.insert(
+                "retry-after",
+                HeaderValue::from_str(&format!("Mon Nov  6 08:49:37 1994 {zone}")).unwrap(),
+            );
+            assert_eq!(
+                classifier_retry_delay(&headers, 0, old_now).unwrap(),
+                Duration::from_secs(5)
+            );
+        }
+        use chrono::TimeZone;
+        let local_now = chrono::Local
+            .with_ymd_and_hms(1994, 11, 6, 8, 49, 32)
+            .earliest()
+            .unwrap()
+            .to_utc();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sun Nov  6 08:49:37 1994"),
+        );
+        assert_eq!(
+            classifier_retry_delay(&headers, 0, local_now).unwrap(),
+            Duration::from_secs(5)
+        );
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sun Nov  6 08:51:00 1994"),
+        );
+        assert!(classifier_retry_delay(&headers, 0, local_now).is_err());
+        assert_eq!(
+            classifier_retry_date("Sunday, 06-Nov-50 08:49:37 GMT")
+                .unwrap()
+                .to_rfc3339(),
+            "1950-11-06T08:49:37+00:00"
+        );
+        assert_eq!(
+            classifier_retry_date("Sunday, 06-Nov-49 08:49:37 GMT")
+                .unwrap()
+                .to_rfc3339(),
+            "2049-11-06T08:49:37+00:00"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifier_retry_asctime_follows_local_clock_changes() {
+        const CHILD: &str = "PI_RS_CLASSIFIER_RETRY_CLOCK_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "operation_models::tests::classifier_retry_asctime_follows_local_clock_changes",
+                ])
+                .env(CHILD, "1")
+                .env("TZ", "America/New_York")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        for (header, expected) in [
+            ("Sun Mar 10 02:00:05 2024", "2024-03-10T07:00:05+00:00"),
+            ("Sun Nov  3 01:00:05 2024", "2024-11-03T05:00:05+00:00"),
+        ] {
+            assert_eq!(
+                classifier_retry_date(header).unwrap().to_rfc3339(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_classifier_retry_wait() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut chunk = [0u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&chunk[..read]);
+            }
+            stream.write_all(b"HTTP/1.1 429 Fixture\r\nretry-after-ms: 5000\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+            sent.send(()).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let request = client
+            .post(format!("http://{address}/test"))
+            .body("")
+            .build()
+            .unwrap();
+        let cancellation = pi_rs::CancellationToken::new();
+        let operation = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => true,
+                    _ = send_model_request(&client, request, Api::SystemOne) => false,
+                }
+            }
+        });
+        received.await.unwrap();
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), operation)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn classifier_retries_timeouts_before_headers_and_during_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (body_stall, cancel) in [(false, false), (true, false), (false, true), (true, true)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (ready, received) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut first, _) = listener.accept().await.unwrap();
+                let mut bytes = [0u8; 2048];
+                assert_ne!(first.read(&mut bytes).await.unwrap(), 0);
+                if body_stall {
+                    first
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 12\r\n\r\n{")
+                        .await
+                        .unwrap();
+                }
+                ready.send(()).unwrap();
+                if cancel {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(1500), listener.accept())
+                            .await
+                            .is_err(),
+                        "cancelled request was retried"
+                    );
+                } else {
+                    let (mut second, _) =
+                        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                            .await
+                            .expect("timeout was not retried")
+                            .unwrap();
+                    assert_ne!(second.read(&mut bytes).await.unwrap(), 0);
+                    second
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await
+                        .unwrap();
+                }
+                drop(first);
+            });
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_millis(500))
+                .build()
+                .unwrap();
+            let request = client
+                .post(format!("http://{address}/test"))
+                .body("fixture")
+                .build()
+                .unwrap();
+            let cancellation = pi_rs::CancellationToken::new();
+            let operation = tokio::spawn({
+                let cancellation = cancellation.clone();
+                async move {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => None,
+                        result = send_model_request(&client, request, Api::SystemOne) => Some(result),
+                    }
+                }
+            });
+            received.await.unwrap();
+            if cancel {
+                cancellation.cancel();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), operation)
+                .await
+                .unwrap()
+                .unwrap();
+            if cancel {
+                assert!(result.is_none());
+            } else {
+                assert_eq!(result.unwrap().unwrap(), b"ok");
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn classifier_image_header_defaults_are_independent_of_wire_format() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (
+            provider,
+            mode,
+            override_header,
+            with_image,
+            expected,
+            provider_header,
+            model_header,
+            expected_custom,
+        ) in [
+            (
+                "typesafe",
+                "state-image-urls",
+                None,
+                true,
+                Some("true"),
+                None,
+                None,
+                None,
+            ),
+            ("openrouter", "assets", None, true, None, None, None, None),
+            (
+                "openrouter",
+                "assets",
+                Some(true),
+                true,
+                Some("true"),
+                None,
+                None,
+                None,
+            ),
+            (
+                "typesafe",
+                "images",
+                Some(false),
+                true,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "typesafe",
+                "state-image-urls",
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "openrouter",
+                "assets",
+                Some(true),
+                false,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "typesafe",
+                "assets",
+                None,
+                true,
+                Some("true"),
+                Some(("TypeSafe-Danger-Zone-Images", "false")),
+                Some(("typesafe-danger-zone-images", "false")),
+                None,
+            ),
+            (
+                "typesafe",
+                "assets",
+                Some(false),
+                true,
+                Some("false"),
+                Some(("typesafe-danger-zone-images", "false")),
+                None,
+                None,
+            ),
+            (
+                "typesafe",
+                "assets",
+                None,
+                false,
+                Some("false"),
+                None,
+                Some(("TypeSafe-Danger-Zone-Images", "false")),
+                None,
+            ),
+            (
+                "typesafe",
+                "assets",
+                None,
+                true,
+                Some("true"),
+                Some(("x-fixture", "provider")),
+                Some(("X-Fixture", "model")),
+                Some("model"),
+            ),
+            (
+                "typesafe",
+                "assets",
+                None,
+                true,
+                Some("true"),
+                Some(("X-Fixture", "provider")),
+                Some(("x-fixture", "model")),
+                Some("model"),
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (header_end, content_length) = loop {
+                    let mut chunk = [0u8; 2048];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&chunk[..count]);
+                    if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let end = pos + 4;
+                        let headers = std::str::from_utf8(&request[..end]).unwrap();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end, length);
+                    }
+                };
+                while request.len() < header_end + content_length {
+                    let mut chunk = [0u8; 2048];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let response = b"{\"answers\":{\"ok\":{\"type\":\"noul\",\"noul\":0.6}}}";
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).as_bytes()).await.unwrap();
+                stream.write_all(response).await.unwrap();
+                request
+            });
+            let mut compat = json!({"imageInput":mode});
+            if let Some(value) = override_header {
+                compat["sendImageOptInHeader"] = json!(value);
+            }
+            let provider_headers: BTreeMap<_, _> = provider_header.into_iter().collect();
+            let model_headers: BTreeMap<_, _> = model_header.into_iter().collect();
+            let config = json!({provider:{"baseUrl":format!("http://{address}/v1"), "apiKey":"test-key", "headers":provider_headers, "models":[{
+                "type":"classifier", "id":"parity-fixture", "api":"typesafe-system-one", "input":["text","image"], "compat":compat, "headers":model_headers
+            }]}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| entry.provider == provider && entry.model.id == "parity-fixture")
+                .unwrap();
+            let context = json!({"state":{"text":"test"}, "questions":{"ok":{"type":"bool", "instructions":"decide", "criteria":{"true":"yes", "false":"no"}}},
+                "images":if with_image { json!([{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}]) } else { json!([]) }});
+            let operation = Operations {
+                args: Cli::parse_from(["pi"]),
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            };
+            let mut data = json!({});
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                operation.perform(entry, &context, &Keys::parse(&json!({})), &mut data),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let request = tokio::time::timeout(Duration::from_secs(10), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = std::str::from_utf8(&request[..end]).unwrap();
+            let header_values = |wanted: &str| {
+                headers
+                    .lines()
+                    .filter_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case(wanted).then(|| value.trim())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                header_values("typesafe-danger-zone-images"),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{provider} {mode} {override_header:?}"
+            );
+            assert_eq!(
+                header_values("x-fixture"),
+                expected_custom.into_iter().collect::<Vec<_>>()
+            );
+            let body: Value = serde_json::from_slice(&request[end..]).unwrap();
+            assert_eq!(body["questions"]["ok"]["type"], "noul");
+            if with_image {
+                match mode {
+                    "assets" => assert!(body["assets"]["<image-1>"].is_object()),
+                    "state-image-urls" => assert_eq!(body["state"][0]["type"], "image_url"),
+                    "images" => assert!(
+                        body["images"][0]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("data:image/png;base64,")
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            assert_eq!(data["answers"]["ok"]["probability"], 0.6);
+        }
+    }
+
+    #[test]
+    fn classifier_header_default_detects_openrouter_host_independently() {
+        let config = json!({"relay":{"baseUrl":"https://eu.openrouter.ai/api/v1", "models":[{
+            "type":"classifier", "id":"fixture", "api":"typesafe-system-one", "input":["text","image"], "compat":{"imageInput":"assets"}
+        }]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "relay")
+            .unwrap();
+        let context = json!({"state":{"text":"test"}, "questions":{"ok":{"type":"bool","instructions":"test","criteria":{"true":"yes","false":"no"}}}, "images":[{"type":"image","mimeType":"image/png","data":"aGVsbG8="}]});
+        let (body, opt_in) = classifier_payload(entry, &context).unwrap();
+        assert!(body["assets"]["<image-1>"].is_object());
+        assert!(!opt_in);
+    }
+
+    #[tokio::test]
+    async fn operation_credentials_prefer_stored_then_configured_then_environment() {
+        for (provider, variable) in [
+            ("typesafe", "TYPESAFE_API_KEY"),
+            ("openrouter", "OPENROUTER_API_KEY"),
+        ] {
+            let config = json!({provider: {"apiKey":"configured-key"}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entry = catalogue
+                .0
+                .iter()
+                .find(|entry| entry.provider == provider)
+                .unwrap();
+            let env = |name: &str| (name == variable).then(|| "environment-key".to_owned());
+            let empty = Keys::parse(&json!({}));
+            assert_eq!(
+                entry
+                    .credential_with_env(&empty, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                Some("configured-key")
+            );
+            let saved = Keys::parse(&json!({provider: {"type":"api_key", "key":"stored-key"}}));
+            assert_eq!(
+                entry
+                    .credential_with_env(&saved, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                Some("stored-key")
+            );
+            let mut no_config = entry.clone();
+            no_config.api_key = None;
+            assert_eq!(
+                no_config
+                    .credential_with_env(&empty, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                Some("environment-key")
+            );
+            no_config.endpoint = Url::parse("https://proxy.example/v1/systemone").unwrap();
+            assert!(no_config.credential_with_env(&empty, env).is_none());
+            let mut invalid = entry.clone();
+            invalid.api_key = Some("${PI_RS_MISSING_OPERATION_KEY_TEST_8E43B}".into());
+            assert!(
+                invalid
+                    .credential_with_env(&empty, env)
+                    .unwrap()
+                    .resolve()
+                    .await
+                    .is_err()
+            );
+            invalid.api_key = Some(String::new());
+            assert!(
+                invalid
+                    .credential_with_env(&empty, env)
+                    .unwrap()
+                    .resolve()
+                    .await
+                    .is_err()
+            );
+            for key in ["", "${PI_RS_MISSING_OPERATION_KEY_TEST_8E43B}"] {
+                let saved = Keys::parse(&json!({provider: {"type":"api_key", "key":key}}));
+                assert!(
+                    entry
+                        .credential_with_env(&saved, env)
+                        .unwrap()
+                        .resolve()
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_stored_key_falls_back_and_stored_env_resolves_headers() {
+        let catalogue = Catalogue::parse(json!({}).as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "typesafe")
+            .unwrap();
+        let keys = Keys::parse(
+            &json!({"typesafe":{"type":"api_key", "env":{"HEADER_SECRET":"local-header"}}}),
+        );
+        let env = |name: &str| (name == "TYPESAFE_API_KEY").then(|| "environment-key".to_owned());
+        assert_eq!(
+            entry
+                .credential_with_env(&keys, env)
+                .unwrap()
+                .resolve()
+                .await
+                .unwrap(),
+            "environment-key"
+        );
+        let stored_env =
+            keys.operation_environment("typesafe", entry.endpoint.as_str(), entry.is_official());
+        assert_eq!(
+            resolve_header("$HEADER_SECRET", stored_env)
+                .await
+                .as_deref(),
+            Some("local-header")
+        );
+        assert!(
+            keys.operation_environment("typesafe", "https://other.example/v1/systemone", false)
+                .is_none()
+        );
+        let invalid = Keys::parse(
+            &json!({"typesafe":{"type":"api_key", "key":"$PI_RS_MISSING_KEY_TEST_3F64"}}),
+        );
+        assert!(
+            entry
+                .credential_with_env(&invalid, env)
+                .unwrap()
+                .resolve()
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn operation_endpoints_normalize_complete_route_trailing_slashes() {
+        let (_, plain) = endpoints("https://proxy.example/v1/systemone", "systemone").unwrap();
+        let (_, slash) = endpoints("https://proxy.example/v1/systemone/", "systemone").unwrap();
+        assert_eq!(plain, slash);
+        let config = json!({"relay":{"apiKey":"secret", "models":[
+            {"type":"classifier", "id":"one", "api":"typesafe-system-one", "baseUrl":"https://proxy.example/v1/systemone/"},
+            {"type":"classifier", "id":"two", "api":"typesafe-system-one", "baseUrl":"https://proxy.example/v1/systemone"}
+        ]}});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        for entry in catalogue.0.iter().filter(|entry| entry.provider == "relay") {
+            assert_eq!(entry.endpoint, plain);
+            assert_eq!(entry.api_key.as_deref(), Some("secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn operation_uses_slash_terminated_saved_endpoint_before_configured_key() {
+        let config = json!({"proxy":{
+            "baseUrl":"https://proxy.example/v1", "apiKey":"configured-key",
+            "models":[{"type":"classifier", "id":"classifier", "api":"typesafe-system-one"}]
+        }});
+        let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+        let entry = catalogue
+            .0
+            .iter()
+            .find(|entry| entry.provider == "proxy")
+            .unwrap();
+        let keys = Keys::parse(&json!({"proxy":{
+            "type":"api_key", "key":"stored-key", "endpoint":"https://proxy.example/v1/systemone/",
+            "env":{"HEADER":"saved-header"}
+        }}));
+        assert_eq!(
+            entry.credential(&keys).unwrap().resolve().await.unwrap(),
+            "stored-key"
+        );
+        let env = keys.operation_environment("proxy", entry.endpoint.as_str(), entry.is_official());
+        assert_eq!(
+            resolve_header("$HEADER", env).await.as_deref(),
+            Some("saved-header")
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_terminated_official_saved_bases_keep_key_precedence() {
+        for (provider, base, variable) in [
+            ("typesafe", "https://api.typesafe.ai/v1", "TYPESAFE_API_KEY"),
+            (
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "OPENROUTER_API_KEY",
+            ),
+        ] {
+            let config = json!({provider:{"apiKey":"configured-key"}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entries: Vec<_> = catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == provider && entry.is_official())
+                .collect();
+            assert!(!entries.is_empty());
+            let env = |name: &str| (name == variable).then(|| "ambient-key".to_owned());
+            for saved_base in [base.to_owned(), format!("{base}/")] {
+                let keys = Keys::parse(
+                    &json!({provider:{"type":"api_key", "key":"stored-key", "endpoint":saved_base, "env":{"HEADER":"stored-header"}}}),
+                );
+                for entry in &entries {
+                    assert_eq!(
+                        entry
+                            .credential_with_env(&keys, env)
+                            .unwrap()
+                            .resolve()
+                            .await
+                            .unwrap(),
+                        "stored-key"
+                    );
+                    let header_env =
+                        keys.operation_environment(provider, entry.endpoint.as_str(), true);
+                    assert_eq!(
+                        resolve_header("$HEADER", header_env).await.as_deref(),
+                        Some("stored-header")
+                    );
+                    assert!(
+                        keys.operation_credential(
+                            provider,
+                            "https://other.example/v1/systemone",
+                            false
+                        )
+                        .is_none()
+                    );
+                }
+            }
+            let other = Keys::parse(
+                &json!({provider:{"type":"api_key", "key":"wrong-key", "endpoint":"https://other.example/v1/"}}),
+            );
+            for entry in entries {
+                assert_eq!(
+                    entry
+                        .credential_with_env(&other, env)
+                        .unwrap()
+                        .resolve()
+                        .await
+                        .unwrap(),
+                    "configured-key"
+                );
+                assert!(
+                    other
+                        .operation_environment(provider, entry.endpoint.as_str(), true)
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configured_key_is_bound_to_provider_endpoint_not_model_override() {
+        for (base, override_base) in [
+            ("https://api.typesafe.ai/v1", "https://proxy.example/v1"),
+            ("https://proxy.example/v1", "https://api.typesafe.ai/v1"),
+        ] {
+            let config = json!({"typesafe": {
+                "baseUrl": base, "apiKey": "provider-key",
+                "models": [
+                    {"type":"classifier", "id":"same", "api":"typesafe-system-one"},
+                    {"type":"classifier", "id":"override", "api":"typesafe-system-one", "baseUrl":override_base}
+                ]
+            }});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let find = |id| {
+                catalogue
+                    .0
+                    .iter()
+                    .find(|entry| entry.provider == "typesafe" && entry.model.id == id)
+                    .unwrap()
+            };
+            assert_eq!(find("same").api_key.as_deref(), Some("provider-key"));
+            assert!(find("override").api_key.is_none());
+            let keys = Keys::parse(&json!({}));
+            let env = |name: &str| (name == "TYPESAFE_API_KEY").then(|| "ambient-key".to_owned());
+            assert_eq!(
+                find("same")
+                    .credential_with_env(&keys, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                Some("provider-key")
+            );
+            assert_eq!(
+                find("override")
+                    .credential_with_env(&keys, env)
+                    .and_then(|key| key.literal().map(str::to_owned))
+                    .as_deref(),
+                (override_base == "https://api.typesafe.ai/v1").then_some("ambient-key")
+            );
+        }
+    }
+
+    #[test]
+    fn configured_key_uses_unambiguous_model_base_when_provider_has_none() {
+        let model = |id, base| json!({"type":"classifier", "id":id, "api":"typesafe-system-one", "baseUrl":base});
+        for (models, expected) in [
+            (vec![model("one", "https://proxy.example/v1")], true),
+            (
+                vec![
+                    model("one", "https://proxy.example/v1"),
+                    model("two", "https://proxy.example/v1/"),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    model("one", "https://proxy.example/v1"),
+                    model("two", "https://other.example/v1"),
+                ],
+                false,
+            ),
+        ] {
+            let config = json!({"relay":{"apiKey":"provider-key", "models":models}});
+            let catalogue = Catalogue::parse(config.as_object().unwrap()).unwrap();
+            let entries: Vec<_> = catalogue
+                .0
+                .iter()
+                .filter(|entry| entry.provider == "relay")
+                .collect();
+            assert!(!entries.is_empty());
+            for entry in entries {
+                assert_eq!(entry.api_key.as_deref(), expected.then_some("provider-key"));
+            }
+        }
+    }
 
     #[test]
     fn model_operations_use_distinct_routes_for_equal_model_ids() {

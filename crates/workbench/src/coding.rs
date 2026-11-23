@@ -1,24 +1,76 @@
 //! Local coding tools. Hosted callers opt into their own execution profile.
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use pi_rs::{
-    Error, Extension, Outcome, Result, Tool, ToolContext, ToolExecution, ToolHost, ToolReply,
-    ToolSpec,
+    Error, Extension, Outcome, Result, StrictToolPolicy, Tool, ToolConstraint, ToolContext,
+    ToolExecution, ToolHost, ToolReply, ToolSpec,
 };
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub use crate::shell_config::{ShellConfig, ShellContext, ShellSpawnContext, ShellSpawnHook};
+use crate::tool_output::js_number;
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ORIGINAL_IMAGE_BYTES: usize = 6 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 50 * 1024;
+
+/// Capability set for reading host-side transcripts produced by paired shell tools.
+/// Share this only between tools belonging to the same host/session.
+#[derive(Clone, Default)]
+pub struct ShellOutputStore(Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>);
+
+/// Tracks the selected model's image settings for tools kept across switches.
+#[derive(Clone, Default)]
+pub struct ReadImageModel(Arc<std::sync::Mutex<ReadImageSettings>>);
+
+#[derive(Clone, Default)]
+struct ReadImageSettings {
+    profile: Option<crate::image_profile::ImageResizeProfile>,
+    unsupported_model: Option<Arc<str>>,
+}
+
+impl ReadImageModel {
+    pub fn set(&self, id: &str, supports_images: Option<bool>) {
+        self.set_profile(id, supports_images, None);
+    }
+
+    pub fn set_profile(
+        &self,
+        id: &str,
+        supports_images: Option<bool>,
+        profile: Option<crate::image_profile::ImageResizeProfile>,
+    ) {
+        *self.0.lock().expect("read image model") = ReadImageSettings {
+            profile,
+            unsupported_model: (supports_images == Some(false)).then(|| Arc::from(id)),
+        };
+    }
+
+    fn snapshot(&self) -> ReadImageSettings {
+        self.0.lock().expect("read image model").clone()
+    }
+}
+
+/// The prompt-visible name and contents of an explicit CLI file attachment.
+pub struct CliAttachment {
+    pub name: PathBuf,
+    pub content: AttachmentContent,
+}
+
+pub enum AttachmentContent {
+    Text(String),
+    Image {
+        note: String,
+        images: Vec<pi_rs::ImageContent>,
+    },
+}
 
 pub struct CodingTools {
     root: PathBuf,
@@ -26,7 +78,14 @@ pub struct CodingTools {
     shell: ShellConfig,
     auto_resize_images: bool,
     image_profile: Option<crate::image_profile::ImageResizeProfile>,
-    model_supports_images: Option<bool>,
+    unsupported_image_model: Option<UnsupportedImageModel>,
+    read_operations: Option<Arc<dyn ReadOperations>>,
+    write_operations: Option<Arc<dyn WriteOperations>>,
+    bash_operations: Option<Arc<dyn BashOperations>>,
+    edit_operations: Option<Arc<dyn EditOperations>>,
+    edit_options: EditToolOptions,
+    shell_outputs: ShellOutputStore,
+    remote_home: Option<PathBuf>,
 }
 
 impl CodingTools {
@@ -41,7 +100,14 @@ impl CodingTools {
             shell: ShellConfig::default(),
             auto_resize_images: true,
             image_profile: None,
-            model_supports_images: None,
+            unsupported_image_model: None,
+            read_operations: None,
+            write_operations: None,
+            bash_operations: None,
+            edit_operations: None,
+            edit_options: EditToolOptions::default(),
+            shell_outputs: ShellOutputStore::default(),
+            remote_home: None,
         })
     }
     /// Local Pi profile, with paths resolved from the workspace and access to user resources.
@@ -50,6 +116,111 @@ impl CodingTools {
         tools.unrestricted = true;
         Ok(tools)
     }
+    /// Replace model-facing read operations in the unrestricted local Pi profile.
+    /// A remote backend controls its own access policy; scoped profiles cannot use it
+    /// because local canonicalization cannot establish remote symlink boundaries.
+    pub fn with_read_operations(mut self, operations: Arc<dyn ReadOperations>) -> Result<Self> {
+        if !self.unrestricted {
+            return Err(Error::Config(
+                "custom read operations require the unrestricted profile".into(),
+            ));
+        }
+        self.read_operations = Some(operations);
+        Ok(self)
+    }
+
+    pub(crate) fn has_custom_read_operations(&self) -> bool {
+        self.read_operations.is_some()
+    }
+
+    pub(crate) fn has_custom_write_operations(&self) -> bool {
+        self.write_operations.is_some()
+    }
+
+    pub(crate) fn has_custom_edit_operations(&self) -> bool {
+        self.edit_operations.is_some()
+    }
+
+    pub(crate) fn has_custom_bash_operations(&self) -> bool {
+        self.bash_operations.is_some()
+    }
+
+    pub(crate) fn shell_and_file_operations_share_remote_backend(&self) -> bool {
+        match (&self.read_operations, &self.bash_operations) {
+            (Some(read), Some(shell)) => {
+                self.file_operations_share_backend()
+                    && !shell.is_local()
+                    && Arc::as_ptr(read) as *const () == Arc::as_ptr(shell) as *const ()
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn file_operations_share_backend(&self) -> bool {
+        match (
+            &self.read_operations,
+            &self.write_operations,
+            &self.edit_operations,
+        ) {
+            (Some(read), Some(write), Some(edit)) => {
+                let read = Arc::as_ptr(read) as *const ();
+                let write = Arc::as_ptr(write) as *const ();
+                let edit = Arc::as_ptr(edit) as *const ();
+                read == write && write == edit
+            }
+            _ => false,
+        }
+    }
+
+    /// Inject model-facing writes in the unrestricted profile. The backend is
+    /// responsible for its own remote access policy.
+    pub fn with_write_operations(mut self, operations: Arc<dyn WriteOperations>) -> Result<Self> {
+        if !self.unrestricted {
+            return Err(Error::Config(
+                "custom write operations require the unrestricted profile".into(),
+            ));
+        }
+        self.write_operations = Some(operations);
+        Ok(self)
+    }
+
+    /// Inject model edits in the unrestricted profile; the backend enforces its access policy.
+    pub fn with_edit_operations(mut self, operations: Arc<dyn EditOperations>) -> Result<Self> {
+        if !self.unrestricted {
+            return Err(Error::Config(
+                "custom edit operations require the unrestricted profile".into(),
+            ));
+        }
+        self.edit_operations = Some(operations);
+        Ok(self)
+    }
+
+    /// Configure `~` for injected file operations in the backend namespace.
+    /// Local tools continue to use the host home directory.
+    pub fn with_remote_home(mut self, home: Option<PathBuf>) -> Result<Self> {
+        validate_remote_home(home.as_deref())?;
+        self.remote_home = home;
+        Ok(self)
+    }
+
+    /// Configure injected edits, including the opt-in non-atomic compatibility fallback.
+    pub fn with_edit_options(mut self, options: EditToolOptions) -> Self {
+        self.edit_options = options;
+        self
+    }
+
+    /// Inject model shell operations in the unrestricted profile. The backend
+    /// must enforce its own access policy and stop work when cancelled.
+    pub fn with_bash_operations(mut self, operations: Arc<dyn BashOperations>) -> Result<Self> {
+        if !self.unrestricted {
+            return Err(Error::Config(
+                "custom shell operations require the unrestricted profile".into(),
+            ));
+        }
+        self.bash_operations = Some(operations);
+        Ok(self)
+    }
+
     pub fn with_shell_config(mut self, shell: ShellConfig) -> Self {
         self.shell = shell;
         self
@@ -69,7 +240,15 @@ impl CodingTools {
     }
 
     pub fn with_model_image_support(mut self, supports_images: Option<bool>) -> Self {
-        self.model_supports_images = supports_images;
+        self.unsupported_image_model =
+            (supports_images == Some(false)).then_some(UnsupportedImageModel::Legacy);
+        self
+    }
+
+    /// Record the selected text-only model in image result details so the
+    /// saved tool text can be reused after a model switch.
+    pub fn with_read_image_model(mut self, model: ReadImageModel) -> Self {
+        self.unsupported_image_model = Some(UnsupportedImageModel::Current(model));
         self
     }
 
@@ -137,6 +316,52 @@ impl CodingTools {
         cancellation: &pi_rs::CancellationToken,
         progress: &mut (dyn FnMut(&str) + Send),
     ) -> Result<pi_rs::BashExecution> {
+        self.execute_shell_operations_inner(
+            event,
+            extension,
+            state,
+            timeout,
+            cancellation,
+            progress,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_shell_operations_with_host(
+        &self,
+        event: &pi_rs::UserBashEvent,
+        extension: &dyn pi_rs::Extension,
+        state: Option<&pi_rs::ExtensionState>,
+        timeout: Option<Duration>,
+        cancellation: &pi_rs::CancellationToken,
+        progress: &mut (dyn FnMut(&str) + Send),
+        host: Arc<dyn pi_rs::ToolHost>,
+    ) -> Result<pi_rs::BashExecution> {
+        self.execute_shell_operations_inner(
+            event,
+            extension,
+            state,
+            timeout,
+            cancellation,
+            progress,
+            Some(host),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_shell_operations_inner(
+        &self,
+        event: &pi_rs::UserBashEvent,
+        extension: &dyn pi_rs::Extension,
+        state: Option<&pi_rs::ExtensionState>,
+        timeout: Option<Duration>,
+        cancellation: &pi_rs::CancellationToken,
+        progress: &mut (dyn FnMut(&str) + Send),
+        host: Option<Arc<dyn pi_rs::ToolHost>>,
+    ) -> Result<pi_rs::BashExecution> {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -153,13 +378,33 @@ impl CodingTools {
         let mut operation_event = event.clone();
         operation_event.command = self.shell.command_with_prefix(&event.command);
         let exit_code = {
-            let operation = extension.execute_user_bash(
-                &operation_event,
-                state,
-                timeout,
-                operation_cancel.clone(),
-                sender,
-            );
+            let operation = async {
+                match host {
+                    Some(host) => {
+                        extension
+                            .execute_user_bash_with_host(
+                                &operation_event,
+                                state,
+                                timeout,
+                                operation_cancel.clone(),
+                                sender,
+                                host,
+                            )
+                            .await
+                    }
+                    None => {
+                        extension
+                            .execute_user_bash(
+                                &operation_event,
+                                state,
+                                timeout,
+                                operation_cancel.clone(),
+                                sender,
+                            )
+                            .await
+                    }
+                }
+            };
             tokio::pin!(operation);
             let deadline = async {
                 match timeout {
@@ -220,17 +465,7 @@ impl CodingTools {
 
     /// Resolve a reader path, including Pi's filename fallbacks and this profile's scope.
     pub fn resolve_read_path(&self, path: &Path) -> Result<PathBuf> {
-        CodingTool {
-            root: self.root.clone(),
-            unrestricted: self.unrestricted,
-            shell: self.shell.clone(),
-            kind: Kind::Read {
-                auto_resize: self.auto_resize_images,
-                profile: self.image_profile,
-                model_supports_images: None,
-            },
-        }
-        .path(
+        self.attachment_reader().path(
             path.to_str()
                 .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?,
         )
@@ -238,37 +473,123 @@ impl CodingTools {
 
     /// Read a user-selected attachment using the same image limits as the read tool.
     pub fn read_attachment(&self, path: &Path) -> Result<(String, Vec<pi_rs::ImageContent>)> {
-        let tool = CodingTool {
+        self.read_attachment_inner(path, false)
+    }
+
+    /// Read CLI text attachments using Pi's replacement decoding and input bound.
+    pub fn read_attachment_lossy(&self, path: &Path) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+        self.read_attachment_inner(path, true)
+    }
+
+    /// Read an explicit CLI attachment and retain its lexical filename for the prompt.
+    /// Relative names are resolved from the CLI workspace before following links.
+    pub fn read_cli_attachment(
+        &self,
+        workspace: &Path,
+        value: &str,
+    ) -> Result<Option<CliAttachment>> {
+        let tool = self.attachment_reader();
+        let name = tool.input_path(&std::path::absolute(workspace)?, value)?;
+        let path = tool.canonical_path(&name)?;
+        let metadata = path.metadata()?;
+        if metadata.is_file() && metadata.len() == 0 {
+            return Ok(None);
+        }
+        let mut content = tool.read_attachment_at(&path, true)?;
+        if let AttachmentContent::Image { note, .. } = &mut content {
+            // The first line is the read tool's MIME summary. Prompt tags contain only hints.
+            *note = note
+                .split_once('\n')
+                .map_or("", |(_, hints)| hints)
+                .to_owned();
+        }
+        Ok(Some(CliAttachment { name, content }))
+    }
+
+    fn read_attachment_inner(
+        &self,
+        path: &Path,
+        lossy: bool,
+    ) -> Result<(String, Vec<pi_rs::ImageContent>)> {
+        let tool = self.attachment_reader();
+        let name = path
+            .to_str()
+            .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?;
+        let path = tool.path(name)?;
+        match tool.read_attachment_at(&path, lossy)? {
+            AttachmentContent::Text(text) => Ok((text, Vec::new())),
+            AttachmentContent::Image { note, images } => Ok((note, images)),
+        }
+    }
+
+    fn attachment_reader(&self) -> CodingTool {
+        CodingTool {
             root: self.root.clone(),
             unrestricted: self.unrestricted,
             shell: self.shell.clone(),
             kind: Kind::Read {
                 auto_resize: self.auto_resize_images,
                 profile: self.image_profile,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
-        };
-        let name = path
-            .to_str()
-            .ok_or_else(|| Error::Config("attachment path must be UTF-8".into()))?;
-        let path = tool.path(name)?;
-        if let Some(image) = tool.read_image(&path)? {
-            let blocks = image["content"].as_array().expect("image content");
-            let images = blocks
-                .iter()
-                .filter(|block| block["type"] == "image")
-                .cloned()
-                .map(serde_json::from_value)
-                .collect::<std::result::Result<_, _>>()?;
-            let hints = blocks
-                .iter()
-                .filter_map(|block| block["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok((hints, images))
-        } else {
-            Ok((tool.text(&path)?, Vec::new()))
         }
+    }
+}
+
+impl CodingTool {
+    fn read_attachment_at(&self, path: &Path, lossy: bool) -> Result<AttachmentContent> {
+        let image = if lossy && !crate::cli_attachment_sniff::is_image_file(path)? {
+            Ok(None)
+        } else if lossy {
+            self.read_image_inner(path, false)
+        } else {
+            self.read_image(path)
+        };
+        finish_attachment(image, || {
+            if !lossy {
+                return self.text(path);
+            }
+            use std::io::Read as _;
+            let metadata = path.metadata()?;
+            if !metadata.is_file() || (!self.unrestricted && metadata.len() > MAX_FILE_BYTES) {
+                return Err(Error::Config(
+                    "expected a regular text file up to 4 MiB".into(),
+                ));
+            }
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)?
+                .take(8 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 8 * 1024 * 1024 {
+                return Err(Error::Config(
+                    "attachments exceed the 8 MiB input limit".into(),
+                ));
+            }
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        })
+    }
+}
+
+fn finish_attachment(
+    image: Result<Option<Value>>,
+    read_text: impl FnOnce() -> Result<String>,
+) -> Result<AttachmentContent> {
+    if let Some(image) = image? {
+        let blocks = image["content"].as_array().expect("image content");
+        let images = blocks
+            .iter()
+            .filter(|block| block["type"] == "image")
+            .cloned()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<_, _>>()?;
+        let note = blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(AttachmentContent::Image { note, images })
+    } else {
+        Ok(AttachmentContent::Text(read_text()?))
     }
 }
 
@@ -299,7 +620,7 @@ impl Extension for CodingTools {
             Kind::Read {
                 auto_resize: self.auto_resize_images,
                 profile: self.image_profile,
-                model_supports_images: self.model_supports_images,
+                unsupported_image_model: self.unsupported_image_model.clone(),
             },
             Kind::Write,
             Kind::Edit,
@@ -316,23 +637,1684 @@ impl Extension for CodingTools {
         kinds
             .into_iter()
             .map(|kind| {
-                Arc::new(CodingTool {
+                let tool = CodingTool {
                     root: self.root.clone(),
                     unrestricted: self.unrestricted,
                     shell: self.shell.clone(),
                     kind,
-                }) as Arc<dyn Tool>
+                };
+                if matches!(tool.kind, Kind::Read { .. })
+                    && let Some(operations) = &self.read_operations
+                {
+                    Arc::new(RemoteReadTool {
+                        tool,
+                        operations: operations.clone(),
+                        shell_outputs: self.shell_outputs.clone(),
+                        remote_home: self.remote_home.clone(),
+                    }) as Arc<dyn Tool>
+                } else if matches!(tool.kind, Kind::Write)
+                    && let Some(operations) = &self.write_operations
+                {
+                    Arc::new(RemoteWriteTool {
+                        tool,
+                        operations: operations.clone(),
+                        remote_home: self.remote_home.clone(),
+                    }) as Arc<dyn Tool>
+                } else if matches!(tool.kind, Kind::Edit)
+                    && let Some(operations) = &self.edit_operations
+                {
+                    Arc::new(RemoteEditTool {
+                        tool,
+                        operations: operations.clone(),
+                        options: self.edit_options,
+                        remote_home: self.remote_home.clone(),
+                    }) as Arc<dyn Tool>
+                } else if matches!(tool.kind, Kind::Bash)
+                    && let Some(operations) = &self.bash_operations
+                {
+                    Arc::new(RemoteShellTool {
+                        tool,
+                        operations: operations.clone(),
+                        shell_outputs: self.shell_outputs.clone(),
+                    }) as Arc<dyn Tool>
+                } else if matches!(tool.kind, Kind::Read { .. })
+                    && let Some(UnsupportedImageModel::Current(model)) =
+                        &self.unsupported_image_model
+                {
+                    Arc::new(LiveReadTool {
+                        tool,
+                        model: model.clone(),
+                    }) as Arc<dyn Tool>
+                } else {
+                    Arc::new(tool) as Arc<dyn Tool>
+                }
             })
             .collect()
     }
 }
 
-#[derive(Clone, Copy)]
+struct LiveReadTool {
+    tool: CodingTool,
+    model: ReadImageModel,
+}
+
+impl LiveReadTool {
+    fn snapshot(&self) -> CodingTool {
+        let settings = self.model.snapshot();
+        let auto_resize = matches!(
+            self.tool.kind,
+            Kind::Read {
+                auto_resize: true,
+                ..
+            }
+        );
+        CodingTool {
+            kind: Kind::Read {
+                auto_resize,
+                profile: settings.profile,
+                unsupported_image_model: settings
+                    .unsupported_model
+                    .map(UnsupportedImageModel::Selected),
+            },
+            ..self.tool.clone()
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for LiveReadTool {
+    fn spec(&self) -> ToolSpec {
+        self.tool.spec()
+    }
+
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        self.tool.constrained_sampling()
+    }
+
+    fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
+        self.tool.event_structured_content(outcome)
+    }
+
+    fn execution(&self) -> ToolExecution {
+        self.tool.execution()
+    }
+
+    fn output_limit(&self) -> usize {
+        self.tool.output_limit()
+    }
+
+    fn pi_argument_diagnostics(&self) -> bool {
+        self.tool.pi_argument_diagnostics()
+    }
+
+    async fn prepare_arguments(&self, arguments: Value) -> pi_rs::ExtensionResult<Value> {
+        self.tool.prepare_arguments(arguments).await
+    }
+
+    async fn invoke(&self, arguments: Value, context: ToolContext) -> Outcome {
+        self.snapshot().invoke(arguments, context).await
+    }
+
+    async fn invoke_with_host(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&pi_rs::ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> Outcome {
+        self.snapshot()
+            .invoke_with_host(arguments, context, state, host)
+            .await
+    }
+
+    async fn invoke_programmatic(
+        &self,
+        arguments: Value,
+        context: ToolContext,
+        state: Option<&pi_rs::ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ToolReply {
+        self.snapshot()
+            .invoke_programmatic(arguments, context, state, host)
+            .await
+    }
+}
+
+/// File operations for an unrestricted model-facing read tool. Paths are absolute
+/// and normalized relative to the configured working directory. Implementations
+/// are responsible for enforcing any remote access policy and for cancelling work
+/// when their futures are dropped.
+/// A seekable blocking reader consumed on the blocking worker pool.
+pub trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
+
+#[async_trait::async_trait]
+pub trait ReadOperations: Send + Sync {
+    /// Return `Error::Io` with `NotFound` to allow filename fallback probing.
+    /// Other errors stop resolution immediately.
+    async fn access(&self, path: &Path) -> Result<()>;
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>>;
+    /// Optionally provide a seekable reader so large files need not be buffered
+    /// in memory. Reader methods run on a blocking worker and must return in
+    /// bounded time; cancellation is observed between reads. When absent,
+    /// `read_file` is used.
+    async fn open_file(&self, _path: &Path) -> Result<Option<Box<dyn ReadSeek>>> {
+        Ok(None)
+    }
+    async fn detect_image_mime_type(&self, _path: &Path) -> Result<Option<String>> {
+        Ok(None)
+    }
+}
+
+/// Local implementation of the read operations interface.
+pub struct LocalReadOperations;
+
+// Inspect before and after opening, and use nonblocking open on Unix so a
+// replacement with a FIFO cannot strand a worker between those checks.
+fn open_regular_file(path: &Path) -> Result<std::fs::File> {
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(Error::Config("expected a regular file".into()));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::Config("expected a regular file".into()));
+    }
+    Ok(file)
+}
+async fn open_local_read_file(path: &Path) -> Result<std::fs::File> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || open_regular_file(&path))
+        .await
+        .map_err(|error| Error::Config(error.to_string()))?
+}
+#[async_trait::async_trait]
+impl ReadOperations for LocalReadOperations {
+    async fn access(&self, path: &Path) -> Result<()> {
+        open_local_read_file(path).await?;
+        Ok(())
+    }
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        let file = open_local_read_file(path).await?;
+        let mut file = tokio::fs::File::from_std(file);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).await?;
+        Ok(bytes)
+    }
+    async fn open_file(&self, path: &Path) -> Result<Option<Box<dyn ReadSeek>>> {
+        Ok(Some(Box::new(open_local_read_file(path).await?)))
+    }
+    async fn detect_image_mime_type(&self, path: &Path) -> Result<Option<String>> {
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let file = open_regular_file(&path)?;
+            let reader =
+                image::ImageReader::new(std::io::BufReader::new(file)).with_guessed_format()?;
+            Ok(reader
+                .format()
+                .map(|format| format.to_mime_type().to_owned()))
+        })
+        .await
+        .map_err(|error| Error::Config(error.to_string()))?
+    }
+}
+
+/// Path configuration shared by injected read, write and edit tools.
+/// `None` rejects home-relative paths; the host home is never inferred.
+#[derive(Clone, Debug, Default)]
+pub struct RemotePathOptions {
+    pub remote_home: Option<PathBuf>,
+}
+
+fn validate_remote_home(home: Option<&Path>) -> Result<()> {
+    if home.is_some_and(|home| !home.is_absolute()) {
+        return Err(Error::Config(
+            "remote home directory must be absolute".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Construct a model-facing read tool backed by custom operations. This factory
+/// uses Pi's unrestricted path semantics; the backend owns access enforcement.
+pub fn create_read_tool(root: &Path, operations: Arc<dyn ReadOperations>) -> Result<Arc<dyn Tool>> {
+    create_read_tool_with_options(root, operations, RemotePathOptions::default())
+}
+
+/// Construct a read tool with access to transcripts from shell tools sharing `outputs`.
+pub fn create_read_tool_with_shell_outputs(
+    root: &Path,
+    operations: Arc<dyn ReadOperations>,
+    outputs: ShellOutputStore,
+) -> Result<Arc<dyn Tool>> {
+    create_read_tool_with_options_and_shell_outputs(
+        root,
+        operations,
+        RemotePathOptions::default(),
+        outputs,
+    )
+}
+
+/// Construct an injected read tool with an explicit backend home.
+pub fn create_read_tool_with_options(
+    root: &Path,
+    operations: Arc<dyn ReadOperations>,
+    options: RemotePathOptions,
+) -> Result<Arc<dyn Tool>> {
+    create_read_tool_with_options_and_shell_outputs(
+        root,
+        operations,
+        options,
+        ShellOutputStore::default(),
+    )
+}
+
+/// Configure backend paths and a shared shell transcript store together.
+pub fn create_read_tool_with_options_and_shell_outputs(
+    root: &Path,
+    operations: Arc<dyn ReadOperations>,
+    options: RemotePathOptions,
+    outputs: ShellOutputStore,
+) -> Result<Arc<dyn Tool>> {
+    validate_remote_home(options.remote_home.as_deref())?;
+    if !root.is_absolute() {
+        return Err(Error::Config(
+            "remote working directory must be absolute".into(),
+        ));
+    }
+    Ok(Arc::new(RemoteReadTool {
+        tool: CodingTool {
+            root: crate::coding_paths::resolve(root, Path::new(".")),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                unsupported_image_model: None,
+            },
+        },
+        operations,
+        shell_outputs: outputs,
+        remote_home: options.remote_home,
+    }))
+}
+
+struct RemoteReadTool {
+    tool: CodingTool,
+    operations: Arc<dyn ReadOperations>,
+    shell_outputs: ShellOutputStore,
+    remote_home: Option<PathBuf>,
+}
+
+// A blocking read cannot be interrupted in progress, but no further backend
+// reads or seeks should begin after cancellation.
+struct CancellableReader<R> {
+    inner: R,
+    cancellation: pi_rs::CancellationToken,
+}
+fn read_event_content(outcome: &Outcome) -> Option<Value> {
+    match outcome {
+        Outcome::Succeeded(output)
+        | Outcome::SucceededWithDetails { output, .. }
+        | Outcome::TextResult { output, .. } => Some(json!(output)),
+        Outcome::Structured { data, attachments }
+        | Outcome::StructuredWithDetails {
+            data, attachments, ..
+        } if attachments.is_empty() => {
+            let blocks = data.get("content")?.as_array()?;
+            let note = blocks
+                .iter()
+                .find_map(|block| {
+                    (block.get("type")?.as_str()? == "text")
+                        .then(|| block.get("text")?.as_str())
+                        .flatten()
+                })
+                .unwrap_or("");
+            if let Some(image) = blocks
+                .iter()
+                .find(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+            {
+                let data = image.get("data")?.as_str()?;
+                let mime_type = image.get("mimeType")?.as_str()?;
+                if data.len() > 8 * 1024 * 1024 {
+                    return None;
+                }
+                Some(json!({"type":"image", "data":data, "mimeType":mime_type, "note":note}))
+            } else {
+                Some(json!(note))
+            }
+        }
+        _ => None,
+    }
+}
+
+impl<R> CancellableReader<R> {
+    fn check(&self) -> std::io::Result<()> {
+        if self.cancellation.is_cancelled() {
+            // Interrupted would cause read_to_end to retry indefinitely.
+            Err(std::io::Error::other("operation cancelled"))
+        } else {
+            Ok(())
+        }
+    }
+}
+impl<R: Read> Read for CancellableReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.check()?;
+        self.inner.read(buffer)
+    }
+}
+impl<R: Seek> Seek for CancellableReader<R> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.check()?;
+        self.inner.seek(position)
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for RemoteReadTool {
+    fn spec(&self) -> ToolSpec {
+        let mut spec = self.tool.spec();
+        for parameter in ["offset", "limit"] {
+            spec.parameters["properties"][parameter] = read_page_parameter(false);
+        }
+        spec
+    }
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        self.tool.constrained_sampling()
+    }
+    fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
+        read_event_content(outcome)
+    }
+    fn execution(&self) -> ToolExecution {
+        self.tool.execution()
+    }
+    fn output_limit(&self) -> usize {
+        self.tool.output_limit()
+    }
+    async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
+        let cancellation = context.cancellation.child_token();
+        let _guard = cancellation.clone().drop_guard();
+        let operation = async {
+            let name = string(&args, "path")?.to_owned();
+            let input = crate::coding_paths::remote_input(&name, self.remote_home.as_deref())?;
+            let requested = crate::coding_paths::resolve_remote(&self.tool.root, &input)?;
+            let transcript = self
+                .shell_outputs
+                .0
+                .lock()
+                .map_err(|_| Error::Config("shell output store poisoned".into()))?
+                .contains(&requested);
+            if transcript {
+                let token = cancellation.clone();
+                let offset =
+                    usize::try_from(args["offset"].as_u64().unwrap_or(1).saturating_sub(1))
+                        .unwrap_or(usize::MAX);
+                let limit = args["limit"]
+                    .as_u64()
+                    .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+                return tokio::task::spawn_blocking(move || {
+                    crate::text_page::read(&requested, &name, offset, limit, &token)
+                })
+                .await
+                .map_err(|error| Error::Config(error.to_string()))?;
+            }
+            let mut candidates = crate::coding_paths::read_candidates(&requested).into_iter();
+            let mut path = candidates.next().expect("exact candidate");
+            loop {
+                match self.operations.access(&path).await {
+                    Ok(()) => break,
+                    Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if let Some(next) = candidates.next() {
+                            path = next;
+                        } else {
+                            return Err(Error::Io(error));
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let mime = self.operations.detect_image_mime_type(&path).await?;
+            let source: Box<dyn ReadSeek> = match self.operations.open_file(&path).await? {
+                Some(reader) => reader,
+                None => Box::new(Cursor::new(self.operations.read_file(&path).await?)),
+            };
+            let tool = self.tool.clone();
+            let token = cancellation.clone();
+            tokio::task::spawn_blocking(move || -> Result<Outcome> {
+                if token.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                if let Some(mime) = mime {
+                    let mut source = CancellableReader {
+                        inner: source,
+                        cancellation: token.clone(),
+                    };
+                    if source.seek(SeekFrom::End(0))? > 20 * 1024 * 1024 {
+                        return Err(Error::Config("image exceeds 20 MiB".into()));
+                    }
+                    source.seek(SeekFrom::Start(0))?;
+                    let format = image::ImageFormat::from_mime_type(&mime).ok_or_else(|| {
+                        Error::Config(format!("unsupported image MIME type: {mime}"))
+                    })?;
+                    let reader =
+                        image::ImageReader::with_format(std::io::BufReader::new(source), format);
+                    let data = tool.process_image(&path, reader, format, Some(&token))?;
+                    Ok(tool.image_outcome(data, true))
+                } else {
+                    let offset =
+                        usize::try_from(args["offset"].as_u64().unwrap_or(1).saturating_sub(1))
+                            .unwrap_or(usize::MAX);
+                    let limit = args["limit"]
+                        .as_u64()
+                        .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+                    crate::text_page::read_from(
+                        std::io::BufReader::new(source),
+                        &name,
+                        offset,
+                        limit,
+                        &token,
+                    )
+                }
+            })
+            .await
+            .map_err(|error| Error::Config(error.to_string()))?
+        };
+        let result = tokio::select! { biased; _ = cancellation.cancelled() => Err(Error::Cancelled), result = operation => result };
+        match result {
+            Ok(outcome) => outcome,
+            Err(Error::Cancelled) => Outcome::Failed("Operation aborted".into()),
+            Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+    async fn invoke_programmatic(
+        &self,
+        args: Value,
+        context: ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+        _: Arc<dyn ToolHost>,
+    ) -> ToolReply {
+        match self.invoke(args, context).await {
+            Outcome::Structured { data, attachments }
+            | Outcome::StructuredWithDetails {
+                data, attachments, ..
+            } => {
+                if let Some(blocks) = data["content"].as_array()
+                    && !blocks.iter().any(|block| block["type"] == "image")
+                    && let Some(text) = blocks.iter().find_map(|block| block["text"].as_str())
+                {
+                    return Outcome::Succeeded(text.to_owned()).into();
+                }
+                let mut image = data["content"]
+                    .as_array()
+                    .and_then(|blocks| blocks.iter().find(|b| b["type"] == "image"))
+                    .cloned()
+                    .unwrap_or_else(|| data.clone());
+                if image["type"] == "image" {
+                    image["note"] = json!(
+                        data["content"]
+                            .as_array()
+                            .and_then(|blocks| blocks.iter().find_map(|b| b["text"].as_str()))
+                            .unwrap_or_default()
+                    );
+                }
+                Outcome::Structured {
+                    data: image,
+                    attachments,
+                }
+                .into()
+            }
+            outcome => outcome.into(),
+        }
+    }
+}
+
+/// Asynchronous operations for a model-facing write tool. Paths are absolute
+/// and the backend must enforce its own access policy. Operations must not
+/// return until their externally visible effects have settled; a cancellation
+/// can be observed after an in-flight operation completes.
+#[async_trait::async_trait]
+pub trait WriteOperations: Send + Sync {
+    /// Return true only when paths address this host's local filesystem. This
+    /// makes writes share the canonicalized cross-process lock used by local edits.
+    /// This is cooperative locking, not a security boundary: path components can
+    /// be replaced by outside processes after resolution and before an operation.
+    fn uses_local_filesystem(&self) -> bool {
+        false
+    }
+    /// Stable identity for aliases of the same remote resource. Implementations
+    /// must use the same identity across their read/write/edit interfaces.
+    async fn resource_identity(&self, path: &Path) -> Result<PathBuf> {
+        Ok(path.to_owned())
+    }
+    async fn mkdir(&self, directory: &Path) -> Result<()>;
+    async fn write_file(&self, path: &Path, content: &str) -> Result<()>;
+}
+
+/// Local filesystem implementation of Pi's write operations interface.
+pub struct LocalWriteOperations;
+
+#[async_trait::async_trait]
+impl WriteOperations for LocalWriteOperations {
+    fn uses_local_filesystem(&self) -> bool {
+        true
+    }
+    async fn mkdir(&self, directory: &Path) -> Result<()> {
+        tokio::fs::create_dir_all(directory).await?;
+        Ok(())
+    }
+    async fn write_file(&self, path: &Path, content: &str) -> Result<()> {
+        let path = path.to_owned();
+        let file = tokio::task::spawn_blocking(move || open_local_write_file(&path))
+            .await
+            .map_err(|error| Error::Config(error.to_string()))??;
+        let mut file = tokio::fs::File::from_std(file);
+        file.set_len(0).await?;
+        file.write_all(content.as_bytes()).await?;
+        file.flush().await?;
+        Ok(())
+    }
+}
+
+// Open without truncation, then verify the opened object before changing it.
+// O_NONBLOCK prevents a FIFO substituted after the metadata check from hanging.
+fn open_local_write_file(path: &Path) -> Result<std::fs::File> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(Error::Config("expected a regular file".into()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Ok(metadata) = std::fs::symlink_metadata(path)
+                && metadata.file_type().is_symlink()
+            {
+                return Err(Error::Config(
+                    "dangling symlink cannot be used as a mutation target".into(),
+                ));
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(all(test, unix))]
+    pause_local_write_open(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::Config("expected a regular file".into()));
+    }
+    Ok(file)
+}
+
+#[cfg(all(test, unix))]
+struct LocalWriteOpenHook {
+    expected: PathBuf,
+    ready: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(all(test, unix))]
+static LOCAL_WRITE_OPEN_HOOK: std::sync::Mutex<Option<LocalWriteOpenHook>> =
+    std::sync::Mutex::new(None);
+#[cfg(all(test, unix))]
+fn pause_local_write_open(path: &Path) {
+    if let Some(hook) = LOCAL_WRITE_OPEN_HOOK.lock().unwrap().as_ref()
+        && hook.expected == path
+    {
+        let _ = hook.ready.send(());
+        let _ = hook.resume.recv_timeout(Duration::from_secs(5));
+    }
+}
+
+/// Create an unrestricted model-facing write tool for a remote directory.
+/// The backend is responsible for access control and filesystem semantics.
+pub fn create_write_tool(
+    root: &Path,
+    operations: Arc<dyn WriteOperations>,
+) -> Result<Arc<dyn Tool>> {
+    create_write_tool_with_options(root, operations, RemotePathOptions::default())
+}
+
+/// Construct an injected write tool with an explicit backend home.
+pub fn create_write_tool_with_options(
+    root: &Path,
+    operations: Arc<dyn WriteOperations>,
+    options: RemotePathOptions,
+) -> Result<Arc<dyn Tool>> {
+    validate_remote_home(options.remote_home.as_deref())?;
+    if !root.is_absolute() {
+        return Err(Error::Config(
+            "remote working directory must be absolute".into(),
+        ));
+    }
+    Ok(Arc::new(RemoteWriteTool {
+        tool: CodingTool {
+            root: crate::coding_paths::resolve(root, Path::new(".")),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Write,
+        },
+        operations,
+        remote_home: options.remote_home,
+    }))
+}
+
+struct RemoteWriteTool {
+    tool: CodingTool,
+    operations: Arc<dyn WriteOperations>,
+    remote_home: Option<PathBuf>,
+}
+
+// Local operations participate in the existing OS-file lock shared with edits.
+// Remote operations are serialized per backend allocation and path, rather
+// than treating identical paths in unrelated stores as the same resource.
+struct InjectedWriteGuard {
+    _local: Option<std::fs::File>,
+    _remote: Option<tokio::sync::OwnedMutexGuard<()>>,
+    local_target: Option<PathBuf>,
+}
+
+fn canonical_local_target(path: &Path) -> Result<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for part in missing.iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Ok(metadata) = std::fs::symlink_metadata(ancestor)
+                    && metadata.file_type().is_symlink()
+                {
+                    return Err(Error::Config(
+                        "dangling symlink cannot be used as a mutation target".into(),
+                    ));
+                }
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .ok_or_else(|| Error::Config("invalid target path".into()))?
+                        .to_os_string(),
+                );
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| Error::Config("invalid target path".into()))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+static LOCAL_LOCK_RESOLVED: std::sync::Mutex<Option<(PathBuf, std::sync::mpsc::Sender<()>)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn notify_local_lock_resolved(path: &Path) {
+    if let Some((expected, sender)) = LOCAL_LOCK_RESOLVED.lock().unwrap().as_ref()
+        && expected == path
+    {
+        let _ = sender.send(());
+    }
+}
+
+async fn injected_mutation_lock(
+    identity: usize,
+    uses_local_filesystem: bool,
+    path: &Path,
+    resource_identity: PathBuf,
+    cancellation: &pi_rs::CancellationToken,
+) -> Result<InjectedWriteGuard> {
+    if uses_local_filesystem {
+        let path = path.to_owned();
+        let token = cancellation.clone();
+        let (file, target) = tokio::task::spawn_blocking(move || {
+            let target = canonical_local_target(&path)?;
+            #[cfg(test)]
+            notify_local_lock_resolved(&path);
+            let file = mutation_lock(&target, &token)?;
+            Ok::<_, Error>((file, target))
+        })
+        .await
+        .map_err(|error| Error::Config(error.to_string()))??;
+        Ok(InjectedWriteGuard {
+            _local: Some(file),
+            _remote: None,
+            local_target: Some(target),
+        })
+    } else {
+        type Key = (usize, PathBuf);
+        type WeakLock = std::sync::Weak<tokio::sync::Mutex<()>>;
+        static LOCKS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<Key, WeakLock>>,
+        > = std::sync::OnceLock::new();
+        let key = (identity, resource_identity);
+        let lock = {
+            let mut locks = LOCKS
+                .get_or_init(Default::default)
+                .lock()
+                .expect("remote write locks");
+            locks.retain(|_, lock| lock.strong_count() != 0);
+            if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let guard = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            guard = lock.lock_owned() => guard,
+        };
+        Ok(InjectedWriteGuard {
+            _local: None,
+            _remote: Some(guard),
+            local_target: None,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for RemoteWriteTool {
+    fn spec(&self) -> ToolSpec {
+        self.tool.spec()
+    }
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        self.tool.constrained_sampling()
+    }
+    fn execution(&self) -> ToolExecution {
+        self.tool.execution()
+    }
+    fn output_limit(&self) -> usize {
+        self.tool.output_limit()
+    }
+    async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
+        let result = async {
+            let display = string(&args, "path")?.to_owned();
+            let content = string(&args, "content")?.to_owned();
+            let path = crate::coding_paths::resolve_remote(
+                &self.tool.root,
+                &crate::coding_paths::remote_input(&display, self.remote_home.as_deref())?,
+            )?;
+            let cancellation = context.cancellation.child_token();
+            let _guard = cancellation.clone().drop_guard();
+            let operations = self.operations.clone();
+            // The detached worker owns the lock while an operation is in flight.
+            // Dropping the caller never releases it before a backend has settled.
+            let worker = tokio::spawn(async move {
+                let local = operations.uses_local_filesystem();
+                check_mutation_cancelled(&cancellation)?;
+                let resource = if local {
+                    path.clone()
+                } else {
+                    operations.resource_identity(&path).await?
+                };
+                check_mutation_cancelled(&cancellation)?;
+                let _lock = injected_mutation_lock(
+                    Arc::as_ptr(&operations) as *const () as usize,
+                    local,
+                    &path,
+                    resource,
+                    &cancellation,
+                )
+                .await?;
+                check_mutation_cancelled(&cancellation)?;
+                let path = _lock.local_target.as_deref().unwrap_or(&path);
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| Error::Config("file needs a parent".into()))?;
+                operations.mkdir(parent).await?;
+                check_mutation_cancelled(&cancellation)?;
+                operations.write_file(path, &content).await?;
+                check_mutation_cancelled(&cancellation)?;
+                Ok::<_, Error>(format!("Successfully wrote to {display}"))
+            });
+            worker
+                .await
+                .map_err(|error| Error::Config(error.to_string()))?
+        }
+        .await;
+        match result {
+            Ok(output) => Outcome::Succeeded(output),
+            Err(Error::Cancelled) => Outcome::Failed("Operation aborted".into()),
+            Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+}
+
+/// Operations for a model-facing edit. A backend shared with WriteOperations
+/// must use the same Arc allocation for both interfaces to share remote locks.
+/// Operations must not return until any effects have settled.
+/// Result of an atomic backend compare-and-replace attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConditionalEdit {
+    Applied,
+    Conflict,
+    Unsupported,
+}
+
+#[async_trait::async_trait]
+pub trait EditOperations: Send + Sync {
+    /// Return the same stable identity for all aliases of one backend resource.
+    async fn resource_identity(&self, path: &Path) -> Result<PathBuf> {
+        Ok(path.to_owned())
+    }
+    /// Return true only for paths in this host's local filesystem.
+    fn uses_local_filesystem(&self) -> bool {
+        false
+    }
+    async fn access(&self, path: &Path) -> Result<()>;
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>>;
+    async fn write_file(&self, path: &Path, content: &str) -> Result<()>;
+    /// Atomically compare current bytes and write when equal. Return Unsupported
+    /// without mutating if the backend cannot provide this operation.
+    async fn write_if_unchanged(
+        &self,
+        _path: &Path,
+        _expected: &[u8],
+        _content: &str,
+    ) -> Result<ConditionalEdit> {
+        Ok(ConditionalEdit::Unsupported)
+    }
+}
+
+/// Local Pi-style edit operations; the default local tool retains atomic writes.
+pub struct LocalEditOperations;
+
+#[cfg(unix)]
+fn local_edit_access(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn unix_edit_access_error(error: std::io::Error, display_path: &str) -> Error {
+    let code = match error.raw_os_error() {
+        Some(libc::EACCES) => "EACCES",
+        Some(libc::ENOENT) => "ENOENT",
+        Some(libc::ENOTDIR) => "ENOTDIR",
+        Some(libc::ELOOP) => "ELOOP",
+        Some(libc::EROFS) => "EROFS",
+        Some(libc::EPERM) => "EPERM",
+        Some(libc::ENAMETOOLONG) => "ENAMETOOLONG",
+        _ => return error.into(),
+    };
+    Error::Config(format!(
+        "Could not edit file: {display_path}. Error code: {code}."
+    ))
+}
+
+#[cfg(windows)]
+fn windows_edit_access_error(error: std::io::Error, display_path: &str) -> Error {
+    let code = match error.kind() {
+        std::io::ErrorKind::NotFound => "ENOENT",
+        std::io::ErrorKind::PermissionDenied => "EACCES",
+        _ => return error.into(),
+    };
+    Error::Config(format!(
+        "Could not edit file: {display_path}. Error code: {code}."
+    ))
+}
+
+fn open_local_edit_file(path: &Path) -> Result<std::fs::File> {
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(Error::Config("expected a regular file".into()));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::Config("expected a regular file".into()));
+    }
+    Ok(file)
+}
+async fn local_edit_file(path: &Path) -> Result<tokio::fs::File> {
+    let path = path.to_owned();
+    let file = tokio::task::spawn_blocking(move || open_local_edit_file(&path))
+        .await
+        .map_err(|error| Error::Config(error.to_string()))??;
+    Ok(tokio::fs::File::from_std(file))
+}
+#[async_trait::async_trait]
+impl EditOperations for LocalEditOperations {
+    fn uses_local_filesystem(&self) -> bool {
+        true
+    }
+    async fn access(&self, path: &Path) -> Result<()> {
+        local_edit_file(path).await?;
+        Ok(())
+    }
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        let mut file = local_edit_file(path).await?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).await?;
+        Ok(bytes)
+    }
+    async fn write_file(&self, path: &Path, content: &str) -> Result<()> {
+        let path = path.to_owned();
+        let content = content.as_bytes().to_vec();
+        tokio::task::spawn_blocking(move || {
+            // Resolve a symlink before replacement: the symlink itself remains intact.
+            let _file = open_local_edit_file(&path)?;
+            let target = path.canonicalize()?;
+            open_local_edit_file(&target)?;
+            atomic_write(&target, &content, &pi_rs::CancellationToken::new())
+        })
+        .await
+        .map_err(|error| Error::Config(error.to_string()))?
+    }
+}
+
+/// Controls whether an injected edit may use a non-atomic compatibility fallback.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EditToolOptions {
+    /// Explicitly allow reread-then-write when the backend lacks compare-and-replace.
+    /// External writers can still race between that reread and the write.
+    pub allow_non_atomic_fallback: bool,
+}
+
+/// Construct an unrestricted edit tool requiring atomic backend comparison.
+pub fn create_edit_tool(root: &Path, operations: Arc<dyn EditOperations>) -> Result<Arc<dyn Tool>> {
+    create_edit_tool_with_options(root, operations, EditToolOptions::default())
+}
+
+/// Construct an edit tool with explicit compatibility options.
+pub fn create_edit_tool_with_options(
+    root: &Path,
+    operations: Arc<dyn EditOperations>,
+    options: EditToolOptions,
+) -> Result<Arc<dyn Tool>> {
+    create_edit_tool_with_path_options(root, operations, options, RemotePathOptions::default())
+}
+
+/// Construct an injected edit tool with explicit backend path configuration.
+pub fn create_edit_tool_with_path_options(
+    root: &Path,
+    operations: Arc<dyn EditOperations>,
+    options: EditToolOptions,
+    paths: RemotePathOptions,
+) -> Result<Arc<dyn Tool>> {
+    validate_remote_home(paths.remote_home.as_deref())?;
+    if !root.is_absolute() {
+        return Err(Error::Config(
+            "remote working directory must be absolute".into(),
+        ));
+    }
+    Ok(Arc::new(RemoteEditTool {
+        tool: CodingTool {
+            root: crate::coding_paths::resolve(root, Path::new(".")),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        },
+        operations,
+        options,
+        remote_home: paths.remote_home,
+    }))
+}
+struct RemoteEditTool {
+    tool: CodingTool,
+    operations: Arc<dyn EditOperations>,
+    options: EditToolOptions,
+    remote_home: Option<PathBuf>,
+}
+#[async_trait::async_trait]
+impl Tool for RemoteEditTool {
+    fn spec(&self) -> ToolSpec {
+        self.tool.spec()
+    }
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        self.tool.constrained_sampling()
+    }
+    fn execution(&self) -> ToolExecution {
+        self.tool.execution()
+    }
+    fn output_limit(&self) -> usize {
+        self.tool.output_limit()
+    }
+    async fn prepare_arguments(&self, arguments: Value) -> pi_rs::ExtensionResult<Value> {
+        crate::text_edit::prepare_arguments(arguments).map_err(edit_error_text)
+    }
+    async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
+        let result = async {
+            let display = string(&args, "path")?.to_owned();
+            let path = crate::coding_paths::resolve_remote(
+                &self.tool.root,
+                &crate::coding_paths::remote_input(&display, self.remote_home.as_deref())?,
+            )?;
+            let cancellation = context.cancellation.child_token();
+            let _guard = cancellation.clone().drop_guard();
+            let operations = self.operations.clone();
+            let options = self.options;
+            let worker = tokio::spawn(async move {
+                let local = operations.uses_local_filesystem();
+                check_mutation_cancelled(&cancellation)?;
+                let resource = if local {
+                    path.clone()
+                } else {
+                    operations.resource_identity(&path).await?
+                };
+                check_mutation_cancelled(&cancellation)?;
+                let _lock = injected_mutation_lock(
+                    Arc::as_ptr(&operations) as *const () as usize,
+                    local,
+                    &path,
+                    resource,
+                    &cancellation,
+                )
+                .await?;
+                check_mutation_cancelled(&cancellation)?;
+                let path = _lock.local_target.as_deref().unwrap_or(&path);
+                if let Err(error) = operations.access(path).await {
+                    check_mutation_cancelled(&cancellation)?;
+                    let message = match &error {
+                        Error::Io(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
+                            "Error code: ENOENT".to_owned()
+                        }
+                        Error::Io(cause)
+                            if cause.kind() == std::io::ErrorKind::PermissionDenied =>
+                        {
+                            "Error code: EACCES".to_owned()
+                        }
+                        _ => error.to_string(),
+                    };
+                    return Err(Error::Config(format!(
+                        "Could not edit file: {display}. {message}."
+                    )));
+                }
+                check_mutation_cancelled(&cancellation)?;
+                let bytes = operations.read_file(path).await?;
+                check_mutation_cancelled(&cancellation)?;
+                let original =
+                    String::from_utf8(bytes).map_err(|error| Error::Config(error.to_string()))?;
+                let before = original.clone();
+                let edit_token = cancellation.clone();
+                let (output, count) = tokio::task::spawn_blocking(move || {
+                    check_mutation_cancelled(&edit_token)?;
+                    crate::text_edit::apply(&before, &args)
+                })
+                .await
+                .map_err(|error| Error::Config(error.to_string()))??;
+                check_mutation_cancelled(&cancellation)?;
+                let conditional = operations
+                    .write_if_unchanged(path, original.as_bytes(), &output)
+                    .await?;
+                check_mutation_cancelled(&cancellation)?;
+                match conditional {
+                    ConditionalEdit::Applied => {}
+                    ConditionalEdit::Conflict => {
+                        return Err(Error::Config(
+                            "file changed while preparing edits; read it again".into(),
+                        ));
+                    }
+                    ConditionalEdit::Unsupported => {
+                        if !options.allow_non_atomic_fallback {
+                            return Err(Error::Config("backend does not support atomic conditional edit; enable non-atomic fallback explicitly to use reread-then-write".into()));
+                        }
+                        let current = operations.read_file(path).await?;
+                        check_mutation_cancelled(&cancellation)?;
+                        if current != original.as_bytes() {
+                            return Err(Error::Config(
+                                "file changed while preparing edits; read it again".into(),
+                            ));
+                        }
+                        operations.write_file(path, &output).await?;
+                        check_mutation_cancelled(&cancellation)?;
+                    }
+                }
+                tokio::task::spawn_blocking(move || {
+                    edit_success(&display, &original, &output, count)
+                })
+                .await
+                .map_err(|error| Error::Config(error.to_string()))
+            });
+            worker
+                .await
+                .map_err(|error| Error::Config(error.to_string()))?
+        }
+        .await;
+        match result {
+            Ok(outcome) => outcome,
+            Err(Error::Cancelled) => Outcome::Failed("Operation aborted".into()),
+            Err(error) => Outcome::Failed(edit_error_text(error)),
+        }
+    }
+}
+
+fn edit_success(display_path: &str, original: &str, output: &str, count: usize) -> Outcome {
+    let original = crate::text_edit::normalized_content(original);
+    let edited = crate::text_edit::normalized_content(output);
+    let diff = crate::text_edit::EditDiff::new(&original, &edited);
+    let first_changed_line = diff.first_changed_line();
+    let display = diff.numbered_diff();
+    let patch = diff.unified_patch(display_path);
+    Outcome::SucceededWithDetails {
+        output: format!("Successfully replaced {count} block(s) in {display_path}."),
+        details: json!({"diff":bounded(display),"patch":bounded(patch),"firstChangedLine":first_changed_line}),
+    }
+}
+
+/// Asynchronous streaming model-shell execution. The backend owns remote
+/// access control and must stop work when the cancellation token is cancelled
+/// or the returned future is dropped. Output must be sent before returning.
+#[async_trait::async_trait]
+pub trait BashOperations: Send + Sync {
+    /// Local adapters may opt into the host environment; remote adapters default to an empty one.
+    fn is_local(&self) -> bool {
+        false
+    }
+    /// Whether the backend owns the requested timeout and reports its own
+    /// diagnostic. Other backends also receive a deadline from the tool.
+    fn owns_timeout(&self) -> bool {
+        false
+    }
+    async fn exec(
+        &self,
+        context: ShellSpawnContext,
+        timeout: Option<Duration>,
+        cancellation: pi_rs::CancellationToken,
+        output: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<Option<i32>>;
+}
+
+/// Create Pi-style local bash operations for hosts that wrap the shell backend.
+/// Command prefixes and spawn hooks belong to the calling tool and are not
+/// applied again here.
+pub fn create_local_bash_operations(shell_path: Option<&str>) -> Arc<dyn BashOperations> {
+    Arc::new(LocalBashOperations {
+        shell: ShellConfig::new(shell_path, None),
+    })
+}
+
+struct LocalBashOperations {
+    shell: ShellConfig,
+}
+
+async fn check_local_shell_cwd(
+    cwd: &Path,
+    shell_name: &str,
+    cancellation: &pi_rs::CancellationToken,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(Error::Cancelled),
+        result = tokio::fs::metadata(cwd) => result.map(|_| ()).map_err(|_| {
+            Error::Config(format!("Working directory does not exist: {}\nCannot execute {shell_name} commands.", cwd.display()))
+        }),
+    }
+}
+
+const SHELL_POST_EXIT_IDLE: Duration = Duration::from_millis(100);
+// Bound completion even when a descendant writes continuously without a timeout.
+const SHELL_POST_EXIT_MAX: Duration = Duration::from_secs(2);
+
+#[async_trait::async_trait]
+impl BashOperations for LocalBashOperations {
+    fn is_local(&self) -> bool {
+        true
+    }
+    fn owns_timeout(&self) -> bool {
+        true
+    }
+    async fn exec(
+        &self,
+        context: ShellSpawnContext,
+        timeout: Option<Duration>,
+        cancellation: pi_rs::CancellationToken,
+        output: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<Option<i32>> {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let crate::shell_config::Launch {
+            mut command,
+            input,
+            cwd,
+        } = self
+            .shell
+            .launch(&context.cwd, false, true, &context.command, false)?;
+        // The backend owns the deadline so it can report a shell that has
+        // already exited. The same deadline bounds the directory check.
+        let deadline = async {
+            match timeout {
+                Some(value) => tokio::time::sleep(value).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(deadline);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            _ = &mut deadline => return Err(operation_timeout(timeout.expect("timeout"), None)),
+            result = check_local_shell_cwd(&cwd, "bash", &cancellation) => result?,
+        }
+        command
+            .current_dir(cwd)
+            .env_clear()
+            .envs(context.env)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut process = ProcessGroup::spawn(command)?;
+        let spawned_at = tokio::time::Instant::now();
+        let input_task = input.map(|input| {
+            let mut stdin = process.stdin();
+            tokio::spawn(async move {
+                let _ = stdin.write_all(input.as_bytes()).await;
+            })
+        });
+        let mut stdout = process.stdout();
+        let mut stderr = process.stderr();
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let mut stdout_buffer = [0u8; 8192];
+        let mut stderr_buffer = [0u8; 8192];
+        let mut shell_exit = None;
+        let mut drain_deadline = None;
+        let mut drain_max = None;
+        'drain: while shell_exit.is_none() || stdout_open || stderr_open {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
+                _ = &mut deadline => {
+                    let timeout = timeout.expect("timeout");
+                    let shell_exit = shell_exit.filter(|_| stdout_open || stderr_open);
+                    process.terminate();
+                    return Err(operation_timeout(timeout, shell_exit));
+                },
+                result = process.wait(), if shell_exit.is_none() => {
+                    shell_exit = Some((result?, spawned_at.elapsed()));
+                    drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
+                },
+                _ = async { match drain_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
+                _ = async { match drain_max { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break,
+                count = stdout.read(&mut stdout_buffer), if stdout_open => {
+                    let count = count?; stdout_open = count != 0;
+                    if count != 0 {
+                        if shell_exit.is_some() { drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE); }
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
+                                _ = &mut deadline => {
+                                    let timeout = timeout.expect("timeout");
+                                    let shell_exit = shell_exit.filter(|_| stdout_open || stderr_open);
+                                    process.terminate();
+                                    return Err(operation_timeout(timeout, shell_exit));
+                                },
+                                result = process.wait(), if shell_exit.is_none() => {
+                                    shell_exit = Some((result?, spawned_at.elapsed()));
+                                    drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                                    drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
+                                },
+                                _ = async { match drain_max { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break 'drain,
+                                result = output.send(stdout_buffer[..count].to_vec()) => {
+                                    if result.is_err() { return Err(Error::Cancelled); }
+                                    break;
+                                },
+                            }
+                        }
+                    }
+                },
+                count = stderr.read(&mut stderr_buffer), if stderr_open => {
+                    let count = count?; stderr_open = count != 0;
+                    if count != 0 {
+                        if shell_exit.is_some() { drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE); }
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancellation.cancelled() => { process.terminate(); return Err(Error::Cancelled); },
+                                _ = &mut deadline => {
+                                    let timeout = timeout.expect("timeout");
+                                    let shell_exit = shell_exit.filter(|_| stdout_open || stderr_open);
+                                    process.terminate();
+                                    return Err(operation_timeout(timeout, shell_exit));
+                                },
+                                result = process.wait(), if shell_exit.is_none() => {
+                                    shell_exit = Some((result?, spawned_at.elapsed()));
+                                    drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                                    drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
+                                },
+                                _ = async { match drain_max { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break 'drain,
+                                result = output.send(stderr_buffer[..count].to_vec()) => {
+                                    if result.is_err() { return Err(Error::Cancelled); }
+                                    break;
+                                },
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        if let Some(task) = input_task {
+            task.abort();
+        }
+        process.finished = true;
+        let (status, _) = shell_exit.expect("shell status observed");
+        Ok(Some(exit_code(status)))
+    }
+}
+
+/// Construct a model-facing bash tool for an absolute remote working directory.
+/// The backend is responsible for access control. User shell commands are separate.
+pub fn create_bash_tool(
+    root: &Path,
+    shell: ShellConfig,
+    operations: Arc<dyn BashOperations>,
+) -> Result<Arc<dyn Tool>> {
+    create_bash_tool_with_shell_outputs(root, shell, operations, ShellOutputStore::default())
+}
+
+/// Construct a shell tool whose transcripts are available to paired read tools.
+pub fn create_bash_tool_with_shell_outputs(
+    root: &Path,
+    shell: ShellConfig,
+    operations: Arc<dyn BashOperations>,
+    outputs: ShellOutputStore,
+) -> Result<Arc<dyn Tool>> {
+    if !root.is_absolute() {
+        return Err(Error::Config(
+            "remote working directory must be absolute".into(),
+        ));
+    }
+    Ok(Arc::new(RemoteShellTool {
+        tool: CodingTool {
+            root: crate::coding_paths::resolve(root, Path::new(".")),
+            unrestricted: true,
+            shell,
+            kind: Kind::Bash,
+        },
+        operations,
+        shell_outputs: outputs,
+    }))
+}
+
+struct RemoteShellTool {
+    tool: CodingTool,
+    operations: Arc<dyn BashOperations>,
+    shell_outputs: ShellOutputStore,
+}
+struct RemoteShellResult {
+    output: crate::shell_output::Output,
+    exit_code: i32,
+    elapsed: f64,
+}
+
+impl RemoteShellTool {
+    async fn run(
+        &self,
+        args: &Value,
+        cancellation: &pi_rs::CancellationToken,
+        host: Option<Arc<dyn ToolHost>>,
+    ) -> Result<RemoteShellResult> {
+        if cancellation.is_cancelled() {
+            return if self.operations.is_local() {
+                Err(Error::Config("Command aborted".into()))
+            } else {
+                Err(Error::Cancelled)
+            };
+        }
+        let started = std::time::Instant::now();
+        let timeout = shell_timeout(args, false)?;
+        let context = self.tool.shell.spawn_context(
+            &self.tool.root,
+            true,
+            string(args, "command")?,
+            true,
+            self.operations.is_local(),
+        )?;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let child = cancellation.child_token();
+        let _guard = child.clone().drop_guard();
+        let mut output = crate::shell_output::Accumulator::default();
+        let progress = host.filter(|host| host.supports_progress()).map(|host| {
+            let (sender, mut receiver) = tokio::sync::watch::channel::<Option<Value>>(None);
+            let worker = tokio::spawn(async move {
+                let _ = host.report_progress(json!({"content":[]})).await;
+                while receiver.changed().await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let value = receiver.borrow_and_update().clone();
+                    if let Some(value) = value {
+                        let _ = host.report_progress(value).await;
+                    }
+                }
+            });
+            (sender, worker)
+        });
+        let deadline = async {
+            match timeout {
+                Some(value) => tokio::time::sleep(value).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(deadline);
+        let backend_owns_timeout = self.operations.owns_timeout();
+        let (code, cancelled, timed_out) = {
+            let operation = self
+                .operations
+                .exec(context, timeout, child.clone(), sender);
+            tokio::pin!(operation);
+            let mut open = true;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => { child.cancel(); break (Ok(None), true, false); }
+                    _ = &mut deadline, if !backend_owns_timeout => { child.cancel(); break (Ok(None), true, true); }
+                    chunk = receiver.recv(), if open => match chunk {
+                        Some(chunk) => { output.append(&chunk)?; if let Some((sender, _)) = &progress { let _ = sender.send_replace(Some(output.partial_result())); } },
+                        None => open = false,
+                    },
+                    result = &mut operation => { break (result, false, false); }
+                }
+            }
+        };
+        while let Ok(chunk) = receiver.try_recv() {
+            output.append(&chunk)?;
+            if let Some((sender, _)) = &progress {
+                let _ = sender.send_replace(Some(output.partial_result()));
+            }
+        }
+        if let Some((sender, mut worker)) = progress {
+            drop(sender);
+            if tokio::time::timeout(Duration::from_secs(1), &mut worker)
+                .await
+                .is_err()
+            {
+                worker.abort();
+            }
+        }
+        let output = output.finish()?;
+        if let Some(path) = &output.path {
+            self.shell_outputs
+                .0
+                .lock()
+                .map_err(|_| Error::Config("shell output store poisoned".into()))?
+                .insert(path.clone());
+        }
+        if timed_out {
+            return Err(Error::Config(shell_status(
+                &output.display,
+                &format!(
+                    "Command timed out after {} seconds",
+                    timeout.expect("timeout").as_secs_f64()
+                ),
+            )));
+        }
+        if cancelled {
+            return Err(Error::Config(shell_status(
+                &output.display,
+                "Command aborted",
+            )));
+        }
+        let code = code
+            .map_err(|error| {
+                let message = match error {
+                    Error::Config(message)
+                        if self.operations.is_local()
+                            && message.starts_with("Working directory does not exist: ") =>
+                    {
+                        message
+                    }
+                    Error::Config(message)
+                        if backend_owns_timeout
+                            && message.starts_with("Command timed out after ") =>
+                    {
+                        message
+                    }
+                    Error::Cancelled if self.operations.is_local() => "Command aborted".into(),
+                    error => error.to_string(),
+                };
+                Error::Config(shell_status(&output.display, &message))
+            })?
+            .ok_or_else(|| {
+                Error::Config(shell_status(
+                    &output.result_display(),
+                    "Command terminated without an exit code",
+                ))
+            })?;
+        Ok(RemoteShellResult {
+            output,
+            exit_code: code,
+            elapsed: started.elapsed().as_secs_f64(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for RemoteShellTool {
+    fn spec(&self) -> ToolSpec {
+        let mut spec = self.tool.spec();
+        spec.parameters["properties"]["timeout"] = shell_timeout_schema(false);
+        spec
+    }
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        self.tool.constrained_sampling()
+    }
+    fn execution(&self) -> ToolExecution {
+        self.tool.execution()
+    }
+    fn output_limit(&self) -> usize {
+        self.tool.output_limit()
+    }
+    async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
+        match self.run(&args, &context.cancellation, None).await {
+            Ok(result) => shell_outcome(result.output, result.exit_code, result.elapsed),
+            Err(Error::Config(message)) => Outcome::Failed(message),
+            Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+    async fn invoke_with_host(
+        &self,
+        args: Value,
+        context: ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> Outcome {
+        match self.run(&args, &context.cancellation, Some(host)).await {
+            Ok(result) => shell_outcome(result.output, result.exit_code, result.elapsed),
+            Err(Error::Config(message)) => Outcome::Failed(message),
+            Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+    async fn invoke_programmatic(
+        &self,
+        args: Value,
+        context: ToolContext,
+        _: Option<&pi_rs::ExtensionState>,
+        host: Arc<dyn ToolHost>,
+    ) -> ToolReply {
+        match self.run(&args, &context.cancellation, Some(host)).await {
+            Ok(result) => {
+                let mut data = json!({"output":result.output.script,"truncated":result.output.script_truncated,"exit_code":result.exit_code,"wall_time_seconds":(result.elapsed * 10.0).round() / 10.0});
+                if result.output.script_truncated {
+                    data["full_output_path"] = json!(result.output.path);
+                }
+                Outcome::Structured {
+                    data,
+                    attachments: vec![],
+                }
+                .into()
+            }
+            Err(error) => Outcome::Failed(error.to_string()).into(),
+        }
+    }
+}
+
+fn pi_tool_failure(output: String) -> Outcome {
+    Outcome::TextResult {
+        output,
+        details: Some(json!({})),
+        is_error: true,
+    }
+}
+
+fn shell_outcome(output: crate::shell_output::Output, code: i32, elapsed: f64) -> Outcome {
+    let text = output.result_display();
+    let mut structured_content = json!({"output":output.script,"truncated":output.script_truncated,"exit_code":code,"wall_time_seconds":(elapsed * 10.0).round() / 10.0});
+    if output.script_truncated
+        && let Some(path) = &output.path
+    {
+        structured_content["full_output_path"] = json!(path);
+    }
+    Outcome::TextResultWithStructuredContent {
+        output: if code == 0 {
+            text
+        } else {
+            shell_status(&text, &format!("Command exited with code {code}"))
+        },
+        details: output.details,
+        structured_content,
+        is_error: code != 0,
+    }
+}
+
+#[derive(Clone)]
+enum UnsupportedImageModel {
+    Legacy,
+    Current(ReadImageModel),
+    Selected(Arc<str>),
+}
+
+#[derive(Clone)]
 enum Kind {
     Read {
         auto_resize: bool,
         profile: Option<crate::image_profile::ImageResizeProfile>,
-        model_supports_images: Option<bool>,
+        unsupported_image_model: Option<UnsupportedImageModel>,
     },
     Write,
     Edit,
@@ -351,6 +2333,14 @@ struct CodingTool {
     kind: Kind,
 }
 
+fn read_page_parameter(pi_numeric: bool) -> Value {
+    if pi_numeric {
+        json!({"type":"number"})
+    } else {
+        json!({"type":"integer","minimum":1})
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for CodingTool {
     fn spec(&self) -> ToolSpec {
@@ -359,7 +2349,7 @@ impl Tool for CodingTool {
             Kind::Read { .. } => (
                 "read",
                 "Read text with optional one-based line offset and line limit, or return a PNG/JPEG/GIF/WebP/BMP/TIFF image to the model.",
-                json!({"path":path,"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}}),
+                json!({"path":path,"offset":read_page_parameter(self.unrestricted),"limit":read_page_parameter(self.unrestricted)}),
                 vec!["path"],
             ),
             Kind::Write => (
@@ -395,25 +2385,40 @@ impl Tool for CodingTool {
                     "bash"
                 },
                 "Run a shell command in the workspace. Returns the last 2000 lines or 50 KiB and saves complete output to a temporary file when truncated.",
-                json!({"command":{"type":"string"},"timeout":{"type":"number","exclusiveMinimum":0,"maximum":2147483.647}}),
+                json!({"command":{"type":"string"},"timeout":shell_timeout_schema(self.unrestricted)}),
                 vec!["command"],
             ),
             Kind::Grep => (
                 "grep",
                 "Search UTF-8 file contents. Respects ignore files and returns path, line number, and matching text.",
-                json!({"pattern":{"type":"string"},"path":path,"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer","minimum":0,"maximum":1000},"limit":{"type":"integer","minimum":1,"maximum":100000}}),
+                json!({
+                    "pattern": {"type": "string"},
+                    "path": path,
+                    "glob": {
+                        "type": "string",
+                        "description": if self.unrestricted {
+                            "Filter by glob relative to the search directory, e.g. 'src/**/*.ts'. A basename glob such as '*.ts' matches at any depth."
+                        } else {
+                            "Filter by glob relative to the workspace root."
+                        }
+                    },
+                    "ignoreCase": {"type": "boolean"},
+                    "literal": {"type": "boolean"},
+                    "context": {"type": "integer", "minimum": 0},
+                    "limit": if self.unrestricted { json!({"type":"number"}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }
+                }),
                 vec!["pattern"],
             ),
             Kind::Find => (
                 "find",
                 "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).",
-                json!({"pattern":{"type":"string"},"path":path,"limit":{"type":"integer","minimum":1,"maximum":100000}}),
+                json!({"pattern":{"type":"string"},"path":path,"limit": if self.unrestricted { json!({"type":"number"}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
                 vec!["pattern"],
             ),
             Kind::List => (
                 "ls",
                 "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).",
-                json!({"path":path,"limit":{"type":"integer","minimum":1,"maximum":100000}}),
+                json!({"path":path,"limit": if self.unrestricted { json!({"type":"number"}) } else { json!({"type":"integer","minimum":1,"maximum":100000}) }}),
                 vec![],
             ),
         };
@@ -425,6 +2430,23 @@ impl Tool for CodingTool {
         }
     }
 
+    fn constrained_sampling(&self) -> Option<ToolConstraint> {
+        matches!(
+            self.kind,
+            Kind::Read { .. } | Kind::Write | Kind::Edit | Kind::Bash
+        )
+        .then_some(ToolConstraint::JsonSchema {
+            strict: StrictToolPolicy::Prefer,
+        })
+    }
+
+    fn event_structured_content(&self, outcome: &Outcome) -> Option<Value> {
+        if matches!(self.kind, Kind::Read { .. }) {
+            read_event_content(outcome)
+        } else {
+            None
+        }
+    }
     fn execution(&self) -> ToolExecution {
         match self.kind {
             Kind::Read { .. } | Kind::Grep | Kind::Find | Kind::List => ToolExecution::ParallelRead,
@@ -433,21 +2455,56 @@ impl Tool for CodingTool {
     }
 
     fn output_limit(&self) -> usize {
-        if self.unrestricted && matches!(self.kind, Kind::Read { .. }) {
-            // The reference permits inline images up to a 4.5 MiB base64
-            // payload; include room for the surrounding JSON and text.
+        if self.unrestricted
+            && matches!(self.kind, Kind::Read { .. } | Kind::Bash | Kind::PowerShell)
+        {
+            // Include room for inline images and JSON-escaped structured shell
+            // output in addition to the bounded model-facing display text.
             8 * 1024 * 1024
         } else {
             1024 * 1024
         }
     }
 
-    async fn prepare_arguments(&self, arguments: Value) -> pi_rs::ExtensionResult<Value> {
-        if matches!(self.kind, Kind::Edit) {
-            crate::text_edit::prepare_arguments(arguments).map_err(edit_error_text)
-        } else {
-            Ok(arguments)
+    fn pi_argument_diagnostics(&self) -> bool {
+        self.unrestricted
+    }
+
+    async fn prepare_arguments(&self, mut arguments: Value) -> pi_rs::ExtensionResult<Value> {
+        if self.unrestricted {
+            if matches!(self.kind, Kind::Edit)
+                && let Some(edits) = arguments.get_mut("edits")
+                && let Some(encoded) = edits.as_str()
+                && let Ok(decoded @ (Value::Array(_) | Value::Object(_))) =
+                    serde_json::from_str(encoded)
+            {
+                *edits = decoded;
+            }
+            coerce_local_tool_argument(&mut arguments, &self.spec().parameters);
         }
+        if matches!(self.kind, Kind::Edit) {
+            let legacy_pair = arguments["oldText"].is_string() && arguments["newText"].is_string();
+            if self.unrestricted && arguments.get("edits").is_none() && !legacy_pair {
+                return Ok(arguments);
+            }
+            if self.unrestricted
+                && !legacy_pair
+                && arguments["edits"].as_array().is_some_and(Vec::is_empty)
+            {
+                return Err(
+                    "Edit tool input is invalid. edits must contain at least one replacement."
+                        .into(),
+                );
+            }
+            match crate::text_edit::prepare_arguments_in_place(&mut arguments) {
+                // Keep the normalized shape for the schema validator to identify
+                // the offending field. Valid edit arguments still use edit preparation.
+                Ok(()) => {}
+                Err(Error::Json(_)) if self.unrestricted => {}
+                Err(error) => return Err(edit_error_text(error)),
+            }
+        }
+        Ok(arguments)
     }
     async fn invoke(&self, args: Value, context: ToolContext) -> Outcome {
         let result = match self.kind {
@@ -493,7 +2550,24 @@ impl Tool for CodingTool {
             Ok(outcome) => outcome,
             Err(Error::Cancelled) => Outcome::Failed("Operation aborted".into()),
             Err(Error::Config(message))
-                if self.unrestricted && matches!(self.kind, Kind::Grep | Kind::List) =>
+                if self.unrestricted
+                    && matches!(self.kind, Kind::Read { .. })
+                    && (message.starts_with("ENOENT: no such file or directory, access '")
+                        || message.starts_with("ENOTDIR: not a directory, access '")
+                        || message.starts_with("EACCES: permission denied, access '")
+                        || message == "EISDIR: illegal operation on a directory, read"
+                        || message == crate::text_page::PI_FRACTIONAL_OVERSIZE_LINE
+                        || (message.starts_with("Offset ")
+                            && message.contains(" is beyond end of file (")
+                            && message.ends_with(" lines total)"))) =>
+            {
+                Outcome::Failed(message)
+            }
+            Err(Error::Config(message))
+                if self.unrestricted
+                    && (matches!(self.kind, Kind::Grep | Kind::List)
+                        || (matches!(self.kind, Kind::Find)
+                            && message.starts_with("[fd error]: "))) =>
             {
                 Outcome::Failed(message)
             }
@@ -510,11 +2584,16 @@ impl Tool for CodingTool {
         _state: Option<&pi_rs::ExtensionState>,
         host: Arc<dyn ToolHost>,
     ) -> Outcome {
-        if matches!(self.kind, Kind::Bash | Kind::PowerShell) {
+        let outcome = if matches!(self.kind, Kind::Bash | Kind::PowerShell) {
             self.bash_with_host(&args, &context.cancellation, Some(host))
                 .await
         } else {
             self.invoke(args, context).await
+        };
+        // Pi reports the tool's diagnostic as model-facing text with a separate error bit.
+        match outcome {
+            Outcome::Failed(output) if self.unrestricted => pi_tool_failure(output),
+            outcome => outcome,
         }
     }
 
@@ -551,7 +2630,16 @@ impl Tool for CodingTool {
         }
         let outcome = self.invoke(args, context).await;
         match outcome {
-            Outcome::Structured { data, attachments } if matches!(self.kind, Kind::Read { .. }) => {
+            Outcome::Structured { data, attachments }
+            | Outcome::StructuredWithDetails {
+                data, attachments, ..
+            } if matches!(self.kind, Kind::Read { .. }) => {
+                if let Some(blocks) = data["content"].as_array()
+                    && !blocks.iter().any(|block| block["type"] == "image")
+                    && let Some(text) = blocks.iter().find_map(|block| block["text"].as_str())
+                {
+                    return Outcome::Succeeded(text.to_owned()).into();
+                }
                 let mut image = data["content"]
                     .as_array()
                     .and_then(|blocks| blocks.iter().find(|block| block["type"] == "image"))
@@ -575,22 +2663,276 @@ impl Tool for CodingTool {
     }
 }
 
-fn directory_collator(locale: &str) -> Result<icu_collator::CollatorBorrowed<'static>> {
-    let locale = locale
-        .split(['.', '@'])
-        .next()
-        .unwrap_or_default()
-        .replace('_', "-");
-    let locale = locale
-        .parse::<icu_locale_core::Locale>()
-        .map(icu_collator::CollatorPreferences::from)
-        .unwrap_or_default();
-    icu_collator::Collator::try_new(locale, Default::default())
-        .map_err(|error| Error::Config(format!("Cannot initialize directory collation: {error}")))
+fn image_omission(mime: &str, reason: &str) -> Value {
+    json!({"content":[{"type":"text", "text":format!("Read image file [{mime}]\n{reason}")}]})
+}
+
+fn directory_read_error(error: std::io::Error, requested: &Path, unrestricted: bool) -> Error {
+    #[cfg(unix)]
+    if unrestricted && error.raw_os_error() == Some(libc::EACCES) {
+        return Error::Config(format!(
+            "Cannot read directory: EACCES: permission denied, scandir '{}'",
+            requested.display()
+        ));
+    }
+    #[cfg(not(unix))]
+    let _ = (requested, unrestricted);
+    Error::Config(format!("Cannot read directory: {error}"))
+}
+
+fn is_ecmascript_whitespace(character: char) -> bool {
+    matches!(character, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
+}
+
+// Pi consumes fd's stdout with readline, trims each line, then relativizes
+// absolute lines against the search root. File names may themselves contain
+// line breaks, so a single fd result can become several displayed results.
+fn find_pi_lines(root: &Path, path: &Path, is_directory: bool) -> Vec<String> {
+    let mut raw = path.to_string_lossy().into_owned();
+    if is_directory {
+        raw.push(std::path::MAIN_SEPARATOR);
+    }
+    raw.split(['\r', '\n'])
+        .map(|line| line.trim_matches(is_ecmascript_whitespace))
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let path = Path::new(line);
+            if !path.is_absolute() {
+                return line.replace(std::path::MAIN_SEPARATOR, "/");
+            }
+            let trailing = line.ends_with(std::path::MAIN_SEPARATOR);
+            let target = crate::coding_paths::resolve(root, path);
+            let root_parts: Vec<_> = root.components().collect();
+            let target_parts: Vec<_> = target.components().collect();
+            let common = root_parts
+                .iter()
+                .zip(&target_parts)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let mut relative = PathBuf::new();
+            if common == 0 {
+                relative.push(&target);
+            } else {
+                for _ in common..root_parts.len() {
+                    relative.push("..");
+                }
+                for component in &target_parts[common..] {
+                    relative.push(component.as_os_str());
+                }
+            }
+            let mut relative = relative
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            if trailing && !relative.ends_with('/') {
+                relative.push('/');
+            }
+            relative
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn is_unix_access_denied(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EACCES)
+}
+
+#[cfg(not(unix))]
+fn is_unix_access_denied(_error: &std::io::Error) -> bool {
+    false
+}
+
+// These are the scalar and container types advertised by the local tool specs.
+fn coerce_local_tool_argument(value: &mut Value, schema: &Value) {
+    match schema["type"].as_str() {
+        Some("object") => {
+            let (Some(object), Some(properties)) =
+                (value.as_object_mut(), schema["properties"].as_object())
+            else {
+                return;
+            };
+            let required = schema["required"].as_array();
+            for (key, property) in properties {
+                if object.get(key) == Some(&Value::Null)
+                    && !required
+                        .is_some_and(|fields| fields.iter().any(|field| field == key.as_str()))
+                {
+                    object.remove(key);
+                } else if let Some(member) = object.get_mut(key) {
+                    coerce_local_tool_argument(member, property);
+                }
+            }
+        }
+        Some("array") => {
+            if !value.is_array() {
+                *value = Value::Array(vec![value.take()]);
+            }
+            if let Some(values) = value.as_array_mut() {
+                for item in values {
+                    coerce_local_tool_argument(item, &schema["items"]);
+                }
+            }
+        }
+        Some("string") => {
+            let converted = match value {
+                Value::Bool(boolean) => Some(boolean.to_string()),
+                Value::Number(number) => number.as_f64().map(js_number),
+                Value::Null => Some("null".into()),
+                _ => None,
+            };
+            if let Some(converted) = converted {
+                *value = Value::String(converted);
+            }
+        }
+        Some(kind @ ("number" | "integer")) if !value.is_number() || kind == "integer" => {
+            let parsed = match value {
+                Value::Bool(boolean) => Some(u8::from(*boolean).into()),
+                Value::Null => Some(0.0),
+                Value::String(text) => parse_local_tool_number(text),
+                Value::Number(number) if number.is_f64() => number.as_f64(),
+                _ => None,
+            };
+            if let Some(number) = parsed {
+                *value = if kind == "integer"
+                    && number.fract() == 0.0
+                    && (0.0..u64::MAX as f64).contains(&number)
+                {
+                    json!(number as u64)
+                } else {
+                    json!(number)
+                };
+            }
+        }
+        Some("boolean") => {
+            let converted = match value {
+                Value::String(text) if text == "1" || text.eq_ignore_ascii_case("true") => {
+                    Some(true)
+                }
+                Value::String(text) if text == "0" || text.eq_ignore_ascii_case("false") => {
+                    Some(false)
+                }
+                Value::Number(number) if number.as_f64() == Some(1.0) => Some(true),
+                Value::Number(number) if number.as_f64() == Some(0.0) => Some(false),
+                Value::Null => Some(false),
+                _ => None,
+            };
+            if let Some(converted) = converted {
+                *value = Value::Bool(converted);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_local_tool_number(text: &str) -> Option<f64> {
+    let trimmed = text.trim_matches(is_ecmascript_whitespace);
+    if trimmed.is_empty() {
+        return Some(0.0);
+    }
+    let radix = match trimmed.get(..2) {
+        Some("0b" | "0B") => Some(2),
+        Some("0o" | "0O") => Some(8),
+        Some("0x" | "0X") => Some(16),
+        _ => None,
+    };
+    if let Some(radix) = radix {
+        let digits = &trimmed[2..];
+        if digits.is_empty() || !digits.chars().all(|digit| digit.is_digit(radix)) {
+            return None;
+        }
+        let digits = digits.trim_start_matches('0');
+        if digits.is_empty() {
+            return Some(0.0);
+        }
+        let bits_per_digit = radix.trailing_zeros() as usize;
+        let (prefix, suffix) = digits.split_at(digits.len().min(128 / bits_per_digit));
+        let shift = suffix.len().saturating_mul(bits_per_digit);
+        if shift >= 1024 {
+            return None;
+        }
+        // Keep a sticky bit so the cast rounds correctly when digits were discarded.
+        let prefix = u128::from_str_radix(prefix, radix).ok()?;
+        let sticky = suffix.bytes().any(|digit| digit != b'0');
+        let number = (prefix | u128::from(sticky)) as f64 * 2.0_f64.powi(shift as i32);
+        return number.is_finite().then_some(number);
+    }
+    if let Ok(number) = trimmed.parse::<f64>()
+        && number.is_finite()
+    {
+        return Some(number);
+    }
+    if text.eq_ignore_ascii_case("true") {
+        return Some(1.0);
+    }
+    if text.eq_ignore_ascii_case("false") {
+        return Some(0.0);
+    }
+    let bigint = text.strip_suffix('n')?;
+    let digits = bigint.strip_prefix('-').unwrap_or(bigint);
+    if digits == "0"
+        || (!digits.starts_with('0') && digits.bytes().all(|digit| digit.is_ascii_digit()))
+    {
+        let number: i64 = bigint.parse().ok()?;
+        return (number.unsigned_abs() <= 9_007_199_254_740_991).then_some(number as f64);
+    }
+    None
+}
+
+// Pi parses JSON numbers as JavaScript doubles and formats them using Number.toString.
+fn local_numeric_limit(args: &Value, default: f64) -> f64 {
+    args.get("limit").and_then(Value::as_f64).unwrap_or(default)
+}
+
+// Pi passes String(limit + 1) to fd to detect when the result set exceeds the displayed limit.
+fn fd_numeric_limit(value: f64) -> std::result::Result<usize, String> {
+    let text = js_number(value);
+    text.parse::<usize>().map_err(|reason| {
+        format!(
+            "error: invalid value '{text}' for '--max-results <count>': {reason}\n\nFor more information, try '--help'."
+        )
+    })
+}
+
+fn grep_glob_overrides(
+    root: &Path,
+    glob: &str,
+    unrestricted: bool,
+) -> Result<ignore::overrides::Override> {
+    let normalized = if unrestricted {
+        // Directory globs are rooted at the search directory. Strip explicit
+        // current-directory markers after any negation marker as well.
+        let (negation, pattern) = glob
+            .strip_prefix('!')
+            .map_or(("", glob), |pattern| ("!", pattern));
+        let pattern = pattern.trim_start_matches("./");
+        if negation.is_empty() {
+            std::borrow::Cow::Borrowed(pattern)
+        } else {
+            std::borrow::Cow::Owned(format!("{negation}{pattern}"))
+        }
+    } else {
+        std::borrow::Cow::Borrowed(glob)
+    };
+    let mut builder = ignore::overrides::OverrideBuilder::new(root);
+    builder
+        .add(&normalized)
+        .and_then(|builder| builder.build())
+        .map_err(|error| {
+            Error::Config(match error {
+                ignore::Error::Glob { glob: Some(_), err } if unrestricted => {
+                    format!("rg: error parsing glob '{glob}': {err}")
+                }
+                error if unrestricted => format!("rg: {error}"),
+                error => error.to_string(),
+            })
+        })
 }
 
 impl CodingTool {
     fn path(&self, value: &str) -> Result<PathBuf> {
+        self.canonical_path(&self.input_path(&self.root, value)?)
+    }
+
+    fn input_path(&self, root: &Path, value: &str) -> Result<PathBuf> {
         let input = crate::coding_paths::normalize(value)?;
         if !self.unrestricted
             && input
@@ -599,15 +2941,43 @@ impl CodingTool {
         {
             return Err(Error::Config("parent traversal is not supported".into()));
         }
-        let path = crate::coding_paths::resolve(&self.root, &input);
-        let path = if matches!(self.kind, Kind::Read { .. }) {
+        let path = crate::coding_paths::resolve(root, &input);
+        Ok(if matches!(self.kind, Kind::Read { .. }) {
             crate::coding_paths::read_variant(path)
         } else {
             path
-        };
+        })
+    }
+
+    fn canonical_path(&self, path: &Path) -> Result<PathBuf> {
         let resolved = path.canonicalize().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound
-                && matches!(self.kind, Kind::Grep | Kind::List)
+            if self.unrestricted
+                && error.kind() == std::io::ErrorKind::NotFound
+                && matches!(self.kind, Kind::Read { .. })
+            {
+                Error::Config(format!(
+                    "ENOENT: no such file or directory, access '{}'",
+                    path.display()
+                ))
+            } else if self.unrestricted
+                && cfg!(unix)
+                && error.kind() == std::io::ErrorKind::NotADirectory
+                && matches!(self.kind, Kind::Read { .. })
+            {
+                Error::Config(format!(
+                    "ENOTDIR: not a directory, access '{}'",
+                    path.display()
+                ))
+            } else if self.unrestricted
+                && is_unix_access_denied(&error)
+                && matches!(self.kind, Kind::Read { .. })
+            {
+                Error::Config(format!(
+                    "EACCES: permission denied, access '{}'",
+                    path.display()
+                ))
+            } else if matches!(self.kind, Kind::Grep | Kind::List)
+                && (self.unrestricted || error.kind() == std::io::ErrorKind::NotFound)
             {
                 Error::Config(format!("Path not found: {}", path.display()))
             } else {
@@ -631,16 +3001,48 @@ impl CodingTool {
     }
 
     fn read_image(&self, path: &Path) -> Result<Option<Value>> {
+        self.read_image_inner(path, true)
+    }
+
+    fn read_image_inner(&self, path: &Path, infer_extension: bool) -> Result<Option<Value>> {
+        self.read_image_cancellable(path, infer_extension, None)
+    }
+
+    fn read_image_cancellable(
+        &self,
+        path: &Path,
+        infer_extension: bool,
+        cancellation: Option<&pi_rs::CancellationToken>,
+    ) -> Result<Option<Value>> {
+        crate::image_profile::check_cancelled(cancellation)?;
         if !path.is_file() {
             return Err(Error::Config("expected a regular file".into()));
         }
-        let reader = image::ImageReader::open(path)?.with_guessed_format()?;
+        let reader = if infer_extension {
+            image::ImageReader::open(path)?
+        } else {
+            image::ImageReader::new(std::io::BufReader::new(std::fs::File::open(path)?))
+        }
+        .with_guessed_format()?;
+        crate::image_profile::check_cancelled(cancellation)?;
         let Some(format) = reader.format() else {
             return Ok(None);
         };
         if path.metadata()?.len() > 20 * 1024 * 1024 {
             return Err(Error::Config("image exceeds 20 MiB".into()));
         }
+        self.process_image(path, reader, format, cancellation)
+            .map(Some)
+    }
+
+    fn process_image<R: std::io::BufRead + std::io::Seek>(
+        &self,
+        path: &Path,
+        reader: image::ImageReader<R>,
+        format: image::ImageFormat,
+        cancellation: Option<&pi_rs::CancellationToken>,
+    ) -> Result<Value> {
+        crate::image_profile::check_cancelled(cancellation)?;
         if self.unrestricted
             && let Kind::Read {
                 auto_resize: true,
@@ -649,12 +3051,52 @@ impl CodingTool {
             } = self.kind
         {
             let original_mime = format.to_mime_type();
-            let prepared = crate::image_profile::normalize(reader, profile.unwrap_or_default())?;
-            let mut note = format!("Read image file [{}]", prepared.mime_type);
-            if !matches!(
+            let profile = profile.unwrap_or_default();
+            if !profile.valid() {
+                return Err(Error::Config("invalid model image resize profile".into()));
+            }
+            let supported = matches!(
                 original_mime,
                 "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-            ) {
+            );
+            let prepared = if supported {
+                crate::image_profile::normalize_cancellable(reader, profile, cancellation)
+            } else {
+                let image = match crate::image_profile::decode_source_cancellable(
+                    reader,
+                    crate::image_profile::MAX_IMAGE_SOURCE_BYTES,
+                    cancellation,
+                ) {
+                    Ok(image) => image,
+                    Err(Error::Config(message))
+                        if message.starts_with("cannot prepare model image:") =>
+                    {
+                        return Ok(image_omission(
+                            original_mime,
+                            "[Image omitted: could not be converted to a supported inline image format.]",
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
+                crate::image_profile::prepare_pixels_cancellable(image, profile, cancellation)
+            };
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(Error::Config(message))
+                    if profile.valid()
+                        && (message.starts_with("cannot prepare model image:")
+                            || message == "image cannot fit the configured model size limit") =>
+                {
+                    return Ok(image_omission(
+                        original_mime,
+                        "[Image omitted: could not be resized below the inline image size limit.]",
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            crate::image_profile::check_cancelled(cancellation)?;
+            let mut note = format!("Read image file [{}]", prepared.mime_type);
+            if !supported {
                 note.push_str(&format!(
                     "\n[Image converted from {original_mime} to {}.]",
                     prepared.mime_type
@@ -673,10 +3115,10 @@ impl CodingTool {
                     prepared.source.0, prepared.source.1, prepared.output.0, prepared.output.1
                 ));
             }
-            return Ok(Some(json!({"content":[
+            return Ok(json!({"content":[
                 {"type":"text", "text":note},
                 {"type":"image", "mimeType":prepared.mime_type, "data":base64::engine::general_purpose::STANDARD.encode(prepared.bytes)}
-            ]})));
+            ]}));
         }
         let (bytes, mime_type, source, output) = if matches!(
             self.kind,
@@ -690,6 +3132,33 @@ impl CodingTool {
                 mime_type,
                 "image/png" | "image/jpeg" | "image/gif" | "image/webp"
             ) {
+                if self.unrestricted {
+                    let png = match crate::image_profile::convert_to_png_cancellable(
+                        reader,
+                        MAX_ORIGINAL_IMAGE_BYTES,
+                        cancellation,
+                    ) {
+                        Ok(png) => png,
+                        Err(Error::Config(message))
+                            if message.starts_with("cannot prepare model image:") =>
+                        {
+                            return Ok(image_omission(
+                                mime_type,
+                                "[Image omitted: could not be converted to a supported inline image format.]",
+                            ));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if png.len() > MAX_ORIGINAL_IMAGE_BYTES {
+                        return Err(Error::Config(
+                            "image exceeds the 6 MiB original image limit".into(),
+                        ));
+                    }
+                    return Ok(json!({"content":[
+                        {"type":"text", "text":format!("Read image file [image/png]\n[Image converted from {mime_type} to image/png.]")},
+                        {"type":"image", "mimeType":"image/png", "data":base64::engine::general_purpose::STANDARD.encode(png)}
+                    ]}));
+                }
                 return Err(Error::Config("unsupported image format".into()));
             }
             let mut bytes = Vec::new();
@@ -697,21 +3166,30 @@ impl CodingTool {
                 .into_inner()
                 .take((MAX_ORIGINAL_IMAGE_BYTES + 1) as u64)
                 .read_to_end(&mut bytes)?;
+            crate::image_profile::check_cancelled(cancellation)?;
             if bytes.len() > MAX_ORIGINAL_IMAGE_BYTES {
                 return Err(Error::Config(
                     "image exceeds the 6 MiB original image limit".into(),
                 ));
             }
+            if self.unrestricted {
+                return Ok(json!({"content":[
+                    {"type":"text", "text":format!("Read image file [{mime_type}]")},
+                    {"type":"image", "mimeType":mime_type, "data":base64::engine::general_purpose::STANDARD.encode(bytes)}
+                ]}));
+            }
             let dimensions = image::ImageReader::with_format(Cursor::new(&bytes), format)
                 .into_dimensions()
                 .map_err(|error| Error::Config(format!("cannot decode image: {error}")))?;
+            crate::image_profile::check_cancelled(cancellation)?;
             (bytes, mime_type, dimensions, dimensions)
         } else if let Kind::Read {
             profile: Some(profile),
             ..
         } = self.kind
         {
-            let prepared = crate::image_profile::normalize(reader, profile)?;
+            let prepared =
+                crate::image_profile::normalize_cancellable(reader, profile, cancellation)?;
             (
                 prepared.bytes,
                 prepared.mime_type,
@@ -719,7 +3197,7 @@ impl CodingTool {
                 prepared.output,
             )
         } else {
-            let prepared = normalize_image(reader)?;
+            let prepared = normalize_image_cancellable(reader, cancellation)?;
             (
                 prepared.png,
                 "image/png",
@@ -727,6 +3205,7 @@ impl CodingTool {
                 (prepared.width, prepared.height),
             )
         };
+        crate::image_profile::check_cancelled(cancellation)?;
         let note = if self.unrestricted {
             format!("Read image file [{mime_type}]")
         } else {
@@ -739,10 +3218,10 @@ impl CodingTool {
                 output.1
             )
         };
-        Ok(Some(json!({"content":[
+        Ok(json!({"content":[
             {"type":"text","text":note},
             {"type":"image","mimeType":mime_type,"data":base64::engine::general_purpose::STANDARD.encode(bytes)}
-        ]})))
+        ]}))
     }
 
     fn read(&self, args: &Value, cancellation: &pi_rs::CancellationToken) -> Result<Outcome> {
@@ -751,25 +3230,43 @@ impl CodingTool {
         }
         let display_path = string(args, "path")?;
         let path = self.path(display_path)?;
-        if let Some(mut data) = self.read_image(&path)? {
-            if self.unrestricted
-                && matches!(
-                    self.kind,
-                    Kind::Read {
-                        model_supports_images: Some(false),
-                        ..
-                    }
-                )
-                && let Some(note) = data["content"][0]["text"].as_str()
-            {
-                data["content"][0]["text"] = json!(format!(
-                    "{note}\n[Current model does not support images. The image will be omitted from this request.]"
+        #[cfg(unix)]
+        if self.unrestricted {
+            use std::os::unix::ffi::OsStrExt;
+            let access_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|error| Error::Config(error.to_string()))?;
+            if unsafe { libc::access(access_path.as_ptr(), libc::R_OK) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EACCES) {
+                    let requested =
+                        crate::coding_paths::read_variant(crate::coding_paths::resolve(
+                            &self.root,
+                            &crate::coding_paths::normalize(display_path)?,
+                        ));
+                    return Err(Error::Config(format!(
+                        "EACCES: permission denied, access '{}'",
+                        requested.display()
+                    )));
+                }
+                return Err(error.into());
+            }
+            if path.is_dir() {
+                return Err(Error::Config(
+                    "EISDIR: illegal operation on a directory, read".into(),
                 ));
             }
-            return Ok(Outcome::Structured {
-                data,
-                attachments: vec![],
-            });
+        }
+        if let Some(data) = self.read_image_cancellable(&path, true, Some(cancellation))? {
+            return Ok(self.image_outcome(data, self.unrestricted));
+        }
+        if self.unrestricted {
+            return crate::text_page::read_pi(
+                &path,
+                display_path,
+                args["offset"].as_f64().unwrap_or(1.0),
+                args["limit"].as_f64(),
+                cancellation,
+            );
         }
         let offset = usize::try_from(args["offset"].as_u64().unwrap_or(1).saturating_sub(1))
             .unwrap_or(usize::MAX);
@@ -777,6 +3274,47 @@ impl CodingTool {
             .as_u64()
             .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
         crate::text_page::read(&path, display_path, offset, limit, cancellation)
+    }
+
+    fn image_outcome(&self, mut data: Value, include_model_warning: bool) -> Outcome {
+        if include_model_warning
+            && let Kind::Read {
+                unsupported_image_model: Some(model),
+                ..
+            } = &self.kind
+        {
+            match model {
+                UnsupportedImageModel::Current(_) | UnsupportedImageModel::Selected(_) => {
+                    let id = match model {
+                        UnsupportedImageModel::Current(model) => model.snapshot().unsupported_model,
+                        UnsupportedImageModel::Selected(id) => Some(id.clone()),
+                        UnsupportedImageModel::Legacy => unreachable!(),
+                    };
+                    if data["content"]
+                        .as_array()
+                        .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
+                        && let Some(id) = id
+                    {
+                        return Outcome::StructuredWithDetails {
+                            data,
+                            attachments: vec![],
+                            details: json!({"imageUnsupportedByModel": id.as_ref()}),
+                        };
+                    }
+                }
+                UnsupportedImageModel::Legacy => {
+                    if let Some(note) = data["content"][0]["text"].as_str() {
+                        data["content"][0]["text"] = json!(format!(
+                            "{note}\n[Current model does not support images. The image will be omitted from this request.]"
+                        ));
+                    }
+                }
+            }
+        }
+        Outcome::Structured {
+            data,
+            attachments: vec![],
+        }
     }
 
     #[cfg(test)]
@@ -815,25 +3353,41 @@ impl CodingTool {
                 .parent()
                 .ok_or_else(|| Error::Config("invalid parent".into()))?;
         }
-        self.path(&ancestor.to_string_lossy())?;
+        self.canonical_path(ancestor)?;
         check_mutation_cancelled(cancellation)?;
-        std::fs::create_dir_all(parent)?;
-        let parent = self.path(&parent.to_string_lossy())?;
-        let mut target = parent.join(
+        std::fs::create_dir_all(parent).map_err(|error| {
+            if self.unrestricted && cfg!(unix) {
+                local_write_mkdir_error(error, parent)
+            } else {
+                error.into()
+            }
+        })?;
+        let parent = self.canonical_path(parent)?;
+        let mut destination = parent.join(
             target
                 .file_name()
                 .ok_or_else(|| Error::Config("file name missing".into()))?,
         );
-        if target.symlink_metadata().is_ok() {
-            let existing = self.path(&target.to_string_lossy())?;
+        if destination.symlink_metadata().is_ok() {
+            let existing = self.canonical_path(&destination)?;
             if !existing.is_file() {
+                if self.unrestricted && cfg!(unix) && existing.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        format!(
+                            "EISDIR: illegal operation on a directory, open '{}'",
+                            target.display()
+                        ),
+                    )
+                    .into());
+                }
                 return Err(Error::Config("expected a regular file".into()));
             }
-            target = existing;
+            destination = existing;
         }
-        let _lock = mutation_lock(&target, cancellation)?;
+        let _lock = mutation_lock(&destination, cancellation)?;
         check_mutation_cancelled(cancellation)?;
-        atomic_write(&target, content.as_bytes(), cancellation)?;
+        atomic_write(&destination, content.as_bytes(), cancellation)?;
         check_mutation_cancelled(cancellation)?;
         Ok(format!("Successfully wrote to {display_path}"))
     }
@@ -849,9 +3403,38 @@ impl CodingTool {
         cancellation: &pi_rs::CancellationToken,
     ) -> Result<Outcome> {
         check_mutation_cancelled(cancellation)?;
-        let path = self.path(string(args, "path")?)?;
+        let display_path = string(args, "path")?;
+        let path = self.path(display_path).map_err(|error| match error {
+            #[cfg(unix)]
+            Error::Io(cause) if self.unrestricted => unix_edit_access_error(cause, display_path),
+            #[cfg(windows)]
+            Error::Io(cause) if self.unrestricted => windows_edit_access_error(cause, display_path),
+            Error::Io(ref cause)
+                if self.unrestricted && cause.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Error::Config(format!(
+                    "Could not edit file: {display_path}. Error code: ENOENT."
+                ))
+            }
+            error => error,
+        })?;
         let _lock = mutation_lock(&path, cancellation)?;
         check_mutation_cancelled(cancellation)?;
+        #[cfg(unix)]
+        if self.unrestricted {
+            local_edit_access(&path)
+                .map_err(|error| unix_edit_access_error(error, display_path))?;
+        }
+        #[cfg(windows)]
+        if self.unrestricted {
+            let metadata = std::fs::metadata(&path)
+                .map_err(|error| windows_edit_access_error(error, display_path))?;
+            if metadata.permissions().readonly() {
+                return Err(Error::Config(format!(
+                    "Could not edit file: {display_path}. Error code: EPERM."
+                )));
+            }
+        }
         let original = self.text(&path)?;
         let (output, count) = crate::text_edit::apply(&original, args)?;
         if !self.unrestricted && output.len() as u64 > MAX_FILE_BYTES {
@@ -865,113 +3448,164 @@ impl CodingTool {
         check_mutation_cancelled(cancellation)?;
         atomic_write(&path, output.as_bytes(), cancellation)?;
         check_mutation_cancelled(cancellation)?;
-        let display_path = args["path"].as_str().unwrap_or_default();
-        let original = crate::text_edit::normalized_content(&original);
-        let edited = crate::text_edit::normalized_content(&output);
-        let diff = similar::TextDiff::from_lines(&original, &edited);
-        let first_changed_line = diff
-            .ops()
-            .iter()
-            .find(|op| !matches!(op, similar::DiffOp::Equal { .. }))
-            .map(|op| op.new_range().start + 1);
-        let digits = original
-            .split('\n')
-            .count()
-            .max(edited.split('\n').count())
-            .to_string()
-            .len();
-        let display = crate::text_edit::numbered_diff(&diff, digits);
-        let patch = diff
-            .unified_diff()
-            .context_radius(4)
-            .header(display_path, display_path)
-            .to_string();
-        Ok(Outcome::SucceededWithDetails {
-            output: format!("Successfully replaced {count} block(s) in {display_path}."),
-            details: json!({"diff":bounded(display),"patch":bounded(patch),"firstChangedLine":first_changed_line}),
-        })
+        Ok(edit_success(
+            args["path"].as_str().unwrap_or_default(),
+            &original,
+            &output,
+            count,
+        ))
     }
 
     fn list(&self, args: &Value, cancellation: &pi_rs::CancellationToken) -> Result<Outcome> {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let path = self.path(args["path"].as_str().unwrap_or("."))?;
+        let requested_path = args["path"].as_str().unwrap_or(".");
+        let requested = crate::coding_paths::resolve(
+            &self.root,
+            &crate::coding_paths::normalize(requested_path)?,
+        );
+        let path = self.path(requested_path)?;
+        let numeric_limit = local_numeric_limit(args, 500.0).floor().max(1.0);
         let limit = args["limit"].as_u64().unwrap_or(500).min(100_000) as usize;
         if !path.is_dir() {
             return Err(Error::Config(format!(
                 "Not a directory: {}",
-                path.display()
+                requested.display()
             )));
         }
         let directory = std::fs::read_dir(&path)
-            .map_err(|error| Error::Config(format!("Cannot read directory: {error}")))?;
+            .map_err(|error| directory_read_error(error, &requested, self.unrestricted))?;
         let mut entries = Vec::new();
         for entry in directory {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let entry = entry?;
+            let entry = entry
+                .map_err(|error| directory_read_error(error, &requested, self.unrestricted))?;
             entries.push((entry.file_name().to_string_lossy().to_lowercase(), entry));
         }
-        let locale = ["LC_ALL", "LANG"]
-            .into_iter()
-            .filter_map(|key| std::env::var(key).ok())
-            .find(|value| !value.is_empty())
-            .unwrap_or_default();
-        let collator = directory_collator(&locale)?;
+        let locale = crate::locale::select(|key| std::env::var(key).ok());
+        let collator = crate::locale::collator(&locale).map_err(|error| {
+            Error::Config(format!("Cannot initialize directory collation: {error}"))
+        })?;
         entries.sort_by(|(left, _), (right, _)| collator.compare(left, right));
-        let mut results = Vec::new();
+        let mut listing = crate::tool_output::Listing::new();
+        let mut result_count = 0usize;
         let mut entry_limit_reached = false;
         for (_, entry) in entries {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            if results.len() >= limit {
+            if if self.unrestricted {
+                (result_count as f64) >= numeric_limit
+            } else {
+                result_count >= limit
+            } {
                 entry_limit_reached = true;
                 break;
             }
             if let Ok(metadata) = std::fs::metadata(entry.path()) {
-                results.push(format!(
+                listing.push(&format!(
                     "{}{}",
                     entry.file_name().to_string_lossy(),
                     if metadata.is_dir() { "/" } else { "" }
                 ));
+                result_count += 1;
             }
         }
-        if results.is_empty() {
+        if result_count == 0 {
             return Ok(Outcome::Succeeded("(empty directory)".into()));
         }
         let mut details = Map::new();
         let mut notices = Vec::new();
         if entry_limit_reached {
-            details.insert("entryLimitReached".into(), json!(limit));
-            notices.push(format!(
-                "{limit} entries limit reached. Use limit={} for more",
-                limit.saturating_mul(2)
-            ));
+            if self.unrestricted {
+                details.insert("entryLimitReached".into(), json!(numeric_limit));
+                notices.push(format!(
+                    "{} entries limit reached. Use limit={} for more",
+                    js_number(numeric_limit),
+                    js_number(numeric_limit * 2.0)
+                ));
+            } else {
+                details.insert("entryLimitReached".into(), json!(limit));
+                notices.push(format!(
+                    "{limit} entries limit reached. Use limit={} for more",
+                    limit.saturating_mul(2)
+                ));
+            }
         }
-        Ok(crate::tool_output::listing(
-            results.join("\n"),
-            details,
-            notices,
-        ))
+        Ok(listing.finish(details, notices))
     }
 
     fn search(&self, args: &Value, cancellation: &pi_rs::CancellationToken) -> Result<Outcome> {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let base = self.path(args["path"].as_str().unwrap_or("."))?;
         let is_find = matches!(self.kind, Kind::Find);
-        let limit = args["limit"]
+        let numeric_find_limit = local_numeric_limit(args, 1000.0).floor().max(1.0);
+        // fd parses its arguments before checking the search path.
+        let unrestricted_find_limit = if is_find && self.unrestricted {
+            match fd_numeric_limit(numeric_find_limit + 1.0) {
+                Ok(limit) => Some(limit),
+                Err(output) => return Ok(pi_tool_failure(output)),
+            }
+        } else {
+            None
+        };
+        let requested_path = args["path"].as_str().unwrap_or(".");
+        let base = if is_find && self.unrestricted {
+            let requested = crate::coding_paths::resolve(
+                &self.root,
+                &crate::coding_paths::normalize(requested_path)?,
+            );
+            requested
+                .canonicalize()
+                .ok()
+                .filter(|path| path.is_dir())
+                .ok_or_else(|| Error::Config(format!(
+                    "[fd error]: Search path {requested:?} is not a directory.\n[fd error]: No valid search paths given."
+                )))?
+        } else {
+            self.path(requested_path)?
+        };
+        // Keep the requested name for a single-file grep, even when path()
+        // resolves a symlink to enforce workspace boundaries.
+        let grep_file_name = if !is_find && base.is_file() {
+            let input = crate::coding_paths::normalize(requested_path)?;
+            crate::coding_paths::resolve(&self.root, &input)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        let requested_limit = args["limit"]
             .as_u64()
-            .unwrap_or(if is_find { 1000 } else { 100 })
-            .min(100_000) as usize;
+            .unwrap_or(if is_find { 1000 } else { 100 });
+        let limit = unrestricted_find_limit.unwrap_or_else(|| {
+            let limit = if self.unrestricted {
+                requested_limit
+            } else {
+                requested_limit.min(100_000)
+            };
+            usize::try_from(limit).unwrap_or(usize::MAX)
+        });
         let limit = if is_find { limit } else { limit.max(1) };
         let pattern = string(args, "pattern")?;
+        let windows_pattern =
+            (is_find && self.unrestricted && cfg!(windows)).then(|| pattern.replace('\\', "/"));
+        let pattern = windows_pattern.as_deref().unwrap_or(pattern);
+        let pattern = if is_find && self.unrestricted {
+            pattern.trim_start_matches("./")
+        } else {
+            pattern
+        };
+        let is_path_pattern = pattern.contains('/');
+        let relative_find_pattern =
+            self.unrestricted && is_path_pattern && !Path::new(pattern).has_root();
         let glob = if is_find {
-            let pattern = if pattern.contains('/')
+            let pattern = if !self.unrestricted
+                && is_path_pattern
                 && !pattern.starts_with('/')
                 && !pattern.starts_with("**/")
             {
@@ -984,18 +3618,66 @@ impl CodingTool {
                     .case_insensitive(!pattern.chars().any(char::is_uppercase))
                     .literal_separator(true)
                     .build()
-                    .map_err(|error| Error::Config(error.to_string()))?
+                    .map_err(|error| {
+                        Error::Config(if self.unrestricted {
+                            format!("[fd error]: {error}")
+                        } else {
+                            error.to_string()
+                        })
+                    })?
                     .compile_matcher(),
             )
+        } else {
+            None
+        };
+        let grep_glob = (!is_find).then(|| args["glob"].as_str()).flatten();
+        let overrides = if self.unrestricted
+            && let Some(glob) = grep_glob.filter(|glob| !glob.is_empty())
+        {
+            // Ripgrep builds its glob filter before compiling the regex.
+            let root = if grep_file_name.is_some() {
+                Path::new(".")
+            } else {
+                &base
+            };
+            Some(grep_glob_overrides(root, glob, true)?)
         } else {
             None
         };
         let mut grep = if is_find {
             None
         } else {
-            Some(crate::file_search::Grep::new(args, limit)?)
+            let grep = crate::file_search::Grep::new(args, limit).map_err(|error| match error {
+                Error::Config(message)
+                    if self.unrestricted && message.starts_with("regex parse error:") =>
+                {
+                    let advice = if message.contains("look-around")
+                        || message.contains("backreferences")
+                    {
+                        "\n\nConsider enabling PCRE2 with the --pcre2 flag, which can handle backreferences\nand look-around."
+                    } else {
+                        ""
+                    };
+                    Error::Config(format!("rg: {message}{advice}"))
+                }
+                error => error,
+            })?;
+            let grep = if self.unrestricted {
+                grep.with_numeric_limit(args["limit"].as_f64().unwrap_or(100.0))
+            } else {
+                grep
+            };
+            Some(if base.is_file() {
+                grep.with_explicit_file()
+            } else {
+                grep
+            })
         };
         let mut results = Vec::new();
+        let mut find_count = 0usize;
+        let mut find_listing = crate::tool_output::Listing::new();
+        let mut find_line_count = 0usize;
+        let mut find_limit_exceeded = false;
         let mut walker = ignore::WalkBuilder::new(&base);
         walker.hidden(false);
         if is_find {
@@ -1014,20 +3696,34 @@ impl CodingTool {
                         || entry.file_name() != ".git"
                         || !entry.file_type().is_some_and(|kind| kind.is_dir())
                 })
+                // ignore's serial sorted walker visits each parent before its
+                // children and sorts siblings by Path::cmp. Path ordering is
+                // component-wise, so all descendants of a sibling precede the
+                // next sibling: this is the same global order as sorting the
+                // selected full paths afterwards.
                 .sort_by_file_path(std::path::Path::cmp);
-        } else if let Some(glob) = args["glob"].as_str() {
-            let mut overrides = ignore::overrides::OverrideBuilder::new(&self.root);
-            let overrides = overrides
-                .add(glob)
-                .and_then(|builder| builder.build())
-                .map_err(|error| Error::Config(error.to_string()))?;
+        } else if let Some(overrides) = overrides {
             walker.overrides(overrides);
+        } else if !self.unrestricted
+            && let Some(glob) = grep_glob
+        {
+            walker.overrides(grep_glob_overrides(&self.root, glob, false)?);
         }
-        for entry in walker.build() {
+        let mut find_error = None;
+        'entries: for entry in walker.build() {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let entry = entry.map_err(|error| Error::Config(error.to_string()))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if is_find => {
+                    // fd can return useful matches alongside a traversal error.
+                    // Preserve the error only if no matching path is produced.
+                    find_error.get_or_insert_with(|| error.to_string());
+                    continue;
+                }
+                Err(error) => return Err(Error::Config(error.to_string())),
+            };
             if (is_find && entry.depth() == 0)
                 || (!is_find && !entry.file_type().is_some_and(|kind| kind.is_file()))
             {
@@ -1039,7 +3735,9 @@ impl CodingTool {
                 .ok()
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new(entry.file_name()));
-            let match_path = if pattern.contains('/') {
+            let match_path = if relative_find_pattern {
+                relative
+            } else if is_path_pattern {
                 entry.path()
             } else {
                 Path::new(entry.file_name())
@@ -1048,18 +3746,44 @@ impl CodingTool {
                 continue;
             }
             if let Some(grep) = &mut grep {
-                if !grep.search(entry.path(), &relative.to_string_lossy(), cancellation)? {
+                let display = grep_file_name.as_deref().map_or_else(
+                    || {
+                        let relative = relative.to_string_lossy();
+                        if self.unrestricted && relative.starts_with("..") {
+                            entry.file_name().to_string_lossy().into_owned().into()
+                        } else if self.unrestricted || cfg!(windows) {
+                            std::borrow::Cow::Owned(relative.replace('\\', "/"))
+                        } else {
+                            relative
+                        }
+                    },
+                    std::borrow::Cow::from,
+                );
+                if !grep.search(entry.path(), &display, cancellation)? {
                     break;
                 }
             } else {
-                let mut path = relative
-                    .to_string_lossy()
-                    .replace(std::path::MAIN_SEPARATOR, "/");
-                if entry.file_type().is_some_and(|kind| kind.is_dir()) {
-                    path.push('/');
+                let is_directory = entry.file_type().is_some_and(|kind| kind.is_dir());
+                if self.unrestricted {
+                    for line in find_pi_lines(&base, entry.path(), is_directory) {
+                        if find_line_count as f64 >= numeric_find_limit {
+                            find_limit_exceeded = true;
+                            break 'entries;
+                        }
+                        find_listing.push(&line);
+                        find_line_count += 1;
+                    }
+                } else {
+                    let mut path = relative
+                        .to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/");
+                    if is_directory {
+                        path.push('/');
+                    }
+                    results.push(path);
                 }
-                results.push(path);
-                if results.len() >= limit {
+                find_count += 1;
+                if find_count >= limit {
                     break;
                 }
             }
@@ -1067,13 +3791,37 @@ impl CodingTool {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        if is_find && self.unrestricted {
+            if find_line_count == 0 {
+                if let Some(error) = find_error {
+                    return Err(Error::Config(error));
+                }
+                return Ok(Outcome::Succeeded("No files found matching pattern".into()));
+            }
+            let mut details = Map::new();
+            let mut notices = Vec::new();
+            if find_limit_exceeded {
+                details.insert("resultLimitReached".into(), json!(numeric_find_limit));
+                notices.push(format!(
+                    "{} results limit reached. Use limit={} for more, or refine pattern",
+                    js_number(numeric_find_limit),
+                    js_number(numeric_find_limit * 2.0)
+                ));
+            }
+            return Ok(find_listing.finish(details, notices));
+        }
         Ok(match grep {
             Some(grep) => grep.finish(),
             None => {
                 if results.is_empty() {
+                    if let Some(error) = find_error {
+                        return Err(Error::Config(error));
+                    }
                     return Ok(Outcome::Succeeded("No files found matching pattern".into()));
                 }
-                results.sort();
+                if !self.unrestricted {
+                    results.sort();
+                }
                 let mut details = Map::new();
                 let mut notices = Vec::new();
                 if results.len() >= limit {
@@ -1112,21 +3860,7 @@ impl CodingTool {
                 Outcome::Failed(Error::Config(output).to_string())
             };
         }
-        let output = if result.output.display.is_empty() {
-            "(no output)".into()
-        } else {
-            result.output.display
-        };
-        match exit_code(result.status) {
-            0 => match result.output.details {
-                Some(details) => Outcome::SucceededWithDetails { output, details },
-                None => Outcome::Succeeded(output),
-            },
-            code => Outcome::Failed(shell_status(
-                &output,
-                &format!("Command exited with code {code}"),
-            )),
-        }
+        shell_outcome(result.output, exit_code(result.status), result.elapsed)
     }
 
     #[cfg(test)]
@@ -1144,17 +3878,29 @@ impl CodingTool {
         host: Option<Arc<dyn ToolHost>>,
     ) -> Result<ShellResult> {
         if cancellation.is_cancelled() {
-            return Err(Error::Cancelled);
+            return if self.unrestricted {
+                Err(Error::Config("Command aborted".into()))
+            } else {
+                Err(Error::Cancelled)
+            };
         }
         let result = self
             .shell_stream(args, cancellation, &mut |_| {}, false, host)
             .await?;
         if result.timed_out {
-            let status = format!(
-                "Command timed out after {} seconds",
-                shell_timeout(args)?.expect("elapsed timeout").as_secs_f64()
-            );
-            return Err(Error::Config(shell_status(&result.output.display, &status)));
+            let seconds = if self.unrestricted {
+                js_number(args["timeout"].as_f64().expect("validated timeout"))
+            } else {
+                shell_timeout(args, false)?
+                    .expect("elapsed timeout")
+                    .as_secs_f64()
+                    .to_string()
+            };
+            let status = format!("Command timed out after {seconds} seconds");
+            return Err(Error::Config(shell_status(
+                &result.output.display,
+                &append_shell_exit_status(status, result.exit_before_timeout),
+            )));
         }
         if result.cancelled {
             return Err(Error::Config(shell_status(
@@ -1173,7 +3919,7 @@ impl CodingTool {
         host: Option<Arc<dyn ToolHost>>,
     ) -> Result<ShellResult> {
         let started = std::time::Instant::now();
-        let timeout = shell_timeout(args)?;
+        let timeout = shell_timeout(args, self.unrestricted && !sanitize_user_output)?;
         let crate::shell_config::Launch {
             mut command,
             input,
@@ -1185,6 +3931,19 @@ impl CodingTool {
             string(args, "command")?,
             !sanitize_user_output,
         )?;
+        if self.unrestricted && !sanitize_user_output {
+            let shell_name = if matches!(self.kind, Kind::PowerShell) {
+                "PowerShell"
+            } else {
+                "bash"
+            };
+            check_local_shell_cwd(&cwd, shell_name, cancellation)
+                .await
+                .map_err(|error| match error {
+                    Error::Cancelled => Error::Config("Command aborted".into()),
+                    error => error,
+                })?;
+        }
         command
             .current_dir(cwd)
             .stdin(if input.is_some() {
@@ -1198,6 +3957,7 @@ impl CodingTool {
         #[cfg(unix)]
         command.process_group(0);
         let mut process = ProcessGroup::spawn(command)?;
+        let spawned_at = tokio::time::Instant::now();
         let input_task = input.map(|input| {
             let mut stdin = process.stdin();
             tokio::spawn(async move {
@@ -1234,35 +3994,53 @@ impl CodingTool {
         });
         let mut stdout_open = true;
         let mut stderr_open = true;
-        let mut status = None;
+        let mut shell_exit = None;
         let mut stdout_chunk = [0; 8192];
         let mut stderr_chunk = [0; 8192];
         let mut drain_deadline = None;
+        let mut drain_max = None;
         let mut cancelled = false;
         let mut timed_out = false;
+        let mut exit_before_timeout = None;
+        #[cfg(all(test, unix))]
+        let mut drain_reason = "pipes closed";
         let mut stdout_text = ShellStream::default();
         let mut stderr_text = ShellStream::default();
         let mut stdout_filter = UserShellFilter::default();
-        while status.is_none() || stdout_open || stderr_open {
+        while shell_exit.is_none() || stdout_open || stderr_open {
             tokio::select! {
                 _ = cancellation.cancelled(), if !cancelled => {
                     cancelled = true;
                     process.terminate();
+                    if shell_exit.is_some() {
+                        drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    }
                 }
                 _ = &mut deadline, if !cancelled => {
                     timed_out = true;
                     cancelled = true;
+                    // Pi captures its exit event before the deadline callback.
+                    // Only describe inherited pipes when the exit was observed
+                    // and the output loop was still draining at the deadline.
+                    exit_before_timeout = shell_exit.filter(|_| stdout_open || stderr_open);
                     process.terminate();
+                    if shell_exit.is_some() {
+                        drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    }
                 }
-                result = process.wait(), if status.is_none() => {
-                    status = Some(result?);
+                result = process.wait(), if shell_exit.is_none() => {
+                    shell_exit = Some((result?, spawned_at.elapsed()));
                     process.finished = true;
                     // Descendants may retain inherited pipes after the shell exits.
-                    drain_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                    drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    drain_max = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_MAX);
                 }
                 count = stdout.read(&mut stdout_chunk), if stdout_open => {
                     let count = count?;
                     stdout_open = count != 0;
+                    if count != 0 && shell_exit.is_some() && !cancelled {
+                        drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    }
                     if sanitize_user_output {
                         output.record_raw_bytes(count);
                         let mut clean = String::new();
@@ -1282,6 +4060,9 @@ impl CodingTool {
                 count = stderr.read(&mut stderr_chunk), if stderr_open => {
                     let count = count?;
                     stderr_open = count != 0;
+                    if count != 0 && shell_exit.is_some() && !cancelled {
+                        drain_deadline = Some(tokio::time::Instant::now() + SHELL_POST_EXIT_IDLE);
+                    }
                     if sanitize_user_output {
                         output.record_raw_bytes(count);
                         let mut clean = String::new();
@@ -1303,7 +4084,19 @@ impl CodingTool {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending().await,
                     }
-                } => break,
+                } => {
+                    #[cfg(all(test, unix))] { drain_reason = "idle deadline"; }
+                    break;
+                },
+                _ = async {
+                    match drain_max {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    #[cfg(all(test, unix))] { drain_reason = "maximum deadline"; }
+                    break;
+                },
             }
         }
         if let Some(input_task) = input_task {
@@ -1330,12 +4123,16 @@ impl CodingTool {
                 worker.abort();
             }
         }
+        let (status, _) = shell_exit.expect("shell status observed");
         Ok(ShellResult {
             cancelled,
             timed_out,
+            exit_before_timeout,
             output: output.finish()?,
-            status: status.expect("shell status observed"),
+            status,
             elapsed: started.elapsed().as_secs_f64(),
+            #[cfg(all(test, unix))]
+            drain_reason,
         })
     }
 }
@@ -1349,15 +4146,24 @@ pub struct PreparedImage {
 }
 /// Normalize supported image readers under the shared decoding and output limits.
 pub fn normalize_image<R: std::io::BufRead + std::io::Seek>(
-    mut reader: image::ImageReader<R>,
+    reader: image::ImageReader<R>,
 ) -> Result<PreparedImage> {
+    normalize_image_cancellable(reader, None)
+}
+
+fn normalize_image_cancellable<R: std::io::BufRead + std::io::Seek>(
+    mut reader: image::ImageReader<R>,
+    cancellation: Option<&pi_rs::CancellationToken>,
+) -> Result<PreparedImage> {
+    crate::image_profile::check_cancelled(cancellation)?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(128 * 1024 * 1024);
     reader.limits(limits);
-    let original = reader
-        .decode()
-        .map_err(|error| Error::Config(format!("cannot decode image: {error}")))?;
-    prepare_image(original)
+    let original = reader.decode();
+    crate::image_profile::check_cancelled(cancellation)?;
+    let original =
+        original.map_err(|error| Error::Config(format!("cannot decode image: {error}")))?;
+    prepare_image_with_resize_cancellable(original, true, cancellation)
 }
 
 /// Normalize a decoded image under the same limits as file and clipboard input.
@@ -1370,6 +4176,41 @@ pub fn prepare_image_with_resize(
     original: image::DynamicImage,
     resize: bool,
 ) -> Result<PreparedImage> {
+    prepare_image_with_resize_cancellable(original, resize, None)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImageCheckpoint {
+    Thumbnail,
+    Png,
+}
+
+#[cfg(test)]
+thread_local! {
+    static IMAGE_CANCEL_AT: std::cell::RefCell<Option<(ImageCheckpoint, pi_rs::CancellationToken)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn cancel_at_image_checkpoint(checkpoint: ImageCheckpoint) {
+    IMAGE_CANCEL_AT.with(|slot| {
+        let pending = slot.borrow_mut().take();
+        if let Some((target, token)) = pending {
+            if target == checkpoint {
+                token.cancel();
+            } else {
+                *slot.borrow_mut() = Some((target, token));
+            }
+        }
+    });
+}
+
+fn prepare_image_with_resize_cancellable(
+    original: image::DynamicImage,
+    resize: bool,
+    cancellation: Option<&pi_rs::CancellationToken>,
+) -> Result<PreparedImage> {
+    crate::image_profile::check_cancelled(cancellation)?;
     let source_width = original.width();
     let source_height = original.height();
     let mut resized = if resize && (source_width > 2000 || source_height > 2000) {
@@ -1377,6 +4218,9 @@ pub fn prepare_image_with_resize(
     } else {
         original
     };
+    #[cfg(test)]
+    cancel_at_image_checkpoint(ImageCheckpoint::Thumbnail);
+    crate::image_profile::check_cancelled(cancellation)?;
     let limit = if resize {
         512 * 1024
     } else {
@@ -1385,9 +4229,12 @@ pub fn prepare_image_with_resize(
     let mut png = Vec::new();
     loop {
         png.clear();
-        resized
-            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
-            .map_err(|error| Error::Config(error.to_string()))?;
+        crate::image_profile::check_cancelled(cancellation)?;
+        let encoded = resized.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png);
+        #[cfg(test)]
+        cancel_at_image_checkpoint(ImageCheckpoint::Png);
+        crate::image_profile::check_cancelled(cancellation)?;
+        encoded.map_err(|error| Error::Config(error.to_string()))?;
         if png.len() <= limit {
             break;
         }
@@ -1402,6 +4249,7 @@ pub fn prepare_image_with_resize(
             return Err(Error::Config("image cannot fit the output limit".into()));
         }
         resized = resized.thumbnail(width, height);
+        crate::image_profile::check_cancelled(cancellation)?;
     }
     Ok(PreparedImage {
         png,
@@ -1415,9 +4263,12 @@ pub fn prepare_image_with_resize(
 struct ShellResult {
     cancelled: bool,
     timed_out: bool,
+    exit_before_timeout: Option<(std::process::ExitStatus, Duration)>,
     output: crate::shell_output::Output,
     status: std::process::ExitStatus,
     elapsed: f64,
+    #[cfg(all(test, unix))]
+    drain_reason: &'static str,
 }
 
 struct UserShellFilter {
@@ -1591,6 +4442,16 @@ fn atomic_write(
     Ok(())
 }
 
+fn local_write_mkdir_error(error: std::io::Error, parent: &Path) -> Error {
+    let kind = error.kind();
+    let diagnostic = match kind {
+        std::io::ErrorKind::AlreadyExists => "EEXIST: file already exists",
+        std::io::ErrorKind::NotADirectory => "ENOTDIR: not a directory",
+        _ => return error.into(),
+    };
+    std::io::Error::new(kind, format!("{diagnostic}, mkdir '{}'", parent.display())).into()
+}
+
 fn edit_error_text(error: Error) -> String {
     match error {
         Error::Config(message) => message,
@@ -1613,6 +4474,32 @@ fn bounded(mut output: String) -> String {
     output
 }
 
+fn operation_timeout(
+    timeout: Duration,
+    shell_exit: Option<(std::process::ExitStatus, Duration)>,
+) -> Error {
+    let message = format!("Command timed out after {} seconds", timeout.as_secs_f64());
+    Error::Config(append_shell_exit_status(message, shell_exit))
+}
+
+fn append_shell_exit_status(
+    mut message: String,
+    shell_exit: Option<(std::process::ExitStatus, Duration)>,
+) -> String {
+    if let Some((status, elapsed)) = shell_exit {
+        use std::fmt::Write as _;
+        let code = exit_code(status);
+        let seconds = (elapsed.as_secs_f64() * 10.0).round() / 10.0;
+        // Pi uses this wording whenever inherited pipes remain open at the
+        // deadline, including when the descendant did not write to them.
+        let _ = write!(
+            message,
+            ". The shell exited with code {code} after {seconds} seconds, but background processes it started kept writing output until the timeout."
+        );
+    }
+    message
+}
+
 fn shell_status(output: &str, status: &str) -> String {
     if output.is_empty() {
         status.to_owned()
@@ -1621,18 +4508,46 @@ fn shell_status(output: &str, status: &str) -> String {
     }
 }
 
-fn shell_timeout(args: &Value) -> Result<Option<Duration>> {
+const MAX_SHELL_TIMEOUT_MILLIS: f64 = 2_147_483_647.0;
+const MAX_SHELL_TIMEOUT_SECONDS: f64 = MAX_SHELL_TIMEOUT_MILLIS / 1_000.0;
+
+fn shell_timeout_schema(pi_diagnostics: bool) -> Value {
+    if pi_diagnostics {
+        // Pi's tool code distinguishes nonpositive values from excessive timeouts.
+        json!({"type":"number"})
+    } else {
+        json!({"type":"number","exclusiveMinimum":0,"maximum":MAX_SHELL_TIMEOUT_SECONDS})
+    }
+}
+
+fn shell_timeout(args: &Value, pi_diagnostics: bool) -> Result<Option<Duration>> {
     let Some(value) = args.get("timeout") else {
         return Ok(None);
     };
-    let seconds = value
+    let native_error = || {
+        Error::Config(
+            "timeout must be a positive number no greater than 2147483.647 seconds".into(),
+        )
+    };
+    let Some(seconds) = value
         .as_f64()
-        .filter(|seconds| seconds.is_finite() && *seconds > 0.0 && *seconds <= 2_147_483.647)
-        .ok_or_else(|| {
-            Error::Config(
-                "timeout must be a positive number no greater than 2147483.647 seconds".into(),
-            )
-        })?;
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+    else {
+        return Err(if pi_diagnostics {
+            Error::Config("Invalid timeout: must be a finite number of seconds".into())
+        } else {
+            native_error()
+        });
+    };
+    if pi_diagnostics {
+        if seconds * 1_000.0 > MAX_SHELL_TIMEOUT_MILLIS {
+            return Err(Error::Config(format!(
+                "Invalid timeout: maximum is {MAX_SHELL_TIMEOUT_SECONDS} seconds"
+            )));
+        }
+    } else if seconds > MAX_SHELL_TIMEOUT_SECONDS {
+        return Err(native_error());
+    }
     Ok(Some(Duration::from_secs_f64(seconds)))
 }
 
@@ -1643,7 +4558,7 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        128 + status.signal().unwrap_or(0)
+        status.signal().map_or(1, |signal| 128 + signal)
     }
     #[cfg(not(unix))]
     {
@@ -1736,7 +4651,611 @@ impl Drop for ProcessGroup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_image_read_honors_cancellation_before_processing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        image::RgbImage::new(2, 2).save(&path).unwrap();
+        let tool = CodingTool {
+            root: dir.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                unsupported_image_model: None,
+            },
+        };
+        let token = pi_rs::CancellationToken::new();
+        assert!(
+            tool.read_image_cancellable(&path, true, Some(&token))
+                .unwrap()
+                .is_some()
+        );
+        token.cancel();
+        assert!(matches!(
+            tool.read_image_cancellable(&path, true, Some(&token)),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            tool.read(&json!({"path": "image.png"}), &token),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn image_processing_stops_when_cancelled_during_input_read() {
+        use std::io::{BufRead, Read, Seek, SeekFrom};
+
+        struct CancelOnRead {
+            data: std::io::Cursor<Vec<u8>>,
+            token: pi_rs::CancellationToken,
+        }
+        impl Read for CancelOnRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.token.cancel();
+                Read::read(&mut self.data, buf)
+            }
+        }
+        impl BufRead for CancelOnRead {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                self.token.cancel();
+                self.data.fill_buf()
+            }
+            fn consume(&mut self, amount: usize) {
+                self.data.consume(amount);
+            }
+        }
+        impl Seek for CancelOnRead {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.data.seek(pos)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        image::RgbImage::new(2, 2).save(&path).unwrap();
+        for unrestricted in [true, false] {
+            let tool = CodingTool {
+                root: dir.path().to_path_buf(),
+                unrestricted,
+                shell: ShellConfig::default(),
+                kind: Kind::Read {
+                    auto_resize: true,
+                    profile: None,
+                    unsupported_image_model: None,
+                },
+            };
+            let token = pi_rs::CancellationToken::new();
+            let reader = CancelOnRead {
+                data: std::io::Cursor::new(std::fs::read(&path).unwrap()),
+                token: token.clone(),
+            };
+            let reader = image::ImageReader::with_format(reader, image::ImageFormat::Png);
+            assert!(matches!(
+                tool.process_image(&path, reader, image::ImageFormat::Png, Some(&token)),
+                Err(Error::Cancelled)
+            ));
+        }
+    }
+
+    #[test]
+    fn restricted_image_cancels_after_thumbnail_and_png_encoding() {
+        let image = image::DynamicImage::new_rgb8(2001, 2);
+        let mut encoded = Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let encoded = encoded.into_inner();
+        for checkpoint in [ImageCheckpoint::Thumbnail, ImageCheckpoint::Png] {
+            let token = pi_rs::CancellationToken::new();
+            IMAGE_CANCEL_AT.with(|slot| *slot.borrow_mut() = Some((checkpoint, token.clone())));
+            let reader = image::ImageReader::with_format(
+                Cursor::new(encoded.clone()),
+                image::ImageFormat::Png,
+            );
+            assert!(matches!(
+                normalize_image_cancellable(reader, Some(&token)),
+                Err(Error::Cancelled)
+            ));
+            assert!(token.is_cancelled());
+        }
+    }
+
+    #[test]
+    fn restricted_image_preserves_dimensions_pixels_and_decode_errors() {
+        let pixels = image::RgbImage::from_pixel(4000, 2000, image::Rgb([12, 34, 56]));
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(pixels)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let reader = image::ImageReader::with_format(
+            Cursor::new(bytes.into_inner()),
+            image::ImageFormat::Png,
+        );
+        let token = pi_rs::CancellationToken::new();
+        let actual = normalize_image_cancellable(reader, Some(&token)).unwrap();
+        assert_eq!((actual.source_width, actual.source_height), (4000, 2000));
+        assert_eq!((actual.width, actual.height), (2000, 1000));
+        let decoded = image::load_from_memory(&actual.png).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (2000, 1000));
+        assert_eq!(*decoded.get_pixel(0, 0), image::Rgb([12, 34, 56]));
+        assert_eq!(*decoded.get_pixel(1000, 500), image::Rgb([12, 34, 56]));
+
+        let invalid =
+            image::ImageReader::with_format(Cursor::new(vec![0u8; 8]), image::ImageFormat::Png);
+        assert!(matches!(normalize_image_cancellable(invalid, Some(&token)),
+            Err(Error::Config(message)) if message.starts_with("cannot decode image:") && message.contains("PNG")));
+    }
+
+    #[test]
+    fn image_read_structured_projection_uses_first_text_and_image() {
+        use pi_rs::{AttachmentRef, Outcome};
+        use serde_json::json;
+        let image = Outcome::Structured {
+            data: json!({"content":[
+                {"type":"text", "text":"read note"},
+                {"type":"image", "mimeType":"image/png", "data":"aW1hZ2U="},
+                {"type":"text", "text":"other"}
+            ]}),
+            attachments: vec![],
+        };
+        assert_eq!(
+            super::read_event_content(&image),
+            Some(
+                json!({"type":"image", "mimeType":"image/png", "data":"aW1hZ2U=", "note":"read note"})
+            )
+        );
+        let omitted = Outcome::Structured {
+            data: json!({"content":[{"type":"text", "text":"image omitted"}]}),
+            attachments: vec![],
+        };
+        assert_eq!(
+            super::read_event_content(&omitted),
+            Some(json!("image omitted"))
+        );
+        let malformed = Outcome::Structured {
+            data: json!({"content":[{"type":"image", "data":"x"}]}),
+            attachments: vec![],
+        };
+        assert_eq!(super::read_event_content(&malformed), None);
+        let external = Outcome::Structured {
+            data: json!({"content":[]}),
+            attachments: vec![AttachmentRef {
+                id: "asset".into(),
+                media_type: "image/png".into(),
+            }],
+        };
+        assert_eq!(super::read_event_content(&external), None);
+        let oversized = Outcome::Structured {
+            data: json!({"content":[{"type":"image", "mimeType":"image/png", "data":"x".repeat(8 * 1024 * 1024 + 1)}]}),
+            attachments: vec![],
+        };
+        assert_eq!(super::read_event_content(&oversized), None);
+    }
+
+    #[test]
+    fn attachment_image_io_invalid_data_does_not_fall_back_to_text() {
+        let image_error = std::io::Error::new(std::io::ErrorKind::InvalidData, "image read failed");
+        let result = super::finish_attachment(Err(image_error.into()), || {
+            panic!("image errors must not invoke text decoding")
+        });
+        assert!(
+            matches!(result, Err(pi_rs::Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_structured_result_preserves_output_and_exit_status() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = super::CodingTool {
+            root: root.path().into(),
+            unrestricted: true,
+            shell: super::ShellConfig::default(),
+            kind: super::Kind::Bash,
+        };
+        for (command, expected, code) in [
+            ("printf hello", "hello", 0),
+            ("printf bad; exit 7", "bad\n\nCommand exited with code 7", 7),
+        ] {
+            let outcome = tool
+                .bash(
+                    &serde_json::json!({"command":command}),
+                    &pi_rs::CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(outcome.tool_content(), expected);
+            assert_eq!(outcome.is_error(), code != 0);
+            let pi_rs::Outcome::TextResultWithStructuredContent {
+                structured_content, ..
+            } = outcome
+            else {
+                panic!("missing structured result")
+            };
+            assert_eq!(
+                structured_content["output"],
+                if code == 0 { "hello" } else { "bad" }
+            );
+            assert_eq!(structured_content["exit_code"], code);
+            assert_eq!(structured_content["truncated"], false);
+            assert!(structured_content["wall_time_seconds"].as_f64().is_some());
+        }
+        for (signal, code) in [("TERM", 143), ("KILL", 137)] {
+            let terminated = tool
+                .bash(
+                    &serde_json::json!({"command":format!("printf partial; kill -{signal} $$")}),
+                    &pi_rs::CancellationToken::new(),
+                )
+                .await;
+            let pi_rs::Outcome::TextResultWithStructuredContent {
+                output,
+                structured_content,
+                is_error,
+                ..
+            } = terminated
+            else {
+                panic!("signal termination must return a structured result")
+            };
+            assert_eq!(
+                output,
+                format!("partial\n\nCommand exited with code {code}")
+            );
+            assert!(is_error);
+            assert_eq!(structured_content["output"], "partial");
+            assert_eq!(structured_content["exit_code"], code);
+        }
+    }
+
+    #[test]
+    fn shell_structured_result_reports_bounded_full_output() {
+        let mut output = super::super::shell_output::Accumulator::default();
+        output.append(&vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        let outcome = super::shell_outcome(output.finish().unwrap(), 0, 1.26);
+        let pi_rs::Outcome::TextResultWithStructuredContent {
+            structured_content,
+            details,
+            ..
+        } = outcome
+        else {
+            panic!("missing structured result")
+        };
+        let text = structured_content["output"].as_str().unwrap();
+        assert!(text.contains("\n\n[... 1 bytes omitted ...]\n\n"));
+        assert_eq!(
+            text.bytes().filter(|byte| *byte == b'x').count(),
+            1024 * 1024
+        );
+        assert_eq!(structured_content["truncated"], true);
+        assert_eq!(structured_content["wall_time_seconds"], 1.3);
+        assert!(
+            std::path::Path::new(structured_content["full_output_path"].as_str().unwrap())
+                .is_file()
+        );
+        assert!(details.is_some());
+        std::fs::remove_file(structured_content["full_output_path"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn shell_partial_line_snapshot_keeps_output_and_exit_status() {
+        for code in [0, 2] {
+            let input = format!("{}\n", "x".repeat(300_000));
+            let mut output = super::super::shell_output::Accumulator::default();
+            for chunk in input.as_bytes().chunks(313) {
+                output.append(chunk).unwrap();
+            }
+            let output = output.finish().unwrap();
+            let path = output.path.clone().unwrap();
+            let outcome = super::shell_outcome(output, code, 0.0);
+            let pi_rs::Outcome::TextResultWithStructuredContent {
+                output,
+                details,
+                structured_content,
+                is_error,
+            } = outcome
+            else {
+                panic!("missing structured result")
+            };
+            assert!(output.starts_with(&format!(
+                "{}\n\n[Showing last 50.0KB of line 1 (line is 0B). Full output: ",
+                "x".repeat(50 * 1024)
+            )));
+            assert_eq!(is_error, code != 0);
+            assert_eq!(output.ends_with("Command exited with code 2"), code == 2);
+            assert_eq!(details.unwrap()["truncation"]["outputLines"], 1);
+            assert_eq!(structured_content["output"], input);
+            assert_eq!(std::fs::read(&path).unwrap(), input.as_bytes());
+            std::fs::remove_file(path).unwrap();
+        }
+    }
     use super::*;
+
+    #[test]
+    fn coding_tool_sampling_declarations_survive_backend_wrappers() {
+        let root = tempfile::tempdir().unwrap();
+        for wrapped in [false, true] {
+            let mut tools = CodingTools::local(root.path()).unwrap();
+            if wrapped {
+                tools = tools
+                    .with_read_operations(Arc::new(LocalReadOperations))
+                    .unwrap()
+                    .with_write_operations(Arc::new(LocalWriteOperations))
+                    .unwrap()
+                    .with_edit_operations(Arc::new(LocalEditOperations))
+                    .unwrap()
+                    .with_bash_operations(create_local_bash_operations(None))
+                    .unwrap();
+            }
+            let mut registry = pi_rs::Registry::default();
+            registry.register(Arc::new(tools)).unwrap();
+            let declarations = registry.active_tool_declarations();
+            for declaration in &declarations {
+                let expected = matches!(
+                    declaration.spec.name.as_str(),
+                    "read" | "write" | "edit" | "bash"
+                )
+                .then_some(ToolConstraint::JsonSchema {
+                    strict: StrictToolPolicy::Prefer,
+                });
+                assert_eq!(
+                    declaration.constrained_sampling, expected,
+                    "{}",
+                    declaration.spec.name
+                );
+            }
+            for name in ["read", "write", "edit", "bash"] {
+                assert!(declarations.iter().any(|tool| tool.spec.name == name));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_preserves_the_filesystem_spelling_of_a_symlink_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let actual = root.join("real\u{00a0}dir");
+        let lookalike = root.join("real dir");
+        std::fs::create_dir(&actual).unwrap();
+        std::fs::create_dir(&lookalike).unwrap();
+        std::fs::write(actual.join("file"), "original").unwrap();
+        std::fs::write(lookalike.join("file"), "untouched").unwrap();
+        std::os::unix::fs::symlink(&actual, root.join("alias")).unwrap();
+
+        for unrestricted in [false, true] {
+            let tool = CodingTool {
+                root: root.clone(),
+                unrestricted,
+                shell: ShellConfig::default(),
+                kind: Kind::Write,
+            };
+            tool.write(&json!({"path":"alias/file", "content":"updated"}))
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(actual.join("file")).unwrap(),
+                "updated"
+            );
+            assert_eq!(
+                std::fs::read_to_string(lookalike.join("file")).unwrap(),
+                "untouched"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_write_matches_pi_directory_diagnostics() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("dir")).unwrap();
+        std::fs::write(root.join("parent-file"), "retained").unwrap();
+        std::os::unix::fs::symlink("dir", root.join("dir-link")).unwrap();
+        std::os::unix::fs::symlink("parent-file", root.join("file-link")).unwrap();
+        let tool = CodingTool {
+            root: root.clone(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Write,
+        };
+        for (path, reported_path, diagnostic) in [
+            (
+                "dir",
+                "dir",
+                "EISDIR: illegal operation on a directory, open",
+            ),
+            (
+                "dir-link",
+                "dir-link",
+                "EISDIR: illegal operation on a directory, open",
+            ),
+            (
+                "parent-file/child",
+                "parent-file",
+                "EEXIST: file already exists, mkdir",
+            ),
+            (
+                "parent-file/nested/child",
+                "parent-file/nested",
+                "ENOTDIR: not a directory, mkdir",
+            ),
+            (
+                "file-link/child",
+                "file-link",
+                "EEXIST: file already exists, mkdir",
+            ),
+            (
+                "file-link/nested/child",
+                "file-link/nested",
+                "ENOTDIR: not a directory, mkdir",
+            ),
+        ] {
+            let result = tool
+                .invoke(
+                    json!({"path":path,"content":"replacement"}),
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            let expected = format!("{diagnostic} '{}'", root.join(reported_path).display());
+            assert!(
+                matches!(&result, Outcome::Failed(actual) if actual == &expected),
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("parent-file")).unwrap(),
+            "retained"
+        );
+        assert!(
+            std::fs::read_dir(root.join("dir"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        assert!(matches!(
+            scoped.write(&json!({"path":"dir","content":"replacement"})),
+            Err(Error::Config(message)) if message == "expected a regular file"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_write_fifo_substitution_settles_after_cancellation() {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("target");
+        std::fs::write(&path, "original").unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *LOCAL_WRITE_OPEN_HOOK.lock().unwrap() = Some(LocalWriteOpenHook {
+            expected: path.clone(),
+            ready: ready_tx,
+            resume: resume_rx,
+        });
+        let tool = create_write_tool(&root, Arc::new(LocalWriteOperations)).unwrap();
+        let cancellation = pi_rs::CancellationToken::new();
+        let token = cancellation.clone();
+        let task = tokio::spawn(async move {
+            tool.invoke(
+                json!({"path":"target", "content":"new"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: token,
+                },
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || ready_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .expect("open precheck completed");
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // A reader lets open succeed, exercising post-open fstat, not just ENXIO.
+        let fd = unsafe { libc::open(name.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        assert!(fd >= 0);
+        let _reader = unsafe { std::fs::File::from_raw_fd(fd) };
+        cancellation.cancel();
+        resume_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("FIFO open must not block")
+            .unwrap();
+        *LOCAL_WRITE_OPEN_HOOK.lock().unwrap() = None;
+        assert!(matches!(result, Outcome::Failed(_)));
+        assert!(std::fs::metadata(&path).unwrap().file_type().is_fifo());
+        let mut byte = [0u8; 1];
+        let count = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+        assert_eq!(count, 0, "no content was written to the FIFO");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_injected_mutations_bind_target_before_waiting_for_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let a = root.join("a");
+        let b = root.join("b");
+        let alias = root.join("alias");
+        for edit in [true, false] {
+            std::fs::write(&a, "before").unwrap();
+            std::fs::write(&b, "before").unwrap();
+            let _ = std::fs::remove_file(&alias);
+            std::os::unix::fs::symlink(&a, &alias).unwrap();
+            let held = mutation_lock(&a, &pi_rs::CancellationToken::new()).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            *LOCAL_LOCK_RESOLVED.lock().unwrap() = Some((alias.clone(), tx));
+            let tool = if edit {
+                create_edit_tool_with_options(
+                    &root,
+                    Arc::new(LocalEditOperations),
+                    EditToolOptions {
+                        allow_non_atomic_fallback: true,
+                    },
+                )
+                .unwrap()
+            } else {
+                create_write_tool(&root, Arc::new(LocalWriteOperations)).unwrap()
+            };
+            let args = if edit {
+                json!({"path":"alias", "edits":[{"oldText":"before", "newText":"after"}]})
+            } else {
+                json!({"path":"alias", "content":"after"})
+            };
+            let task = tokio::spawn(async move {
+                tool.invoke(
+                    args,
+                    ToolContext {
+                        operation_id: uuid::Uuid::new_v4(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await
+            });
+            tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(2)))
+                .await
+                .unwrap()
+                .expect("tool resolved its target");
+            std::fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(&b, &alias).unwrap();
+            *LOCAL_LOCK_RESOLVED.lock().unwrap() = None;
+            drop(held);
+            let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                Outcome::Succeeded(_) | Outcome::SucceededWithDetails { .. }
+            ));
+            assert_eq!(std::fs::read_to_string(&a).unwrap(), "after");
+            assert_eq!(std::fs::read_to_string(&b).unwrap(), "before");
+        }
+    }
+
+    #[test]
+    fn atomic_edit_failure_before_replace_preserves_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, "original").unwrap();
+        let cancellation = pi_rs::CancellationToken::new();
+        cancellation.cancel();
+        assert!(matches!(
+            atomic_write(&path, b"replacement", &cancellation),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -1777,7 +5296,8 @@ mod tests {
                 host.clone(),
             )
             .await;
-        assert!(matches!(result, Outcome::Succeeded(ref text) if text == "firstsecond"));
+        assert_eq!(result.tool_content(), "firstsecond");
+        assert!(!result.is_error());
         let events = host.0.lock().unwrap();
         assert_eq!(events[0]["content"], json!([]));
         assert!(
@@ -1898,6 +5418,37 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn model_shell_receives_external_session_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let config = ShellConfig::default();
+        config.set_context_with_external_id(
+            ShellContext {
+                id: uuid::Uuid::new_v4(),
+                path: None,
+                provider: "fixture".into(),
+                model: "model".into(),
+                reasoning_level: None,
+            },
+            "legacy 日本語".into(),
+        );
+        let tool = CodingTool {
+            root: root.path().into(),
+            unrestricted: true,
+            shell: config,
+            kind: Kind::Bash,
+        };
+        let result = tool
+            .shell(
+                &json!({"command":"printf '%s' \"$PI_SESSION_ID\""}),
+                &pi_rs::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output.script, "legacy 日本語");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn failing_shell_spawn_hook_stops_execution() {
         let root = tempfile::tempdir().unwrap();
         let config = ShellConfig::default()
@@ -2014,6 +5565,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grep_exposes_and_honors_large_context() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("fixture"),
+            format!("{}needle\n", "before\n".repeat(1001)),
+        )
+        .unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        assert!(
+            tool.spec().parameters["properties"]["context"]
+                .get("maximum")
+                .is_none()
+        );
+        let validator = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+        for context in [json!(1001), json!(1001.0), json!(1e20)] {
+            let args = json!({"pattern":"needle", "context":context});
+            assert!(validator.is_valid(&args));
+            let outcome = tool
+                .invoke(
+                    args,
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert!(outcome.tool_content().starts_with("fixture-1- before\n"));
+        }
+    }
+
+    #[test]
+    fn unrestricted_grep_accepts_more_than_one_hundred_thousand_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let count = 100_001usize;
+        std::fs::write(root.path().join("fixture"), "needle\n".repeat(count)).unwrap();
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let args = json!({"pattern":"needle", "limit":200_000, "context":1});
+        assert!(
+            jsonschema::validator_for(&tool.spec().parameters)
+                .unwrap()
+                .is_valid(&args)
+        );
+        match tool
+            .search(&args, &pi_rs::CancellationToken::new())
+            .unwrap()
+        {
+            Outcome::SucceededWithDetails { details, .. } => {
+                assert!(details.get("matchLimitReached").is_none());
+                assert_eq!(details["truncation"]["totalLines"], count);
+            }
+            other => panic!("expected truncated result with details, got {other:?}"),
+        }
+        tool.unrestricted = false;
+        assert!(
+            !jsonschema::validator_for(&tool.spec().parameters)
+                .unwrap()
+                .is_valid(&args)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_tool_argument_coercion_stays_within_the_unrestricted_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let args = json!({
+            "pattern": 42,
+            "path": null,
+            "ignoreCase": "TRUE",
+            "literal": 1,
+            "limit": "1.5",
+            "context": "0x2",
+        });
+        let prepared = tool.prepare_arguments(args.clone()).await.unwrap();
+        assert_eq!(
+            prepared,
+            json!({"pattern":"42", "ignoreCase":true, "literal":true, "limit":1.5, "context":2})
+        );
+        assert!(
+            jsonschema::validator_for(&tool.spec().parameters)
+                .unwrap()
+                .is_valid(&prepared)
+        );
+        tool.unrestricted = false;
+        assert_eq!(tool.prepare_arguments(args.clone()).await.unwrap(), args);
+
+        tool.unrestricted = true;
+        tool.kind = Kind::Edit;
+        let prepared = tool
+            .prepare_arguments(json!({"path":true,"edits":"[{\"oldText\":42,\"newText\":null}]"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared,
+            json!({"path":"true", "edits":[{"oldText":"42","newText":"null"}]})
+        );
+    }
+
+    #[test]
+    fn local_tool_numeric_strings_follow_javascript_conversion() {
+        for (input, expected) in [
+            ("", Some(0.0)),
+            ("\u{feff} 4.5e1 ", Some(45.0)),
+            ("0Xf", Some(15.0)),
+            ("0b10", Some(2.0)),
+            ("0o10", Some(8.0)),
+            ("1n", Some(1.0)),
+            ("-1n", Some(-1.0)),
+            ("FALSE", Some(0.0)),
+            (" true ", None),
+            ("0x+1", None),
+            ("-0x10", None),
+            ("01n", None),
+            ("9007199254740992n", None),
+            ("1e400", None),
+        ] {
+            assert_eq!(parse_local_tool_number(input), expected, "{input}");
+        }
+        // A radix value just above a halfway point must round up even when its
+        // lowest set bit falls outside the integer prefix.
+        let long = format!("0b1{}1{}1", "0".repeat(52), "0".repeat(80));
+        assert_eq!(
+            parse_local_tool_number(&long),
+            Some(2.0_f64.powi(134) + 2.0_f64.powi(82))
+        );
+    }
+
+    #[tokio::test]
+    async fn unrestricted_grep_numeric_limits_through_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("fixture"), "needle\n".repeat(4)).unwrap();
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let validator = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+        for (limit, count, notice, effective) in [
+            (
+                json!(0),
+                1,
+                "1 matches limit reached. Use limit=2",
+                json!(1.0),
+            ),
+            (
+                json!(-3),
+                1,
+                "1 matches limit reached. Use limit=2",
+                json!(1.0),
+            ),
+            (
+                json!(2.0),
+                2,
+                "2 matches limit reached. Use limit=4",
+                json!(2.0),
+            ),
+            (
+                json!(2.5),
+                2,
+                "2 matches limit reached. Use limit=4",
+                json!(2.0),
+            ),
+            (
+                json!("0b10"),
+                2,
+                "2 matches limit reached. Use limit=4",
+                json!(2.0),
+            ),
+        ] {
+            let args = tool
+                .prepare_arguments(json!({"pattern":"needle", "limit":limit, "context":1}))
+                .await
+                .unwrap();
+            assert!(validator.is_valid(&args));
+            let outcome = tool
+                .invoke(
+                    args,
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            match outcome {
+                Outcome::SucceededWithDetails { output, details } => {
+                    assert_eq!(
+                        output
+                            .lines()
+                            .filter(|line| line.contains(": needle"))
+                            .count(),
+                        count
+                    );
+                    assert!(output.contains(notice), "{output}");
+                    assert_eq!(details["matchLimitReached"], effective);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        for limit in [json!(1e100), json!(18446744073709551615u64)] {
+            let args = json!({"pattern":"needle", "limit":limit});
+            assert!(validator.is_valid(&args));
+            let outcome = tool
+                .invoke(
+                    args,
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert_eq!(outcome.tool_content().lines().count(), 4);
+        }
+        tool.unrestricted = false;
+        let scoped = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+        assert!(!scoped.is_valid(&json!({"pattern":"needle", "limit":2.5})));
+    }
+
+    #[tokio::test]
     async fn local_file_queries_report_missing_paths_and_cancellation() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -2037,17 +5821,31 @@ mod tests {
         assert!(!output.contains("file.txt:2:"));
         for kind in [Kind::Grep, Kind::List] {
             tool.kind = kind;
-            let output = tool
-                .invoke(json!({"pattern": "match", "path": "missing"}), context())
-                .await;
+            for path in ["missing", "file.txt/child"] {
+                let mut args = json!({"path": path});
+                if matches!(tool.kind, Kind::Grep) {
+                    args["pattern"] = json!("match");
+                }
+                let output = tool.invoke(args, context()).await;
+                assert!(matches!(output, Outcome::Failed(message)
+                        if message == format!("Path not found: {}", root.join(path).display())));
+            }
+        }
+        tool.kind = Kind::Read {
+            auto_resize: true,
+            profile: None,
+            unsupported_image_model: None,
+        };
+        for path in ["missing", "missing/nested file.txt"] {
+            let output = tool.invoke(json!({"path": path}), context()).await;
             assert!(matches!(output, Outcome::Failed(message)
-                    if message == format!("Path not found: {}", root.join("missing").display())));
+                if message == format!("ENOENT: no such file or directory, access '{}'", root.join(path).display())));
         }
         cancellation.cancel();
         tool.kind = Kind::Read {
             auto_resize: true,
             profile: None,
-            model_supports_images: None,
+            unsupported_image_model: None,
         };
         assert!(matches!(
             tool.invoke(json!({"path":"file.txt"}), context()).await,
@@ -2058,6 +5856,432 @@ mod tests {
             let output = tool.invoke(json!({"pattern": "match"}), context()).await;
             assert!(matches!(output, Outcome::Failed(message) if message == "Operation aborted"));
         }
+    }
+
+    #[tokio::test]
+    async fn unrestricted_grep_reports_ripgrep_glob_errors_before_regex_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), "needle").unwrap();
+        let grep = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::nil(),
+            cancellation: pi_rs::CancellationToken::new(),
+        };
+        for (glob, path, pattern) in [
+            ("[abc", ".", "needle"),
+            ("![abc", ".", "needle"),
+            ("./[abc", ".", "needle"),
+            ("[abc", "file.txt", "needle"),
+            ("[abc", ".", "["),
+        ] {
+            let outcome = grep
+                .invoke(
+                    json!({"pattern":pattern, "path":path, "glob":glob}),
+                    context(),
+                )
+                .await;
+            let expected =
+                format!("rg: error parsing glob '{glob}': unclosed character class; missing ']'");
+            assert!(
+                matches!(&outcome, Outcome::Failed(message) if *message == expected),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_reports_ripgrep_regex_parse_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), "text").unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        let result = tool
+            .invoke(
+                json!({"pattern":"[","path":"file.txt"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message)
+            if message == "rg: regex parse error:\n    (?:[)\n       ^\nerror: unclosed character class"),
+            "{result:?}"
+        );
+        let result = tool
+            .invoke(
+                json!({"pattern":"(?=a)","path":"file.txt"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message)
+            if message == "rg: regex parse error:\n    (?:(?=a))\n       ^^^\nerror: look-around, including look-ahead and look-behind, is not supported\n\nConsider enabling PCRE2 with the --pcre2 flag, which can handle backreferences\nand look-around."),
+            "{result:?}"
+        );
+        for pattern in [r"\1", "backreferences["] {
+            let result = tool
+                .invoke(
+                    json!({"pattern":pattern,"path":"file.txt"}),
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(&result, Outcome::Failed(message)
+                if message.ends_with("\n\nConsider enabling PCRE2 with the --pcre2 flag, which can handle backreferences\nand look-around.")),
+                "{result:?}"
+            );
+        }
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        let result = scoped
+            .invoke(
+                json!({"pattern":"[","path":"file.txt"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message) if message.starts_with("configuration: regex parse error:")),
+            "{result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_reports_non_directory_parent_with_requested_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file"), "contents").unwrap();
+        std::os::unix::fs::symlink("file", root.join("alias")).unwrap();
+        let tool = CodingTool {
+            root: root.clone(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                unsupported_image_model: None,
+            },
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"alias/child"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message)
+            if message == &format!("ENOTDIR: not a directory, access '{}'", root.join("alias/child").display())),
+            "{result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_reports_access_denied_with_requested_symlink_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        assert!(is_unix_access_denied(&std::io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        assert!(!is_unix_access_denied(&std::io::Error::from_raw_os_error(
+            libc::EPERM
+        )));
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("private");
+        let link = root.join("alias");
+        std::fs::write(&path, "contents").unwrap();
+        symlink("private", &link).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = std::fs::File::open(&path);
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                unsupported_image_model: None,
+            },
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"alias"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if let Err(error) = probe {
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert!(matches!(result, Outcome::Failed(message)
+                if message == format!("EACCES: permission denied, access '{}'", link.display())));
+        } else {
+            assert!(matches!(result, Outcome::Succeeded(text) if text == "contents"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_reports_inaccessible_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let parent = root.join("private");
+        let path = parent.join("file");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(&path, "contents").unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = std::fs::File::open(&path);
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                unsupported_image_model: None,
+            },
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"private/file"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if let Err(error) = probe {
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert!(matches!(result, Outcome::Failed(message)
+                if message == format!("EACCES: permission denied, access '{}'", path.display())));
+        } else {
+            assert!(matches!(result, Outcome::Succeeded(text) if text == "contents"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_rejects_read_only_file_even_with_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("readonly.txt");
+        std::fs::write(&path, "before\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let probe = local_edit_access(&path);
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"readonly.txt","edits":[{"oldText":"before","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if let Err(error) = probe {
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                matches!(result, Outcome::Failed(message) if message == "Could not edit file: readonly.txt. Error code: EACCES.")
+            );
+            assert_eq!(content, "before\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_reports_inaccessible_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let parent = root.join("private");
+        std::fs::create_dir(&parent).unwrap();
+        let file = parent.join("file");
+        std::fs::write(&file, "before").unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = local_edit_access(&file);
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"private/file","edits":[{"oldText":"before","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if let Err(error) = probe {
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert!(
+                matches!(result, Outcome::Failed(message) if message == "Could not edit file: private/file. Error code: EACCES.")
+            );
+            assert_eq!(std::fs::read_to_string(file).unwrap(), "before");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_formats_unix_access_codes() {
+        for (errno, code) in [
+            (libc::EROFS, "EROFS"),
+            (libc::ENOTDIR, "ENOTDIR"),
+            (libc::ELOOP, "ELOOP"),
+            (libc::ENAMETOOLONG, "ENAMETOOLONG"),
+        ] {
+            assert!(
+                matches!(unix_edit_access_error(std::io::Error::from_raw_os_error(errno), "name"),
+                Error::Config(message) if message == format!("Could not edit file: name. Error code: {code}."))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_reports_oversized_path_component() {
+        let directory = tempfile::tempdir().unwrap();
+        let name = "a".repeat(4096);
+        let tool = CodingTool {
+            root: directory.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":name,"edits":[{"oldText":"before","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Outcome::Failed(message) if message == format!("Could not edit file: {name}. Error code: ENAMETOOLONG."))
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn edit_rejects_windows_readonly_file_before_matching() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("readonly.txt");
+        std::fs::write(&path, "before").unwrap();
+        let original_permissions = std::fs::metadata(&path).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let result = tool
+            .invoke(
+                json!({"path":"readonly.txt","edits":[{"oldText":"missing","newText":"after"}]}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        std::fs::set_permissions(&path, original_permissions).unwrap();
+        assert!(
+            matches!(result, Outcome::Failed(message) if message == "Could not edit file: readonly.txt. Error code: EPERM.")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_single_file_uses_requested_symlink_name() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("original.txt"), "before\nneedle\nafter\n").unwrap();
+        std::os::unix::fs::symlink("original.txt", root.path().join("alias.txt")).unwrap();
+        let cancellation = pi_rs::CancellationToken::new();
+        for unrestricted in [false, true] {
+            let tool = CodingTool {
+                root: root.path().canonicalize().unwrap(),
+                unrestricted,
+                shell: ShellConfig::default(),
+                kind: Kind::Grep,
+            };
+            for (path, expected) in [("alias.txt", "alias.txt"), ("original.txt", "original.txt")] {
+                let output = tool
+                    .search(
+                        &json!({"path":path,"pattern":"needle","context":1}),
+                        &cancellation,
+                    )
+                    .unwrap()
+                    .tool_content();
+                assert_eq!(
+                    output,
+                    format!("{expected}-1- before\n{expected}:2: needle\n{expected}-3- after")
+                );
+            }
+        }
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("outside.txt")).unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: false,
+            shell: ShellConfig::default(),
+            kind: Kind::Grep,
+        };
+        assert!(
+            tool.search(
+                &json!({"path":"outside.txt","pattern":"needle"}),
+                &cancellation
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("path is outside the workspace")
+        );
     }
 
     #[test]
@@ -2248,6 +6472,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn read_image_records_model_omission_as_metadata_only() {
+        let directory = tempfile::tempdir().unwrap();
+        image::RgbImage::from_pixel(2, 2, image::Rgb([1, 2, 3]))
+            .save(directory.path().join("image.png"))
+            .unwrap();
+        let selected = ReadImageModel::default();
+        let tools = CodingTools::local(directory.path())
+            .unwrap()
+            .with_read_image_model(selected.clone());
+        let tool = tools
+            .tools()
+            .into_iter()
+            .find(|tool| tool.spec().name == "read")
+            .unwrap();
+        for (id, capability) in [
+            ("text-model", Some(false)),
+            ("vision-model", Some(true)),
+            ("another-text-model", Some(false)),
+            ("unknown-model", None),
+        ] {
+            selected.set(id, capability);
+            let result = tool
+                .invoke(
+                    json!({"path":"image.png"}),
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            let (data, details) = match &result {
+                Outcome::StructuredWithDetails { data, details, .. } => (data, Some(details)),
+                Outcome::Structured { data, .. } => (data, None),
+                other => panic!("expected image, got {other:?}"),
+            };
+            assert_eq!(
+                details,
+                (capability == Some(false))
+                    .then(|| json!({"imageUnsupportedByModel":id}))
+                    .as_ref()
+            );
+            assert_eq!(data["content"][0]["text"], "Read image file [image/png]");
+            assert_eq!(data["content"][1]["type"], "image");
+            let (text, images) = pi_rs::extract_tool_images(result.tool_content());
+            assert_eq!(images.len(), 1);
+            assert!(!text.contains(id));
+            assert!(!text.contains("does not support images"));
+        }
+    }
+
     #[test]
     fn read_image_notes_when_current_model_is_text_only() {
         let directory = tempfile::tempdir().unwrap();
@@ -2263,7 +6538,8 @@ mod tests {
                 kind: Kind::Read {
                     auto_resize: true,
                     profile: None,
-                    model_supports_images: support,
+                    unsupported_image_model: (support == Some(false))
+                        .then_some(UnsupportedImageModel::Legacy),
                 },
             };
             let Outcome::Structured { data, .. } = tool
@@ -2291,6 +6567,287 @@ mod tests {
     }
 
     #[test]
+    fn oriented_tiff_is_applied_with_and_without_resizing() {
+        // Little-endian TIFF: two RGB pixels with orientation 6 (90° clockwise).
+        let mut tiff = b"II\x2a\0\x08\0\0\0".to_vec();
+        let entries: [(u16, u16, u32, u32); 11] = [
+            (256, 4, 1, 2),
+            (257, 4, 1, 1),
+            (258, 3, 3, 146),
+            (259, 3, 1, 1),
+            (262, 3, 1, 2),
+            (273, 4, 1, 152),
+            (274, 3, 1, 6),
+            (277, 3, 1, 3),
+            (278, 4, 1, 1),
+            (279, 4, 1, 6),
+            (284, 3, 1, 1),
+        ];
+        tiff.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, ty, count, value) in entries {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&ty.to_le_bytes());
+            tiff.extend_from_slice(&count.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&[8, 0, 8, 0, 8, 0, 255, 0, 0, 0, 255, 0]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oriented.tiff");
+        std::fs::write(&path, tiff).unwrap();
+        for auto_resize in [true, false] {
+            let tool = CodingTool {
+                root: dir.path().to_path_buf(),
+                unrestricted: true,
+                shell: ShellConfig::default(),
+                kind: Kind::Read {
+                    auto_resize,
+                    profile: None,
+                    unsupported_image_model: None,
+                },
+            };
+            let value = tool.read_image(&path).unwrap().unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(value["content"][1]["data"].as_str().unwrap())
+                .unwrap();
+            let image = image::load_from_memory(&bytes).unwrap().to_rgb8();
+            assert_eq!(image.dimensions(), (1, 2));
+            assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0]);
+            assert_eq!(image.get_pixel(0, 1).0, [0, 255, 0]);
+        }
+    }
+
+    #[test]
+    fn converted_image_can_exceed_source_limit_before_resize() {
+        let (width, height) = (2048, 3413);
+        let mut state = 0x12345678u32;
+        let pixels: Vec<u8> = (0..width * height * 3)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let image = image::RgbImage::from_raw(width, height, pixels).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.bmp");
+        image.save(&path).unwrap();
+        assert!(
+            path.metadata().unwrap().len() < crate::image_profile::MAX_IMAGE_SOURCE_BYTES as u64
+        );
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert!(
+            png.len() > crate::image_profile::MAX_IMAGE_SOURCE_BYTES,
+            "PNG size: {}",
+            png.len()
+        );
+        drop(png);
+        let tool = CodingTool {
+            root: dir.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: Some(crate::image_profile::ImageResizeProfile {
+                    max_width: Some(32),
+                    max_height: Some(32),
+                    ..Default::default()
+                }),
+                unsupported_image_model: None,
+            },
+        };
+        let value = tool.read_image(&path).unwrap().unwrap();
+        assert_eq!(value["content"][1]["type"], "image");
+    }
+
+    #[test]
+    fn no_resize_passes_through_corrupt_inline_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.gif");
+        let bytes = b"GIF89a broken";
+        std::fs::write(&path, bytes).unwrap();
+        let tool = CodingTool {
+            root: dir.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: false,
+                profile: None,
+                unsupported_image_model: None,
+            },
+        };
+        let value = tool.read_image(&path).unwrap().unwrap();
+        assert_eq!(value["content"][0]["text"], "Read image file [image/gif]");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(value["content"][1]["data"].as_str().unwrap())
+                .unwrap(),
+            bytes
+        );
+        for (format, bytes) in [
+            (
+                image::ImageFormat::Png,
+                b"\x89PNG\r\n\x1a\nbroken".as_slice(),
+            ),
+            (image::ImageFormat::Jpeg, b"\xff\xd8\xffbroken".as_slice()),
+            (image::ImageFormat::Gif, b"GIF89a broken".as_slice()),
+            (
+                image::ImageFormat::WebP,
+                b"RIFF\0\0\0\0WEBPbroken".as_slice(),
+            ),
+        ] {
+            let reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+            let value = tool.process_image(&path, reader, format, None).unwrap();
+            assert_eq!(value["content"][1]["mimeType"], format.to_mime_type());
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(value["content"][1]["data"].as_str().unwrap())
+                    .unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn bmp_conversion_and_resize_failures_are_distinct() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.bmp");
+        image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3]))
+            .save(&path)
+            .unwrap();
+        let tool = CodingTool {
+            root: directory.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: Some(crate::image_profile::ImageResizeProfile {
+                    max_bytes: Some(1),
+                    ..Default::default()
+                }),
+                unsupported_image_model: None,
+            },
+        };
+        let result = tool.read_image(&path).unwrap().unwrap();
+        assert_eq!(
+            result["content"][0]["text"],
+            "Read image file [image/bmp]\n[Image omitted: could not be resized below the inline image size limit.]"
+        );
+        let tool = CodingTool {
+            kind: Kind::Read {
+                auto_resize: false,
+                profile: None,
+                unsupported_image_model: None,
+            },
+            ..tool
+        };
+        let result = tool.read_image(&path).unwrap().unwrap();
+        assert_eq!(
+            result["content"][0]["text"],
+            "Read image file [image/png]\n[Image converted from image/bmp to image/png.]"
+        );
+        assert_eq!(result["content"][1]["mimeType"], "image/png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(result["content"][1]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            image::load_from_memory(&bytes)
+                .unwrap()
+                .to_rgb8()
+                .get_pixel(0, 0)
+                .0,
+            [1, 2, 3]
+        );
+        std::fs::write(&path, b"BM broken").unwrap();
+        let result = tool.read_image(&path).unwrap().unwrap();
+        assert_eq!(
+            result["content"][0]["text"],
+            "Read image file [image/bmp]\n[Image omitted: could not be converted to a supported inline image format.]"
+        );
+    }
+
+    #[test]
+    fn invalid_image_profile_precedes_conversion_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broken.bmp");
+        std::fs::write(&path, b"BM broken").unwrap();
+        let tool = CodingTool {
+            root: directory.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: Some(crate::image_profile::ImageResizeProfile {
+                    max_bytes: Some(0),
+                    ..Default::default()
+                }),
+                unsupported_image_model: None,
+            },
+        };
+        let error = tool.read_image(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid model image resize profile")
+        );
+    }
+
+    #[test]
+    fn live_read_policy_preserves_in_flight_image_limits_and_updates_the_next_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sample.png");
+        image::RgbImage::from_pixel(64, 32, image::Rgb([12, 34, 56]))
+            .save(&path)
+            .unwrap();
+        let model = ReadImageModel::default();
+        let read = LiveReadTool {
+            tool: CodingTool {
+                root: directory.path().into(),
+                unrestricted: true,
+                shell: ShellConfig::default(),
+                kind: Kind::Read {
+                    auto_resize: true,
+                    profile: None,
+                    unsupported_image_model: None,
+                },
+            },
+            model: model.clone(),
+        };
+        let profile = |width| crate::image_profile::ImageResizeProfile {
+            max_width: Some(width),
+            ..Default::default()
+        };
+        model.set_profile("small", Some(false), Some(profile(32)));
+        let in_flight = read.snapshot();
+        model.set_profile("smaller", Some(true), Some(profile(16)));
+        for (tool, dimensions, unsupported) in [
+            (in_flight, "32x16", Some("small")),
+            (read.snapshot(), "16x8", None),
+        ] {
+            let result = tool.read_image(&path).unwrap().unwrap();
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(dimensions)
+            );
+            let outcome = tool.image_outcome(result, true);
+            let model_id = match &outcome {
+                Outcome::StructuredWithDetails { details, .. } => {
+                    details["imageUnsupportedByModel"].as_str()
+                }
+                Outcome::Structured { .. } => None,
+                other => panic!("expected an image, got {other:?}"),
+            };
+            assert_eq!(model_id, unsupported);
+        }
+    }
+
+    #[test]
     fn local_image_reads_preserve_supported_bytes_and_report_resized_coordinates() {
         let directory = tempfile::tempdir().unwrap();
         let small = directory.path().join("small.jpg");
@@ -2308,7 +6865,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         assert_eq!(tool.output_limit(), 8 * 1024 * 1024);
@@ -2342,7 +6899,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: false,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
             ..tool
         }
@@ -2366,7 +6923,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         let value = tool.read_image(&path).unwrap().unwrap();
@@ -2393,7 +6950,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         assert!(scoped.path(skill.to_str().unwrap()).is_err());
@@ -2404,7 +6961,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
         };
         assert_eq!(
@@ -2431,6 +6988,112 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "beta delta gamma");
         assert!(tool.edit(&json!({"path":"a.txt","edits":[{"oldText":"beta delta","newText":"x"},{"oldText":"delta","newText":"y"}]})).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "beta delta gamma");
+    }
+
+    #[tokio::test]
+    async fn unrestricted_read_accepts_pi_numeric_paging() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("page.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        std::fs::write(root.join("long.txt"), "x".repeat(MAX_OUTPUT_BYTES + 1)).unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                unsupported_image_model: None,
+            },
+        };
+        let validator = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool.clone()
+        };
+        let scoped_validator = jsonschema::validator_for(&scoped.spec().parameters).unwrap();
+        assert!(!scoped_validator.is_valid(&json!({"path": "page.txt", "offset": 2.7})));
+        assert!(!scoped_validator.is_valid(&json!({"path": "page.txt", "limit": -1})));
+        for (offset, limit, expected) in [
+            (0.0, 100.0, "a\nb\nc\nd\ne\n"),
+            (
+                -2.5,
+                1.5,
+                "a\n\n[4.5 more lines in file. Use offset=2.5 to continue.]",
+            ),
+            (
+                2.7,
+                1.5,
+                "b\nc\n\n[2.8 more lines in file. Use offset=4.2 to continue.]",
+            ),
+            (
+                1.0,
+                0.0,
+                "\n\n[6 more lines in file. Use offset=1 to continue.]",
+            ),
+            (
+                1.0,
+                -1.0,
+                "a\nb\nc\nd\ne\n\n[7 more lines in file. Use offset=0 to continue.]",
+            ),
+            (
+                2.2,
+                -2.5,
+                "b\nc\nd\ne\n\n[7.3 more lines in file. Use offset=-0.2999999999999998 to continue.]",
+            ),
+            (
+                4.1,
+                -1.0,
+                "\n\n[3.9000000000000004 more lines in file. Use offset=3.0999999999999996 to continue.]",
+            ),
+        ] {
+            let args = json!({"path":"page.txt", "offset":offset, "limit":limit});
+            assert!(validator.is_valid(&args), "{args}");
+            let result = tool
+                .invoke(
+                    args,
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(&result, Outcome::Succeeded(text) if text == expected),
+                "{result:?}"
+            );
+        }
+        for (path, offset, expected) in [
+            (
+                "page.txt",
+                7.2,
+                "Offset 7.2 is beyond end of file (6 lines total)",
+            ),
+            (
+                "page.txt",
+                1e30,
+                "Offset 1e+30 is beyond end of file (6 lines total)",
+            ),
+            (
+                "long.txt",
+                1.5,
+                crate::text_page::PI_FRACTIONAL_OVERSIZE_LINE,
+            ),
+        ] {
+            let result = tool
+                .invoke(
+                    json!({"path":path, "offset":offset}),
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(&result, Outcome::Failed(message) if message == expected),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]
@@ -2478,7 +7141,7 @@ mod tests {
             kind: Kind::Read {
                 auto_resize: true,
                 profile: None,
-                model_supports_images: None,
+                unsupported_image_model: None,
             },
             ..tool
         };
@@ -2520,6 +7183,30 @@ mod tests {
                 .edit(&json!({"path":"Capture d'ecran.txt", "oldText":"curly", "newText":"other"}))
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn local_edit_reports_missing_target_with_original_path() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        for path in ["missing.txt", "missing/child.txt", "@absent.txt"] {
+            let context = ToolContext {
+                operation_id: uuid::Uuid::new_v4(),
+                cancellation: pi_rs::CancellationToken::new(),
+            };
+            let outcome = tool
+                .invoke(json!({"path":path,"oldText":"a","newText":"b"}), context)
+                .await;
+            assert!(
+                matches!(outcome, Outcome::Failed(message) if message == format!("Could not edit file: {path}. Error code: ENOENT."))
+            );
+        }
+        assert!(!root.path().join("missing").exists());
     }
 
     #[tokio::test]
@@ -2650,6 +7337,141 @@ mod tests {
     }
 
     #[test]
+    fn local_edit_preserves_mixed_line_endings() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let path = root.path().join("mixed.txt");
+        for (original, edits, expected) in [
+            (
+                "\u{feff}α\nb\r\nX = 1\r\n",
+                json!([{"oldText":"X = 1","newText":"X = 2"}]),
+                "\u{feff}α\nb\r\nX = 2\r\n",
+            ),
+            (
+                "a\r\nb\nc",
+                json!([{"oldText":"c","newText":"C\nD"}]),
+                "a\r\nb\nC\nD",
+            ),
+            (
+                "lf1\nlf2\ncr1\r\ncr2\r\n",
+                json!([
+                    {"oldText":"cr1\n","newText":"C\r\nD\n"},
+                    {"oldText":"lf1\n","newText":"A\nB\n"}
+                ]),
+                "A\nB\nlf2\nC\r\nD\r\ncr2\r\n",
+            ),
+            (
+                "a\r\n“keep”  \nfoo   \r\nb\n",
+                json!([{"oldText":"foo\n","newText":"FOO\nMORE\n"}]),
+                "a\r\n“keep”  \nFOO\r\nMORE\r\nb\n",
+            ),
+            ("a\rb\nc", json!([{"oldText":"b","newText":""}]), "a\r\n\nc"),
+            (
+                "a\rb\rc",
+                json!([{"oldText":"b","newText":"B\nD"}]),
+                "a\rB\rD\rc",
+            ),
+            (
+                "a\rb\r\nc",
+                json!([{"oldText":"a","newText":"A\nB"}]),
+                "A\r\nB\rb\r\nc",
+            ),
+            (
+                "a\nb\rc",
+                json!([{"oldText":"c","newText":"C\nD"}]),
+                "a\nb\rC\nD",
+            ),
+            (
+                "head\r\na\n“b” tail\r\n",
+                json!([
+                    {"oldText":"a\n\"b\"","newText":"x"},
+                    {"oldText":"tail","newText":"Y\nZ"}
+                ]),
+                "head\r\nx Y\nZ\n",
+            ),
+        ] {
+            std::fs::write(&path, original).unwrap();
+            tool.edit(&json!({"path":"mixed.txt","edits":edits}))
+                .unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                expected.as_bytes(),
+                "{original:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_edit_does_not_remove_u0085_via_fuzzy_match() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("example.txt");
+        let original = "alpha\u{0085}\nbeta\n";
+        std::fs::write(&path, original).unwrap();
+        let tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: false,
+            shell: ShellConfig::default(),
+            kind: Kind::Edit,
+        };
+        let error = tool
+            .edit(&json!({"path":"example.txt","oldText":"alpha\nbeta","newText":"changed"}))
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Config(message) if message.starts_with("Could not find the exact text"))
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn injected_edit_does_not_write_for_u0085_mismatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Backend(AtomicUsize);
+        #[async_trait::async_trait]
+        impl EditOperations for Backend {
+            async fn access(&self, _: &Path) -> Result<()> {
+                Ok(())
+            }
+            async fn read_file(&self, _: &Path) -> Result<Vec<u8>> {
+                Ok("alpha\u{0085}\nbeta\n".as_bytes().to_vec())
+            }
+            async fn write_file(&self, _: &Path, _: &str) -> Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn write_if_unchanged(
+                &self,
+                _: &Path,
+                _: &[u8],
+                _: &str,
+            ) -> Result<ConditionalEdit> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(ConditionalEdit::Applied)
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(Backend(AtomicUsize::new(0)));
+        let tool = create_edit_tool(&root.path().canonicalize().unwrap(), backend.clone()).unwrap();
+        let result = tool
+            .invoke(
+                json!({"path":"example.txt","oldText":"alpha\nbeta","newText":"changed"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Outcome::Failed(ref message) if message.starts_with("Could not find the exact text"))
+        );
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn directory_output_sorts_case_insensitively_and_reports_limits() {
         let root = tempfile::tempdir().unwrap();
         let tool = CodingTool {
@@ -2681,10 +7503,46 @@ mod tests {
         assert!(output.contains("1 entries limit reached"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn directory_permission_error_uses_requested_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let directory = root_path.join("private");
+        let link = root_path.join("alias");
+        std::fs::create_dir(&directory).unwrap();
+        symlink("private", &link).unwrap();
+        let expected = format!(
+            "Cannot read directory: EACCES: permission denied, scandir '{}'",
+            link.display()
+        );
+        assert!(matches!(
+            directory_read_error(std::io::Error::from_raw_os_error(libc::EACCES), &link, true),
+            Error::Config(message) if message == expected
+        ));
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = std::fs::read_dir(&directory);
+        let tool = CodingTool {
+            root: root_path,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::List,
+        };
+        let result = tool.list(&json!({"path":"alias"}), &pi_rs::CancellationToken::new());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Privileged test runners can still read mode-000 directories.
+        if let Err(error) = probe {
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            assert!(matches!(result, Err(Error::Config(message)) if message == expected));
+        }
+    }
+
     #[test]
     fn directory_collation_matches_pi_for_punctuation_and_local_accents() {
         let sort = |locale, mut names: Vec<&'static str>| {
-            let collator = directory_collator(locale).unwrap();
+            let collator = crate::locale::collator(locale).unwrap();
             names.sort_by(|left, right| {
                 collator.compare(&left.to_lowercase(), &right.to_lowercase())
             });
@@ -2709,6 +7567,55 @@ mod tests {
             sort("C.UTF-8", vec!["Zeta", "Älmhult"]),
             ["Älmhult", "Zeta"]
         );
+    }
+
+    #[test]
+    fn directory_locale_uses_node_message_locale_precedence() {
+        let select = |all: Option<&str>, messages: Option<&str>, lang: Option<&str>| {
+            crate::locale::select(|key| match key {
+                "LC_ALL" => all.map(str::to_owned),
+                "LC_MESSAGES" => messages.map(str::to_owned),
+                "LANG" => lang.map(str::to_owned),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            select(None, Some("sv_SE.UTF-8"), Some("en_US.UTF-8")),
+            "sv_SE.UTF-8"
+        );
+        assert_eq!(
+            select(Some("en_US.UTF-8"), Some("sv_SE.UTF-8"), None),
+            "en_US.UTF-8"
+        );
+        assert_eq!(select(None, None, Some("en_US.UTF-8")), "en_US.UTF-8");
+        assert_eq!(select(Some(""), Some("sv_SE.UTF-8"), None), "");
+        let collator =
+            crate::locale::collator(&select(None, Some("sv_SE.UTF-8"), Some("en_US.UTF-8")))
+                .unwrap();
+        assert!(collator.compare("z", "ä").is_lt());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_a_symlink_to_a_file_reports_the_requested_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("target"), "contents").unwrap();
+        std::os::unix::fs::symlink("target", root.join("link")).unwrap();
+        for unrestricted in [false, true] {
+            let tool = CodingTool {
+                root: root.clone(),
+                unrestricted,
+                shell: ShellConfig::default(),
+                kind: Kind::List,
+            };
+            let error = tool
+                .list(&json!({"path":"link"}), &pi_rs::CancellationToken::new())
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::Config(message) if message == format!("Not a directory: {}", root.join("link").display()))
+            );
+        }
     }
 
     #[test]
@@ -2808,6 +7715,57 @@ mod tests {
         assert_eq!(notice, "[50.0KB limit reached]");
     }
 
+    #[tokio::test]
+    async fn unrestricted_find_reports_fd_path_and_glob_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), "").unwrap();
+        let tool = CodingTool {
+            root: root.clone(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Find,
+        };
+        for (path, pattern, expected) in [
+            (
+                "missing",
+                "[abc",
+                format!(
+                    "[fd error]: Search path {:?} is not a directory.\n[fd error]: No valid search paths given.",
+                    root.join("missing")
+                ),
+            ),
+            (
+                "file.txt",
+                "*",
+                format!(
+                    "[fd error]: Search path {:?} is not a directory.\n[fd error]: No valid search paths given.",
+                    root.join("file.txt")
+                ),
+            ),
+            (
+                ".",
+                "[abc",
+                "[fd error]: error parsing glob '[abc': unclosed character class; missing ']'"
+                    .into(),
+            ),
+        ] {
+            let outcome = tool
+                .invoke(
+                    json!({"pattern": pattern, "path": path}),
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation: pi_rs::CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(&outcome, Outcome::Failed(message) if *message == expected),
+                "{outcome:?}"
+            );
+        }
+    }
+
     #[test]
     fn find_keeps_dependency_paths_but_respects_vcs_and_fd_ignores() {
         let root = tempfile::tempdir().unwrap();
@@ -2840,6 +7798,251 @@ mod tests {
             .tool_content(),
             "nested/sample.rs"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_returns_partial_matches_when_a_subdirectory_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let inaccessible = root.path().join("z-inaccessible");
+        std::fs::create_dir(&inaccessible).unwrap();
+        std::fs::write(root.path().join("a-readable.txt"), "content").unwrap();
+        std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Privileged test runners can bypass directory permissions.
+        if std::fs::read_dir(&inaccessible).is_ok() {
+            std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            return;
+        }
+        let tool = CodingTool {
+            unrestricted: false,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Find,
+        };
+        let token = pi_rs::CancellationToken::new();
+        let partial = tool.search(&json!({"pattern":"*.txt"}), &token);
+        let no_match = tool.search(&json!({"pattern":"*.missing"}), &token);
+        let grep = CodingTool {
+            kind: Kind::Grep,
+            ..tool
+        };
+        let grep_error = grep.search(&json!({"pattern":"content"}), &token);
+        std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(partial.unwrap().tool_content(), "a-readable.txt");
+        assert!(no_match.is_err());
+        assert!(grep_error.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_fd_lines_trim_then_relativize_and_split() {
+        let root = Path::new("/tmp/find-root");
+        assert_eq!(find_pi_lines(root, &root.join(". "), false), [""]);
+        assert_eq!(find_pi_lines(root, &root.join("sub/.. "), false), [""]);
+        assert_eq!(
+            find_pi_lines(root, &root.join("foo\n bar "), false),
+            ["foo", "bar"]
+        );
+        assert_eq!(
+            find_pi_lines(root, &root.join("foo\r\n bar "), false),
+            ["foo", "bar"]
+        );
+        assert_eq!(find_pi_lines(root, &root.join("dir "), true), ["dir /"]);
+        assert_eq!(
+            find_pi_lines(root, &root.join("nel\u{85}"), false),
+            ["nel\u{85}"]
+        );
+    }
+
+    #[test]
+    fn find_orders_fd_paths_before_expanding_lines() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::write(root.join("a").join("x"), "").unwrap();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Find,
+        };
+        let output = tool
+            .search(&json!({"pattern":"*"}), &pi_rs::CancellationToken::new())
+            .unwrap()
+            .tool_content();
+        assert_eq!(output, "a/\na/x\na.txt");
+    }
+
+    #[test]
+    fn find_and_ls_limit_schemas_preserve_scoped_cap() {
+        for kind in [Kind::Find, Kind::List] {
+            let tool = CodingTool {
+                root: PathBuf::from("."),
+                unrestricted: false,
+                shell: ShellConfig::default(),
+                kind,
+            };
+            assert_eq!(
+                tool.spec().parameters["properties"]["limit"]["maximum"],
+                json!(100000)
+            );
+            let unrestricted = CodingTool {
+                unrestricted: true,
+                ..tool
+            };
+            assert_eq!(
+                unrestricted.spec().parameters["properties"]["limit"],
+                json!({"type":"number"})
+            );
+        }
+    }
+
+    #[test]
+    fn local_numeric_limit_details_and_javascript_formatting() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(root.path().join(name), "").unwrap();
+        }
+        let mut tool = CodingTool {
+            root: root.path().canonicalize().unwrap(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::List,
+        };
+        let token = pi_rs::CancellationToken::new();
+        let outcome = tool.list(&json!({"limit": 1.5}), &token).unwrap();
+        assert!(
+            matches!(outcome, Outcome::SucceededWithDetails { details, .. } if details["entryLimitReached"] == json!(1.0))
+        );
+        tool.kind = Kind::Find;
+        let outcome = tool
+            .search(&json!({"pattern":"*", "limit": 0.0}), &token)
+            .unwrap();
+        assert!(
+            matches!(&outcome, Outcome::SucceededWithDetails { details, .. } if details["resultLimitReached"] == json!(1.0))
+        );
+        let rounded = tool
+            .search(&json!({"pattern":"*", "limit":1.5}), &token)
+            .unwrap();
+        assert_eq!(rounded.tool_content(), outcome.tool_content());
+        let missing = json!({"pattern":"*", "path":"missing", "limit":1.5});
+        let missing_error = tool.search(&missing, &token).unwrap_err().to_string();
+        assert!(
+            missing_error.contains("is not a directory."),
+            "{missing_error}"
+        );
+        tool.unrestricted = false;
+        assert!(tool.search(&missing, &token).is_err());
+        assert_eq!(js_number(9007199254740993_u64 as f64), "9007199254740992");
+        assert_eq!(js_number(u64::MAX as f64), "18446744073709552000");
+        assert_eq!(js_number(-0.0), "0");
+        assert_eq!(js_number(f64::MAX * 2.0), "Infinity");
+        assert_eq!(fd_numeric_limit(0.0).unwrap(), 0);
+        assert_eq!(fd_numeric_limit(2_147_483_647.0).unwrap(), 2_147_483_647);
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(
+                fd_numeric_limit(18_446_744_073_709_550_000.0).unwrap(),
+                18_446_744_073_709_550_000usize
+            );
+            assert!(
+                fd_numeric_limit(u64::MAX as f64)
+                    .unwrap_err()
+                    .contains("number too large")
+            );
+        }
+        assert!(
+            fd_numeric_limit(f64::MAX)
+                .unwrap_err()
+                .contains("invalid digit found in string")
+        );
+        assert!(
+            fd_numeric_limit(f64::MIN_POSITIVE)
+                .unwrap_err()
+                .contains("invalid digit found in string")
+        );
+    }
+
+    #[test]
+    fn find_sorted_walk_matches_global_path_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for name in ["a", "a/z", "a/z/d", "a-", "a./x", "b"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let mut walker = ignore::WalkBuilder::new(root);
+        walker.hidden(false).sort_by_file_path(Path::cmp);
+        let paths: Vec<_> = walker
+            .build()
+            .map(|entry| entry.unwrap().into_path())
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_newline_filename_counts_displayed_lines_for_limit_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("foo\n bar "), "").unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Find,
+        };
+        for (limit, expected) in [
+            (
+                1,
+                "foo\n\n[1 results limit reached. Use limit=2 for more, or refine pattern]",
+            ),
+            (2, "foo\nbar"),
+        ] {
+            let outcome = tool
+                .search(
+                    &json!({"pattern":"*","limit":limit}),
+                    &pi_rs::CancellationToken::new(),
+                )
+                .unwrap();
+            assert_eq!(outcome.tool_content(), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_trims_upstream_line_whitespace_only_for_unrestricted_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for name in ["space ", "bom\u{feff}", "nel\u{85}"] {
+            std::fs::write(root.join(name), "").unwrap();
+        }
+        std::fs::create_dir(root.join("dir ")).unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Find,
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        let output = tool
+            .search(&json!({"pattern":"*"}), &cancellation)
+            .unwrap()
+            .tool_content();
+        assert_eq!(output, "bom\ndir /\nnel\u{85}\nspace");
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        let output = scoped
+            .search(&json!({"pattern":"*"}), &cancellation)
+            .unwrap()
+            .tool_content();
+        assert_eq!(output, "bom\u{feff}\ndir /\nnel\u{85}\nspace ");
     }
 
     #[test]
@@ -2894,6 +8097,52 @@ mod tests {
                 &pi_rs::CancellationToken::new()
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn unrestricted_find_anchors_relative_globs_at_search_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for path in ["src/a.ts", "pkg/src/b.ts", "CaseDir/mixed.ts"] {
+            let target = root.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, "").unwrap();
+        }
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root,
+            kind: Kind::Find,
+        };
+        let token = pi_rs::CancellationToken::new();
+        for (pattern, expected) in [
+            ("src/*.ts", "src/a.ts"),
+            ("./src/*.ts", "src/a.ts"),
+            ("././src/*.ts", "src/a.ts"),
+            ("**/src/*.ts", "pkg/src/b.ts\nsrc/a.ts"),
+            ("casedir/*.ts", "CaseDir/mixed.ts"),
+        ] {
+            assert_eq!(
+                tool.search(&json!({"pattern": pattern}), &token)
+                    .unwrap()
+                    .tool_content(),
+                expected,
+                "{pattern}"
+            );
+        }
+        assert_eq!(
+            tool.search(&json!({"pattern":"src/*.ts", "path":"pkg"}), &token)
+                .unwrap()
+                .tool_content(),
+            "src/b.ts"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            tool.search(&json!({"pattern":r"src\*.ts"}), &token)
+                .unwrap()
+                .tool_content(),
+            "src/a.ts"
         );
     }
 
@@ -2987,6 +8236,236 @@ mod tests {
     }
 
     #[test]
+    fn grep_globs_follow_the_search_directory() {
+        let root = tempfile::tempdir().unwrap();
+        for file in [
+            "project/src/main.rs",
+            "project/src/nested/sub.rs",
+            "project/other/no.rs",
+        ] {
+            let path = root.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "needle\n").unwrap();
+        }
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Grep,
+        };
+        for (glob, expected) in [
+            ("project/src/**", vec![]),
+            (
+                "!project/src/**",
+                vec![
+                    "other/no.rs:1: needle",
+                    "src/main.rs:1: needle",
+                    "src/nested/sub.rs:1: needle",
+                ],
+            ),
+            (
+                "**/src/**",
+                vec!["src/main.rs:1: needle", "src/nested/sub.rs:1: needle"],
+            ),
+            ("!**/src/**", vec!["other/no.rs:1: needle"]),
+            (
+                "src/**",
+                vec!["src/main.rs:1: needle", "src/nested/sub.rs:1: needle"],
+            ),
+            (
+                "././src/**",
+                vec!["src/main.rs:1: needle", "src/nested/sub.rs:1: needle"],
+            ),
+            ("!./src/**", vec!["other/no.rs:1: needle"]),
+            (
+                "*.rs",
+                vec![
+                    "other/no.rs:1: needle",
+                    "src/main.rs:1: needle",
+                    "src/nested/sub.rs:1: needle",
+                ],
+            ),
+            ("!*.rs", vec![]),
+        ] {
+            let output = tool
+                .search(
+                    &json!({"pattern":"needle","path":"project","glob":glob}),
+                    &pi_rs::CancellationToken::new(),
+                )
+                .unwrap()
+                .tool_content();
+            let mut actual: Vec<_> = if output == "No matches found" {
+                vec![]
+            } else {
+                output.lines().collect()
+            };
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "glob {glob}");
+        }
+        for glob in ["*.txt", "!*.rs"] {
+            assert_eq!(
+                tool.search(
+                    &json!({"pattern":"needle","path":"project/src/main.rs","glob":glob}),
+                    &pi_rs::CancellationToken::new()
+                )
+                .unwrap()
+                .tool_content(),
+                "main.rs:1: needle"
+            );
+        }
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        let output = scoped
+            .search(
+                &json!({"pattern":"needle","path":"project","glob":"project/src/**"}),
+                &pi_rs::CancellationToken::new(),
+            )
+            .unwrap()
+            .tool_content();
+        let mut actual: Vec<_> = output.lines().collect();
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            ["src/main.rs:1: needle", "src/nested/sub.rs:1: needle"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_globs_follow_symlinked_search_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        for name in ["migrations/main/a.js", "nested/migrations/main/b.js"] {
+            let path = repo.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "hello\n").unwrap();
+        }
+        std::os::unix::fs::symlink(&repo, root.path().join("repo-link")).unwrap();
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Grep,
+        };
+        for path in ["repo", "repo-link"] {
+            for (glob, expected) in [
+                (
+                    "migrations/main/*.js",
+                    vec!["migrations/main/a.js:1: hello"],
+                ),
+                (
+                    "./migrations/main/*.js",
+                    vec!["migrations/main/a.js:1: hello"],
+                ),
+                (
+                    "**/migrations/main/*.js",
+                    vec![
+                        "migrations/main/a.js:1: hello",
+                        "nested/migrations/main/b.js:1: hello",
+                    ],
+                ),
+                (
+                    "!./migrations/**",
+                    vec!["nested/migrations/main/b.js:1: hello"],
+                ),
+            ] {
+                let output = tool
+                    .search(
+                        &json!({"pattern":"hello", "path":path, "glob":glob}),
+                        &pi_rs::CancellationToken::new(),
+                    )
+                    .unwrap()
+                    .tool_content();
+                let mut actual: Vec<_> = output.lines().collect();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "path={path}, glob={glob}");
+            }
+        }
+    }
+
+    #[test]
+    fn grep_explicit_binary_file_and_directory_use_distinct_binary_modes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("binary.dat"),
+            b"match first\nnext line\n\0remaining match\n",
+        )
+        .unwrap();
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Grep,
+        };
+        let token = pi_rs::CancellationToken::new();
+        assert_eq!(
+            tool.search(&json!({"pattern":"match", "path":"binary.dat"}), &token)
+                .unwrap()
+                .tool_content(),
+            "binary.dat:1: match first\nbinary.dat:4: remaining match"
+        );
+        assert_eq!(
+            tool.search(&json!({"pattern":"match"}), &token)
+                .unwrap()
+                .tool_content(),
+            "No matches found"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_normalizes_backslashes_only_for_directory_results() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("name\\part.txt"), "needle\n").unwrap();
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Grep,
+        };
+        let token = pi_rs::CancellationToken::new();
+        assert_eq!(
+            tool.search(&json!({"pattern":"needle"}), &token)
+                .unwrap()
+                .tool_content(),
+            "name/part.txt:1: needle"
+        );
+        assert_eq!(
+            tool.search(
+                &json!({"pattern":"needle", "path":"name\\part.txt"}),
+                &token
+            )
+            .unwrap()
+            .tool_content(),
+            "name\\part.txt:1: needle"
+        );
+    }
+
+    #[test]
+    fn grep_uses_pi_basename_for_relative_paths_starting_with_dot_dot() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("..reports")).unwrap();
+        std::fs::write(root.path().join("..reports/file.txt"), "needle\n").unwrap();
+        let tool = CodingTool {
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            root: root.path().canonicalize().unwrap(),
+            kind: Kind::Grep,
+        };
+        assert_eq!(
+            tool.search(
+                &json!({"pattern":"needle"}),
+                &pi_rs::CancellationToken::new()
+            )
+            .unwrap()
+            .tool_content(),
+            "file.txt:1: needle"
+        );
+    }
+
+    #[test]
     fn grep_globs_accept_exclusions_and_workspace_relative_patterns() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("src")).unwrap();
@@ -3057,9 +8536,155 @@ mod tests {
         };
         assert!(error.contains("before"));
         assert!(error.contains(&format!("timed out after {timeout}")));
-        assert_eq!(shell_timeout(&json!({})).unwrap(), None);
+        assert_eq!(shell_timeout(&json!({}), false).unwrap(), None);
         for value in [json!(0), json!(-1), json!(null), json!("1"), json!(2147484)] {
-            assert!(shell_timeout(&json!({"timeout":value})).is_err());
+            assert!(shell_timeout(&json!({"timeout":value}), false).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn unrestricted_local_shell_reports_pi_numeric_timeout_diagnostics() {
+        let root = tempfile::tempdir().unwrap();
+        for kind in [Kind::Bash, Kind::PowerShell] {
+            let tool = CodingTool {
+                root: root.path().to_path_buf(),
+                unrestricted: true,
+                shell: ShellConfig::default(),
+                kind,
+            };
+            let validator = jsonschema::validator_for(&tool.spec().parameters).unwrap();
+            for (value, expected) in [
+                (0.0, "Invalid timeout: must be a finite number of seconds"),
+                (-0.5, "Invalid timeout: must be a finite number of seconds"),
+                (
+                    2147483.648,
+                    "Invalid timeout: maximum is 2147483.647 seconds",
+                ),
+                (1e100, "Invalid timeout: maximum is 2147483.647 seconds"),
+            ] {
+                let args = json!({"command":"exit 99", "timeout":value});
+                assert!(validator.is_valid(&args));
+                let outcome = tool.bash(&args, &pi_rs::CancellationToken::new()).await;
+                assert!(
+                    matches!(&outcome, Outcome::Failed(actual) if actual == expected),
+                    "{outcome:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_timeout_can_advance_after_process_readiness() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let tool = CodingTool {
+            root: root.path().to_path_buf(),
+            unrestricted: false,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        };
+        let cancellation = pi_rs::CancellationToken::new();
+        let _cleanup = cancellation.clone().drop_guard();
+        let mut task = tokio::spawn(async move {
+            tool.shell(
+                &json!({"command":"printf ready > ready; sleep 300", "timeout":120}),
+                &cancellation,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ready.exists() {
+                tokio::select! {
+                    result = &mut task => panic!("shell ended before readiness: {}", match result {
+                        Ok(Ok(_)) => "unexpected success".into(),
+                        Ok(Err(error)) => error.to_string(),
+                        Err(error) => error.to_string(),
+                    }),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+            }
+        })
+        .await
+        .expect("shell readiness timed out");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(121)).await;
+        tokio::time::resume();
+        let result = tokio::time::timeout(Duration::from_secs(10), &mut task)
+            .await
+            .expect("shell did not finish after advancing the clock")
+            .expect("shell task panicked");
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message.contains("timed out after 120 seconds"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_timeout_reports_an_exit_before_inherited_pipes_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let local: Arc<dyn Tool> = Arc::new(CodingTool {
+            root: directory.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        });
+        let installed = create_bash_tool(
+            directory.path(),
+            ShellConfig::default(),
+            create_local_bash_operations(None),
+        )
+        .unwrap();
+
+        for tool in [local, installed] {
+            let pid_file = directory.path().join("shell-pid");
+            let cancellation = pi_rs::CancellationToken::new();
+            let _cleanup = cancellation.clone().drop_guard();
+            tokio::time::pause();
+            let task = tokio::spawn(async move {
+                tool.invoke(
+                    json!({
+                        "command": "printf before; printf '%s' \"$$\" > shell-pid; sleep 300 & exit 7",
+                        "timeout": 0.05
+                    }),
+                    ToolContext {
+                        operation_id: uuid::Uuid::nil(),
+                        cancellation,
+                    },
+                )
+                .await
+            });
+            let readiness_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = pid.parse::<i32>()
+                    && pid > 0
+                    && unsafe { libc::kill(pid, 0) } != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    // The shell has been reaped while the background sleep
+                    // still holds the pipes. The idle deadline is at 100 ms.
+                    break;
+                }
+                assert!(!task.is_finished(), "shell finished before its deadline");
+                assert!(
+                    std::time::Instant::now() < readiness_deadline,
+                    "shell exit not observed"
+                );
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_millis(60)).await;
+            tokio::time::resume();
+            let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(outcome.is_error(), "{outcome:?}");
+            assert_eq!(
+                outcome.tool_content(),
+                "Tool failed: before\n\nCommand timed out after 0.05 seconds. The shell exited with code 7 after 0 seconds, but background processes it started kept writing output until the timeout."
+            );
+            std::fs::remove_file(pid_file).unwrap();
         }
     }
 
@@ -3085,6 +8710,266 @@ mod tests {
         .unwrap();
         assert_eq!(result.output.script, "done");
         assert!(result.status.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_bash_reports_missing_working_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let direct = CodingTool {
+            root: root.clone(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        };
+        let factory = create_bash_tool(
+            &root,
+            ShellConfig::default(),
+            create_local_bash_operations(None),
+        )
+        .unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::nil(),
+            cancellation: pi_rs::CancellationToken::new(),
+        };
+        let expected = format!(
+            "Working directory does not exist: {}\nCannot execute bash commands.",
+            root.display()
+        );
+        for result in [
+            direct.invoke(json!({"command":"true"}), context()).await,
+            factory.invoke(json!({"command":"true"}), context()).await,
+        ] {
+            assert!(
+                matches!(&result, Outcome::Failed(message) if message == &expected),
+                "{result:?}"
+            );
+        }
+        let cancellation = pi_rs::CancellationToken::new();
+        cancellation.cancel();
+        let result = direct
+            .shell_stream(
+                &json!({"command":"true"}),
+                &cancellation,
+                &mut |_| {},
+                false,
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(Error::Config(message)) if message == "Command aborted"));
+        let result = direct
+            .invoke(
+                json!({"command":"true"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation: cancellation.clone(),
+                },
+            )
+            .await;
+        assert!(matches!(result, Outcome::Failed(message) if message == "Command aborted"));
+        let result = factory
+            .invoke(
+                json!({"command":"true"}),
+                ToolContext {
+                    operation_id: uuid::Uuid::nil(),
+                    cancellation,
+                },
+            )
+            .await;
+        assert!(matches!(result, Outcome::Failed(message) if message == "Command aborted"));
+    }
+
+    #[tokio::test]
+    async fn shell_cwd_check_preserves_powershell_wording_and_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let token = pi_rs::CancellationToken::new();
+        let result = check_local_shell_cwd(&missing, "PowerShell", &token).await;
+        assert!(
+            matches!(result, Err(Error::Config(message)) if message == format!(
+                "Working directory does not exist: {}\nCannot execute PowerShell commands.", missing.display()
+            ))
+        );
+        token.cancel();
+        assert!(matches!(
+            check_local_shell_cwd(&missing, "PowerShell", &token).await,
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_keeps_draining_active_descendants_after_exit() {
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        // Keep the pipes active beyond the idle timeout without sleeping between
+        // writes. An oversleep can make an active pipe look idle. Limit
+        // both the write rate and the total time spent producing output.
+        let command = r#"python3 -c '
+import os
+import time
+
+parent = os.getppid()
+open("ready", "w").close()
+while os.getppid() == parent:
+    time.sleep(.001)
+os.write(1, b"out0\n")
+os.write(2, b"err0\n")
+deadline = time.monotonic() + .30
+while time.monotonic() < deadline:
+    os.write(1, b".")
+    os.write(2, b".")
+    next_write = min(deadline, time.monotonic() + .005)
+    while time.monotonic() < next_write:
+        pass
+os.write(1, b"out11\n")
+os.write(2, b"err11\n")
+' & while [ ! -f ready ]; do sleep .01; done; rm ready; exit 0"#;
+        let local = CodingTool {
+            root: root.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            local.shell(
+                &json!({"command":command}),
+                &pi_rs::CancellationToken::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.status.success());
+        assert!(
+            result.output.script.contains("out11\n"),
+            "reason={}, elapsed={}, output={:?}",
+            result.drain_reason,
+            result.elapsed,
+            result.output.script
+        );
+        assert!(
+            result.output.script.contains("err11\n"),
+            "reason={}, elapsed={}, output={:?}",
+            result.drain_reason,
+            result.elapsed,
+            result.output.script
+        );
+
+        let backend = create_bash_tool(
+            root.path(),
+            ShellConfig::default(),
+            create_local_bash_operations(None),
+        )
+        .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            backend.invoke(
+                json!({"command":command}),
+                ToolContext {
+                    operation_id: uuid::Uuid::new_v4(),
+                    cancellation: pi_rs::CancellationToken::new(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let output = result.tool_content();
+        assert!(
+            output.contains("out11\n"),
+            "backend stdout missing: {output:?}"
+        );
+        assert!(
+            output.contains("err11\n"),
+            "backend stderr missing: {output:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_or_timed_out_shell_bounds_active_descendant_drain() {
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let tool = CodingTool {
+            root: root.path().to_path_buf(),
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Bash,
+        };
+        // The child escapes the shell's process group and continues writing after
+        // the shell exits, so killing the group cannot close its inherited pipe.
+        let command = "python3 -c 'import os,time; parent=os.getppid(); os.setsid(); open(\"ready\",\"w\").close();\nwhile os.getppid()==parent: time.sleep(.001)\nopen(\"active\",\"w\").close(); os.write(1,b\"0\\n\"); end=time.monotonic()+2\nwhile time.monotonic()<end:\n os.write(1,b\".\"); until=time.monotonic()+.002\n while time.monotonic()<until: pass' & while [ ! -f ready ]; do sleep .01; done; exit 0";
+        let cancellation = pi_rs::CancellationToken::new();
+        let cancel = cancellation.clone();
+        let ready = root.path().join("active");
+        let task = tokio::spawn(async move {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            cancel.cancel();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            tool.shell_stream(
+                &json!({"command":command}),
+                &cancellation,
+                &mut |_| {},
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("cancelled shell kept draining");
+        task.abort();
+        let _ = task.await;
+        let result = result.unwrap();
+        assert!(
+            result.cancelled,
+            "reason={}, elapsed={}, output={:?}",
+            result.drain_reason, result.elapsed, result.output.script
+        );
+        std::fs::remove_file(root.path().join("ready")).unwrap();
+        std::fs::remove_file(root.path().join("active")).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            tool.shell_stream(
+                &json!({"command":command,"timeout":0.7}),
+                &pi_rs::CancellationToken::new(),
+                &mut |_| {},
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("timed out shell kept draining");
+        let result = result.unwrap();
+        assert!(
+            result.timed_out && result.output.script.starts_with("0\n"),
+            "reason={}, elapsed={}, output={:?}",
+            result.drain_reason,
+            result.elapsed,
+            result.output.script
+        );
     }
 
     #[tokio::test]
@@ -3129,20 +9014,19 @@ mod tests {
             kind: Kind::Bash,
         };
         let cancellation = pi_rs::CancellationToken::new();
-        assert_eq!(
-            tool.bash(&json!({"command":"printf hello"}), &cancellation)
-                .await,
-            Outcome::Succeeded("hello".into())
-        );
-        assert_eq!(
-            tool.bash(&json!({"command":"true"}), &cancellation).await,
-            Outcome::Succeeded("(no output)".into())
-        );
-        assert_eq!(
-            tool.bash(&json!({"command":"printf hello; exit 7"}), &cancellation)
-                .await,
-            Outcome::Failed("hello\n\nCommand exited with code 7".into())
-        );
+        for (command, expected, error) in [
+            ("printf hello", "hello", false),
+            ("true", "(no output)", false),
+            (
+                "printf hello; exit 7",
+                "hello\n\nCommand exited with code 7",
+                true,
+            ),
+        ] {
+            let outcome = tool.bash(&json!({"command":command}), &cancellation).await;
+            assert_eq!(outcome.tool_content(), expected);
+            assert_eq!(outcome.is_error(), error);
+        }
     }
 
     #[cfg(windows)]
@@ -3176,40 +9060,179 @@ mod tests {
             .await
             .unwrap();
         assert!(output.output.script.contains("日本語"));
-        let ready = root
-            .path()
-            .join("ready.txt")
-            .display()
-            .to_string()
-            .replace('\'', "''");
-        let leaked = root
-            .path()
-            .join("leaked.txt")
-            .display()
-            .to_string()
-            .replace('\'', "''");
+        use base64::Engine as _;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+
+        struct ProcessHandle(HANDLE);
+        impl Drop for ProcessHandle {
+            fn drop(&mut self) {
+                // SAFETY: this guard owns a successful OpenProcess handle.
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+        let quote = |path: &std::path::Path| path.display().to_string().replace('\'', "''");
+        let ready = root.path().join("ready.txt");
+        let pid_file = root.path().join("child.pid");
+        let leaked = root.path().join("leaked.txt");
+        let child_stderr = root.path().join("child-stderr.txt");
+        let parent_stage = root.path().join("parent-stage.txt");
         let script = format!(
-            "Set-Content -LiteralPath '{ready}' -Value ready; Start-Sleep -Seconds 10; Set-Content -LiteralPath '{leaked}' -Value leaked"
+            "[IO.File]::WriteAllText('{}',[string]$PID); [IO.File]::WriteAllText('{}','ready'); Start-Sleep -Seconds 300; [IO.File]::WriteAllText('{}','leaked')",
+            quote(&pid_file),
+            quote(&ready),
+            quote(&leaked),
         );
+        let utf16 = script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
         let command = format!(
-            "Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-Command',\"{script}\"; Start-Sleep -Seconds 20"
+            "$ErrorActionPreference='Stop'; [IO.File]::WriteAllText('{}','starting child'); Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-EncodedCommand','{encoded}' -RedirectStandardError '{}' | Out-Null; [IO.File]::WriteAllText('{}','child started'); Start-Sleep -Seconds 300",
+            quote(&parent_stage),
+            quote(&child_stderr),
+            quote(&parent_stage),
         );
-        assert!(
-            tool.shell(
-                &json!({"command":command,"timeout":5}),
-                &pi_rs::CancellationToken::new()
-            )
+        let cancellation = pi_rs::CancellationToken::new();
+        let _cleanup = cancellation.clone().drop_guard();
+        let task_cancel = cancellation.clone();
+        let mut shell = tokio::spawn(async move {
+            tool.shell(&json!({"command":command,"timeout":120}), &task_cancel)
+                .await
+        });
+        let readiness = async {
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
             .await
-            .is_err()
-        );
+        };
+        tokio::select! {
+            result = &mut shell => panic!("shell ended before child readiness: {}", match result {
+                Ok(Ok(_)) => "unexpected success".into(),
+                Ok(Err(error)) => error.to_string(),
+                Err(error) => error.to_string(),
+            }),
+            result = readiness => if result.is_err() {
+                panic!("child did not report readiness before deadline; parent stage: {:?}; child stderr: {:?}; child pid: {:?}",
+                    std::fs::read_to_string(&parent_stage), std::fs::read_to_string(&child_stderr), std::fs::read_to_string(&pid_file));
+            },
+        }
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: requesting a synchronization-only handle for the reported child PID.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
         assert!(
-            root.path().join("ready.txt").exists(),
-            "child process must have started"
+            !raw.is_null(),
+            "cannot open child process: {}",
+            std::io::Error::last_os_error()
         );
-        tokio::time::sleep(Duration::from_secs(11)).await;
+        let child = ProcessHandle(raw);
+        // SAFETY: the guard holds a live process handle. A zero timeout only observes its state.
+        assert_eq!(
+            unsafe { WaitForSingleObject(child.0, 0) },
+            WAIT_TIMEOUT,
+            "child must be running before timeout"
+        );
+        // Expire the running timeout only after observing the live descendant.
+        // Advancing Tokio's clock avoids waiting two minutes or racing
+        // PowerShell startup on a loaded Windows runner.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(121)).await;
+        tokio::time::resume();
+        let result = match tokio::time::timeout(Duration::from_secs(35), &mut shell).await {
+            Ok(result) => result.expect("shell task panicked"),
+            Err(_) => {
+                cancellation.cancel();
+                let stopped = tokio::time::timeout(Duration::from_secs(5), &mut shell).await;
+                if stopped.is_err() {
+                    shell.abort();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), &mut shell).await;
+                }
+                panic!("shell did not finish within the outer deadline after child readiness");
+            }
+        };
         assert!(
-            !root.path().join("leaked.txt").exists(),
-            "timed-out descendants must be terminated"
+            matches!(result, Err(pi_rs::Error::Config(ref message)) if message.contains("timed out after 120 seconds")),
+            "expected the configured timeout"
+        );
+        // SAFETY: the process handle remains owned by the guard during the wait.
+        assert_eq!(
+            unsafe { WaitForSingleObject(child.0, 5000) },
+            WAIT_OBJECT_0,
+            "timed-out descendant must terminate"
+        );
+        assert!(!leaked.exists(), "timed-out descendant must not continue");
+    }
+
+    #[tokio::test]
+    async fn unrestricted_read_reports_pi_paging_and_directory_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("file"), "first\nsecond").unwrap();
+        let tool = CodingTool {
+            root,
+            unrestricted: true,
+            shell: ShellConfig::default(),
+            kind: Kind::Read {
+                auto_resize: true,
+                profile: None,
+                unsupported_image_model: None,
+            },
+        };
+        let context = || ToolContext {
+            operation_id: uuid::Uuid::nil(),
+            cancellation: pi_rs::CancellationToken::new(),
+        };
+        let result = tool
+            .invoke(json!({"path":"file","offset":2}), context())
+            .await;
+        assert!(
+            matches!(&result, Outcome::Succeeded(text) if text == "second"),
+            "{result:?}"
+        );
+        let result = tool
+            .invoke(json!({"path":"file","offset":3}), context())
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message) if message == "Offset 3 is beyond end of file (2 lines total)"),
+            "{result:?}"
+        );
+        std::fs::write(tool.root.join("empty"), "").unwrap();
+        let result = tool
+            .invoke(json!({"path":"empty","offset":2}), context())
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message) if message == "Offset 2 is beyond end of file (1 lines total)"),
+            "{result:?}"
+        );
+        #[cfg(unix)]
+        {
+            let result = tool.invoke(json!({"path":"."}), context()).await;
+            assert!(
+                matches!(&result, Outcome::Failed(message) if message == "EISDIR: illegal operation on a directory, read"),
+                "{result:?}"
+            );
+        }
+        let scoped = CodingTool {
+            unrestricted: false,
+            ..tool
+        };
+        let result = scoped
+            .invoke(json!({"path":"file","offset":4}), context())
+            .await;
+        assert!(
+            matches!(&result, Outcome::Failed(message) if message.starts_with("configuration: Offset 4 is beyond end of file")),
+            "{result:?}"
         );
     }
 }

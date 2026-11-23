@@ -928,6 +928,8 @@ fn ordered_tool_request() -> pi_rs_durable::model::DurableToolRequest {
             replay: None,
         },
         Message::Tool {
+            is_error: false,
+            is_structured: None,
             call_id: "c1".into(),
             content: String::new(),
         },
@@ -990,6 +992,8 @@ async fn tool_blocks_reach_http_in_order_and_reject_hook_tampering() {
     );
     let mut duplicate = req.clone();
     duplicate.request.request.messages.push(Message::Tool {
+        is_error: false,
+        is_structured: None,
         call_id: "c1".into(),
         content: String::new(),
     });

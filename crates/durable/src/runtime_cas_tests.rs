@@ -3011,6 +3011,8 @@ fn message_history_tracks_commit_state_across_batches_reset_and_reopen() {
             replay: None,
         },
         Message::Tool {
+            is_error: false,
+            is_structured: None,
             call_id: "call".into(),
             content: "result".into(),
         },
@@ -4243,6 +4245,8 @@ fn interior_entry_fork_requires_proven_stable_state_and_valid_context() {
             replay: None,
         },
         Message::Tool {
+            is_error: false,
+            is_structured: None,
             call_id: "call".into(),
             content: "result".into(),
         },
@@ -4453,6 +4457,8 @@ fn config_change_does_not_authorize_interior_tool_batch_cut() {
             replay: None,
         },
         Message::Tool {
+            is_error: false,
+            is_structured: None,
             call_id: "call".into(),
             content: "result".into(),
         },
