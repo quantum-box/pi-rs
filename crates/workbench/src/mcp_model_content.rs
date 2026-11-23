@@ -263,10 +263,13 @@ fn project_result_with_files(
     if let Some(data) = distinct_data {
         projected.push(text(serde_json::to_string_pretty(data).ok()?));
     }
-    let spilled = limit_text_preview(&mut projected, files);
+    let location = limit_text_preview(&mut projected, files);
+    if let Some(location) = &location {
+        projected.push(text(location));
+    }
     let (mut output, mut structured) = encode_blocks(&projected);
     if output.len() > MAX_MODEL_CONTENT_BYTES
-        && !spilled
+        && location.is_none()
         && let Some(data) = distinct_data
     {
         *projected.last_mut().expect("structured content added") = text(data.to_string());
@@ -279,10 +282,10 @@ fn project_result_with_files(
     })
 }
 
-fn limit_text_preview(projected: &mut Vec<Value>, files: FileReaders) -> bool {
+fn limit_text_preview(projected: &mut Vec<Value>, files: FileReaders) -> Option<String> {
     let full = joined_text(projected);
     if full.len() <= TEXT_PREVIEW_BYTES {
-        return false;
+        return None;
     }
     let page_by_line = files.read
         && full
@@ -293,11 +296,11 @@ fn limit_text_preview(projected: &mut Vec<Value>, files: FileReaders) -> bool {
     } else if files.shell {
         "read byte ranges with the local shell"
     } else {
-        return false;
+        return None;
     };
     // Keep the inline form if there is no usable copy on disk.
     let Ok(path) = save_output_file(full.as_bytes(), ".txt") else {
-        return false;
+        return None;
     };
     let mut head = TEXT_PREVIEW_BYTES / 2;
     let mut tail = full.len() - TEXT_PREVIEW_BYTES / 2;
@@ -334,22 +337,22 @@ fn limit_text_preview(projected: &mut Vec<Value>, files: FileReaders) -> bool {
         }
         offset = end + 1;
         if preview.is_empty() {
-            return false;
+            return None;
         }
         *block = text(preview);
         true
     });
-    projected.push(text(format!(
-        "\n[Full output: {} ({hint})]",
-        path.display()
-    )));
-    true
+    Some(format!("\n[Full output: {} ({hint})]", path.display()))
 }
 
-fn encode_limited_blocks(projected: &[Value]) -> (String, bool) {
+fn encode_limited_blocks(projected: &[Value], location: Option<&str>) -> (String, bool) {
     // Text may expand when escaped in an image-bearing JSON envelope. Leave
     // room for the envelope and notice, and reserve the complete media first.
-    let mut available = MAX_MODEL_CONTENT_BYTES - 512;
+    let location = location.map(text);
+    let location_bytes = location
+        .as_ref()
+        .map_or(0, |block| block.to_string().len() + 1);
+    let mut available = (MAX_MODEL_CONTENT_BYTES - 512).saturating_sub(location_bytes);
     let mut blocks = Vec::new();
     let mut omitted_media = false;
     for block in projected.iter().filter(|block| block["type"] != "text") {
@@ -382,6 +385,7 @@ fn encode_limited_blocks(projected: &[Value]) -> (String, bool) {
         preview.push_str("\n[MCP resource content omitted at the native output limit]");
     }
     blocks.insert(0, text(preview));
+    blocks.extend(location);
     encode_blocks(&blocks)
 }
 
@@ -748,6 +752,30 @@ mod tests {
         assert!(text.contains("Warning: truncated output"));
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].data, "YQ==");
+    }
+
+    #[test]
+    fn mcp_model_content_keeps_the_saved_path_with_large_media() {
+        let original = tool_content(json!({"content":[
+            {"type":"resource","resource":{"uri":"mock://image",
+              "mimeType":"image/png","blob":STANDARD.encode(vec![0; 735_000])}},
+            {"type":"resource","resource":{"uri":"mock://text",
+              "mimeType":"text/plain","blob":STANDARD.encode(vec![0; 23_000])}},
+        ]}));
+        assert!(original.len() < MAX_MODEL_CONTENT_BYTES);
+        let (output, structured) = project_result(&original, "fixture", "get", None).unwrap();
+        assert!(structured);
+        assert!(output.len() <= MAX_MODEL_CONTENT_BYTES);
+        let value: Value = serde_json::from_str(&output).unwrap();
+        let content = value["data"]["content"].as_array().unwrap();
+        assert!(content.iter().any(|block| block["type"] == "image"));
+        let location = content.last().unwrap()["text"].as_str().unwrap();
+        let path = location
+            .strip_prefix("\n[Full output: ")
+            .unwrap()
+            .strip_suffix(" (read it with offset/limit)]")
+            .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), vec![0; 23_000]);
     }
 
     #[test]
