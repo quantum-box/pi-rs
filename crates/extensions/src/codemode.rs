@@ -2464,38 +2464,6 @@ mod tests {
             )
     }
     #[test]
-    fn inline_declarations_select_by_utf16_cost_and_share_the_budget_between_namespaces() {
-        let tool = |name: &str, description: String| ToolSpec {
-            name: name.into(),
-            description,
-            parameters: json!({"type":"object"}),
-        };
-        let tools = [
-            tool("mcp__a__expensive", "expensive".repeat(20)),
-            tool("mcp__a__unicode", "猫😀".repeat(10)),
-            tool("mcp__a__small", "a".into()),
-            tool("mcp__b__other", "b".into()),
-            tool("read", "native".into()),
-        ];
-        let cost = |index: usize| describe(&tools[index]).encode_utf16().count().div_ceil(4);
-        let unicode_budget = cost(4) + cost(2) + cost(3) + cost(1);
-        assert_eq!(
-            inline_declarations(&tools, unicode_budget),
-            [4, 1, 2, 3]
-                .map(|index| describe(&tools[index]) + "\n")
-                .concat()
-        );
-        let first_round = cost(4) + cost(2) + cost(3);
-        assert_eq!(
-            inline_declarations(&tools, first_round),
-            [4, 2, 3]
-                .map(|index| describe(&tools[index]) + "\n")
-                .concat()
-        );
-        assert!(inline_declarations(&tools, 0).is_empty());
-    }
-
-    #[test]
     fn options_match_reference_source_validation() {
         let maximum = Some(Duration::from_secs(2));
         let (parsed, source) = options(
@@ -4249,6 +4217,38 @@ mod tests {
         };
         assert_eq!(data["isError"], false, "{data}");
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn inline_declarations_select_by_utf16_cost_and_share_the_budget_between_namespaces() {
+        let tool = |name: &str, description: String| ToolSpec {
+            name: name.into(),
+            description,
+            parameters: json!({"type":"object"}),
+        };
+        let tools = [
+            tool("mcp__a__expensive", "expensive".repeat(20)),
+            tool("mcp__a__unicode", "猫😀".repeat(10)),
+            tool("mcp__a__small", "a".into()),
+            tool("mcp__b__other", "b".into()),
+            tool("read", "native".into()),
+        ];
+        let cost = |index: usize| describe(&tools[index]).encode_utf16().count().div_ceil(4);
+        let unicode_budget = cost(4) + cost(2) + cost(3) + cost(1);
+        assert_eq!(
+            inline_declarations(&tools, unicode_budget),
+            [4, 1, 2, 3]
+                .map(|index| describe(&tools[index]) + "\n")
+                .concat()
+        );
+        let first_round = cost(4) + cost(2) + cost(3);
+        assert_eq!(
+            inline_declarations(&tools, first_round),
+            [4, 2, 3]
+                .map(|index| describe(&tools[index]) + "\n")
+                .concat()
+        );
+        assert!(inline_declarations(&tools, 0).is_empty());
     }
 
     #[test]
