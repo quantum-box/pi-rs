@@ -83,8 +83,23 @@ fn redirect(request: &[u8], callback: &Url, state: Option<&str>) -> Option<Url> 
         return None;
     }
     let redirect = callback.join(target).ok()?;
+    validate_redirect(redirect, callback, state)
+}
+
+/// Match the callback origin, path, state, and result of a pasted OAuth redirect.
+pub fn manual_redirect(value: &str, callback: &Url, state: &str) -> Option<Url> {
+    let value = value.trim();
+    if value.len() > 8192 {
+        return None;
+    }
+    validate_redirect(Url::parse(value).ok()?, callback, Some(state))
+}
+
+fn validate_redirect(redirect: Url, callback: &Url, state: Option<&str>) -> Option<Url> {
     if redirect.origin() != callback.origin()
         || redirect.path() != callback.path()
+        || !redirect.username().is_empty()
+        || redirect.password().is_some()
         || redirect.fragment().is_some()
     {
         return None;
@@ -147,6 +162,29 @@ pub async fn open_browser(url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasted_redirect_matches_the_exact_callback() {
+        let callback = Url::parse("http://127.0.0.1:1456/oauth/callback").unwrap();
+        assert!(
+            manual_redirect(
+                "http://127.0.0.1:1456/oauth/callback?state=expected&code=valid",
+                &callback,
+                "expected",
+            )
+            .is_some()
+        );
+        for value in [
+            "http://127.0.0.1:1457/oauth/callback?state=expected&code=valid",
+            "http://127.0.0.1:1456/other?state=expected&code=valid",
+            "http://user@127.0.0.1:1456/oauth/callback?state=expected&code=valid",
+            "http://127.0.0.1:1456/oauth/callback?state=wrong&code=valid",
+            "http://127.0.0.1:1456/oauth/callback?state=expected&state=wrong&code=valid",
+            "http://127.0.0.1:1456/oauth/callback?state=expected&code=valid#error",
+        ] {
+            assert!(manual_redirect(value, &callback, "expected").is_none());
+        }
+    }
 
     #[test]
     fn validates_the_callback_origin_path_state_and_result() {
