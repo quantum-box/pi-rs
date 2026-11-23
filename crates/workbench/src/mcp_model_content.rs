@@ -103,6 +103,8 @@ struct FileReaders {
 
 impl FileReaders {
     fn from_request(request: &ModelRequest) -> Self {
+        // CodingTools' remote adapters use the strict integer read offsets
+        // and bounded shell schema. Neither can read files on this host.
         Self {
             read: request.tools.iter().any(|tool| {
                 tool.name == "read" && tool.parameters["properties"]["offset"]["type"] == "number"
@@ -817,18 +819,22 @@ mod tests {
         };
         let local = FileReaders::from_request(&request);
         assert!(local.read && local.shell);
-        for spec in &mut request.tools {
-            match spec.name.as_str() {
-                "read" => {
-                    spec.parameters["properties"]["offset"] = json!({"type":"integer","minimum":1})
-                }
-                "bash" | "powershell" => {
-                    spec.parameters["properties"]["timeout"] =
-                        json!({"type":"number","exclusiveMinimum":0})
-                }
-                _ => {}
-            }
-        }
+        let wrapper = pi_rs_workbench::coding::CodingTools::local(workspace.path())
+            .unwrap()
+            .with_read_operations(std::sync::Arc::new(
+                pi_rs_workbench::coding::LocalReadOperations,
+            ))
+            .unwrap()
+            .with_bash_operations(pi_rs_workbench::coding::create_local_bash_operations(None))
+            .unwrap();
+        // These are the same adapters used with remote operations. On Windows
+        // a separate PowerShell tool stays local, even when bash is wrapped.
+        request.tools = wrapper
+            .tools()
+            .iter()
+            .map(|tool| tool.spec())
+            .filter(|spec| spec.name == "read" || spec.name == "bash")
+            .collect();
         let remote = FileReaders::from_request(&request);
         assert!(!remote.read && !remote.shell);
     }
