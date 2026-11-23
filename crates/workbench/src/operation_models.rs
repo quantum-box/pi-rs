@@ -17,6 +17,7 @@ use super::{
 mod decisions;
 mod llama_cpp;
 mod llama_discovery;
+mod pi_classifier;
 mod wire;
 use wire::{
     classifier_answers, classifier_payload, classifier_response, image_output, image_payload, usage,
@@ -41,6 +42,8 @@ enum Kind {
 enum Api {
     #[serde(rename = "openai-decisions")]
     OpenAiDecisions,
+    #[serde(rename = "pi-classifier")]
+    PiClassifier,
     #[serde(rename = "typesafe-system-one")]
     SystemOne,
     #[serde(rename = "cloudflare-workers-ai-system-one")]
@@ -57,6 +60,7 @@ impl Api {
             Self::SystemOne
             | Self::WorkersAiSystemOne
             | Self::OpenAiDecisions
+            | Self::PiClassifier
             | Self::LlamaCppClassifier => Kind::Classifier,
             Self::OpenRouterImages => Kind::Image,
         }
@@ -65,6 +69,7 @@ impl Api {
     fn route(self) -> &'static str {
         match self {
             Self::OpenAiDecisions => "decisions",
+            Self::PiClassifier => "classify",
             Self::SystemOne => "systemone",
             Self::WorkersAiSystemOne => "run",
             Self::OpenRouterImages => "chat/completions",
@@ -1362,6 +1367,7 @@ impl Operations {
             }
             Api::SystemOne | Api::WorkersAiSystemOne => classifier_payload(entry, context)?,
             Api::OpenAiDecisions => (decisions::payload(entry, context)?, false),
+            Api::PiClassifier => (pi_classifier::payload(entry, context)?, false),
             Api::OpenRouterImages => (image_payload(entry, context)?, false),
         };
         let (endpoint, mut headers) = self.request_target(entry, keys).await?;
@@ -1390,6 +1396,10 @@ impl Operations {
             Api::OpenAiDecisions => {
                 data["answers"] =
                     decisions::answers(&context["questions"], &result_body["answers"])?;
+            }
+            Api::PiClassifier => {
+                data["answers"] =
+                    pi_classifier::answers(&context["questions"], &result_body["answers"])?;
             }
             Api::OpenRouterImages => {
                 if let Some(id) = body["id"].as_str() {
