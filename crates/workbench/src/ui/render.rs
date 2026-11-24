@@ -357,6 +357,7 @@ pub enum Entry {
         parts: Vec<ToolPart>,
         numbered_diff: bool,
         render_records: Option<crate::backend::ToolRenderRecords>,
+        render_call_id: Option<String>,
         rendered: Option<std::sync::Arc<pi_rs::RenderedTool>>,
     },
 }
@@ -5423,6 +5424,7 @@ mod tests {
             finished: true,
             numbered_diff: false,
             render_records: None,
+            render_call_id: None,
             rendered: Some(std::sync::Arc::new(rendered)),
             parts: Vec::new(),
         };
@@ -5475,6 +5477,7 @@ mod tests {
             finished: true,
             numbered_diff: true,
             render_records: None,
+            render_call_id: None,
             rendered: None,
             parts: Vec::new(),
         };
@@ -5536,6 +5539,7 @@ mod tests {
             finished: true,
             numbered_diff: false,
             render_records: None,
+            render_call_id: None,
             rendered: None,
             parts: vec![
                 ToolPart::Text("before".into()),
