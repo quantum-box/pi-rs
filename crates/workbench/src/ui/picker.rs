@@ -262,6 +262,10 @@ impl Picker {
         }
     }
 
+    pub fn is_completion(&self) -> bool {
+        self.completion_limit.is_some()
+    }
+
     pub fn paste(&mut self, text: &str) {
         if self.title == "Warnings" {
             return;
