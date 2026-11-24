@@ -1141,7 +1141,13 @@ impl Executor {
             message: "Tool was aborted".into(),
         };
         let gate = match memo.claim {
-            ConversationAbortClaim::Parked(_) => stored_gate.clone(),
+            ConversationAbortClaim::Parked(_) => crate::runtime::ToolDiagnostic {
+                message: bounded_diagnostic(&format!(
+                    "Tool {} was aborted",
+                    self.identity.spec.name
+                )),
+                ..stored_gate.clone()
+            },
             ConversationAbortClaim::Woken(_) => crate::runtime::ToolDiagnostic {
                 severity: crate::runtime::DiagnosticSeverity::Error,
                 code: Some("interrupted".into()),
@@ -1196,7 +1202,7 @@ impl Executor {
         }
         validate_content_hook_result(&result, Some(&gate), false)?;
         // Existing readers authenticate this marker in cancellation receipts.
-        // Keep it stable on disk while supplying the interruption to the hook.
+        // Keep it stable on disk while supplying the tool-specific diagnostic to the hook.
         if gate != stored_gate {
             for diagnostic in &mut result.diagnostics {
                 if *diagnostic == gate {
