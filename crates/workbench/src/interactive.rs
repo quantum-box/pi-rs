@@ -674,7 +674,7 @@ struct RegularLayout {
     theme: Theme,
     expand_tools: bool,
     hide_thinking: bool,
-    output: TranscriptOptions,
+    output: TranscriptOptions<'static>,
 }
 #[derive(Default)]
 struct RegularState {
@@ -1203,6 +1203,7 @@ struct ExtensionChrome {
     header: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
     footer: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
     working: ExtensionWorkingStatus,
+    hidden_thinking_label: Option<String>,
 }
 
 #[derive(Default)]
@@ -1514,6 +1515,13 @@ impl View {
                 self.extension_chrome.working.indicator = options;
                 self.extension_chrome.working.animation_started = None;
             }
+            pi_rs::UiRequest::SetHiddenThinkingLabel { label } => {
+                if self.extension_chrome.hidden_thinking_label != label {
+                    self.extension_chrome.hidden_thinking_label = label;
+                    self.regular.redraw = true;
+                    self.panel_press = None;
+                }
+            }
             pi_rs::UiRequest::SetTitle { mut title } => {
                 title.retain(|character| !character.is_control());
                 self.pending_terminal_title = Some(title);
@@ -1535,10 +1543,15 @@ impl View {
     }
     fn clear_extension_chrome(&mut self) -> bool {
         let header_changed = self.extension_chrome.header.take().is_some();
-        self.regular.redraw |= header_changed;
+        let label_changed = self.extension_chrome.hidden_thinking_label.take().is_some();
+        self.regular.redraw |= header_changed || label_changed;
+        if label_changed {
+            self.panel_press = None;
+        }
         let working = std::mem::take(&mut self.extension_chrome.working);
         self.extension_chrome.footer.take().is_some()
             || header_changed
+            || label_changed
             || working.message.is_some()
             || working.hidden
             || working.indicator.is_some()
@@ -3899,7 +3912,7 @@ impl View {
                         .count();
                     panels.push((start..start + panel_height, TranscriptPanel::Skill(index)));
                 }
-                Entry::Thinking { .. } => panels.push((
+                Entry::Thinking { .. } if lines.len() > start => panels.push((
                     start..lines.len().saturating_sub(1),
                     TranscriptPanel::Thinking(index),
                 )),
@@ -3921,10 +3934,12 @@ impl View {
                     self.transcript_options(args, true),
                 ),
             );
-            panels.push((
-                start..lines.len().saturating_sub(1),
-                TranscriptPanel::StreamingThinking,
-            ));
+            if lines.len() > start {
+                panels.push((
+                    start..lines.len().saturating_sub(1),
+                    TranscriptPanel::StreamingThinking,
+                ));
+            }
         }
         if !self.streaming.is_empty() {
             lines.extend(Entry::Assistant(self.streaming_markdown(false)).render(
@@ -4173,8 +4188,16 @@ impl View {
         Ok(())
     }
 
-    fn transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions {
+    fn transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions<'_> {
         TranscriptOptions {
+            hidden_thinking_label: self.extension_chrome.hidden_thinking_label.as_deref(),
+            ..self.base_transcript_options(args, streaming)
+        }
+    }
+
+    fn base_transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions<'static> {
+        TranscriptOptions {
+            hidden_thinking_label: None,
             image_width: (self.graphics.enabled() && args.settings.show_terminal_images())
                 .then(|| args.settings.terminal_image_width()),
             padding: args.settings.output_padding(),
@@ -4300,7 +4323,10 @@ impl View {
 
     fn replay_transcript(&mut self, args: &Cli, theme: &Theme) -> Result<()> {
         self.graphics.reset();
-        let output = self.transcript_options(args, false);
+        let output = TranscriptOptions {
+            hidden_thinking_label: self.extension_chrome.hidden_thinking_label.as_deref(),
+            ..self.base_transcript_options(args, false)
+        };
         let width = usize::from(terminal::size()?.0.max(1));
         let mut out = std::io::stdout().lock();
         queue!(out, MoveToColumn(0), Print("\r\n"))?;
@@ -4321,7 +4347,7 @@ impl View {
         let width = usize::from(width.max(1));
         let height = usize::from(height.max(7));
         let hardware_cursor = args.settings.show_hardware_cursor();
-        let output = self.transcript_options(args, false);
+        let base_output = self.base_transcript_options(args, false);
         let layout = RegularLayout {
             width,
             height,
@@ -4329,7 +4355,7 @@ impl View {
             theme: theme.clone(),
             expand_tools: self.expand_tools,
             hide_thinking: self.hide_thinking,
-            output,
+            output: base_output,
         };
         let redraw = self.regular.layout.is_some()
             && (self.regular.redraw
@@ -4355,6 +4381,10 @@ impl View {
         if self.dialog().is_some() {
             below.clear();
         }
+        let output = TranscriptOptions {
+            hidden_thinking_label: self.extension_chrome.hidden_thinking_label.as_deref(),
+            ..base_output
+        };
         let render_entry = |entry: &Entry| {
             entry.render(theme, width, self.expand_tools, !self.hide_thinking, output)
         };
@@ -13777,6 +13807,55 @@ exit {exit}
         assert!(output.contains("=== Agent messages (JSONL) ==="));
         assert!(output.contains("\"role\":\"user\""));
         assert!(output.contains("question"));
+    }
+
+    #[test]
+    fn extension_hidden_thinking_label_updates_history_and_pending_thinking() {
+        use clap::Parser;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = directory.path().join("session.jsonl");
+        drop(Session::open(&args.session).unwrap());
+        let mut view = View {
+            thinking: "live reasoning".into(),
+            hide_thinking: true,
+            ..View::default()
+        };
+        view.lines.push(Entry::Thinking {
+            text: "previous reasoning".into(),
+            expanded: None,
+        });
+        let theme = Theme::system();
+        let output = |view: &View| view.debug_log(&args, &theme, 80, 24).unwrap();
+        let id = uuid::Uuid::new_v4();
+
+        assert_eq!(output(&view).matches("Thinking...").count(), 2);
+        view.ui_request(&json!({
+            "id":id,"method":"setHiddenThinkingLabel","label":"Extension reasoning"
+        }))
+        .unwrap();
+        assert!(view.regular.redraw);
+        assert_eq!(output(&view).matches("Extension reasoning").count(), 2);
+
+        view.ui_request(&json!({"id":id,"method":"setHiddenThinkingLabel","label":"  "}))
+            .unwrap();
+        let hidden = output(&view);
+        assert!(!hidden.contains("reasoning"));
+        assert!(!hidden.contains("Thinking..."));
+        view.thinking_expanded = Some(true);
+        assert!(output(&view).contains("live reasoning"));
+        assert!(!output(&view).contains("previous reasoning"));
+
+        view.ui_request(&json!({"id":id,"method":"setHiddenThinkingLabel"}))
+            .unwrap();
+        assert_eq!(output(&view).matches("Thinking...").count(), 1);
+        assert_eq!(view.thinking_expanded, Some(true));
+
+        view.ui_request(&json!({"id":id,"method":"setHiddenThinkingLabel","label":"temporary"}))
+            .unwrap();
+        assert!(view.clear_extension_chrome());
+        assert_eq!(output(&view).matches("Thinking...").count(), 1);
     }
 
     #[test]
