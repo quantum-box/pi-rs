@@ -2,7 +2,7 @@
 
 ## Nested and woken cancellation groundwork
 
-Upstream `main` at `ff0e0ff17008d5e7da979b032694a0bfec2248d5`
+Upstream `main` at `8209929fb553e7a8c91dc0894569f9ec43dd201f`
 uses the same ToolTask cancellation path for nested calls and for a woken
 execution interrupted after intent. It passes the last parked checkpoint and
 prepared arguments, disallows nested work from `cancel`, and runs abort or
@@ -68,10 +68,15 @@ publication rechecks the
 selected identity, snapshot, ownership, original wake and absence of late
 results; it appends the after output while retaining a Blocked conversation and
 the uncertain Tool outcome. A changed snapshot, selection or late result needs
-reconciliation. The current hook input uses the generic aborted diagnostic
-rather than upstream’s tool-specific interrupted diagnostic. After process loss recovery fails
-the original task for reconciliation and atomically retires only matching task
-and conversation start markers. Missing, incomplete or foreign marker pairs
+reconciliation. The woken cleanup after hook receives an `interrupted`
+diagnostic naming the tool and warning that it may have partially run. This
+also applies to a live abort of a woken attempt with an unknown outcome.
+The hook receives the same message as a text block to preserve compatibility
+with legacy text hooks. This path does not reconstruct upstream’s live slot
+output, details or truncation. Receipts preserve the existing on-disk abort
+diagnostic so old readers can still authenticate them. After process loss,
+recovery fails the original task for reconciliation and atomically retires only
+matching task and conversation start markers. Missing, incomplete or foreign marker pairs
 cannot authorize a new callback; the claim and any receipt remain available.
 
 ## Opt-in first-poll dispatch
@@ -472,3 +477,22 @@ not provide the v4 SQLite function. This is a write fence, not a guarantee that
 all old binaries refuse to start. Verify the selected binary and its features
 before restarting a migrated store; do not treat a successful old-process start
 as evidence of compatibility.
+
+A synthetic release build on Apple M5 Pro measured 40 SQLite checks per case
+with both experimental features compiled in. Each independent root had one
+task and one conversation record with an 800-byte payload. Checks were spaced
+20 ms apart, with up to 1,024 unrelated mutations between the callback boundary
+and the checks. A second connection attempted an unrelated write every 2 ms.
+
+| Independent roots | Scoped checks that succeeded | Check p95 | Unrelated writer p95 |
+| ---: | ---: | ---: | ---: |
+| 64 | 40 / 40 | 4.87 ms | 5.33 ms |
+| 1,024 | 40 / 40 | 27.00 ms | 24.58 ms |
+| 4,096 | 40 / 40 | 35.06 ms | 45.30 ms |
+| 8,192 | 0 / 40 (scan budget) | 19.70 ms | 25.86 ms |
+
+These measurements cover the SQLite transaction on a synthetic workload.
+Keep both features opt-in. Before changing that default, verify the migration
+and rollback on representative stores and agree on a write-latency and
+reconciliation budget. Production workloads with large scopes also need a
+plan for scans that exceed the limit.
