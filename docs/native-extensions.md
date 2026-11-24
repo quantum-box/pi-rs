@@ -182,6 +182,14 @@ block from the view. Omit `label` to restore `Thinking...`. The override
 uses the theme's thinking style, wraps to at most 16 terminal rows and
 resets with the extension worker or session.
 
+## Paste into the main input editor
+
+`PasteToEditor` (wire method `pasteToEditor`) inserts `text` at the cursor
+in the prompt draft as one undoable edit. Workbench handles it the same way
+as a terminal or text clipboard paste. It normalizes line endings and tabs
+and collapses long pastes to a visual marker. `GetEditorText`, draft
+submission, and the external editor receive the full text.
+
 ## Share SDK extension events
 
 An embedding host can share a `pi_rs_extensions::ExtensionEventBus` with its
