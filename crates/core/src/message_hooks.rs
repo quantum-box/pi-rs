@@ -1,12 +1,13 @@
-use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
+use std::{future::Future, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::time::{Instant, timeout};
 use crate::{
-    Event, Extension, ExtensionState, ExtensionStates, Message, Notification, Observer, Outcome,
-    Registry, Session, ToolCall, ToolCallDelta,
+    ContentBlock, ContextContent, CustomMessage, Event, Extension, ExtensionResult, ExtensionState,
+    ExtensionStates, Message, Notification, Observer, Outcome, Registry, Session, ToolCall,
+    ToolCallDelta,
 };
 
 /// Native assistant streaming updates before the corresponding public notification.
@@ -77,6 +78,16 @@ pub enum MessageLifecycleEvent {
     },
 }
 
+/// An extension-defined message entering an agent turn.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum CustomMessageLifecycleEvent {
+    #[serde(rename = "message_start")]
+    Start { message: CustomMessage },
+    #[serde(rename = "message_end")]
+    End { message: CustomMessage },
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Start,
@@ -98,6 +109,38 @@ impl Phase {
 struct Handler {
     extension: Arc<dyn Extension>,
     state: Option<ExtensionState>,
+}
+
+trait LifecycleCallback {
+    type Replacement;
+    fn dispatch<'a>(
+        &'a self,
+        handler: &'a Handler,
+    ) -> impl Future<Output = ExtensionResult<Option<Self::Replacement>>> + Send + 'a;
+}
+
+impl LifecycleCallback for MessageLifecycleEvent {
+    type Replacement = Message;
+    fn dispatch<'a>(
+        &'a self,
+        handler: &'a Handler,
+    ) -> impl Future<Output = ExtensionResult<Option<Message>>> + Send + 'a {
+        handler
+            .extension
+            .message_lifecycle(self, handler.state.as_ref())
+    }
+}
+
+impl LifecycleCallback for CustomMessageLifecycleEvent {
+    type Replacement = CustomMessage;
+    fn dispatch<'a>(
+        &'a self,
+        handler: &'a Handler,
+    ) -> impl Future<Output = ExtensionResult<Option<CustomMessage>>> + Send + 'a {
+        handler
+            .extension
+            .custom_message_lifecycle(self, handler.state.as_ref())
+    }
 }
 
 struct Failure {
@@ -123,7 +166,12 @@ impl MessageHooks {
         session: &Session,
         model_timeout: Duration,
     ) -> Option<Self> {
-        Self::with_states(registry, || session.extension_states(), model_timeout)
+        Self::with_states(
+            registry,
+            || session.extension_states(),
+            model_timeout,
+            |extension| extension.handles_message_lifecycle(),
+        )
     }
 
     pub(crate) fn for_states(
@@ -131,18 +179,37 @@ impl MessageHooks {
         states: &ExtensionStates,
         model_timeout: Duration,
     ) -> Option<Self> {
-        Self::with_states(registry, || states.clone(), model_timeout)
+        Self::with_states(
+            registry,
+            || states.clone(),
+            model_timeout,
+            |extension| extension.handles_message_lifecycle(),
+        )
+    }
+
+    pub(crate) fn for_custom_session(
+        registry: &Registry,
+        session: &Session,
+        model_timeout: Duration,
+    ) -> Option<Self> {
+        Self::with_states(
+            registry,
+            || session.extension_states(),
+            model_timeout,
+            |extension| extension.handles_custom_message_lifecycle(),
+        )
     }
 
     fn with_states(
         registry: &Registry,
         states: impl FnOnce() -> ExtensionStates,
         model_timeout: Duration,
+        subscribed: impl Fn(&dyn Extension) -> bool,
     ) -> Option<Self> {
         let extensions: Vec<_> = registry
             .extensions
             .iter()
-            .filter(|extension| extension.handles_message_lifecycle())
+            .filter(|extension| subscribed(extension.as_ref()))
             .cloned()
             .collect();
         if extensions.is_empty() {
@@ -328,6 +395,35 @@ impl MessageHooks {
         outcome
     }
 
+    pub(crate) async fn custom(&mut self, message: CustomMessage) -> CustomMessage {
+        let start = CustomMessageLifecycleEvent::Start {
+            message: message.clone(),
+        };
+        self.observe(Phase::TerminalStart, &start).await;
+        let mut end = CustomMessageLifecycleEvent::End { message };
+        for index in 0..self.handlers.len() {
+            let Some(replacement) = self.invoke(index, Phase::End, &end).await else {
+                continue;
+            };
+            let CustomMessageLifecycleEvent::End { message: current } = &mut end else {
+                unreachable!("constructed a custom message end event")
+            };
+            if replacement.custom_type == current.custom_type
+                && protected_custom_blocks(&current.content)
+                    .eq(protected_custom_blocks(&replacement.content))
+                && crate::journal::validate_custom_message(&replacement).is_ok()
+            {
+                *current = replacement;
+            } else {
+                self.record_failure(index, Phase::End, "message_end must keep the custom type, images and signed blocks and return a valid custom message".into(), false);
+            }
+        }
+        let CustomMessageLifecycleEvent::End { message } = end else {
+            unreachable!("custom message end event retains its role")
+        };
+        message
+    }
+
     pub(crate) async fn update(&mut self, parts: &[String], update: AssistantMessageUpdate) {
         if self.stream_budget.is_zero() {
             return;
@@ -342,7 +438,7 @@ impl MessageHooks {
         .await;
     }
 
-    async fn observe(&mut self, phase: Phase, event: &MessageLifecycleEvent) {
+    async fn observe(&mut self, phase: Phase, event: &(impl LifecycleCallback + Sync)) {
         for index in 0..self.handlers.len() {
             self.invoke(index, phase, event).await;
         }
@@ -395,12 +491,12 @@ impl MessageHooks {
         self.end(content, &[], status, response_limit).await;
     }
 
-    async fn invoke(
+    async fn invoke<E: LifecycleCallback + Sync>(
         &mut self,
         index: usize,
         phase: Phase,
-        event: &MessageLifecycleEvent,
-    ) -> Option<Message> {
+        event: &E,
+    ) -> Option<E::Replacement> {
         if self
             .failures
             .iter()
@@ -422,13 +518,7 @@ impl MessageHooks {
         }
         let handler = &self.handlers[index];
         let started = Instant::now();
-        let callback = AssertUnwindSafe(async {
-            handler
-                .extension
-                .message_lifecycle(event, handler.state.as_ref())
-                .await
-        })
-        .catch_unwind();
+        let callback = AssertUnwindSafe(async { event.dispatch(handler).await }).catch_unwind();
         let result = timeout(duration, callback).await;
         if !terminal {
             self.stream_budget = self.stream_budget.saturating_sub(started.elapsed());
@@ -477,6 +567,22 @@ impl MessageHooks {
             });
         }
     }
+}
+
+fn protected_custom_blocks(content: &ContextContent) -> impl Iterator<Item = &ContentBlock> {
+    let blocks = match content {
+        ContextContent::Text(_) => &[][..],
+        ContextContent::Blocks(blocks) => blocks.as_slice(),
+    };
+    blocks.iter().filter(|block| {
+        !matches!(
+            block,
+            ContentBlock::Text {
+                text_signature: None,
+                ..
+            }
+        )
+    })
 }
 
 fn tool_message(call_id: &str, outcome: &Outcome) -> Message {
@@ -1490,6 +1596,228 @@ mod tests {
             assert!(tool_text_edit(&outcome, changed.to_string()).is_none());
             changed = original.clone();
         }
+    }
+
+    #[tokio::test]
+    async fn native_custom_message_callbacks_edit_turn_delivery_once() {
+        struct InvalidEdit;
+
+        #[async_trait::async_trait]
+        impl Extension for InvalidEdit {
+            fn id(&self) -> &str {
+                "invalid-edit"
+            }
+            fn handles_custom_message_lifecycle(&self) -> bool {
+                true
+            }
+            async fn custom_message_lifecycle(
+                &self,
+                event: &CustomMessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<CustomMessage>> {
+                if let CustomMessageLifecycleEvent::End { message } = event
+                    && message.custom_type == "next"
+                {
+                    let mut replacement = message.clone();
+                    replacement.content = ContextContent::Text("would remove attachments".into());
+                    return Ok(Some(replacement));
+                }
+                Ok(None)
+            }
+        }
+
+        struct ObserveCustom(Arc<Mutex<Vec<String>>>);
+
+        #[async_trait::async_trait]
+        impl Extension for ObserveCustom {
+            fn id(&self) -> &str {
+                "custom-observer"
+            }
+            fn handles_custom_message_lifecycle(&self) -> bool {
+                true
+            }
+            async fn custom_message_lifecycle(
+                &self,
+                event: &CustomMessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<CustomMessage>> {
+                match event {
+                    CustomMessageLifecycleEvent::Start { message } => {
+                        self.0
+                            .lock()
+                            .unwrap()
+                            .push(format!("start:{}", message.custom_type));
+                        Ok(None)
+                    }
+                    CustomMessageLifecycleEvent::End { message } => {
+                        self.0
+                            .lock()
+                            .unwrap()
+                            .push(format!("end:{}", message.custom_type));
+                        let mut replacement = message.clone();
+                        let edited = format!("{}/edited", message.custom_type);
+                        match &mut replacement.content {
+                            ContextContent::Text(text) => *text = edited,
+                            ContextContent::Blocks(blocks) => blocks.insert(
+                                0,
+                                ContentBlock::Text {
+                                    text: edited,
+                                    text_signature: None,
+                                },
+                            ),
+                        }
+                        replacement.display = true;
+                        replacement.details = Some(serde_json::json!({"edited":true}));
+                        Ok(Some(replacement))
+                    }
+                }
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry.register(Arc::new(InvalidEdit)).unwrap();
+        registry
+            .register(Arc::new(ObserveCustom(log.clone())))
+            .unwrap();
+        let model = TextModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let run_id = uuid::Uuid::new_v4();
+        use crate::CustomMessageDelivery::*;
+        let attached = vec![
+            ContentBlock::Text {
+                text: "signed block".into(),
+                text_signature: Some("signature".into()),
+            },
+            ContentBlock::Image {
+                data: "iVBORw0KGgo=".into(),
+                mime_type: "image/png".into(),
+            },
+        ];
+        let mut ids = std::collections::HashMap::new();
+        for (name, delivery) in [
+            ("next", NextTurn),
+            ("trigger", TriggerTurn),
+            ("steer", Steer),
+            ("follow", FollowUp),
+            ("deferred", AfterTurn),
+        ] {
+            let id = if delivery == TriggerTurn {
+                run_id
+            } else {
+                uuid::Uuid::new_v4()
+            };
+            ids.insert(id, name);
+            session
+                .append(Event::CustomMessageQueued {
+                    input: crate::QueuedCustomMessage {
+                        id,
+                        delivery,
+                        message: CustomMessage {
+                            custom_type: name.into(),
+                            content: if name == "next" {
+                                ContextContent::Blocks(attached.clone())
+                            } else {
+                                ContextContent::Text(name.into())
+                            },
+                            display: false,
+                            details: None,
+                        },
+                    },
+                })
+                .unwrap();
+        }
+        let (_tx, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+        let mut deliveries = Vec::new();
+        let mut rejected_edits = 0;
+        agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                None,
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |notification| {
+                    if matches!(
+                        notification,
+                        Notification::ExtensionLifecycleError {
+                            extension: "invalid-edit",
+                            event: "message_end",
+                            ..
+                        }
+                    ) {
+                        rejected_edits += 1;
+                    }
+                    if let Notification::Committed(record) = notification
+                        && let Event::CustomMessageDelivered { id, message } = &record.event
+                    {
+                        let expected = ids[id];
+                        assert_eq!(message.custom_type, expected);
+                        if expected == "deferred" {
+                            assert_eq!(message.content, ContextContent::Text(expected.into()));
+                            assert!(!message.display);
+                        } else {
+                            let edited = format!("{expected}/edited");
+                            let expected_content = if expected == "next" {
+                                let mut blocks = attached.clone();
+                                blocks.insert(
+                                    0,
+                                    ContentBlock::Text {
+                                        text: edited,
+                                        text_signature: None,
+                                    },
+                                );
+                                ContextContent::Blocks(blocks)
+                            } else {
+                                ContextContent::Text(edited)
+                            };
+                            assert_eq!(message.content, expected_content);
+                            assert!(message.display);
+                            assert_eq!(message.details, Some(serde_json::json!({"edited":true})));
+                        }
+                        log.lock().unwrap().push(format!("commit:{expected}"));
+                        deliveries.push(*id);
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), ids.len());
+        assert_eq!(rejected_edits, 1);
+        let log = log.lock().unwrap();
+        for name in ["trigger", "next", "steer", "follow"] {
+            let start = log
+                .iter()
+                .position(|event| *event == format!("start:{name}"))
+                .unwrap();
+            assert_eq!(
+                &log[start..start + 3],
+                [
+                    format!("start:{name}"),
+                    format!("end:{name}"),
+                    format!("commit:{name}")
+                ]
+            );
+        }
+        assert_eq!(
+            log.iter()
+                .filter(|event| event.ends_with(":deferred"))
+                .count(),
+            1
+        );
+        assert!(session.queued_custom_messages().is_empty());
+        let restored = Session::from_records(session.records().to_vec()).unwrap();
+        let messages = restored.current_messages();
+        assert!(messages.iter().any(
+            |message| matches!(message, Message::User { content } if content == "follow/edited")
+        ));
     }
 
     #[test]
