@@ -290,7 +290,7 @@ impl DurableAsyncTool for AsyncTool {
             if self.name == "root"
                 && let Some(path) = std::env::var_os("PI_CONV_ASYNC_KILL_WAKE")
             {
-                std::fs::write(path, "root-woken").unwrap();
+                std::fs::write(&path, "root-woken").unwrap();
                 if std::env::var_os("PI_TEST_WOKEN_LIVE_DIR").is_some() {
                     context.cancellation.cancelled().await;
                     if report {
@@ -2185,15 +2185,15 @@ async fn exercise_conversation_park_claim_with_late_publication(
             "task: {:?}",
             tasks.load(root_id).unwrap().unwrap().task.state()
         );
-        assert_eq!(
-            receipt.after_result.as_ref().unwrap()["task_content_v1"]["output"][0]["text"],
-            "after cancel"
-        );
+        let result = &receipt.after_result.as_ref().unwrap()["task_content_v1"];
+        let output = result["output"].as_array().unwrap();
+        assert_eq!(output.last().unwrap()["text"], "after cancel");
         if case == "selection_hook_output_schema" {
-            assert!(
-                receipt.after_result.as_ref().unwrap()["task_content_v1"]["structuredOutput"]
-                    .is_null()
-            );
+            assert!(result["structuredOutput"].is_null());
+            assert_eq!(output[0]["text"], "parked progress");
+            assert_eq!(result["details"]["phase"], "parked progress");
+            assert_eq!(result["diagnostics"][0]["code"], "test_progress");
+            assert_eq!(result["diagnostics"][2]["code"], "truncated");
         }
         crate::async_task_tool::validate_aborted_after_result(
             receipt.after_result.as_ref().unwrap(),
