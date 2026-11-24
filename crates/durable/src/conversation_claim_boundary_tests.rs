@@ -199,10 +199,15 @@ impl crate::extension::Hook for SchemaClaimHook {
             }));
         }
         let mut result = result.clone();
-        if !self.1 {
-            result.output.clear();
-        }
-        result.output.push(json!({"type":"text", "text":value}));
+        // This fixture uses a text-only provider. Keep the hook's replacement
+        // in a single block so the next model turn can consume the transcript.
+        let text = value.as_str().unwrap();
+        let text = if self.1 && call.name == "root" {
+            format!("parked progress\n{text}")
+        } else {
+            text.to_owned()
+        };
+        result.output = vec![json!({"type":"text", "text":text})];
         result
             .extra
             .insert("structuredOutput".into(), json!({"must":"be discarded"}));
@@ -2186,14 +2191,15 @@ async fn exercise_conversation_park_claim_with_late_publication(
             tasks.load(root_id).unwrap().unwrap().task.state()
         );
         let result = &receipt.after_result.as_ref().unwrap()["task_content_v1"];
-        let output = result["output"].as_array().unwrap();
-        assert_eq!(output.last().unwrap()["text"], "after cancel");
+        let text = result["output"][0]["text"].as_str().unwrap();
         if case == "selection_hook_output_schema" {
             assert!(result["structuredOutput"].is_null());
-            assert_eq!(output[0]["text"], "parked progress");
+            assert_eq!(text, "parked progress\nafter cancel");
             assert_eq!(result["details"]["phase"], "parked progress");
             assert_eq!(result["diagnostics"][0]["code"], "test_progress");
             assert_eq!(result["diagnostics"][2]["code"], "truncated");
+        } else {
+            assert_eq!(text, "after cancel");
         }
         crate::async_task_tool::validate_aborted_after_result(
             receipt.after_result.as_ref().unwrap(),
