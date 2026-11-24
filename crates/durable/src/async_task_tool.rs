@@ -846,10 +846,35 @@ pub struct DurableToolResume {
     pub ended: Vec<uuid::Uuid>,
 }
 
+/// Replacement snapshot of the text and metadata a checkpointable tool has
+/// reported. These bytes are supplemental output, never an execution receipt.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableToolProgress {
+    pub text: String,
+    pub details: Option<serde_json::Value>,
+    pub diagnostics: Vec<crate::runtime::ToolDiagnostic>,
+    /// Counts from the tool's output retention policy, if it dropped output.
+    pub dropped_bytes: u64,
+    pub dropped_lines: u64,
+}
+
+pub(crate) fn durable_progress_key(task: uuid::Uuid, attempt: uuid::Uuid) -> Vec<u8> {
+    format!("durable/checkpointable-progress/{task}/{attempt}").into_bytes()
+}
+
 /// Task-owned nested admission and result access. Implementations must fence
 /// every operation against the current parent reservation and abort state.
 #[async_trait::async_trait]
 pub trait DurableTaskHost: Send + Sync {
+    /// Save a replacement for this execution attempt. Available to selected
+    /// conversation tools with cancellation enabled. The snapshot is limited
+    /// to 32 KiB encoded and 30 diagnostics. A resumed tool may replace it; if
+    /// it has not reported, cancellation can use the last committed park.
+    async fn report_progress(&self, _progress: DurableToolProgress) -> Result<(), String> {
+        Err("checkpointable tool progress is unavailable".into())
+    }
+
     async fn start_child(
         &self,
         key: &str,

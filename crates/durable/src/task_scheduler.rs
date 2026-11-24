@@ -170,6 +170,13 @@ pub(crate) enum HookFenceError {
     #[error("{0}")]
     Other(String),
 }
+enum CheckpointableFence {
+    CreateIntent,
+    Undispatched,
+    Hook,
+    Progress,
+}
+
 impl From<String> for HookFenceError {
     fn from(value: String) -> Self {
         Self::Other(value)
@@ -7872,8 +7879,7 @@ impl AdmissionHandle<'_> {
             test_namespace,
             expected_replay_safe,
             cancellation,
-            true,
-            false,
+            CheckpointableFence::CreateIntent,
             (&[], &[]),
         ) {
             Err(HookFenceError::Conflict) => {
@@ -7884,8 +7890,7 @@ impl AdmissionHandle<'_> {
                         test_namespace,
                         expected_replay_safe,
                         cancellation,
-                        false,
-                        false,
+                        CheckpointableFence::Undispatched,
                         (&[], &[]),
                     ) {
                         Ok(_) => return Err(UNSAFE_ANCESTOR_BUSY.into()),
@@ -7969,8 +7974,7 @@ impl AdmissionHandle<'_> {
             false,
             self.running.task.replay_safe(),
             Some(cancellation),
-            false,
-            true,
+            CheckpointableFence::Hook,
             (&[], &[]),
         )
         .map(|_| ())
@@ -7982,15 +7986,52 @@ impl AdmissionHandle<'_> {
             }
         })
     }
+    pub(crate) fn report_checkpointable_progress(
+        &self,
+        cancellation: &pi_rs_core::CancellationToken,
+        value: Vec<u8>,
+    ) -> Result<(), String> {
+        let task = &self.running.task;
+        let attempt = task.attempt_id().ok_or("missing progress attempt")?;
+        let mutation = durable_store::Mutation::Put {
+            key: crate::async_task_tool::durable_progress_key(task.id(), attempt),
+            value,
+        };
+        self.replay_safe_durable_fence(
+            false,
+            task.replay_safe(),
+            Some(cancellation),
+            CheckpointableFence::Progress,
+            (&[], std::slice::from_ref(&mutation)),
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn read_checkpointable_progress(
+        &self,
+        attempt: Uuid,
+    ) -> Result<Option<durable_store::Entry>, String> {
+        let key = crate::async_task_tool::durable_progress_key(self.running.task.id(), attempt);
+        self.lease
+            .attachment
+            .owner
+            .store()
+            .get(&key)
+            .map_err(|error| error.to_string())
+    }
+
     fn replay_safe_durable_fence(
         &self,
         test_namespace: bool,
         expected_replay_safe: bool,
         cancellation: Option<&pi_rs_core::CancellationToken>,
-        write_intent: bool,
-        hook_phase: bool,
+        phase: CheckpointableFence,
         extra: (&[durable_store::Check], &[durable_store::Mutation]),
     ) -> Result<Vec<u8>, HookFenceError> {
+        let write_intent = matches!(phase, CheckpointableFence::CreateIntent);
+        let hook_phase = matches!(phase, CheckpointableFence::Hook);
+        let progress = matches!(phase, CheckpointableFence::Progress);
         let attempt = self.running.task.attempt_id().ok_or("missing attempt")?;
         if (!self.standalone && (test_namespace || self.validator.is_none()))
             || self.abort
@@ -8066,7 +8107,15 @@ impl AdmissionHandle<'_> {
             Uuid::nil(),
         )
         .map_err(|e| e.to_string())?;
-        if !expected_replay_safe && !test_namespace {
+        if progress {
+            let task_key = task_store::key(current.task.id());
+            if !checks.iter().any(|check| {
+                check.key == task_key
+                    && check.expected == durable_store::Expected::Version(current.version)
+            }) {
+                return Err(HookFenceError::Conflict);
+            }
+        } else if !expected_replay_safe && !test_namespace {
             if !hook_phase {
                 checks.extend(crate::async_task_tool::unsafe_park_proof::dispatch_checks(
                     owner.store(),
@@ -8170,9 +8219,26 @@ impl AdmissionHandle<'_> {
                 }
             }
         }
+        // A report can only follow dispatch of this exact reservation. Do not
+        // rerun the pre-dispatch absence checks against the committed intent.
+        let expected = if progress {
+            let entry = owner
+                .store()
+                .get(&key)
+                .map_err(|error| error.to_string())?
+                .ok_or("missing checkpointable progress intent")?;
+            let intent: Task = serde_json::from_slice(&entry.value)
+                .map_err(|_| "invalid checkpointable progress intent")?;
+            if intent != current.task {
+                return Err("checkpointable progress intent changed".into());
+            }
+            durable_store::Expected::Version(entry.version)
+        } else {
+            durable_store::Expected::Missing
+        };
         checks.push(durable_store::Check {
             key: key.clone(),
-            expected: durable_store::Expected::Missing,
+            expected,
         });
         checks.extend_from_slice(extra.0);
         let mut mutations = if write_intent {
@@ -8185,7 +8251,7 @@ impl AdmissionHandle<'_> {
         };
         mutations.extend_from_slice(extra.1);
         #[cfg(test)]
-        {
+        if !progress {
             let hook = INTENT_COMMIT_HOOK
                 .lock()
                 .unwrap()
@@ -8204,7 +8270,9 @@ impl AdmissionHandle<'_> {
             }
         }
         #[cfg(feature = "test-hooks")]
-        let test_phase = if extra
+        let test_phase = if progress {
+            "progress"
+        } else if extra
             .0
             .iter()
             .any(|check| check.key.starts_with(b"runtime/extension-memo/"))
@@ -8279,8 +8347,7 @@ impl AdmissionHandle<'_> {
                 false,
                 true,
                 Some(cancel),
-                false,
-                true,
+                CheckpointableFence::Hook,
                 (std::slice::from_ref(&check), &[]),
             ) {
                 Ok(_) => return Ok((state, check)),
@@ -8316,8 +8383,7 @@ impl AdmissionHandle<'_> {
                 false,
                 true,
                 Some(cancel),
-                false,
-                true,
+                CheckpointableFence::Hook,
                 (std::slice::from_ref(&check), &[]),
             ) {
                 Ok(_) => return Ok((available, check)),
@@ -8374,8 +8440,7 @@ impl AdmissionHandle<'_> {
             false,
             self.running.task.replay_safe(),
             Some(cancel),
-            false,
-            true,
+            CheckpointableFence::Hook,
             (&checks, &mutations),
         )?;
         Ok(result)

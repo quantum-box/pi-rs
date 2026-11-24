@@ -71,10 +71,10 @@ the uncertain Tool outcome. A changed snapshot, selection or late result needs
 reconciliation. The woken cleanup after hook receives an `interrupted`
 diagnostic naming the tool and warning that it may have partially run. This
 also applies to a live abort of a woken attempt with an unknown outcome.
-The hook receives the same message as a text block to preserve compatibility
-with legacy text hooks. This path does not reconstruct upstream’s live slot
-output, details or truncation. Receipts preserve the existing on-disk abort
-diagnostic so old readers can still authenticate them. After process loss,
+When the tool has not reported progress, the hook receives the same message
+as a text block to preserve compatibility with legacy text hooks. Receipts
+preserve the existing on-disk abort diagnostic so old readers can still
+authenticate them. After process loss,
 recovery fails the original task for reconciliation and atomically retires only
 matching task and conversation start markers. Missing, incomplete or foreign marker pairs
 cannot authorize a new callback; the claim and any receipt remain available.
@@ -126,9 +126,26 @@ abort result has no structured output. A hook that attempts to introduce structu
 output is discarded before downstream hooks. Woken cancellation is not enabled by this registration. Result publication currently requires the
 root adapter in the Harness tool list; an extension-only tool is rejected before
 callback dispatch. The abort hook receives the upstream `aborted` diagnostic
-with the tool name. pi-rs supplies a text block with the same message for
-legacy text hooks and retains the existing diagnostic marker in the receipt
-for compatibility. It does not restore partial tool output.
+with the tool name. When no progress was reported, pi-rs supplies a text block
+with the same message for legacy text hooks. It retains the existing diagnostic
+marker in the receipt for compatibility.
+
+For these selected cancellation registrations, `DurableTaskHost::report_progress`
+writes a replacement snapshot of retained text, details, diagnostics and
+truncation counts. Calls commit synchronously and should report meaningful
+updates. Each snapshot is limited to 32 KiB encoded and 30 diagnostics. The
+write checks the original dispatch intent and active invocation lease,
+registration, ownership and abort state. A cancelled attempt cannot change
+the snapshot used by cleanup.
+
+The after hook receives the last committed snapshot of the interrupted wake,
+or the committed park's snapshot when that wake never reported. A parked
+cancellation uses its own committed park. As in upstream's `fromSlot` path,
+the host appends the truncation diagnostic after running the hook. The partial
+result is supplemental output and leaves the original interrupted execution
+uncertain. Tools with existing stores may report without a schema migration.
+Unlike upstream's live streaming, reports are explicit snapshots with no
+automatic append, live display, or success-result fallback.
 
 The claim, start-marker and receipt transactions hold the selection gate
 from validation through commit. A per-name, nonblocking selection start lease

@@ -8,9 +8,9 @@ use pi_rs_core::{
 use pi_rs_durable::task::TaskState;
 use pi_rs_durable::{
     async_task_tool::{
-        AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableTaskHost, DurableToolResume,
-        DurableToolStep, DurableWait, ReplaySafeAuthorization, UnsafeDurableAuthorization,
-        register_conversation_replay_safe_durable_tool,
+        AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableTaskHost, DurableToolProgress,
+        DurableToolResume, DurableToolStep, DurableWait, ReplaySafeAuthorization,
+        UnsafeDurableAuthorization, register_conversation_replay_safe_durable_tool,
     },
     recovery::UncertainPolicy,
     runtime::{Config, Options, Scheduler},
@@ -96,7 +96,34 @@ impl crate::extension::Hook for ClaimPassHook {
         Ok(None)
     }
 }
-struct WokenClaimHook(ClaimPassHook);
+struct WokenClaimHook(ClaimPassHook, Option<&'static str>);
+
+fn tool_progress(text: &str) -> DurableToolProgress {
+    DurableToolProgress {
+        text: text.into(),
+        details: Some(json!({"phase":text})),
+        diagnostics: vec![crate::runtime::ToolDiagnostic {
+            severity: crate::runtime::DiagnosticSeverity::Info,
+            code: Some("test_progress".into()),
+            message: format!("{text} reported"),
+        }],
+        dropped_bytes: 14,
+        dropped_lines: 1,
+    }
+}
+
+fn assert_tool_progress(result: &crate::extension::ToolBlockResult, text: &str) {
+    let progress = tool_progress(text);
+    assert_eq!(result.output, vec![json!({"type":"text","text":text})]);
+    assert_eq!(result.extra.get("details"), progress.details.as_ref());
+    assert_eq!(result.diagnostics.first(), progress.diagnostics.first());
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("truncated"))
+    );
+}
 
 #[async_trait]
 impl crate::extension::Hook for WokenClaimHook {
@@ -119,7 +146,11 @@ impl crate::extension::Hook for WokenClaimHook {
             return Ok(None);
         }
         let message = "Tool root was interrupted and may have partially run";
-        assert_eq!(result.output, vec![json!({"type":"text","text":message})]);
+        if let Some(text) = self.1 {
+            assert_tool_progress(result, text);
+        } else {
+            assert_eq!(result.output, vec![json!({"type":"text","text":message})]);
+        }
         assert!(result.diagnostics.iter().any(|diagnostic| {
             diagnostic.code.as_deref() == Some("interrupted") && diagnostic.message == message
         }));
@@ -127,12 +158,15 @@ impl crate::extension::Hook for WokenClaimHook {
             return Ok(None);
         };
         let mut result = result.clone();
-        result.output = vec![json!({"type":"text","text":value})];
+        if self.1.is_none() {
+            result.output.clear();
+        }
+        result.output.push(json!({"type":"text","text":value}));
         Ok(Some(result))
     }
 }
 
-struct SchemaClaimHook(ClaimPassHook);
+struct SchemaClaimHook(ClaimPassHook, bool);
 #[async_trait]
 impl crate::extension::Hook for SchemaClaimHook {
     async fn before_tool(
@@ -140,6 +174,11 @@ impl crate::extension::Hook for SchemaClaimHook {
         call: &crate::extension::ToolCall,
         ctx: &crate::extension::Context<'_>,
     ) -> Result<crate::extension::BeforeTool, String> {
+        if self.1 && call.name == "root" {
+            return Ok(crate::extension::BeforeTool::Rewrite(
+                json!({"before":"prepared", "test_progress":true}),
+            ));
+        }
         self.0.before_tool(call, ctx).await
     }
     async fn after_tool_blocks(
@@ -152,13 +191,18 @@ impl crate::extension::Hook for SchemaClaimHook {
         let Some(value) = self.0.after_tool(call, &json!(null), ctx).await? else {
             return Ok(None);
         };
-        let message = format!("Tool {} was aborted", call.name);
-        assert_eq!(result.output, vec![json!({"type":"text","text":message})]);
-        assert!(result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code.as_deref() == Some("aborted") && diagnostic.message == message
-        }));
+        if self.1 && call.name == "root" {
+            assert_tool_progress(result, "parked progress");
+            assert!(result.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code.as_deref() == Some("aborted")
+                    && diagnostic.message == "Tool root was aborted"
+            }));
+        }
         let mut result = result.clone();
-        result.output = vec![json!({"type":"text", "text": value.as_str().unwrap()})];
+        if !self.1 {
+            result.output.clear();
+        }
+        result.output.push(json!({"type":"text", "text":value}));
         result
             .extra
             .insert("structuredOutput".into(), json!({"must":"be discarded"}));
@@ -211,7 +255,7 @@ impl Tool for AsyncTool {
 impl DurableAsyncTool for AsyncTool {
     async fn execute_durable(
         &self,
-        _: Value,
+        arguments: Value,
         context: ToolContext,
         resume: DurableToolResume,
         host: &dyn DurableTaskHost,
@@ -232,13 +276,35 @@ impl DurableAsyncTool for AsyncTool {
             }
             return Ok(DurableToolStep::Complete(Outcome::Succeeded("leaf".into())));
         };
+        let progress_mode = std::env::var("PI_TEST_CHECKPOINT_PROGRESS").ok();
+        let report = self.name == "root"
+            && (arguments.get("test_progress") == Some(&Value::Bool(true))
+                || progress_mode
+                    .as_deref()
+                    .is_some_and(|mode| !mode.is_empty()));
         if let Some(checkpoint) = resume.checkpoint {
+            if report && progress_mode.as_deref() != Some("parked") {
+                host.report_progress(tool_progress("woken progress"))
+                    .await?;
+            }
             if self.name == "root"
                 && let Some(path) = std::env::var_os("PI_CONV_ASYNC_KILL_WAKE")
             {
                 std::fs::write(path, "root-woken").unwrap();
                 if std::env::var_os("PI_TEST_WOKEN_LIVE_DIR").is_some() {
                     context.cancellation.cancelled().await;
+                    if report {
+                        assert!(
+                            host.report_progress(tool_progress("late progress"))
+                                .await
+                                .is_err()
+                        );
+                        std::fs::write(
+                            std::path::Path::new(&path).with_file_name("late-progress-rejected"),
+                            b"yes",
+                        )
+                        .unwrap();
+                    }
                     return Err("cancelled".into());
                 }
                 std::future::pending::<()>().await;
@@ -258,6 +324,17 @@ impl DurableAsyncTool for AsyncTool {
                 self.name.into(),
             )))
         } else {
+            if report {
+                host.report_progress(tool_progress("replaced progress"))
+                    .await?;
+                let oversized = DurableToolProgress {
+                    text: "x".repeat(32 * 1024),
+                    ..Default::default()
+                };
+                assert!(host.report_progress(oversized).await.is_err());
+                host.report_progress(tool_progress("parked progress"))
+                    .await?;
+            }
             let child = host.start_child("key", child_name, json!({})).await?;
             if self.early {
                 return Ok(DurableToolStep::Complete(Outcome::Succeeded(
@@ -586,11 +663,22 @@ async fn exercise_conversation_park_claim_with_late_publication(
             .install_identified(
                 crate::extension::Extension {
                     name: "policy".into(),
-                    hooks: vec![if case == "selection_hook_woken_schema" {
-                        Arc::new(SchemaClaimHook(ClaimPassHook(
-                            Some(after_calls.clone()),
-                            true,
-                        ))) as Arc<dyn crate::extension::Hook>
+                    hooks: vec![if matches!(
+                        case,
+                        "selection_hook_woken_schema" | "selection_hook_output_schema"
+                    ) {
+                        Arc::new(SchemaClaimHook(
+                            ClaimPassHook(
+                                Some(after_calls.clone()),
+                                case == "selection_hook_woken_schema",
+                            ),
+                            case == "selection_hook_output_schema",
+                        )) as Arc<dyn crate::extension::Hook>
+                    } else if case == "selection_hook_woken_live" {
+                        Arc::new(WokenClaimHook(
+                            ClaimPassHook(Some(after_calls.clone()), true),
+                            Some("woken progress"),
+                        ))
                     } else {
                         Arc::new(ClaimPassHook(
                             Some(after_calls.clone()),
@@ -6214,6 +6302,11 @@ async fn selected_woken_after_is_retained_without_resolving_uncertain_effect() {
     exercise_selected_woken_receipt("normal").await;
 }
 
+#[tokio::test]
+async fn selected_woken_restores_last_park_if_resume_never_reports() {
+    exercise_selected_woken_receipt("parked_progress").await;
+}
+
 #[cfg(feature = "experimental-graph-scope")]
 #[tokio::test]
 async fn selected_woken_busy_receipt_retries_after_writer_release() {
@@ -6253,12 +6346,18 @@ async fn exercise_selected_woken_receipt(mode: &str) {
         }
     }
     let dir = tempfile::tempdir().unwrap();
+    let progress_mode = match mode {
+        "normal" => "woken",
+        "parked_progress" => "parked",
+        _ => "",
+    };
     let mut wake = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "conversation_claim_boundary_tests::selected_woken_original_worker",
         ])
         .env("PI_TEST_SELECTED_WOKEN_DIR", dir.path())
+        .env("PI_TEST_CHECKPOINT_PROGRESS", progress_mode)
         .env("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR", dir.path())
         .env("PI_CONV_ASYNC_KILL_WAKE", dir.path().join("wake"))
         .stdout(Stdio::null())
@@ -6300,10 +6399,14 @@ async fn exercise_selected_woken_receipt(mode: &str) {
         .install_identified(
             crate::extension::Extension {
                 name: "policy".into(),
-                hooks: vec![Arc::new(WokenClaimHook(ClaimPassHook(
-                    Some(after_calls.clone()),
-                    true,
-                )))],
+                hooks: vec![Arc::new(WokenClaimHook(
+                    ClaimPassHook(Some(after_calls.clone()), true),
+                    match progress_mode {
+                        "woken" => Some("woken progress"),
+                        "parked" => Some("parked progress"),
+                        _ => None,
+                    },
+                ))],
                 ..Default::default()
             },
             crate::extension::ExtensionIdentity::new(1, "policy-v1".into(), vec!["hook-v1".into()])
@@ -6715,6 +6818,22 @@ async fn exercise_selected_woken_receipt(mode: &str) {
     .await
     .unwrap_or_else(|_| panic!("selected state: {:?}", scheduler.conversation(conversation)));
     assert!(format!("{state:?}").contains("after cancel"));
+    if !progress_mode.is_empty() {
+        let receipt = store
+            .get(&crate::task_scheduler::woken_conversation_receipt_key(
+                root.task.id(),
+            ))
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_slice(&receipt.value).unwrap();
+        let result = &value["after_result"]["task_content_v1"];
+        let text = format!("{progress_mode} progress");
+        assert_eq!(result["output"][0]["text"], text);
+        assert_eq!(result["details"]["phase"], text);
+        assert_eq!(result["diagnostics"][0]["code"], "test_progress");
+        assert_eq!(result["diagnostics"][2]["code"], "truncated");
+        assert!(format!("{state:?}").contains(&text));
+    }
     assert!(driver.shutdown_with_pending().unwrap().failure().is_none());
 }
 
@@ -6749,10 +6868,10 @@ fn start_selected_woken_test_scheduler(
                     .as_deref()
                     == Some("1")
                 {
-                    Arc::new(SchemaClaimHook(ClaimPassHook(
-                        Some(Arc::new(AtomicUsize::new(0))),
-                        true,
-                    ))) as Arc<dyn crate::extension::Hook>
+                    Arc::new(SchemaClaimHook(
+                        ClaimPassHook(Some(Arc::new(AtomicUsize::new(0))), true),
+                        false,
+                    )) as Arc<dyn crate::extension::Hook>
                 } else {
                     Arc::new(ClaimPassHook(Some(Arc::new(AtomicUsize::new(0))), true))
                 }],
@@ -7026,6 +7145,7 @@ async fn selected_woken_live_abort_runs_after_but_stays_blocked() {
                 ])
                 .env("PI_TEST_WOKEN_LIVE_DIR", &dir)
                 .env("PI_TEST_SELECTED_WOKEN_LIVE", "1")
+                .env("PI_TEST_CHECKPOINT_PROGRESS", "woken")
                 .env("PI_TEST_CONVERSATION_RECEIPT_KILL_DIR", &dir)
                 .env("PI_CONV_ASYNC_KILL_WAKE", dir.join("wake"))
                 .stdout(Stdio::inherit())
@@ -7037,6 +7157,10 @@ async fn selected_woken_live_abort_runs_after_but_stays_blocked() {
     .await
     .unwrap();
     assert!(status.success());
+    assert_eq!(
+        std::fs::read(dir.path().join("late-progress-rejected")).unwrap(),
+        b"yes"
+    );
     let (calls, task): (usize, crate::task::Task) =
         serde_json::from_slice(&std::fs::read(dir.path().join("live-result")).unwrap()).unwrap();
     assert_eq!(calls, 1);
