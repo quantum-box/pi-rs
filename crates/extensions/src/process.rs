@@ -209,6 +209,10 @@ enum ProtocolRequest {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
     },
+    BeforeProviderHeaders {
+        headers: pi_rs_core::BeforeProviderHeaders,
+        state: Option<ExtensionState>,
+    },
     TurnEndBoundary {
         event: pi_rs_core::TurnEndBoundary,
         state: Option<ExtensionState>,
@@ -472,6 +476,8 @@ struct Description {
     model_selection_hook: bool,
     #[serde(default)]
     after_provider_response_hook: bool,
+    #[serde(default)]
+    before_provider_headers_hook: bool,
     #[serde(default)]
     provider_stream_event_hook: bool,
     #[serde(default)]
@@ -1224,6 +1230,25 @@ impl Extension for ExecutableExtension {
             .await
             .map_err(|error| error.to_string())?
     }
+    fn handles_before_provider_headers(&self) -> bool {
+        self.description.before_provider_headers_hook
+    }
+    async fn before_provider_headers(
+        &self,
+        headers: &mut pi_rs_core::BeforeProviderHeaders,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        if self.handles_before_provider_headers() {
+            *headers = self
+                .request_async(ProtocolRequest::BeforeProviderHeaders {
+                    headers: headers.clone(),
+                    state: state.cloned(),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
     fn handles_message_lifecycle(&self) -> bool {
         self.description.message_lifecycle_hook
     }
@@ -4060,6 +4085,7 @@ async fn dispatch_inner(
             ui_prompt_lifecycle_hook: extension.handles_ui_prompt_lifecycle(),
             model_selection_hook: extension.handles_model_selection(),
             after_provider_response_hook: extension.handles_after_provider_response(),
+            before_provider_headers_hook: extension.handles_before_provider_headers(),
             provider_stream_event_hook: extension.handles_provider_stream_event(),
             session_lifecycle_hook: extension.handles_session_lifecycle(),
             session_transition_reasons: true,
@@ -4219,6 +4245,12 @@ async fn dispatch_inner(
                 encode(extension.lifecycle(&event, state.as_ref()).await)
             }
         }
+        ProtocolRequest::BeforeProviderHeaders { mut headers, state } => encode(
+            extension
+                .before_provider_headers(&mut headers, state.as_ref())
+                .await
+                .map(|()| headers),
+        ),
         ProtocolRequest::TurnEndBoundary { event, state } => {
             encode(extension.turn_end_boundary(&event, state.as_ref()).await)
         }
@@ -5070,13 +5102,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_hooks_negotiate_and_dispatch_read_only_metadata() {
+    async fn provider_headers_and_events_negotiate_and_dispatch() {
         struct Observe;
         #[async_trait::async_trait]
         impl Extension for Observe {
             fn id(&self) -> &str {
                 "response"
             }
+            fn handles_before_provider_headers(&self) -> bool {
+                true
+            }
+
+            async fn before_provider_headers(
+                &self,
+                headers: &mut pi_rs_core::BeforeProviderHeaders,
+                state: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                assert_eq!(headers["x-session"].as_deref(), Some("old"));
+                assert!(state.is_none());
+                headers.insert("x-session".into(), None);
+                headers.insert("x-new".into(), Some("new".into()));
+                Ok(())
+            }
+
             fn handles_after_provider_response(&self) -> bool {
                 true
             }
@@ -5122,6 +5170,16 @@ mod tests {
         let descriptor = dispatch(fixture.clone(), ProtocolRequest::Describe)
             .await
             .unwrap();
+        assert_eq!(descriptor["before_provider_headers_hook"], true);
+        let headers = serde_json::from_value(serde_json::json!({
+            "type": "before_provider_headers",
+            "headers": {"x-session": "old"}
+        }))
+        .unwrap();
+        assert_eq!(
+            dispatch(fixture.clone(), headers).await.unwrap(),
+            serde_json::json!({"x-session": null, "x-new": "new"}),
+        );
         assert_eq!(descriptor["after_provider_response_hook"], true);
         let request = serde_json::from_value(serde_json::json!({
             "type": "after_provider_response",
