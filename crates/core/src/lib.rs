@@ -58,7 +58,9 @@ pub use lifecycle::{
 };
 pub use live_model::{LiveModelControl, LiveModelSelection};
 pub use mcp_registration::{McpRegistryHost, McpServerDeclaration, RegisteredMcpServer};
-pub use message_hooks::{AssistantMessageUpdate, MessageLifecycleEvent, MessageStatus};
+pub use message_hooks::{
+    AssistantMessageUpdate, CustomMessageLifecycleEvent, MessageLifecycleEvent, MessageStatus,
+};
 pub use model_catalog::*;
 pub use model_price::ChatPrice;
 pub use pi_rs_tool_arguments::{

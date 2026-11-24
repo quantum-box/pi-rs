@@ -7,9 +7,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use pi_rs_core::{
-    CacheWarmingAction, CacheWarmingDecision, CancellationToken, Compaction, Decision, Error,
-    Extension, ExtensionFlag, ExtensionFlagValue, ExtensionResult, ExtensionState, InputAction,
-    InputEvent, LifecycleEvent, Message, ModelRequest, Outcome, RenderedExtensionRows,
+    CacheWarmingAction, CacheWarmingDecision, CancellationToken, Compaction, CustomMessage,
+    Decision, Error, Extension, ExtensionFlag, ExtensionFlagValue, ExtensionResult, ExtensionState,
+    InputAction, InputEvent, LifecycleEvent, Message, ModelRequest, Outcome, RenderedExtensionRows,
     RequestPurpose, Result, Tool, ToolContext, ToolExecution, ToolHost, ToolRenderContext,
     ToolRenderShell, ToolRenderers, ToolReply, ToolSectionRenderer, ToolSpec, TreeDecision,
     TreePreparation,
@@ -203,6 +203,10 @@ enum ProtocolRequest {
     },
     MessageLifecycle {
         event: pi_rs_core::MessageLifecycleEvent,
+        state: Option<ExtensionState>,
+    },
+    CustomMessageLifecycle {
+        event: pi_rs_core::CustomMessageLifecycleEvent,
         state: Option<ExtensionState>,
     },
     Lifecycle {
@@ -432,6 +436,8 @@ struct Description {
     lifecycle_hook: bool,
     #[serde(default)]
     message_lifecycle_hook: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    custom_message_lifecycle_hook: bool,
     #[serde(default)]
     agent_before_settle_hook: bool,
     #[serde(default)]
@@ -1262,6 +1268,25 @@ impl Extension for ExecutableExtension {
             return Ok(None);
         }
         self.request_async(ProtocolRequest::MessageLifecycle {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+
+    fn handles_custom_message_lifecycle(&self) -> bool {
+        self.description.custom_message_lifecycle_hook
+    }
+
+    async fn custom_message_lifecycle(
+        &self,
+        event: &pi_rs_core::CustomMessageLifecycleEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<Option<CustomMessage>> {
+        if !self.handles_custom_message_lifecycle() {
+            return Ok(None);
+        }
+        self.request_async(ProtocolRequest::CustomMessageLifecycle {
             event: event.clone(),
             state: state.cloned(),
         })
@@ -3749,19 +3774,22 @@ fn call<T: serde::de::DeserializeOwned>(
             ..
         }
     );
-    let legacy_response_limit = if endpoint.text_result_v2
-        && endpoint.structured_text_result
-        && matches!(
-            &request,
-            ProtocolRequest::ToolResult {
-                outcome: Outcome::TextResultWithStructuredContent { .. },
-                ..
-            }
-        ) {
-        MAX_DUPLEX_MESSAGE
-    } else {
-        MAX_MESSAGE
-    };
+    let legacy_response_limit =
+        if matches!(&request, ProtocolRequest::CustomMessageLifecycle { .. })
+            || (endpoint.text_result_v2
+                && endpoint.structured_text_result
+                && matches!(
+                    &request,
+                    ProtocolRequest::ToolResult {
+                        outcome: Outcome::TextResultWithStructuredContent { .. },
+                        ..
+                    }
+                ))
+        {
+            MAX_DUPLEX_MESSAGE
+        } else {
+            MAX_MESSAGE
+        };
     let response_limit = legacy_response_limit
         + if presence_response {
             PRESENCE_RESPONSE_OVERHEAD
@@ -4063,6 +4091,7 @@ async fn dispatch_inner(
             mcp_registry_host_calls: extension.handles_mcp_registry(),
             lifecycle_hook: extension.handles_lifecycle(),
             message_lifecycle_hook: extension.handles_message_lifecycle(),
+            custom_message_lifecycle_hook: extension.handles_custom_message_lifecycle(),
             agent_before_settle_hook: extension.handles_agent_before_settle(),
             turn_end_boundary_hook: extension.handles_turn_end_boundary(),
             lifecycle_host_calls: true,
@@ -4222,6 +4251,11 @@ async fn dispatch_inner(
         ProtocolRequest::MessageLifecycle { event, state } => {
             encode(extension.message_lifecycle(&event, state.as_ref()).await)
         }
+        ProtocolRequest::CustomMessageLifecycle { event, state } => encode(
+            extension
+                .custom_message_lifecycle(&event, state.as_ref())
+                .await,
+        ),
         ProtocolRequest::Lifecycle { event, state } => {
             if let Some(mcp) = mcp
                 && extension.handles_mcp_registry()
@@ -4940,6 +4974,61 @@ mod tests {
         .unwrap();
         let edited: Message = serde_json::from_value(output).unwrap();
         assert!(matches!(edited, Message::Assistant { content, .. } if content == "raw/edited"));
+    }
+
+    #[tokio::test]
+    async fn native_custom_message_lifecycle_negotiates_without_changing_legacy_events() {
+        let legacy: Description = serde_json::from_value(serde_json::json!({
+            "id":"legacy", "dependencies":[], "commands":[], "tools":[],
+            "message_lifecycle_hook":true
+        }))
+        .unwrap();
+        assert!(legacy.message_lifecycle_hook);
+        assert!(!legacy.custom_message_lifecycle_hook);
+
+        struct Rewrite;
+        #[async_trait::async_trait]
+        impl Extension for Rewrite {
+            fn id(&self) -> &str {
+                "rewrite-custom"
+            }
+            fn handles_custom_message_lifecycle(&self) -> bool {
+                true
+            }
+            async fn custom_message_lifecycle(
+                &self,
+                event: &pi_rs_core::CustomMessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<CustomMessage>> {
+                let pi_rs_core::CustomMessageLifecycleEvent::End { message } = event else {
+                    return Ok(None);
+                };
+                let mut message = message.clone();
+                message.display = true;
+                Ok(Some(message))
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Rewrite);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["custom_message_lifecycle_hook"], true);
+        assert_eq!(description["message_lifecycle_hook"], false);
+        let request = serde_json::from_value(serde_json::json!({
+            "type":"custom_message_lifecycle",
+            "event":{"type":"message_end","message":{
+                "customType":"fixture","content":"test","display":false,
+            }},
+        }))
+        .unwrap();
+        let output = dispatch(extension, request).await.unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "customType":"fixture","content":"test","display":true,
+            })
+        );
     }
 
     #[tokio::test]
