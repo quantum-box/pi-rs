@@ -901,6 +901,10 @@ fn debug_command_and_global_shortcut_write_session_snapshots() {
     assert!(output.contains("=== All rendered lines with visible widths ==="));
     assert!(output.contains("=== Agent messages (JSONL) ==="));
     std::fs::remove_file(&path).unwrap();
+    master.write_all(b"/changelog\r").unwrap();
+    output_until(&mut master, |text| {
+        text.contains("What's New") && text.contains("Added native MCP")
+    });
     master.write_all(b"/settings\r").unwrap();
     output_until(&mut master, |text| text.contains("Settings"));
     // Kitty CSI-u for Shift+Ctrl+D, delivered while the settings picker has focus.
@@ -2307,6 +2311,11 @@ fn settings_switches_terminal_modes_and_restores_input() {
         if initial == "regular" {
             for (label, key, expected) in [
                 ("Quiet startup", "quietStartup", serde_json::json!(true)),
+                (
+                    "Collapse changelog",
+                    "collapseChangelog",
+                    serde_json::json!(true),
+                ),
                 (
                     "Session share destination",
                     "sessionShareDestination",

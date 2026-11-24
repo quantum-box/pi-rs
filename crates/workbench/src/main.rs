@@ -23,6 +23,7 @@ mod backend;
 mod builtin_chat;
 mod cache_stats;
 mod cache_warming;
+mod changelog;
 mod chatgpt_auth;
 mod cli_compat;
 mod clipboard;
