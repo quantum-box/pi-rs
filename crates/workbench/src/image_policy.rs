@@ -271,7 +271,7 @@ impl Model for WorkbenchModel {
                     ))?;
                 }
                 pi_rs::fingerprint_model_context(&(
-                    "workbench-policy-v2",
+                    "workbench-policy-v3",
                     identity,
                     self.block_images,
                     self.supports_images,
@@ -298,7 +298,7 @@ impl Model for WorkbenchModel {
     }
     fn context_identity(&self) -> Option<String> {
         pi_rs::fingerprint_model_context(&(
-            "workbench-policy-v2",
+            "workbench-policy-v3",
             self.client.context_identity()?,
             self.block_images,
             self.supports_images,
@@ -312,13 +312,20 @@ impl Model for WorkbenchModel {
     }
     fn estimate_message_tokens(&self, request: &ModelRequest, message: &Message) -> u64 {
         let mut one = request.clone();
-        one.messages = vec![message.clone()];
+        one.messages.clear();
+        if let Message::Tool { call_id, .. } = message
+            && let Some(call) = request.messages.iter().rev().find(|entry| {
+                matches!(entry, Message::Assistant { calls, .. } if calls.iter().any(|call| call.id == *call_id))
+            })
+        {
+            one.messages.push(call.clone());
+        }
+        one.messages.push(message.clone());
         let filtered = self.filtered(one);
-        filtered
-            .messages
-            .iter()
-            .map(|m| self.client.estimate_message_tokens(&filtered, m))
-            .fold(0_u64, u64::saturating_add)
+        self.client.estimate_message_tokens(
+            &filtered,
+            filtered.messages.last().expect("single message estimate"),
+        )
     }
 
     async fn context_window(&self, model: &str) -> Option<u32> {
@@ -825,6 +832,7 @@ impl WorkbenchModel {
     }
 
     fn filtered(&self, mut request: ModelRequest) -> ModelRequest {
+        super::mcp_model_content::project_tool_results(&mut request);
         if self.block_images {
             remove_images(&mut request.messages, BLOCKED_IMAGE, BLOCKED_IMAGE);
         } else if self.supports_images == Some(false) {
@@ -867,18 +875,36 @@ fn remove_images(messages: &mut [Message], user_placeholder: &str, tool_placehol
 
 fn remove_tool_images(content: &str, placeholder: &str) -> Option<String> {
     let mut result: Value = serde_json::from_str(content).ok()?;
-    let blocks = result.get_mut("data")?.get_mut("content")?.as_array_mut()?;
+    let data = result.get_mut("data")?;
+    let resource_read = data.get("content").is_none() && data["contents"].is_array();
+    let key = if resource_read { "contents" } else { "content" };
+    let blocks = data.get_mut(key)?.as_array_mut()?;
     let mut previous_placeholder = false;
     let mut changed = false;
     blocks.retain_mut(|block| {
-        if block["type"] == "image" {
+        let resource = if resource_read {
+            &*block
+        } else {
+            &block["resource"]
+        };
+        let embedded_image = (resource_read || block["type"] == "resource")
+            && resource["blob"].is_string()
+            && resource["mimeType"]
+                .as_str()
+                .is_some_and(|mime| mime.starts_with("image/"));
+        if block["type"] == "image" || embedded_image {
             changed = true;
             if previous_placeholder {
                 return false;
             }
-            *block = json!({"type":"text","text":placeholder});
+            *block = if resource_read {
+                json!({"uri":resource["uri"],"text":placeholder})
+            } else {
+                json!({"type":"text","text":placeholder})
+            };
         }
-        previous_placeholder = block["type"] == "text" && block["text"] == placeholder;
+        previous_placeholder =
+            (resource_read || block["type"] == "text") && block["text"] == placeholder;
         true
     });
     changed.then(|| result.to_string())
@@ -1587,6 +1613,29 @@ mod tests {
     }
 
     #[test]
+    fn image_policy_redacts_fallback_mcp_resource_envelopes() {
+        let resource = json!({"uri":"mock://fixture","mimeType":"image/png","blob":"YQ=="});
+        let envelopes = [
+            json!({"data":{"content":[{"type":"resource","resource":resource}]}}),
+            json!({"data":{"contents":[resource]}}),
+        ];
+        for original in envelopes {
+            let mut messages = [Message::Tool {
+                call_id: "fixture".into(),
+                content: original.to_string(),
+                is_error: false,
+                is_structured: Some(true),
+            }];
+            remove_images(&mut messages, BLOCKED_IMAGE, BLOCKED_IMAGE);
+            let Message::Tool { content, .. } = &messages[0] else {
+                panic!("expected tool result");
+            };
+            assert!(content.contains(BLOCKED_IMAGE));
+            assert!(!content.contains("YQ=="));
+        }
+    }
+
+    #[test]
     fn plain_json_tool_text_is_not_changed_by_image_policy() {
         let content = r#"{ "data": { "content": [{"type":"image","mimeType":"image/png","data":"private"}] } }"#;
         let mut messages = vec![Message::Tool {
@@ -2041,7 +2090,7 @@ mod measured_anchor_policy_tests {
             .unwrap()
             .unwrap();
         let expected = pi_rs::fingerprint_model_context(&(
-            "workbench-policy-v2",
+            "workbench-policy-v3",
             old_identity.unwrap(),
             false,
             Option::<bool>::None,

@@ -1946,6 +1946,15 @@ the execution boundary for the pending codemode sandbox.
 
 ### Codemode OpenAI Decisions checkpoint
 
+Codemode accepts configured `pi-classifier` models and uses Pi's
+`POST <baseUrl>/classify` protocol, including image blocks, bounded response
+probabilities, provider usage and the classifier retry policy. Native endpoint
+credential binding and image validation apply. Radius classifier models are
+discovered from the active account's gateway configuration during available-model
+lookups and explicit resolution. Unfiltered and offline lists use the matching
+cached catalog when the current account can be identified without running a
+credential command.
+
 Codemode supports OpenAI Decisions classifier models, including the pinned
 GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
 and the Decisions-specific 504 retry exclusion. Native image validation and
@@ -2020,7 +2029,18 @@ MCP tools default to codemode exposure. `--exposure direct`, `deferred`,
 exclusions also prevent script access. Codemode receives the MCP call result,
 including `content`, `structuredContent`, and `isError` when a server returns
 a tool error. Connection and transport failures reject the script's call.
-The client's tool result omits the server's top-level `_meta`.
+The client's tool result omits the server's top-level `_meta`. Direct calls
+send text, embedded text resources, and resource links in the model-facing view.
+When a result contains multiple resources, text resources keep their URIs.
+Embedded images use the provider's existing image path and respect the active
+image policy. The model still receives distinct structured content alongside
+text blocks. When a local shell tool is available, embedded non-image binary
+resources can be saved to private temporary files. Text beyond 20 KiB shows
+its beginning and end with a link to the full text when an available local
+tool can read it. Output remains inline when a file cannot be used. Repeated
+projections reuse files, and the CLI cleans its temporary files on normal
+shutdown. The native limit on the size of each tool result still applies. Formats marked as
+images that the provider cannot attach stay subject to the native image policy.
 
 Programmatic shell calls return output,
 exit status, truncation and elapsed time, including nonzero exit statuses.
@@ -2836,7 +2856,10 @@ available after the shared settings. The Transport row cycles through SSE,
 WebSocket, cached WebSocket, and automatic selection in Pi's order. It updates
 the next request in a running Codex session, including sessions that
 resolve their credentials at request time, and retains the normal settings precedence. Native providers without multiple transports retain their existing
-connection behavior. The changelog and installation telemetry controls are still open. The Warnings submenu includes the default-on
+connection behavior. HTTP idle timeout edits apply to subsequent provider
+requests in the running session, including Codemode classifier and image calls,
+without interrupting an active turn. The
+changelog and installation telemetry controls are still open. The Warnings submenu includes the default-on
 Anthropic extra-usage warning. The terminal shows it once when the active model
 uses Anthropic subscription OAuth or a configured subscription token on the
 official endpoint. The warning check uses configured credentials without

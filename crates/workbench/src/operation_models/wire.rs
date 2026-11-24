@@ -37,7 +37,7 @@ pub(super) fn classifier_response(body: &Value) -> Result<&Value> {
         .ok_or_else(|| Error::Model("invalid Cloudflare Workers AI response".into()))
 }
 
-fn image_parts(values: &Value) -> Result<Vec<pi_rs::ImageContent>> {
+pub(super) fn image_parts(values: &Value) -> Result<Vec<pi_rs::ImageContent>> {
     if values.is_null() {
         return Ok(vec![]);
     }
@@ -72,7 +72,7 @@ fn image_url(image: &pi_rs::ImageContent) -> String {
     format!("data:{};base64,{}", image.mime_type, image.data)
 }
 
-pub(super) fn classifier_payload(entry: &Entry, context: &Value) -> Result<(Value, bool)> {
+pub(super) fn classifier_context(context: &Value) -> Result<(&Value, &Map<String, Value>)> {
     let state = context
         .get("state")
         .filter(|state| state.is_object())
@@ -81,9 +81,7 @@ pub(super) fn classifier_payload(entry: &Entry, context: &Value) -> Result<(Valu
         .as_object()
         .filter(|questions| !questions.is_empty() && questions.len() <= 256)
         .ok_or_else(|| Error::Config("classifier context requires 1–256 questions".into()))?;
-    let mut wire = Map::new();
     for (id, question) in questions {
-        let mut question = question.clone();
         let criteria = &question["criteria"];
         let valid = match question["type"].as_str() {
             Some("choice") => criteria.as_object().is_some_and(|criteria| {
@@ -98,10 +96,17 @@ pub(super) fn classifier_payload(entry: &Entry, context: &Value) -> Result<(Valu
         if !valid || !question["instructions"].is_string() {
             return Err(Error::Config(format!("invalid classifier question {id}")));
         }
+    }
+    Ok((state, questions))
+}
+
+pub(super) fn classifier_payload(entry: &Entry, context: &Value) -> Result<(Value, bool)> {
+    let (state, questions) = classifier_context(context)?;
+    let mut wire = questions.clone();
+    for question in wire.values_mut() {
         if question["type"] == "bool" {
             question["type"] = json!("noul");
         }
-        wire.insert(id.clone(), question);
     }
     let mut body = json!({"model":entry.model.id,"state":state,"questions":wire});
     let images = image_parts(&context["images"])?;
@@ -276,8 +281,8 @@ pub(super) fn image_output(body: &Value, blocks: &mut Vec<Value>) -> Result<()> 
     Ok(())
 }
 
-pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
-    let value = value.as_object()?;
+pub(super) fn usage(entry: &Entry, raw: &Value) -> Option<Value> {
+    let value = raw.as_object()?;
     let count = |name: &str| {
         value
             .get(name)
@@ -287,6 +292,7 @@ pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
     };
     let (input, output, cache_read, cache_write) = match entry.api {
         Api::LlamaCppClassifier => return None,
+        Api::PiClassifier => return super::pi_classifier::usage(&entry.model.cost, raw),
         Api::SystemOne | Api::WorkersAiSystemOne | Api::OpenAiDecisions => {
             if !value.contains_key("input_tokens") && !value.contains_key("output_tokens") {
                 return None;
@@ -328,23 +334,27 @@ pub(super) fn usage(entry: &Entry, value: &Value) -> Option<Value> {
             )
         }
     };
-    let cost = &entry.model.cost;
+    Some(json!({
+        "input":input,"output":output,"cacheRead":cache_read,"cacheWrite":cache_write,
+        "totalTokens":input+output+cache_read+cache_write,
+        "cost": token_cost(&entry.model.cost, [input, output, cache_read, cache_write].map(|count| count as f64)),
+    }))
+}
+
+pub(super) fn token_cost(cost: &super::Cost, counts: [f64; 4]) -> Value {
+    let [input, output, cache_read, cache_write] = counts;
     let tier = cost
         .tiers
         .iter()
-        .filter(|tier| input + cache_read + cache_write > tier.input_tokens_above)
+        .filter(|tier| input + cache_read + cache_write > tier.input_tokens_above as f64)
         .max_by_key(|tier| tier.input_tokens_above);
-    let input_cost = tier.map_or(cost.input, |tier| tier.input) * input as f64 / 1_000_000.0;
-    let output_cost = tier.map_or(cost.output, |tier| tier.output) * output as f64 / 1_000_000.0;
-    let read_cost =
-        tier.map_or(cost.cache_read, |tier| tier.cache_read) * cache_read as f64 / 1_000_000.0;
+    let input_cost = tier.map_or(cost.input, |tier| tier.input) * input / 1_000_000.0;
+    let output_cost = tier.map_or(cost.output, |tier| tier.output) * output / 1_000_000.0;
+    let read_cost = tier.map_or(cost.cache_read, |tier| tier.cache_read) * cache_read / 1_000_000.0;
     let write_cost =
-        tier.map_or(cost.cache_write, |tier| tier.cache_write) * cache_write as f64 / 1_000_000.0;
-    let result = json!({
-        "input":input,"output":output,"cacheRead":cache_read,"cacheWrite":cache_write,
-        "totalTokens":input+output+cache_read+cache_write,
-        "cost":{"input":input_cost,"output":output_cost,"cacheRead":read_cost,"cacheWrite":write_cost,
-            "total":input_cost+output_cost+read_cost+write_cost,"totalFromProvider":false},
-    });
-    Some(result)
+        tier.map_or(cost.cache_write, |tier| tier.cache_write) * cache_write / 1_000_000.0;
+    json!({
+        "input":input_cost,"output":output_cost,"cacheRead":read_cost,"cacheWrite":write_cost,
+        "total":input_cost+output_cost+read_cost+write_cost,"totalFromProvider":false,
+    })
 }

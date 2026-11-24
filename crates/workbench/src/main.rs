@@ -37,6 +37,7 @@ mod interactive;
 mod kimi_auth;
 mod locale;
 mod mcp_config;
+mod mcp_model_content;
 mod meta_auth;
 mod model_auth;
 mod model_listing;
@@ -1417,6 +1418,7 @@ fn main() {
     // rotation and prevent another one from starting before process exit.
     let _refreshes = process::stop_new_refreshes();
     pi_rs_workbench::mcp_refresh::finish_refreshes();
+    mcp_model_content::cleanup_output_files();
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     std::process::exit(code);
