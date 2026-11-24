@@ -2,6 +2,7 @@
 mod headers;
 mod options;
 mod response;
+mod stream_observer;
 mod tool_sampling;
 use aws_sdk_bedrockruntime::{
     Client,
@@ -1649,6 +1650,11 @@ impl Bedrock {
         use tracing::instrument::WithSubscriber;
         let has_secrets = !secrets.is_empty();
         let mut request = command.customize();
+        let stream_capture =
+            pi_rs_core::observes_provider_stream().then(stream_observer::Capture::default);
+        if let Some(capture) = &stream_capture {
+            request = request.interceptor(capture.clone());
+        }
         let observations = if pi_rs_core::observes_provider_response() {
             let (capture, observations) = response::Capture::channel();
             request = request.interceptor(capture);
@@ -1677,6 +1683,7 @@ impl Bedrock {
             send.await
         };
         let mut response = response.map_err(|error| request_error(error, &secrets))?;
+        let stream_observation = stream_capture.and_then(|capture| capture.finish(&secrets));
         let request_id = response.request_id().map(str::to_owned);
         Ok(Box::pin(async_stream::try_stream! {
             let mut calls: BTreeMap<i32, ToolCall> = BTreeMap::new();
@@ -1692,6 +1699,11 @@ impl Bedrock {
                 } else {
                     receive.await
                 };
+                if !matches!(&next, Ok(None))
+                    && let Some(observation) = &stream_observation
+                {
+                    observation.notify_next(&requested_model).await;
+                }
                 let Some(event) = next.map_err(|e| {
                 if let Some(service) = e.as_service_error() {
                     let mut message=diagnostic(service.meta(), request_id.as_deref(), &secrets);
