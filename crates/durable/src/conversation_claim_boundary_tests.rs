@@ -96,6 +96,42 @@ impl crate::extension::Hook for ClaimPassHook {
         Ok(None)
     }
 }
+struct WokenClaimHook(ClaimPassHook);
+
+#[async_trait]
+impl crate::extension::Hook for WokenClaimHook {
+    async fn before_tool(
+        &self,
+        call: &crate::extension::ToolCall,
+        ctx: &crate::extension::Context<'_>,
+    ) -> Result<crate::extension::BeforeTool, String> {
+        self.0.before_tool(call, ctx).await
+    }
+
+    async fn after_tool_blocks(
+        &self,
+        call: &crate::extension::ToolCall,
+        result: &crate::extension::ToolBlockResult,
+        _nested: bool,
+        ctx: &crate::extension::Context<'_>,
+    ) -> Result<Option<crate::extension::ToolBlockResult>, String> {
+        if call.name != "root" {
+            return Ok(None);
+        }
+        let message = "Tool root was interrupted and may have partially run";
+        assert_eq!(result.output, vec![json!({"type":"text","text":message})]);
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_deref() == Some("interrupted") && diagnostic.message == message
+        }));
+        let Some(value) = self.0.after_tool(call, &Value::Null, ctx).await? else {
+            return Ok(None);
+        };
+        let mut result = result.clone();
+        result.output = vec![json!({"type":"text","text":value})];
+        Ok(Some(result))
+    }
+}
+
 struct SchemaClaimHook(ClaimPassHook);
 #[async_trait]
 impl crate::extension::Hook for SchemaClaimHook {
@@ -6259,7 +6295,10 @@ async fn exercise_selected_woken_receipt(mode: &str) {
         .install_identified(
             crate::extension::Extension {
                 name: "policy".into(),
-                hooks: vec![Arc::new(ClaimPassHook(Some(after_calls.clone()), true))],
+                hooks: vec![Arc::new(WokenClaimHook(ClaimPassHook(
+                    Some(after_calls.clone()),
+                    true,
+                )))],
                 ..Default::default()
             },
             crate::extension::ExtensionIdentity::new(1, "policy-v1".into(), vec!["hook-v1".into()])

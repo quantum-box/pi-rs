@@ -1135,13 +1135,24 @@ impl Executor {
         memo: &ConversationAbortMemo<'_, '_>,
     ) -> Result<serde_json::Value, String> {
         self.bounded_hook_arguments(&arguments)?;
-        let gate = crate::runtime::ToolDiagnostic {
+        let stored_gate = crate::runtime::ToolDiagnostic {
             severity: crate::runtime::DiagnosticSeverity::Error,
             code: Some("aborted".into()),
             message: "Tool was aborted".into(),
         };
+        let gate = match memo.claim {
+            ConversationAbortClaim::Parked(_) => stored_gate.clone(),
+            ConversationAbortClaim::Woken(_) => crate::runtime::ToolDiagnostic {
+                severity: crate::runtime::DiagnosticSeverity::Error,
+                code: Some("interrupted".into()),
+                message: bounded_diagnostic(&format!(
+                    "Tool {} was interrupted and may have partially run",
+                    self.identity.spec.name
+                )),
+            },
+        };
         let initial = crate::extension::ToolBlockResult {
-            output: vec![serde_json::json!({"type":"text","text":"Tool was aborted"})],
+            output: vec![serde_json::json!({"type":"text","text":gate.message})],
             diagnostics: vec![gate.clone()],
             extra: [("isError".into(), serde_json::json!(true))]
                 .into_iter()
@@ -1184,6 +1195,15 @@ impl Executor {
             return Err("abort hook memo failed".into());
         }
         validate_content_hook_result(&result, Some(&gate), false)?;
+        // Existing readers authenticate this marker in cancellation receipts.
+        // Keep it stable on disk while supplying the interruption to the hook.
+        if gate != stored_gate {
+            for diagnostic in &mut result.diagnostics {
+                if *diagnostic == gate {
+                    *diagnostic = stored_gate.clone();
+                }
+            }
+        }
         let value = serde_json::to_value(DurableTaskResult::Rich {
             task_content_v1: result,
         })
