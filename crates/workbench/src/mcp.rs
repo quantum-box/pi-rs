@@ -1070,7 +1070,7 @@ impl McpExtension {
                 (
                     "read_resource",
                     "read_resource",
-                    "Read a resource URI from this MCP server",
+                    READ_RESOURCE_DESCRIPTION,
                     json!({"type":"object","properties":{"uri":{"type":"string"}},"required":["uri"],"additionalProperties":false}),
                 ),
             ] {
@@ -2198,6 +2198,9 @@ fn normalize(name: &str) -> String {
         })
         .collect()
 }
+#[doc(hidden)]
+pub const READ_RESOURCE_DESCRIPTION: &str = "Read a resource URI from this MCP server";
+
 const MIN_MCP_TIMEOUT: Duration = Duration::from_millis(1);
 const MAX_MCP_TIMEOUT: Duration = Duration::from_secs(3600);
 
@@ -2348,6 +2351,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn stringified_tool_progress_renews_idle_timeout() {
+        assert_tool_progress("stringified").await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn unmatched_tool_progress_does_not_renew_idle_timeout() {
         assert_tool_progress("unmatched").await;
     }
@@ -2393,10 +2401,11 @@ mod tests {
             assert_eq!(call["method"], "tools/call");
             let token = &call["params"]["_meta"]["progressToken"];
             assert!(!token.is_null());
-            let token = if fixture_case == "unmatched" {
-                json!("unrelated")
-            } else {
-                token.clone()
+            let numeric = token.as_i64().unwrap();
+            let token = match fixture_case.as_str() {
+                "unmatched" => json!(format!("0{numeric}")),
+                "stringified" => json!(numeric.to_string()),
+                _ => token.clone(),
             };
             for params in [
                 json!({"progressToken":token,"progress":1,"total":3}),

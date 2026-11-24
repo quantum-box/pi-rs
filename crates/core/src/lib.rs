@@ -19,7 +19,7 @@ mod model_price;
 mod persistent_map;
 #[doc(hidden)]
 pub mod pi_import;
-mod provider_response;
+mod provider_hooks;
 mod provider_retry;
 mod resource;
 mod retry;
@@ -53,6 +53,7 @@ pub use lifecycle::{
     LifecycleMessage, ModelSelectSource, SessionShutdownReason, SessionStartReason,
     SessionSwitchReason, TreeDecision, TreePreparation, TreeSummary,
     notify as notify_extension_lifecycle, notify_filtered as notify_extension_lifecycle_filtered,
+    notify_filtered_with_ui as notify_extension_lifecycle_filtered_with_ui,
     notify_in_session as notify_extension_lifecycle_in_session,
 };
 pub use live_model::{LiveModelControl, LiveModelSelection};
@@ -63,8 +64,9 @@ pub use model_price::ChatPrice;
 pub use pi_rs_tool_arguments::{
     JSON_DIAGNOSTIC_RETRY_LIMIT, StreamingJson, json_syntax_diagnostic, parse_tool_arguments,
 };
-pub use provider_response::{
-    ProviderResponseEvent, observe_provider_response, observes_provider_response,
+pub use provider_hooks::{
+    ProviderResponseEvent, ProviderStreamEvent, observe_provider_response, observe_provider_stream,
+    observes_provider_response, observes_provider_stream,
 };
 pub use provider_retry::ProviderRetry;
 pub use resource::Resource;

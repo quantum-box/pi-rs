@@ -197,14 +197,24 @@ async fn http_mcp_resources_and_tool_retries_match_pi() {
                     ),
                     _ => None,
                 };
-                let (status, body) = match result {
+                let (status, content_type, body) = match result {
+                    Some(result) if method == "tools/call" && scenario == Some("recover") => {
+                        let id = request["id"].as_i64().unwrap().to_string();
+                        let response = json!({"jsonrpc":"2.0","id":id,"result":result});
+                        (
+                            "200 OK",
+                            "text/event-stream",
+                            format!("id: recovered\ndata: {response}\n\n"),
+                        )
+                    }
                     Some(result) => (
                         "200 OK",
+                        "application/json",
                         json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string(),
                     ),
-                    None => ("202 Accepted", String::new()),
+                    None => ("202 Accepted", "application/json", String::new()),
                 };
-                let _ = socket.write_all(format!("HTTP/1.1 {status}\r\n{session_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
+                let _ = socket.write_all(format!("HTTP/1.1 {status}\r\n{session_header}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
             });
         }
     });

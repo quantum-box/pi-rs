@@ -927,6 +927,17 @@ changes rerender the active presentation with the host theme. Streaming
 argument and partial result rendering and executable cross-tool resolver
 registration remain pending.
 
+### Native extension header and footer
+
+In-process Rust and executable extensions can set, hide or reset the
+session header and footer using bounded styled rows. Both terminal modes
+use the active theme. Fullscreen layout and mouse offsets include the
+actual header height, and footer rows leave room for the editor. Reload
+and session transitions reset the overrides. Upstream Pi can also mount
+arbitrary live components and passes a footer data provider to its
+factory. Native extensions supply updated rows through non-blocking host UI
+requests, including in terminal session and selection callbacks.
+
 ### Native custom message renderers
 
 Native Rust and executable extensions can match a visible custom message by
@@ -1251,6 +1262,10 @@ Within the existing initialization deadline, HTTP connections retry after
 other than 501. Remote resource reads and listings, including paged listings
 and templates, retry once on those HTTP statuses. Cancellation interrupts the
 resource retry wait, and ordinary tool calls are sent once on these failures.
+The client accepts numeric request IDs echoed as strings in streamed HTTP
+responses. Matching progress tokens can also be echoed as canonical decimal
+strings, as in Pi. Leading-zero strings remain distinct tokens.
+
 For stdio and streamable HTTP tool calls, progress notifications matching the
 request's MCP progress token renew its idle timeout. The live tool result shows
 the server's message or `Progress N[/total]` when no message was supplied.
@@ -1945,6 +1960,15 @@ the execution boundary for the pending codemode sandbox.
 
 ### Codemode OpenAI Decisions checkpoint
 
+Codemode accepts configured `pi-classifier` models and uses Pi's
+`POST <baseUrl>/classify` protocol, including image blocks, bounded response
+probabilities, provider usage and the classifier retry policy. Native endpoint
+credential binding and image validation apply. Radius classifier models are
+discovered from the active account's gateway configuration during available-model
+lookups and explicit resolution. Unfiltered and offline lists use the matching
+cached catalog when the current account can be identified without running a
+credential command.
+
 Codemode supports OpenAI Decisions classifier models, including the pinned
 GPT-6 Luna catalog, image input, named answer conversion, usage pricing tiers,
 and the Decisions-specific 504 retry exclusion. Native image validation and
@@ -2008,13 +2032,29 @@ The native full transcript also records the status header and image locations.
 If the native result size limit omits inline image locations, a transcript
 includes every location.
 
+The Codemode inline budget gives each tool namespace a turn to include
+its least expensive remaining declaration. The estimate uses one token per
+four UTF-16 code units, rounded up per declaration, matching Pi's selection
+rule. The native declarations retain their existing text format.
+
 MCP tools default to codemode exposure. `--exposure direct`, `deferred`,
 `codemode` and `hidden` select another mode when adding a server. The root
 `autoEnableCodemode` MCP setting controls automatic activation. Explicit tool
 exclusions also prevent script access. Codemode receives the MCP call result,
 including `content`, `structuredContent`, and `isError` when a server returns
 a tool error. Connection and transport failures reject the script's call.
-The client's tool result omits the server's top-level `_meta`.
+The client's tool result omits the server's top-level `_meta`. Direct calls
+send text, embedded text resources, and resource links in the model-facing view.
+When a result contains multiple resources, text resources keep their URIs.
+Embedded images use the provider's existing image path and respect the active
+image policy. The model still receives distinct structured content alongside
+text blocks. When a local shell tool is available, embedded non-image binary
+resources can be saved to private temporary files. Text beyond 20 KiB shows
+its beginning and end with a link to the full text when an available local
+tool can read it. Output remains inline when a file cannot be used. Repeated
+projections reuse files, and the CLI cleans its temporary files on normal
+shutdown. The native limit on the size of each tool result still applies. Formats marked as
+images that the provider cannot attach stay subject to the native image policy.
 
 Programmatic shell calls return output,
 exit status, truncation and elapsed time, including nonzero exit statuses.
@@ -2026,8 +2066,10 @@ execution. Tests cover rollback, interruption, memory/stack limits, output
 truncation and parallel script calls through the core execution host. The
 first-line `@options` parser accepts indented directives and zero output tokens,
 rejects unsupported or invalid fields and misplaced directives, and preserves
-script line numbers. The native JSON code argument differs from Pi's
-provider-specific raw-code input.
+script line numbers. Compatible OpenAI Responses providers use Pi's raw
+JavaScript grammar, with the same code field used internally and by providers
+that use JSON function arguments. The parser trims JavaScript whitespace and
+uses the same Pi-compatible JSON syntax diagnostics as settings and RPC.
 Non-chat model APIs and remaining execution-limit differences remain open.
 
 Classifier results include their API and invocation timestamp even if the
@@ -2826,9 +2868,12 @@ The terminal lists shared settings in Pi's order and uses Pi's labels and
 boolean values for those rows. Native controls and JSON editors remain
 available after the shared settings. The Transport row cycles through SSE,
 WebSocket, cached WebSocket, and automatic selection in Pi's order. It updates
-the next request in a running Codex session and retains the normal settings
-precedence. Native providers without multiple transports retain their existing
-connection behavior. The changelog and installation telemetry controls are still open. The Warnings submenu includes the default-on
+the next request in a running Codex session, including sessions that
+resolve their credentials at request time, and retains the normal settings precedence. Native providers without multiple transports retain their existing
+connection behavior. HTTP idle timeout edits apply to subsequent provider
+requests in the running session, including Codemode classifier and image calls,
+without interrupting an active turn. The
+changelog and installation telemetry controls are still open. The Warnings submenu includes the default-on
 Anthropic extra-usage warning. The terminal shows it once when the active model
 uses Anthropic subscription OAuth or a configured subscription token on the
 official endpoint. The warning check uses configured credentials without
@@ -4591,7 +4636,9 @@ Live account verification remains separate work.
 ### Live provider selection checkpoint
 
 The terminal model picker searches the available Ollama, Anthropic, and Google catalogs.
-Use `/model anthropic/<id>` or `/model ollama/<id>` to select a model directly,
+An exact, unambiguous bare `/model` reference selects that model. Other bare
+queries open the model picker with the search field filled in, as in Pi.
+Use `/model anthropic/<id>` or `/model ollama/<id>` for native direct selection,
 or send the provider and model ID with RPC `set_model`. The worker reconnects
 for the next prompt and keeps the current session. Reopening a session
 restores the recorded provider when its connection is available and the CLI
@@ -5183,7 +5230,8 @@ attempts receive transient start and end notifications when needed. Executable e
 
 Native extensions can subscribe to `after_provider_response` to observe the
 HTTP status and normalized headers from an agent turn. The OpenAI Responses,
-OpenAI-compatible chat, Anthropic Messages, Google Gemini, and Ollama adapters
+OpenAI-compatible chat, Anthropic Messages, Google Gemini, Ollama and Pi
+Messages adapters
 await these callbacks in registration order before reading either a success or
 error body. This includes HTTP errors the native transports receive directly.
 Callback failures are reported as extension diagnostics. The
@@ -5198,6 +5246,21 @@ gateway fields. It services the hook as soon as the SDK reports those headers,
 even if the SDK waits for the stream before returning. HTTP errors follow Pi's
 Bedrock behavior and produce no callback. Custom transports opt in by reporting metadata.
 Summary and catalog requests remain outside the turn hook.
+
+Native `provider_stream_event` callbacks see parsed events from OpenAI
+Responses, Codex Responses over SSE and WebSocket, OpenAI-compatible chat,
+Anthropic Messages, Google Gemini and Vertex AI, Ollama and Mistral
+Conversations, and Pi Messages before those transports normalize them into
+model events.
+Events include the provider, API, requested model and parsed data. Callbacks
+run in registration order and their results cannot rewrite the stream. The
+observer copy withholds known reflected credentials and authentication fields
+and is never persisted. Executable extensions negotiate
+`provider_stream_event_hook` and receive `provider_stream_event` requests.
+Repeated callback failures produce one diagnostic per observer and request,
+and a timeout ends that observer's participation in the remaining frames.
+Stream callbacks share up to one quarter of the model request timeout across
+all frames. The Bedrock adapter currently supplies HTTP metadata at this boundary.
 
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
@@ -5985,7 +6048,8 @@ public metadata support use dynamic registration in auto mode.
 
 A loopback OAuth fixture covered both document paths, dynamic registration,
 and precedence. The hosted documents are supplied by the configured
-application identity. [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#client-id-metadata-documents)
+application identity. Real-service sign-in, token refresh, and sign-out with a
+hosted pi-rs client identity remain unverified. [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#client-id-metadata-documents)
 
 `images.autoResize` controls CLI file attachments, clipboard image
 encoding and the native `read` tool. With resizing disabled, supported

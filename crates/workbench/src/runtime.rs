@@ -14,6 +14,7 @@ pub struct Runtime {
     pub auto_compaction: pi_rs::AutoCompactionControl,
     pub retry: pi_rs::RetryControl,
     pub(super) provider: super::image_policy::WorkbenchModel,
+    operation_models: Option<super::operation_models::Operations>,
     pub registry: Registry,
     pub extension_sources: std::collections::BTreeMap<String, std::path::PathBuf>,
     shell: ShellConfig,
@@ -838,11 +839,16 @@ impl Runtime {
     }
 
     pub fn update_codex_transport(&mut self, settings: &super::config::Settings) {
-        if let super::providers::Client::OpenAi(client) = &mut self.provider.client {
-            *client = client
-                .clone()
-                .with_codex_transport(settings.codex_transport());
+        self.provider.client.update_codex_transport(settings);
+    }
+
+    pub fn update_http_idle_timeout(&mut self, args: &Cli, reported: bool) -> Result<()> {
+        let provider = model_client(args, reported, true)?;
+        if let Some(operations) = &self.operation_models {
+            operations.update_http_client(args)?;
         }
+        self.provider = provider;
+        Ok(())
     }
 
     pub fn configure_model_options(&mut self, args: &Cli, reported: bool) -> Result<()> {
@@ -869,21 +875,38 @@ impl Runtime {
     ) -> bool {
         let mut failed = false;
         if self.registry.has_session_lifecycle_hooks() && session.host_binding().is_none() {
-            pi_rs::notify_extension_lifecycle_filtered(
-                &self.registry,
-                event,
-                &session.extension_states(),
-                args.tool_timeout(),
-                &mut |notification| {
-                    failed |= matches!(
-                        notification,
-                        pi_rs::Notification::ExtensionLifecycleError { .. }
-                    );
-                    super::observe(notification, args.trace);
-                },
-                include,
-            )
-            .await;
+            let mut observer = |notification: pi_rs::Notification<'_>| {
+                failed |= matches!(
+                    notification,
+                    pi_rs::Notification::ExtensionLifecycleError { .. }
+                );
+                super::observe(notification, args.trace);
+            };
+            let states = session.extension_states();
+            let timeout = args.tool_timeout();
+            if args.terminal_managed_worker
+                && !matches!(event, pi_rs::LifecycleEvent::SessionShutdown { .. })
+            {
+                pi_rs::notify_extension_lifecycle_filtered_with_ui(
+                    &self.registry,
+                    event,
+                    &states,
+                    timeout,
+                    &mut observer,
+                    include,
+                )
+                .await;
+            } else {
+                pi_rs::notify_extension_lifecycle_filtered(
+                    &self.registry,
+                    event,
+                    &states,
+                    timeout,
+                    &mut observer,
+                    include,
+                )
+                .await;
+            }
         }
         failed
     }
@@ -1543,10 +1566,10 @@ async fn configure_after(
                 Vec::new(),
             )));
         }
-        if enabled("builtin:codemode")? {
+        let operation_models = if enabled("builtin:codemode")? {
             let mut operations = super::operation_models::Operations::new(args)?;
             operations.discover_llama().await;
-            extensions.push(Arc::new(operations));
+            extensions.push(Arc::new(operations.clone()));
             extensions.push(Arc::new(pi_rs_extensions::codemode::Codemode {
                 only: only_code,
                 inline_budget: args.settings.value()["codemode"]["inlineBudget"]
@@ -1555,7 +1578,10 @@ async fn configure_after(
                     .min(100_000) as usize,
                 timeout: Duration::MAX,
             }));
-        }
+            Some(operations)
+        } else {
+            None
+        };
         if let Some(project) = &args.project
             && !args.no_context_files
         {
@@ -1722,6 +1748,7 @@ async fn configure_after(
                     .unwrap_or_else(|| args.settings.auto_compaction_enabled()),
             ),
             provider,
+            operation_models,
             read_image_model,
             registry,
             extension_sources,

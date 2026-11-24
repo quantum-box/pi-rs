@@ -514,14 +514,14 @@ mod tests {
             .iter()
             .find(|entry| entry.provider == "llama")
             .unwrap();
-        let operation = Operations {
-            args: Cli::parse_from(["pi"]),
-            client: Client::builder()
+        let operation = Operations::with_client(
+            Cli::parse_from(["pi"]),
+            Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(3))
                 .build()
                 .unwrap(),
-        };
+        );
         let context = json!({"state":{"word":"fixture"}, "questions":{
             "bool":{"type":"bool","instructions":"Does it match?", "criteria":{"true":"yes","false":"no"}},
             "choice":{"type":"choice","instructions":"Which?", "criteria":{"yes":"first","no":""}},
