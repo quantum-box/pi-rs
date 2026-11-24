@@ -1,7 +1,8 @@
 //! Standalone checkpointable tools with an explicitly registered replay policy.
 use super::{
     AsyncTaskCall, AsyncTaskResult, DurableAsyncTool, DurableParkCancel, DurableTaskHost,
-    DurableTaskResult, DurableToolResume, DurableToolStep, DurableWait, ToolIdentity,
+    DurableTaskResult, DurableToolProgress, DurableToolResume, DurableToolStep, DurableWait,
+    ToolIdentity,
 };
 use crate::task::{Checkpoint, Task, WaitFor};
 use crate::task_scheduler::{AdmissionHandle, Handler, Scheduler, Step};
@@ -812,6 +813,95 @@ fn validate_content_result(result: &crate::extension::ToolBlockResult) -> Result
     validate_content_result_with_limit(result, 60 * 1024)
 }
 
+const MAX_PROGRESS_BYTES: usize = 32 * 1024;
+
+fn validate_durable_progress(progress: &DurableToolProgress, size: usize) -> Result<(), String> {
+    if size > MAX_PROGRESS_BYTES {
+        return Err("checkpointable progress exceeds 32 KiB".into());
+    }
+    // Leave room for the required interruption and truncation diagnostics.
+    if progress.diagnostics.len() > 30
+        || progress
+            .diagnostics
+            .iter()
+            .any(|d| d.message.len() > 4096 || d.code.as_ref().is_some_and(|code| code.len() > 256))
+        || (progress.dropped_bytes == 0 && progress.dropped_lines != 0)
+    {
+        return Err("invalid checkpointable progress metadata".into());
+    }
+    Ok(())
+}
+
+fn cancelled_tool_content(
+    task: &Task,
+    admission: &AdmissionHandle<'_>,
+    gate: &crate::runtime::ToolDiagnostic,
+) -> Result<
+    (
+        crate::extension::ToolBlockResult,
+        Option<crate::runtime::ToolDiagnostic>,
+    ),
+    String,
+> {
+    use crate::runtime::{DiagnosticSeverity, ToolDiagnostic};
+    let parked_attempt = if task.checkpoint().phase == "replay-safe-async-wait" {
+        serde_json::from_value::<ParkCheckpoint>(task.checkpoint().data.clone())
+            .map_err(|_| "invalid progress park checkpoint")?
+            .park_attempt
+    } else {
+        None
+    };
+    let mut progress = None;
+    for attempt in [task.woken_interrupted_attempt(), parked_attempt]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(entry) = admission.read_checkpointable_progress(attempt)? {
+            if entry.value.len() > MAX_PROGRESS_BYTES {
+                return Err("stored checkpointable progress exceeds 32 KiB".into());
+            }
+            let snapshot = serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+            validate_durable_progress(&snapshot, entry.value.len())?;
+            progress = Some(snapshot);
+            break;
+        }
+    }
+    let mut result = crate::extension::ToolBlockResult {
+        output: Vec::new(),
+        diagnostics: Vec::new(),
+        extra: [("isError".into(), serde_json::json!(true))]
+            .into_iter()
+            .collect(),
+    };
+    let truncation = if let Some(progress) = progress {
+        if !progress.text.is_empty() {
+            result
+                .output
+                .push(serde_json::json!({"type":"text","text":progress.text}));
+        }
+        if let Some(details) = progress.details {
+            result.extra.insert("details".into(), details);
+        }
+        result.diagnostics = progress.diagnostics;
+        (progress.dropped_bytes > 0).then(|| ToolDiagnostic {
+            severity: DiagnosticSeverity::Warn,
+            code: Some("truncated".into()),
+            message: format!(
+                "Output truncated: {} lines, {} bytes dropped",
+                progress.dropped_lines, progress.dropped_bytes
+            ),
+        })
+    } else {
+        // Older stores and non-reporting tools retain the legacy text input.
+        result
+            .output
+            .push(serde_json::json!({"type":"text","text":gate.message}));
+        None
+    };
+    result.diagnostics.push(gate.clone());
+    Ok((result, truncation))
+}
+
 pub(super) fn bounded_diagnostic(message: &str) -> String {
     let mut end = message.len().min(4096);
     while !message.is_char_boundary(end) {
@@ -965,10 +1055,24 @@ struct Host<'a, 'b> {
     children: &'a HashMap<String, Arc<TaskTool>>,
     started: Mutex<HashSet<uuid::Uuid>>,
     cancellation: &'a pi_rs_core::CancellationToken,
+    admission: &'a AdmissionHandle<'a>,
+    reports_for_cancel: bool,
 }
 
 #[async_trait::async_trait]
 impl DurableTaskHost for Host<'_, '_> {
+    async fn report_progress(&self, progress: DurableToolProgress) -> Result<(), String> {
+        if !self.reports_for_cancel {
+            return Err(
+                "checkpointable progress requires selected conversation cancellation".into(),
+            );
+        }
+        let encoded = serde_json::to_vec(&progress).map_err(|e| e.to_string())?;
+        validate_durable_progress(&progress, encoded.len())?;
+        self.admission
+            .report_checkpointable_progress(self.cancellation, encoded)
+    }
+
     async fn start_child(
         &self,
         key: &str,
@@ -1157,13 +1261,7 @@ impl Executor {
                 )),
             },
         };
-        let initial = crate::extension::ToolBlockResult {
-            output: vec![serde_json::json!({"type":"text","text":gate.message})],
-            diagnostics: vec![gate.clone()],
-            extra: [("isError".into(), serde_json::json!(true))]
-                .into_iter()
-                .collect(),
-        };
+        let (initial, truncation) = cancelled_tool_content(task, memo.admission, &gate)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1200,6 +1298,7 @@ impl Executor {
         if *memo.failed.lock().map_err(|_| "abort memo unavailable")? {
             return Err("abort hook memo failed".into());
         }
+        result.diagnostics.extend(truncation);
         validate_content_hook_result(&result, Some(&gate), false)?;
         // Existing readers authenticate this marker in cancellation receipts.
         // Keep it stable on disk while supplying the tool-specific diagnostic to the hook.
@@ -3288,6 +3387,8 @@ impl Handler for Executor {
             children: &self.children,
             started: Mutex::new(HashSet::new()),
             cancellation,
+            admission,
+            reports_for_cancel: self.block_results && self.conversation_cancel_dispatch_enabled(),
         };
         let (result, args, no_dispatch) = runtime.block_on(async {
             let args = match saved_args {
