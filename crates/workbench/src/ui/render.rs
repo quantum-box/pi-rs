@@ -314,6 +314,7 @@ impl TranscriptMarkdown {
 #[derive(Clone)]
 pub enum Entry {
     Notice(String),
+    Changelog(crate::changelog::Notice),
     Status(String),
     Warning(String),
     User(TranscriptMarkdown),
@@ -427,6 +428,42 @@ impl Entry {
         let inner = width.saturating_sub(2 * padding).max(1);
         let mut lines = match self {
             Self::Notice(text) => return wrap(&[Span::themed(text, theme, "muted")], width),
+            Self::Changelog(notice) => {
+                let border = Line::themed(&"─".repeat(inner), theme, "border");
+                let mut lines = vec![Line::default(), border.clone()];
+                match notice {
+                    crate::changelog::Notice::Full(body) => {
+                        let mut title = Span::themed("What's New", theme, "accent");
+                        title.bold = true;
+                        lines.extend(wrap(&[title], inner));
+                        lines.push(Line::default());
+                        lines.extend(markdown_at_depth(
+                            body,
+                            theme,
+                            inner,
+                            0,
+                            options.mermaid,
+                            *HYPERLINKS,
+                            false,
+                        ));
+                        lines.push(Line::default());
+                    }
+                    crate::changelog::Notice::Condensed(version) => {
+                        let mut command = Span::themed("/changelog", theme, "text");
+                        command.bold = true;
+                        lines.extend(wrap(
+                            &[
+                                Span::themed(format!("Updated to v{version}. Use "), theme, "text"),
+                                command,
+                                Span::themed(" to view full changelog.", theme, "text"),
+                            ],
+                            inner,
+                        ));
+                    }
+                }
+                lines.push(border);
+                lines
+            }
             Self::Status(text) => {
                 let mut lines = vec![Line::default()];
                 let inset = usize::from(width >= 3);

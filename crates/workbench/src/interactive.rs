@@ -37,7 +37,7 @@ use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::{Cli, Provider, TuiMode, process::Worker, radius_auth, sessions};
+use super::{Cli, Provider, TuiMode, changelog, process::Worker, radius_auth, sessions};
 
 // Shell output is displayed separately from the model-facing context framing.
 fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
@@ -2936,6 +2936,9 @@ impl View {
 
     fn restore(&mut self, args: &Cli) -> Result<()> {
         let session = Session::open(&args.session)?;
+        self.restore_session(args, &session)
+    }
+    fn restore_session(&mut self, args: &Cli, session: &Session) -> Result<()> {
         if session.host_binding().is_some() {
             return Err(Error::Session(
                 "a managed session must be opened by its host".into(),
@@ -3156,7 +3159,7 @@ impl View {
                 }
                 _ => {}
             }
-            self.add_summary(record, Some(&session));
+            self.add_summary(record, Some(session));
             self.show_summary_billing(record, records, args);
             self.observe_cache(record, args);
             self.observe_thinking_drop(&record.event);
@@ -4596,7 +4599,7 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
     outcome.tool_content()
 }
 
-const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>  /debug\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. Ctrl+PageUp/PageDown moves through the editor. Up/Down recall prompts at the editor boundaries.\nFullscreen: PageUp/PageDown scroll. See /hotkeys for transcript search and navigation.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
+const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>  /debug  /changelog\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. Ctrl+PageUp/PageDown moves through the editor. Up/Down recall prompts at the editor boundaries.\nFullscreen: PageUp/PageDown scroll. See /hotkeys for transcript search and navigation.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
 
 fn slash(
     input: &str,
@@ -5685,7 +5688,18 @@ pub(super) async fn run(
         hide_thinking: args.settings.boolean("hideThinkingBlock").unwrap_or(false),
         ..View::default()
     };
-    view.restore(&args)?;
+    {
+        let session = Session::open(&args.session)?;
+        view.restore_session(&args, &session)?;
+        if session.current_messages().is_empty()
+            && let Ok(Some(notice)) = changelog::startup(
+                &super::config::agent_dir().join("pi-rs-changelog.json"),
+                args.settings.boolean("collapseChangelog").unwrap_or(false),
+            )
+        {
+            view.append_entry(Entry::Changelog(notice));
+        }
+    }
     view.resources = initial_resources;
     if args.trust_pending {
         slash("/trust", &mut args, &mut view, None)?;
@@ -7698,6 +7712,8 @@ pub(super) async fn run(
                             view.append(&keys.describe());
                         } else if input.trim() == "/debug" {
                             view.show_debug_log(&args, &theme);
+                        } else if input.trim() == "/changelog" {
+                            view.append_entry(Entry::Changelog(changelog::full()));
                         } else if input.trim() == "/settings" {
                             view.picker = Some(Picker::new(
                                 "Settings",
@@ -9487,6 +9503,16 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
             ),
         },
         Item {
+            label: format!(
+                "Collapse changelog · {}",
+                args.settings.boolean("collapseChangelog").unwrap_or(false)
+            ),
+            selection: Selection::Setting(
+                "collapseChangelog".into(),
+                json!(!args.settings.boolean("collapseChangelog").unwrap_or(false)),
+            ),
+        },
+        Item {
             label: format!("Quiet startup · {quiet_label}"),
             selection: Selection::Setting(
                 "quietStartup".into(),
@@ -10731,6 +10757,7 @@ fn complete_input(args: &Cli, view: &mut View) {
             "/theme",
             "/settings",
             "/debug",
+            "/changelog",
             "/reload",
         ]
         .into_iter()

@@ -2880,8 +2880,16 @@ the next request in a running Codex session, including sessions that
 resolve their credentials at request time, and retains the normal settings precedence. Native providers without multiple transports retain their existing
 connection behavior. HTTP idle timeout edits apply to subsequent provider
 requests in the running session, including Codemode classifier and image calls,
-without interrupting an active turn. The
-changelog and installation telemetry controls are still open. The Warnings submenu includes the default-on
+without interrupting an active turn. `collapseChangelog` controls how native
+release notes appear when starting with no session messages after an update.
+The first launch records a baseline without displaying notes, and `/changelog`
+always shows the full bundled notes. The native version marker lives in
+`pi-rs-changelog.json` in the agent directory, separate from upstream Pi's
+version marker. Extension package changelogs remain outside this feature.
+pi-rs preserves the upstream `enableInstallTelemetry` key in shared settings
+files. Native pi-rs sends no install or update reports to `pi.dev` and never
+adds upstream Pi attribution headers as a side effect of that setting.
+The Warnings submenu includes the default-on
 Anthropic extra-usage warning. The terminal shows it once when the active model
 uses Anthropic subscription OAuth or a configured subscription token on the
 official endpoint. The warning check uses configured credentials without
@@ -6075,7 +6083,11 @@ public metadata support use dynamic registration in auto mode.
 A loopback OAuth fixture covered both document paths, dynamic registration,
 and precedence. The hosted documents are supplied by the configured
 application identity. Real-service sign-in, token refresh, and sign-out with a
-hosted pi-rs client identity remain unverified. [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#client-id-metadata-documents)
+hosted pi-rs client identity remain unverified. Acceptance requires an
+authorized test account and MCP endpoint, operator-hosted HTTPS metadata
+documents for the pi-rs client, an authorization server that permits that
+client and loopback callback, and a flow that issues refresh tokens.
+[MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#client-id-metadata-documents)
 
 `images.autoResize` controls CLI file attachments, clipboard image
 encoding and the native `read` tool. With resizing disabled, supported
