@@ -152,6 +152,11 @@ impl crate::extension::Hook for SchemaClaimHook {
         let Some(value) = self.0.after_tool(call, &json!(null), ctx).await? else {
             return Ok(None);
         };
+        let message = format!("Tool {} was aborted", call.name);
+        assert_eq!(result.output, vec![json!({"type":"text","text":message})]);
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_deref() == Some("aborted") && diagnostic.message == message
+        }));
         let mut result = result.clone();
         result.output = vec![json!({"type":"text", "text": value.as_str().unwrap()})];
         result

@@ -125,9 +125,10 @@ still requires reconciliation; memo persistence does not authorize another callb
 abort result has no structured output. A hook that attempts to introduce structured
 output is discarded before downstream hooks. Woken cancellation is not enabled by this registration. Result publication currently requires the
 root adapter in the Harness tool list; an extension-only tool is rejected before
-callback dispatch. The abort hook currently receives a fresh `Tool was aborted`
-result with an error diagnostic, rather than upstream’s tool-named message and
-its preserved partial output.
+callback dispatch. The abort hook receives the upstream `aborted` diagnostic
+with the tool name. pi-rs supplies a text block with the same message for
+legacy text hooks and retains the existing diagnostic marker in the receipt
+for compatibility. It does not restore partial tool output.
 
 The claim, start-marker and receipt transactions hold the selection gate
 from validation through commit. A per-name, nonblocking selection start lease
