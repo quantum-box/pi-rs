@@ -1426,12 +1426,12 @@ pub trait Extension: Send + Sync {
         false
     }
 
-    /// Opt in to assistant message starts, streaming updates, and final messages.
+    /// Opt in to user, assistant and model-facing tool result boundaries and assistant streaming updates.
     fn handles_message_lifecycle(&self) -> bool {
         false
     }
 
-    /// A completed message may be replaced with a message of the same role.
+    /// A completed message may be edited while retaining its role and associated data.
     async fn message_lifecycle(
         &self,
         _event: &crate::MessageLifecycleEvent,
@@ -1450,14 +1450,19 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Declarative cross-tool renderers, including for executable extensions.
+    fn tool_renderer_overrides(&self) -> Vec<crate::ToolRendererOverride> {
+        Vec::new()
+    }
+
     /// Override or wrap the tool's presentation, including for a tool owned by
     /// another extension. Delegate to `next` for tool names left alone.
     fn resolve_tool_renderers(
         &self,
-        _tool_name: &str,
+        tool_name: &str,
         next: &dyn Fn() -> Option<crate::ToolRenderers>,
     ) -> Option<crate::ToolRenderers> {
-        next()
+        crate::tool_render::resolve_tool_overrides(&self.tool_renderer_overrides(), tool_name, next)
     }
 
     /// Custom message types this extension can render in a native host.
@@ -1477,6 +1482,19 @@ pub trait Extension: Send + Sync {
     /// Observe when an extension starts and stops waiting on a native UI prompt.
     fn handles_ui_prompt_lifecycle(&self) -> bool {
         false
+    }
+
+    /// Opt in to editing configured provider headers before transport authentication.
+    fn handles_before_provider_headers(&self) -> bool {
+        false
+    }
+
+    async fn before_provider_headers(
+        &self,
+        _headers: &mut crate::BeforeProviderHeaders,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        Ok(())
     }
 
     /// Branch-local entry types this extension can render for its host.
@@ -1515,6 +1533,19 @@ pub trait Extension: Send + Sync {
     async fn after_provider_response(
         &self,
         _event: &crate::ProviderResponseEvent,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        Ok(())
+    }
+
+    /// Opt in to observing parsed transport events before model normalization.
+    fn handles_provider_stream_event(&self) -> bool {
+        false
+    }
+
+    async fn provider_stream_event(
+        &self,
+        _event: &crate::ProviderStreamEvent,
         _state: Option<&ExtensionState>,
     ) -> ExtensionResult<()> {
         Ok(())

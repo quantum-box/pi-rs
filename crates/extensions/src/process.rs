@@ -11,8 +11,9 @@ use pi_rs_core::{
     Extension, ExtensionFlag, ExtensionFlagValue, ExtensionResult, ExtensionState, InputAction,
     InputEvent, LifecycleEvent, Message, ModelRequest, Outcome, RenderedExtensionRows,
     RequestPurpose, Result, Tool, ToolContext, ToolExecution, ToolHost, ToolRenderContext,
-    ToolRenderShell, ToolRenderers, ToolReply, ToolSectionRenderer, ToolSpec, TreeDecision,
-    TreePreparation,
+    ToolRenderShell, ToolRendererMatch, ToolRendererOverride, ToolRendererOverrideCallback,
+    ToolRendererOverrideMode, ToolRendererOverrideSection, ToolRenderers, ToolReply,
+    ToolSectionRenderer, ToolSpec, TreeDecision, TreePreparation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -209,12 +210,20 @@ enum ProtocolRequest {
         event: LifecycleEvent,
         state: Option<ExtensionState>,
     },
+    BeforeProviderHeaders {
+        headers: pi_rs_core::BeforeProviderHeaders,
+        state: Option<ExtensionState>,
+    },
     TurnEndBoundary {
         event: pi_rs_core::TurnEndBoundary,
         state: Option<ExtensionState>,
     },
     AfterProviderResponse {
         event: pi_rs_core::ProviderResponseEvent,
+        state: Option<ExtensionState>,
+    },
+    ProviderStreamEvent {
+        event: pi_rs_core::ProviderStreamEvent,
         state: Option<ExtensionState>,
     },
     AgentBeforeSettle {
@@ -226,6 +235,12 @@ enum ProtocolRequest {
         trigger: pi_rs_core::CompactionTrigger,
         metadata: Option<Value>,
         state: Option<ExtensionState>,
+    },
+    RenderToolOverride {
+        id: String,
+        section: ToolSection,
+        context: ToolRenderContext,
+        next: Option<RenderedExtensionRows>,
     },
     RenderToolSection {
         section: ToolSection,
@@ -375,6 +390,8 @@ struct Description {
     dependencies: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     custom_message_renderers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_renderer_overrides: Vec<DescriptionToolRendererOverride>,
     commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     flags: Vec<ExtensionFlag>,
@@ -468,6 +485,10 @@ struct Description {
     model_selection_hook: bool,
     #[serde(default)]
     after_provider_response_hook: bool,
+    #[serde(default)]
+    before_provider_headers_hook: bool,
+    #[serde(default)]
+    provider_stream_event_hook: bool,
     #[serde(default)]
     session_lifecycle_hook: bool,
     #[serde(default)]
@@ -690,6 +711,27 @@ enum ToolSection {
     Result,
 }
 
+#[derive(Serialize, Deserialize)]
+struct DescriptionToolRendererOverride {
+    id: String,
+    selector: ToolRendererMatch,
+    shell: Option<ToolRenderShell>,
+    call: Option<ToolRendererOverrideMode>,
+    result: Option<ToolRendererOverrideMode>,
+}
+
+impl From<ToolRendererOverride> for DescriptionToolRendererOverride {
+    fn from(rule: ToolRendererOverride) -> Self {
+        Self {
+            id: rule.id,
+            selector: rule.selector,
+            shell: rule.shell,
+            call: rule.call.map(|section| section.mode),
+            result: rule.result.map(|section| section.mode),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Serialize, Deserialize)]
 struct DescriptionToolRenderers {
     shell: ToolRenderShell,
@@ -797,6 +839,24 @@ impl ExecutableExtension {
     }
 
     fn from_description(endpoint: Endpoint, description: Description) -> Result<Self> {
+        if description.tool_renderer_overrides.len() > 64 {
+            return Err(Error::Config(
+                "too many executable tool renderer overrides".into(),
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for rule in &description.tool_renderer_overrides {
+            let valid_selector = match &rule.selector {
+                ToolRendererMatch::Exact(name) => !name.is_empty() && name.len() <= 512,
+                ToolRendererMatch::Prefix(prefix) => prefix.len() <= 512,
+            };
+            if !valid_selector || rule.id.is_empty() || rule.id.len() > 128 || !ids.insert(&rule.id)
+            {
+                return Err(Error::Config(
+                    "invalid or duplicate executable tool renderer override".into(),
+                ));
+            }
+        }
         let mut extension = Self {
             endpoint,
             description,
@@ -1126,6 +1186,30 @@ impl Extension for ExecutableExtension {
     fn handles_tool_execution_updates(&self) -> bool {
         self.description.tool_execution_update_hook
     }
+    fn tool_renderer_overrides(&self) -> Vec<ToolRendererOverride> {
+        self.description
+            .tool_renderer_overrides
+            .iter()
+            .map(|rule| {
+                let callback = |mode, section| ToolRendererOverrideSection {
+                    mode,
+                    renderer: Arc::new(ExecutableToolOverride {
+                        endpoint: self.endpoint.clone(),
+                        id: rule.id.clone(),
+                        section,
+                    }),
+                };
+                ToolRendererOverride {
+                    id: rule.id.clone(),
+                    selector: rule.selector.clone(),
+                    shell: rule.shell,
+                    call: rule.call.map(|mode| callback(mode, ToolSection::Call)),
+                    result: rule.result.map(|mode| callback(mode, ToolSection::Result)),
+                }
+            })
+            .collect()
+    }
+
     fn custom_message_renderer_types(&self) -> Vec<&str> {
         self.description
             .custom_message_renderers
@@ -1218,6 +1302,25 @@ impl Extension for ExecutableExtension {
             .await
             .map_err(|error| error.to_string())?
     }
+    fn handles_before_provider_headers(&self) -> bool {
+        self.description.before_provider_headers_hook
+    }
+    async fn before_provider_headers(
+        &self,
+        headers: &mut pi_rs_core::BeforeProviderHeaders,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        if self.handles_before_provider_headers() {
+            *headers = self
+                .request_async(ProtocolRequest::BeforeProviderHeaders {
+                    headers: headers.clone(),
+                    state: state.cloned(),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
     fn handles_message_lifecycle(&self) -> bool {
         self.description.message_lifecycle_hook
     }
@@ -1249,6 +1352,23 @@ impl Extension for ExecutableExtension {
             return Ok(());
         }
         self.request_async(ProtocolRequest::AfterProviderResponse {
+            event: event.clone(),
+            state: state.cloned(),
+        })
+        .await
+    }
+    fn handles_provider_stream_event(&self) -> bool {
+        self.description.provider_stream_event_hook
+    }
+    async fn provider_stream_event(
+        &self,
+        event: &pi_rs_core::ProviderStreamEvent,
+        state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        if !self.handles_provider_stream_event() {
+            return Ok(());
+        }
+        self.request_async(ProtocolRequest::ProviderStreamEvent {
             event: event.clone(),
             state: state.cloned(),
         })
@@ -2316,6 +2436,30 @@ impl ExecutableTool {
         }
     }
 }
+struct ExecutableToolOverride {
+    endpoint: Endpoint,
+    id: String,
+    section: ToolSection,
+}
+
+#[async_trait::async_trait]
+impl ToolRendererOverrideCallback for ExecutableToolOverride {
+    async fn render(
+        &self,
+        context: &ToolRenderContext,
+        next: Option<&RenderedExtensionRows>,
+    ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+        self.endpoint
+            .request_async(ProtocolRequest::RenderToolOverride {
+                id: self.id.clone(),
+                section: self.section,
+                context: context.clone(),
+                next: next.cloned(),
+            })
+            .await
+    }
+}
+
 struct ExecutableToolRenderer {
     endpoint: Endpoint,
     tool_name: String,
@@ -3983,6 +4127,11 @@ async fn dispatch_inner(
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            tool_renderer_overrides: extension
+                .tool_renderer_overrides()
+                .into_iter()
+                .map(DescriptionToolRendererOverride::from)
+                .collect(),
             custom_message_renderers: extension
                 .custom_message_renderer_types()
                 .into_iter()
@@ -4037,6 +4186,8 @@ async fn dispatch_inner(
             ui_prompt_lifecycle_hook: extension.handles_ui_prompt_lifecycle(),
             model_selection_hook: extension.handles_model_selection(),
             after_provider_response_hook: extension.handles_after_provider_response(),
+            before_provider_headers_hook: extension.handles_before_provider_headers(),
+            provider_stream_event_hook: extension.handles_provider_stream_event(),
             session_lifecycle_hook: extension.handles_session_lifecycle(),
             session_transition_reasons: true,
             pi_lifecycle_fields: true,
@@ -4181,7 +4332,8 @@ async fn dispatch_inner(
                     .await;
                 host.close_custom_entry_scope();
                 encode(result)
-            } else if host.supports_custom_messages()
+            } else if host.has_ui()
+                || host.supports_custom_messages()
                 || host.supports_custom_entries()
                 || host.supports_custom_entry_read()
             {
@@ -4194,12 +4346,23 @@ async fn dispatch_inner(
                 encode(extension.lifecycle(&event, state.as_ref()).await)
             }
         }
+        ProtocolRequest::BeforeProviderHeaders { mut headers, state } => encode(
+            extension
+                .before_provider_headers(&mut headers, state.as_ref())
+                .await
+                .map(|()| headers),
+        ),
         ProtocolRequest::TurnEndBoundary { event, state } => {
             encode(extension.turn_end_boundary(&event, state.as_ref()).await)
         }
         ProtocolRequest::AfterProviderResponse { event, state } => encode(
             extension
                 .after_provider_response(&event, state.as_ref())
+                .await,
+        ),
+        ProtocolRequest::ProviderStreamEvent { event, state } => encode(
+            extension
+                .provider_stream_event(&event, state.as_ref())
                 .await,
         ),
         ProtocolRequest::AgentBeforeSettle { event, state } => {
@@ -4221,6 +4384,36 @@ async fn dispatch_inner(
                 )
                 .await,
         ),
+        ProtocolRequest::RenderToolOverride {
+            id,
+            section,
+            context,
+            next,
+        } => {
+            let Some(rule) = extension
+                .tool_renderer_overrides()
+                .into_iter()
+                .find(|rule| rule.id == id && rule.selector.matches(&context.tool_name))
+            else {
+                return Ok(Value::Null);
+            };
+            let section = match section {
+                ToolSection::Call => rule.call,
+                ToolSection::Result if context.result.is_some() => rule.result,
+                ToolSection::Result => None,
+            };
+            match section {
+                Some(section) => {
+                    let next = if section.mode == ToolRendererOverrideMode::Wrap {
+                        next.as_ref()
+                    } else {
+                        None
+                    };
+                    encode(section.renderer.render(&context, next).await)
+                }
+                None => Ok(Value::Null),
+            }
+        }
         ProtocolRequest::RenderToolSection { section, context } => {
             let renderers = extension
                 .tools()
@@ -5040,13 +5233,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_response_hook_negotiates_and_dispatches_read_only_metadata() {
+    async fn provider_headers_and_events_negotiate_and_dispatch() {
         struct Observe;
         #[async_trait::async_trait]
         impl Extension for Observe {
             fn id(&self) -> &str {
                 "response"
             }
+            fn handles_before_provider_headers(&self) -> bool {
+                true
+            }
+
+            async fn before_provider_headers(
+                &self,
+                headers: &mut pi_rs_core::BeforeProviderHeaders,
+                state: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                assert_eq!(headers["x-session"].as_deref(), Some("old"));
+                assert!(state.is_none());
+                headers.insert("x-session".into(), None);
+                headers.insert("x-new".into(), Some("new".into()));
+                Ok(())
+            }
+
             fn handles_after_provider_response(&self) -> bool {
                 true
             }
@@ -5066,17 +5275,60 @@ mod tests {
                 );
                 Ok(())
             }
+
+            fn handles_provider_stream_event(&self) -> bool {
+                true
+            }
+
+            async fn provider_stream_event(
+                &self,
+                event: &pi_rs_core::ProviderStreamEvent,
+                state: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                assert_eq!(event.provider, "fixture");
+                assert_eq!(event.api, pi_rs_core::ModelApi::AnthropicMessages);
+                assert_eq!(event.model, "model-id");
+                assert_eq!(
+                    event.data,
+                    serde_json::json!({"type":"content_block_delta"})
+                );
+                assert!(state.is_none());
+                Ok(())
+            }
         }
 
         let fixture: Arc<dyn Extension> = Arc::new(Observe);
         let descriptor = dispatch(fixture.clone(), ProtocolRequest::Describe)
             .await
             .unwrap();
+        assert_eq!(descriptor["before_provider_headers_hook"], true);
+        let headers = serde_json::from_value(serde_json::json!({
+            "type": "before_provider_headers",
+            "headers": {"x-session": "old"}
+        }))
+        .unwrap();
+        assert_eq!(
+            dispatch(fixture.clone(), headers).await.unwrap(),
+            serde_json::json!({"x-session": null, "x-new": "new"}),
+        );
         assert_eq!(descriptor["after_provider_response_hook"], true);
         let request = serde_json::from_value(serde_json::json!({
             "type": "after_provider_response",
             "event": {"status": 429, "headers": {"retry-after": "3"}},
             "state": {"version": 1, "data": {"seen": 1}}
+        }))
+        .unwrap();
+        assert_eq!(
+            dispatch(fixture.clone(), request).await.unwrap(),
+            Value::Null
+        );
+        assert_eq!(descriptor["provider_stream_event_hook"], true);
+        let request = serde_json::from_value(serde_json::json!({
+            "type": "provider_stream_event",
+            "event": {
+                "provider": "fixture", "api": "anthropic-messages", "model": "model-id",
+                "data": {"type":"content_block_delta"}
+            }
         }))
         .unwrap();
         assert_eq!(dispatch(fixture, request).await.unwrap(), Value::Null);
@@ -5247,6 +5499,78 @@ mod tests {
             serde_json::from_value::<DuplexFrame>(encoded).unwrap(),
             DuplexFrame::Progress { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_dispatch_exposes_a_ui_only_host() {
+        struct UiHost;
+        #[async_trait::async_trait]
+        impl ToolHost for UiHost {
+            fn tools(&self) -> Vec<ToolSpec> {
+                Vec::new()
+            }
+
+            async fn call(&self, _: &str, _: Value) -> Outcome {
+                panic!("read-only lifecycle must not invoke tools");
+            }
+
+            fn has_ui(&self) -> bool {
+                true
+            }
+
+            async fn ui(
+                &self,
+                request: pi_rs_core::UiRequest,
+            ) -> ExtensionResult<pi_rs_core::UiResponse> {
+                assert!(matches!(
+                    request,
+                    pi_rs_core::UiRequest::SetFooter { lines: None }
+                ));
+                Ok(pi_rs_core::UiResponse::Cancelled)
+            }
+        }
+
+        struct Hook;
+        #[async_trait::async_trait]
+        impl Extension for Hook {
+            fn id(&self) -> &str {
+                "chrome"
+            }
+
+            async fn lifecycle(
+                &self,
+                _: &LifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<()> {
+                Err("lifecycle selected the detached path".into())
+            }
+
+            async fn lifecycle_with_host(
+                &self,
+                _: &LifecycleEvent,
+                _: Option<&ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> ExtensionResult<()> {
+                host.ui(pi_rs_core::UiRequest::SetFooter { lines: None })
+                    .await?;
+                Ok(())
+            }
+        }
+
+        let response = dispatch_with_host(
+            Arc::new(Hook),
+            ProtocolRequest::Lifecycle {
+                event: LifecycleEvent::SessionStart {
+                    reason: pi_rs_core::SessionStartReason::Startup,
+                    previous_session_file: None,
+                },
+                state: None,
+            },
+            Arc::new(UiHost),
+        )
+        .await
+        .unwrap();
+        assert!(response.is_null());
     }
 
     #[tokio::test]
@@ -5556,6 +5880,207 @@ esac
         let rows = rendered.call.unwrap();
         assert_eq!(rows.lines[0][0].text, "remote call");
         assert_eq!(rows.lines[0][0].color.as_deref(), Some("accent"));
+    }
+
+    #[cfg(unix)]
+    struct LabelRows;
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl ToolSectionRenderer for LabelRows {
+        async fn render(
+            &self,
+            context: &ToolRenderContext,
+        ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+            Ok(Some(RenderedExtensionRows {
+                lines: vec![vec![pi_rs_core::UiComponentSpan {
+                    text: context.tool_name.clone(),
+                    ..Default::default()
+                }]],
+                ..Default::default()
+            }))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_tool_renderer_overrides_wrap_unregistered_calls_in_order() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = r#"#!/usr/bin/env python3
+import json, pathlib, sys
+
+request = json.load(sys.stdin)
+if request['type'] == 'describe':
+    result = json.loads(pathlib.Path(__file__).with_suffix('.json').read_text())
+elif request['type'] == 'render_tool_override':
+    assert request['context']['toolName'] == 'mcp_archive_read'
+    text = request['id']
+    if request['next'] is not None:
+        text = text + '[' + request['next']['lines'][0][0]['text'] + ']'
+    result = {'lines': [[{'text': text, 'color': 'accent'}]]}
+else:
+    raise AssertionError(request['type'])
+print(json.dumps({'version': 1, 'response': {'Ok': result}}))
+"#;
+        let root = tempfile::tempdir().unwrap();
+        let mut registry = pi_rs_core::Registry::default();
+        for (id, overrides) in [
+            (
+                "outer",
+                serde_json::json!([{
+                    "id": "outer", "selector": {"kind": "prefix", "value": "mcp_archive_"},
+                    "call": "wrap", "result": "wrap", "shell": "self"
+                }]),
+            ),
+            (
+                "inner",
+                serde_json::json!([{
+                    "id": "inner", "selector": {"kind": "exact", "value": "mcp_archive_read"},
+                    "call": "replace"
+                }]),
+            ),
+        ] {
+            let path = root.path().join(format!("{id}.py"));
+            std::fs::write(&path, fixture).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(
+                path.with_extension("json"),
+                serde_json::json!({
+                    "id": id, "dependencies": [], "commands": [], "tools": [],
+                    "tool_renderer_overrides": overrides
+                })
+                .to_string(),
+            )
+            .unwrap();
+            registry
+                .register(Arc::new(
+                    ExecutableExtension::load_async(path).await.unwrap(),
+                ))
+                .unwrap();
+        }
+        let base = || {
+            Some(ToolRenderers {
+                call: Some(Arc::new(LabelRows)),
+                result: Some(Arc::new(LabelRows)),
+                ..Default::default()
+            })
+        };
+        let renderers = registry.tool_renderers();
+        let mut context =
+            ToolRenderContext::new("mcp_archive_read", "hidden-call", Value::Null, ".");
+        context.result = Some(pi_rs_core::ToolRenderResult {
+            content: serde_json::json!([{"type":"text","text":"result"}]),
+            details: None,
+            is_partial: false,
+            is_error: false,
+            duration_ms: None,
+        });
+        let rendered = renderers
+            .resolve("mcp_archive_read", &base)
+            .unwrap()
+            .render(&context, Duration::from_secs(2))
+            .await;
+        assert_eq!(rendered.shell, ToolRenderShell::SelfFramed);
+        assert_eq!(rendered.call.unwrap().lines[0][0].text, "outer[inner]");
+        assert_eq!(
+            rendered.result.unwrap().lines[0][0].text,
+            "outer[mcp_archive_read]"
+        );
+        assert!(renderers.resolve("mcp_live_read", &|| None).is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_renderer_override_only_dispatches_matching_advertised_sections() {
+        struct Rules;
+        struct Callback;
+
+        #[async_trait::async_trait]
+        impl ToolRendererOverrideCallback for Callback {
+            async fn render(
+                &self,
+                _: &ToolRenderContext,
+                next: Option<&RenderedExtensionRows>,
+            ) -> ExtensionResult<Option<RenderedExtensionRows>> {
+                assert!(
+                    next.is_none(),
+                    "a replacement must not receive downstream rows"
+                );
+                Ok(Some(RenderedExtensionRows {
+                    padding: 3,
+                    ..Default::default()
+                }))
+            }
+        }
+
+        impl Extension for Rules {
+            fn id(&self) -> &str {
+                "rules"
+            }
+
+            fn tool_renderer_overrides(&self) -> Vec<ToolRendererOverride> {
+                vec![ToolRendererOverride {
+                    id: "replace".into(),
+                    selector: ToolRendererMatch::Prefix("mcp_".into()),
+                    shell: None,
+                    call: Some(ToolRendererOverrideSection {
+                        mode: ToolRendererOverrideMode::Replace,
+                        renderer: Arc::new(Callback),
+                    }),
+                    result: None,
+                }]
+            }
+        }
+
+        let extension: Arc<dyn Extension> = Arc::new(Rules);
+        let description = dispatch(extension.clone(), ProtocolRequest::Describe)
+            .await
+            .unwrap();
+        assert_eq!(description["tool_renderer_overrides"][0]["call"], "replace");
+        assert_eq!(
+            description["tool_renderer_overrides"][0]["selector"]["kind"],
+            "prefix"
+        );
+        let request = |id: &str, name: &str, section| ProtocolRequest::RenderToolOverride {
+            id: id.into(),
+            section,
+            context: ToolRenderContext::new(name, "call", Value::Null, "."),
+            next: Some(RenderedExtensionRows::default()),
+        };
+        let output = dispatch(
+            extension.clone(),
+            request("replace", "mcp_read", ToolSection::Call),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output["padding"], 3);
+        assert!(
+            dispatch(
+                extension.clone(),
+                request("unknown", "mcp_read", ToolSection::Call)
+            )
+            .await
+            .unwrap()
+            .is_null()
+        );
+        assert!(
+            dispatch(
+                extension.clone(),
+                request("replace", "other", ToolSection::Call)
+            )
+            .await
+            .unwrap()
+            .is_null()
+        );
+        assert!(
+            dispatch(
+                extension,
+                request("replace", "mcp_read", ToolSection::Result)
+            )
+            .await
+            .unwrap()
+            .is_null()
+        );
     }
 
     #[tokio::test]

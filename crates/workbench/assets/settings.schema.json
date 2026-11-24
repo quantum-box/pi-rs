@@ -114,6 +114,7 @@
         "imageWidthCells": { "type": "integer", "minimum": 1 }
       }
     },
+    "collapseChangelog": { "type": "boolean" },
     "quietStartup": {
       "enum": [false, "header", true]
     },

@@ -921,8 +921,56 @@ can theme. Missing or failed sections fall back independently. Pi returns
 live TUI components with local state and invalidation callbacks. Native
 hosts own framing, image handling, component state and redraws. Executable
 extension tool definitions can supply both sections through stateless
-process requests. Workbench terminal integration and executable
-cross-tool resolver registration remain pending.
+process requests. Workbench applies them to journaled calls and committed
+results, including restored transcript entries. Expansion and viewport
+changes rerender the active presentation with the host theme. Live tool
+calls render progressively parsed arguments and execution updates render
+partial content before the committed result.
+
+### Executable cross-tool renderers
+
+Executable extensions advertise ordered exact and prefix matches for tool
+names, including historical calls without a registered tool. A matching
+declaration can replace a call or result callback, or receive and wrap the
+next callback's styled rows. Omitted sections inherit the remaining
+renderer chain. Pi's in-process resolvers also accept arbitrary predicates
+and can wrap live TypeScript components. The native executable protocol
+passes styled rows through isolated process requests.
+
+### Native extension header and footer
+
+In-process Rust and executable extensions can set, hide or reset the
+session header and footer using bounded styled rows. Both terminal modes
+use the active theme. Fullscreen layout and mouse offsets include the
+actual header height, and footer rows leave room for the editor. Reload
+and session transitions reset the overrides. Upstream Pi can also mount
+arbitrary live components and passes a footer data provider to its
+factory. Native extensions supply updated rows through non-blocking host UI
+requests, including in terminal session and selection callbacks.
+
+### Native extension working indicator
+
+Native extensions can change the working message, hide the working display,
+or supply static or animated indicator frames. Regular and fullscreen modes
+use their existing editor border and keep the elapsed time and cancel hint.
+Pi accepts styled terminal strings in custom frames. Native frames use plain
+text in the active border theme. Retry, summary, and shell status are retained.
+
+### Native extension collapsed thinking label
+
+Extensions can override the themed `Thinking...` label for past and
+streaming thinking blocks in both terminal modes. A blank label suppresses
+the block and spacing while collapsed. Changes preserve each block's
+expansion state and the recorded thinking content. Native labels are
+limited to 16 rendered rows.
+
+### Native extension editor paste
+
+Native `pasteToEditor` inserts literal text into the prompt draft without
+dispatching key events. The main editor applies the same behavior to
+extension, terminal, and text clipboard pastes. Pastes over ten lines or 1000
+UTF-16 code units display a Pi-style marker. The full draft is available to
+editor reads, submission, and external editing.
 
 ### Native custom message renderers
 
@@ -2858,8 +2906,16 @@ the next request in a running Codex session, including sessions that
 resolve their credentials at request time, and retains the normal settings precedence. Native providers without multiple transports retain their existing
 connection behavior. HTTP idle timeout edits apply to subsequent provider
 requests in the running session, including Codemode classifier and image calls,
-without interrupting an active turn. The
-changelog and installation telemetry controls are still open. The Warnings submenu includes the default-on
+without interrupting an active turn. `collapseChangelog` controls how native
+release notes appear when starting with no session messages after an update.
+The first launch records a baseline without displaying notes, and `/changelog`
+always shows the full bundled notes. The native version marker lives in
+`pi-rs-changelog.json` in the agent directory, separate from upstream Pi's
+version marker. Extension package changelogs remain outside this feature.
+pi-rs preserves the upstream `enableInstallTelemetry` key in shared settings
+files. Native pi-rs sends no install or update reports to `pi.dev` and never
+adds upstream Pi attribution headers as a side effect of that setting.
+The Warnings submenu includes the default-on
 Anthropic extra-usage warning. The terminal shows it once when the active model
 uses Anthropic subscription OAuth or a configured subscription token on the
 official endpoint. The warning check uses configured credentials without
@@ -5200,6 +5256,20 @@ the current declarations with cached connection status. An explicit
 Workbench refresh retries a disconnected declaration. Configured namespaces
 retain their precedence across refreshes.
 
+Native extensions can subscribe to `before_provider_headers` and add, replace
+or delete configured headers before a turn request is sent. A null value or
+removing a key deletes an editable header. Changes run in registration order
+and are frozen before model estimation and tool preparation, so retained
+context identity reflects the headers the adapter will use. Workbench merges
+session affinity defaults before this hook. Managed authentication, host and
+connection framing headers, and configured values marked sensitive stay under
+host control. This includes profile headers Workbench marks sensitive and
+configured Bedrock values when the caller supplied an opaque signer. Turn
+edits do not carry into compaction requests.
+Invalid or failing edits leave the previous header set intact. Executable
+extensions advertise `before_provider_headers_hook` and respond with the
+edited header map.
+
 Native extensions can subscribe to assistant `message_start`,
 `message_update`, and `message_end` through the message lifecycle callback.
 The stream notifications use native text, thinking and tool-call fragments
@@ -5214,9 +5284,34 @@ edited text while billing retains measured usage. Failed and aborted
 attempts receive transient start and end notifications when needed. Executable extensions advertise
 `message_lifecycle_hook`. Summary requests stay outside the hook.
 
+User prompts emit `message_start` and `message_end` before delivery, including
+image prompts, steering and follow-ups in the SDK and Workbench. A
+`message_end` edit changes the text sent to the model and saved in the journal.
+Native edits retain the input ID, message role and validated attachments.
+Consuming a queued input and saving its final text share one journal record.
+If cancellation arrives during a message callback, that delivery can finish
+and subsequent inputs remain queued. An interruption before the journal
+append can replay callbacks for an undelivered input. Initial text callbacks
+run before the model turn starts. Multimodal prompts are staged before the
+correlated run and emit their callbacks at staging time. Inputs already ready
+at run start use the initial extension registry. Turn-time delivery uses the
+registry refreshed for that turn.
+Rust hosts applying queued inputs outside a run can await
+`Agent::apply_queued_inputs_with_lifecycle` to dispatch these hooks.
+
+Model-facing tool results emit `message_start` and `message_end` after
+tool-result transformations and before the completed result is saved. The
+same record carries the edited text and the tool's state update. A text edit
+retains the call ID, error status, details and attachments, including non-text
+blocks in a structured result. Native `tool_execution_end` follows the
+journal commit. Callbacks run for scheduler results and terminal polls.
+Programmatic results, canceled cleanup, and administrative reconciliation
+keep their existing native journal paths.
+
 Native extensions can subscribe to `after_provider_response` to observe the
 HTTP status and normalized headers from an agent turn. The OpenAI Responses,
-OpenAI-compatible chat, Anthropic Messages, Google Gemini, and Ollama adapters
+OpenAI-compatible chat, Anthropic Messages, Google Gemini, Ollama and Pi
+Messages adapters
 await these callbacks in registration order before reading either a success or
 error body. This includes HTTP errors the native transports receive directly.
 Callback failures are reported as extension diagnostics. The
@@ -5231,6 +5326,24 @@ gateway fields. It services the hook as soon as the SDK reports those headers,
 even if the SDK waits for the stream before returning. HTTP errors follow Pi's
 Bedrock behavior and produce no callback. Custom transports opt in by reporting metadata.
 Summary and catalog requests remain outside the turn hook.
+
+Native `provider_stream_event` callbacks see parsed events from OpenAI
+Responses, Codex Responses over SSE and WebSocket, OpenAI-compatible chat,
+Anthropic Messages, Google Gemini and Vertex AI, Ollama and Mistral
+Conversations, and Pi Messages before those transports normalize them into
+model events.
+Events include the provider, API, requested model and parsed data. Callbacks
+run in registration order and their results cannot rewrite the stream. The
+observer copy withholds known reflected credentials and authentication fields
+and is never persisted. Executable extensions negotiate
+`provider_stream_event_hook` and receive `provider_stream_event` requests.
+Repeated callback failures produce one diagnostic per observer and request,
+and a timeout ends that observer's participation in the remaining frames.
+Stream callbacks share up to one quarter of the model request timeout across
+all frames. Bedrock also exposes the parsed ConverseStream wire frame under
+its event or exception name. It preserves the raw JSON fields that Smithy
+would otherwise discard. Observation buffers are bounded separately from the
+SDK's stream decoder, which remains authoritative.
 
 Provider-request and context-with-system hooks and the normal scheduler's tool-call and tool-result hooks also receive a host.
 Lifecycle hosts are available for active `agent_start`, `turn_start`, `turn_end`,
@@ -6019,7 +6132,11 @@ public metadata support use dynamic registration in auto mode.
 A loopback OAuth fixture covered both document paths, dynamic registration,
 and precedence. The hosted documents are supplied by the configured
 application identity. Real-service sign-in, token refresh, and sign-out with a
-hosted pi-rs client identity remain unverified. [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#client-id-metadata-documents)
+hosted pi-rs client identity remain unverified. Acceptance requires an
+authorized test account and MCP endpoint, operator-hosted HTTPS metadata
+documents for the pi-rs client, an authorization server that permits that
+client and loopback callback, and a flow that issues refresh tokens.
+[MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#client-id-metadata-documents)
 
 `images.autoResize` controls CLI file attachments, clipboard image
 encoding and the native `read` tool. With resizing disabled, supported

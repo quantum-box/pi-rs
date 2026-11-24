@@ -249,6 +249,11 @@ impl PiMessages {
         self.headers.clone()
     }
 
+    pub(super) async fn prepare_header_override(&self, headers: &HeaderMap) -> Option<HeaderMap> {
+        pi_rs::prepare_provider_headers(headers, &self.token.iter().cloned().collect::<Vec<_>>())
+            .await
+    }
+
     /// Freeze credentials and the catalog-selected route for one request.
     pub(super) async fn prepare_context(&self, model: &str) -> Result<Self> {
         if self.radius.is_none() {
@@ -690,6 +695,13 @@ impl Model for PiMessages {
                     Error::Model("Pi Messages request failed".into())
                 }
             })?;
+        pi_rs::observe_provider_response(
+            response.status(),
+            response.headers(),
+            &error_secrets,
+            &self.headers,
+        )
+        .await;
         if !response.status().is_success() {
             let status = response.status();
             let message = format!("Pi Messages request failed ({status})");
@@ -727,6 +739,7 @@ impl Model for PiMessages {
             return Err(Error::Model("Expected a Pi Messages event stream".into()));
         }
         let mut events = response.bytes_stream().eventsource();
+        let observe_stream = pi_rs::observes_provider_stream();
         Ok(Box::pin(async_stream::try_stream! {
             let mut size = 0_usize;
             let mut blocks = Vec::<Block>::new();
@@ -751,6 +764,12 @@ impl Model for PiMessages {
                 }
                 let event: Value = serde_json::from_str(&event.data)
                     .map_err(|_| Error::Model("Invalid Pi Messages event".into()))?;
+                if observe_stream {
+                    pi_rs::observe_provider_stream(
+                        &client.identity, pi_rs::ModelApi::PiMessages, &requested_model,
+                        &event, &error_secrets, &client.headers,
+                    ).await;
+                }
                 match field(&event, "type")? {
                     "start" => {}
                     "text_start" => {

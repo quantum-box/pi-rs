@@ -205,6 +205,13 @@ impl Google {
         self.headers.clone()
     }
 
+    #[doc(hidden)]
+    pub async fn prepare_header_override(&self, headers: &HeaderMap) -> Option<HeaderMap> {
+        pi_rs_core::provider_header_session_id()?;
+        let secrets = [self.api_key.to_str().unwrap_or_default().to_owned()];
+        pi_rs_core::prepare_provider_headers(headers, &secrets).await
+    }
+
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -1120,6 +1127,19 @@ fn wire_request_for_api(
 
 #[async_trait::async_trait]
 impl Model for Google {
+    async fn prepare_context<'a>(
+        &'a self,
+        _: &ModelRequest,
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        Ok(self
+            .prepare_header_override(&self.headers)
+            .await
+            .map(|headers| {
+                std::sync::Arc::new(self.clone().with_headers(headers))
+                    as std::sync::Arc<dyn Model + 'a>
+            }))
+    }
+
     async fn prepare_tool_dispatch<'a>(
         &'a self,
         request: &ModelRequest,
@@ -1323,6 +1343,7 @@ impl Model for Google {
             &mut last_progress,
             Progress::WaitingForModel,
         );
+        let requested_model = request.model;
         let request = self.authenticate(self.client.post(url)).json(&body);
         let response = self
             .provider_retry
@@ -1360,6 +1381,8 @@ impl Model for Google {
         let observe_reasoning = self.reasoning.clone();
         let provider = self.provider.clone();
         let replay_scope = self.replay_scope.clone();
+        let observation_headers =
+            pi_rs_core::observes_provider_stream().then(|| self.headers.clone());
         Ok(Box::pin(async_stream::try_stream! {
             let mut stream = response.bytes_stream().eventsource();
             let mut metadata = ModelMetadata {
@@ -1388,6 +1411,11 @@ impl Model for Google {
                 }
                 let value: Value = serde_json::from_str(&event.data)
                     .map_err(|_| Error::Model("invalid Google Gemini stream chunk".into()))?;
+                if let Some(headers) = &observation_headers {
+                    pi_rs_core::observe_provider_stream(
+                        &provider, api, &requested_model, &value, &error_secrets, headers,
+                    ).await;
+                }
                 if let Some(error) = value.get("error") {
                     let code = error["code"].as_u64().unwrap_or_default();
                     Err(if pi_rs_core::permanent_provider_error(error, &error_secrets) {

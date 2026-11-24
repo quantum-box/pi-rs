@@ -493,19 +493,95 @@ impl Agent<'_> {
             .await
     }
 
-    /// Move queued input into a settled session before starting a queued continuation.
+    /// Move queued input into a settled session synchronously.
+    /// Use [Self::apply_queued_inputs_with_lifecycle] to run asynchronous user-message hooks.
     pub fn apply_queued_inputs(
         &self,
         session: &mut Session,
         observer: &mut Observer<'_>,
     ) -> Result<bool> {
-        if resumable_compaction_run(session).is_some() {
-            return Err(Error::Session(
-                "pending compaction recovery must be resumed before applying queued input".into(),
-            ));
+        ensure_queued_inputs_can_apply(session)?;
+        apply_inputs(session, true, observer)
+    }
+
+    /// Deliver queued input before starting a queued continuation, awaiting message hooks.
+    pub async fn apply_queued_inputs_with_lifecycle(
+        &self,
+        session: &mut Session,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<bool> {
+        ensure_queued_inputs_can_apply(session)?;
+        self.deliver_inputs(session, true, cancel, observer).await
+    }
+
+    /// Append a validated multimodal prompt before a correlated run, awaiting message hooks.
+    /// The caller publishes the committed entry when its run observer is ready.
+    pub async fn append_prompt_with_images(
+        &self,
+        session: &mut Session,
+        content: String,
+        images: Vec<crate::ImageContent>,
+        input_id: Uuid,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<()> {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
         }
         ensure_settled(session.operations())?;
-        apply_inputs(session, true, observer)
+        let event = Session::user_input_event(content, images, Some(input_id))?;
+        let event = self.edit_user_event(session, event, observer).await;
+        session.append(event)?;
+        Ok(())
+    }
+
+    async fn edit_user_event(
+        &self,
+        session: &mut Session,
+        event: Event,
+        observer: &mut Observer<'_>,
+    ) -> Event {
+        match crate::message_hooks::MessageHooks::for_session(
+            self.registry,
+            session,
+            self.limits.model_timeout,
+        ) {
+            Some(mut hooks) => {
+                let event = hooks.user(event).await;
+                hooks.report_errors(observer);
+                event
+            }
+            None => event,
+        }
+    }
+
+    async fn deliver_inputs(
+        &self,
+        session: &mut Session,
+        include_followups: bool,
+        cancel: &CancellationToken,
+        observer: &mut Observer<'_>,
+    ) -> Result<bool> {
+        let mut accepted = false;
+        for event in pending_input_events(session, include_followups) {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let mut event = event?;
+            if matches!(event, Event::User { .. } | Event::UserWithImages { .. }) {
+                event = self.edit_user_event(session, event, observer).await;
+            }
+            commit(session, event, observer)?;
+            accepted = true;
+        }
+        if accepted {
+            notify_queue(session, observer);
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        Ok(accepted)
     }
 
     /// A repeated initial submission never starts a second run. Passing no
@@ -1614,14 +1690,15 @@ impl Agent<'_> {
                 }
             }
             if let Some((id, content)) = input {
-                commit(
-                    session,
-                    Event::User {
-                        content,
-                        input_id: Some(id),
-                    },
-                    observer,
-                )?;
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                let event = Event::User {
+                    content,
+                    input_id: Some(id),
+                };
+                let event = self.edit_user_event(session, event, observer).await;
+                commit(session, event, observer)?;
             }
             // Only messages queued before this run's initial user entry belong to it.
             // This also covers image prompts and avoids consuming newly queued next-turn
@@ -1660,9 +1737,11 @@ impl Agent<'_> {
         let mut pending = pending_reply(session, run_id);
         queue_inputs(session, followups, observer)?;
         if pending.is_none() && !recovering_compaction {
-            let accepted = apply_inputs(session, false, observer)?;
+            let accepted = self
+                .deliver_inputs(session, false, cancel, observer)
+                .await?;
             if force_request && !accepted {
-                apply_inputs(session, true, observer)?;
+                self.deliver_inputs(session, true, cancel, observer).await?;
             }
         }
         let current_entries: std::collections::HashSet<_> = session
@@ -1707,7 +1786,7 @@ impl Agent<'_> {
             if recovering_compaction {
                 self.compact_silent_overflow(session, run_id, &states, cancel, observer, followups).await?;
             }
-            if !apply_inputs(session, true, observer)? {
+            if !self.deliver_inputs(session, true, cancel, observer).await? {
                 if !recovering_compaction {
                     self.compact_silent_overflow(session, run_id, &states, cancel, observer, followups).await?;
                 }
@@ -1722,7 +1801,7 @@ impl Agent<'_> {
                     | Event::CustomMessageDelivered { .. }
             ) && current_entries.contains(&record.id)
         }) {
-            apply_inputs(session, true, observer)?;
+            self.deliver_inputs(session, true, cancel, observer).await?;
         }
 
         let mut runtime_registry = self.registry.clone();
@@ -2010,7 +2089,9 @@ impl Agent<'_> {
                     allowance,
                 )
             } else {
-                apply_inputs(session, false, observer)?;
+                active
+                    .deliver_inputs(session, false, cancel, observer)
+                    .await?;
                 let max_output_tokens = active.limits.output_tokens_per_request.min(budget);
                 if max_output_tokens == 0 {
                     return Err(Error::Budget);
@@ -2076,12 +2157,25 @@ impl Agent<'_> {
                 } else {
                     Vec::new()
                 };
+                let header_hooks = crate::provider_hooks::ProviderHooks::for_header_preparation(
+                    active.registry,
+                    session,
+                    active.limits.model_timeout,
+                );
+                let mutable_headers = header_hooks.is_some();
                 let preparation = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(Error::Cancelled),
-                    result = platform_time::timeout(active.limits.model_timeout, active.model.prepare_context_with_tool_transcript(&request, &tool_transcript)) =>
-                        result.unwrap_or_else(|_| Err(Error::RetryableModel("model preparation timed out".into()))),
+                    result = platform_time::timeout(
+                        active.limits.model_timeout,
+                        crate::provider_hooks::ProviderHooks::scope(
+                            header_hooks.clone(), active.model.prepare_context_with_tool_transcript(&request, &tool_transcript),
+                        ),
+                    ) => result.unwrap_or_else(|_| Err(Error::RetryableModel("model preparation timed out".into()))),
                 };
+                if let Some(hooks) = header_hooks {
+                    hooks.report_errors(observer);
+                }
                 let prepared = match preparation {
                     Ok(prepared) => prepared,
                     Err(Error::RetryableModel(message))
@@ -2130,6 +2224,11 @@ impl Agent<'_> {
                         continue;
                     }
                     Err(error) => return Err(error),
+                };
+                let summary_model = if mutable_headers {
+                    active.model
+                } else {
+                    prepared.as_deref().unwrap_or(active.model)
                 };
                 let active = Agent {
                     model: prepared.as_deref().unwrap_or(active.model),
@@ -2266,23 +2365,27 @@ impl Agent<'_> {
                     if model_summary_available || exceeds {
                         abandon_turn_request_for_summary(session, observer)?;
                     }
-                    let summary = active
-                        .summarize_prefix(
-                            session,
-                            &states,
-                            SummaryScope {
-                                retention,
-                                instructions: None,
-                                output_limit: summary_limit,
-                                cancellation: cancel,
-                                reason: crate::CompactionTrigger::Threshold,
-                                will_retry: false,
-                                skip_without_model: !exceeds && !model_summary_available,
-                            },
-                            observer,
-                            Some(followups),
-                        )
-                        .await?;
+                    let summary = Agent {
+                        model: summary_model,
+                        limits: active.limits.clone(),
+                        ..active
+                    }
+                    .summarize_prefix(
+                        session,
+                        &states,
+                        SummaryScope {
+                            retention,
+                            instructions: None,
+                            output_limit: summary_limit,
+                            cancellation: cancel,
+                            reason: crate::CompactionTrigger::Threshold,
+                            will_retry: false,
+                            skip_without_model: !exceeds && !model_summary_available,
+                        },
+                        observer,
+                        Some(followups),
+                    )
+                    .await?;
                     if let Some((spent, provided)) = summary {
                         budget -= spent;
                         states = session.extension_states();
@@ -2548,22 +2651,27 @@ impl Agent<'_> {
                 if cancel.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
-                if apply_inputs(session, false, observer)? {
+                let current_agent = Agent {
+                    registry: &runtime_registry,
+                    system_prompt: &runtime_prompt,
+                    model,
+                    model_name,
+                    limits,
+                };
+                if current_agent
+                    .deliver_inputs(session, false, cancel, observer)
+                    .await?
+                {
                     continue;
                 }
-                if !apply_inputs(session, true, observer)?
+                if !current_agent
+                    .deliver_inputs(session, true, cancel, observer)
+                    .await?
                     && !crate::extension_boundary::turn_continuation_is_runnable(
                         session, requested, observer,
                     )
                 {
-                    let compact_agent = Agent {
-                        registry: &runtime_registry,
-                        system_prompt: &runtime_prompt,
-                        model,
-                        model_name,
-                        limits,
-                    };
-                    compact_agent
+                    current_agent
                         .compact_silent_overflow(
                             session, run_id, &states, cancel, observer, followups,
                         )
@@ -3367,9 +3475,9 @@ impl Agent<'_> {
                 )
             })
             .flatten();
-        let response_hooks = retain_reply
+        let provider_hooks = retain_reply
             .then(|| {
-                crate::provider_response::ResponseHooks::for_session(
+                crate::provider_hooks::ProviderHooks::for_session(
                     self.registry,
                     session,
                     self.limits.model_timeout,
@@ -3405,7 +3513,7 @@ impl Agent<'_> {
                 }
             };
             let opening =
-                crate::provider_response::ResponseHooks::scope(response_hooks.clone(), opening);
+                crate::provider_hooks::ProviderHooks::scope(provider_hooks.clone(), opening);
             tokio::pin!(opening);
             let mut stream = loop {
                 tokio::select! {
@@ -3415,7 +3523,7 @@ impl Agent<'_> {
             };
             loop {
                 let event = tokio::select! {
-                    event = crate::provider_response::ResponseHooks::scope(response_hooks.clone(), stream.next()) => event,
+                    event = crate::provider_hooks::ProviderHooks::scope(provider_hooks.clone(), stream.next()) => event,
                     Some(input) = receive_input(&mut inputs) => {
                         queue_input(session, input.into(), observer)?;
                         continue;
@@ -3671,7 +3779,7 @@ impl Agent<'_> {
             result = platform_time::timeout(self.limits.model_timeout, collect) =>
                 result.unwrap_or_else(|_| Err(Error::RetryableModel("request timed out".into()))),
         };
-        if let Some(hooks) = response_hooks {
+        if let Some(hooks) = provider_hooks {
             hooks.report_errors(observer);
         }
         metadata.assistant_text_edited = false;
@@ -4107,6 +4215,16 @@ impl Agent<'_> {
                 invocation.operation_id,
                 "recovered_tool_result",
             );
+            let message_hooks = (!is_programmatic_tool(session, &invocation))
+                .then(|| {
+                    crate::message_hooks::MessageHooks::for_states(
+                        self.registry,
+                        states,
+                        self.limits.model_timeout,
+                    )
+                })
+                .flatten();
+            let max_output_bytes = self.tool_output_limit(session, &invocation);
             let mut errors = Vec::new();
             let mut collect = |event: Notification<'_>| {
                 if let Notification::ExtensionLifecycleError {
@@ -4143,6 +4261,15 @@ impl Agent<'_> {
                         Some(result_host),
                     )
                     .await;
+                    reply.outcome = bound_tool_outcome(reply.outcome, max_output_bytes)?;
+                    if let Some(mut hooks) = message_hooks
+                        && !cancel.is_cancelled()
+                    {
+                        reply.outcome = hooks
+                            .tool(&invocation.call.id, reply.outcome, max_output_bytes)
+                            .await;
+                        hooks.report_errors(&mut collect);
+                    }
                     Ok::<_, Error>(reply)
                 };
                 tokio::pin!(future);
@@ -4202,6 +4329,21 @@ impl Agent<'_> {
         .await;
     }
 
+    fn tool_output_limit(&self, session: &Session, invocation: &Invocation) -> usize {
+        // Programmatic results remain in the journal but are not injected into
+        // model context. Leave room for a 1 MiB string and its JSON escaping.
+        if is_programmatic_tool(session, invocation) {
+            8 * 1024 * 1024
+        } else {
+            self.registry
+                .tools
+                .get(&invocation.call.name)
+                .map_or(1024 * 1024, |tool| {
+                    tool.tool.output_limit().min(8 * 1024 * 1024)
+                })
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn finish_tool(
         &self,
@@ -4218,62 +4360,7 @@ impl Agent<'_> {
             outcome,
             state: update,
         } = reply;
-        // Programmatic results remain in the journal but are not injected into
-        // model context. Leave room for a 1 MiB string and its JSON escaping.
-        let max_output_bytes = if session.records().iter().any(|record| {
-            matches!(&record.event, Event::ToolPlanned { invocation: nested, .. } if nested.operation_id == invocation.operation_id)
-        }) {
-            8 * 1024 * 1024
-        } else {
-            self.registry.tools.get(&invocation.call.name)
-                .map_or(1024 * 1024, |tool| tool.tool.output_limit().min(8 * 1024 * 1024))
-        };
-        let outcome = match outcome {
-            Outcome::Succeeded(output) if output.len() > max_output_bytes => Outcome::Truncated {
-                original_bytes: output.len(),
-            },
-            outcome @ Outcome::SucceededWithDetails { .. } => {
-                let size = serde_json::to_vec(&outcome)?.len();
-                if size > max_output_bytes {
-                    Outcome::Truncated {
-                        original_bytes: size,
-                    }
-                } else {
-                    outcome
-                }
-            }
-            outcome @ (Outcome::TextResult { .. }
-            | Outcome::TextResultWithStructuredContent { .. }) => {
-                let size = serde_json::to_vec(&outcome)?.len();
-                if size > max_output_bytes {
-                    Outcome::TextResult {
-                        output: format!("Tool output omitted ({size} bytes exceeded the limit)."),
-                        details: None,
-                        is_error: outcome.is_error(),
-                    }
-                } else {
-                    outcome
-                }
-            }
-            outcome @ (Outcome::Structured { .. } | Outcome::StructuredWithDetails { .. }) => {
-                bound_structured_tool_outcome(outcome, max_output_bytes)?
-            }
-            Outcome::Failed(reason) if reason.len() > max_output_bytes => {
-                Outcome::Failed("failure detail exceeds size limit".into())
-            }
-            Outcome::Skipped(reason) if reason.len() > max_output_bytes => {
-                Outcome::Skipped("skip detail exceeds size limit".into())
-            }
-            Outcome::Unknown(reason) if reason.len() > max_output_bytes => {
-                Outcome::Unknown("uncertain result detail exceeds size limit".into())
-            }
-            Outcome::Pending { reference }
-                if reference.trim().is_empty() || reference.len() > 1024 =>
-            {
-                Outcome::Unknown("tool returned an invalid operation reference".into())
-            }
-            outcome => outcome,
-        };
+        let max_output_bytes = self.tool_output_limit(session, invocation);
         let operation_id = invocation.operation_id;
         let event_metadata = if allow_event_metadata {
             self.registry
@@ -7603,6 +7690,67 @@ fn commit_compaction_record(
     Ok(())
 }
 
+fn is_programmatic_tool(session: &Session, invocation: &Invocation) -> bool {
+    session.records().iter().any(|record| {
+        matches!(&record.event, Event::ToolPlanned { invocation: nested, .. } if nested.operation_id == invocation.operation_id)
+    })
+}
+
+fn bound_tool_outcome(outcome: Outcome, max_output_bytes: usize) -> Result<Outcome> {
+    Ok(match outcome {
+        Outcome::Succeeded(output) if output.len() > max_output_bytes => Outcome::Truncated {
+            original_bytes: output.len(),
+        },
+        outcome @ Outcome::SucceededWithDetails { .. } => {
+            let size = encoded_tool_output_bytes(&outcome)?;
+            if size > max_output_bytes {
+                Outcome::Truncated {
+                    original_bytes: size,
+                }
+            } else {
+                outcome
+            }
+        }
+        outcome
+        @ (Outcome::TextResult { .. } | Outcome::TextResultWithStructuredContent { .. }) => {
+            let size = encoded_tool_output_bytes(&outcome)?;
+            if size > max_output_bytes {
+                Outcome::TextResult {
+                    output: format!("Tool output omitted ({size} bytes exceeded the limit)."),
+                    details: None,
+                    is_error: outcome.is_error(),
+                }
+            } else {
+                outcome
+            }
+        }
+        outcome @ (Outcome::Structured { .. } | Outcome::StructuredWithDetails { .. }) => {
+            bound_structured_tool_outcome(outcome, max_output_bytes)?
+        }
+        Outcome::Failed(reason) if reason.len() > max_output_bytes => {
+            Outcome::Failed("failure detail exceeds size limit".into())
+        }
+        Outcome::Skipped(reason) if reason.len() > max_output_bytes => {
+            Outcome::Skipped("skip detail exceeds size limit".into())
+        }
+        Outcome::Unknown(reason) if reason.len() > max_output_bytes => {
+            Outcome::Unknown("uncertain result detail exceeds size limit".into())
+        }
+        Outcome::Pending { reference } if reference.trim().is_empty() || reference.len() > 1024 => {
+            Outcome::Unknown("tool returned an invalid operation reference".into())
+        }
+        outcome => outcome,
+    })
+}
+
+pub(crate) fn encoded_tool_output_bytes(outcome: &Outcome) -> Result<usize> {
+    Ok(match outcome {
+        Outcome::Succeeded(text) => text.len(),
+        Outcome::Structured { .. } => outcome.tool_content().len(),
+        outcome => serde_json::to_vec(outcome)?.len(),
+    })
+}
+
 // Serialize cancellation's snapshot read with the durable append and publication.
 fn commit_with_reply(
     session: &mut Session,
@@ -7882,11 +8030,19 @@ pub(crate) fn apply_settled_after_turn(
     Ok(())
 }
 
-fn apply_inputs(
-    session: &mut Session,
+fn ensure_queued_inputs_can_apply(session: &Session) -> Result<()> {
+    if resumable_compaction_run(session).is_some() {
+        return Err(Error::Session(
+            "pending compaction recovery must be resumed before applying queued input".into(),
+        ));
+    }
+    ensure_settled(session.operations())
+}
+
+fn pending_input_events(
+    session: &Session,
     include_followups: bool,
-    observer: &mut Observer<'_>,
-) -> Result<bool> {
+) -> impl Iterator<Item = Result<Event>> + use<> {
     enum Pending {
         User(QueuedMessage),
         Custom(crate::QueuedCustomMessage),
@@ -7914,24 +8070,25 @@ fn apply_inputs(
             _ => {}
         }
     }
-    let mut accepted = false;
+    let steer_mode = session.queue_mode(InputKind::Steer);
+    let followup_mode = session.queue_mode(InputKind::FollowUp);
     let mut seen = HashSet::new();
-    for message in pending {
+    pending.into_iter().filter_map(move |message| {
         let kind = match &message {
             Pending::User(message) => message.input.kind,
             Pending::Custom(message) => match message.delivery {
                 crate::CustomMessageDelivery::Steer => InputKind::Steer,
                 crate::CustomMessageDelivery::FollowUp => InputKind::FollowUp,
-                _ => continue,
+                _ => return None,
             },
         };
         if !include_followups && kind == InputKind::FollowUp {
-            continue;
+            return None;
         }
-        if session.queue_mode(kind) == crate::QueueMode::OneAtATime
-            && !seen.insert(kind == InputKind::Steer)
-        {
-            continue;
+        let steering = kind == InputKind::Steer;
+        let mode = if steering { steer_mode } else { followup_mode };
+        if mode == crate::QueueMode::OneAtATime && !seen.insert(steering) {
+            return None;
         }
         let event = match message {
             Pending::Custom(input) => Event::CustomMessageDelivered {
@@ -7939,7 +8096,9 @@ fn apply_inputs(
                 message: input.message,
             },
             Pending::User(message) => {
-                message.validate()?;
+                if let Err(error) = message.validate() {
+                    return Some(Err(error));
+                }
                 if message.images.is_empty() {
                     Event::User {
                         content: message.input.content,
@@ -7954,7 +8113,18 @@ fn apply_inputs(
                 }
             }
         };
-        commit(session, event, observer)?;
+        Some(Ok(event))
+    })
+}
+
+fn apply_inputs(
+    session: &mut Session,
+    include_followups: bool,
+    observer: &mut Observer<'_>,
+) -> Result<bool> {
+    let mut accepted = false;
+    for event in pending_input_events(session, include_followups) {
+        commit(session, event?, observer)?;
         accepted = true;
     }
     if accepted {
@@ -8000,8 +8170,6 @@ fn recover(session: &mut Session, observer: &mut Observer<'_>) -> Result<()> {
     ensure_settled(session.operations())
 }
 
-// Fingerprint only stable request configuration, excluding conversation and
-// output allowance, which legitimately change between turns.
 fn bound_structured_tool_outcome(outcome: Outcome, max_bytes: usize) -> Result<Outcome> {
     let size = if matches!(&outcome, Outcome::StructuredWithDetails { .. }) {
         serde_json::to_vec(&outcome)?.len()
@@ -8020,6 +8188,8 @@ fn bound_structured_tool_outcome(outcome: Outcome, max_bytes: usize) -> Result<O
     }
 }
 
+// Fingerprint only stable request configuration, excluding conversation and
+// output allowance, which legitimately change between turns.
 fn prepared_configuration_hash(
     model: &dyn Model,
     request: &ModelRequest,

@@ -314,6 +314,7 @@ impl TranscriptMarkdown {
 #[derive(Clone)]
 pub enum Entry {
     Notice(String),
+    Changelog(crate::changelog::Notice),
     Status(String),
     Warning(String),
     User(TranscriptMarkdown),
@@ -356,13 +357,17 @@ pub enum Entry {
         finished: bool,
         parts: Vec<ToolPart>,
         numbered_diff: bool,
+        render_records: Option<crate::backend::ToolRenderRecords>,
+        render_call_id: Option<String>,
+        rendered: Option<std::sync::Arc<pi_rs::RenderedTool>>,
     },
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub struct TranscriptOptions {
+pub struct TranscriptOptions<'a> {
     pub image_width: Option<usize>,
     pub padding: usize,
     pub mermaid: super::mermaid::Mermaid,
+    pub hidden_thinking_label: Option<&'a str>,
     pub expand_key: Option<crossterm::event::KeyEvent>,
 }
 
@@ -419,12 +424,48 @@ impl Entry {
         width: usize,
         expand_tools: bool,
         show_thinking: bool,
-        options: TranscriptOptions,
+        options: TranscriptOptions<'_>,
     ) -> Vec<Line> {
         let padding = options.padding.min(width.saturating_sub(1) / 2);
         let inner = width.saturating_sub(2 * padding).max(1);
         let mut lines = match self {
             Self::Notice(text) => return wrap(&[Span::themed(text, theme, "muted")], width),
+            Self::Changelog(notice) => {
+                let border = Line::themed(&"─".repeat(inner), theme, "border");
+                let mut lines = vec![Line::default(), border.clone()];
+                match notice {
+                    crate::changelog::Notice::Full(body) => {
+                        let mut title = Span::themed("What's New", theme, "accent");
+                        title.bold = true;
+                        lines.extend(wrap(&[title], inner));
+                        lines.push(Line::default());
+                        lines.extend(markdown_at_depth(
+                            body,
+                            theme,
+                            inner,
+                            0,
+                            options.mermaid,
+                            *HYPERLINKS,
+                            false,
+                        ));
+                        lines.push(Line::default());
+                    }
+                    crate::changelog::Notice::Condensed(version) => {
+                        let mut command = Span::themed("/changelog", theme, "text");
+                        command.bold = true;
+                        lines.extend(wrap(
+                            &[
+                                Span::themed(format!("Updated to v{version}. Use "), theme, "text"),
+                                command,
+                                Span::themed(" to view full changelog.", theme, "text"),
+                            ],
+                            inner,
+                        ));
+                    }
+                }
+                lines.push(border);
+                lines
+            }
             Self::Status(text) => {
                 let mut lines = vec![Line::default()];
                 let inset = usize::from(width >= 3);
@@ -514,18 +555,8 @@ impl Entry {
                 rendered: Some(rendered),
                 ..
             } => {
-                let pad = rendered.padding.min(width.saturating_sub(1) / 2);
-                let inner = width.saturating_sub(2 * pad).max(1);
                 let mut lines = vec![Line::default()];
-                let padding = " ".repeat(pad);
-                let background = rendered.background.as_deref().map(|role| theme.color(role));
-                for mut row in component_lines(&rendered.lines, theme, inner) {
-                    if pad != 0 && !row.spans.is_empty() {
-                        row.spans.insert(0, Span::new(&padding, Color::Reset));
-                    }
-                    row.background = background;
-                    lines.push(row);
-                }
+                lines.extend(extension_rows(rendered, theme, width));
                 return lines;
             }
             Self::CustomMessage {
@@ -626,9 +657,16 @@ impl Entry {
                     return vec![];
                 }
                 let mut lines = if !expanded.unwrap_or(show_thinking) {
-                    let mut span = Span::themed("Thinking...", theme, "thinkingText");
+                    let label = options.hidden_thinking_label.unwrap_or("Thinking...");
+                    if label
+                        .trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}')
+                        .is_empty()
+                    {
+                        return Vec::new();
+                    }
+                    let mut span = Span::themed(label, theme, "thinkingText");
                     span.italic = true;
-                    wrap(&[span], inner)
+                    wrap_bounded(&[span], inner, 16)
                 } else {
                     // Pi renders thinking as Markdown, but deliberately excludes it
                     // from the Mermaid transformer. Only default text inherits the
@@ -664,6 +702,7 @@ impl Entry {
                 finished,
                 parts,
                 numbered_diff,
+                rendered,
                 ..
             } => {
                 // Shell output may contain terminal escape sequences, including
@@ -679,6 +718,11 @@ impl Entry {
                 } else {
                     "toolPendingBg"
                 };
+                let self_framed = rendered
+                    .as_ref()
+                    .is_some_and(|rendered| rendered.shell == pi_rs::ToolRenderShell::SelfFramed);
+                let inner = if self_framed { width.max(1) } else { inner };
+                let padding = if self_framed { 0 } else { padding };
                 let arguments = serde_json::from_str::<serde_json::Value>(arguments).ok();
                 let detail = arguments
                     .as_ref()
@@ -690,24 +734,46 @@ impl Entry {
                     })
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                let mut lines = if *numbered_diff {
-                    let mut tool = Span::themed(name, theme, "toolTitle");
-                    tool.bold = true;
-                    let path = arguments
-                        .as_ref()
-                        .and_then(|args| args.get("file_path").and_then(serde_json::Value::as_str))
-                        .unwrap_or(detail);
-                    let path = Span::themed(format!(" {path}"), theme, "accent");
-                    let mut lines = vec![Line::default()];
-                    lines.extend(wrap(&[tool, path], inner));
-                    lines.push(Line::default());
+                let mut title = Span::themed(format!("{name} {detail}"), theme, "toolTitle");
+                title.bold = true;
+                let mut lines = match rendered
+                    .as_ref()
+                    .and_then(|rendered| rendered.call.as_ref())
+                {
+                    Some(call) => extension_rows(call, theme, inner),
+                    None if *numbered_diff => {
+                        let mut tool = Span::themed(name, theme, "toolTitle");
+                        tool.bold = true;
+                        let path = arguments
+                            .as_ref()
+                            .and_then(|args| {
+                                args.get("file_path").and_then(serde_json::Value::as_str)
+                            })
+                            .unwrap_or(detail);
+                        let path = Span::themed(format!(" {path}"), theme, "accent");
+                        let mut lines = vec![Line::default()];
+                        lines.extend(wrap(&[tool, path], inner));
+                        lines.push(Line::default());
+                        lines
+                    }
+                    None => wrap(&[title], inner),
+                };
+                if let Some(result) = rendered
+                    .as_ref()
+                    .and_then(|rendered| rendered.result.as_ref())
+                {
+                    lines.extend(extension_rows(result, theme, inner));
+                    if let Some(limit) = options.image_width {
+                        for part in parts {
+                            if let ToolPart::Image(image) = part {
+                                lines.extend(image.lines(width, limit, padding));
+                            }
+                        }
+                    }
+                } else if *numbered_diff {
                     lines.extend(super::diff::render_numbered(output, theme, inner));
                     lines.push(Line::default());
-                    lines
                 } else {
-                    let mut title = Span::themed(format!("{name} {detail}"), theme, "toolTitle");
-                    title.bold = true;
-                    let mut lines = wrap(&[title], inner);
                     let output_lines: Vec<_> = output.lines().collect();
                     let has_warning = parts
                         .iter()
@@ -767,15 +833,23 @@ impl Entry {
                             "dim",
                         ));
                     }
-                    lines
-                };
+                }
                 for part in parts {
                     if let ToolPart::Warning(warning) = part {
                         lines.extend(wrap(&[Span::themed(warning, theme, "warning")], inner));
                     }
                 }
-                for line in &mut lines {
-                    line.background = Some(theme.color(role));
+                if self_framed {
+                    if lines.is_empty() {
+                        return lines;
+                    }
+                    lines.insert(0, Line::default());
+                    lines.push(Line::default());
+                    return lines;
+                } else {
+                    for line in &mut lines {
+                        line.background.get_or_insert_with(|| theme.color(role));
+                    }
                 }
                 lines.push(Line::default());
                 lines
@@ -791,29 +865,60 @@ impl Entry {
         lines
     }
 }
+fn extension_rows(
+    rendered: &pi_rs::RenderedExtensionRows,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line> {
+    let pad = rendered.padding.min(width.saturating_sub(1) / 2);
+    let inner = width.saturating_sub(2 * pad).max(1);
+    let padding = " ".repeat(pad);
+    let background = rendered.background.as_deref().map(|role| theme.color(role));
+    let mut rows = component_lines(&rendered.lines, theme, inner);
+    for row in &mut rows {
+        if pad != 0 && !row.spans.is_empty() {
+            row.spans.insert(0, Span::new(&padding, Color::Reset));
+        }
+        row.background = background;
+    }
+    rows
+}
+
 pub(super) fn component_lines(
     lines: &[Vec<pi_rs::UiComponentSpan>],
     theme: &Theme,
     width: usize,
 ) -> Vec<Line> {
-    lines
-        .iter()
-        .flat_map(|line| {
-            let spans: Vec<_> = line
-                .iter()
-                .map(|span| {
-                    let mut rendered =
-                        Span::themed(&span.text, theme, span.color.as_deref().unwrap_or("text"));
-                    rendered.bold = span.bold;
-                    rendered.italic = span.italic;
-                    rendered.underline = span.underline;
-                    rendered.inverse = span.inverse;
-                    rendered
-                })
-                .collect();
-            wrap(&spans, width)
-        })
-        .collect()
+    component_lines_bounded(lines, theme, width, usize::MAX)
+}
+
+pub(crate) fn component_lines_bounded(
+    lines: &[Vec<pi_rs::UiComponentSpan>],
+    theme: &Theme,
+    width: usize,
+    limit: usize,
+) -> Vec<Line> {
+    let mut output = Vec::new();
+    for line in lines {
+        let remaining = limit - output.len();
+        if remaining == 0 {
+            break;
+        }
+        let spans: Vec<_> = line
+            .iter()
+            .map(|span| {
+                let mut rendered =
+                    Span::themed(&span.text, theme, span.color.as_deref().unwrap_or("text"));
+                rendered.bold = span.bold;
+                rendered.italic = span.italic;
+                rendered.underline = span.underline;
+                rendered.inverse = span.inverse;
+                rendered
+            })
+            .collect();
+        output.extend(wrap_bounded(&spans, width, remaining));
+    }
+    output
 }
 
 fn custom_message_base_style(lines: &mut [Line], theme: &Theme) {
@@ -924,14 +1029,22 @@ pub(crate) fn strip_shell_ansi(text: &str) -> String {
     result
 }
 pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
+    wrap_bounded(spans, width, usize::MAX)
+}
+
+fn wrap_bounded(spans: &[Span], width: usize, limit: usize) -> Vec<Line> {
     let width = width.max(1);
     let mut lines = vec![Line::default()];
     let mut used = 0;
+    let mut full = false;
     for span in spans {
         let mut fragment = span.clone();
         fragment.text.clear();
         fragment.search_text = span.search_text.as_ref().map(|_| String::new());
         search_graphemes(span.searchable(), |range, grapheme| {
+            if full {
+                return;
+            }
             let size = UnicodeWidthStr::width(grapheme);
             let source = &span.searchable()[range];
             let (before_newline, after_newline) = if grapheme == "\n" {
@@ -944,6 +1057,10 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
             }
             if grapheme == "\n" || (used + size > width && used > 0) {
                 lines.last_mut().unwrap().spans.push(fragment.clone());
+                if lines.len() == limit {
+                    full = true;
+                    return;
+                }
                 fragment.text.clear();
                 if let Some(raw) = &mut fragment.search_text {
                     raw.clear();
@@ -965,6 +1082,9 @@ pub fn wrap(spans: &[Span], width: usize) -> Vec<Line> {
                 used += size;
             }
         });
+        if full {
+            break;
+        }
         lines.last_mut().unwrap().spans.push(fragment);
     }
     lines
@@ -1399,7 +1519,12 @@ impl Table {
     }
 }
 
-fn user_lines(text: &str, theme: &Theme, width: usize, options: TranscriptOptions) -> Vec<Line> {
+fn user_lines(
+    text: &str,
+    theme: &Theme,
+    width: usize,
+    options: TranscriptOptions<'_>,
+) -> Vec<Line> {
     let mut lines = markdown_at_depth(text, theme, width, 0, options.mermaid, *HYPERLINKS, true);
     for line in &mut lines {
         line.background = Some(theme.color("userMessageBg"));
@@ -4960,6 +5085,41 @@ mod tests {
     }
 
     #[test]
+    fn hidden_thinking_label_uses_theme_and_skips_blank_blocks() {
+        let theme = Theme::system();
+        let entry = Entry::Thinking {
+            text: "internal text".into(),
+            expanded: None,
+        };
+        let options = TranscriptOptions {
+            padding: 1,
+            hidden_thinking_label: Some("Extension\nlabel"),
+            ..Default::default()
+        };
+        let rows = entry.render(&theme, 20, false, false, options);
+        assert_eq!(rows.len(), 3);
+        for (line, text) in rows.iter().zip(["Extension", "label"]) {
+            assert!(line.spans.iter().any(|span| {
+                span.text == text && span.italic && span.color == theme.color("thinkingText")
+            }));
+        }
+        let options = TranscriptOptions {
+            hidden_thinking_label: Some(" \n \u{feff}"),
+            ..options
+        };
+        assert!(entry.render(&theme, 20, false, false, options).is_empty());
+        assert!(!entry.render(&theme, 20, false, true, options).is_empty());
+
+        let long_label = "wide label\n".repeat(128);
+        let options = TranscriptOptions {
+            hidden_thinking_label: Some(&long_label),
+            ..options
+        };
+        // The label is clipped to 16 visual rows, followed by transcript spacing.
+        assert_eq!(entry.render(&theme, 20, false, false, options).len(), 17);
+    }
+
+    #[test]
     fn thinking_renders_markdown_with_thinking_style_and_no_mermaid_transform() {
         let mut json: serde_json::Value =
             serde_json::from_str(include_str!("../../assets/themes/dark.json")).unwrap();
@@ -5008,6 +5168,22 @@ mod tests {
         assert!(spans.iter().any(|s| s.text.contains("value")
             && !s.italic
             && s.color != theme.color("thinkingText")));
+    }
+
+    #[test]
+    fn bounded_component_lines_preserve_the_wrapped_prefix() {
+        let theme = Theme::system();
+        let lines = vec![vec![pi_rs::UiComponentSpan {
+            text: "◆ab\ncd".repeat(512),
+            ..Default::default()
+        }]];
+        assert!(component_lines_bounded(&lines, &theme, 2, 0).is_empty());
+        let expected = component_lines(&lines, &theme, 2);
+        let actual = component_lines_bounded(&lines, &theme, 2, 3);
+        assert_eq!(actual.len(), 3);
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert_eq!(actual.spans, expected.spans);
+        }
     }
 
     #[test]
@@ -5312,6 +5488,64 @@ mod tests {
     }
 
     #[test]
+    fn tool_renderer_keeps_per_section_fallback_and_uses_host_theme() {
+        let theme = Theme::system();
+        let styled = || pi_rs::RenderedExtensionRows {
+            lines: vec![vec![pi_rs::UiComponentSpan {
+                text: "custom\u{7}".into(),
+                color: Some("accent".into()),
+                bold: true,
+                ..Default::default()
+            }]],
+            ..Default::default()
+        };
+        let entry = |rendered| Entry::Tool {
+            id: "example".into(),
+            call_id: None,
+            name: "search".into(),
+            arguments: r#"{"pattern":"test"}"#.into(),
+            output: "fallback result".into(),
+            failed: true,
+            finished: true,
+            numbered_diff: false,
+            render_records: None,
+            render_call_id: None,
+            rendered: Some(std::sync::Arc::new(rendered)),
+            parts: Vec::new(),
+        };
+        let default_shell = entry(pi_rs::RenderedTool {
+            call: Some(styled()),
+            ..Default::default()
+        });
+        let lines = default_shell.render(&theme, 40, false, false, TranscriptOptions::default());
+        assert_eq!(lines[0].spans[0].text, "custom");
+        assert_eq!(lines[0].spans[0].color, theme.color("accent"));
+        assert!(lines[0].spans[0].bold);
+        assert_eq!(lines[0].background, Some(theme.color("toolErrorBg")));
+        assert_eq!(lines[1].spans[0].text, "fallback result");
+
+        let self_framed = entry(pi_rs::RenderedTool {
+            shell: pi_rs::ToolRenderShell::SelfFramed,
+            call: None,
+            result: Some(styled()),
+        });
+        let lines = self_framed.render(
+            &theme,
+            40,
+            false,
+            false,
+            TranscriptOptions {
+                padding: 4,
+                ..Default::default()
+            },
+        );
+        assert!(lines[0].spans.is_empty());
+        assert_eq!(lines[1].spans[0].text, "search test");
+        assert_eq!(lines[2].spans[0].text, "custom");
+        assert!(lines.iter().all(|line| line.background.is_none()));
+    }
+
+    #[test]
     fn completed_numbered_edits_keep_the_pi_panel_layout_when_tools_collapse() {
         let theme = Theme::system();
         let output = (1..=14)
@@ -5327,6 +5561,9 @@ mod tests {
             failed: false,
             finished: true,
             numbered_diff: true,
+            render_records: None,
+            render_call_id: None,
+            rendered: None,
             parts: Vec::new(),
         };
         let render = |expanded| {
@@ -5386,6 +5623,9 @@ mod tests {
             failed: false,
             finished: true,
             numbered_diff: false,
+            render_records: None,
+            render_call_id: None,
+            rendered: None,
             parts: vec![
                 ToolPart::Text("before".into()),
                 ToolPart::Image(image),

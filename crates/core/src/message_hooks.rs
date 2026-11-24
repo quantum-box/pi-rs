@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::time::{Instant, timeout};
 use crate::{
-    Extension, ExtensionState, Message, Notification, Observer, Registry, Session, ToolCall,
-    ToolCallDelta,
+    Event, Extension, ExtensionState, ExtensionStates, Message, Notification, Observer, Outcome,
+    Registry, Session, ToolCall, ToolCallDelta,
 };
 
 /// Native assistant streaming updates before the corresponding public notification.
@@ -55,7 +55,7 @@ pub enum MessageStatus {
     Aborted,
 }
 
-/// Assistant messages observed by a native extension.
+/// User, assistant and tool-result messages observed by a native extension.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(
     tag = "type",
@@ -123,6 +123,22 @@ impl MessageHooks {
         session: &Session,
         model_timeout: Duration,
     ) -> Option<Self> {
+        Self::with_states(registry, || session.extension_states(), model_timeout)
+    }
+
+    pub(crate) fn for_states(
+        registry: &Registry,
+        states: &ExtensionStates,
+        model_timeout: Duration,
+    ) -> Option<Self> {
+        Self::with_states(registry, || states.clone(), model_timeout)
+    }
+
+    fn with_states(
+        registry: &Registry,
+        states: impl FnOnce() -> ExtensionStates,
+        model_timeout: Duration,
+    ) -> Option<Self> {
         let extensions: Vec<_> = registry
             .extensions
             .iter()
@@ -132,7 +148,7 @@ impl MessageHooks {
         if extensions.is_empty() {
             return None;
         }
-        let mut states = session.extension_states();
+        let mut states = states();
         let count = u32::try_from(extensions.len()).unwrap_or(u32::MAX);
         Some(Self {
             handlers: extensions
@@ -167,6 +183,149 @@ impl MessageHooks {
             },
         )
         .await;
+    }
+
+    pub(crate) async fn user(&mut self, mut event: Event) -> Event {
+        let (input_id, message) = match &event {
+            Event::User { content, input_id } => (
+                *input_id,
+                Message::User {
+                    content: content.clone(),
+                },
+            ),
+            Event::UserWithImages {
+                content,
+                images,
+                input_id,
+            } => (
+                *input_id,
+                Message::UserWithImages {
+                    content: content.clone(),
+                    images: images.clone(),
+                },
+            ),
+            _ => return event,
+        };
+        self.observe(
+            Phase::TerminalStart,
+            &MessageLifecycleEvent::Start {
+                message: message.clone(),
+            },
+        )
+        .await;
+        let mut end = MessageLifecycleEvent::End {
+            message,
+            status: MessageStatus::Complete,
+        };
+        for index in 0..self.handlers.len() {
+            let Some(replacement) = self.invoke(index, Phase::End, &end).await else {
+                continue;
+            };
+            let candidate = match (&event, &replacement) {
+                (Event::User { .. }, Message::User { content }) if !content.trim().is_empty() => {
+                    Event::User {
+                        content: content.clone(),
+                        input_id,
+                    }
+                }
+                (
+                    Event::UserWithImages { images, .. },
+                    Message::UserWithImages {
+                        content,
+                        images: updated,
+                    },
+                ) if images == updated => Event::UserWithImages {
+                    content: content.clone(),
+                    images: updated.clone(),
+                    input_id,
+                },
+                _ => {
+                    self.record_failure(index, Phase::End, "message_end must retain the user role and image attachments and leave a sendable message".into(), false);
+                    continue;
+                }
+            };
+            if serde_json::to_vec(&candidate)
+                .is_ok_and(|bytes| bytes.len() <= crate::journal::MAX_USER_EVENT_BYTES)
+            {
+                event = candidate;
+                end = MessageLifecycleEvent::End {
+                    message: replacement,
+                    status: MessageStatus::Complete,
+                };
+            } else {
+                self.record_failure(
+                    index,
+                    Phase::End,
+                    "message_end user text exceeds the input size limit".into(),
+                    false,
+                );
+            }
+        }
+        event
+    }
+
+    pub(crate) async fn tool(
+        &mut self,
+        call_id: &str,
+        mut outcome: Outcome,
+        output_limit: usize,
+    ) -> Outcome {
+        if matches!(outcome, Outcome::Pending { .. } | Outcome::Unknown(_)) {
+            return outcome;
+        }
+        let mut message = tool_message(call_id, &outcome);
+        self.observe(
+            Phase::TerminalStart,
+            &MessageLifecycleEvent::Start {
+                message: message.clone(),
+            },
+        )
+        .await;
+        for index in 0..self.handlers.len() {
+            let event = MessageLifecycleEvent::End {
+                message,
+                status: MessageStatus::Complete,
+            };
+            let replacement = self.invoke(index, Phase::End, &event).await;
+            let MessageLifecycleEvent::End {
+                message: previous, ..
+            } = event
+            else {
+                unreachable!("constructed a tool message end event");
+            };
+            message = previous;
+            let Some(replacement) = replacement else {
+                continue;
+            };
+            if message == replacement {
+                continue;
+            }
+            let candidate = if let Message::Tool {
+                call_id: updated,
+                content,
+                is_error,
+                is_structured: Some(structured),
+            } = replacement
+                && updated == call_id
+                && content.len() <= output_limit
+                && is_error == outcome.is_error()
+                && structured == outcome.is_structured()
+            {
+                tool_text_edit(&outcome, content)
+            } else {
+                None
+            };
+            if let Some(candidate) = candidate
+                && crate::agent::encoded_tool_output_bytes(&candidate)
+                    .is_ok_and(|bytes| bytes <= output_limit)
+            {
+                message = tool_message(call_id, &candidate);
+                outcome = candidate;
+            } else {
+                self.record_failure(index, Phase::End, "message_end may edit tool result text within the output limit and must retain the call ID, status and other result data".into(), false);
+            }
+        }
+        outcome
     }
 
     pub(crate) async fn update(&mut self, parts: &[String], update: AssistantMessageUpdate) {
@@ -320,6 +479,89 @@ impl MessageHooks {
     }
 }
 
+fn tool_message(call_id: &str, outcome: &Outcome) -> Message {
+    Message::Tool {
+        call_id: call_id.into(),
+        content: outcome.tool_content(),
+        is_error: outcome.is_error(),
+        is_structured: Some(outcome.is_structured()),
+    }
+}
+
+fn tool_text_edit(outcome: &Outcome, content: String) -> Option<Outcome> {
+    use Outcome::*;
+    match outcome {
+        Succeeded(_) => Some(Succeeded(content)),
+        SucceededWithDetails { details, .. } => Some(SucceededWithDetails {
+            output: content,
+            details: details.clone(),
+        }),
+        Failed(_) => Some(TextResult {
+            output: content,
+            details: None,
+            is_error: true,
+        }),
+        TextResult {
+            details, is_error, ..
+        } => Some(TextResult {
+            output: content,
+            details: details.clone(),
+            is_error: *is_error,
+        }),
+        TextResultWithStructuredContent {
+            details,
+            structured_content,
+            is_error,
+            ..
+        } => Some(TextResultWithStructuredContent {
+            output: content,
+            details: details.clone(),
+            structured_content: structured_content.clone(),
+            is_error: *is_error,
+        }),
+        Structured { data, attachments }
+        | StructuredWithDetails {
+            data, attachments, ..
+        } => {
+            let mut projected = serde_json::json!({"data":data, "attachments":attachments});
+            let proposed = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+            let existing_blocks = projected
+                .get_mut("data")?
+                .get_mut("content")?
+                .as_array_mut()?;
+            let proposed_blocks = proposed.get("data")?.get("content")?.as_array()?;
+            if existing_blocks.len() != proposed_blocks.len() {
+                return None;
+            }
+            for (old, new) in existing_blocks.iter_mut().zip(proposed_blocks) {
+                if old["type"] == "text"
+                    && old.get("textSignature").is_none()
+                    && old.get("signature").is_none()
+                    && old.get("text")?.is_string()
+                {
+                    *old.get_mut("text")? = new.get("text")?.as_str()?.into();
+                }
+            }
+            if projected != proposed {
+                return None;
+            }
+            let data = projected.get_mut("data")?.take();
+            Some(match outcome {
+                StructuredWithDetails { details, .. } => StructuredWithDetails {
+                    data,
+                    attachments: attachments.clone(),
+                    details: details.clone(),
+                },
+                _ => Structured {
+                    data,
+                    attachments: attachments.clone(),
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
 fn assistant(content: String, calls: Vec<ToolCall>) -> Message {
     Message::Assistant {
         content,
@@ -359,10 +601,10 @@ mod tests {
         ) -> ExtensionResult<Option<Message>> {
             let mut log = self.log.lock().unwrap();
             match event {
-                MessageLifecycleEvent::Start { message } => {
-                    assert!(
-                        matches!(message, Message::Assistant { content, .. } if content.is_empty())
-                    );
+                MessageLifecycleEvent::Start {
+                    message: Message::Assistant { content, .. },
+                } => {
+                    assert!(content.is_empty());
                     log.push("start".into());
                 }
                 MessageLifecycleEvent::Update {
@@ -375,17 +617,14 @@ mod tests {
                     log.push(format!("extension:{delta}"));
                 }
                 MessageLifecycleEvent::End {
-                    message,
+                    message:
+                        Message::Assistant {
+                            content,
+                            calls,
+                            replay: None,
+                        },
                     status: MessageStatus::Complete,
                 } => {
-                    let Message::Assistant {
-                        content,
-                        calls,
-                        replay: None,
-                    } = message
-                    else {
-                        panic!("expected portable assistant message");
-                    };
                     log.push(format!("end:{content}"));
                     if self.id == "grow" {
                         return Ok(Some(assistant("replacement ".repeat(1024), calls.clone())));
@@ -655,7 +894,12 @@ mod tests {
                 event: &MessageLifecycleEvent,
                 _: Option<&ExtensionState>,
             ) -> ExtensionResult<Option<Message>> {
-                if matches!(event, MessageLifecycleEvent::Start { .. }) {
+                if matches!(
+                    event,
+                    MessageLifecycleEvent::Start {
+                        message: Message::Assistant { .. }
+                    }
+                ) {
                     std::future::pending().await
                 } else {
                     Ok(None)
@@ -679,14 +923,16 @@ mod tests {
                 _: Option<&ExtensionState>,
             ) -> ExtensionResult<Option<Message>> {
                 match event {
-                    MessageLifecycleEvent::Start { .. } => self.0.lock().unwrap().push("start"),
+                    MessageLifecycleEvent::Start {
+                        message: Message::Assistant { .. },
+                    } => self.0.lock().unwrap().push("start"),
                     MessageLifecycleEvent::End {
                         status: MessageStatus::Failed,
                         ..
                     } => {
                         self.0.lock().unwrap().push("failed");
                     }
-                    _ => panic!("unexpected event {event:?}"),
+                    _ => {}
                 }
                 Ok(None)
             }
@@ -820,6 +1066,430 @@ mod tests {
         .await
         .unwrap();
         assert!(started.elapsed() < model_timeout);
+    }
+
+    #[tokio::test]
+    async fn native_user_message_hooks_edit_initial_and_queued_prompts_before_commit() {
+        struct UserHook(Arc<Mutex<Vec<String>>>);
+
+        #[async_trait::async_trait]
+        impl Extension for UserHook {
+            fn id(&self) -> &str {
+                "user"
+            }
+            fn handles_message_lifecycle(&self) -> bool {
+                true
+            }
+            async fn message_lifecycle(
+                &self,
+                event: &MessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Message>> {
+                match event {
+                    MessageLifecycleEvent::Start {
+                        message: Message::User { content },
+                    } => {
+                        self.0.lock().unwrap().push(format!("start:{content}"));
+                        Ok(Some(Message::User {
+                            content: "ignored at start".into(),
+                        }))
+                    }
+                    MessageLifecycleEvent::End {
+                        message: Message::User { content },
+                        status: MessageStatus::Complete,
+                    } => {
+                        self.0.lock().unwrap().push(format!("end:{content}"));
+                        Ok(Some(Message::User {
+                            content: format!("{content}/edited"),
+                        }))
+                    }
+                    _ => Ok(None),
+                }
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry.register(Arc::new(UserHook(log.clone()))).unwrap();
+        let model = TextModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let run_id = uuid::Uuid::new_v4();
+        let followup_id = uuid::Uuid::new_v4();
+        let (tx, mut inputs) = tokio::sync::mpsc::channel(1);
+        tx.send(crate::QueuedInput {
+            id: followup_id,
+            kind: crate::InputKind::FollowUp,
+            content: "follow-up".into(),
+        })
+        .await
+        .unwrap();
+        let mut committed = Vec::new();
+        agent
+            .run_correlated(
+                &mut session,
+                run_id,
+                Some("initial".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |notification| {
+                    if let Notification::Committed(record) = notification
+                        && let Event::User {
+                            content,
+                            input_id: Some(id),
+                        } = &record.event
+                    {
+                        log.lock().unwrap().push(format!("commit:{content}"));
+                        committed.push(*id);
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed, [run_id, followup_id]);
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "start:initial",
+                "end:initial",
+                "commit:initial/edited",
+                "start:follow-up",
+                "end:follow-up",
+                "commit:follow-up/edited",
+            ]
+        );
+        assert!(session.queued_inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_user_message_cancellation_leaves_later_prompts_queued() {
+        struct StopDelivery(CancellationToken);
+
+        #[async_trait::async_trait]
+        impl Extension for StopDelivery {
+            fn id(&self) -> &str {
+                "stop-delivery"
+            }
+            fn handles_message_lifecycle(&self) -> bool {
+                true
+            }
+            async fn message_lifecycle(
+                &self,
+                event: &MessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Message>> {
+                if let MessageLifecycleEvent::Start {
+                    message: Message::User { content },
+                } = event
+                {
+                    assert_eq!(content, "first");
+                    self.0.cancel();
+                }
+                Ok(None)
+            }
+        }
+
+        for queue_more in [false, true] {
+            let cancel = CancellationToken::new();
+            let mut registry = Registry::default();
+            registry
+                .register(Arc::new(StopDelivery(cancel.clone())))
+                .unwrap();
+            let model = TextModel(std::sync::atomic::AtomicUsize::new(0));
+            let agent = Agent {
+                model: &model,
+                model_name: "fixture",
+                registry: &registry,
+                system_prompt: "",
+                limits: Limits::default(),
+            };
+            let mut session = Session::with_store(MemoryStore::default()).unwrap();
+            let first = crate::QueuedInput::from("first".to_owned());
+            session
+                .append(Event::InputQueued {
+                    input: first.clone(),
+                })
+                .unwrap();
+            let mut remaining = Vec::new();
+            if queue_more {
+                let second = crate::QueuedInput::from("second".to_owned());
+                session
+                    .append(Event::InputQueued {
+                        input: second.clone(),
+                    })
+                    .unwrap();
+                remaining.push(crate::QueuedMessage::from(second));
+            }
+            let delivery = agent
+                .apply_queued_inputs_with_lifecycle(&mut session, &cancel, &mut |_| {})
+                .await;
+            assert!(matches!(delivery, Err(crate::Error::Cancelled)));
+            assert_eq!(session.queued_inputs(), remaining);
+            assert!(
+                matches!(&session.records().last().unwrap().event, Event::User { input_id: Some(id), .. } if *id == first.id)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_user_message_hooks_preserve_original_images_and_report_rejected_edits() {
+        struct ImageHook(&'static str);
+
+        #[async_trait::async_trait]
+        impl Extension for ImageHook {
+            fn id(&self) -> &str {
+                self.0
+            }
+            fn handles_message_lifecycle(&self) -> bool {
+                true
+            }
+            async fn message_lifecycle(
+                &self,
+                event: &MessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Message>> {
+                let MessageLifecycleEvent::End {
+                    message: Message::UserWithImages { content, images },
+                    status: MessageStatus::Complete,
+                } = event
+                else {
+                    return Ok(None);
+                };
+                assert_eq!(content, "original");
+                let images = if self.0 == "strip" {
+                    Vec::new()
+                } else {
+                    images.clone()
+                };
+                Ok(Some(Message::UserWithImages {
+                    content: "edited".into(),
+                    images,
+                }))
+            }
+        }
+        let mut registry = Registry::default();
+        registry.register(Arc::new(ImageHook("strip"))).unwrap();
+        registry.register(Arc::new(ImageHook("edit"))).unwrap();
+        let model = TextModel(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent {
+            model: &model,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let image = crate::ImageContent {
+            mime_type: "image/png".into(),
+            data: "iVBORw0KGgo=".into(),
+        };
+        let id = uuid::Uuid::new_v4();
+        let mut errors = 0;
+        agent
+            .append_prompt_with_images(
+                &mut session,
+                "original".into(),
+                vec![image.clone()],
+                id,
+                &CancellationToken::new(),
+                &mut |notification| {
+                    if matches!(
+                        notification,
+                        Notification::ExtensionLifecycleError {
+                            event: "message_end",
+                            ..
+                        }
+                    ) {
+                        errors += 1;
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(errors, 1);
+        assert!(
+            matches!(&session.records().last().unwrap().event, Event::UserWithImages { content, input_id: Some(input_id), images } if content == "edited" && *input_id == id && images == &[image])
+        );
+    }
+
+    #[tokio::test]
+    async fn native_tool_message_hooks_edit_durable_model_result_without_dropping_details() {
+        struct FixtureTool;
+
+        #[async_trait::async_trait]
+        impl crate::Tool for FixtureTool {
+            fn spec(&self) -> crate::ToolSpec {
+                crate::ToolSpec {
+                    name: "fixture".into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+            async fn invoke(&self, _: serde_json::Value, _: crate::ToolContext) -> Outcome {
+                Outcome::SucceededWithDetails {
+                    output: "raw".into(),
+                    details: serde_json::json!({"retained": true}),
+                }
+            }
+        }
+        struct ObserveTool(Arc<Mutex<Vec<&'static str>>>);
+
+        #[async_trait::async_trait]
+        impl Extension for ObserveTool {
+            fn id(&self) -> &str {
+                "tool-message"
+            }
+            fn tools(&self) -> Vec<Arc<dyn crate::Tool>> {
+                vec![Arc::new(FixtureTool)]
+            }
+            fn handles_message_lifecycle(&self) -> bool {
+                true
+            }
+            async fn message_lifecycle(
+                &self,
+                event: &MessageLifecycleEvent,
+                _: Option<&ExtensionState>,
+            ) -> ExtensionResult<Option<Message>> {
+                match event {
+                    MessageLifecycleEvent::Start {
+                        message: Message::Tool { content, .. },
+                    } => {
+                        assert_eq!(content, "raw");
+                        self.0.lock().unwrap().push("start");
+                    }
+                    MessageLifecycleEvent::End {
+                        message:
+                            Message::Tool {
+                                call_id,
+                                content,
+                                is_error,
+                                is_structured,
+                            },
+                        status: MessageStatus::Complete,
+                    } => {
+                        assert_eq!(content, "raw");
+                        assert_eq!(call_id, "call");
+                        self.0.lock().unwrap().push("end");
+                        return Ok(Some(Message::Tool {
+                            call_id: call_id.clone(),
+                            content: "edited".into(),
+                            is_error: *is_error,
+                            is_structured: *is_structured,
+                        }));
+                    }
+                    _ => {}
+                }
+                Ok(None)
+            }
+        }
+        struct CallThenAnswer;
+
+        #[async_trait::async_trait]
+        impl Model for CallThenAnswer {
+            async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
+                let calls = if let Some(message) = request
+                    .messages
+                    .iter()
+                    .find(|msg| matches!(msg, Message::Tool { .. }))
+                {
+                    assert!(
+                        matches!(message, Message::Tool { call_id, content, is_error: false, .. } if call_id == "call" && content == "edited")
+                    );
+                    Vec::new()
+                } else {
+                    vec![ToolCall {
+                        id: "call".into(),
+                        name: "fixture".into(),
+                        arguments: "{}".into(),
+                    }]
+                };
+                Ok(Box::pin(futures_util::stream::iter([
+                    Ok(ModelEvent::Text("answer".into())),
+                    Ok(ModelEvent::Complete { calls, usage: None }),
+                ])))
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        registry
+            .register(Arc::new(ObserveTool(log.clone())))
+            .unwrap();
+        let agent = Agent {
+            model: &CallThenAnswer,
+            model_name: "fixture",
+            registry: &registry,
+            system_prompt: "",
+            limits: Limits::default(),
+        };
+        let mut session = Session::with_store(MemoryStore::default()).unwrap();
+        let (_tx, mut inputs) = tokio::sync::mpsc::channel::<String>(1);
+        agent
+            .run(
+                &mut session,
+                Some("question".into()),
+                &mut inputs,
+                &CancellationToken::new(),
+                &mut |notification| {
+                    if let Notification::Committed(record) = notification
+                        && let Event::ToolFinished { outcome, .. } = &record.event
+                    {
+                        assert_eq!(
+                            *outcome,
+                            Outcome::SucceededWithDetails {
+                                output: "edited".into(),
+                                details: serde_json::json!({"retained": true})
+                            }
+                        );
+                        log.lock().unwrap().push("commit");
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(*log.lock().unwrap(), ["start", "end", "commit"]);
+    }
+
+    #[test]
+    fn native_tool_message_edit_preserves_non_text_blocks_and_attachments() {
+        let data = serde_json::json!({"content":[
+            {"type":"text","text":"original"},
+            {"type":"image","mimeType":"image/png","data":"iVBORw0KGgo="},
+            {"type":"text","text":"signed","textSignature":"signature"}
+        ],"isError":true});
+        let outcome = Outcome::StructuredWithDetails {
+            data,
+            attachments: vec![crate::AttachmentRef {
+                id: "asset".into(),
+                media_type: "image/png".into(),
+            }],
+            details: serde_json::json!({"retained": true}),
+        };
+        let original = serde_json::from_str::<serde_json::Value>(&outcome.tool_content()).unwrap();
+        let mut changed = original.clone();
+        changed["data"]["content"][0]["text"] = "edited".into();
+        let updated = tool_text_edit(&outcome, changed.to_string()).unwrap();
+        assert_eq!(updated.tool_content(), changed.to_string());
+        assert!(updated.is_error());
+        assert!(
+            matches!(&updated, Outcome::StructuredWithDetails { details, .. } if details["retained"] == true)
+        );
+        for (pointer, value) in [
+            ("/data/content/1/data", serde_json::json!("changed")),
+            ("/data/content/2/text", serde_json::json!("changed")),
+            ("/attachments", serde_json::json!([])),
+            ("/data/isError", serde_json::json!(false)),
+        ] {
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(tool_text_edit(&outcome, changed.to_string()).is_none());
+            changed = original.clone();
+        }
     }
 
     #[test]

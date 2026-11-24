@@ -338,6 +338,16 @@ impl Ollama {
         self.headers.clone()
     }
 
+    #[doc(hidden)]
+    pub async fn prepare_header_override(&self, headers: &HeaderMap) -> Option<HeaderMap> {
+        pi_rs_core::provider_header_session_id()?;
+        pi_rs_core::prepare_provider_headers(
+            headers,
+            &self.token.iter().cloned().collect::<Vec<_>>(),
+        )
+        .await
+    }
+
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -900,6 +910,19 @@ fn running_context_window(value: &Value, model: &str) -> Option<u32> {
 
 #[async_trait::async_trait]
 impl Model for Ollama {
+    async fn prepare_context<'a>(
+        &'a self,
+        _: &ModelRequest,
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        Ok(self
+            .prepare_header_override(&self.headers)
+            .await
+            .map(|headers| {
+                std::sync::Arc::new(self.clone().with_headers(headers))
+                    as std::sync::Arc<dyn Model + 'a>
+            }))
+    }
+
     fn uses_tool_transcript(&self, _model: &str) -> bool {
         self.mistral.is_none()
             && self
@@ -912,9 +935,16 @@ impl Model for Ollama {
         request: &ModelRequest,
         changes: &[pi_rs_core::ToolTranscriptChange],
     ) -> Result<Option<Arc<dyn Model + 'a>>> {
-        Ok(self.uses_tool_transcript(&request.model).then(|| {
-            Arc::new(self.clone().with_tool_transcript(request, changes)) as Arc<dyn Model>
-        }))
+        if !self.uses_tool_transcript(&request.model) {
+            return self.prepare_context(request).await;
+        }
+        let mut client = self.clone();
+        if let Some(headers) = self.prepare_header_override(&self.headers).await {
+            client = client.with_headers(headers);
+        }
+        Ok(Some(Arc::new(
+            client.with_tool_transcript(request, changes),
+        )))
     }
 
     fn supports_mid_conversation_system_messages(&self, _model: &str) -> bool {
@@ -1354,6 +1384,11 @@ impl Ollama {
             ModelProgress::WaitingForModel,
         );
         let mistral = self.mistral.is_some();
+        let api = if mistral {
+            ModelApi::MistralConversations
+        } else {
+            ModelApi::OpenaiCompletions
+        };
         let wire_tools = wire_tools.unwrap_or_else(|| ChatWireTools {
             declarations: request
                 .tools
@@ -1563,6 +1598,7 @@ impl Ollama {
         let progress = self.progress.clone();
         let reasoning = self.reasoning.clone();
         let loading_probe = self.clone();
+        let observe_stream = pi_rs_core::observes_provider_stream();
         Ok(Box::pin(async_stream::try_stream! {
             let mut bytes = 0usize;
             let mut events = response.bytes_stream().map(move |chunk| {
@@ -1577,7 +1613,7 @@ impl Ollama {
             let mut usage = None;
             let mut reported_cached_input = None;
             let mut metadata = ModelMetadata {
-                provider_api: Some(if mistral { ModelApi::MistralConversations } else { ModelApi::OpenaiCompletions }),
+                provider_api: Some(api),
                 replay_identity: Some(identity.clone()),
                 ..ModelMetadata::default()
             };
@@ -1612,6 +1648,12 @@ impl Ollama {
                 })?;
                 if event.data == "[DONE]" {
                     break;
+                }
+                if observe_stream && let Ok(raw) = serde_json::from_str::<Value>(&event.data) {
+                    pi_rs_core::observe_provider_stream(
+                        &loading_probe.provider, api, &requested_model,
+                        &raw, &error_secrets, &loading_probe.headers,
+                    ).await;
                 }
                 let chunk: Chunk = serde_json::from_str(&event.data)
                     .map_err(|_| Error::Model("malformed SSE chunk".into()))?;

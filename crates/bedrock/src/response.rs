@@ -58,10 +58,7 @@ impl Intercept for Capture {
         _: &RuntimeComponents,
         _: &mut ConfigBag,
     ) -> Result<(), BoxError> {
-        let request_headers =
-            copy_metadata(http::StatusCode::OK.into(), context.request().headers())
-                .map(|response| response.into_parts().0.headers)
-                .unwrap_or_default();
+        let request_headers = copy_request_headers(context.request().headers());
         *self
             .request_headers
             .lock()
@@ -122,36 +119,7 @@ impl Observation {
             request_headers,
             response,
         } = self;
-        let mut secrets = configured_secrets.to_vec();
-        secrets.extend(
-            request_headers
-                .get_all("x-amz-security-token")
-                .iter()
-                .filter_map(|value| value.to_str().ok().map(str::to_owned)),
-        );
-        for auth in request_headers
-            .get_all("authorization")
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-        {
-            secrets.push(auth.to_owned());
-            if let Some((scheme, value)) = auth.split_once(' ') {
-                if scheme.eq_ignore_ascii_case("bearer") {
-                    secrets.push(value.to_owned());
-                } else if scheme == "AWS4-HMAC-SHA256" || scheme == "AWS4-ECDSA-P256-SHA256" {
-                    for parameter in value.split(',').map(str::trim) {
-                        if let Some(signature) = parameter.strip_prefix("Signature=") {
-                            secrets.push(signature.to_owned());
-                        } else if let Some((key_id, _)) = parameter
-                            .strip_prefix("Credential=")
-                            .and_then(|credential| credential.split_once('/'))
-                        {
-                            secrets.push(key_id.to_owned());
-                        }
-                    }
-                }
-            }
-        }
+        let secrets = request_secrets(configured_secrets, &request_headers);
         pi_rs_core::observe_provider_response(
             response.status(),
             response.headers(),
@@ -160,6 +128,49 @@ impl Observation {
         )
         .await;
     }
+}
+
+pub(crate) fn request_secrets(
+    configured_secrets: &[String],
+    request_headers: &HeaderMap,
+) -> Vec<String> {
+    let mut secrets = configured_secrets.to_vec();
+    secrets.extend(
+        request_headers
+            .get_all("x-amz-security-token")
+            .iter()
+            .filter_map(|value| value.to_str().ok().map(str::to_owned)),
+    );
+    for auth in request_headers
+        .get_all("authorization")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+    {
+        secrets.push(auth.to_owned());
+        if let Some((scheme, value)) = auth.split_once(' ') {
+            if scheme.eq_ignore_ascii_case("bearer") {
+                secrets.push(value.to_owned());
+            } else if scheme == "AWS4-HMAC-SHA256" || scheme == "AWS4-ECDSA-P256-SHA256" {
+                for parameter in value.split(',').map(str::trim) {
+                    if let Some(signature) = parameter.strip_prefix("Signature=") {
+                        secrets.push(signature.to_owned());
+                    } else if let Some((key_id, _)) = parameter
+                        .strip_prefix("Credential=")
+                        .and_then(|credential| credential.split_once('/'))
+                    {
+                        secrets.push(key_id.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    secrets
+}
+
+pub(crate) fn copy_request_headers(headers: &Headers) -> HeaderMap {
+    copy_metadata(http::StatusCode::OK.into(), headers)
+        .map(|response| response.into_parts().0.headers)
+        .unwrap_or_default()
 }
 
 fn copy_metadata(status: StatusCode, headers: &Headers) -> Option<http::Response<()>> {

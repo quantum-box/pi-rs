@@ -262,6 +262,10 @@ impl Picker {
         }
     }
 
+    pub fn is_completion(&self) -> bool {
+        self.completion_limit.is_some()
+    }
+
     pub fn paste(&mut self, text: &str) {
         if self.title == "Warnings" {
             return;
@@ -1755,6 +1759,7 @@ fn setting_description(selection: &Selection) -> Option<&'static str> {
         "terminal.showImages" => "Render supported images inline in the terminal.",
         "terminal.imageWidthCells" => "Set the preferred width of inline images in terminal cells.",
         "tuiMode" => "Choose fullscreen or regular mode; regular mode uses terminal scrollback.",
+        "collapseChangelog" => "Show a condensed changelog after updates.",
         "quietStartup" => "Control startup output; header keeps only the startup header.",
         "sessionShareDestination" => "Choose where to upload sessions shared with /share.",
         "defaultProjectTrust" => "Choose the fallback when no saved project trust decision exists.",

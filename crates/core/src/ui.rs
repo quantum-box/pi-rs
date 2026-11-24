@@ -253,6 +253,18 @@ pub struct UiComponentAction {
     pub label: Option<String>,
 }
 
+/// Configure the indicator shown while the interactive agent is working.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkingIndicatorOptions {
+    /// A single frame is static. Empty frames hide the indicator glyph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<Vec<String>>,
+    /// Omit or set to zero to use the default interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<u64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(
     tag = "method",
@@ -315,8 +327,41 @@ pub enum UiRequest {
         #[serde(default, rename = "widgetPlacement")]
         placement: WidgetPlacement,
     },
+    /// Replace the session header with styled rows. Clear it with `None`.
+    SetHeader {
+        #[serde(default)]
+        lines: Option<Vec<Vec<UiComponentSpan>>>,
+    },
+    /// Replace the session footer with styled rows. Clear it with `None`.
+    SetFooter {
+        #[serde(default)]
+        lines: Option<Vec<Vec<UiComponentSpan>>>,
+    },
+    /// Override the working message. Clear it with `None`.
+    SetWorkingMessage {
+        #[serde(default)]
+        message: Option<String>,
+    },
+    SetWorkingVisible {
+        visible: bool,
+    },
+    /// Override the working animation. Restore the default with `None`.
+    SetWorkingIndicator {
+        #[serde(default)]
+        options: Option<WorkingIndicatorOptions>,
+    },
+    /// Change the collapsed thinking label. A blank label hides the block.
+    /// Omit the label to restore the default.
+    SetHiddenThinkingLabel {
+        #[serde(default)]
+        label: Option<String>,
+    },
     SetTitle {
         title: String,
+    },
+    /// Paste text at the main editor cursor using the frontend's paste behavior.
+    PasteToEditor {
+        text: String,
     },
     #[serde(rename = "set_editor_text", alias = "setEditorText")]
     SetEditorText {
@@ -359,6 +404,45 @@ impl UiRequest {
             && lines.len() > 128
         {
             return Err("extension widgets support at most 128 lines".into());
+        }
+        if let Self::SetHeader { lines: Some(lines) } | Self::SetFooter { lines: Some(lines) } =
+            self
+            && (lines.len() > 16
+                || !component_lines_within_limits(lines)
+                || lines
+                    .iter()
+                    .flatten()
+                    .any(|span| span.color.as_ref().is_some_and(|color| color.len() > 128)))
+        {
+            return Err("extension header or footer exceeds its rendering limits".into());
+        }
+        if let Self::SetWorkingMessage {
+            message: Some(message),
+        } = self
+            && (message.len() > 4096 || message.chars().any(char::is_control))
+        {
+            return Err(
+                "extension working message must be a single line of at most 4096 bytes".into(),
+            );
+        }
+        if let Self::SetWorkingIndicator {
+            options: Some(options),
+        } = self
+            && let Some(frames) = &options.frames
+            && (frames.len() > 64
+                || frames
+                    .iter()
+                    .any(|frame| frame.len() > 256 || frame.chars().any(char::is_control)))
+        {
+            return Err("extension working indicator supports 64 single-line frames of at most 256 bytes each".into());
+        }
+        if let Self::SetHiddenThinkingLabel { label: Some(label) } = self
+            && (label.len() > 4096
+                || label
+                    .chars()
+                    .any(|ch| ch.is_control() && ch != '\n' && ch != '\t'))
+        {
+            return Err("extension hidden thinking label exceeds its rendering limits".into());
         }
         if let Self::Custom { lines, actions, .. } = self {
             if !component_lines_within_limits(lines) {
@@ -429,6 +513,95 @@ pub trait ExtensionUi: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paste_to_editor_uses_the_pi_request_without_opening_a_dialog() {
+        let value = serde_json::json!({"method":"pasteToEditor","text":"a\r\nb"});
+        let request: UiRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), value);
+        assert!(request.validate().is_ok());
+        assert!(!request.needs_response());
+    }
+
+    #[test]
+    fn hidden_thinking_label_accepts_blank_and_reset_without_a_response() {
+        for label in [
+            serde_json::json!({}),
+            serde_json::json!({"label":null}),
+            serde_json::json!({"label":""}),
+            serde_json::json!({"label":"Still thinking\nPlease wait"}),
+        ] {
+            let mut value = label;
+            value["method"] = serde_json::json!("setHiddenThinkingLabel");
+            let request: UiRequest = serde_json::from_value(value).unwrap();
+            assert!(request.validate().is_ok());
+            assert!(!request.needs_response());
+        }
+
+        for label in ["a".repeat(4097), "\x1b[31m".into()] {
+            let request = UiRequest::SetHiddenThinkingLabel { label: Some(label) };
+            assert!(request.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn working_indicator_uses_pi_fields_and_validates_single_line_frames() {
+        let value = serde_json::json!({
+            "method": "setWorkingIndicator",
+            "options": {"frames": ["a", "b"], "intervalMs": 250}
+        });
+        let request: UiRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), value);
+        assert!(request.validate().is_ok());
+        assert!(!request.needs_response());
+
+        for value in [
+            serde_json::json!({"method": "setWorkingIndicator", "options": {"frames": []}}),
+            serde_json::json!({"method": "setWorkingIndicator"}),
+            serde_json::json!({"method": "setWorkingMessage"}),
+            serde_json::json!({"method": "setWorkingVisible", "visible": false}),
+        ] {
+            let request: UiRequest = serde_json::from_value(value).unwrap();
+            assert!(request.validate().is_ok());
+            assert!(!request.needs_response());
+        }
+
+        for frames in [vec!["x"; 65], vec!["\x1b[31mA"], vec!["a\nb"]] {
+            let request = UiRequest::SetWorkingIndicator {
+                options: Some(WorkingIndicatorOptions {
+                    frames: Some(frames.into_iter().map(str::to_owned).collect()),
+                    interval_ms: None,
+                }),
+            };
+            assert!(request.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn header_footer_updates_are_bounded_and_do_not_open_prompts() {
+        let rows = vec![vec![UiComponentSpan {
+            text: "header".into(),
+            ..Default::default()
+        }]];
+        let request = UiRequest::SetHeader {
+            lines: Some(rows.clone()),
+        };
+        assert!(request.validate().is_ok());
+        assert!(!request.needs_response());
+        assert!(request.timeout().is_none());
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["method"], "setHeader");
+        assert_eq!(json["lines"][0][0]["text"], "header");
+        let clear: UiRequest =
+            serde_json::from_value(serde_json::json!({"method": "setFooter"})).unwrap();
+        assert!(matches!(clear, UiRequest::SetFooter { lines: None }));
+        assert!(
+            UiRequest::SetFooter {
+                lines: Some(vec![rows[0].clone(); 17])
+            }
+            .validate()
+            .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn markdown_transformers_chain_display_results_in_load_order() {

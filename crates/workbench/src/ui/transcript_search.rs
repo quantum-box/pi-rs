@@ -457,6 +457,9 @@ mod tests {
             finished: true,
             parts: vec![],
             numbered_diff: false,
+            render_records: None,
+            render_call_id: None,
+            rendered: None,
         };
         let lines = entry.render(&theme, 80, true, true, TranscriptOptions::default());
         let mut search = Search::default();

@@ -370,11 +370,69 @@ pub async fn notify_filtered(
         event,
         states,
         timeout,
-        (observer, &mut include),
+        (observer, &mut include, None),
         None,
         None,
     )
     .await;
+}
+
+/// Deliver a read-only lifecycle event with access to frontend presentation.
+#[doc(hidden)]
+pub async fn notify_filtered_with_ui(
+    registry: &Registry,
+    event: LifecycleEvent,
+    states: &ExtensionStates,
+    timeout: Duration,
+    observer: &mut Observer<'_>,
+    mut include: impl FnMut(&str) -> bool + Send,
+) {
+    notify_inner(
+        registry,
+        event,
+        states,
+        timeout,
+        (observer, &mut include, registry.ui.as_ref()),
+        None,
+        None,
+    )
+    .await;
+}
+
+struct LifecycleUiHost {
+    ui: std::sync::Arc<dyn crate::ExtensionUi>,
+    cancellation: crate::CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl ToolHost for LifecycleUiHost {
+    fn tools(&self) -> Vec<crate::ToolSpec> {
+        Vec::new()
+    }
+
+    async fn call(&self, _: &str, _: serde_json::Value) -> crate::Outcome {
+        crate::Outcome::Skipped("nested tools are unavailable in this lifecycle callback".into())
+    }
+
+    fn has_ui(&self) -> bool {
+        !self.cancellation.is_cancelled()
+    }
+
+    async fn ui(&self, request: crate::UiRequest) -> crate::ExtensionResult<crate::UiResponse> {
+        request.validate()?;
+        if request.needs_response() {
+            return Err("lifecycle presentation does not support prompts".into());
+        }
+        tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => Err("extension UI cancelled".into()),
+            response = self.ui.request(request.clone(), self.cancellation.clone()) => {
+                let response = response?;
+                if request.accepts_response(&response) { Ok(response) }
+                else { Err("invalid extension UI response".into()) }
+            }
+        }
+    }
 }
 
 pub(crate) async fn notify_with_host(
@@ -390,7 +448,7 @@ pub(crate) async fn notify_with_host(
         event,
         states,
         timeout,
-        (observer, &mut |_| true),
+        (observer, &mut |_| true, None),
         Some(host),
         None,
     )
@@ -505,7 +563,7 @@ async fn notify_session_callback(
                         event,
                         &states,
                         timeout,
-                        (&mut collect, &mut include_all),
+                        (&mut collect, &mut include_all, None),
                         Some(host),
                         compaction,
                     )
@@ -671,12 +729,18 @@ async fn notify_idle_session_entries(
     }
 }
 
+type LifecycleObservers<'a, 'observer> = (
+    &'a mut Observer<'observer>,
+    &'a mut (dyn FnMut(&str) -> bool + Send + 'a),
+    Option<&'a std::sync::Arc<dyn crate::ExtensionUi>>,
+);
+
 async fn notify_inner(
     registry: &Registry,
     event: LifecycleEvent,
     states: &ExtensionStates,
     timeout: Duration,
-    (observer, include): (&mut Observer<'_>, &mut (dyn FnMut(&str) -> bool + Send)),
+    (observer, include, ui): LifecycleObservers<'_, '_>,
     host: Option<std::sync::Arc<dyn crate::ToolHost>>,
     compaction: Option<(crate::CompactionTrigger, Option<serde_json::Value>)>,
 ) {
@@ -685,7 +749,7 @@ async fn notify_inner(
         event,
         states,
         timeout,
-        (observer, include),
+        (observer, include, ui),
         host.clone(),
         compaction,
     )
@@ -721,7 +785,7 @@ async fn deliver_mcp_changes(
             LifecycleEvent::McpServersChange { servers },
             states,
             remaining,
-            (observer, &mut |_| true),
+            (observer, &mut |_| true, None),
             host.clone(),
             None,
         )
@@ -735,7 +799,7 @@ async fn notify_inner_once(
     event: LifecycleEvent,
     states: &ExtensionStates,
     timeout: Duration,
-    (observer, include): (&mut Observer<'_>, &mut (dyn FnMut(&str) -> bool + Send)),
+    (observer, include, ui): LifecycleObservers<'_, '_>,
     host: Option<std::sync::Arc<dyn crate::ToolHost>>,
     compaction: Option<(crate::CompactionTrigger, Option<serde_json::Value>)>,
 ) {
@@ -806,13 +870,30 @@ async fn notify_inner_once(
                             }
                         }
                         None => {
+                            let cancellation = crate::CancellationToken::new();
+                            let _lifetime = cancellation.clone().drop_guard();
+                            let ui_host = ui.map(|ui| {
+                                std::sync::Arc::new(LifecycleUiHost {
+                                    ui: ui.clone(),
+                                    cancellation,
+                                })
+                                    as std::sync::Arc<dyn crate::ToolHost>
+                            });
                             if let Some(scope) = registry.mcp_callback_scope(extension.as_ref()) {
                                 extension
                                     .lifecycle_with_mcp_registry(
                                         &event,
                                         states.get(extension.id()),
-                                        std::sync::Arc::new(McpOnlyHost),
+                                        ui_host.unwrap_or_else(|| std::sync::Arc::new(McpOnlyHost)),
                                         scope.host(),
+                                    )
+                                    .await
+                            } else if let Some(ui_host) = ui_host {
+                                extension
+                                    .lifecycle_with_host(
+                                        &event,
+                                        states.get(extension.id()),
+                                        ui_host,
                                     )
                                     .await
                             } else {
@@ -1127,6 +1208,93 @@ mod wire_tests {
             *seen.lock().unwrap(),
             Some(json!({"trigger":"overflow","metadata":metadata}))
         );
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[tokio::test]
+    async fn terminal_snapshot_lifecycle_ui_expires_after_the_callback() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Ui(Mutex<usize>);
+        #[async_trait::async_trait]
+        impl crate::ExtensionUi for Ui {
+            async fn request(
+                &self,
+                request: crate::UiRequest,
+                _: crate::CancellationToken,
+            ) -> crate::ExtensionResult<crate::UiResponse> {
+                assert!(matches!(request, crate::UiRequest::SetHeader { .. }));
+                *self.0.lock().unwrap() += 1;
+                Ok(crate::UiResponse::Cancelled)
+            }
+        }
+
+        #[derive(Default)]
+        struct Extension(Mutex<Option<Arc<dyn ToolHost>>>);
+        #[async_trait::async_trait]
+        impl crate::Extension for Extension {
+            fn id(&self) -> &str {
+                "presentation"
+            }
+
+            fn handles_lifecycle(&self) -> bool {
+                true
+            }
+
+            fn handles_session_lifecycle(&self) -> bool {
+                true
+            }
+
+            async fn lifecycle_with_host(
+                &self,
+                _: &LifecycleEvent,
+                _: Option<&crate::ExtensionState>,
+                host: Arc<dyn ToolHost>,
+            ) -> crate::ExtensionResult<()> {
+                assert!(host.has_ui());
+                assert!(host.tools().is_empty());
+                assert!(!host.supports_custom_entries());
+                host.ui(crate::UiRequest::SetHeader { lines: None }).await?;
+                assert!(
+                    host.ui(crate::UiRequest::Confirm {
+                        title: "Blocked prompt".into(),
+                        message: "Lifecycle presentation cannot wait for input.".into(),
+                        timeout: None,
+                    })
+                    .await
+                    .is_err()
+                );
+                *self.0.lock().unwrap() = Some(host);
+                Ok(())
+            }
+        }
+
+        let ui = Arc::new(Ui::default());
+        let extension = Arc::new(Extension::default());
+        let mut registry = Registry::default();
+        registry.set_ui(ui.clone());
+        registry.register(extension.clone()).unwrap();
+        notify_filtered_with_ui(
+            &registry,
+            LifecycleEvent::SessionStart {
+                reason: SessionStartReason::Startup,
+                previous_session_file: None,
+            },
+            &ExtensionStates::default(),
+            Duration::from_secs(1),
+            &mut |_| panic!("lifecycle callback failed"),
+            |_| true,
+        )
+        .await;
+        let host = extension.0.lock().unwrap().take().unwrap();
+        assert!(!host.has_ui());
+        assert!(
+            host.ui(crate::UiRequest::SetHeader { lines: None })
+                .await
+                .is_err()
+        );
+        assert_eq!(*ui.0.lock().unwrap(), 1);
     }
 
     #[test]

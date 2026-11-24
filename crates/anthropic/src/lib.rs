@@ -507,6 +507,19 @@ impl Anthropic {
         self.headers.clone()
     }
 
+    #[doc(hidden)]
+    pub async fn prepare_header_override(&self, headers: &HeaderMap) -> Option<HeaderMap> {
+        pi_rs_core::provider_header_session_id()?;
+        let credential = self.auth.1.to_str().unwrap_or_default();
+        let mut secrets = vec![credential.to_owned()];
+        if let Some((scheme, token)) = credential.split_once(' ')
+            && scheme.eq_ignore_ascii_case("bearer")
+        {
+            secrets.push(token.to_owned());
+        }
+        pi_rs_core::prepare_provider_headers(headers, &secrets).await
+    }
+
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -2119,6 +2132,19 @@ fn resolve_anthropic_wire_tool(
 
 #[async_trait::async_trait]
 impl Model for Anthropic {
+    async fn prepare_context<'a>(
+        &'a self,
+        _: &ModelRequest,
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        Ok(self
+            .prepare_header_override(&self.headers)
+            .await
+            .map(|headers| {
+                std::sync::Arc::new(self.clone().with_headers(headers))
+                    as std::sync::Arc<dyn Model + 'a>
+            }))
+    }
+
     fn supports_mid_conversation_system_messages(&self, model: &str) -> bool {
         self.mid_conversation_system_models.contains(model)
     }
@@ -2132,9 +2158,16 @@ impl Model for Anthropic {
         request: &ModelRequest,
         changes: &[ToolTranscriptChange],
     ) -> Result<Option<Arc<dyn Model + 'a>>> {
-        Ok(self.supports_tool_transcript(&request.model).then(|| {
-            Arc::new(self.clone().with_tool_transcript(request, changes)) as Arc<dyn Model>
-        }))
+        if !self.supports_tool_transcript(&request.model) {
+            return self.prepare_context(request).await;
+        }
+        let mut client = self.clone();
+        if let Some(headers) = self.prepare_header_override(&self.headers).await {
+            client = client.with_headers(headers);
+        }
+        Ok(Some(Arc::new(
+            client.with_tool_transcript(request, changes),
+        )))
     }
 
     async fn prepare_tool_dispatch<'a>(
@@ -2833,6 +2866,8 @@ impl Anthropic {
         let allow_empty_signature = self.allow_empty_signature;
         let reasoning = self.reasoning.clone();
         let oauth = self.oauth;
+        let observation_headers =
+            pi_rs_core::observes_provider_stream().then(|| self.headers.clone());
         Ok(Box::pin(async_stream::try_stream! {
             let mut size = 0_usize;
             let mut events = response.bytes_stream().map(move |chunk| {
@@ -2875,6 +2910,11 @@ impl Anthropic {
                 })?;
                 let value: Value = serde_json::from_str(&event.data)
                     .map_err(|_| Error::Model("malformed Anthropic SSE event".into()))?;
+                if let Some(headers) = &observation_headers {
+                    pi_rs_core::observe_provider_stream(
+                        &provider, ModelApi::AnthropicMessages, &requested_model, &value, &error_secrets, headers,
+                    ).await;
+                }
                 let previous = metadata.clone();
                 let event_type = value["type"].as_str();
                 match event_type {

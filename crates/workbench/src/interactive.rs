@@ -37,7 +37,7 @@ use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::{Cli, Provider, TuiMode, process::Worker, radius_auth, sessions};
+use super::{Cli, Provider, TuiMode, changelog, process::Worker, radius_auth, sessions};
 
 // Shell output is displayed separately from the model-facing context framing.
 fn shell_display_output(execution: &pi_rs::BashExecution) -> String {
@@ -674,7 +674,7 @@ struct RegularLayout {
     theme: Theme,
     expand_tools: bool,
     hide_thinking: bool,
-    output: TranscriptOptions,
+    output: TranscriptOptions<'static>,
 }
 #[derive(Default)]
 struct RegularState {
@@ -1135,9 +1135,15 @@ enum TranscriptPanel {
 
 #[derive(Default)]
 struct StreamingTool {
+    generation: uuid::Uuid,
+    id: String,
+    revision: u64,
+    attempted: Option<u64>,
+    rendered: Option<std::sync::Arc<pi_rs::RenderedTool>>,
     name: String,
     arguments: crate::StreamingJson,
     preview: Value,
+    has_argument_fragment: bool,
 }
 
 type LinkRow = (u16, Vec<(std::ops::Range<usize>, String)>);
@@ -1153,6 +1159,13 @@ struct TranscriptExtensionRenderPending {
     request: uuid::Uuid,
     record: u64,
     options: pi_rs::CustomMessageRenderOptions,
+}
+
+struct PendingToolRender {
+    request: uuid::Uuid,
+    operation: String,
+    records: super::backend::ToolRenderRecords,
+    retried: bool,
 }
 
 enum MarkdownTarget {
@@ -1179,6 +1192,15 @@ fn markdown_input(text: &str, kind: pi_rs::MarkdownMessageType) -> Option<&str> 
     (!text.is_empty()).then_some(text)
 }
 
+struct PendingToolPreview {
+    request: uuid::Uuid,
+    index: u64,
+    generation: uuid::Uuid,
+    tool_name: String,
+    tool_call_id: String,
+    options: super::backend::ToolRenderOptions,
+}
+
 struct LiveModelChoice {
     id: uuid::Uuid,
     selected: Cli,
@@ -1189,6 +1211,70 @@ struct LiveModelChoice {
 enum SelectionDefault {
     Model,
     Thinking(String),
+}
+
+#[derive(Default)]
+struct ExtensionChrome {
+    header: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
+    footer: Option<Vec<Vec<pi_rs::UiComponentSpan>>>,
+    working: ExtensionWorkingStatus,
+    hidden_thinking_label: Option<String>,
+}
+
+#[derive(Default)]
+struct ExtensionWorkingStatus {
+    message: Option<String>,
+    hidden: bool,
+    indicator: Option<pi_rs::WorkingIndicatorOptions>,
+    animation_started: Option<Instant>,
+}
+
+const WORKING_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+impl ExtensionWorkingStatus {
+    fn interval(&self) -> Duration {
+        Duration::from_millis(
+            self.indicator
+                .as_ref()
+                .and_then(|options| options.interval_ms)
+                .filter(|interval| *interval != 0)
+                .unwrap_or(80),
+        )
+    }
+
+    fn frames(&self) -> Option<&[String]> {
+        self.indicator
+            .as_ref()
+            .and_then(|options| options.frames.as_deref())
+    }
+
+    fn frame(&self, now: Instant) -> &str {
+        let elapsed = now.saturating_duration_since(self.animation_started.unwrap_or(now));
+        let tick = elapsed.as_millis() / self.interval().as_millis();
+        if let Some(frames) = self.frames() {
+            if frames.is_empty() {
+                return "";
+            }
+            return &frames[(tick % frames.len() as u128) as usize];
+        }
+        WORKING_FRAMES[(tick % WORKING_FRAMES.len() as u128) as usize]
+    }
+
+    fn next_frame_wait(&self, now: Instant, last_frame: Instant) -> Option<Duration> {
+        let started = self.animation_started?;
+        if self.frames().is_some_and(|frames| frames.len() < 2) {
+            return None;
+        }
+        let interval = self.interval().as_millis();
+        let elapsed = now.saturating_duration_since(started).as_millis();
+        let drawn = last_frame.saturating_duration_since(started).as_millis();
+        if last_frame < started || drawn / interval != elapsed / interval {
+            return Some(Duration::ZERO);
+        }
+        Some(Duration::from_millis(
+            (interval - elapsed % interval) as u64,
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -1208,9 +1294,18 @@ struct View {
     branch_error: Option<String>,
     ui_status: std::collections::BTreeMap<String, String>,
     widgets: Vec<(String, Vec<String>, pi_rs::WidgetPlacement)>,
+    extension_chrome: ExtensionChrome,
     lines: Vec<Entry>,
     custom_entry_count: usize,
     custom_render_options: Option<pi_rs::CustomMessageRenderOptions>,
+    tool_render_options: Option<super::backend::ToolRenderOptions>,
+    tool_render_pending: Option<PendingToolRender>,
+    tool_preview_pending: Option<PendingToolPreview>,
+    tool_preview_cursor: Option<u64>,
+    tool_render_cursor: Option<usize>,
+    partial_tool_results: std::collections::BTreeMap<String, pi_rs::ToolRenderResult>,
+    tool_render_attempted: std::collections::BTreeMap<String, super::backend::ToolRenderRecords>,
+    tool_render_retry: std::collections::BTreeMap<String, super::backend::ToolRenderRecords>,
     custom_render_attempted: BTreeSet<u64>,
     custom_render_pending: Option<TranscriptExtensionRenderPending>,
     custom_render_redraw_at: Option<Instant>,
@@ -1258,6 +1353,7 @@ struct View {
     mouse: MouseSelection,
     wheel: Wheel,
     fullscreen_width: usize,
+    fullscreen_header_rows: usize,
     scrollbar_activity: Option<Instant>,
     scrollbar_dragging: bool,
     flash: Option<(String, Instant)>,
@@ -1335,6 +1431,9 @@ impl View {
                 finished: false,
                 parts: Vec::new(),
                 numbered_diff: false,
+                render_records: None,
+                render_call_id: None,
+                rendered: tool.rendered.clone(),
             })
         })
     }
@@ -1414,10 +1513,40 @@ impl View {
                     self.widgets.push((key, lines, placement));
                 }
             }
+            pi_rs::UiRequest::SetHeader { lines } => {
+                if self.extension_chrome.header != lines {
+                    self.extension_chrome.header = lines;
+                    self.regular.redraw = true;
+                }
+            }
+            pi_rs::UiRequest::SetFooter { lines } => self.extension_chrome.footer = lines,
+            pi_rs::UiRequest::SetWorkingMessage { message } => {
+                self.extension_chrome.working.message = message;
+            }
+            pi_rs::UiRequest::SetWorkingVisible { visible } => {
+                let working = &mut self.extension_chrome.working;
+                let hidden = !visible;
+                if working.hidden != hidden {
+                    working.animation_started = None;
+                    working.hidden = hidden;
+                }
+            }
+            pi_rs::UiRequest::SetWorkingIndicator { options } => {
+                self.extension_chrome.working.indicator = options;
+                self.extension_chrome.working.animation_started = None;
+            }
+            pi_rs::UiRequest::SetHiddenThinkingLabel { label } => {
+                if self.extension_chrome.hidden_thinking_label != label {
+                    self.extension_chrome.hidden_thinking_label = label;
+                    self.regular.redraw = true;
+                    self.panel_press = None;
+                }
+            }
             pi_rs::UiRequest::SetTitle { mut title } => {
                 title.retain(|character| !character.is_control());
                 self.pending_terminal_title = Some(title);
             }
+            pi_rs::UiRequest::PasteToEditor { text } => self.paste_editor_text(&text),
             pi_rs::UiRequest::SetEditorText { text } => self.editor.replace(text),
             pi_rs::UiRequest::GetEditorText => {
                 return Ok(Some((
@@ -1433,6 +1562,78 @@ impl View {
         }
         Ok(None)
     }
+    fn clear_extension_chrome(&mut self) -> bool {
+        let header_changed = self.extension_chrome.header.take().is_some();
+        let label_changed = self.extension_chrome.hidden_thinking_label.take().is_some();
+        self.regular.redraw |= header_changed || label_changed;
+        if label_changed {
+            self.panel_press = None;
+        }
+        let working = std::mem::take(&mut self.extension_chrome.working);
+        self.extension_chrome.footer.take().is_some()
+            || header_changed
+            || label_changed
+            || working.message.is_some()
+            || working.hidden
+            || working.indicator.is_some()
+    }
+
+    fn header_lines(
+        &self,
+        args: &Cli,
+        theme: &Theme,
+        width: usize,
+        max: usize,
+        fullscreen: bool,
+    ) -> Vec<Line> {
+        if let Some(lines) = &self.extension_chrome.header {
+            return crate::ui::render::component_lines_bounded(lines, theme, width, max.min(16));
+        }
+        if !show_startup_header(args) {
+            return Vec::new();
+        }
+        let version = env!("CARGO_PKG_VERSION");
+        let title = if fullscreen {
+            format!(
+                "pi v{version} · {} · /help",
+                self.session_name.as_deref().unwrap_or("new session")
+            )
+        } else {
+            format!("pi v{version} · /help")
+        };
+        vec![Line::themed(&title, theme, "accent")]
+    }
+
+    fn footer_lines(
+        &self,
+        args: &Cli,
+        theme: &Theme,
+        width: usize,
+        max: usize,
+        fullscreen: bool,
+    ) -> Vec<Line> {
+        if let Some(lines) = &self.extension_chrome.footer {
+            return crate::ui::render::component_lines_bounded(lines, theme, width, max.min(16));
+        }
+        let model = self.model_display(args);
+        let usage = if fullscreen {
+            let model_width = UnicodeWidthStr::width(model.as_str());
+            let usage = clip(
+                &format!("↑↓ 確定 {} tokens", self.tokens),
+                width.saturating_sub(model_width + 1),
+            );
+            let padding =
+                width.saturating_sub(UnicodeWidthStr::width(usage.as_str()) + model_width);
+            format!("{usage}{}{model}", " ".repeat(padding))
+        } else {
+            format!("↑↓ {} tokens · {model}", self.tokens)
+        };
+        vec![
+            Line::themed(&args.workspace.display().to_string(), theme, "dim"),
+            Line::themed(&usage, theme, "dim"),
+        ]
+    }
+
     fn widget_lines(
         &self,
         theme: &Theme,
@@ -1488,6 +1689,106 @@ impl View {
         }
     }
 
+    fn shows_agent_working_status(&self) -> bool {
+        !self.shell_running
+            && self.tree_navigation.is_none()
+            && !self.summarizing
+            && self.phase != Some("再試行待ち")
+    }
+
+    fn sync_working_animation(&mut self, busy: bool, now: Instant) {
+        let agent = self.shows_agent_working_status();
+        let working = &mut self.extension_chrome.working;
+        if busy && agent && !working.hidden && working.indicator.is_some() {
+            working.animation_started.get_or_insert(now);
+        } else {
+            working.animation_started = None;
+        }
+    }
+
+    fn working_status(&self, busy: bool, fullscreen: bool, now: Instant, width: usize) -> String {
+        if !busy {
+            return String::new();
+        }
+        let started = self.request_started.unwrap_or(now);
+        let elapsed = now.saturating_duration_since(started);
+        let working = &self.extension_chrome.working;
+        let agent = self.shows_agent_working_status();
+        if agent && working.hidden {
+            return String::new();
+        }
+        let message = if agent {
+            working
+                .message
+                .as_deref()
+                .unwrap_or_else(|| self.working_phase())
+        } else {
+            self.working_phase()
+        };
+        let frame = if agent && working.indicator.is_some() {
+            working.frame(now)
+        } else if fullscreen {
+            WORKING_FRAMES[(elapsed.as_millis() / 100 % WORKING_FRAMES.len() as u128) as usize]
+        } else {
+            ""
+        };
+        let separator = if frame.is_empty() { "" } else { " " };
+        let mut label = format!("{frame}{separator}{message}");
+        let suffix = format!("{:.1}s · Escで取消 ", elapsed.as_secs_f32());
+        if agent && (working.message.is_some() || working.indicator.is_some()) {
+            let suffix_width = UnicodeWidthStr::width(suffix.as_str());
+            if suffix_width > width {
+                return String::new();
+            }
+            let mut columns = width.saturating_sub(suffix_width + 1);
+            if columns == 0 {
+                return suffix;
+            }
+            if let Some((overflow, _)) = label.grapheme_indices(true).find(|(_, grapheme)| {
+                let size = UnicodeWidthStr::width(*grapheme);
+                if size > columns {
+                    return true;
+                }
+                columns -= size;
+                false
+            }) {
+                label.truncate(overflow);
+            }
+            if label.is_empty() {
+                return suffix;
+            }
+        }
+        format!("{label} {suffix}")
+    }
+
+    fn border_status(&self, busy: bool, fullscreen: bool, now: Instant, width: usize) -> String {
+        let mut other = self.draft_status();
+        other.push_str(&self.extension_status());
+        if fullscreen && let Some((message, _)) = &self.flash {
+            other.push_str(message);
+            other.push(' ');
+        }
+        let remaining = width.saturating_sub(UnicodeWidthStr::width(other.as_str()));
+        let working = self.working_status(busy, fullscreen, now, remaining);
+        format!("{working}{other}")
+    }
+
+    fn status_refresh_wait(
+        &self,
+        now: Instant,
+        last_frame: Instant,
+        frame_interval: Duration,
+    ) -> Duration {
+        let elapsed = now.saturating_duration_since(last_frame);
+        let normal = Duration::from_millis(100).saturating_sub(elapsed);
+        self.extension_chrome
+            .working
+            .next_frame_wait(now, last_frame)
+            .map_or(normal, |wait| {
+                normal.min(wait.max(frame_interval.saturating_sub(elapsed)))
+            })
+    }
+
     fn draft_status(&self) -> String {
         if let Some(task) = &self.remote_task {
             format!(
@@ -1515,6 +1816,18 @@ impl View {
             images: self.draft_images.clone(),
         }
     }
+    fn prepare_editor_paste(&mut self) {
+        if self.picker.as_ref().is_some_and(Picker::is_completion) {
+            self.picker = None;
+        }
+        self.history_index = None;
+    }
+
+    fn paste_editor_text(&mut self, text: &str) {
+        self.prepare_editor_paste();
+        self.editor.paste(text);
+    }
+
     fn paste_clipboard(&mut self, args: &Cli) {
         if self.clipboard.is_some() {
             return;
@@ -1542,15 +1855,14 @@ impl View {
             }
         };
         match result {
-            Ok(super::clipboard::Content::Text(text)) => self.editor.insert(&text),
+            Ok(super::clipboard::Content::Text(text)) => self.paste_editor_text(&text),
             Ok(super::clipboard::Content::Files(paths)) => {
                 match super::clipboard::file_text(
                     &paths,
                     self.editor.text.trim_start().starts_with('!'),
                 ) {
                     Ok(text) => {
-                        let before = self.editor.text[..self.editor.cursor].chars().next_back();
-                        let after = self.editor.text[self.editor.cursor..].chars().next();
+                        let (before, after) = self.editor.visible_neighbors();
                         let leading = if before.is_some_and(|value| !value.is_whitespace()) {
                             " "
                         } else {
@@ -1561,6 +1873,7 @@ impl View {
                         } else {
                             ""
                         };
+                        self.prepare_editor_paste();
                         self.editor.insert(&format!("{leading}{text}{trailing}"));
                     }
                     Err(error) => self.append(&error.to_string()),
@@ -1740,6 +2053,275 @@ impl View {
             }
         }
         self.invalidate_custom_message_renderings()
+    }
+
+    fn invalidate_tool_renderings(&mut self) -> bool {
+        self.tool_render_cursor = None;
+        self.tool_preview_cursor = None;
+        self.tool_render_attempted.clear();
+        self.tool_render_retry.clear();
+        let mut changed = false;
+        for (index, entry) in self.lines.iter_mut().enumerate() {
+            if let Entry::Tool { rendered, .. } = entry
+                && rendered.take().is_some()
+            {
+                self.regular.redraw |= index < self.regular.committed;
+                changed = true;
+            }
+        }
+        for tool in self.streaming_tools.values_mut() {
+            tool.attempted = None;
+            changed |= tool.rendered.take().is_some();
+        }
+        changed
+    }
+
+    fn prepare_tool_render(&mut self, worker: &mut Worker, args: &Cli) -> bool {
+        if !worker.tool_rendering {
+            return false;
+        }
+        let options = super::backend::ToolRenderOptions {
+            expanded: self.expand_tools,
+            show_images: self.graphics.enabled() && args.settings.show_terminal_images(),
+            output_pad: args.settings.output_padding(),
+            expand_key: self
+                .expand_key
+                .map(|key| crate::ui::keys::binding_hint(Some(key))),
+            width: crossterm::terminal::size()
+                .ok()
+                .map(|(width, _)| usize::from(width)),
+        };
+        let changed = if self.tool_render_options.as_ref() == Some(&options) {
+            false
+        } else {
+            self.tool_render_options = Some(options.clone());
+            self.invalidate_tool_renderings()
+        };
+        if self.tool_render_pending.is_some() || self.tool_preview_pending.is_some() {
+            return changed;
+        }
+        let preview = self
+            .streaming_tools
+            .iter()
+            .filter(|(_, tool)| {
+                !tool.id.is_empty()
+                    && !tool.name.is_empty()
+                    && tool.name != super::operation_models::TOOL
+                    && tool.has_argument_fragment
+                    && tool.attempted != Some(tool.revision)
+            })
+            .min_by_key(|&(&index, _)| {
+                (
+                    self.tool_preview_cursor
+                        .is_some_and(|cursor| index >= cursor),
+                    std::cmp::Reverse(index),
+                )
+            })
+            .map(|(&index, _)| index);
+        if let Some(index) = preview {
+            self.tool_preview_cursor = Some(index);
+            let tool = self
+                .streaming_tools
+                .get_mut(&index)
+                .expect("selected tool preview");
+            tool.attempted = Some(tool.revision);
+            let request = uuid::Uuid::new_v4();
+            if worker
+                .send(json!({
+                    "type":"render_tool_preview","id":request,"tool_name":tool.name,
+                    "tool_call_id":tool.id,"args":tool.preview,"options":options,
+                }))
+                .is_ok()
+            {
+                self.tool_preview_pending = Some(PendingToolPreview {
+                    request,
+                    index,
+                    generation: tool.generation,
+                    tool_name: tool.name.clone(),
+                    tool_call_id: tool.id.clone(),
+                    options,
+                });
+            }
+            return changed;
+        }
+        if let Some((index, operation, records)) = self.next_journal_tool_render() {
+            self.tool_render_cursor = Some(index);
+            self.tool_render_attempted
+                .insert(operation.clone(), records);
+            let retried = self.tool_render_retry.remove(&operation) == Some(records);
+            let request = uuid::Uuid::new_v4();
+            if worker
+                .send(json!({
+                    "type":"render_tool","id":request,"operation":operation,
+                    "records":records,"options":options,
+                    "partial":self.partial_tool_results.get(&operation),
+                }))
+                .is_ok()
+            {
+                self.tool_render_pending = Some(PendingToolRender {
+                    request,
+                    operation,
+                    records,
+                    retried,
+                });
+            }
+        }
+        changed
+    }
+
+    fn next_journal_tool_render(
+        &self,
+    ) -> Option<(usize, String, super::backend::ToolRenderRecords)> {
+        let len = self.lines.len();
+        let cursor = self.tool_render_cursor.unwrap_or(len).min(len);
+        self.lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                Entry::Tool {
+                    id,
+                    render_records: Some(records),
+                    ..
+                } if self.tool_render_attempted.get(id) != Some(records) => {
+                    Some((index, id, *records))
+                }
+                _ => None,
+            })
+            .min_by_key(|&(index, _, records)| {
+                let distance = if index < cursor {
+                    cursor - index - 1
+                } else {
+                    len - (index - cursor) - 1
+                };
+                (records.result.is_some(), distance)
+            })
+            .map(|(index, id, records)| (index, id.clone(), records))
+    }
+
+    fn receive_tool_render(&mut self, event: Value) -> bool {
+        if self.tool_preview_pending.as_ref().is_some_and(|pending| {
+            event["id"].as_str().and_then(|id| id.parse().ok()) == Some(pending.request)
+        }) {
+            let pending = self
+                .tool_preview_pending
+                .take()
+                .expect("matching tool preview");
+            let Some(tool) = self.streaming_tools.get_mut(&pending.index) else {
+                return false;
+            };
+            if tool.generation != pending.generation
+                || tool.name != pending.tool_name
+                || tool.id != pending.tool_call_id
+                || self.tool_render_options.as_ref() != Some(&pending.options)
+            {
+                return false;
+            }
+            if event["available"] == false {
+                return tool.rendered.take().is_some();
+            }
+            let Ok(rendering) =
+                serde_json::from_value::<pi_rs::RenderedTool>(event["rendered"].clone())
+            else {
+                return false;
+            };
+            tool.rendered = Some(std::sync::Arc::new(rendering));
+            return true;
+        }
+        if !self.tool_render_pending.as_ref().is_some_and(|pending| {
+            event["id"].as_str().and_then(|id| id.parse().ok()) == Some(pending.request)
+        }) {
+            return false;
+        }
+        let pending = self
+            .tool_render_pending
+            .take()
+            .expect("matching tool render");
+        if self.tool_render_attempted.get(&pending.operation) != Some(&pending.records) {
+            return false;
+        }
+        let Some((index, current_records, rendered)) = self
+            .lines
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .find_map(|(index, entry)| match entry {
+                Entry::Tool {
+                    id,
+                    render_records: Some(records),
+                    rendered,
+                    ..
+                } if id == &pending.operation
+                    && (records == &pending.records
+                        || (pending.records.progress != 0
+                            && records.result.is_none()
+                            && records.progress > pending.records.progress
+                            && records.started == pending.records.started
+                            && records.invocation == pending.records.invocation)) =>
+                {
+                    Some((index, *records, rendered))
+                }
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        if event["rendered"].is_null() {
+            if event["available"] == false && rendered.take().is_some() {
+                if index < self.regular.committed {
+                    self.regular.redraw = true;
+                }
+                return true;
+            }
+            if event["available"].is_null()
+                && !pending.retried
+                && current_records == pending.records
+            {
+                self.tool_render_attempted.remove(&pending.operation);
+                self.tool_render_retry
+                    .insert(pending.operation, pending.records);
+            }
+            return false;
+        }
+        let Ok(rendering) =
+            serde_json::from_value::<pi_rs::RenderedTool>(event["rendered"].clone())
+        else {
+            return false;
+        };
+        *rendered = Some(std::sync::Arc::new(rendering));
+        if index < self.regular.committed {
+            self.custom_render_redraw_at
+                .get_or_insert_with(|| Instant::now() + Duration::from_millis(40));
+        }
+        true
+    }
+
+    fn track_tool_render(&mut self, operation: &str, record: u64, started: bool) {
+        if !started {
+            self.partial_tool_results.remove(operation);
+        }
+        for (index, entry) in self.lines.iter_mut().enumerate().rev() {
+            let Entry::Tool {
+                id,
+                render_records: Some(records),
+                rendered,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            if id != operation {
+                continue;
+            }
+            if started {
+                records.started = Some(record);
+            } else {
+                records.result = Some(record);
+            }
+            if rendered.take().is_some() && index < self.regular.committed {
+                self.regular.redraw = true;
+            }
+            break;
+        }
     }
 
     fn clear_markdown_renderings(&mut self) -> bool {
@@ -1935,6 +2517,50 @@ impl View {
             .filter(|cached| cached.original == *text)
             .cloned()
             .unwrap_or_else(|| text.clone().into())
+    }
+
+    fn render_tool_progress(&mut self, event: &Value) -> bool {
+        let (Some(call_id), Some(name)) =
+            (event["toolCallId"].as_str(), event["toolName"].as_str())
+        else {
+            return false;
+        };
+        let mut matches = self.lines.iter_mut().rev().filter(|entry| {
+            matches!(entry, Entry::Tool {
+                name: tool_name, render_call_id: Some(id), render_records: Some(records), ..
+            } if tool_name == name && id == call_id && records.started.is_some() && records.result.is_none())
+        });
+        let Some(Entry::Tool {
+            id,
+            render_records: Some(records),
+            output,
+            parts,
+            ..
+        }) = matches.next()
+        else {
+            return false;
+        };
+        if matches.next().is_some() {
+            return true;
+        }
+        let update = &event["partialResult"];
+        let Some(blocks) = update["content"].as_array() else {
+            return true;
+        };
+        *output = crate::ui::render::strip_shell_ansi(&display_tool_blocks(blocks));
+        *parts = tool_result_parts(&update["content"], self.graphics.enabled());
+        records.progress = records.progress.wrapping_add(1);
+        self.partial_tool_results.insert(
+            id.clone(),
+            pi_rs::ToolRenderResult {
+                content: update["content"].clone(),
+                details: update.get("details").cloned(),
+                is_partial: true,
+                is_error: false,
+                duration_ms: None,
+            },
+        );
+        true
     }
 
     fn invalidate_custom_message_renderings(&mut self) -> bool {
@@ -2518,6 +3144,9 @@ impl View {
 
     fn restore(&mut self, args: &Cli) -> Result<()> {
         let session = Session::open(&args.session)?;
+        self.restore_session(args, &session)
+    }
+    fn restore_session(&mut self, args: &Cli, session: &Session) -> Result<()> {
         if session.host_binding().is_some() {
             return Err(Error::Session(
                 "a managed session must be opened by its host".into(),
@@ -2533,6 +3162,11 @@ impl View {
         self.custom_render_redraw_at = None;
         // Keep an in-flight request as the only one until its response. The
         // cleared attempted set prevents it from updating the restored rows.
+        self.tool_render_cursor = None;
+        self.tool_preview_cursor = None;
+        self.tool_render_attempted.clear();
+        self.tool_render_retry.clear();
+        self.partial_tool_results.clear();
         self.custom_render_attempted.clear();
         self.viewport.follow();
         self.search = None;
@@ -2637,6 +3271,9 @@ impl View {
                         finished: false,
                         parts: Vec::new(),
                         numbered_diff: false,
+                        render_records: None,
+                        render_call_id: None,
+                        rendered: None,
                     });
                     self.finish_tool(&id, &outcome);
                 }
@@ -2657,6 +3294,9 @@ impl View {
                         finished: true,
                         parts: Vec::new(),
                         numbered_diff: false,
+                        render_records: None,
+                        render_call_id: None,
+                        rendered: None,
                     });
                 }
                 pi_rs::Event::UserImages { images } => {
@@ -2709,10 +3349,15 @@ impl View {
                             )));
                     }
                     for invocation in invocations {
-                        self.add_tool(invocation);
+                        self.add_tool(invocation, Some(record.id));
                     }
                 }
-                pi_rs::Event::ToolPlanned { invocation, .. } => self.add_tool(invocation),
+                pi_rs::Event::ToolPlanned { invocation, .. } => {
+                    self.add_tool(invocation, Some(record.id))
+                }
+                pi_rs::Event::ToolStarted { operation_id, .. } => {
+                    self.track_tool_render(&operation_id.to_string(), record.id, true);
+                }
                 pi_rs::Event::ToolFinished {
                     operation_id,
                     outcome,
@@ -2722,11 +3367,12 @@ impl View {
                     operation_id,
                     outcome,
                 } => {
+                    self.track_tool_render(&operation_id.to_string(), record.id, false);
                     self.finish_tool(&operation_id.to_string(), outcome);
                 }
                 _ => {}
             }
-            self.add_summary(record, Some(&session));
+            self.add_summary(record, Some(session));
             self.show_summary_billing(record, records, args);
             self.observe_cache(record, args);
             self.observe_thinking_drop(&record.event);
@@ -2763,7 +3409,7 @@ impl View {
             );
         }
     }
-    fn add_tool(&mut self, invocation: &pi_rs::Invocation) {
+    fn add_tool(&mut self, invocation: &pi_rs::Invocation, record: Option<u64>) {
         if invocation.call.name == super::operation_models::TOOL {
             self.model_operations
                 .insert(invocation.operation_id.to_string());
@@ -2779,6 +3425,14 @@ impl View {
             finished: false,
             parts: Vec::new(),
             numbered_diff: false,
+            render_records: record.map(|invocation| super::backend::ToolRenderRecords {
+                invocation,
+                started: None,
+                result: None,
+                progress: 0,
+            }),
+            render_call_id: Some(invocation.call.id.clone()),
+            rendered: None,
         });
     }
     fn finish_tool(&mut self, operation: &str, outcome: &pi_rs::Outcome) {
@@ -2788,35 +3442,12 @@ impl View {
             }
             return;
         }
-        let mut rendered_parts = if self.graphics.enabled() {
-            match outcome {
-                pi_rs::Outcome::Structured { data, .. }
-                | pi_rs::Outcome::StructuredWithDetails { data, .. } => data["content"]
-                    .as_array()
-                    .filter(|blocks| blocks.iter().any(|block| block["type"] == "image"))
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|value| match value["type"].as_str() {
-                        Some("text") => value["text"]
-                            .as_str()
-                            .map(|text| ToolPart::Text(text.into())),
-                        Some("image") => {
-                            let image =
-                                serde_json::from_value::<pi_rs::ImageContent>(value.clone())
-                                    .ok()
-                                    .and_then(|content| InlineImage::decode(&content));
-                            Some(match image {
-                                Some(image) => ToolPart::Image(image),
-                                None => ToolPart::Text("[image unavailable]".into()),
-                            })
-                        }
-                        _ => None,
-                    })
-                    .collect(),
-                _ => Vec::new(),
+        let mut rendered_parts = match outcome {
+            pi_rs::Outcome::Structured { data, .. }
+            | pi_rs::Outcome::StructuredWithDetails { data, .. } => {
+                tool_result_parts(&data["content"], self.graphics.enabled())
             }
-        } else {
-            Vec::new()
+            _ => Vec::new(),
         };
         if let Some(Entry::Tool {
             output,
@@ -2938,6 +3569,9 @@ impl View {
                     finished: false,
                     parts: Vec::new(),
                     numbered_diff: false,
+                    render_records: None,
+render_call_id: None,
+                    rendered: None,
                 });
             }
             Some("bash_execution_update") => {
@@ -2983,11 +3617,25 @@ impl View {
                 self.text_items.clear();
                 self.streaming_tools.clear();
             }
+            Some("tool_execution_update") => {
+                if !self.render_tool_progress(value) {
+                    self.update_tool_progress(value);
+                }
+            }
             Some("tool_call_delta") if !self.summarizing => {
                 if let Ok(delta) = serde_json::from_value::<pi_rs::ToolCallDelta>(value["toolCallDelta"].clone()) {
-                    let tool = self.streaming_tools.entry(delta.index).or_default();
-                    tool.name.push_str(&delta.name);
+                    let tool = self.streaming_tools.entry(delta.index).or_insert_with(|| StreamingTool {
+                        generation: uuid::Uuid::new_v4(),
+                        ..Default::default()
+                    });
+                    if !delta.id.is_empty() || !delta.name.is_empty() {
+                        tool.id.push_str(&delta.id);
+                        tool.name.push_str(&delta.name);
+                        tool.rendered = None;
+                    }
+                    tool.revision = tool.revision.wrapping_add(1);
                     if !delta.arguments.is_empty() {
+                        tool.has_argument_fragment = true;
                         tool.preview = tool.arguments.append(&delta.arguments);
                     }
                     self.phase = Some("ツール呼出し準備中");
@@ -3030,7 +3678,6 @@ impl View {
                     append_indexed(&mut self.text_items, &mut self.streaming, &mut self.text_items_consistent, index, delta);
                 } else { self.streaming.push_str(delta); self.text_items_consistent = false; }
             }
-            Some("tool_execution_update") => self.update_tool_progress(value),
             Some("mcp_server") => self.append(&format!(
                 "MCP {} · {} · {}",
                 value["name"].as_str().unwrap_or(""),
@@ -3101,6 +3748,11 @@ impl View {
                                     finished: false,
                                     parts: Vec::new(),
                                     numbered_diff: false,
+                                    render_records: value["record"]["id"].as_u64().map(|invocation| {
+                                        super::backend::ToolRenderRecords { invocation, started: None, result: None, progress: 0 }
+                                    }),
+                                    render_call_id: call["call"]["id"].as_str().map(str::to_owned),
+                                    rendered: None,
                                 });
                             }
                         }
@@ -3109,11 +3761,19 @@ impl View {
                         self.phase = Some("ツール実行中");
                         if let Ok(invocation) = serde_json::from_value(event["invocation"].clone())
                         {
-                            self.add_tool(&invocation);
+                            self.add_tool(&invocation, value["record"]["id"].as_u64());
+                        }
+                    }
+                    Some("tool_started") => {
+                        if let Some(record) = value["record"]["id"].as_u64() {
+                            self.track_tool_render(event["operation_id"].as_str().unwrap_or_default(), record, true);
                         }
                     }
                     Some("tool_finished" | "tool_reconciled") => {
                         self.phase = Some("処理を継続中");
+                        if let Some(record) = value["record"]["id"].as_u64() {
+                            self.track_tool_render(event["operation_id"].as_str().unwrap_or_default(), record, false);
+                        }
                         if let Ok(outcome) = serde_json::from_value(event["outcome"].clone()) {
                             self.finish_tool(
                                 event["operation_id"].as_str().unwrap_or_default(),
@@ -3155,6 +3815,7 @@ impl View {
         self.thinking_items.clear();
         self.text_items.clear();
         self.streaming_tools.clear();
+        self.partial_tool_results.clear();
         if !self.thinking.is_empty() {
             self.lines.push(Entry::Thinking {
                 text: std::mem::take(&mut self.thinking).into(),
@@ -3390,14 +4051,38 @@ impl View {
         let hardware_cursor = args.settings.show_hardware_cursor();
         let (prompt, cursor_row, column) = self.prompt_rows(args, width, height);
         let prompt_height = prompt.len();
+        let modal = self.picker.is_some() || self.dialog().is_some();
+        let min_body = if modal { 3 } else { 1 };
+        let chrome_space = height.saturating_sub(prompt_height + 2 + min_body);
+        let footer_limit = chrome_space.saturating_sub(usize::from(!modal));
+        let mut footer = self.footer_lines(args, theme, width, footer_limit, true);
+        if modal {
+            footer.truncate(footer_limit);
+        }
+        let header_limit = chrome_space.saturating_sub(footer.len());
+        let mut header = self.header_lines(args, theme, width, header_limit, true);
+        if modal {
+            header.truncate(header_limit);
+        }
+        let header_rows = header.len();
+        if self.fullscreen_header_rows != header_rows
+            && let Some(picker) = &mut self.picker
+        {
+            picker.clear_mouse_press();
+        }
+        self.fullscreen_header_rows = header_rows;
+        let available = height.saturating_sub(prompt_height + 2 + header_rows + footer.len());
         let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
-        below.truncate(height.saturating_sub(prompt_height + 6));
+        below.truncate(
+            height
+                .saturating_sub(prompt_height + 4 + footer.len())
+                .min(available.saturating_sub(min_body)),
+        );
         if self.dialog().is_some() {
             below.clear();
         }
         let output = self.transcript_options(args, false);
-        let header_rows = usize::from(show_startup_header(args));
-        let body_height = height.saturating_sub(prompt_height + 4 + header_rows + below.len());
+        let body_height = available.saturating_sub(below.len());
         let mut lines = Vec::new();
         let mut prompts = Vec::new();
         let mut panels = Vec::new();
@@ -3425,7 +4110,7 @@ impl View {
                         .count();
                     panels.push((start..start + panel_height, TranscriptPanel::Skill(index)));
                 }
-                Entry::Thinking { .. } => panels.push((
+                Entry::Thinking { .. } if lines.len() > start => panels.push((
                     start..lines.len().saturating_sub(1),
                     TranscriptPanel::Thinking(index),
                 )),
@@ -3447,10 +4132,12 @@ impl View {
                     self.transcript_options(args, true),
                 ),
             );
-            panels.push((
-                start..lines.len().saturating_sub(1),
-                TranscriptPanel::StreamingThinking,
-            ));
+            if lines.len() > start {
+                panels.push((
+                    start..lines.len().saturating_sub(1),
+                    TranscriptPanel::StreamingThinking,
+                ));
+            }
         }
         if !self.streaming.is_empty() {
             lines.extend(Entry::Assistant(self.streaming_markdown(false)).render(
@@ -3488,7 +4175,6 @@ impl View {
         {
             line.mark_cursor(column);
         }
-        let modal = self.picker.is_some() || self.dialog().is_some();
         let start = if modal {
             0
         } else {
@@ -3547,42 +4233,12 @@ impl View {
             !cfg!(windows),
             synchronized_updates_supported(),
         )?;
-        let elapsed = self
-            .request_started
-            .map(|start| start.elapsed())
-            .unwrap_or_default();
-        let status = if busy {
-            let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            format!(
-                "{} {} {:.1}s · Escで取消 ",
-                spinner[(elapsed.as_millis() / 100) as usize % spinner.len()],
-                self.working_phase(),
-                elapsed.as_secs_f32()
-            )
-        } else {
-            String::new()
-        };
-        let status = format!(
-            "{status}{}{}{}",
-            self.draft_status(),
-            self.extension_status(),
-            self.flash
-                .as_ref()
-                .map_or(String::new(), |(message, _)| format!("{message} ")),
-        );
+        let status = self.border_status(busy, true, Instant::now(), width);
         queue!(out, Hide)?;
         self.graphics.clear_fullscreen_frame(&mut out)?;
-        if header_rows != 0 {
-            Line::themed(
-                &format!(
-                    "pi v{} · {} · /help",
-                    env!("CARGO_PKG_VERSION"),
-                    self.session_name.as_deref().unwrap_or("new session")
-                ),
-                theme,
-                "accent",
-            )
-            .draw(&mut out, width)?;
+        for (row, line) in header.iter().enumerate() {
+            queue!(out, MoveTo(0, row as u16))?;
+            line.draw(&mut out, width)?;
         }
         for (row, line) in lines[start..end].iter().enumerate() {
             queue!(out, MoveTo(0, (row + header_rows) as u16))?;
@@ -3625,7 +4281,7 @@ impl View {
                 Line::themed(glyph, theme, role).draw(&mut out, 1)?;
             }
         }
-        let border_row = height - prompt_height - 4 - below.len();
+        let border_row = height - prompt_height - 2 - footer.len() - below.len();
         queue!(out, MoveTo(0, border_row as u16))?;
         Line::themed(
             &format!(
@@ -3652,22 +4308,13 @@ impl View {
             )?;
             line.draw(&mut out, width)?;
         }
-        queue!(out, MoveTo(0, (height - 3) as u16))?;
+        let footer_row = height - footer.len();
+        queue!(out, MoveTo(0, (footer_row - 1) as u16))?;
         Line::themed(&"─".repeat(width), theme, "border").draw(&mut out, width)?;
-        queue!(out, MoveTo(0, (height - 2) as u16))?;
-        Line::themed(&args.workspace.display().to_string(), theme, "dim").draw(&mut out, width)?;
-        queue!(out, MoveTo(0, (height - 1) as u16))?;
-        let model = self.model_display(args);
-        let model_width = UnicodeWidthStr::width(model.as_str());
-        let usage = format!("↑↓ 確定 {} tokens", self.tokens);
-        let usage = clip(&usage, width.saturating_sub(model_width + 1));
-        let padding = width.saturating_sub(UnicodeWidthStr::width(usage.as_str()) + model_width);
-        Line::themed(
-            &format!("{usage}{}{model}", " ".repeat(padding)),
-            theme,
-            "dim",
-        )
-        .draw(&mut out, width)?;
+        for (row, line) in footer.iter().enumerate() {
+            queue!(out, MoveTo(0, (footer_row + row) as u16))?;
+            line.draw(&mut out, width)?;
+        }
         if let Some((rows, columns, overlay, cursor_row, cursor_column)) = search_overlay {
             let left = columns.start;
             let top = header_rows + rows.start;
@@ -3739,8 +4386,16 @@ impl View {
         Ok(())
     }
 
-    fn transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions {
+    fn transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions<'_> {
         TranscriptOptions {
+            hidden_thinking_label: self.extension_chrome.hidden_thinking_label.as_deref(),
+            ..self.base_transcript_options(args, streaming)
+        }
+    }
+
+    fn base_transcript_options(&self, args: &Cli, streaming: bool) -> TranscriptOptions<'static> {
+        TranscriptOptions {
+            hidden_thinking_label: None,
             image_width: (self.graphics.enabled() && args.settings.show_terminal_images())
                 .then(|| args.settings.terminal_image_width()),
             padding: args.settings.output_padding(),
@@ -3866,7 +4521,10 @@ impl View {
 
     fn replay_transcript(&mut self, args: &Cli, theme: &Theme) -> Result<()> {
         self.graphics.reset();
-        let output = self.transcript_options(args, false);
+        let output = TranscriptOptions {
+            hidden_thinking_label: self.extension_chrome.hidden_thinking_label.as_deref(),
+            ..self.base_transcript_options(args, false)
+        };
         let width = usize::from(terminal::size()?.0.max(1));
         let mut out = std::io::stdout().lock();
         queue!(out, MoveToColumn(0), Print("\r\n"))?;
@@ -3887,7 +4545,7 @@ impl View {
         let width = usize::from(width.max(1));
         let height = usize::from(height.max(7));
         let hardware_cursor = args.settings.show_hardware_cursor();
-        let output = self.transcript_options(args, false);
+        let base_output = self.base_transcript_options(args, false);
         let layout = RegularLayout {
             width,
             height,
@@ -3895,7 +4553,7 @@ impl View {
             theme: theme.clone(),
             expand_tools: self.expand_tools,
             hide_thinking: self.hide_thinking,
-            output,
+            output: base_output,
         };
         let redraw = self.regular.layout.is_some()
             && (self.regular.redraw
@@ -3908,15 +4566,26 @@ impl View {
         }
         let (prompt, cursor, column) = self.prompt_rows(args, width, height);
         let prompt_height = prompt.len();
+        let modal = self.picker.is_some() || self.dialog().is_some();
+        let min_body = if modal { 3 } else { 1 };
+        let footer_limit = height.saturating_sub(prompt_height + 2 + min_body);
+        let mut footer = self.footer_lines(args, theme, width, footer_limit, false);
+        if modal {
+            footer.truncate(footer_limit);
+        }
+        let editor_region = prompt_height + 2 + footer.len();
         let mut below = self.widget_lines(theme, width, pi_rs::WidgetPlacement::BelowEditor);
-        below.truncate(height.saturating_sub(prompt_height + 6));
+        below.truncate(height.saturating_sub(editor_region + min_body.max(2)));
         if self.dialog().is_some() {
             below.clear();
         }
+        let output = TranscriptOptions {
+            hidden_thinking_label: self.extension_chrome.hidden_thinking_label.as_deref(),
+            ..base_output
+        };
         let render_entry = |entry: &Entry| {
             entry.render(theme, width, self.expand_tools, !self.hide_thinking, output)
         };
-        let modal = self.picker.is_some() || self.dialog().is_some();
         let committing = !busy && !modal;
         // A trailing status can still be replaced by another status.
         let trailing_status = matches!(self.lines.last(), Some(Entry::Status(_)));
@@ -3962,13 +4631,13 @@ impl View {
                 active = picker.render_in_terminal(
                     theme,
                     width,
-                    height - prompt_height - 4 - below.len(),
+                    height - editor_region - below.len(),
                     height,
                     keys,
                 );
             }
         }
-        let dialog_height = height - prompt_height - 4 - below.len();
+        let dialog_height = height - editor_region - below.len();
         let modal_cursor = if let Some(dialog) = self.dialog() {
             active = dialog.render(theme, width, dialog_height, keys);
             dialog.cursor(width, dialog_height)
@@ -3990,7 +4659,7 @@ impl View {
         {
             line.mark_cursor(column);
         }
-        let region_height = active.len() + prompt_height + 4 + below.len();
+        let region_height = active.len() + editor_region + below.len();
         let rows_to_match = self
             .regular
             .max_rows
@@ -4021,14 +4690,11 @@ impl View {
             )?;
         } else {
             queue!(out, Print("\r\n"))?;
-            if (self.regular.committed == 0 || redraw) && show_startup_header(args) {
-                Line::themed(
-                    &format!("pi v{} · /help", env!("CARGO_PKG_VERSION")),
-                    theme,
-                    "accent",
-                )
-                .draw(&mut out, width)?;
-                queue!(out, Print("\r\n"))?;
+            if self.regular.committed == 0 || redraw {
+                for line in self.header_lines(args, theme, width, 16, false) {
+                    line.draw(&mut out, width)?;
+                    queue!(out, Print("\r\n"))?;
+                }
             }
         }
         if redraw {
@@ -4070,16 +4736,7 @@ impl View {
             )?;
             queue!(out, Print("\r\n"))?;
         }
-        let elapsed = self
-            .request_started
-            .map(|start| start.elapsed().as_secs_f32())
-            .unwrap_or_default();
-        let status = if busy {
-            format!("{} {elapsed:.1}s · Escで取消 ", self.working_phase())
-        } else {
-            String::new()
-        };
-        let status = format!("{status}{}{}", self.draft_status(), self.extension_status());
+        let status = self.border_status(busy, false, Instant::now(), width);
         Line::themed(
             &format!(
                 "{}{}",
@@ -4104,19 +4761,11 @@ impl View {
             line.draw(&mut out, width)?;
             queue!(out, Print("\r\n"))?;
         }
-        for line in [
-            Line::themed(&"─".repeat(width), theme, "border"),
-            Line::themed(&args.workspace.display().to_string(), theme, "dim"),
-        ] {
-            line.draw(&mut out, width)?;
+        Line::themed(&"─".repeat(width), theme, "border").draw(&mut out, width)?;
+        for line in &footer {
             queue!(out, Print("\r\n"))?;
+            line.draw(&mut out, width)?;
         }
-        Line::themed(
-            &format!("↑↓ {} tokens · {}", self.tokens, self.model_display(args)),
-            theme,
-            "dim",
-        )
-        .draw(&mut out, width)?;
         self.regular.cursor_row = active.len() + 1 + cursor;
         self.regular.region_height = region_height;
         let (column, show_cursor) = if let Some((row, column)) = modal_cursor {
@@ -4144,6 +4793,45 @@ impl View {
     }
 }
 
+fn tool_result_parts(content: &Value, images: bool) -> Vec<ToolPart> {
+    content
+        .as_array()
+        .filter(|blocks| images && blocks.iter().any(|block| block["type"] == "image"))
+        .into_iter()
+        .flatten()
+        .filter_map(|value| match value["type"].as_str() {
+            Some("text") => value["text"]
+                .as_str()
+                .map(|text| ToolPart::Text(text.into())),
+            Some("image") => {
+                let image = serde_json::from_value::<pi_rs::ImageContent>(value.clone())
+                    .ok()
+                    .and_then(|content| InlineImage::decode(&content));
+                Some(match image {
+                    Some(image) => ToolPart::Image(image),
+                    None => ToolPart::Text("[image unavailable]".into()),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn display_tool_blocks(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block["type"].as_str() {
+            Some("text") => block["text"].as_str().map(str::to_owned),
+            Some("image") => Some(format!(
+                "[image · {}]",
+                block["mimeType"].as_str().unwrap_or("image")
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
     if let pi_rs::Outcome::SucceededWithDetails { output, details }
     | pi_rs::Outcome::TextResult {
@@ -4159,23 +4847,12 @@ fn display_tool_result(outcome: &pi_rs::Outcome) -> String {
     | pi_rs::Outcome::StructuredWithDetails { data, .. } = outcome
         && let Some(blocks) = data["content"].as_array()
     {
-        return blocks
-            .iter()
-            .filter_map(|block| match block["type"].as_str() {
-                Some("text") => block["text"].as_str().map(str::to_owned),
-                Some("image") => Some(format!(
-                    "[image · {}]",
-                    block["mimeType"].as_str().unwrap_or("image")
-                )),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        return display_tool_blocks(blocks);
     }
     outcome.tool_content()
 }
 
-const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>  /debug\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. Ctrl+PageUp/PageDown moves through the editor. Up/Down recall prompts at the editor boundaries.\nFullscreen: PageUp/PageDown scroll. See /hotkeys for transcript search and navigation.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
+const HELP: &str = "/help  /new  /resume [path]  /session  /model <name>  /scoped-models  /compact  /tree  /checkout <id>  /quit\n/login [provider]  /logout [provider]\n/extensions  /extension <id> <command> [arguments]\n/context-edit <id> <text>  /context-delete <id>  /debug  /changelog\n/notes [text]  /todo [JSON list]  /plan <text|accept|discard>  /review <task>\nShift+Enter inserts a newline. Ctrl+PageUp/PageDown moves through the editor. Up/Down recall prompts at the editor boundaries.\nFullscreen: PageUp/PageDown scroll. See /hotkeys for transcript search and navigation.\nEnter while working steers the next model response. Alt+Enter queues a follow-up.";
 
 fn slash(
     input: &str,
@@ -4327,6 +5004,7 @@ fn slash(
             args.session = destination;
             args.restore_session_model(&Session::open(&args.session)?)?;
             view.restore(args)?;
+            view.clear_extension_chrome();
             args.session_transition = Some(pi_rs::SessionStartReason::Fork);
             if let Some(input) = input {
                 view.editor.replace(input);
@@ -4722,6 +5400,7 @@ fn slash(
             }
             initialize_session(&mut next)?;
             view.restore(&next)?;
+            view.clear_extension_chrome();
             next.session_transition = Some(pi_rs::SessionStartReason::New);
             *args = next;
         }
@@ -5262,7 +5941,18 @@ pub(super) async fn run(
         hide_thinking: args.settings.boolean("hideThinkingBlock").unwrap_or(false),
         ..View::default()
     };
-    view.restore(&args)?;
+    {
+        let session = Session::open(&args.session)?;
+        view.restore_session(&args, &session)?;
+        if session.current_messages().is_empty()
+            && let Ok(Some(notice)) = changelog::startup(
+                &super::config::agent_dir().join("pi-rs-changelog.json"),
+                args.settings.boolean("collapseChangelog").unwrap_or(false),
+            )
+        {
+            view.append_entry(Entry::Changelog(notice));
+        }
+    }
     view.resources = initial_resources;
     if args.trust_pending {
         slash("/trust", &mut args, &mut view, None)?;
@@ -5394,14 +6084,6 @@ pub(super) async fn run(
                 dirty = true;
             }
         }
-        if !is_busy(&worker) {
-            for event in std::mem::take(&mut args.selection_events) {
-                if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
-                    view.append(&format!("Extension selection notification: {error}"));
-                    dirty = true;
-                }
-            }
-        }
         if let Some(terminal) = &mut _terminal {
             let alternate = args.tui_mode != Some(TuiMode::Regular);
             if terminal.alternate != alternate {
@@ -5457,6 +6139,18 @@ pub(super) async fn run(
                 dirty |= view.invalidate_custom_message_renderings();
                 dirty |= view.clear_markdown_renderings();
             }
+            if old.tool_rendering {
+                if !old.message_renderer_types.is_empty() || !view.resources.extensions.is_empty() {
+                    startup_extensions = None;
+                }
+                view.tool_render_pending = None;
+                view.tool_preview_pending = None;
+                dirty |= view.invalidate_tool_renderings();
+            }
+            if view.clear_extension_chrome() {
+                startup_extensions = None;
+                dirty = true;
+            }
             for warning in old.take_pending_warnings() {
                 view.append(&warning);
                 dirty = true;
@@ -5474,6 +6168,14 @@ pub(super) async fn run(
                     });
             }
             view.pending_thinking = None;
+        }
+        if !is_busy(&worker) {
+            for event in std::mem::take(&mut args.selection_events) {
+                if let Err(error) = Worker::notify_selection(&mut worker, &args, &event) {
+                    view.append(&format!("Extension selection notification: {error}"));
+                    dirty = true;
+                }
+            }
         }
         if (view.picker.is_none()
             || view
@@ -5647,6 +6349,14 @@ pub(super) async fn run(
                     active.markdown_transformers = value["markdown_transformers"] == true;
                     dirty |= view.clear_markdown_renderings();
                     dirty |= view.refresh_transcript_extension_renderers();
+                    active.tool_rendering = value["tool_rendering"] == true;
+                    view.tool_render_pending = None;
+                    view.tool_preview_pending = None;
+                    dirty |= view.invalidate_tool_renderings();
+                }
+                if value["type"] == "tool_rendered" {
+                    dirty |= view.receive_tool_render(value);
+                    continue;
                 }
                 if value["type"] == "transcript_extension_rendered" {
                     dirty |= view.receive_transcript_extension_render(value);
@@ -5793,12 +6503,16 @@ pub(super) async fn run(
                 dirty = true;
             }
             dirty |= view.prepare_transcript_extension_render(active, &args);
+            dirty |= view.prepare_tool_render(active, &args);
             view.prepare_markdown_transform(active, &args);
             if let Some(status) = active.child.try_wait()? {
                 let mut finished = worker.take().expect("active worker");
                 view.custom_render_pending = None;
                 view.clear_markdown_renderings();
                 view.invalidate_custom_message_renderings();
+                view.tool_render_pending = None;
+                view.tool_preview_pending = None;
+                view.invalidate_tool_renderings();
                 for reader in finished.readers.drain(..) {
                     let _ = reader.join();
                 }
@@ -5828,6 +6542,7 @@ pub(super) async fn run(
                 {
                     view.append(&error.to_string());
                 }
+                view.clear_extension_chrome();
                 if !status.success() {
                     view.append(&format!(
                         "Run stopped ({status}). Use /session to inspect its saved journal."
@@ -6044,11 +6759,17 @@ pub(super) async fn run(
         if let Some(title) = view.pending_terminal_title.take() {
             execute!(std::io::stdout(), crossterm::terminal::SetTitle(title))?;
         }
+        let busy = is_busy(&worker);
+        let now = Instant::now();
+        view.sync_working_animation(busy, now);
+        let refresh_status = busy || view.remote_task.is_some() || view.pending_share.is_some();
         if (dirty && last_frame.elapsed() >= frame_interval)
-            || ((is_busy(&worker) || view.remote_task.is_some() || view.pending_share.is_some())
-                && last_frame.elapsed() >= Duration::from_millis(100))
+            || (refresh_status
+                && view
+                    .status_refresh_wait(now, last_frame, frame_interval)
+                    .is_zero())
         {
-            view.draw(&args, &theme, is_busy(&worker), &keys)?;
+            view.draw(&args, &theme, busy, &keys)?;
             dirty = false;
             last_frame = Instant::now();
         }
@@ -6069,6 +6790,11 @@ pub(super) async fn run(
             frame_interval.saturating_sub(last_frame.elapsed())
         } else {
             Duration::from_millis(40)
+        };
+        let input_wait = if refresh_status {
+            input_wait.min(view.status_refresh_wait(Instant::now(), last_frame, frame_interval))
+        } else {
+            input_wait
         };
         let picker_title = view.picker.as_ref().map(|picker| picker.title.as_str());
         let loading = picker_title == Some("Loading thinking levels");
@@ -6280,7 +7006,7 @@ pub(super) async fn run(
                     && view.picker.is_some() =>
             {
                 let mut picker = view.picker.take().expect("picker checked above");
-                let header_rows = usize::from(show_startup_header(&args));
+                let header_rows = view.fullscreen_header_rows;
                 let action = if usize::from(mouse.column) < view.fullscreen_width
                     && let Some(row) = usize::from(mouse.row).checked_sub(header_rows)
                 {
@@ -6359,10 +7085,12 @@ pub(super) async fn run(
                     dialog.paste(&text);
                 } else if let Some(search) = &mut view.search {
                     search.paste(&text);
-                } else if let Some(picker) = &mut view.picker {
+                } else if let Some(picker) = &mut view.picker
+                    && !picker.is_completion()
+                {
                     picker.paste(&text);
                 } else {
-                    view.editor.insert(&text);
+                    view.paste_editor_text(&text);
                 }
                 dirty = true;
             }
@@ -7242,6 +7970,8 @@ pub(super) async fn run(
                             view.append(&keys.describe());
                         } else if input.trim() == "/debug" {
                             view.show_debug_log(&args, &theme);
+                        } else if input.trim() == "/changelog" {
+                            view.append_entry(Entry::Changelog(changelog::full()));
                         } else if input.trim() == "/settings" {
                             view.picker = Some(Picker::new(
                                 "Settings",
@@ -7300,6 +8030,7 @@ pub(super) async fn run(
                             view.dialogs.clear();
                             view.ui_status.clear();
                             view.widgets.clear();
+                            view.clear_extension_chrome();
                             args.settings =
                                 args.settings.reload_latest(&args.workspace, args.trusted)?;
                             for warning in args.settings.diagnostics() {
@@ -9030,6 +9761,16 @@ fn settings_items(args: &Cli, view: &View, worker: Option<&Worker>) -> Vec<Item>
             ),
         },
         Item {
+            label: format!(
+                "Collapse changelog · {}",
+                args.settings.boolean("collapseChangelog").unwrap_or(false)
+            ),
+            selection: Selection::Setting(
+                "collapseChangelog".into(),
+                json!(!args.settings.boolean("collapseChangelog").unwrap_or(false)),
+            ),
+        },
+        Item {
             label: format!("Quiet startup · {quiet_label}"),
             selection: Selection::Setting(
                 "quietStartup".into(),
@@ -9654,6 +10395,7 @@ fn apply_session(args: &mut Cli, view: &mut View, mut next: Cli) -> Result<()> {
         initialize_session(&mut next)?;
     }
     view.restore(&next)?;
+    view.clear_extension_chrome();
     for warning in next.settings.diagnostics() {
         view.append(warning);
     }
@@ -10242,13 +10984,16 @@ fn complete_input(args: &Cli, view: &mut View) {
         Prompt(Option<String>),
         Other,
     }
-    let prefix = &view.editor.text[..view.editor.cursor];
-    let start = prefix
+    let Some((boundary, prefix)) = view.editor.completion_prefix() else {
+        return;
+    };
+    let start_in_prefix = prefix
         .char_indices()
         .rev()
         .find(|(_, character)| character.is_whitespace())
         .map_or(0, |(index, character)| index + character.len_utf8());
-    let word = &prefix[start..];
+    let word = &prefix[start_in_prefix..];
+    let start = boundary + start_in_prefix;
     let mut candidates = if start == 0 && word.starts_with('/') {
         [
             "/help",
@@ -10273,6 +11018,7 @@ fn complete_input(args: &Cli, view: &mut View) {
             "/theme",
             "/settings",
             "/debug",
+            "/changelog",
             "/reload",
         ]
         .into_iter()
@@ -10383,11 +11129,7 @@ fn complete_input(args: &Cli, view: &mut View) {
 }
 
 fn insert_completion(view: &mut View, range: std::ops::Range<usize>, completion: &str) {
-    let mut text = view.editor.text.clone();
-    let cursor = range.start + completion.len();
-    text.replace_range(range, completion);
-    view.editor.replace(text);
-    view.editor.cursor = cursor;
+    view.editor.replace_range(range, completion);
 }
 
 fn clean(text: &str) -> String {
@@ -11287,14 +12029,17 @@ mod tests {
         use super::{Theme, View, json};
         let operation_id = uuid::Uuid::new_v4();
         let mut view = View::default();
-        view.add_tool(&pi_rs::Invocation {
-            operation_id,
-            call: pi_rs::ToolCall {
-                id: "fixture".into(),
-                name: "read".into(),
-                arguments: r#"{"path":"image.png"}"#.into(),
+        view.add_tool(
+            &pi_rs::Invocation {
+                operation_id,
+                call: pi_rs::ToolCall {
+                    id: "fixture".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"image.png"}"#.into(),
+                },
             },
-        });
+            None,
+        );
         view.finish_tool(
             &operation_id.to_string(),
             &pi_rs::Outcome::StructuredWithDetails {
@@ -13319,6 +14064,248 @@ exit {exit}
     }
 
     #[test]
+    fn completion_after_a_paste_marker_cannot_modify_its_hidden_text() {
+        use clap::Parser;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.workspace = workspace.path().to_owned();
+        std::fs::write(args.workspace.join("unique-file.txt"), "").unwrap();
+        let mut view = View::default();
+        let paste = format!("{}unique", "paragraph\n".repeat(11));
+        view.paste_editor_text(&paste);
+        complete_input(&args, &mut view);
+        assert_eq!(view.editor.text, paste);
+        assert_eq!(view.editor.visible_rows(80, 6).0, ["[paste #1 +12 lines]"]);
+
+        view.editor.insert("uni");
+        complete_input(&args, &mut view);
+        assert_eq!(view.editor.text, format!("{paste}unique-file.txt"));
+        assert_eq!(
+            view.editor.visible_rows(80, 6).0,
+            ["[paste #1 +12 lines]unique-file.txt"]
+        );
+    }
+
+    #[test]
+    fn extension_paste_targets_the_draft_and_get_editor_text_returns_source() {
+        let mut view = View::default();
+        view.editor.replace("leftRIGHT".into());
+        view.editor.cursor = 4;
+        view.history_index = Some(3);
+        view.picker = Some(Picker::completion(vec![("/stale".into(), None)], 0..4, 3));
+        let source = std::iter::repeat_n("row", 11)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let id = uuid::Uuid::new_v4();
+        assert!(
+            view.ui_request(&json!({"id":id,"method":"pasteToEditor","text":source}))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(view.history_index, None);
+        assert!(view.picker.is_none());
+        assert!(view.dialogs.is_empty());
+        assert_eq!(
+            view.editor.visible_rows(80, 6).0,
+            ["left[paste #1 +11 lines]RIGHT"]
+        );
+        let response = view
+            .ui_request(&json!({"id":id,"method":"getEditorText"}))
+            .unwrap();
+        assert_eq!(
+            response,
+            Some((id, pi_rs::UiResponse::Text(format!("left{source}RIGHT"))))
+        );
+    }
+
+    #[test]
+    fn extension_hidden_thinking_label_updates_history_and_pending_thinking() {
+        use clap::Parser;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Cli::parse_from(["pi"]);
+        args.session = directory.path().join("session.jsonl");
+        drop(Session::open(&args.session).unwrap());
+        let mut view = View {
+            thinking: "live reasoning".into(),
+            hide_thinking: true,
+            ..View::default()
+        };
+        view.lines.push(Entry::Thinking {
+            text: "previous reasoning".into(),
+            expanded: None,
+        });
+        let theme = Theme::system();
+        let output = |view: &View| view.debug_log(&args, &theme, 80, 24).unwrap();
+        let id = uuid::Uuid::new_v4();
+
+        assert_eq!(output(&view).matches("Thinking...").count(), 2);
+        view.ui_request(&json!({
+            "id":id,"method":"setHiddenThinkingLabel","label":"Extension reasoning"
+        }))
+        .unwrap();
+        assert!(view.regular.redraw);
+        assert_eq!(output(&view).matches("Extension reasoning").count(), 2);
+
+        view.ui_request(&json!({"id":id,"method":"setHiddenThinkingLabel","label":"  "}))
+            .unwrap();
+        let hidden = output(&view);
+        assert!(!hidden.contains("reasoning"));
+        assert!(!hidden.contains("Thinking..."));
+        view.thinking_expanded = Some(true);
+        assert!(output(&view).contains("live reasoning"));
+        assert!(!output(&view).contains("previous reasoning"));
+
+        view.ui_request(&json!({"id":id,"method":"setHiddenThinkingLabel"}))
+            .unwrap();
+        assert_eq!(output(&view).matches("Thinking...").count(), 1);
+        assert_eq!(view.thinking_expanded, Some(true));
+
+        view.ui_request(&json!({"id":id,"method":"setHiddenThinkingLabel","label":"temporary"}))
+            .unwrap();
+        assert!(view.clear_extension_chrome());
+        assert_eq!(output(&view).matches("Thinking...").count(), 1);
+    }
+
+    #[test]
+    fn extension_working_indicator_animates_hides_and_restores_in_both_modes() {
+        let id = uuid::Uuid::new_v4();
+        let mut view = View::default();
+        view.ui_request(&json!({"id":id, "method":"setWorkingMessage", "message":"Reading files"}))
+            .unwrap();
+        view.ui_request(&json!({
+            "id":id, "method":"setWorkingIndicator",
+            "options":{"intervalMs":150,"frames":["one", "two"]},
+        }))
+        .unwrap();
+
+        let started = Instant::now();
+        view.request_started = Some(started);
+        view.sync_working_animation(true, started);
+        for fullscreen in [false, true] {
+            let status = |millis| {
+                view.working_status(
+                    true,
+                    fullscreen,
+                    started + Duration::from_millis(millis),
+                    80,
+                )
+            };
+            assert!(status(0).starts_with("one Reading files "));
+            assert!(status(150).starts_with("two Reading files "));
+            assert!(status(300).starts_with("one Reading files "));
+            assert!(
+                view.working_status(false, fullscreen, started, 80)
+                    .is_empty()
+            );
+        }
+
+        let later = started + Duration::from_millis(160);
+        view.request_started = Some(later);
+        view.sync_working_animation(true, later);
+        assert!(
+            view.working_status(true, true, later, 80)
+                .starts_with("two ")
+        );
+        assert_eq!(
+            view.extension_chrome
+                .working
+                .next_frame_wait(later, started + Duration::from_millis(150)),
+            Some(Duration::from_millis(140))
+        );
+
+        view.ui_request(&json!({"id":id,"method":"setWorkingIndicator","options":{"frames":[]}}))
+            .unwrap();
+        assert!(
+            view.working_status(true, true, started, 80)
+                .starts_with("Reading files ")
+        );
+        view.ui_request(&json!({"id":id,"method":"setWorkingVisible","visible":false}))
+            .unwrap();
+        assert!(view.working_status(true, true, started, 80).is_empty());
+        view.phase = Some("再試行待ち");
+        assert!(
+            view.working_status(true, false, started, 80)
+                .starts_with("再試行待ち ")
+        );
+        view.phase = None;
+        view.shell_running = true;
+        assert!(
+            view.working_status(true, false, started, 80)
+                .starts_with("コマンド実行中 ")
+        );
+        view.shell_running = false;
+        view.ui_request(&json!({"id":id,"method":"setWorkingVisible","visible":true}))
+            .unwrap();
+        view.ui_request(&json!({"id":id,"method":"setWorkingMessage","message":"幅".repeat(128)}))
+            .unwrap();
+        view.ui_status
+            .insert("fixture".into(), "independent status".into());
+        for fullscreen in [false, true] {
+            let status = view.border_status(true, fullscreen, later, 48);
+            assert!(status.contains("Escで取消"));
+            assert!(status.contains("independent status"));
+            assert!(UnicodeWidthStr::width(status.as_str()) <= 48);
+        }
+        assert!(view.clear_extension_chrome());
+        assert!(
+            view.working_status(true, false, started, 80)
+                .starts_with("処理中 ")
+        );
+        assert!(
+            view.working_status(true, true, started, 80)
+                .starts_with("⠋ 処理中 ")
+        );
+    }
+
+    #[test]
+    fn extension_header_footer_follow_theme_and_restore_independently() {
+        use clap::Parser;
+        let mut args = super::Cli::parse_from(["pi"]);
+        let directory = tempfile::tempdir().unwrap();
+        args.session = directory.path().join("session.jsonl");
+        let theme = super::Theme::system();
+        let mut view = super::View::default();
+        let id = uuid::Uuid::new_v4();
+        let apply = |view: &mut super::View, method, lines| {
+            assert!(
+                view.ui_request(&json!({"id":id,"method":method,"lines":lines}))
+                    .unwrap()
+                    .is_none()
+            );
+        };
+        let header = json!([[{"text":"heading","color":"accent","bold":true}]]);
+        let footer = json!([[{"text":"first"}],[{"text":"second"}]]);
+        apply(&mut view, "setHeader", header.clone());
+        assert!(view.regular.redraw);
+        view.regular.redraw = false;
+        apply(&mut view, "setHeader", header);
+        assert!(!view.regular.redraw);
+        apply(&mut view, "setFooter", footer);
+
+        for fullscreen in [false, true] {
+            let header = view.header_lines(&args, &theme, 7, 2, fullscreen);
+            assert_eq!(header[0].spans[0].text, "heading");
+            assert_eq!(header[0].spans[0].color, theme.color("accent"));
+            assert!(header[0].spans[0].bold);
+            let short_footer = view.footer_lines(&args, &theme, 8, 1, fullscreen);
+            assert_eq!(short_footer.len(), 1);
+            assert_eq!(short_footer[0].spans[0].text, "first");
+        }
+
+        apply(&mut view, "setFooter", json!([]));
+        assert!(view.footer_lines(&args, &theme, 80, 5, false).is_empty());
+        apply(&mut view, "setFooter", Value::Null);
+        assert_eq!(view.footer_lines(&args, &theme, 80, 5, false).len(), 2);
+        assert!(view.extension_chrome.header.is_some());
+        view.restore(&args).unwrap();
+        assert!(view.extension_chrome.header.is_some());
+        assert!(view.clear_extension_chrome());
+        assert!(view.extension_chrome.header.is_none());
+        assert!(!view.clear_extension_chrome());
+    }
+
+    #[test]
     fn extension_widgets_truncate_each_string_array_after_ten_lines() {
         let mut view = super::View::default();
         let set = |view: &mut super::View, key: &str, count: usize, placement: &str| {
@@ -13438,6 +14425,153 @@ exit {exit}
     }
 
     #[test]
+    fn tool_renderer_accepts_coalesced_previews_and_discards_reused_stream_indices() {
+        let mut view = super::View::default();
+        let options = crate::backend::ToolRenderOptions {
+            expanded: false,
+            show_images: false,
+            output_pad: 0,
+            expand_key: None,
+            width: None,
+        };
+        view.tool_render_options = Some(options.clone());
+        let delta = |id, name, args| {
+            json!({
+                "type":"tool_call_delta",
+                "toolCallDelta":{"index":0,"id":id,"name":name,"arguments":args},
+            })
+        };
+        view.receive(&delta("call", "lookup", r#"{"path":"exam"#));
+        let tool = &view.streaming_tools[&0];
+        let request = uuid::Uuid::new_v4();
+        let pending = |request| super::PendingToolPreview {
+            request,
+            index: 0,
+            generation: tool.generation,
+            options: options.clone(),
+            tool_name: tool.name.clone(),
+            tool_call_id: tool.id.clone(),
+        };
+        let old_pending = pending(uuid::Uuid::new_v4());
+        view.tool_preview_pending = Some(pending(request));
+        view.receive(&delta("", "", r#"ple"}"#));
+        let response = |id| json!({"id":id, "rendered":pi_rs::RenderedTool::default()});
+        assert!(view.receive_tool_render(response(request)));
+        assert_eq!(view.streaming_tools[&0].preview["path"], "example");
+        assert!(matches!(
+            view.streaming_tool_entries().next(),
+            Some(super::Entry::Tool {
+                rendered: Some(_),
+                ..
+            })
+        ));
+
+        view.receive(&delta("", "_more", ""));
+        assert!(view.streaming_tools[&0].rendered.is_none());
+
+        let obsolete = old_pending.request;
+        view.tool_preview_pending = Some(old_pending);
+        view.streaming_tools.clear();
+        view.receive(&delta("next", "lookup", "{}"));
+        assert!(!view.receive_tool_render(response(obsolete)));
+        assert!(view.streaming_tools[&0].rendered.is_none());
+    }
+
+    #[test]
+    fn tool_renderer_rotates_between_dirty_live_calls() {
+        let mut view = super::View::default();
+        for record in 1..=3 {
+            view.add_tool(
+                &pi_rs::Invocation {
+                    operation_id: uuid::Uuid::new_v4(),
+                    call: pi_rs::ToolCall {
+                        id: format!("call-{record}"),
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                Some(record),
+            );
+        }
+        let (index, operation, _) = view.next_journal_tool_render().unwrap();
+        assert_eq!(index, 2);
+        view.tool_render_cursor = Some(index);
+        // The newest call is still dirty. It must wait for the other live calls.
+        assert_eq!(view.next_journal_tool_render().unwrap().0, 1);
+        view.track_tool_render(&operation, 4, false);
+        view.tool_render_cursor = Some(0);
+        assert_eq!(view.next_journal_tool_render().unwrap().0, 1);
+    }
+
+    #[test]
+    fn tool_renderer_projects_partial_results_until_the_matching_tool_finishes() {
+        let mut view = super::View::default();
+        let operation_id = uuid::Uuid::new_v4();
+        let operation = operation_id.to_string();
+        view.add_tool(
+            &pi_rs::Invocation {
+                operation_id,
+                call: pi_rs::ToolCall {
+                    id: "provider-id".into(),
+                    name: "lookup".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            Some(1),
+        );
+        view.track_tool_render(&operation, 2, true);
+        let update = |text| {
+            json!({
+                "type":"tool_execution_update",
+                "toolCallId":"provider-id",
+                "toolName":"lookup",
+                "partialResult":{"content":[{"type":"text","text":text}],"details":{"stage":2}},
+            })
+        };
+        view.receive(&update("first"));
+        let partial = &view.partial_tool_results[&operation];
+        assert!(partial.is_partial && !partial.is_error);
+        assert_eq!(partial.duration_ms, None);
+        assert_eq!(partial.details.as_ref().unwrap()["stage"], 2);
+        assert!(
+            matches!(&view.lines[0], super::Entry::Tool { output, finished: false, .. } if output == "first")
+        );
+
+        let first = crate::backend::ToolRenderRecords {
+            invocation: 1,
+            started: Some(2),
+            result: None,
+            progress: 1,
+        };
+        let request = uuid::Uuid::new_v4();
+        view.tool_render_attempted.insert(operation.clone(), first);
+        view.tool_render_pending = Some(super::PendingToolRender {
+            request,
+            operation: operation.clone(),
+            records: first,
+            retried: false,
+        });
+        view.receive(&update("next"));
+        assert_eq!(
+            view.partial_tool_results[&operation].content[0]["text"],
+            "next"
+        );
+        assert!(
+            view.receive_tool_render(
+                json!({"id":request,"rendered":pi_rs::RenderedTool::default()})
+            )
+        );
+
+        view.track_tool_render(&operation, 3, false);
+        view.finish_tool(&operation, &pi_rs::Outcome::Succeeded("completed".into()));
+        view.receive(&update("late"));
+        assert!(view.partial_tool_results.is_empty());
+        assert!(matches!(&view.lines[0], super::Entry::Tool {
+            output, finished: true, rendered: None, ..
+        } if output == "completed"));
+    }
+
+    #[test]
     fn custom_entry_renderer_absence_omits_the_initial_row() {
         use super::Entry;
 
@@ -13498,6 +14632,85 @@ exit {exit}
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn tool_renderer_response_is_discarded_when_call_state_changes() {
+        let mut view = super::View::default();
+        let operation_id = uuid::Uuid::new_v4();
+        let operation = operation_id.to_string();
+        view.add_tool(
+            &pi_rs::Invocation {
+                operation_id,
+                call: pi_rs::ToolCall {
+                    id: "call".into(),
+                    name: "lookup".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            Some(1),
+        );
+        let original = crate::backend::ToolRenderRecords {
+            invocation: 1,
+            started: None,
+            result: None,
+            progress: 0,
+        };
+        let request = uuid::Uuid::new_v4();
+        view.tool_render_attempted
+            .insert(operation.clone(), original);
+        view.tool_render_pending = Some(super::PendingToolRender {
+            request,
+            operation: operation.clone(),
+            records: original,
+            retried: false,
+        });
+        view.track_tool_render(&operation, 2, true);
+        let response = |id| {
+            json!({
+                "type":"tool_rendered", "id":id,
+                "rendered": pi_rs::RenderedTool::default(),
+            })
+        };
+        assert!(!view.receive_tool_render(response(request)));
+        assert!(view.tool_render_pending.is_none());
+
+        let started = crate::backend::ToolRenderRecords {
+            started: Some(2),
+            ..original
+        };
+        let request = uuid::Uuid::new_v4();
+        view.tool_render_attempted
+            .insert(operation.clone(), started);
+        view.tool_render_pending = Some(super::PendingToolRender {
+            request,
+            operation: operation.clone(),
+            records: started,
+            retried: false,
+        });
+        assert!(!view.receive_tool_render(json!({"id":request,"rendered":null})));
+        assert_eq!(view.tool_render_retry.remove(&operation), Some(started));
+        assert!(!view.tool_render_attempted.contains_key(&operation));
+
+        let request = uuid::Uuid::new_v4();
+        view.tool_render_attempted
+            .insert(operation.clone(), started);
+        view.tool_render_pending = Some(super::PendingToolRender {
+            request,
+            operation,
+            records: started,
+            retried: true,
+        });
+        view.regular.committed = 1;
+        assert!(view.receive_tool_render(response(request)));
+        assert!(matches!(
+            &view.lines[0],
+            super::Entry::Tool {
+                rendered: Some(_),
+                ..
+            }
+        ));
+        assert!(view.custom_render_redraw_at.is_some());
     }
 
     #[test]

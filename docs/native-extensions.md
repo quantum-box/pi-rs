@@ -100,7 +100,7 @@ errors remain failures because their origin is unknown. The standard extension
 server advertises the capability and propagates typed errors from extensions it
 hosts, including executable extensions.
 
-## Render tool calls and results in an SDK host
+## Render tool calls and results
 
 A Rust tool can implement `Tool::tool_renderers` to provide separate call
 and result callbacks. An extension can wrap or replace renderers for any
@@ -128,9 +128,93 @@ because the initial capability check runs before configured flags take
 effect. Return `null` when a callback should opt out for a particular call.
 
 Call and result requests run in separate processes, so executable renderers
-should use the supplied context for their inputs. Resolver wrappers for
-other tools use the in-process API. Workbench terminal integration is
-tracked separately.
+should use the supplied context for their inputs.
+
+Workbench uses these callbacks for journaled tool calls and their committed
+results, including when a session is resumed. It runs the callbacks off
+the terminal paint path and supplies expansion state, viewport width and
+the configured output padding. The active theme maps the returned
+semantic roles. Each section can fall back to the standard presentation.
+While a call streams, the call renderer receives the current parsed arguments
+with `argsComplete: false`. Execution progress uses the newest content and
+details with `result.isPartial: true`. The terminal coalesces updates while
+drawing and replaces partial output when the journal commits a final result.
+
+## Wrap or replace another tool's renderer
+
+Native extensions can declare an ordered set of `ToolRendererOverride`
+entries through `Extension::tool_renderer_overrides`. Each entry has an
+extension-local ID and an exact or prefix tool-name selector. Selectors
+also match historical tools that are no longer registered. The first
+matching entry takes precedence and can inherit the shell or either
+section from the rest of the chain. A `replace` section renders on its
+own. A `wrap` section receives styled rows from the next callback, when
+one exists. Missing or invalid wrapper output leaves valid downstream rows
+in place. Each section shares a deadline across the whole chain, so a
+downstream timeout can end the section before an outer wrapper runs.
+The original tool result and its journal are unaffected.
+
+An executable advertises these declarations in the optional
+`tool_renderer_overrides` array of its `Describe` response. Keep IDs,
+selectors, sections and modes stable across flag configurations. Each
+declaration provides
+`id`, `selector` (a `kind` of `exact` or `prefix` with a string `value`),
+and optional `shell`, `call` and `result` fields. `call` and `result` use
+`wrap` or `replace`. The host sends `render_tool_override` with the
+declaration `id`, the `section`, the current `context`, and `next` rows
+or `null`. The callback returns styled rows or `null` in the v1 response
+envelope. A missing downstream callback leaves the Workbench's ordinary
+tool presentation as the fallback. In-process extensions can use the
+resolver method for arbitrary name predicates and callback composition.
+
+## Customize the header and footer
+
+Extensions can send `UiRequest::SetHeader` and `UiRequest::SetFooter` through
+`ExtensionUi`. Each takes `lines` of styled `UiComponentSpan` rows. The
+executable protocol accepts the same requests as `setHeader` and `setFooter`.
+A missing or null `lines` restores the built-in section. An empty array hides
+it. Updates do not open a dialog or wait for terminal input.
+
+Workbench uses the active theme and available width to display the rows in
+regular and fullscreen terminals. The header uses the startup banner slot.
+The footer replaces the working directory and model/usage rows. An extension
+can supply updated rows from terminal session and selection callbacks. These
+callbacks can publish UI updates without waiting for input. Overrides reset
+when switching sessions or replacing the extension worker. Pi's arbitrary
+live components and footer data provider remain specific to its TypeScript UI
+API.
+
+## Customize the working indicator
+
+`SetWorkingMessage` changes the working text during an agent turn.
+`SetWorkingVisible` hides or shows that text and its indicator. Use
+`SetWorkingIndicator` to set `options.frames` and `options.intervalMs`.
+One frame gives a static indicator, and an empty array hides just the
+indicator. Omit `message` or `options` to restore the terminal default.
+Executable extensions use `setWorkingMessage`, `setWorkingVisible`, and
+`setWorkingIndicator` with the same fields.
+
+Both terminal modes render custom frames as single-line text in the active
+border theme. Retries, summaries, and standalone shell runs keep their own
+status. Overrides apply across turns and reset with the extension worker or
+a new session.
+
+## Customize the collapsed thinking label
+
+Send `SetHiddenThinkingLabel` (wire method `setHiddenThinkingLabel`) to
+change the label for collapsed thinking blocks in the visible transcript,
+including streamed thinking. A blank or whitespace-only label removes the
+block from the view. Omit `label` to restore `Thinking...`. The override
+uses the theme's thinking style, wraps to at most 16 terminal rows and
+resets with the extension worker or session.
+
+## Paste into the main input editor
+
+`PasteToEditor` (wire method `pasteToEditor`) inserts `text` at the cursor
+in the prompt draft as one undoable edit. Workbench handles it the same way
+as a terminal or text clipboard paste. It normalizes line endings and tabs
+and collapses long pastes to a visual marker. `GetEditorText`, draft
+submission, and the external editor receive the full text.
 
 ## Share SDK extension events
 
