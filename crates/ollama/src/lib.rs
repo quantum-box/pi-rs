@@ -338,6 +338,16 @@ impl Ollama {
         self.headers.clone()
     }
 
+    #[doc(hidden)]
+    pub async fn prepare_header_override(&self, headers: &HeaderMap) -> Option<HeaderMap> {
+        pi_rs_core::provider_header_session_id()?;
+        pi_rs_core::prepare_provider_headers(
+            headers,
+            &self.token.iter().cloned().collect::<Vec<_>>(),
+        )
+        .await
+    }
+
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -900,6 +910,19 @@ fn running_context_window(value: &Value, model: &str) -> Option<u32> {
 
 #[async_trait::async_trait]
 impl Model for Ollama {
+    async fn prepare_context<'a>(
+        &'a self,
+        _: &ModelRequest,
+    ) -> Result<Option<std::sync::Arc<dyn Model + 'a>>> {
+        Ok(self
+            .prepare_header_override(&self.headers)
+            .await
+            .map(|headers| {
+                std::sync::Arc::new(self.clone().with_headers(headers))
+                    as std::sync::Arc<dyn Model + 'a>
+            }))
+    }
+
     fn uses_tool_transcript(&self, _model: &str) -> bool {
         self.mistral.is_none()
             && self
@@ -912,9 +935,16 @@ impl Model for Ollama {
         request: &ModelRequest,
         changes: &[pi_rs_core::ToolTranscriptChange],
     ) -> Result<Option<Arc<dyn Model + 'a>>> {
-        Ok(self.uses_tool_transcript(&request.model).then(|| {
-            Arc::new(self.clone().with_tool_transcript(request, changes)) as Arc<dyn Model>
-        }))
+        if !self.uses_tool_transcript(&request.model) {
+            return self.prepare_context(request).await;
+        }
+        let mut client = self.clone();
+        if let Some(headers) = self.prepare_header_override(&self.headers).await {
+            client = client.with_headers(headers);
+        }
+        Ok(Some(Arc::new(
+            client.with_tool_transcript(request, changes),
+        )))
     }
 
     fn supports_mid_conversation_system_messages(&self, _model: &str) -> bool {

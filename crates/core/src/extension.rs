@@ -1479,6 +1479,19 @@ pub trait Extension: Send + Sync {
         false
     }
 
+    /// Opt in to editing configured provider headers before transport authentication.
+    fn handles_before_provider_headers(&self) -> bool {
+        false
+    }
+
+    async fn before_provider_headers(
+        &self,
+        _headers: &mut crate::BeforeProviderHeaders,
+        _state: Option<&ExtensionState>,
+    ) -> ExtensionResult<()> {
+        Ok(())
+    }
+
     /// Branch-local entry types this extension can render for its host.
     fn custom_entry_renderer_types(&self) -> Vec<&str> {
         Vec::new()
