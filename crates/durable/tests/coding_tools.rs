@@ -99,7 +99,13 @@ async fn coding_tools_execute_through_durable_adapter() {
         json!({"path":"sub/file.txt","edits":[{"oldText":"missing","newText":"x"}]}),
     )
     .await;
-    assert!(matches!(failed, Outcome::Failed(_)));
+    assert!(
+        failed.is_error()
+            && failed
+                .tool_content()
+                .contains("Could not find the exact text"),
+        "{failed:?}"
+    );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("sub/file.txt")).unwrap(),
         "ONE\nTWO\n"
@@ -107,7 +113,10 @@ async fn coding_tools_execute_through_durable_adapter() {
     let bash = call(&tools, "bash", json!({"command":"printf durable"})).await;
     assert!(format!("{bash:?}").contains("durable"), "{bash:?}");
     let failed = call(&tools, "bash", json!({"command":"exit 7"})).await;
-    assert!(matches!(failed, Outcome::Failed(_)), "{failed:?}");
+    assert!(
+        failed.is_error() && failed.tool_content().contains("Command exited with code 7"),
+        "{failed:?}"
+    );
 }
 
 #[test]
