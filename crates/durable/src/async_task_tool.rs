@@ -877,8 +877,8 @@ pub trait DurableTaskHost: Send + Sync {
     }
 
     /// Append a text chunk and commit the current bounded output for observers.
-    /// Each execution attempt starts a new stream. The head is retained, up to
-    /// 4 KiB and 2,000 lines. The complete snapshot must fit the reporting limit.
+    /// Each execution attempt starts a new stream with the tool's output limits.
+    /// The complete snapshot must fit the reporting limit.
     async fn append_output(&self, _chunk: &str) -> Result<(), String> {
         Err("checkpointable tool progress is unavailable".into())
     }
@@ -910,6 +910,17 @@ pub trait DurableTaskHost: Send + Sync {
 /// registration is available only with an explicit replay-safe attestation.
 #[async_trait::async_trait]
 pub trait DurableAsyncTool: Tool {
+    /// Retention for this tool's `DurableTaskHost::append_output` stream.
+    /// Values over 4 KiB are clamped to fit the encoded progress envelope.
+    /// Explicit results and replacement progress retain their own limits.
+    fn output_limits(&self) -> crate::output::OutputLimits {
+        crate::output::OutputLimits {
+            max_bytes: 4 * 1024,
+            max_lines: 2_000,
+            retain: crate::output::Retain::Head,
+        }
+    }
+
     async fn execute_durable(
         &self,
         arguments: serde_json::Value,

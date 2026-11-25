@@ -881,13 +881,9 @@ struct ReportedProgress {
 }
 
 impl ReportedProgress {
-    fn append(&mut self, chunk: &str) {
+    fn append(&mut self, chunk: &str, limits: crate::output::OutputLimits) {
         let output = self.output.get_or_insert_with(|| {
-            let mut output = crate::output::OutputBuffer::new(crate::output::OutputLimits {
-                max_bytes: 4 * 1024,
-                max_lines: 2_000,
-                retain: crate::output::Retain::Head,
-            });
+            let mut output = crate::output::OutputBuffer::new(limits);
             output.push_str(&self.replacement.text);
             output
         });
@@ -1130,6 +1126,7 @@ struct Host<'a, 'b> {
     cancellation: &'a pi_rs_core::CancellationToken,
     admission: &'a AdmissionHandle<'a>,
     progress: Mutex<ReportedProgress>,
+    output_limits: crate::output::OutputLimits,
 }
 
 impl Host<'_, '_> {
@@ -1156,7 +1153,7 @@ impl DurableTaskHost for Host<'_, '_> {
     async fn append_output(&self, chunk: &str) -> Result<(), String> {
         let mut current = self.progress.lock().map_err(|error| error.to_string())?;
         let mut next = current.clone();
-        next.append(chunk);
+        next.append(chunk, self.output_limits);
         self.commit_progress(&next.snapshot())?;
         *current = next;
         Ok(())
@@ -3483,6 +3480,8 @@ impl Handler for Executor {
             .enable_all()
             .build()
             .map_err(|e| e.to_string())?;
+        let mut output_limits = self.tool.output_limits();
+        output_limits.max_bytes = output_limits.max_bytes.min(4 * 1024);
         let host = Host {
             task: task.clone(),
             docs: Mutex::new(docs),
@@ -3491,6 +3490,7 @@ impl Handler for Executor {
             cancellation,
             admission,
             progress: Mutex::new(ReportedProgress::default()),
+            output_limits,
         };
         let (result, args, no_dispatch) = runtime.block_on(async {
             let args = match saved_args {

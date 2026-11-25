@@ -42,6 +42,23 @@ impl Tool for StreamingTool {
 
 #[async_trait]
 impl DurableAsyncTool for StreamingTool {
+    fn output_limits(&self) -> pi_rs_durable::output::OutputLimits {
+        use pi_rs_durable::output::{OutputLimits, Retain};
+        if self.name == "leaf" {
+            OutputLimits {
+                max_bytes: 1024,
+                max_lines: 1,
+                retain: Retain::Tail,
+            }
+        } else {
+            OutputLimits {
+                max_bytes: 4096,
+                max_lines: 2000,
+                retain: Retain::Head,
+            }
+        }
+    }
+
     async fn execute_durable(
         &self,
         args: Value,
@@ -50,7 +67,7 @@ impl DurableAsyncTool for StreamingTool {
         host: &dyn DurableTaskHost,
     ) -> Result<DurableToolStep, String> {
         if args["mode"] == "nested" {
-            host.append_output("nested output").await?;
+            host.append_output("old line\nnested output").await?;
             self.advance.acquire().await.unwrap().forget();
             return host.complete_from_progress().await;
         }
@@ -212,6 +229,8 @@ async fn checkpointable_stream_is_live_and_fills_only_omitted_success_output() {
                                 .unwrap()
                         {
                             assert_eq!(progress.text, "nested output");
+                            assert_eq!(progress.dropped_bytes, 9);
+                            assert_eq!(progress.dropped_lines, 1);
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(5)).await;
