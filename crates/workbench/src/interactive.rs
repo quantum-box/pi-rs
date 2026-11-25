@@ -1485,10 +1485,19 @@ impl View {
         args: &mut Cli,
         theme: &mut Theme,
     ) -> Result<Option<(uuid::Uuid, pi_rs::UiResponse)>> {
-        if value["method"] != "setTheme" {
+        if !matches!(
+            value["method"].as_str(),
+            Some("getActiveTheme" | "setTheme")
+        ) {
             return self.ui_request(value);
         }
         let id = serde_json::from_value(value["id"].clone())?;
+        if value["method"] == "getActiveTheme" {
+            return Ok(Some((
+                id,
+                pi_rs::UiResponse::Theme(theme.clone().extension_palette()),
+            )));
+        }
         let request: pi_rs::UiRequest = serde_json::from_value(value.clone())?;
         request.validate().map_err(Error::Config)?;
         let pi_rs::UiRequest::SetTheme { theme: selection } = request else {
@@ -1596,7 +1605,7 @@ impl View {
                 };
                 return Ok(Some((id, response)));
             }
-            pi_rs::UiRequest::SetTheme { .. } => {
+            pi_rs::UiRequest::GetActiveTheme | pi_rs::UiRequest::SetTheme { .. } => {
                 return Err(Error::Config(
                     "theme selection requires the terminal controller".into(),
                 ));

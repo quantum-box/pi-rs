@@ -1105,10 +1105,19 @@ else:
         def select(theme):
             print(json.dumps({'type':'ui','request':{'method':'setTheme','theme':theme}}), flush=True)
             return json.loads(sys.stdin.readline())['Ok']
+        def active():
+            print(json.dumps({'type':'ui','request':{'method':'getActiveTheme'}}), flush=True)
+            return json.loads(sys.stdin.readline())['Ok']
         assert select('light') == {'success':True}
+        assert active() == light
         assert select('untrusted-project-theme')['success'] is False
         assert select('light/dark')['success'] is False
+        assert active() == light
         assert select(selected) == {'success':True}
+        palette = active()
+        assert palette['name'] == selected['name'], palette
+        assert palette['colors'] == selected['colors'], palette
+        assert 'path' not in palette, palette
         print(json.dumps({'type':'ui','request':{'method':'notify','message':'Startup theme palettes verified'}}), flush=True)
         assert json.loads(sys.stdin.readline()) == {'Ok':None}
     print(json.dumps({'type':'complete','response':{'Ok':None}}), flush=True)

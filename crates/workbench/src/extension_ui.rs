@@ -53,7 +53,9 @@ impl Broker {
         };
         match (&self.themes, request) {
             (None, UiRequest::GetAllThemes) => Ok(Some(UiResponse::Themes(vec![]))),
-            (None, UiRequest::GetTheme { .. }) => Ok(Some(UiResponse::Cancelled)),
+            (None, UiRequest::GetTheme { .. } | UiRequest::GetActiveTheme) => {
+                Ok(Some(UiResponse::Cancelled))
+            }
             (None, UiRequest::SetTheme { .. }) => {
                 Ok(Some(UiResponse::ThemeChanged(pi_rs::UiThemeChange {
                     success: false,
@@ -92,7 +94,10 @@ impl ExtensionUi for Broker {
         request.validate()?;
         if matches!(
             request,
-            UiRequest::GetAllThemes | UiRequest::GetTheme { .. } | UiRequest::SetTheme { .. }
+            UiRequest::GetAllThemes
+                | UiRequest::GetTheme { .. }
+                | UiRequest::GetActiveTheme
+                | UiRequest::SetTheme { .. }
         ) && cancellation.is_cancelled()
         {
             return Err("extension UI cancelled".into());
@@ -277,6 +282,12 @@ mod tests {
                 UiResponse::Cancelled
             );
         }
+        assert_eq!(
+            rpc.request(UiRequest::GetActiveTheme, CancellationToken::new())
+                .await
+                .unwrap(),
+            UiResponse::Cancelled
+        );
         assert_eq!(
             rpc.request(
                 UiRequest::SetTheme {

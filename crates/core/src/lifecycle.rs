@@ -425,6 +425,7 @@ impl ToolHost for LifecycleUiHost {
                 request,
                 crate::UiRequest::GetAllThemes
                     | crate::UiRequest::GetTheme { .. }
+                    | crate::UiRequest::GetActiveTheme
                     | crate::UiRequest::SetTheme { .. }
             )
         {

@@ -417,6 +417,8 @@ pub enum UiRequest {
     GetTheme {
         name: String,
     },
+    /// Read the palette used to render the terminal right now.
+    GetActiveTheme,
     /// Select a theme. Named selections can persist, while palettes only affect the session.
     SetTheme {
         theme: UiThemeSelection,
@@ -545,6 +547,9 @@ impl UiRequest {
                 theme.name == *name
                     && serde_json::to_vec(theme).is_ok_and(|value| value.len() <= 1024 * 1024)
             }
+            (Self::GetActiveTheme, UiResponse::Theme(theme)) => {
+                serde_json::to_vec(theme).is_ok_and(|value| value.len() <= 1024 * 1024)
+            }
             (Self::SetTheme { .. }, UiResponse::ThemeChanged(result)) => {
                 if result.success {
                     result.error.is_none()
@@ -576,6 +581,7 @@ impl UiRequest {
                 | Self::GetEditorText
                 | Self::GetAllThemes
                 | Self::GetTheme { .. }
+                | Self::GetActiveTheme
                 | Self::SetTheme { .. }
                 | Self::GetToolsExpanded
         )

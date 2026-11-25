@@ -989,7 +989,9 @@ selection updates the active terminal and saves the name in user settings.
 A palette applies only to the current session and does not read or watch any
 path supplied with it. Terminal color notifications and resource discovery
 leave that palette in place. The theme protocol reports `{success, error?}`
-and a rejected selection keeps the active theme. Headless RPC returns
+and a rejected selection keeps the active theme. `getActiveTheme` exposes
+the current palette, corresponding to Pi’s extension UI `theme` property.
+Headless RPC returns
 `{success: false, error: "UI not available"}` locally.
 [Pi theme setting](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L2874-L2891)
 
