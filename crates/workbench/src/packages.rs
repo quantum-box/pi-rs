@@ -1,10 +1,12 @@
 //! Native Rust package installation and resource discovery.
 use pi_rs_workbench::package_manifest::parse_manifest_object;
 use pi_rs_workbench::package_manifest::read_optional_manifest;
+#[cfg(all(test, unix))]
+use pi_rs_workbench::package_manifest::read_optional_manifest_after_probe;
 pub(crate) use pi_rs_workbench::package_manifest::validate_patterns;
 #[cfg(test)]
 use pi_rs_workbench::package_manifest::{
-    MAX_PACKAGE_MANIFEST_BYTES, read_optional_manifest_after_probe, read_optional_pi_package_json,
+    MAX_PACKAGE_MANIFEST_BYTES, read_optional_pi_package_json,
 };
 use pi_rs_workbench::package_manifest::{
     has_resource_fields, local_startup_manifest, manifest_pi, resource_glob, resource_patterns,
