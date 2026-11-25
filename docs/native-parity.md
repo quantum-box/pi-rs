@@ -186,7 +186,7 @@ or custom models through the native fallback.
 | MCP | Existing AIP read-only Linear host integration; local MCP stdio and streamable HTTP clients; user/trusted-project configuration; namespaced tools, resources, URI templates and prompts with per-server resource pagination; deferred tool discovery, codemode exposure and task polling; environment/command credentials; OAuth PKCE login/logout, private credential persistence, refresh, first-use consent, configured clients and interactive scope upgrades; automatic selection of configured hosted client metadata; add/remove/list commands; tool catalog notifications; per-request model-provider bearer forwarding | Live acceptance with a hosted pi-rs client identity |
 | Codemode | Bounded QuickJS execution, journaled native tool calls, parallel reads, transactional branch-local store, discovery, text/image output and console capture, classifier and image model calls via System One and OpenRouter, catalog and durable usage | Additional non-chat provider APIs, complete chat-model catalog, provider retries and remaining execution-limit fidelity |
 | Themes | Pi theme schema, system/dark/light themes, indexed/hex/OKHSL/OKLCH colors, variables, user and trusted-project loading, `/theme`, `/reload`, live custom-file reload and VT appearance notifications on Unix and Windows | Real Windows Terminal acceptance and remaining palette synchronization |
-| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, host-granted prompt, context, skill, template and theme resource snapshots, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Package and extension loading, model/auth factories and remaining Pi SDK equivalents |
+| SDK | Public Rust agent/session/model/tool/extension interfaces, owned session builder, host-owned exact-identity model catalog and recovery, coherent local and remote coding/read-only tool factories, host-granted prompt, context, skill, template, theme and package resource snapshots, explicit native extension composition, controls, event subscriptions, in-memory/persistent forks, JSONL export, compaction, idle custom-message turn triggering and lifecycle shutdown | Automatic SDK package discovery, install and reload, and remaining Pi SDK equivalents |
 | Browser SDK | Experimental text-only Rust `AgentSession` via a Fetch gateway; localStorage journal with Web Locks, cancellation, timeout, reload restoration and interrupted-run resumption tested in Chrome | Native tools and extensions, provider-specific adapters, streaming UI events, multimodal input, branch navigation and other browsers |
 | Packages | Native Cargo/git/local install, remove, update, list, per-source build cache, dependency builds and filtered resources | Remaining native source/filter edge cases |
 
@@ -7263,8 +7263,9 @@ include symlink targets and authorize discovery before the loader applies
 disabled IDs. Hosts can omit a path to skip executing its discovery hook.
 A replaceable inline extension yields when an enabled, non-replaceable
 extension claims a tool, command or flag of the same kind and name. The SDK
-host controls settings, load order, and package discovery. Pi's default
-resource loader also discovers project and package extensions automatically.
+host controls settings, load order, and which executable candidates to pass
+to the loader. Pi's default resource loader discovers project and package
+extensions automatically.
 
 ### Combined native SDK resource snapshots
 
@@ -7284,7 +7285,33 @@ file grants.
 format for the addendum, project context, skills, and working directory. The
 host supplies the default preamble with any tool and documentation sections,
 chooses the skill reader based on its tool loadout, and handles template
-invocation and theme selection. This factory uses explicit grants. Pi's default
-loader also discovers settings and packages, loads extensions, and rebuilds
-the structured prompt during a session. Native hosts can explicitly apply a
-fresh prompt to an idle session with `AgentSession::set_system_prompt`.
+invocation and theme selection. Pi's default loader also discovers settings
+and packages, loads extensions, and rebuilds the structured prompt during a
+session. Native hosts can explicitly apply a fresh prompt to an idle session
+with `AgentSession::set_system_prompt`.
+
+### Native SDK package resources
+
+`ResourceFactory::load_with_packages` adds skill metadata, prompt templates and
+themes from host-granted local package directories to the combined snapshot.
+`PackageResourcePaths::discover` also exposes the selected paths for hosts that
+load individual resource kinds. Discovery shares the native CLI's manifest
+precedence of `pi-package.json`, Cargo metadata and Pi `package.json`. Explicit
+Pi `package.json` resource lists contribute themes only, as in the native CLI.
+Without an explicit resource list, discovery uses the conventional resource
+directories. The SDK supports package-relative paths and globs, `!` glob
+exclusions and exact `+` and `-` file overrides. A package is evaluated in
+grant order, with paths sorted within each resource kind. Recursive scans
+have entry and depth limits and skip hidden entries, linked directories,
+`target` and `node_modules`. Exact manifest paths can include hidden entries
+and follow symlinks, as can granted package roots. SDK package scans use the
+manifest patterns for filtering. Pi also applies its local ignore rules.
+
+Package discovery reads manifests and file metadata. Extensions appear as
+candidate paths, and the host authorizes each executable separately with
+`NativeExtensionSource::Executable` to run its discovery hook. Installation,
+Cargo builds, package acquisition, settings discovery and reload scheduling
+remain host responsibilities. Pi's default SDK loader resolves these sources
+through its package manager and loads extensions during reload.
+[Pi SDK](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/sdk.ts)
+· [Pi resource loader](https://github.com/earendil-works/pi/blob/b882d08f34f8a245c8d3ea8b057759e1b8b2054c/packages/coding-agent/src/core/resource-loader.ts)

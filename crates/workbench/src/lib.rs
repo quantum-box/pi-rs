@@ -47,6 +47,9 @@ pub mod model_file;
 #[doc(hidden)]
 pub mod oauth_callback;
 #[doc(hidden)]
+pub mod package_manifest;
+pub mod package_resources;
+#[doc(hidden)]
 pub mod process_cleanup;
 pub mod prompt_resources;
 pub mod prompt_template_arguments;
