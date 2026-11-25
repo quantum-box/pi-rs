@@ -2509,6 +2509,16 @@ impl Conversation {
         self.answer_ids.get(&submission).copied()
     }
 
+    /// Whether ordinary input would be queued behind an active run.
+    pub fn input_run_active(&self) -> bool {
+        self.active.is_some()
+            || pending_failure_continuation(self)
+            || matches!(
+                self.phase,
+                Phase::AfterRun { .. } | Phase::HookTasksWaiting { .. }
+            )
+    }
+
     /// Current model request identity for a submission placed in this run.
     pub fn model_request_id(&self, submission: Uuid) -> Option<Uuid> {
         match self.phase {

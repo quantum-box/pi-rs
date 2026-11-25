@@ -60,7 +60,10 @@ impl Turn {
             let same_run = match status {
                 Status::Running => input.status == Status::Running,
                 Status::Done { .. } => answer.is_some() && state.answer_id(input.id) == answer,
-                _ => false,
+                Status::Unanswered { .. } => state.run_failure.as_ref().is_some_and(|failed| {
+                    failed.inputs.contains(&self.submission) && failed.inputs.contains(&input.id)
+                }),
+                Status::Queued => false,
             };
             if same_run && seen.insert(input.id) {
                 self.emit_user(&input.content)?;
@@ -290,11 +293,11 @@ async fn respond(
         Err(error) => return reply(&Value::Null, Err(error)).map(|_| false),
     };
     let command = request["type"].as_str().unwrap_or_default();
-    let mut admitted = None;
+    let mut admitted = false;
     let result = match command {
         "prompt" | "steer" | "follow_up" => submit_input(scheduler, id, command, &request)
-            .map(|(submission, running)| {
-                admitted = Some((submission, running));
+            .map(|running| {
+                admitted = true;
                 Some(json!({"disposition": if running { "started" } else { "queued" }}))
             }),
         "clear_queue" => scheduler.clear_input_queue(id).map(|withdrawn| {
@@ -328,7 +331,7 @@ async fn respond(
             Some(json!({
                 "sessionId": id,
                 "model": {"id": model, "provider":"openai", "api":"openai-responses"},
-                "isStreaming": state.submissions.iter().any(|s| s.status == Status::Running),
+                "isStreaming": state.input_run_active(),
                 "isCompacting": false,
                 "steeringMode": state.queue_modes.steering_mode,
                 "followUpMode": state.queue_modes.follow_up_mode,
@@ -346,16 +349,7 @@ async fn respond(
         _ => Err("unsupported durable RPC command".into()),
     };
     reply(&request, result)?;
-    if let Some((submission, true)) = admitted
-        && active.is_none()
-    {
-        seen.insert(submission);
-        *active = Some(Turn::start(
-            submission,
-            request["message"].as_str().unwrap(),
-        )?);
-    }
-    Ok(admitted.is_some())
+    Ok(admitted)
 }
 
 fn submit_input(
@@ -363,7 +357,7 @@ fn submit_input(
     id: Uuid,
     command: &str,
     request: &Value,
-) -> Result<(Uuid, bool), String> {
+) -> Result<bool, String> {
     if request
         .get("images")
         .is_some_and(|value| value.as_array().is_none_or(|images| !images.is_empty()))
@@ -384,10 +378,7 @@ fn submit_input(
     let state = scheduler
         .conversation(id)
         .map_err(|error| error.to_string())?;
-    let running = state
-        .submissions
-        .iter()
-        .any(|s| matches!(s.status, Status::Running | Status::Queued));
+    let running = state.input_run_active();
     let queued = command != "prompt" || running;
     if queued && behavior.is_none() {
         return Err("a running prompt needs streamingBehavior".into());
@@ -400,7 +391,7 @@ fn submit_input(
     };
     scheduler
         .submit_with_options(id, None, message.to_owned(), options)
-        .map(|submission| (submission, !queued))
+        .map(|_| !queued)
         .map_err(|error| error.to_string())
 }
 
@@ -489,8 +480,15 @@ fn publish_turns(
     loop {
         if active.is_none() {
             let Some(input) = state.submissions.iter().find(|input| {
-                matches!(input.status, Status::Running | Status::Done { .. })
-                    && !seen.contains(&input.id)
+                !seen.contains(&input.id)
+                    && match input.status {
+                        Status::Running | Status::Done { .. } => true,
+                        Status::Unanswered { .. } => state
+                            .run_failure
+                            .as_ref()
+                            .is_some_and(|failed| failed.inputs.contains(&input.id)),
+                        Status::Queued => false,
+                    }
             }) else {
                 return Ok(());
             };
